@@ -3933,6 +3933,14 @@ fn approval_outcome_from_response(response: &CodexServerResponse) -> Result<Code
         };
     }
 
+    if response.response_type == "codex.approval.permissions.respond" {
+        return Ok(if permissions_response_grants_anything(&response.payload) {
+            CodexApprovalOutcome::Accepted
+        } else {
+            CodexApprovalOutcome::Denied
+        });
+    }
+
     if response.response_type == "codex.permissions.request.respond" {
         return Ok(CodexApprovalOutcome::Accepted);
     }
@@ -3941,6 +3949,21 @@ fn approval_outcome_from_response(response: &CodexServerResponse) -> Result<Code
         "missing CodeX approval decision for request {}",
         response.id
     )))
+}
+
+fn permissions_response_grants_anything(payload: &Value) -> bool {
+    let Some(permissions) = payload.get("permissions").and_then(Value::as_object) else {
+        return false;
+    };
+
+    permissions.values().any(|value| match value {
+        Value::Null => false,
+        Value::Object(object) => !object.is_empty(),
+        Value::Array(array) => !array.is_empty(),
+        Value::Bool(value) => *value,
+        Value::String(value) => !value.is_empty(),
+        Value::Number(_) => true,
+    })
 }
 
 fn payload_string(payload: &Value, keys: &[&str]) -> Option<String> {
@@ -5867,6 +5890,57 @@ mod tests {
             .unwrap();
 
         assert!(!adapter.has_pending_server_request("server-request-1"));
+        assert_eq!(
+            transport.sent().await,
+            vec![CodexOutboundMessage::ServerResponse(response)]
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_response_payload_resolves_without_legacy_decision_field() {
+        let transport = Arc::new(RecordingTransport::default());
+        let (adapter, mut events, mut server_requests) =
+            CodexGatewayAdapter::new(transport.clone());
+        let server_request = CodexServerRequest {
+            id: "permission-request-1".to_string(),
+            request_type: "codex.approval.permissions.request".to_string(),
+            payload: json!({
+                "permissions": {
+                    "network": { "enabled": true },
+                },
+            }),
+        };
+
+        adapter
+            .handle_inbound(CodexInboundMessage::ServerRequest(server_request.clone()))
+            .unwrap();
+        assert_eq!(server_requests.recv().await.unwrap(), server_request);
+        let pending = events.recv().await.unwrap();
+        assert_eq!(pending.event_type, "codex.approval.permissions.request");
+
+        let response = CodexServerResponse {
+            id: "permission-request-1".to_string(),
+            response_type: "codex.approval.permissions.respond".to_string(),
+            payload: json!({
+                "permissions": {
+                    "network": { "enabled": true },
+                },
+                "scope": "turn",
+                "strictAutoReview": false,
+            }),
+        };
+        adapter
+            .respond_to_server_request(response.clone())
+            .await
+            .unwrap();
+
+        let resolved = events.recv().await.unwrap();
+        assert_eq!(resolved.event_type, "codex.serverRequest.resolved");
+        assert_eq!(
+            payload_str(&resolved.payload, "requestId"),
+            Some("permission-request-1")
+        );
+        assert_eq!(payload_str(&resolved.payload, "outcome"), Some("accepted"));
         assert_eq!(
             transport.sent().await,
             vec![CodexOutboundMessage::ServerResponse(response)]

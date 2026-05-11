@@ -1875,7 +1875,13 @@ mod tests {
                         tenant_id: "local".to_owned(),
                         request_id: "permission-1".to_owned(),
                         response_type: "codex.approval.permissions.respond".to_owned(),
-                        response: json!({ "decision": "accept" }),
+                        response: json!({
+                            "permissions": {
+                                "network": { "enabled": true },
+                            },
+                            "scope": "turn",
+                            "strictAutoReview": false,
+                        }),
                     },
                 ),
             },
