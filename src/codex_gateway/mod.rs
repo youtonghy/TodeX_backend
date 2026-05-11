@@ -18,7 +18,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, Mutex as AsyncMutex},
-    time::{timeout, Duration},
+    time::{sleep, timeout, Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -525,6 +525,8 @@ pub type CodexGatewayCursor = u64;
 pub type CodexLocalAdapterCommandId = String;
 
 const CODEX_LOCAL_ADAPTER_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
+const CODEX_LOCAL_ADAPTER_IDLE_SHUTDOWN_AFTER: Duration = Duration::from_secs(5 * 60);
+const CODEX_LOCAL_ADAPTER_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1270,14 +1272,24 @@ pub struct CodexLocalAdapterSupervisor {
     adapters: Arc<DashMap<CodexGatewaySessionId, Arc<LocalCodexAdapter>>>,
     store: CodexGatewayStore,
     events: EventBus,
+    idle_shutdown_after: Duration,
 }
 
 impl CodexLocalAdapterSupervisor {
     pub fn new(store: CodexGatewayStore, events: EventBus) -> Self {
+        Self::new_with_idle_shutdown_after(store, events, CODEX_LOCAL_ADAPTER_IDLE_SHUTDOWN_AFTER)
+    }
+
+    fn new_with_idle_shutdown_after(
+        store: CodexGatewayStore,
+        events: EventBus,
+        idle_shutdown_after: Duration,
+    ) -> Self {
         Self {
             adapters: Arc::new(DashMap::new()),
             store,
             events,
+            idle_shutdown_after,
         }
     }
 
@@ -1311,8 +1323,38 @@ impl CodexLocalAdapterSupervisor {
         } else {
             self.adapters
                 .insert(options.codex_session_id.clone(), adapter.clone());
+            self.spawn_idle_shutdown_task(options.codex_session_id.clone(), adapter.clone());
             Ok(adapter)
         }
+    }
+
+    fn spawn_idle_shutdown_task(
+        &self,
+        codex_session_id: CodexGatewaySessionId,
+        adapter: Arc<LocalCodexAdapter>,
+    ) {
+        let adapters = self.adapters.clone();
+        let idle_shutdown_after = self.idle_shutdown_after;
+        tokio::spawn(async move {
+            loop {
+                sleep(CODEX_LOCAL_ADAPTER_IDLE_REAP_INTERVAL.min(idle_shutdown_after)).await;
+                if adapters.get(&codex_session_id).is_none() {
+                    break;
+                }
+                if !adapter.is_idle_shutdown_due(idle_shutdown_after).await {
+                    continue;
+                }
+                let Some((_, registered_adapter)) = adapters.remove(&codex_session_id) else {
+                    break;
+                };
+                if !Arc::ptr_eq(&registered_adapter, &adapter) {
+                    adapters.insert(codex_session_id.clone(), registered_adapter);
+                    continue;
+                }
+                let _ = adapter.stop("idle-shutdown", false).await;
+                break;
+            }
+        });
     }
 
     pub fn get(&self, codex_session_id: &str) -> Option<Arc<LocalCodexAdapter>> {
@@ -1496,6 +1538,7 @@ impl CodexLocalAdapterSupervisor {
 
 pub struct LocalCodexAdapter {
     runtime: Arc<AsyncMutex<CodexLocalAdapterRuntime>>,
+    idle_state: Arc<AsyncMutex<LocalCodexAdapterIdleState>>,
     child: Arc<AsyncMutex<Option<Child>>>,
     stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
     stderr: Arc<AsyncMutex<Option<ChildStderr>>>,
@@ -1509,6 +1552,38 @@ impl std::fmt::Debug for LocalCodexAdapter {
         formatter
             .debug_struct("LocalCodexAdapter")
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LocalCodexAdapterIdleState {
+    last_input_at: Instant,
+    completed_idle_since: Option<Instant>,
+}
+
+impl LocalCodexAdapterIdleState {
+    fn new() -> Self {
+        Self {
+            last_input_at: Instant::now(),
+            completed_idle_since: None,
+        }
+    }
+
+    fn record_input(&mut self) {
+        self.last_input_at = Instant::now();
+        self.completed_idle_since = None;
+    }
+
+    fn record_turn_finished(&mut self) {
+        self.completed_idle_since = Some(Instant::now());
+    }
+
+    fn is_shutdown_due(&self, idle_shutdown_after: Duration) -> bool {
+        let Some(completed_idle_since) = self.completed_idle_since else {
+            return false;
+        };
+        completed_idle_since.elapsed() >= idle_shutdown_after
+            && self.last_input_at <= completed_idle_since
     }
 }
 
@@ -1592,6 +1667,7 @@ impl LocalCodexAdapter {
 
         let pid = child.id().unwrap_or_default();
         let pending_server_requests = Arc::new(DashMap::new());
+        let idle_state = Arc::new(AsyncMutex::new(LocalCodexAdapterIdleState::new()));
         let (ready_tx, ready_rx) = oneshot::channel();
         spawn_local_stdout_reader(
             options.codex_session_id.clone(),
@@ -1600,6 +1676,7 @@ impl LocalCodexAdapter {
             store.clone(),
             events.clone(),
             runtime.clone(),
+            idle_state.clone(),
             pending_server_requests.clone(),
             ready_tx,
         );
@@ -1639,6 +1716,7 @@ impl LocalCodexAdapter {
                 drop(runtime_guard);
                 Ok(Self {
                     runtime,
+                    idle_state,
                     child: Arc::new(AsyncMutex::new(Some(child))),
                     stdin: Arc::new(AsyncMutex::new(Some(stdin))),
                     stderr: Arc::new(AsyncMutex::new(stderr)),
@@ -1696,6 +1774,20 @@ impl LocalCodexAdapter {
         self.runtime.lock().await.clone()
     }
 
+    async fn is_idle_shutdown_due(&self, idle_shutdown_after: Duration) -> bool {
+        let runtime = self.runtime.lock().await;
+        if runtime.state != CodexLocalAdapterLifecycleState::Ready
+            || !runtime.command_lane.is_idle()
+        {
+            return false;
+        }
+        drop(runtime);
+        self.idle_state
+            .lock()
+            .await
+            .is_shutdown_due(idle_shutdown_after)
+    }
+
     pub async fn run_turn(
         &self,
         request_id: &str,
@@ -1727,6 +1819,7 @@ impl LocalCodexAdapter {
             sandbox_policy,
             service_tier,
         );
+        self.idle_state.lock().await.record_input();
         self.dispatch_mutating_request(request_id, "codex.local.turn", request)
             .await
     }
@@ -1739,6 +1832,7 @@ impl LocalCodexAdapter {
         input: Value,
     ) -> CodexLocalAdapterProcessResult<()> {
         let request = CodexGatewayRequest::turn_input(request_id, thread_id, turn_id, input);
+        self.idle_state.lock().await.record_input();
         self.dispatch_mutating_request(request_id, "codex.local.input", request)
             .await
     }
@@ -1758,6 +1852,7 @@ impl LocalCodexAdapter {
             expected_turn_id,
             input,
         );
+        self.idle_state.lock().await.record_input();
         self.dispatch_control_request(request_id, "codex.local.steer", request)
             .await
     }
@@ -2269,6 +2364,7 @@ fn spawn_local_stdout_reader(
     store: CodexGatewayStore,
     events: EventBus,
     runtime: Arc<AsyncMutex<CodexLocalAdapterRuntime>>,
+    idle_state: Arc<AsyncMutex<LocalCodexAdapterIdleState>>,
     pending_server_requests: Arc<DashMap<GatewayRequestId, CodexServerRequest>>,
     ready_tx: oneshot::Sender<std::result::Result<(), String>>,
 ) {
@@ -2307,7 +2403,7 @@ fn spawn_local_stdout_reader(
                     }
                     match parse_local_reader_message(value) {
                         Ok(Some(CodexLocalAdapterReaderMessage::Event(event))) => {
-                            apply_reader_event_runtime(&runtime, &event).await;
+                            apply_reader_event_runtime(&runtime, &idle_state, &event).await;
                             if let Ok(record) = store.append_event(&codex_session_id, event).await {
                                 publish_codex_gateway_record_to_bus(&events, record).await;
                             }
@@ -2486,18 +2582,28 @@ fn app_server_server_request_method_to_codex(method: &str) -> String {
 
 async fn apply_reader_event_runtime(
     runtime: &Arc<AsyncMutex<CodexLocalAdapterRuntime>>,
+    idle_state: &Arc<AsyncMutex<LocalCodexAdapterIdleState>>,
     event: &CodexGatewayEvent,
 ) {
     let mut runtime = runtime.lock().await;
     match event.event_type.as_str() {
-        "codex.turn.completed" | "codex.item.completed" => {
+        "codex.turn.completed" => {
+            if runtime.complete_mutating_command().is_ok() {
+                idle_state.lock().await.record_turn_finished();
+            }
+        }
+        "codex.item.completed" => {
             let _ = runtime.complete_mutating_command();
         }
         "codex.turn.interrupted" => {
-            let _ = runtime.complete_mutating_command();
+            if runtime.complete_mutating_command().is_ok() {
+                idle_state.lock().await.record_turn_finished();
+            }
         }
         "codex.control.error" => {
-            let _ = runtime.complete_mutating_command();
+            if runtime.complete_mutating_command().is_ok() {
+                idle_state.lock().await.record_turn_finished();
+            }
         }
         "codex.turn.failed" | "codex.error" => runtime.fail(),
         _ => {}
@@ -4205,9 +4311,11 @@ mod tests {
             runtime.begin_mutating_command("msg-1").unwrap();
             runtime
         }));
+        let idle_state = Arc::new(AsyncMutex::new(LocalCodexAdapterIdleState::new()));
 
         apply_reader_event_runtime(
             &runtime,
+            &idle_state,
             &CodexGatewayEvent::new(
                 "codex.control.error",
                 json!({
@@ -5088,6 +5196,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_codex_adapter_supervisor_reaps_completed_idle_sessions() {
+        let root = unique_tmp_dir("todex-codex-local-adapter-idle");
+        let cwd = root.join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let binary = write_fake_codex_binary(&root, "turn-once").await;
+        let store = CodexGatewayStore::new(root.join("data"));
+        let supervisor = CodexLocalAdapterSupervisor::new_with_idle_shutdown_after(
+            store.clone(),
+            EventBus::new(16),
+            Duration::from_millis(50),
+        );
+        supervisor
+            .start(CodexLocalAdapterStartOptions {
+                startup_timeout_ms: 1_000,
+                ..CodexLocalAdapterStartOptions::new(
+                    "cdxs_adapter_idle",
+                    "local-start-1",
+                    &cwd,
+                    binary.to_string_lossy(),
+                )
+            })
+            .await
+            .unwrap();
+
+        supervisor
+            .run_turn(
+                "cdxs_adapter_idle",
+                "local-turn-1",
+                "thread-idle-1",
+                json!([{ "type": "text", "text": "complete and idle" }]),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if supervisor.len() == 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("completed idle adapter should be reaped");
+
+        let replay = store
+            .replay_events("cdxs_adapter_idle", None, 20)
+            .await
+            .unwrap();
+        assert!(replay
+            .events
+            .iter()
+            .any(|event| event.event_type == "codex.turn.completed"));
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .rev()
+                .find(|event| event.event_type == "codex.control.stopped")
+                .and_then(|event| event.payload.get("requestId"))
+                .and_then(Value::as_str),
+            Some("idle-shutdown")
+        );
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn local_codex_adapter_supervisor_maps_start_failures_to_typed_errors() {
         let root = unique_tmp_dir("todex-codex-local-adapter-failures");
         let cwd = root.join("project");
@@ -5239,6 +5419,9 @@ mod tests {
         let script = match mode {
             "ready" => {
                 "#!/bin/sh\nprintf '{\"type\":\"codex.control.ready\"}\\n'\nwhile read line; do :; done\n"
+            }
+            "turn-once" => {
+                "#!/bin/sh\nprintf '{\"type\":\"codex.control.ready\"}\\n'\nwhile read line; do\ncase \"$line\" in\n*'\"method\":\"turn/start\"'*)\nprintf '{\"type\":\"codex.turn.completed\",\"payload\":{\"requestId\":\"local-turn-1\",\"threadId\":\"thread-idle-1\",\"turnId\":\"turn-idle-1\",\"lifecycleState\":\"ready\"}}\\n'\n;;\nesac\ndone\n"
             }
             "timeout" => "#!/bin/sh\nsleep 2\n",
             "crash" => "#!/bin/sh\nexit 42\n",
