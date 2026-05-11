@@ -1345,6 +1345,9 @@ impl CodexLocalAdapterSupervisor {
         request_id: &str,
         thread_id: &str,
         input: Value,
+        approval_policy: Option<Value>,
+        sandbox_policy: Option<Value>,
+        service_tier: Option<Value>,
         collaboration_mode: Option<Value>,
     ) -> CodexLocalAdapterProcessResult<()> {
         let Some(adapter) = self.get(codex_session_id) else {
@@ -1357,7 +1360,15 @@ impl CodexLocalAdapterSupervisor {
             ));
         };
         adapter
-            .run_turn(request_id, thread_id, input, collaboration_mode)
+            .run_turn(
+                request_id,
+                thread_id,
+                input,
+                approval_policy,
+                sandbox_policy,
+                service_tier,
+                collaboration_mode,
+            )
             .await
     }
 
@@ -1690,6 +1701,9 @@ impl LocalCodexAdapter {
         request_id: &str,
         thread_id: &str,
         input: Value,
+        approval_policy: Option<Value>,
+        sandbox_policy: Option<Value>,
+        service_tier: Option<Value>,
         collaboration_mode: Option<Value>,
     ) -> CodexLocalAdapterProcessResult<()> {
         let codex_session_id = self.runtime.lock().await.codex_session_id.clone();
@@ -1705,8 +1719,14 @@ impl LocalCodexAdapter {
                     "codex.local.turn",
                 )
             })?;
-        let request =
+        let mut request =
             CodexGatewayRequest::turn_start(request_id, thread_id, input, collaboration_mode);
+        apply_turn_start_overrides(
+            &mut request.payload,
+            approval_policy,
+            sandbox_policy,
+            service_tier,
+        );
         self.dispatch_mutating_request(request_id, "codex.local.turn", request)
             .await
     }
@@ -2612,7 +2632,10 @@ fn codex_method_to_request_type(method: &str) -> String {
 fn codex_request_to_app_server_method_and_params(request: CodexGatewayRequest) -> (String, Value) {
     let mut params = request.payload;
     let method = match request.request_type.as_str() {
-        "codex.turn.start" => "turn/start".to_string(),
+        "codex.turn.start" => {
+            normalize_turn_start_params(&mut params);
+            "turn/start".to_string()
+        }
         "codex.turn.input" => {
             normalize_turn_input_as_steer(&mut params);
             "turn/steer".to_string()
@@ -2631,6 +2654,48 @@ fn codex_request_to_app_server_method_and_params(request: CodexGatewayRequest) -
         other => other.to_string(),
     };
     (method, params)
+}
+
+fn apply_turn_start_overrides(
+    params: &mut Value,
+    approval_policy: Option<Value>,
+    sandbox_policy: Option<Value>,
+    service_tier: Option<Value>,
+) {
+    let Some(object) = params.as_object_mut() else {
+        return;
+    };
+    if let Some(approval_policy) = approval_policy {
+        object.insert("approvalPolicy".to_string(), approval_policy);
+    }
+    if let Some(sandbox_policy) = sandbox_policy {
+        object.insert("sandboxPolicy".to_string(), sandbox_policy);
+    }
+    if let Some(service_tier) = service_tier {
+        object.insert("serviceTier".to_string(), service_tier);
+    }
+}
+
+fn normalize_turn_start_params(params: &mut Value) {
+    let Some(object) = params.as_object_mut() else {
+        return;
+    };
+    let collaboration_mode = object.remove("collaborationMode");
+    let Some(settings) = collaboration_mode
+        .as_ref()
+        .and_then(|value| value.get("settings"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    if let Some(model) = settings.get("model").cloned() {
+        object.entry("model".to_string()).or_insert(model);
+    }
+    if let Some(reasoning_effort) = settings.get("reasoningEffort").cloned() {
+        object
+            .entry("effort".to_string())
+            .or_insert(reasoning_effort);
+    }
 }
 
 fn normalize_turn_input_as_steer(params: &mut Value) {
@@ -4208,6 +4273,46 @@ mod tests {
             request.payload["collaborationMode"]["settings"]["model"],
             "mock-model"
         );
+    }
+
+    #[test]
+    fn turn_start_app_server_params_project_mobile_config_overrides() {
+        let mut request = CodexGatewayRequest::turn_start(
+            "turn-start-1",
+            "thread-1",
+            json!([{ "type": "text", "text": "Plan this" }]),
+            Some(CodexCollaborationMode {
+                mode: CodexModeKind::Default,
+                settings: CodexCollaborationSettings {
+                    model: "gpt-5.4".to_string(),
+                    reasoning_effort: Some("high".to_string()),
+                    developer_instructions: None,
+                },
+            }),
+        );
+        apply_turn_start_overrides(
+            &mut request.payload,
+            Some(json!("on-request")),
+            Some(json!({
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            })),
+            Some(json!("priority")),
+        );
+
+        let (method, params) = codex_request_to_app_server_method_and_params(request);
+
+        assert_eq!(method, "turn/start");
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["model"], "gpt-5.4");
+        assert_eq!(params["effort"], "high");
+        assert_eq!(params["approvalPolicy"], "on-request");
+        assert_eq!(params["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(params["serviceTier"], "priority");
+        assert!(params.get("collaborationMode").is_none());
     }
 
     #[test]

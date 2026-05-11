@@ -137,6 +137,12 @@ pub struct CodexLocalTurnRequest {
     pub thread_id: String,
     pub input: Value,
     #[serde(default)]
+    pub approval_policy: Option<Value>,
+    #[serde(default)]
+    pub sandbox_policy: Option<Value>,
+    #[serde(default)]
+    pub service_tier: Option<Value>,
+    #[serde(default)]
     pub collaboration_mode: Option<Value>,
 }
 
