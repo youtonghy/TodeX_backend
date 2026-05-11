@@ -1761,14 +1761,17 @@ impl LocalCodexAdapter {
         response: Value,
     ) -> CodexLocalAdapterProcessResult<()> {
         let runtime = self.runtime.lock().await.clone();
-        let Some((_, request)) = self.pending_server_requests.remove(upstream_request_id) else {
-            return Err(CodexLocalAdapterProcessError::new(
-                CodexLocalErrorCode::UnsupportedAction,
-                "local Codex adapter has no pending server request for that response",
-                &runtime.codex_session_id,
-                Some(request_id),
-                "codex.local.approval.respond",
-            ));
+        let request = {
+            let Some(request) = self.pending_server_requests.get(upstream_request_id) else {
+                return Err(CodexLocalAdapterProcessError::new(
+                    CodexLocalErrorCode::UnsupportedAction,
+                    "local Codex adapter has no pending server request for that response",
+                    &runtime.codex_session_id,
+                    Some(request_id),
+                    "codex.local.approval.respond",
+                ));
+            };
+            request.clone()
         };
         let message = CodexOutboundMessage::ServerResponse(CodexServerResponse {
             id: upstream_request_id.to_string(),
@@ -1814,6 +1817,9 @@ impl LocalCodexAdapter {
                 )
             })?,
         };
+        self.write_outbound(message).await?;
+        self.pending_server_requests.remove(upstream_request_id);
+
         if let Some(event) = resolved_event {
             let record = self
                 .store
@@ -1842,7 +1848,7 @@ impl LocalCodexAdapter {
             }),
         )
         .await?;
-        self.write_outbound(message).await
+        Ok(())
     }
 
     pub async fn send_request(
@@ -3859,11 +3865,14 @@ impl CodexGatewayAdapter {
     }
 
     pub async fn respond_to_server_request(&self, response: CodexServerResponse) -> Result<()> {
-        let Some((_, request)) = self.pending_server_requests.remove(&response.id) else {
-            return Err(AppError::InvalidRequest(format!(
-                "unknown CodeX server request id {}",
-                response.id
-            )));
+        let request = {
+            let Some(request) = self.pending_server_requests.get(&response.id) else {
+                return Err(AppError::InvalidRequest(format!(
+                    "unknown CodeX server request id {}",
+                    response.id
+                )));
+            };
+            request.clone()
         };
 
         let resolved_event = if request.request_type == "codex.tool.requestUserInput.request" {
@@ -3879,15 +3888,18 @@ impl CodexGatewayAdapter {
                 .or(CodexGatewayEvent::elicitation_resolved(&response)?)
         };
 
+        self.transport
+            .send(CodexOutboundMessage::ServerResponse(response))
+            .await?;
+        self.pending_server_requests.remove(&request.id);
+
         if let Some(event) = resolved_event {
             self.events.send(event).map_err(|_| {
                 AppError::InvalidRequest("CodeX gateway event receiver is closed".to_string())
             })?;
         }
 
-        self.transport
-            .send(CodexOutboundMessage::ServerResponse(response))
-            .await
+        Ok(())
     }
 
     pub fn handle_inbound(
@@ -3981,6 +3993,17 @@ mod tests {
         async fn send(&self, message: CodexOutboundMessage) -> Result<()> {
             self.sent.lock().await.push(message);
             Ok(())
+        }
+    }
+
+    struct FailingTransport;
+
+    #[async_trait]
+    impl CodexGatewayTransport for FailingTransport {
+        async fn send(&self, _message: CodexOutboundMessage) -> Result<()> {
+            Err(AppError::InvalidRequest(
+                "transport write failed".to_string(),
+            ))
         }
     }
 
@@ -5560,6 +5583,35 @@ mod tests {
             transport.sent().await,
             vec![CodexOutboundMessage::ServerResponse(response)]
         );
+    }
+
+    #[tokio::test]
+    async fn failed_server_request_response_keeps_request_pending() {
+        let transport = Arc::new(FailingTransport);
+        let (adapter, _events, mut server_requests) = CodexGatewayAdapter::new(transport);
+        let server_request = CodexServerRequest {
+            id: "server-request-1".to_string(),
+            request_type: "codex.approval.commandExecution.request".to_string(),
+            payload: json!({ "command": "cargo test" }),
+        };
+
+        adapter
+            .handle_inbound(CodexInboundMessage::ServerRequest(server_request))
+            .unwrap();
+        let _ = server_requests.recv().await.unwrap();
+
+        let response = CodexServerResponse {
+            id: "server-request-1".to_string(),
+            response_type: "codex.approval.commandExecution.respond".to_string(),
+            payload: json!({ "decision": "approved" }),
+        };
+        let error = adapter
+            .respond_to_server_request(response)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("transport write failed"));
+        assert!(adapter.has_pending_server_request("server-request-1"));
     }
 
     #[tokio::test]
