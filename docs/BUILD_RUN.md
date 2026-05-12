@@ -152,6 +152,14 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 cargo run -- tui --host 127.0.0.1 --port 7345
 ```
 
+真机扫码配对需要手机能访问后端监听地址。推荐在可信局域网内用：
+
+```bash
+cargo run -- tui --host 0.0.0.0 --port 7345
+```
+
+此时服务监听所有网卡，TUI 配对二维码会尽量写入当前局域网 IP，而不是不可访问的 `0.0.0.0`。
+
 ### 指定数据目录和 workspace 根目录
 
 ```bash

@@ -1,3 +1,4 @@
+use std::net::{IpAddr, UdpSocket};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -98,14 +99,36 @@ impl PairingKeys {
         port: u16,
         preferred_encryption: PairingEncryption,
     ) -> Result<String, AppError> {
+        let advertise_host = pairing_advertise_host(&config.host);
         Ok(serde_json::to_string(&PairingLinkPayload {
             kind: "todex-pairing-link".to_owned(),
             version: PAIRING_VERSION,
-            server_url: format!("http://{}:{port}", config.host),
-            pairing_url: format!("http://{}:{port}/v1/pairing", config.host),
+            server_url: format!("http://{advertise_host}:{port}"),
+            pairing_url: format!("http://{advertise_host}:{port}/v1/pairing"),
             auth_token: config.security.auth_token.clone(),
             preferred_encryption: Some(preferred_encryption),
         })?)
+    }
+}
+
+fn pairing_advertise_host(config_host: &str) -> String {
+    let host = config_host.trim();
+    match host.parse::<IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => {
+            default_route_ipv4().unwrap_or_else(|| "127.0.0.1".to_owned())
+        }
+        Ok(IpAddr::V6(ip)) => format!("[{ip}]"),
+        Ok(_) => host.to_owned(),
+        Err(_) => host.to_owned(),
+    }
+}
+
+fn default_route_ipv4() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
+        _ => None,
     }
 }
 
@@ -497,6 +520,20 @@ mod tests {
             max_width <= 80,
             "compact pairing QR should fit common terminal widths, got {max_width}"
         );
+    }
+
+    #[test]
+    fn pairing_link_replaces_unspecified_bind_host_with_reachable_advertise_host() {
+        let keys = PairingKeys::generate();
+        let mut config = test_config();
+        config.host = "0.0.0.0".to_owned();
+        let link = keys
+            .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&link).unwrap();
+
+        assert_ne!(value["serverUrl"], "http://0.0.0.0:7345");
+        assert_ne!(value["pairingUrl"], "http://0.0.0.0:7345/v1/pairing");
     }
 
     #[test]
