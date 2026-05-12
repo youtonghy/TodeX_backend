@@ -8,6 +8,7 @@ use crate::{
     config::Config,
     error::Result,
     event::EventBus,
+    transport_crypto::PairingKeys,
 };
 
 #[derive(Clone)]
@@ -16,6 +17,7 @@ pub struct AppState {
     pub events: EventBus,
     pub codex_gateway: CodexGatewayStore,
     pub codex_local_adapters: CodexLocalAdapterSupervisor,
+    pub pairing_keys: PairingKeys,
     websocket_connections: Arc<AtomicUsize>,
 }
 
@@ -29,6 +31,7 @@ impl AppState {
         let codex_gateway = CodexGatewayStore::new(config.data_dir.clone());
         let codex_local_adapters =
             CodexLocalAdapterSupervisor::new(codex_gateway.clone(), events.clone());
+        let pairing_keys = PairingKeys::generate();
         let websocket_connections = Arc::new(AtomicUsize::new(0));
 
         Ok(Self {
@@ -36,6 +39,7 @@ impl AppState {
             events,
             codex_gateway,
             codex_local_adapters,
+            pairing_keys,
             websocket_connections,
         })
     }

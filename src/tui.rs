@@ -26,7 +26,7 @@ use crate::config::{Config, ServeArgs};
 use crate::event::EventRecord;
 use crate::server_runner::ManagedServer;
 
-const ACTION_COUNT: usize = 7;
+const ACTION_COUNT: usize = 8;
 const MAX_LOG_LINES: usize = 256;
 const MAX_LOG_EVENTS: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
@@ -199,6 +199,39 @@ impl TuiApp {
         self.log_scroll = self.bottom_log_scroll();
     }
 
+    fn show_pairing_qr(&mut self) {
+        let qr = match self.server.as_ref() {
+            Some(server) => server.pairing_qr_text(),
+            None => {
+                self.notice = "Start the service before showing a pairing QR.".to_owned();
+                return;
+            }
+        };
+        self.push_pairing_qr_result(qr);
+    }
+
+    fn push_pairing_qr_for_server(&mut self, server: &ManagedServer) {
+        self.push_pairing_qr_result(server.pairing_qr_text());
+    }
+
+    fn push_pairing_qr_result(&mut self, qr: Result<String>) {
+        match qr {
+            Ok(qr) => {
+                self.notice = "Pairing QR is visible in live logs.".to_owned();
+                self.push_log(
+                    "Encrypted pairing QR follows. Scan it from the app settings page.".to_owned(),
+                );
+                for line in qr.lines() {
+                    self.push_log(line.to_owned());
+                }
+            }
+            Err(error) => {
+                self.notice = "Failed to render pairing QR.".to_owned();
+                self.last_error = Some(error.to_string());
+            }
+        }
+    }
+
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if self.input.is_some() {
             self.handle_input_key(key).await?;
@@ -224,6 +257,7 @@ impl TuiApp {
             KeyCode::Char('p') => self.start_port_edit(),
             KeyCode::Char('w') => self.save_config()?,
             KeyCode::Char('l') => self.save_logs()?,
+            KeyCode::Char('g') => self.show_pairing_qr(),
             KeyCode::PageUp => self.scroll_logs_up(LOG_SCROLL_STEP),
             KeyCode::PageDown => self.scroll_logs_down(LOG_SCROLL_STEP),
             KeyCode::Home => self.scroll_logs_to_top(),
@@ -264,8 +298,9 @@ impl TuiApp {
             2 => self.start_host_edit(),
             3 => self.start_port_edit(),
             4 => self.save_config()?,
-            5 => self.save_logs()?,
-            6 => return Ok(true),
+            5 => self.show_pairing_qr(),
+            6 => self.save_logs()?,
+            7 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -294,6 +329,7 @@ impl TuiApp {
                 self.notice = format!("Service started on {}.", server.addr());
                 self.last_error = None;
                 self.push_log(self.notice.clone());
+                self.push_pairing_qr_for_server(&server);
                 self.event_rx = Some(server.subscribe_events());
                 self.server = Some(server);
             }
@@ -585,6 +621,7 @@ impl TuiApp {
                 "WS endpoint: ws://{}:{}/v1/ws",
                 runtime_config.host, runtime_config.port
             )),
+            Line::from("Encryption QR: optional x25519 or ml-kem-768 (action g)"),
             Line::from(vec![Span::raw("Auth: "), auth_state]),
             token_line,
             Line::from(format!("Data dir: {}", runtime_config.data_dir.display())),
@@ -646,6 +683,7 @@ impl TuiApp {
             "Edit listen IP",
             "Edit listen port",
             "Save IP and port",
+            "Show pairing QR",
             "Save logs",
             "Quit",
         ];
@@ -695,7 +733,7 @@ impl TuiApp {
             vec![
                 Line::from("Use Up/Down or j/k to choose an action, Enter to run it."),
                 Line::from(
-                    "Shortcuts: s start/stop, r restart, h host, p port, w config, l logs, q quit.",
+                    "Shortcuts: s start/stop, r restart, h host, p port, w config, g QR, l logs, q quit.",
                 ),
                 Line::from("The TUI starts stopped by default and stops its service on exit."),
             ]

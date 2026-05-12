@@ -5,6 +5,7 @@ mod error;
 mod event;
 mod server;
 mod server_runner;
+mod transport_crypto;
 mod tui;
 
 use anyhow::Context;

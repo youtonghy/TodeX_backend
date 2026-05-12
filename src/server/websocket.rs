@@ -18,6 +18,7 @@ use crate::{
         CodexCloudTaskIdRequest, CodexCloudTaskListRequest, CodexCloudTaskSiblingAttemptsRequest,
         CodexGatewayAction, CodexLifecycleRequest, CodexLocalErrorCode, ServerEvent,
     },
+    transport_crypto::TransportCryptoSession,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +50,35 @@ pub fn authenticate_headers(state: &AppState, headers: &HeaderMap) -> Option<Aut
     })
 }
 
-pub async fn handle_socket(state: AppState, socket: WebSocket, auth: Option<AuthContext>) {
+pub fn transport_crypto_from_handshake(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Result<Option<TransportCryptoSession>, AppError> {
+    TransportCryptoSession::from_headers_and_query(&state.pairing_keys, headers, query)
+}
+
+pub async fn handle_socket(
+    state: AppState,
+    socket: WebSocket,
+    auth: Option<AuthContext>,
+    crypto: Result<Option<TransportCryptoSession>, AppError>,
+) {
+    let crypto = match crypto {
+        Ok(crypto) => crypto,
+        Err(error) => {
+            let mut socket = socket;
+            let json =
+                serde_json::to_string(&ServerEvent::from(error_event(error, None, None, None)))
+                    .unwrap_or_else(|_| {
+                        r#"{"type":"server.error","payload":{"code":"INVALID_REQUEST"}}"#.to_owned()
+                    });
+            let _ = socket.send(Message::Text(json.into())).await;
+            let _ = socket.close().await;
+            return;
+        }
+    };
+
     let active_connections = state.increment_websocket_connections();
     state
         .events
@@ -62,40 +91,53 @@ pub async fn handle_socket(state: AppState, socket: WebSocket, auth: Option<Auth
                 "active_connections": active_connections,
                 "authenticated": auth.is_some(),
                 "principal_id": auth.as_ref().map(|auth| auth.principal_id.as_str()),
+                "encrypted": crypto.is_some(),
+                "encryption_protocol": crypto.as_ref().map(|crypto| crypto.protocol().as_str()),
             }),
         ))
         .await;
 
     let (mut sender, mut receiver) = socket.split();
     let mut event_rx = state.events.subscribe();
+    let send_crypto = crypto.clone();
 
     let send_task = tokio::spawn(async move {
         loop {
             let event = match event_rx.recv().await {
                 Ok(event) => event,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    if send_error_message(&mut sender, AppError::StreamLagged(skipped))
-                        .await
-                        .is_err()
+                    if send_serialized_event(
+                        &mut sender,
+                        &send_crypto,
+                        ServerEvent::from(error_event(
+                            AppError::StreamLagged(skipped),
+                            None,
+                            None,
+                            None,
+                        )),
+                    )
+                    .await
+                    .is_err()
                     {
                         break;
                     }
                     continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    let _ = send_error_message(&mut sender, AppError::StreamClosed).await;
+                    let _ = send_serialized_event(
+                        &mut sender,
+                        &send_crypto,
+                        ServerEvent::from(error_event(AppError::StreamClosed, None, None, None)),
+                    )
+                    .await;
                     break;
                 }
             };
 
-            let json = match serde_json::to_string(&ServerEvent::from(event)) {
-                Ok(json) => json,
-                Err(err) => {
-                    warn!(error = %err, "failed to serialize server event");
-                    continue;
-                }
-            };
-            if sender.send(Message::Text(json.into())).await.is_err() {
+            if send_serialized_event(&mut sender, &send_crypto, ServerEvent::from(event))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -111,29 +153,44 @@ pub async fn handle_socket(state: AppState, socket: WebSocket, auth: Option<Auth
         };
 
         match frame {
-            Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(message) => {
-                    if let Err(error) = dispatch(message, &state, auth.as_ref()).await {
+            Message::Text(text) => {
+                let text = match &crypto {
+                    Some(crypto) => match crypto.decrypt_client_text(&text) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            state
+                                .events
+                                .publish(error_event(error, None, None, None))
+                                .await;
+                            continue;
+                        }
+                    },
+                    None => text.to_string(),
+                };
+                match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(message) => {
+                        if let Err(error) = dispatch(message, &state, auth.as_ref()).await {
+                            state
+                                .events
+                                .publish(error_event(error, None, None, None))
+                                .await;
+                        }
+                    }
+                    Err(err) => {
                         state
                             .events
-                            .publish(error_event(error, None, None, None))
+                            .publish(error_event(
+                                AppError::InvalidRequest(format!(
+                                    "failed to parse client message: {err}"
+                                )),
+                                None,
+                                None,
+                                None,
+                            ))
                             .await;
                     }
                 }
-                Err(err) => {
-                    state
-                        .events
-                        .publish(error_event(
-                            AppError::InvalidRequest(format!(
-                                "failed to parse client message: {err}"
-                            )),
-                            None,
-                            None,
-                            None,
-                        ))
-                        .await;
-                }
-            },
+            }
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Close(_) => break,
             Message::Binary(_) => debug!("ignored binary websocket frame"),
@@ -154,6 +211,8 @@ pub async fn handle_socket(state: AppState, socket: WebSocket, auth: Option<Auth
                 "active_connections": active_connections,
                 "authenticated": auth.is_some(),
                 "principal_id": auth.as_ref().map(|auth| auth.principal_id.as_str()),
+                "encrypted": crypto.is_some(),
+                "encryption_protocol": crypto.as_ref().map(|crypto| crypto.protocol().as_str()),
             }),
         ))
         .await;
@@ -813,12 +872,28 @@ async fn dispatch(
     Ok(())
 }
 
-async fn send_error_message(
+async fn send_serialized_event(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    error: AppError,
+    crypto: &Option<TransportCryptoSession>,
+    event: ServerEvent,
 ) -> Result<(), axum::Error> {
-    let json = serde_json::to_string(&ServerEvent::from(error_event(error, None, None, None)))
-        .expect("serializing websocket error event cannot fail");
+    let json = match serde_json::to_string(&event) {
+        Ok(json) => json,
+        Err(err) => {
+            warn!(error = %err, "failed to serialize server event");
+            return Ok(());
+        }
+    };
+    let json = match crypto {
+        Some(crypto) => match crypto.encrypt_server_text(&json) {
+            Ok(json) => json,
+            Err(err) => {
+                warn!(error = %err, "failed to encrypt server event");
+                return Ok(());
+            }
+        },
+        None => json,
+    };
     sender.send(Message::Text(json.into())).await
 }
 
