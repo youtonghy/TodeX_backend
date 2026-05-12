@@ -948,6 +948,7 @@ impl CodexLocalFixture {
         })?;
         self.push_server_request(CodexServerRequest {
             id: "approval-fixture-1".to_owned(),
+            wire_id: None,
             request_type: "codex.approval.commandExecution.request".to_owned(),
             payload: json!({
                 "requestId": "approval-fixture-1",
@@ -991,6 +992,7 @@ impl CodexLocalFixture {
         })?;
         self.push_outbound(CodexOutboundMessage::ServerResponse(CodexServerResponse {
             id: "approval-fixture-1".to_owned(),
+            wire_id: None,
             response_type: "codex.approval.commandExecution.respond".to_owned(),
             payload: json!({ "decision": "accept" }),
         }));
@@ -1890,6 +1892,7 @@ impl LocalCodexAdapter {
         };
         let message = CodexOutboundMessage::ServerResponse(CodexServerResponse {
             id: upstream_request_id.to_string(),
+            wire_id: request.wire_id.clone(),
             response_type: response_type.to_string(),
             payload: response.clone(),
         });
@@ -1904,6 +1907,7 @@ impl LocalCodexAdapter {
             "codex.mcp.elicitation.request" => {
                 CodexGatewayEvent::elicitation_resolved(&CodexServerResponse {
                     id: upstream_request_id.to_string(),
+                    wire_id: request.wire_id.clone(),
                     response_type: response_type.to_string(),
                     payload: response.clone(),
                 })
@@ -1919,6 +1923,7 @@ impl LocalCodexAdapter {
             }
             _ => CodexGatewayEvent::approval_resolved(&CodexServerResponse {
                 id: upstream_request_id.to_string(),
+                wire_id: request.wire_id.clone(),
                 response_type: response_type.to_string(),
                 payload: response.clone(),
             })
@@ -2514,6 +2519,7 @@ fn parse_local_reader_message(
             return Ok(Some(CodexLocalAdapterReaderMessage::ServerRequest(
                 CodexServerRequest {
                     id,
+                    wire_id: value.get("id").cloned(),
                     request_type: app_server_server_request_method_to_codex(method),
                     payload,
                 },
@@ -2591,9 +2597,6 @@ async fn apply_reader_event_runtime(
             if runtime.complete_mutating_command().is_ok() {
                 idle_state.lock().await.record_turn_finished();
             }
-        }
-        "codex.item.completed" => {
-            let _ = runtime.complete_mutating_command();
         }
         "codex.turn.interrupted" => {
             if runtime.complete_mutating_command().is_ok() {
@@ -2696,7 +2699,7 @@ fn outbound_message_to_jsonrpc(message: CodexOutboundMessage) -> Value {
             })
         }
         CodexOutboundMessage::ServerResponse(response) => json!({
-            "id": response.id,
+            "id": response.wire_id.unwrap_or(Value::String(response.id)),
             "result": response.payload,
         }),
     }
@@ -3975,6 +3978,8 @@ fn payload_string(payload: &Value, keys: &[&str]) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CodexServerRequest {
     pub id: GatewayRequestId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_id: Option<Value>,
     #[serde(rename = "type")]
     pub request_type: String,
     pub payload: Value,
@@ -3983,6 +3988,8 @@ pub struct CodexServerRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CodexServerResponse {
     pub id: GatewayRequestId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_id: Option<Value>,
     #[serde(rename = "type")]
     pub response_type: String,
     pub payload: Value,
@@ -4082,8 +4089,13 @@ impl CodexGatewayAdapter {
                 .or(CodexGatewayEvent::elicitation_resolved(&response)?)
         };
 
+        let mut outbound_response = response;
+        if outbound_response.wire_id.is_none() {
+            outbound_response.wire_id = request.wire_id.clone();
+        }
+
         self.transport
-            .send(CodexOutboundMessage::ServerResponse(response))
+            .send(CodexOutboundMessage::ServerResponse(outbound_response))
             .await?;
         self.pending_server_requests.remove(&request.id);
 
@@ -5585,6 +5597,7 @@ mod tests {
 
         let approve_request = CodexServerRequest {
             id: "approval-accept-1".to_string(),
+            wire_id: None,
             request_type: "codex.approval.commandExecution.request".to_string(),
             payload: json!({
                 "threadId": "thread-1",
@@ -5617,6 +5630,7 @@ mod tests {
 
         let accept_response = CodexServerResponse {
             id: "approval-accept-1".to_string(),
+            wire_id: None,
             response_type: "codex.approval.commandExecution.respond".to_string(),
             payload: json!({ "decision": "accept" }),
         };
@@ -5635,6 +5649,7 @@ mod tests {
 
         let deny_request = CodexServerRequest {
             id: "approval-deny-1".to_string(),
+            wire_id: None,
             request_type: "codex.approval.commandExecution.request".to_string(),
             payload: json!({
                 "threadId": "thread-1",
@@ -5656,6 +5671,7 @@ mod tests {
 
         let deny_response = CodexServerResponse {
             id: "approval-deny-1".to_string(),
+            wire_id: None,
             response_type: "codex.approval.commandExecution.respond".to_string(),
             payload: json!({ "decision": "decline" }),
         };
@@ -5774,6 +5790,7 @@ mod tests {
             CodexGatewayAdapter::new(transport.clone());
         let request = CodexServerRequest {
             id: "elicitation-1".to_string(),
+            wire_id: None,
             request_type: "codex.mcp.elicitation.request".to_string(),
             payload: json!({
                 "threadId": "thread-1",
@@ -5800,6 +5817,7 @@ mod tests {
 
         let response = CodexServerResponse {
             id: "elicitation-1".to_string(),
+            wire_id: None,
             response_type: "codex.mcp.elicitation.respond".to_string(),
             payload: json!({ "action": "accept", "content": { "allow": true }, "_meta": null }),
         };
@@ -5867,6 +5885,7 @@ mod tests {
         let (adapter, _events, mut server_requests) = CodexGatewayAdapter::new(transport.clone());
         let server_request = CodexServerRequest {
             id: "server-request-1".to_string(),
+            wire_id: None,
             request_type: "codex.approval.commandExecution.request".to_string(),
             payload: json!({ "command": "cargo test" }),
         };
@@ -5881,6 +5900,7 @@ mod tests {
 
         let response = CodexServerResponse {
             id: "server-request-1".to_string(),
+            wire_id: None,
             response_type: "codex.approval.commandExecution.respond".to_string(),
             payload: json!({ "decision": "approved" }),
         };
@@ -5897,12 +5917,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_server_numeric_server_request_id_is_preserved_on_response_wire() {
+        let transport = Arc::new(RecordingTransport::default());
+        let (adapter, _events, mut server_requests) = CodexGatewayAdapter::new(transport.clone());
+        let inbound = json!({
+            "id": 0,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "call-1",
+                "command": "git push"
+            }
+        });
+        let parsed = parse_local_reader_message(inbound)
+            .expect("numeric server request should parse")
+            .expect("numeric server request should route");
+        let CodexLocalAdapterReaderMessage::ServerRequest(server_request) = parsed else {
+            panic!("expected server request");
+        };
+
+        assert_eq!(server_request.id, "0");
+        assert_eq!(server_request.wire_id, Some(json!(0)));
+
+        adapter
+            .handle_inbound(CodexInboundMessage::ServerRequest(server_request.clone()))
+            .unwrap();
+        assert_eq!(server_requests.recv().await.unwrap(), server_request);
+
+        adapter
+            .respond_to_server_request(CodexServerResponse {
+                id: "0".to_string(),
+                wire_id: None,
+                response_type: "codex.approval.commandExecution.respond".to_string(),
+                payload: json!({ "decision": "accept" }),
+            })
+            .await
+            .unwrap();
+
+        let sent = transport.sent().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            outbound_message_to_jsonrpc(sent.into_iter().next().unwrap()),
+            json!({ "id": 0, "result": { "decision": "accept" } })
+        );
+    }
+
+    #[tokio::test]
     async fn permission_response_payload_resolves_without_legacy_decision_field() {
         let transport = Arc::new(RecordingTransport::default());
         let (adapter, mut events, mut server_requests) =
             CodexGatewayAdapter::new(transport.clone());
         let server_request = CodexServerRequest {
             id: "permission-request-1".to_string(),
+            wire_id: None,
             request_type: "codex.approval.permissions.request".to_string(),
             payload: json!({
                 "permissions": {
@@ -5920,6 +5988,7 @@ mod tests {
 
         let response = CodexServerResponse {
             id: "permission-request-1".to_string(),
+            wire_id: None,
             response_type: "codex.approval.permissions.respond".to_string(),
             payload: json!({
                 "permissions": {
@@ -5953,6 +6022,7 @@ mod tests {
         let (adapter, _events, mut server_requests) = CodexGatewayAdapter::new(transport);
         let server_request = CodexServerRequest {
             id: "server-request-1".to_string(),
+            wire_id: None,
             request_type: "codex.approval.commandExecution.request".to_string(),
             payload: json!({ "command": "cargo test" }),
         };
@@ -5964,6 +6034,7 @@ mod tests {
 
         let response = CodexServerResponse {
             id: "server-request-1".to_string(),
+            wire_id: None,
             response_type: "codex.approval.commandExecution.respond".to_string(),
             payload: json!({ "decision": "approved" }),
         };
@@ -5999,6 +6070,7 @@ mod tests {
         let (adapter, _events, _server_requests) = CodexGatewayAdapter::new(transport.clone());
         let response = CodexServerResponse {
             id: "missing".to_string(),
+            wire_id: None,
             response_type: "codex.approval.commandExecution.respond".to_string(),
             payload: json!({ "decision": "approved" }),
         };

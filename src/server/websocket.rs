@@ -2611,6 +2611,7 @@ mod tests {
 
         let approval_accept_request = CodexServerRequest {
             id: "approval-accept-full-1".to_string(),
+            wire_id: None,
             request_type: "codex.approval.commandExecution.request".to_string(),
             payload: json!({
                 "threadId": thread_id,
@@ -2646,6 +2647,7 @@ mod tests {
 
         let approval_accept_response = CodexServerResponse {
             id: "approval-accept-full-1".to_string(),
+            wire_id: None,
             response_type: "codex.approval.commandExecution.respond".to_string(),
             payload: json!({ "decision": "accept" }),
         };
@@ -2670,6 +2672,7 @@ mod tests {
 
         let approval_deny_request = CodexServerRequest {
             id: "approval-deny-full-1".to_string(),
+            wire_id: None,
             request_type: "codex.approval.fileChange.request".to_string(),
             payload: json!({
                 "threadId": thread_id,
@@ -2705,6 +2708,7 @@ mod tests {
 
         let approval_deny_response = CodexServerResponse {
             id: "approval-deny-full-1".to_string(),
+            wire_id: None,
             response_type: "codex.approval.fileChange.respond".to_string(),
             payload: json!({ "decision": "deny" }),
         };
