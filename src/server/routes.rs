@@ -1,4 +1,6 @@
 use std::cmp::Ordering;
+use std::collections::VecDeque;
+use std::fs::FileType;
 use std::path::{Component, Path, PathBuf};
 
 use axum::extract::{Query, State, WebSocketUpgrade};
@@ -46,11 +48,92 @@ async fn workspace_entries(
         return Err(AppError::WorkspacePathNotFound);
     }
 
-    let relative_query = normalize_relative_query(query.query.as_deref().unwrap_or(""))?;
-    let (directory_query, filter) = split_query(&relative_query);
-    let directory = cwd.join(&directory_query);
+    let raw_query = query.query.as_deref().unwrap_or("");
+    let relative_query = normalize_relative_query(raw_query)?;
+    let entries = list_workspace_entries(
+        &cwd,
+        &relative_query,
+        raw_query.trim().ends_with('/'),
+        query.limit.unwrap_or(40).clamp(1, 100),
+    )
+    .await?;
+
+    Ok(Json(WorkspaceEntriesResponse { entries }))
+}
+
+async fn list_workspace_entries(
+    cwd: &Path,
+    relative_query: &Path,
+    trailing_slash_query: bool,
+    limit: usize,
+) -> Result<Vec<WorkspaceEntry>, AppError> {
+    let query_text = slash_path(relative_query);
+    if query_text.is_empty() {
+        return list_direct_workspace_entries(cwd, Path::new(""), "", limit).await;
+    }
+
+    let include_hidden = query_includes_hidden_path(&query_text);
+    if trailing_slash_query {
+        let directory = cwd.join(relative_query);
+        if !directory.exists() || !directory.is_dir() {
+            return Ok(vec![]);
+        }
+        return list_direct_workspace_entries(cwd, relative_query, "", limit).await;
+    }
+
+    let mut entries = Vec::new();
+    let mut queue = VecDeque::from([PathBuf::new()]);
+    let query = query_text.to_ascii_lowercase();
+    while let Some(directory_query) = queue.pop_front() {
+        let directory = cwd.join(&directory_query);
+        let mut read_dir = match tokio::fs::read_dir(&directory).await {
+            Ok(read_dir) => read_dir,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error.into()),
+        };
+
+        while let Some(entry) = read_dir.next_entry().await? {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.is_empty() || (!include_hidden && file_name.starts_with('.')) {
+                continue;
+            }
+
+            let file_type = entry.file_type().await?;
+            if !file_type.is_dir() && !file_type.is_file() {
+                continue;
+            }
+
+            let relative_path = directory_query.join(&file_name);
+            let relative_path_text = slash_path(&relative_path);
+            if relative_path_text
+                .to_ascii_lowercase()
+                .contains(query.as_str())
+            {
+                entries.push(workspace_entry(file_name.clone(), &relative_path, &file_type));
+            }
+
+            if file_type.is_dir()
+                && should_descend_workspace_directory(&file_name, include_hidden, query.as_str())
+            {
+                queue.push_back(relative_path);
+            }
+        }
+    }
+
+    sort_workspace_entries(&mut entries);
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+async fn list_direct_workspace_entries(
+    cwd: &Path,
+    directory_query: &Path,
+    filter: &str,
+    limit: usize,
+) -> Result<Vec<WorkspaceEntry>, AppError> {
+    let directory = cwd.join(directory_query);
     if !directory.exists() || !directory.is_dir() {
-        return Ok(Json(WorkspaceEntriesResponse { entries: vec![] }));
+        return Ok(vec![]);
     }
 
     let mut entries = Vec::new();
@@ -72,31 +155,63 @@ async fn workspace_entries(
         }
 
         let relative_path = directory_query.join(&file_name);
-        let mut path = slash_path(&relative_path);
-        let kind = if file_type.is_dir() {
-            path.push('/');
-            WorkspaceEntryKind::Directory
-        } else {
-            WorkspaceEntryKind::File
-        };
-        entries.push(WorkspaceEntry {
-            name: file_name,
-            path,
-            kind,
-        });
+        entries.push(workspace_entry(file_name, &relative_path, &file_type));
     }
 
+    sort_workspace_entries(&mut entries);
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+fn workspace_entry(
+    name: String,
+    relative_path: &Path,
+    file_type: &FileType,
+) -> WorkspaceEntry {
+    let mut path = slash_path(relative_path);
+    let kind = if file_type.is_dir() {
+        path.push('/');
+        WorkspaceEntryKind::Directory
+    } else {
+        WorkspaceEntryKind::File
+    };
+    WorkspaceEntry { name, path, kind }
+}
+
+fn sort_workspace_entries(entries: &mut [WorkspaceEntry]) {
     entries.sort_by(|left, right| match (&left.kind, &right.kind) {
         (WorkspaceEntryKind::Directory, WorkspaceEntryKind::File) => Ordering::Less,
         (WorkspaceEntryKind::File, WorkspaceEntryKind::Directory) => Ordering::Greater,
         _ => left
-            .name
+            .path
             .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase()),
+            .cmp(&right.path.to_ascii_lowercase()),
     });
-    entries.truncate(query.limit.unwrap_or(40).clamp(1, 100));
+}
 
-    Ok(Json(WorkspaceEntriesResponse { entries }))
+fn query_includes_hidden_path(query: &str) -> bool {
+    query
+        .split('/')
+        .any(|part| part.starts_with('.') && part.len() > 1)
+}
+
+fn should_descend_workspace_directory(name: &str, include_hidden: bool, query: &str) -> bool {
+    if name.starts_with('.') && !include_hidden {
+        return false;
+    }
+
+    const LARGE_DIRECTORY_NAMES: &[&str] = &[
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        ".git",
+        ".expo",
+        ".next",
+    ];
+    !LARGE_DIRECTORY_NAMES
+        .iter()
+        .any(|large_name| name == *large_name && !query.contains(large_name))
 }
 
 fn authorize_http(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
@@ -130,22 +245,6 @@ fn normalize_relative_query(raw: &str) -> Result<PathBuf, AppError> {
         }
     }
     Ok(normalized)
-}
-
-fn split_query(query: &Path) -> (PathBuf, String) {
-    let raw = slash_path(query);
-    if raw.ends_with('/') {
-        return (query.to_path_buf(), String::new());
-    }
-    let directory = query
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .to_path_buf();
-    let filter = query
-        .file_name()
-        .map(|value| value.to_string_lossy().to_string())
-        .unwrap_or_default();
-    (directory, filter)
 }
 
 fn slash_path(path: &Path) -> String {
@@ -202,4 +301,65 @@ struct WorkspaceEntry {
     name: String,
     path: String,
     kind: WorkspaceEntryKind,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn recursive_workspace_entries_match_nested_paths() {
+        let root = make_temp_workspace("recursive-match");
+        fs::create_dir_all(root.join("src/server")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("src/server/routes.rs"), "").unwrap();
+        fs::write(root.join("docs/routes.md"), "").unwrap();
+        fs::write(root.join("README.md"), "").unwrap();
+
+        let entries = list_workspace_entries(&root, Path::new("routes"), false, 20)
+            .await
+            .unwrap();
+        let paths = entry_paths(&entries);
+
+        assert_eq!(paths, vec!["docs/routes.md", "src/server/routes.rs"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn recursive_workspace_entries_hide_hidden_paths_until_requested() {
+        let root = make_temp_workspace("hidden-match");
+        fs::create_dir_all(root.join(".config")).unwrap();
+        fs::write(root.join(".config/settings.json"), "").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/settings.json"), "").unwrap();
+
+        let visible = list_workspace_entries(&root, Path::new("settings"), false, 20)
+            .await
+            .unwrap();
+        assert_eq!(entry_paths(&visible), vec!["src/settings.json"]);
+
+        let hidden = list_workspace_entries(&root, Path::new(".config"), false, 20)
+            .await
+            .unwrap();
+        assert_eq!(entry_paths(&hidden), vec![".config/", ".config/settings.json"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn entry_paths(entries: &[WorkspaceEntry]) -> Vec<String> {
+        entries.iter().map(|entry| entry.path.clone()).collect()
+    }
+
+    fn make_temp_workspace(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("todex-{name}-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
 }
