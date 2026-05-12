@@ -6,19 +6,19 @@
 
 ## 功能 / Features
 
-- HTTP 接口：`/health`、`/v1/version`、`/v1/workspace/entries`
-- WebSocket 接口：`/v1/ws`
+- HTTP 接口：`/health`、`/v1/version`、`/v1/pairing`、`/v1/workspace/entries`
+- WebSocket 接口：`/v1/ws`，可选 X25519 或 ML-KEM-768 传输加密
 - 本地 Codex 会话管理：`start`、`status`、`stop`、`turn`、`attach`、`replay`、`interrupt`
 - 工作区文件检索：为前端 `@` 引用提供目录和文件建议
 - 认证与配置：支持 Bearer token、环境变量、`config.toml`
-- 交互式 TUI：可启动、停止服务，并保存监听地址
+- 交互式 TUI：可启动、停止服务，保存监听地址，并显示 App 配对二维码
 
-- HTTP endpoints: `/health`, `/v1/version`, `/v1/workspace/entries`
-- WebSocket endpoint: `/v1/ws`
+- HTTP endpoints: `/health`, `/v1/version`, `/v1/pairing`, `/v1/workspace/entries`
+- WebSocket endpoint: `/v1/ws`, with optional X25519 or ML-KEM-768 transport encryption
 - Local Codex session control: `start`, `status`, `stop`, `turn`, `attach`, `replay`, `interrupt`
 - Workspace file lookup for the frontend `@` picker
 - Auth and config via Bearer token, environment variables, and `config.toml`
-- Interactive TUI for starting/stopping the service and saving host/port
+- Interactive TUI for starting/stopping the service, saving host/port, and showing the app pairing QR
 
 ## 快速开始 / Quick Start
 
@@ -76,13 +76,13 @@ Priority order:
 
 1. 先启动后端服务。
 2. 让前端客户端连接到 `http://127.0.0.1:7345` 或你自己的地址。
-3. 在设置里填写 `Auth token` 和 `Tenant id`。
+3. 在设置里填写 `Auth token` 和 `Tenant id`，或从 TUI 扫描配对二维码一键导入地址、token 和加密公钥。
 4. 通过 `/v1/workspace/entries` 为 `@` 引用提供文件建议。
 5. 通过 WebSocket `/v1/ws` 收发协议事件。
 
 1. Start the backend service first.
 2. Point the frontend client to `http://127.0.0.1:7345` or your own host.
-3. Fill in `Auth token` and `Tenant id` in the client settings.
+3. Fill in `Auth token` and `Tenant id` in the client settings, or scan the TUI pairing QR to import the address, token, and encryption public key.
 4. Use `/v1/workspace/entries` to power `@` file suggestions.
 5. Exchange protocol events over WebSocket `/v1/ws`.
 
@@ -110,4 +110,3 @@ TODEX_REAL_E2E=1 cargo test --test e2e_real_codex -- --ignored --test-threads=1
 
 - `docs/API.md`
 - `docs/BUILD_RUN.md`
-

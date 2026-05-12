@@ -8,6 +8,7 @@
 - 默认监听地址：`127.0.0.1:7345`
 - 默认 HTTP Base URL：`http://127.0.0.1:7345`
 - 默认 WebSocket URL：`ws://127.0.0.1:7345/v1/ws`
+- 可选传输加密：`x25519` 或 `ml-kem-768`，由 TUI 配对二维码和 `/v1/pairing` 暴露的服务端公钥协商
 - 数据格式：JSON
 - 字符编码：UTF-8
 
@@ -68,15 +69,42 @@ GET /v1/version
 | `data_dir` | string | 当前数据目录 |
 | `workspace_root` | string | 当前 workspace 根目录 |
 
+### App 配对信息
+
+```http
+GET /v1/pairing
+Authorization: Bearer <TODEX_AGENTD_AUTH_TOKEN>
+```
+
+返回后端地址、Bearer token 和可用传输加密公钥。TUI 中的配对二维码为了保持可扫描性，只编码短配对链接；App 扫描后会自动调用此接口拉取完整公钥。
+
+响应字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `kind` | string | 固定为 `todex-pairing` |
+| `version` | number | 配对负载版本，当前为 `1` |
+| `serverUrl` | string | App 使用的 HTTP Base URL |
+| `wsUrl` | string | App 使用的 WebSocket URL |
+| `authToken` | string/null | 当前 Bearer token |
+| `protocols[].id` | string | `x25519` 或 `ml-kem-768` |
+| `protocols[].publicKey` | string | base64url 编码的服务端公钥 |
+
 ## WebSocket 协议
 
-客户端发送文本帧，内容必须是 JSON。二进制帧会被忽略。
+客户端发送文本帧，内容必须是 JSON。二进制帧会被忽略。默认仍支持明文 JSON；如果 WebSocket URL 带上加密握手参数，业务 JSON 会被包装在 `todex.crypto.v1` 加密帧中。
 
 连接示例：
 
 ```bash
 websocat -H "Authorization: Bearer ${TODEX_AGENTD_AUTH_TOKEN}" ws://127.0.0.1:7345/v1/ws
 ```
+
+可选加密握手：
+
+- X25519：客户端从配对信息读取服务端 X25519 公钥，连接 `ws://.../v1/ws?enc=x25519&client_key=<base64url-client-public-key>`。
+- ML-KEM-768：客户端从配对信息读取服务端 ML-KEM-768 公钥，连接 `ws://.../v1/ws?enc=ml-kem-768&ciphertext=<base64url-kem-ciphertext>`。
+- 双方用 HKDF-SHA256 派生 32 字节会话密钥，并用 XChaCha20-Poly1305 加密每个业务文本帧。
 
 消息 envelope：
 
