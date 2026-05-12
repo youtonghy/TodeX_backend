@@ -3136,6 +3136,7 @@ mod tests {
         AppState::new(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
+            pairing_encryption: crate::config::PairingEncryption::default(),
             data_dir: unique_tmp_dir("todex-codex-auth-test-data"),
             workspace_root: unique_tmp_dir("todex-codex-auth-test-workspaces"),
             agent: AgentConfig {

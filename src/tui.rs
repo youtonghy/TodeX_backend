@@ -14,7 +14,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
@@ -22,11 +22,11 @@ use ratatui::{Frame, Terminal};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::config::{Config, ServeArgs};
+use crate::config::{Config, PairingEncryption, ServeArgs};
 use crate::event::EventRecord;
 use crate::server_runner::ManagedServer;
 
-const ACTION_COUNT: usize = 8;
+const ACTION_COUNT: usize = 9;
 const MAX_LOG_LINES: usize = 256;
 const MAX_LOG_EVENTS: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
@@ -103,6 +103,7 @@ struct TuiApp {
     live_events: VecDeque<EventRecord>,
     log_scroll: usize,
     log_follow_tail: bool,
+    pairing_qr: Option<String>,
     event_rx: Option<broadcast::Receiver<EventRecord>>,
 }
 
@@ -119,6 +120,7 @@ impl TuiApp {
             live_events: VecDeque::new(),
             log_scroll: 0,
             log_follow_tail: true,
+            pairing_qr: None,
             event_rx: None,
         }
     }
@@ -201,29 +203,16 @@ impl TuiApp {
 
     fn show_pairing_qr(&mut self) {
         let qr = match self.server.as_ref() {
-            Some(server) => server.pairing_qr_text(),
+            Some(server) => server.pairing_qr_text(self.config.pairing_encryption),
             None => {
                 self.notice = "Start the service before showing a pairing QR.".to_owned();
                 return;
             }
         };
-        self.push_pairing_qr_result(qr);
-    }
-
-    fn push_pairing_qr_for_server(&mut self, server: &ManagedServer) {
-        self.push_pairing_qr_result(server.pairing_qr_text());
-    }
-
-    fn push_pairing_qr_result(&mut self, qr: Result<String>) {
         match qr {
             Ok(qr) => {
-                self.notice = "Pairing QR is visible in live logs.".to_owned();
-                self.push_log(
-                    "Encrypted pairing QR follows. Scan it from the app settings page.".to_owned(),
-                );
-                for line in qr.lines() {
-                    self.push_log(line.to_owned());
-                }
+                self.pairing_qr = Some(qr);
+                self.notice = "Pairing QR is open in the center window.".to_owned();
             }
             Err(error) => {
                 self.notice = "Failed to render pairing QR.".to_owned();
@@ -232,7 +221,19 @@ impl TuiApp {
         }
     }
 
+    fn close_pairing_qr(&mut self) {
+        if self.pairing_qr.is_some() {
+            self.pairing_qr = None;
+            self.notice = "Pairing QR closed.".to_owned();
+        }
+    }
+
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.pairing_qr.is_some() {
+            self.close_pairing_qr();
+            return Ok(false);
+        }
+
         if self.input.is_some() {
             self.handle_input_key(key).await?;
             return Ok(false);
@@ -255,6 +256,7 @@ impl TuiApp {
             KeyCode::Char('r') => self.restart_server().await?,
             KeyCode::Char('h') => self.start_host_edit(),
             KeyCode::Char('p') => self.start_port_edit(),
+            KeyCode::Char('e') => self.cycle_pairing_encryption(),
             KeyCode::Char('w') => self.save_config()?,
             KeyCode::Char('l') => self.save_logs()?,
             KeyCode::Char('g') => self.show_pairing_qr(),
@@ -297,10 +299,11 @@ impl TuiApp {
             1 => self.restart_server().await?,
             2 => self.start_host_edit(),
             3 => self.start_port_edit(),
-            4 => self.save_config()?,
-            5 => self.show_pairing_qr(),
-            6 => self.save_logs()?,
-            7 => return Ok(true),
+            4 => self.cycle_pairing_encryption(),
+            5 => self.save_config()?,
+            6 => self.show_pairing_qr(),
+            7 => self.save_logs()?,
+            8 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -329,7 +332,6 @@ impl TuiApp {
                 self.notice = format!("Service started on {}.", server.addr());
                 self.last_error = None;
                 self.push_log(self.notice.clone());
-                self.push_pairing_qr_for_server(&server);
                 self.event_rx = Some(server.subscribe_events());
                 self.server = Some(server);
             }
@@ -449,17 +451,27 @@ impl TuiApp {
     }
 
     fn save_config(&mut self) -> Result<()> {
-        Config::save_host_port(
+        Config::save_tui_settings(
             self.config.data_dir.clone(),
             &self.config.host,
             self.config.port,
+            self.config.pairing_encryption,
         )?;
         self.notice = format!(
-            "Saved host and port to {}/config.toml.",
+            "Saved host, port, and pairing encryption to {}/config.toml.",
             self.config.data_dir.display()
         );
         self.last_error = None;
         Ok(())
+    }
+
+    fn cycle_pairing_encryption(&mut self) {
+        self.config.pairing_encryption = self.config.pairing_encryption.next();
+        self.notice = format!(
+            "Pairing encryption updated to {}. Save config to persist it.",
+            pairing_encryption_label(self.config.pairing_encryption)
+        );
+        self.last_error = None;
     }
 
     fn save_logs(&mut self) -> Result<()> {
@@ -550,6 +562,11 @@ impl TuiApp {
         frame.render_widget(self.action_panel(), main_chunks[1]);
         frame.render_widget(self.help_panel(), chunks[2]);
         frame.render_widget(self.message_panel(), chunks[3]);
+        if self.pairing_qr.is_some() {
+            let area = self.pairing_qr_area(frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(self.pairing_qr_popup(), area);
+        }
     }
 
     fn status_panel(&self) -> Paragraph<'_> {
@@ -621,7 +638,11 @@ impl TuiApp {
                 "WS endpoint: ws://{}:{}/v1/ws",
                 runtime_config.host, runtime_config.port
             )),
-            Line::from("Encryption QR: optional x25519 or ml-kem-768 (action g)"),
+            Line::from(format!(
+                "Pairing encryption: {} (action e)",
+                pairing_encryption_label(runtime_config.pairing_encryption)
+            )),
+            Line::from("Pairing QR: one-click link + auth token; app fetches protocol key"),
             Line::from(vec![Span::raw("Auth: "), auth_state]),
             token_line,
             Line::from(format!("Data dir: {}", runtime_config.data_dir.display())),
@@ -682,7 +703,8 @@ impl TuiApp {
             "Restart service",
             "Edit listen IP",
             "Edit listen port",
-            "Save IP and port",
+            "Edit pairing encryption",
+            "Save settings",
             "Show pairing QR",
             "Save logs",
             "Quit",
@@ -733,7 +755,7 @@ impl TuiApp {
             vec![
                 Line::from("Use Up/Down or j/k to choose an action, Enter to run it."),
                 Line::from(
-                    "Shortcuts: s start/stop, r restart, h host, p port, w config, g QR, l logs, q quit.",
+                    "Shortcuts: s start/stop, r restart, h host, p port, e encryption, w config, g QR, l logs, q quit.",
                 ),
                 Line::from("The TUI starts stopped by default and stops its service on exit."),
             ]
@@ -756,6 +778,58 @@ impl TuiApp {
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
             .block(Block::default().title("Messages").borders(Borders::ALL))
+    }
+
+    fn pairing_qr_area(&self, area: Rect) -> Rect {
+        let qr_width = self
+            .pairing_qr
+            .as_ref()
+            .map(|qr| {
+                qr.lines()
+                    .map(|line| line.chars().count())
+                    .max()
+                    .unwrap_or(0) as u16
+            })
+            .unwrap_or(60);
+        let width = (qr_width + 6)
+            .min(area.width.saturating_sub(2).max(1))
+            .max(1);
+        let height = self
+            .pairing_qr
+            .as_ref()
+            .map(|qr| qr.lines().count() as u16 + 6)
+            .unwrap_or(20)
+            .min(area.height.saturating_sub(2).max(1))
+            .max(1);
+        Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        }
+    }
+
+    fn pairing_qr_popup(&self) -> Paragraph<'_> {
+        let qr = self
+            .pairing_qr
+            .as_deref()
+            .unwrap_or("Failed to render pairing QR.");
+        let mut lines = vec![
+            Line::from("Pairing QR"),
+            Line::from("Press any key to close."),
+            Line::from(""),
+        ];
+        lines.extend(qr.lines().map(Line::from));
+
+        Paragraph::new(lines)
+            .style(Style::default().fg(Color::Black).bg(Color::White))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Pairing")
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(Color::Black).bg(Color::White)),
+            )
     }
 }
 
@@ -896,6 +970,14 @@ fn format_duration(duration: Duration) -> String {
         format!("{minutes}m {seconds}s")
     } else {
         format!("{seconds}s")
+    }
+}
+
+fn pairing_encryption_label(value: PairingEncryption) -> &'static str {
+    match value {
+        PairingEncryption::None => "无",
+        PairingEncryption::MlKem768 => "后量子",
+        PairingEncryption::X25519 => "X25519",
     }
 }
 

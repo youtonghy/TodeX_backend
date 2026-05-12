@@ -325,7 +325,7 @@ struct WorkspaceEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentConfig, Config, SecurityConfig};
+    use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -423,6 +423,7 @@ mod tests {
         Config {
             host: "127.0.0.1".to_owned(),
             port: 7345,
+            pairing_encryption: PairingEncryption::default(),
             data_dir: root.join("data"),
             workspace_root: root.join("workspace"),
             agent: AgentConfig {

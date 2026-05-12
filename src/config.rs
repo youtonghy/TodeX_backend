@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Args;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use toml_edit::{value, DocumentMut};
 use uuid::Uuid;
 
@@ -25,10 +25,54 @@ pub struct ServeArgs {
 pub struct Config {
     pub host: String,
     pub port: u16,
+    pub pairing_encryption: PairingEncryption,
     pub data_dir: PathBuf,
     pub workspace_root: PathBuf,
     pub agent: AgentConfig,
     pub security: SecurityConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+pub enum PairingEncryption {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "x25519")]
+    X25519,
+    #[serde(rename = "ml-kem-768")]
+    MlKem768,
+}
+
+impl PairingEncryption {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "disabled" => Some(Self::None),
+            "x25519" | "x-25519" => Some(Self::X25519),
+            "ml-kem-768" | "mlkem768" | "post-quantum" | "pq" => Some(Self::MlKem768),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::X25519 => "x25519",
+            Self::MlKem768 => "ml-kem-768",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::None => Self::MlKem768,
+            Self::MlKem768 => Self::X25519,
+            Self::X25519 => Self::None,
+        }
+    }
+}
+
+impl Default for PairingEncryption {
+    fn default() -> Self {
+        Self::MlKem768
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +92,7 @@ pub struct SecurityConfig {
 struct FileConfig {
     host: Option<String>,
     port: Option<u16>,
+    pairing_encryption: Option<PairingEncryption>,
     data_dir: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     agent: Option<PartialAgentConfig>,
@@ -105,6 +150,14 @@ impl Config {
             file_config.port,
             defaults.port,
         );
+        let pairing_encryption = coalesce(
+            None,
+            env::var("TODEX_AGENTD_PAIRING_ENCRYPTION")
+                .ok()
+                .and_then(|value| PairingEncryption::parse(&value)),
+            file_config.pairing_encryption,
+            defaults.pairing_encryption,
+        );
 
         let agent_file = file_config.agent.unwrap_or_default();
         let security_file = file_config.security.unwrap_or_default();
@@ -124,6 +177,7 @@ impl Config {
         Ok(Config {
             host,
             port,
+            pairing_encryption,
             data_dir,
             workspace_root: expand_home(workspace_root),
             agent: AgentConfig {
@@ -158,11 +212,17 @@ impl Config {
         })
     }
 
-    pub fn save_host_port(data_dir: PathBuf, host: &str, port: u16) -> anyhow::Result<()> {
+    pub fn save_tui_settings(
+        data_dir: PathBuf,
+        host: &str,
+        port: u16,
+        pairing_encryption: PairingEncryption,
+    ) -> anyhow::Result<()> {
         let data_dir = expand_home(data_dir);
         let mut document = load_config_document(&data_dir)?;
         document["host"] = value(host);
         document["port"] = value(i64::from(port));
+        document["pairing_encryption"] = value(pairing_encryption.as_str());
         write_config_document(&data_dir, &document)?;
         Ok(())
     }
@@ -190,6 +250,7 @@ impl Default for Config {
         Config {
             host: "127.0.0.1".to_owned(),
             port: 7345,
+            pairing_encryption: PairingEncryption::default(),
             data_dir,
             workspace_root,
             agent: AgentConfig {
@@ -306,7 +367,7 @@ pub(crate) fn expand_home_with_home(path: PathBuf, home: Option<OsString>) -> Pa
 mod tests {
     use std::{env, ffi::OsString, fs, path::PathBuf};
 
-    use super::{expand_home_with_home, Config, ServeArgs};
+    use super::{expand_home_with_home, Config, PairingEncryption, ServeArgs};
 
     #[test]
     fn default_config_requires_auth() {
@@ -357,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn save_host_port_preserves_existing_config_sections() {
+    fn save_tui_settings_preserves_existing_config_sections() {
         let root = env::temp_dir().join(format!("todex-config-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create temp config dir");
@@ -373,11 +434,13 @@ codex_bin = "codex"
         )
         .expect("write config");
 
-        Config::save_host_port(root.clone(), "0.0.0.0", 8080).expect("save host port");
+        Config::save_tui_settings(root.clone(), "0.0.0.0", 8080, PairingEncryption::X25519)
+            .expect("save TUI settings");
         let updated = fs::read_to_string(root.join("config.toml")).expect("read updated config");
 
         assert!(updated.contains("host = \"0.0.0.0\""));
         assert!(updated.contains("port = 8080"));
+        assert!(updated.contains("pairing_encryption = \"x25519\""));
         assert!(updated.contains("workspace_root = \"/tmp/workspaces\""));
         assert!(updated.contains("custom_value = \"kept\""));
         assert!(updated.contains("[agent]"));

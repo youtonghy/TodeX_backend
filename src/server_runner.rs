@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::app_state::AppState;
 use crate::config::Config;
+use crate::config::PairingEncryption;
 use crate::event::EventRecord;
 use crate::server;
 
@@ -85,11 +86,12 @@ impl ManagedServer {
         self.state.events.subscribe()
     }
 
-    pub fn pairing_qr_text(&self) -> Result<String> {
-        Ok(self
-            .state
-            .pairing_keys
-            .pairing_qr_text(&self.config, self.addr.port())?)
+    pub fn pairing_qr_text(&self, preferred_encryption: PairingEncryption) -> Result<String> {
+        Ok(self.state.pairing_keys.pairing_qr_text(
+            &self.config,
+            self.addr.port(),
+            preferred_encryption,
+        )?)
     }
 
     pub fn is_finished(&self) -> bool {
@@ -120,7 +122,7 @@ mod tests {
     use std::{env, fs};
 
     use super::ManagedServer;
-    use crate::config::{AgentConfig, Config, SecurityConfig};
+    use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -135,6 +137,7 @@ mod tests {
         let config = Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
+            pairing_encryption: PairingEncryption::default(),
             data_dir,
             workspace_root,
             agent: AgentConfig {
@@ -171,6 +174,8 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("\"id\":\"x25519\""));
         assert!(body.contains("\"id\":\"ml-kem-768\""));
+        assert!(body.contains("\"preferredEncryption\":\"ml-kem-768\""));
+        assert!(body.contains("\"authToken\":\"token\""));
 
         server.stop().await.expect("stop server");
         let _ = fs::remove_dir_all(root);
@@ -180,6 +185,7 @@ mod tests {
         Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
+            pairing_encryption: PairingEncryption::default(),
             data_dir,
             workspace_root,
             agent: AgentConfig {

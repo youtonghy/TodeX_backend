@@ -76,7 +76,7 @@ GET /v1/pairing
 Authorization: Bearer <TODEX_AGENTD_AUTH_TOKEN>
 ```
 
-返回后端地址、Bearer token 和可用传输加密公钥。TUI 中的配对二维码为了保持可扫描性，只编码短配对链接；App 扫描后会自动调用此接口拉取完整公钥。
+返回后端地址、Bearer token、当前首选加密方式和可用传输加密公钥。TUI 中的配对二维码编码短配对链接、Auth token 和首选加密方式；App 扫描后自动调用此接口拉取完整公钥并一次性导入连接配置。
 
 响应字段：
 
@@ -87,6 +87,7 @@ Authorization: Bearer <TODEX_AGENTD_AUTH_TOKEN>
 | `serverUrl` | string | App 使用的 HTTP Base URL |
 | `wsUrl` | string | App 使用的 WebSocket URL |
 | `authToken` | string/null | 当前 Bearer token |
+| `preferredEncryption` | string | 当前 TUI 设置的首选加密方式：`none`、`x25519` 或 `ml-kem-768` |
 | `protocols[].id` | string | `x25519` 或 `ml-kem-768` |
 | `protocols[].publicKey` | string | base64url 编码的服务端公钥 |
 

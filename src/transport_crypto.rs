@@ -20,7 +20,7 @@ use serde_json::json;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
-use crate::config::Config;
+use crate::config::{Config, PairingEncryption};
 use crate::error::AppError;
 
 const PAIRING_VERSION: u8 = 1;
@@ -50,6 +50,15 @@ impl PairingKeys {
     }
 
     pub fn pairing_payload(&self, config: &Config, port: u16) -> PairingPayload {
+        self.pairing_payload_with_preference(config, port, config.pairing_encryption)
+    }
+
+    pub fn pairing_payload_with_preference(
+        &self,
+        config: &Config,
+        port: u16,
+        preferred_encryption: PairingEncryption,
+    ) -> PairingPayload {
         let host = config.host.clone();
         let server_url = format!("http://{host}:{port}");
         PairingPayload {
@@ -60,6 +69,7 @@ impl PairingKeys {
             host,
             port,
             auth_token: config.security.auth_token.clone(),
+            preferred_encryption: Some(preferred_encryption),
             protocols: vec![
                 PairingProtocol {
                     id: EncryptionProtocol::X25519.as_str().to_owned(),
@@ -73,18 +83,29 @@ impl PairingKeys {
         }
     }
 
-    pub fn pairing_link_json(&self, config: &Config, port: u16) -> Result<String, AppError> {
+    pub fn pairing_qr_text(
+        &self,
+        config: &Config,
+        port: u16,
+        preferred_encryption: PairingEncryption,
+    ) -> Result<String, AppError> {
+        render_qr_text(&self.pairing_link_json(config, port, preferred_encryption)?)
+    }
+
+    fn pairing_link_json(
+        &self,
+        config: &Config,
+        port: u16,
+        preferred_encryption: PairingEncryption,
+    ) -> Result<String, AppError> {
         Ok(serde_json::to_string(&PairingLinkPayload {
             kind: "todex-pairing-link".to_owned(),
             version: PAIRING_VERSION,
             server_url: format!("http://{}:{port}", config.host),
             pairing_url: format!("http://{}:{port}/v1/pairing", config.host),
             auth_token: config.security.auth_token.clone(),
+            preferred_encryption: Some(preferred_encryption),
         })?)
-    }
-
-    pub fn pairing_qr_text(&self, config: &Config, port: u16) -> Result<String, AppError> {
-        render_qr_text(&self.pairing_link_json(config, port)?)
     }
 }
 
@@ -122,6 +143,7 @@ pub struct PairingPayload {
     host: String,
     port: u16,
     auth_token: Option<String>,
+    preferred_encryption: Option<PairingEncryption>,
     protocols: Vec<PairingProtocol>,
 }
 
@@ -140,6 +162,7 @@ struct PairingLinkPayload {
     server_url: String,
     pairing_url: String,
     auth_token: Option<String>,
+    preferred_encryption: Option<PairingEncryption>,
 }
 
 #[derive(Clone)]
@@ -395,13 +418,25 @@ fn render_qr_text(payload: &str) -> Result<String, AppError> {
     let qr = QrCode::encode_text(payload, QrCodeEcc::Low)
         .map_err(|_| AppError::InvalidRequest("pairing payload is too large for QR".to_owned()))?;
     let border = 2;
+    let size = qr.size();
+    let min = -border;
+    let max = size + border;
     let mut lines = Vec::new();
-    for y in -border..qr.size() + border {
+    let mut y = min;
+    while y < max {
         let mut line = String::new();
-        for x in -border..qr.size() + border {
-            line.push_str(if qr.get_module(x, y) { "██" } else { "  " });
+        for x in min..max {
+            let top = qr.get_module(x, y);
+            let bottom = y + 1 < max && qr.get_module(x, y + 1);
+            line.push(match (top, bottom) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
         }
         lines.push(line);
+        y += 2;
     }
     Ok(lines.join("\n"))
 }
@@ -409,7 +444,7 @@ fn render_qr_text(payload: &str) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentConfig, Config, SecurityConfig};
+    use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use std::path::PathBuf;
 
     #[test]
@@ -425,6 +460,43 @@ mod tests {
         assert_eq!(protocols, vec!["x25519", "ml-kem-768"]);
         assert_eq!(payload.server_url, "http://127.0.0.1:7345");
         assert_eq!(payload.auth_token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn pairing_payload_serializes_preferred_encryption_and_token() {
+        let keys = PairingKeys::generate();
+        let payload =
+            keys.pairing_payload_with_preference(&test_config(), 7345, PairingEncryption::X25519);
+        let json = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(json["preferredEncryption"], "x25519");
+        assert_eq!(json["authToken"], "token");
+        assert_eq!(json["serverUrl"], "http://127.0.0.1:7345");
+    }
+
+    #[test]
+    fn pairing_qr_uses_compact_authenticated_link() {
+        let keys = PairingKeys::generate();
+        let config = test_config();
+        let link = keys
+            .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&link).unwrap();
+
+        assert_eq!(value["kind"], "todex-pairing-link");
+        assert_eq!(value["pairingUrl"], "http://127.0.0.1:7345/v1/pairing");
+        assert_eq!(value["authToken"], "token");
+        assert_eq!(value["preferredEncryption"], "ml-kem-768");
+        assert!(value.get("protocols").is_none());
+
+        let qr = keys
+            .pairing_qr_text(&config, 7345, PairingEncryption::MlKem768)
+            .unwrap();
+        let max_width = qr.lines().map(|line| line.chars().count()).max().unwrap();
+        assert!(
+            max_width <= 80,
+            "compact pairing QR should fit common terminal widths, got {max_width}"
+        );
     }
 
     #[test]
@@ -506,6 +578,7 @@ mod tests {
         Config {
             host: "127.0.0.1".to_owned(),
             port: 7345,
+            pairing_encryption: PairingEncryption::default(),
             data_dir: PathBuf::from("/tmp/todex-test"),
             workspace_root: PathBuf::from("/tmp/todex-test/workspace"),
             agent: AgentConfig {
