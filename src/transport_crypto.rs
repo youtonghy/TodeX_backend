@@ -84,13 +84,23 @@ impl PairingKeys {
         }
     }
 
-    pub fn pairing_qr_text(
+    #[cfg(test)]
+    fn pairing_qr_text(
         &self,
         config: &Config,
         port: u16,
         preferred_encryption: PairingEncryption,
     ) -> Result<String, AppError> {
-        render_qr_text(&self.pairing_link_json(config, port, preferred_encryption)?)
+        render_qr_text(&self.pairing_qr_payload(config, port, preferred_encryption)?)
+    }
+
+    pub(crate) fn pairing_qr_payload(
+        &self,
+        config: &Config,
+        port: u16,
+        preferred_encryption: PairingEncryption,
+    ) -> Result<String, AppError> {
+        self.pairing_link_json(config, port, preferred_encryption)
     }
 
     fn pairing_link_json(
@@ -437,10 +447,76 @@ fn decode_fixed_24(value: &str, label: &str) -> Result<[u8; 24], AppError> {
         .map_err(|_| AppError::InvalidRequest(format!("{label} must be 24 bytes")))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QrRenderMode {
+    HalfBlock,
+    Braille,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RenderedQrText {
+    pub(crate) text: String,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+}
+
+pub(crate) fn render_qr_text_for_bounds(
+    payload: &str,
+    max_width: u16,
+    max_height: u16,
+) -> Result<RenderedQrText, AppError> {
+    let qr = QrCode::encode_text(payload, QrCodeEcc::Low)
+        .map_err(|_| AppError::InvalidRequest("pairing payload is too large for QR".to_owned()))?;
+    let candidates = [
+        (QrRenderMode::HalfBlock, 2),
+        (QrRenderMode::HalfBlock, 1),
+        (QrRenderMode::HalfBlock, 0),
+        (QrRenderMode::Braille, 2),
+        (QrRenderMode::Braille, 1),
+        (QrRenderMode::Braille, 0),
+    ];
+    let mut best = None;
+    for (mode, border) in candidates {
+        let rendered = render_qr_with_mode(&qr, mode, border);
+        if rendered.width <= max_width && rendered.height <= max_height {
+            return Ok(rendered);
+        }
+        best = match best {
+            Some(current) if qr_area(&current) <= qr_area(&rendered) => Some(current),
+            _ => Some(rendered),
+        };
+    }
+
+    Ok(best.expect("QR render candidates must not be empty"))
+}
+
+#[cfg(test)]
 fn render_qr_text(payload: &str) -> Result<String, AppError> {
     let qr = QrCode::encode_text(payload, QrCodeEcc::Low)
         .map_err(|_| AppError::InvalidRequest("pairing payload is too large for QR".to_owned()))?;
-    let border = 2;
+    Ok(render_qr_with_mode(&qr, QrRenderMode::HalfBlock, 2).text)
+}
+
+fn render_qr_with_mode(qr: &QrCode, mode: QrRenderMode, border: i32) -> RenderedQrText {
+    let text = match mode {
+        QrRenderMode::HalfBlock => render_qr_half_block(qr, border),
+        QrRenderMode::Braille => render_qr_braille(qr, border),
+    };
+    let width = text
+        .lines()
+        .map(|line| line.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
+    let height = text.lines().count() as u16;
+
+    RenderedQrText {
+        text,
+        width,
+        height,
+    }
+}
+
+fn render_qr_half_block(qr: &QrCode, border: i32) -> String {
     let size = qr.size();
     let min = -border;
     let max = size + border;
@@ -461,7 +537,52 @@ fn render_qr_text(payload: &str) -> Result<String, AppError> {
         lines.push(line);
         y += 2;
     }
-    Ok(lines.join("\n"))
+    lines.join("\n")
+}
+
+fn render_qr_braille(qr: &QrCode, border: i32) -> String {
+    let size = qr.size();
+    let min = -border;
+    let max = size + border;
+    let mut lines = Vec::new();
+    let mut y = min;
+    while y < max {
+        let mut line = String::new();
+        let mut x = min;
+        while x < max {
+            let mut pattern = 0u8;
+            for dy in 0..4 {
+                for dx in 0..2 {
+                    if qr.get_module(x + dx, y + dy) {
+                        pattern |= braille_dot(dx, dy);
+                    }
+                }
+            }
+            line.push(char::from_u32(0x2800 + pattern as u32).unwrap_or(' '));
+            x += 2;
+        }
+        lines.push(line);
+        y += 4;
+    }
+    lines.join("\n")
+}
+
+fn braille_dot(dx: i32, dy: i32) -> u8 {
+    match (dx, dy) {
+        (0, 0) => 0x01,
+        (0, 1) => 0x02,
+        (0, 2) => 0x04,
+        (0, 3) => 0x40,
+        (1, 0) => 0x08,
+        (1, 1) => 0x10,
+        (1, 2) => 0x20,
+        (1, 3) => 0x80,
+        _ => 0,
+    }
+}
+
+fn qr_area(rendered: &RenderedQrText) -> u32 {
+    rendered.width as u32 * rendered.height as u32
 }
 
 #[cfg(test)]
@@ -519,6 +640,27 @@ mod tests {
         assert!(
             max_width <= 80,
             "compact pairing QR should fit common terminal widths, got {max_width}"
+        );
+    }
+
+    #[test]
+    fn pairing_qr_renderer_scales_to_short_terminal_height() {
+        let keys = PairingKeys::generate();
+        let config = test_config();
+        let payload = keys
+            .pairing_qr_payload(&config, 7345, PairingEncryption::MlKem768)
+            .unwrap();
+        let rendered = render_qr_text_for_bounds(&payload, 76, 20).unwrap();
+
+        assert!(
+            rendered.width <= 76,
+            "scaled pairing QR should fit terminal content width, got {}",
+            rendered.width
+        );
+        assert!(
+            rendered.height <= 20,
+            "scaled pairing QR should fit terminal content height, got {}",
+            rendered.height
         );
     }
 

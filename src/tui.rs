@@ -25,11 +25,13 @@ use tokio::sync::broadcast;
 use crate::config::{Config, PairingEncryption, ServeArgs};
 use crate::event::EventRecord;
 use crate::server_runner::ManagedServer;
+use crate::transport_crypto::render_qr_text_for_bounds;
 
 const ACTION_COUNT: usize = 9;
 const MAX_LOG_LINES: usize = 256;
 const MAX_LOG_EVENTS: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
+const QR_POPUP_MARGIN: u16 = 1;
 
 pub async fn run(args: ServeArgs) -> Result<()> {
     let config = Config::load(args).context("failed to load configuration")?;
@@ -92,6 +94,15 @@ impl Drop for TerminalGuard {
     }
 }
 
+struct PairingQr {
+    payload: String,
+}
+
+struct PairingQrPopup {
+    area: Rect,
+    lines: Vec<Line<'static>>,
+}
+
 struct TuiApp {
     config: Config,
     server: Option<ManagedServer>,
@@ -103,7 +114,7 @@ struct TuiApp {
     live_events: VecDeque<EventRecord>,
     log_scroll: usize,
     log_follow_tail: bool,
-    pairing_qr: Option<String>,
+    pairing_qr: Option<PairingQr>,
     event_rx: Option<broadcast::Receiver<EventRecord>>,
 }
 
@@ -203,15 +214,15 @@ impl TuiApp {
 
     fn show_pairing_qr(&mut self) {
         let qr = match self.server.as_ref() {
-            Some(server) => server.pairing_qr_text(self.config.pairing_encryption),
+            Some(server) => server.pairing_qr_payload(self.config.pairing_encryption),
             None => {
                 self.notice = "Start the service before showing a pairing QR.".to_owned();
                 return;
             }
         };
         match qr {
-            Ok(qr) => {
-                self.pairing_qr = Some(qr);
+            Ok(payload) => {
+                self.pairing_qr = Some(PairingQr { payload });
                 self.notice = "Pairing QR is open in the center window.".to_owned();
             }
             Err(error) => {
@@ -563,9 +574,9 @@ impl TuiApp {
         frame.render_widget(self.help_panel(), chunks[2]);
         frame.render_widget(self.message_panel(), chunks[3]);
         if self.pairing_qr.is_some() {
-            let area = self.pairing_qr_area(frame.area());
-            frame.render_widget(Clear, area);
-            frame.render_widget(self.pairing_qr_popup(), area);
+            let popup = self.pairing_qr_popup(frame.area());
+            frame.render_widget(Clear, popup.area);
+            frame.render_widget(self.pairing_qr_paragraph(popup.lines), popup.area);
         }
     }
 
@@ -780,27 +791,17 @@ impl TuiApp {
             .block(Block::default().title("Messages").borders(Borders::ALL))
     }
 
-    fn pairing_qr_area(&self, area: Rect) -> Rect {
-        let qr_width = self
-            .pairing_qr
-            .as_ref()
-            .map(|qr| {
-                qr.lines()
-                    .map(|line| line.chars().count())
-                    .max()
-                    .unwrap_or(0) as u16
-            })
-            .unwrap_or(60);
-        let width = (qr_width + 6)
-            .min(area.width.saturating_sub(2).max(1))
+    fn pairing_qr_area(&self, area: Rect, content_width: u16, content_height: u16) -> Rect {
+        let max_width = area
+            .width
+            .saturating_sub(QR_POPUP_MARGIN.saturating_mul(2))
             .max(1);
-        let height = self
-            .pairing_qr
-            .as_ref()
-            .map(|qr| qr.lines().count() as u16 + 6)
-            .unwrap_or(20)
-            .min(area.height.saturating_sub(2).max(1))
+        let max_height = area
+            .height
+            .saturating_sub(QR_POPUP_MARGIN.saturating_mul(2))
             .max(1);
+        let width = content_width.saturating_add(2).min(max_width).max(1);
+        let height = content_height.saturating_add(2).min(max_height).max(1);
         Rect {
             x: area.x + (area.width.saturating_sub(width)) / 2,
             y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -809,28 +810,71 @@ impl TuiApp {
         }
     }
 
-    fn pairing_qr_popup(&self) -> Paragraph<'_> {
-        let qr = self
-            .pairing_qr
-            .as_deref()
-            .unwrap_or("Failed to render pairing QR.");
-        let mut lines = vec![
-            Line::from("Pairing QR"),
-            Line::from("Press any key to close."),
-            Line::from(""),
-        ];
-        lines.extend(qr.lines().map(Line::from));
+    fn pairing_qr_popup(&self, area: Rect) -> PairingQrPopup {
+        let max_popup_width = area
+            .width
+            .saturating_sub(QR_POPUP_MARGIN.saturating_mul(2))
+            .max(1);
+        let max_popup_height = area
+            .height
+            .saturating_sub(QR_POPUP_MARGIN.saturating_mul(2))
+            .max(1);
+        let max_content_width = max_popup_width.saturating_sub(2).max(1);
+        let max_content_height = max_popup_height.saturating_sub(2).max(1);
+        let lines = self.pairing_qr_lines(max_content_width, max_content_height);
+        let content_width = lines_width(&lines).min(max_content_width).max(1);
+        let content_height = (lines.len() as u16).min(max_content_height).max(1);
+        let area = self.pairing_qr_area(area, content_width, content_height);
 
+        PairingQrPopup { area, lines }
+    }
+
+    fn pairing_qr_lines(&self, max_width: u16, max_height: u16) -> Vec<Line<'static>> {
+        let Some(qr) = self.pairing_qr.as_ref() else {
+            return vec![Line::from("Failed to render pairing QR.")];
+        };
+        match render_qr_text_for_bounds(&qr.payload, max_width, max_height) {
+            Ok(rendered) if rendered.width <= max_width && rendered.height <= max_height => {
+                rendered
+                    .text
+                    .lines()
+                    .map(|line| Line::from(line.to_owned()))
+                    .collect()
+            }
+            Ok(rendered) => vec![
+                Line::from("Terminal is too small for the pairing QR."),
+                Line::from(format!(
+                    "Need at least {}x{} cells for the compact code.",
+                    rendered.width, rendered.height
+                )),
+                Line::from("Resize the window and it will redraw automatically."),
+            ],
+            Err(error) => vec![
+                Line::from("Failed to render pairing QR."),
+                Line::from(error.to_string()),
+            ],
+        }
+    }
+
+    fn pairing_qr_paragraph(&self, lines: Vec<Line<'static>>) -> Paragraph<'static> {
         Paragraph::new(lines)
             .style(Style::default().fg(Color::Black).bg(Color::White))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
-                    .title("Pairing")
+                    .title("Pairing QR - any key closes")
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Black).bg(Color::White)),
             )
     }
+}
+
+fn lines_width(lines: &[Line<'_>]) -> u16 {
+    lines
+        .iter()
+        .map(|line| line.width() as u16)
+        .max()
+        .unwrap_or(0)
 }
 
 fn summarize_event(event: &EventRecord) -> String {

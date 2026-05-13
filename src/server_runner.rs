@@ -86,8 +86,8 @@ impl ManagedServer {
         self.state.events.subscribe()
     }
 
-    pub fn pairing_qr_text(&self, preferred_encryption: PairingEncryption) -> Result<String> {
-        Ok(self.state.pairing_keys.pairing_qr_text(
+    pub fn pairing_qr_payload(&self, preferred_encryption: PairingEncryption) -> Result<String> {
+        Ok(self.state.pairing_keys.pairing_qr_payload(
             &self.config,
             self.addr.port(),
             preferred_encryption,
