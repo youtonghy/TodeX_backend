@@ -117,7 +117,22 @@ impl PairingKeys {
             pairing_url: format!("http://{advertise_host}:{port}/v1/pairing"),
             auth_token: config.security.auth_token.clone(),
             preferred_encryption: Some(preferred_encryption),
+            protocol: self.pairing_protocol_for(preferred_encryption),
         })?)
+    }
+
+    fn pairing_protocol_for(&self, encryption: PairingEncryption) -> Option<PairingProtocol> {
+        match encryption {
+            PairingEncryption::None => None,
+            PairingEncryption::X25519 => Some(PairingProtocol {
+                id: EncryptionProtocol::X25519.as_str().to_owned(),
+                public_key: encode_b64(&self.x25519_public),
+            }),
+            PairingEncryption::MlKem768 => Some(PairingProtocol {
+                id: EncryptionProtocol::MlKem768.as_str().to_owned(),
+                public_key: encode_b64(&self.ml_kem_public),
+            }),
+        }
     }
 }
 
@@ -180,7 +195,7 @@ pub struct PairingPayload {
     protocols: Vec<PairingProtocol>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingProtocol {
     id: String,
@@ -196,6 +211,8 @@ struct PairingLinkPayload {
     pairing_url: String,
     auth_token: Option<String>,
     preferred_encryption: Option<PairingEncryption>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<PairingProtocol>,
 }
 
 #[derive(Clone)]
@@ -619,28 +636,43 @@ mod tests {
     }
 
     #[test]
-    fn pairing_qr_uses_compact_authenticated_link() {
+    fn pairing_qr_embeds_selected_public_key() {
         let keys = PairingKeys::generate();
         let config = test_config();
         let link = keys
-            .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
+            .pairing_link_json(&config, 7345, PairingEncryption::X25519)
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&link).unwrap();
 
         assert_eq!(value["kind"], "todex-pairing-link");
         assert_eq!(value["pairingUrl"], "http://127.0.0.1:7345/v1/pairing");
         assert_eq!(value["authToken"], "token");
-        assert_eq!(value["preferredEncryption"], "ml-kem-768");
+        assert_eq!(value["preferredEncryption"], "x25519");
+        assert_eq!(value["protocol"]["id"], "x25519");
+        assert!(value["protocol"]["publicKey"].as_str().unwrap().len() > 40);
         assert!(value.get("protocols").is_none());
 
         let qr = keys
-            .pairing_qr_text(&config, 7345, PairingEncryption::MlKem768)
+            .pairing_qr_text(&config, 7345, PairingEncryption::X25519)
             .unwrap();
         let max_width = qr.lines().map(|line| line.chars().count()).max().unwrap();
         assert!(
             max_width <= 80,
-            "compact pairing QR should fit common terminal widths, got {max_width}"
+            "x25519 pairing QR should fit common terminal widths, got {max_width}"
         );
+    }
+
+    #[test]
+    fn plaintext_pairing_qr_does_not_embed_a_public_key() {
+        let keys = PairingKeys::generate();
+        let config = test_config();
+        let link = keys
+            .pairing_link_json(&config, 7345, PairingEncryption::None)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&link).unwrap();
+
+        assert_eq!(value["preferredEncryption"], "none");
+        assert!(value.get("protocol").is_none());
     }
 
     #[test]
@@ -648,7 +680,7 @@ mod tests {
         let keys = PairingKeys::generate();
         let config = test_config();
         let payload = keys
-            .pairing_qr_payload(&config, 7345, PairingEncryption::MlKem768)
+            .pairing_qr_payload(&config, 7345, PairingEncryption::X25519)
             .unwrap();
         let rendered = render_qr_text_for_bounds(&payload, 76, 20).unwrap();
 
