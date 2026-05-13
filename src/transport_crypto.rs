@@ -18,13 +18,14 @@ use qrcodegen::{QrCode, QrCodeEcc};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
 use crate::config::{Config, PairingEncryption};
 use crate::error::AppError;
 
 const PAIRING_VERSION: u8 = 1;
+const PAIRING_QR_SEGMENT_DATA_LENGTH: usize = 384;
 const WRAPPER_TYPE: &str = "todex.crypto.v1";
 const AAD: &[u8] = b"todex-ws-transport-crypto-v1";
 
@@ -60,6 +61,7 @@ impl PairingKeys {
         render_qr_text(&self.pairing_qr_payload(config, port, preferred_encryption)?)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn pairing_qr_payload(
         &self,
         config: &Config,
@@ -67,6 +69,20 @@ impl PairingKeys {
         preferred_encryption: PairingEncryption,
     ) -> Result<String, AppError> {
         self.pairing_link_json(config, port, preferred_encryption)
+    }
+
+    pub(crate) fn pairing_qr_payloads(
+        &self,
+        config: &Config,
+        port: u16,
+        preferred_encryption: PairingEncryption,
+    ) -> Result<Vec<String>, AppError> {
+        let payload = self.pairing_link_json(config, port, preferred_encryption)?;
+        if preferred_encryption != PairingEncryption::MlKem768 {
+            return Ok(vec![payload]);
+        }
+
+        self.segment_pairing_qr_payload(&payload)
     }
 
     fn pairing_link_json(
@@ -98,6 +114,33 @@ impl PairingKeys {
                 public_key: encode_b64(&self.ml_kem_public),
             }),
         }
+    }
+
+    fn segment_pairing_qr_payload(&self, payload: &str) -> Result<Vec<String>, AppError> {
+        let encoded = encode_b64(payload.as_bytes());
+        let checksum = encode_b64(&Sha256::digest(payload.as_bytes()));
+        let chunks: Vec<&[u8]> = encoded
+            .as_bytes()
+            .chunks(PAIRING_QR_SEGMENT_DATA_LENGTH)
+            .collect();
+        let total = chunks.len() as u16;
+
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                serde_json::to_string(&PairingQrChunkPayload {
+                    kind: "todex-pairing-chunk".to_owned(),
+                    version: PAIRING_VERSION,
+                    checksum: checksum.clone(),
+                    index: (index + 1) as u16,
+                    total,
+                    data: String::from_utf8(chunk.to_vec())
+                        .expect("base64url chunk should always be valid UTF-8"),
+                })
+                .map_err(Into::into)
+            })
+            .collect()
     }
 }
 
@@ -151,6 +194,17 @@ impl EncryptionProtocol {
 pub struct PairingProtocol {
     id: String,
     public_key: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingQrChunkPayload {
+    kind: String,
+    version: u8,
+    checksum: String,
+    index: u16,
+    total: u16,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -583,6 +637,40 @@ mod tests {
             max_width <= 80,
             "x25519 pairing QR should fit common terminal widths, got {max_width}"
         );
+    }
+
+    #[test]
+    fn ml_kem_pairing_qr_is_split_into_segments() {
+        let keys = PairingKeys::generate();
+        let config = test_config();
+        let frames = keys
+            .pairing_qr_payloads(&config, 7345, PairingEncryption::MlKem768)
+            .unwrap();
+
+        assert!(frames.len() > 1, "ml-kem pairing QR should be segmented");
+
+        let mut encoded = String::new();
+        let mut checksum = String::new();
+
+        for (index, frame) in frames.iter().enumerate() {
+            let value: serde_json::Value = serde_json::from_str(frame).unwrap();
+            assert_eq!(value["kind"], "todex-pairing-chunk");
+            assert_eq!(value["version"], PAIRING_VERSION);
+            assert_eq!(value["index"], (index + 1) as u64);
+            assert_eq!(value["total"], frames.len() as u64);
+            if checksum.is_empty() {
+                checksum = value["checksum"].as_str().unwrap().to_owned();
+            } else {
+                assert_eq!(value["checksum"], checksum);
+            }
+            encoded.push_str(value["data"].as_str().unwrap());
+        }
+
+        let decoded = decode_b64(&encoded, "pairing qr chunk payload").unwrap();
+        assert_eq!(encode_b64(&Sha256::digest(&decoded)), checksum);
+        let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(value["kind"], "todex-pairing-link");
+        assert_eq!(value["preferredEncryption"], "ml-kem-768");
     }
 
     #[test]

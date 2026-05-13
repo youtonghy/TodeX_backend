@@ -95,12 +95,14 @@ impl Drop for TerminalGuard {
 }
 
 struct PairingQr {
-    payload: String,
+    payloads: Vec<String>,
+    active_index: usize,
 }
 
 struct PairingQrPopup {
     area: Rect,
     lines: Vec<Line<'static>>,
+    title: String,
 }
 
 struct TuiApp {
@@ -214,16 +216,24 @@ impl TuiApp {
 
     fn show_pairing_qr(&mut self) {
         let qr = match self.server.as_ref() {
-            Some(server) => server.pairing_qr_payload(self.config.pairing_encryption),
+            Some(server) => server.pairing_qr_payloads(self.config.pairing_encryption),
             None => {
                 self.notice = "Start the service before showing a pairing QR.".to_owned();
                 return;
             }
         };
         match qr {
-            Ok(payload) => {
-                self.pairing_qr = Some(PairingQr { payload });
-                self.notice = "Pairing QR is open in the center window.".to_owned();
+            Ok(payloads) => {
+                let total = payloads.len();
+                self.pairing_qr = Some(PairingQr {
+                    payloads,
+                    active_index: 0,
+                });
+                self.notice = if total > 1 {
+                    format!("Pairing QR is open in the center window. Use Left/Right to switch {total} segments.")
+                } else {
+                    "Pairing QR is open in the center window.".to_owned()
+                };
             }
             Err(error) => {
                 self.notice = "Failed to render pairing QR.".to_owned();
@@ -239,9 +249,34 @@ impl TuiApp {
         }
     }
 
+    fn next_pairing_qr(&mut self) {
+        if let Some(qr) = &mut self.pairing_qr {
+            if !qr.payloads.is_empty() {
+                qr.active_index = (qr.active_index + 1) % qr.payloads.len();
+            }
+        }
+    }
+
+    fn previous_pairing_qr(&mut self) {
+        if let Some(qr) = &mut self.pairing_qr {
+            if !qr.payloads.is_empty() {
+                qr.active_index = if qr.active_index == 0 {
+                    qr.payloads.len() - 1
+                } else {
+                    qr.active_index - 1
+                };
+            }
+        }
+    }
+
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if self.pairing_qr.is_some() {
-            self.close_pairing_qr();
+            match key.code {
+                KeyCode::Left | KeyCode::PageUp => self.previous_pairing_qr(),
+                KeyCode::Right | KeyCode::PageDown => self.next_pairing_qr(),
+                KeyCode::Esc | KeyCode::Char('q') => self.close_pairing_qr(),
+                _ => self.close_pairing_qr(),
+            }
             return Ok(false);
         }
 
@@ -576,7 +611,7 @@ impl TuiApp {
         if self.pairing_qr.is_some() {
             let popup = self.pairing_qr_popup(frame.area());
             frame.render_widget(Clear, popup.area);
-            frame.render_widget(self.pairing_qr_paragraph(popup.lines), popup.area);
+            frame.render_widget(self.pairing_qr_paragraph(popup.lines, popup.title), popup.area);
         }
     }
 
@@ -811,6 +846,15 @@ impl TuiApp {
     }
 
     fn pairing_qr_popup(&self, area: Rect) -> PairingQrPopup {
+        let title = match self.pairing_qr.as_ref() {
+            Some(qr) if qr.payloads.len() > 1 => format!(
+                "Pairing QR {}/{} - Left/Right switch, Esc closes",
+                qr.active_index + 1,
+                qr.payloads.len()
+            ),
+            Some(_) => "Pairing QR - any key closes".to_owned(),
+            None => "Pairing QR - any key closes".to_owned(),
+        };
         let max_popup_width = area
             .width
             .saturating_sub(QR_POPUP_MARGIN.saturating_mul(2))
@@ -826,14 +870,17 @@ impl TuiApp {
         let content_height = (lines.len() as u16).min(max_content_height).max(1);
         let area = self.pairing_qr_area(area, content_width, content_height);
 
-        PairingQrPopup { area, lines }
+        PairingQrPopup { area, lines, title }
     }
 
     fn pairing_qr_lines(&self, max_width: u16, max_height: u16) -> Vec<Line<'static>> {
         let Some(qr) = self.pairing_qr.as_ref() else {
             return vec![Line::from("Failed to render pairing QR.")];
         };
-        match render_qr_text_for_bounds(&qr.payload, max_width, max_height) {
+        let Some(payload) = qr.payloads.get(qr.active_index) else {
+            return vec![Line::from("Failed to render pairing QR.")];
+        };
+        match render_qr_text_for_bounds(payload, max_width, max_height) {
             Ok(rendered) if rendered.width <= max_width && rendered.height <= max_height => {
                 rendered
                     .text
@@ -856,16 +903,17 @@ impl TuiApp {
         }
     }
 
-    fn pairing_qr_paragraph(&self, lines: Vec<Line<'static>>) -> Paragraph<'static> {
+    fn pairing_qr_paragraph(
+        &self,
+        lines: Vec<Line<'static>>,
+        title: String,
+    ) -> Paragraph<'static> {
         Paragraph::new(lines)
             .style(Style::default().fg(Color::Black).bg(Color::White))
             .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title("Pairing QR - any key closes")
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Black).bg(Color::White)),
-            )
+            .block(Block::default().title(title).borders(Borders::ALL).style(
+                Style::default().fg(Color::Black).bg(Color::White),
+            ))
     }
 }
 
