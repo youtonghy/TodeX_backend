@@ -19,7 +19,6 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/v1/version", get(version))
-        .route("/v1/pairing", get(pairing))
         .route("/v1/workspace/entries", get(workspace_entries))
         .route("/v1/ws", get(ws))
 }
@@ -35,22 +34,6 @@ async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
         data_dir: state.config.data_dir.display().to_string(),
         workspace_root: state.config.workspace_root.display().to_string(),
     })
-}
-
-async fn pairing(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<crate::transport_crypto::PairingPayload>, AppError> {
-    authorize_http(&state, &headers)?;
-    let port = headers
-        .get(axum::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|host| host.rsplit_once(':'))
-        .and_then(|(_, port)| port.parse::<u16>().ok())
-        .unwrap_or(state.config.port);
-    Ok(Json(
-        state.pairing_keys.pairing_payload(&state.config, port),
-    ))
 }
 
 async fn workspace_entries(
@@ -325,41 +308,8 @@ struct WorkspaceEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[tokio::test]
-    async fn pairing_requires_auth_and_returns_available_protocols() {
-        let state = AppState::new(test_config(true)).await.unwrap();
-
-        assert!(pairing(State(state.clone()), HeaderMap::new())
-            .await
-            .is_err());
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Bearer test-token".parse().unwrap(),
-        );
-        headers.insert(
-            axum::http::header::HOST,
-            "phone.local:9191".parse().unwrap(),
-        );
-
-        let Json(payload) = pairing(State(state), headers).await.unwrap();
-        let value = serde_json::to_value(payload).unwrap();
-
-        assert_eq!(value["kind"], "todex-pairing");
-        assert_eq!(value["version"], 1);
-        assert_eq!(value["serverUrl"], "http://127.0.0.1:9191");
-        assert_eq!(value["wsUrl"], "ws://127.0.0.1:9191/v1/ws");
-        assert_eq!(value["authToken"], "test-token");
-        assert_eq!(value["protocols"][0]["id"], "x25519");
-        assert_eq!(value["protocols"][1]["id"], "ml-kem-768");
-        assert!(value["protocols"][0]["publicKey"].as_str().unwrap().len() > 16);
-        assert!(value["protocols"][1]["publicKey"].as_str().unwrap().len() > 16);
-    }
 
     #[tokio::test]
     async fn recursive_workspace_entries_match_nested_paths() {
@@ -416,25 +366,5 @@ mod tests {
         let root = std::env::temp_dir().join(format!("todex-{name}-{nonce}"));
         fs::create_dir_all(&root).unwrap();
         root
-    }
-
-    fn test_config(enable_auth: bool) -> Config {
-        let root = make_temp_workspace("config");
-        Config {
-            host: "127.0.0.1".to_owned(),
-            port: 7345,
-            pairing_encryption: PairingEncryption::default(),
-            data_dir: root.join("data"),
-            workspace_root: root.join("workspace"),
-            agent: AgentConfig {
-                default_agent: "codex".to_owned(),
-                codex_bin: "codex".to_owned(),
-            },
-            security: SecurityConfig {
-                enable_auth,
-                enable_tls: false,
-                auth_token: Some("test-token".to_owned()),
-            },
-        }
     }
 }

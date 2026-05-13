@@ -50,40 +50,6 @@ impl PairingKeys {
         }
     }
 
-    pub fn pairing_payload(&self, config: &Config, port: u16) -> PairingPayload {
-        self.pairing_payload_with_preference(config, port, config.pairing_encryption)
-    }
-
-    pub fn pairing_payload_with_preference(
-        &self,
-        config: &Config,
-        port: u16,
-        preferred_encryption: PairingEncryption,
-    ) -> PairingPayload {
-        let host = config.host.clone();
-        let server_url = format!("http://{host}:{port}");
-        PairingPayload {
-            kind: "todex-pairing".to_owned(),
-            version: PAIRING_VERSION,
-            server_url,
-            ws_url: format!("ws://{host}:{port}/v1/ws"),
-            host,
-            port,
-            auth_token: config.security.auth_token.clone(),
-            preferred_encryption: Some(preferred_encryption),
-            protocols: vec![
-                PairingProtocol {
-                    id: EncryptionProtocol::X25519.as_str().to_owned(),
-                    public_key: encode_b64(&self.x25519_public),
-                },
-                PairingProtocol {
-                    id: EncryptionProtocol::MlKem768.as_str().to_owned(),
-                    public_key: encode_b64(&self.ml_kem_public),
-                },
-            ],
-        }
-    }
-
     #[cfg(test)]
     fn pairing_qr_text(
         &self,
@@ -114,7 +80,6 @@ impl PairingKeys {
             kind: "todex-pairing-link".to_owned(),
             version: PAIRING_VERSION,
             server_url: format!("http://{advertise_host}:{port}"),
-            pairing_url: format!("http://{advertise_host}:{port}/v1/pairing"),
             auth_token: config.security.auth_token.clone(),
             preferred_encryption: Some(preferred_encryption),
             protocol: self.pairing_protocol_for(preferred_encryption),
@@ -181,20 +146,6 @@ impl EncryptionProtocol {
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PairingPayload {
-    kind: String,
-    version: u8,
-    server_url: String,
-    ws_url: String,
-    host: String,
-    port: u16,
-    auth_token: Option<String>,
-    preferred_encryption: Option<PairingEncryption>,
-    protocols: Vec<PairingProtocol>,
-}
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingProtocol {
@@ -208,7 +159,6 @@ struct PairingLinkPayload {
     kind: String,
     version: u8,
     server_url: String,
-    pairing_url: String,
     auth_token: Option<String>,
     preferred_encryption: Option<PairingEncryption>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -609,33 +559,6 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn pairing_payload_contains_both_protocols() {
-        let keys = PairingKeys::generate();
-        let payload = keys.pairing_payload(&test_config(), 7345);
-        let protocols = payload
-            .protocols
-            .iter()
-            .map(|protocol| protocol.id.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(protocols, vec!["x25519", "ml-kem-768"]);
-        assert_eq!(payload.server_url, "http://127.0.0.1:7345");
-        assert_eq!(payload.auth_token.as_deref(), Some("token"));
-    }
-
-    #[test]
-    fn pairing_payload_serializes_preferred_encryption_and_token() {
-        let keys = PairingKeys::generate();
-        let payload =
-            keys.pairing_payload_with_preference(&test_config(), 7345, PairingEncryption::X25519);
-        let json = serde_json::to_value(payload).unwrap();
-
-        assert_eq!(json["preferredEncryption"], "x25519");
-        assert_eq!(json["authToken"], "token");
-        assert_eq!(json["serverUrl"], "http://127.0.0.1:7345");
-    }
-
-    #[test]
     fn pairing_qr_embeds_selected_public_key() {
         let keys = PairingKeys::generate();
         let config = test_config();
@@ -645,12 +568,12 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&link).unwrap();
 
         assert_eq!(value["kind"], "todex-pairing-link");
-        assert_eq!(value["pairingUrl"], "http://127.0.0.1:7345/v1/pairing");
         assert_eq!(value["authToken"], "token");
         assert_eq!(value["preferredEncryption"], "x25519");
         assert_eq!(value["protocol"]["id"], "x25519");
         assert!(value["protocol"]["publicKey"].as_str().unwrap().len() > 40);
         assert!(value.get("protocols").is_none());
+        assert!(value.get("pairingUrl").is_none());
 
         let qr = keys
             .pairing_qr_text(&config, 7345, PairingEncryption::X25519)
@@ -707,7 +630,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&link).unwrap();
 
         assert_ne!(value["serverUrl"], "http://0.0.0.0:7345");
-        assert_ne!(value["pairingUrl"], "http://0.0.0.0:7345/v1/pairing");
+        assert!(value.get("pairingUrl").is_none());
     }
 
     #[test]

@@ -6,14 +6,14 @@
 
 ## 功能 / Features
 
-- HTTP 接口：`/health`、`/v1/version`、`/v1/pairing`、`/v1/workspace/entries`
+- HTTP 接口：`/health`、`/v1/version`、`/v1/workspace/entries`
 - WebSocket 接口：`/v1/ws`，可选 X25519 或 ML-KEM-768 传输加密
 - 本地 Codex 会话管理：`start`、`status`、`stop`、`turn`、`attach`、`replay`、`interrupt`
 - 工作区文件检索：为前端 `@` 引用提供目录和文件建议
 - 认证与配置：支持 Bearer token、环境变量、`config.toml`
 - 交互式 TUI：可启动、停止服务，保存监听地址，并显示 App 配对二维码
 
-- HTTP endpoints: `/health`, `/v1/version`, `/v1/pairing`, `/v1/workspace/entries`
+- HTTP endpoints: `/health`, `/v1/version`, `/v1/workspace/entries`
 - WebSocket endpoint: `/v1/ws`, with optional X25519 or ML-KEM-768 transport encryption
 - Local Codex session control: `start`, `status`, `stop`, `turn`, `attach`, `replay`, `interrupt`
 - Workspace file lookup for the frontend `@` picker

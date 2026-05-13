@@ -123,8 +123,6 @@ mod tests {
 
     use super::ManagedServer;
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
     #[tokio::test]
     async fn managed_server_starts_and_stops() {
@@ -156,81 +154,5 @@ mod tests {
         server.stop().await.expect("stop server");
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn managed_server_serves_encrypted_pairing_payload() {
-        let root = env::temp_dir().join(format!("todex-pairing-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let data_dir = root.join("data");
-        let workspace_root = root.join("workspace");
-        fs::create_dir_all(&workspace_root).expect("create workspace root");
-
-        let server = ManagedServer::start(test_config(data_dir, workspace_root))
-            .await
-            .expect("start server");
-        let (status, body) = http_get(server.addr().port(), "/v1/pairing", Some("token")).await;
-
-        assert_eq!(status, 200);
-        assert!(body.contains("\"id\":\"x25519\""));
-        assert!(body.contains("\"id\":\"ml-kem-768\""));
-        assert!(body.contains("\"preferredEncryption\":\"ml-kem-768\""));
-        assert!(body.contains("\"authToken\":\"token\""));
-
-        server.stop().await.expect("stop server");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    fn test_config(data_dir: std::path::PathBuf, workspace_root: std::path::PathBuf) -> Config {
-        Config {
-            host: "127.0.0.1".to_owned(),
-            port: 0,
-            pairing_encryption: PairingEncryption::default(),
-            data_dir,
-            workspace_root,
-            agent: AgentConfig {
-                default_agent: "codex".to_owned(),
-                codex_bin: "codex".to_owned(),
-            },
-            security: SecurityConfig {
-                enable_auth: true,
-                enable_tls: false,
-                auth_token: Some("token".to_owned()),
-            },
-        }
-    }
-
-    async fn http_get(port: u16, path: &str, token: Option<&str>) -> (u16, String) {
-        let mut stream = TcpStream::connect(("127.0.0.1", port))
-            .await
-            .expect("connect server");
-        let authorization = token
-            .map(|token| format!("Authorization: Bearer {token}\r\n"))
-            .unwrap_or_default();
-        let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{authorization}Connection: close\r\n\r\n"
-        );
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .expect("write request");
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .expect("read response");
-        let response = String::from_utf8_lossy(&response);
-        let status = response
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(0);
-        let body = response
-            .split("\r\n\r\n")
-            .nth(1)
-            .unwrap_or_default()
-            .to_owned();
-        (status, body)
     }
 }
