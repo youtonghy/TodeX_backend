@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
 use std::net::IpAddr;
@@ -29,7 +29,6 @@ use crate::transport_crypto::render_qr_text_for_bounds;
 
 const ACTION_COUNT: usize = 9;
 const MAX_LOG_LINES: usize = 256;
-const MAX_LOG_EVENTS: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
 
@@ -108,16 +107,25 @@ struct PairingQrPopup {
 struct TuiApp {
     config: Config,
     server: Option<ManagedServer>,
+    view: TuiView,
     selected_action: usize,
+    selected_session: usize,
     input: Option<InputMode>,
     last_error: Option<String>,
     notice: String,
     live_logs: VecDeque<String>,
-    live_events: VecDeque<EventRecord>,
+    live_events: Vec<EventRecord>,
     log_scroll: usize,
+    observer_scroll: usize,
     log_follow_tail: bool,
     pairing_qr: Option<PairingQr>,
     event_rx: Option<broadcast::Receiver<EventRecord>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TuiView {
+    Control,
+    Observer,
 }
 
 impl TuiApp {
@@ -125,13 +133,16 @@ impl TuiApp {
         Self {
             config,
             server: None,
+            view: TuiView::Control,
             selected_action: 0,
+            selected_session: 0,
             input: None,
             last_error: None,
             notice: "Service is stopped. Select Start when ready.".to_owned(),
             live_logs: VecDeque::new(),
-            live_events: VecDeque::new(),
+            live_events: Vec::new(),
             log_scroll: 0,
+            observer_scroll: 0,
             log_follow_tail: true,
             pairing_qr: None,
             event_rx: None,
@@ -164,10 +175,13 @@ impl TuiApp {
     }
 
     fn push_event(&mut self, event: EventRecord) {
-        if self.live_events.len() >= MAX_LOG_EVENTS {
-            self.live_events.pop_front();
+        self.live_events.push(event);
+        let session_count = self.observer_state().sessions.len();
+        if session_count == 0 {
+            self.selected_session = 0;
+        } else {
+            self.selected_session = self.selected_session.min(session_count - 1);
         }
-        self.live_events.push_back(event);
     }
 
     fn push_log(&mut self, line: String) {
@@ -212,6 +226,18 @@ impl TuiApp {
     fn scroll_logs_to_bottom(&mut self) {
         self.log_follow_tail = true;
         self.log_scroll = self.bottom_log_scroll();
+    }
+
+    fn scroll_observer_up(&mut self, amount: usize) {
+        self.observer_scroll = self.observer_scroll.saturating_sub(amount);
+    }
+
+    fn scroll_observer_down(&mut self, amount: usize) {
+        self.observer_scroll = self.observer_scroll.saturating_add(amount);
+    }
+
+    fn scroll_observer_to_top(&mut self) {
+        self.observer_scroll = 0;
     }
 
     fn show_pairing_qr(&mut self) {
@@ -285,8 +311,38 @@ impl TuiApp {
             return Ok(false);
         }
 
+        if self.view == TuiView::Observer {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('o') | KeyCode::Tab => {
+                    self.view = TuiView::Control;
+                    self.notice = "Returned to the control view.".to_owned();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.selected_session = self.selected_session.saturating_sub(1);
+                    self.observer_scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let session_count = self.observer_state().sessions.len();
+                    if session_count > 0 {
+                        self.selected_session = (self.selected_session + 1).min(session_count - 1);
+                    }
+                    self.observer_scroll = 0;
+                }
+                KeyCode::PageUp => self.scroll_observer_up(LOG_SCROLL_STEP),
+                KeyCode::PageDown => self.scroll_observer_down(LOG_SCROLL_STEP),
+                KeyCode::Home => self.scroll_observer_to_top(),
+                KeyCode::End => self.observer_scroll = usize::MAX,
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Char('o') | KeyCode::Tab => {
+                self.view = TuiView::Observer;
+                self.notice = "Observer is read-only. Use q, Esc, o, or Tab to return.".to_owned();
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected_action = self.selected_action.saturating_sub(1);
             }
@@ -578,6 +634,19 @@ impl TuiApp {
 
     fn render(&self, frame: &mut Frame<'_>) {
         frame.render_widget(Clear, frame.area());
+        if self.view == TuiView::Observer {
+            self.render_observer(frame);
+            if self.pairing_qr.is_some() {
+                let popup = self.pairing_qr_popup(frame.area());
+                frame.render_widget(Clear, popup.area);
+                frame.render_widget(
+                    self.pairing_qr_paragraph(popup.lines, popup.title),
+                    popup.area,
+                );
+            }
+            return;
+        }
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -611,8 +680,40 @@ impl TuiApp {
         if self.pairing_qr.is_some() {
             let popup = self.pairing_qr_popup(frame.area());
             frame.render_widget(Clear, popup.area);
-            frame.render_widget(self.pairing_qr_paragraph(popup.lines, popup.title), popup.area);
+            frame.render_widget(
+                self.pairing_qr_paragraph(popup.lines, popup.title),
+                popup.area,
+            );
         }
+    }
+
+    fn render_observer(&self, frame: &mut Frame<'_>) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(7),
+                Constraint::Min(12),
+                Constraint::Length(4),
+            ])
+            .split(frame.area());
+        let main_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(42), Constraint::Min(48)])
+            .split(chunks[1]);
+
+        for area in [chunks[0], main_chunks[0], main_chunks[1], chunks[2]] {
+            frame.render_widget(Clear, area);
+        }
+
+        let state = self.observer_state();
+        frame.render_widget(self.observer_summary_panel(&state), chunks[0]);
+        frame.render_widget(self.session_panel(&state), main_chunks[0]);
+        frame.render_widget(
+            self.session_detail_panel(&state, main_chunks[1]),
+            main_chunks[1],
+        );
+        frame.render_widget(self.observer_help_panel(), chunks[2]);
     }
 
     fn status_panel(&self) -> Paragraph<'_> {
@@ -801,7 +902,7 @@ impl TuiApp {
             vec![
                 Line::from("Use Up/Down or j/k to choose an action, Enter to run it."),
                 Line::from(
-                    "Shortcuts: s start/stop, r restart, h host, p port, e encryption, w config, g QR, l logs, q quit.",
+                    "Shortcuts: s start/stop, r restart, h host, p port, e encryption, w config, g QR, l logs, o observer, q quit.",
                 ),
                 Line::from("The TUI starts stopped by default and stops its service on exit."),
             ]
@@ -903,18 +1004,662 @@ impl TuiApp {
         }
     }
 
-    fn pairing_qr_paragraph(
-        &self,
-        lines: Vec<Line<'static>>,
-        title: String,
-    ) -> Paragraph<'static> {
+    fn pairing_qr_paragraph(&self, lines: Vec<Line<'static>>, title: String) -> Paragraph<'static> {
         Paragraph::new(lines)
             .style(Style::default().fg(Color::Black).bg(Color::White))
             .wrap(Wrap { trim: false })
-            .block(Block::default().title(title).borders(Borders::ALL).style(
-                Style::default().fg(Color::Black).bg(Color::White),
-            ))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(Color::Black).bg(Color::White)),
+            )
     }
+
+    fn observer_state(&self) -> ObserverState {
+        ObserverState::from_events(&self.live_events)
+    }
+
+    fn observer_summary_panel(&self, state: &ObserverState) -> Paragraph<'_> {
+        let runtime_state = if self.server.is_some() {
+            "running"
+        } else {
+            "stopped"
+        };
+        let selected = state
+            .sessions
+            .get(self.selected_session)
+            .map(|session| session.session_id.as_str())
+            .unwrap_or("-");
+
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    "Observer ",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("read-only view for this TUI session"),
+            ]),
+            Line::from(format!(
+                "Service: {runtime_state} | Sessions: {} | Active tasks: {} | Pending requests: {} | Events: {}",
+                state.sessions.len(),
+                state.active_task_count,
+                state.pending_request_count,
+                self.live_events.len()
+            )),
+            Line::from(format!("Selected session: {selected}")),
+            Line::from("No service commands are available on this page."),
+        ])
+        .wrap(Wrap { trim: true })
+        .block(Block::default().title("Session Observer").borders(Borders::ALL))
+    }
+
+    fn session_panel(&self, state: &ObserverState) -> List<'_> {
+        let items = if state.sessions.is_empty() {
+            vec![ListItem::new(Line::from("No Codex session events yet."))]
+        } else {
+            state
+                .sessions
+                .iter()
+                .enumerate()
+                .map(|(idx, session)| {
+                    let marker = if idx == self.selected_session {
+                        "> "
+                    } else {
+                        "  "
+                    };
+                    let style = if idx == self.selected_session {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::raw(marker),
+                        Span::raw(truncate_text(&session.session_id, 22)),
+                        Span::raw(format!(
+                            " {} ev {} turn {} req",
+                            session.event_count,
+                            session.turns.len(),
+                            session.pending_request_count()
+                        )),
+                    ]))
+                    .style(style)
+                })
+                .collect()
+        };
+
+        List::new(items).block(Block::default().title("Sessions").borders(Borders::ALL))
+    }
+
+    fn session_detail_panel(&self, state: &ObserverState, area: Rect) -> Paragraph<'_> {
+        let lines = match state.sessions.get(self.selected_session) {
+            Some(session) => session_detail_lines(session),
+            None => vec![Line::from(
+                "Start or connect a client to populate this observer.",
+            )],
+        };
+        let content_height = area.height.saturating_sub(2) as usize;
+        let max_scroll = lines.len().saturating_sub(content_height);
+        let scroll = self.observer_scroll.min(max_scroll);
+        let line_count = lines.len();
+
+        Paragraph::new(lines)
+            .scroll((scroll as u16, 0))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(format!(
+                        "History / Conversation / Current Tasks [{line_count}]"
+                    ))
+                    .borders(Borders::ALL),
+            )
+    }
+
+    fn observer_help_panel(&self) -> Paragraph<'_> {
+        Paragraph::new(vec![
+            Line::from("Read-only navigation: Up/Down selects session, PageUp/PageDown scrolls details, Home/End jumps."),
+            Line::from("q, Esc, o, or Tab returns to the control view. This page does not start, stop, approve, or send anything."),
+        ])
+        .wrap(Wrap { trim: true })
+        .block(Block::default().title("Observer Controls").borders(Borders::ALL))
+    }
+}
+
+#[derive(Debug, Default)]
+struct ObserverState {
+    sessions: Vec<ObservedSession>,
+    active_task_count: usize,
+    pending_request_count: usize,
+}
+
+impl ObserverState {
+    fn from_events(events: &[EventRecord]) -> Self {
+        let mut sessions = BTreeMap::<String, ObservedSession>::new();
+        for event in events {
+            let Some(session_id) = event_session_id(event) else {
+                continue;
+            };
+            sessions
+                .entry(session_id.clone())
+                .or_insert_with(|| ObservedSession::new(session_id))
+                .apply(event);
+        }
+
+        let mut sessions = sessions.into_values().collect::<Vec<_>>();
+        sessions.sort_by(|left, right| {
+            right
+                .last_time
+                .cmp(&left.last_time)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        let active_task_count = sessions
+            .iter()
+            .map(ObservedSession::active_task_count)
+            .sum();
+        let pending_request_count = sessions
+            .iter()
+            .map(ObservedSession::pending_request_count)
+            .sum();
+        Self {
+            sessions,
+            active_task_count,
+            pending_request_count,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ObservedSession {
+    session_id: String,
+    event_count: usize,
+    first_time: chrono::DateTime<Utc>,
+    last_time: chrono::DateTime<Utc>,
+    adapter_state: Option<String>,
+    in_flight_command_id: Option<String>,
+    child_pid: Option<String>,
+    threads: BTreeSet<String>,
+    turns: BTreeMap<String, ObservedTurn>,
+    requests: BTreeMap<String, ObservedRequest>,
+    plans: Vec<String>,
+    cloud_tasks: BTreeMap<String, String>,
+    conversation: Vec<String>,
+    history: Vec<String>,
+}
+
+impl ObservedSession {
+    fn new(session_id: String) -> Self {
+        let now = Utc::now();
+        Self {
+            session_id,
+            event_count: 0,
+            first_time: now,
+            last_time: now,
+            adapter_state: None,
+            in_flight_command_id: None,
+            child_pid: None,
+            threads: BTreeSet::new(),
+            turns: BTreeMap::new(),
+            requests: BTreeMap::new(),
+            plans: Vec::new(),
+            cloud_tasks: BTreeMap::new(),
+            conversation: Vec::new(),
+            history: Vec::new(),
+        }
+    }
+
+    fn apply(&mut self, event: &EventRecord) {
+        self.event_count += 1;
+        if self.event_count == 1 {
+            self.first_time = event.time;
+        }
+        self.last_time = event.time;
+
+        let payload = event_payload_source(event);
+        if let Some(thread_id) = event_thread_id(event) {
+            self.threads.insert(thread_id);
+        }
+        if let Some(turn_id) = event_turn_id(event) {
+            self.turns
+                .entry(turn_id.clone())
+                .or_insert_with(|| ObservedTurn::new(turn_id))
+                .apply(event, payload);
+        }
+        if let Some(lifecycle_state) = payload_string_any(payload, &["lifecycleState"]) {
+            self.adapter_state = Some(lifecycle_state);
+        }
+        if let Some(command_id) = payload
+            .get("commandLane")
+            .and_then(|lane| payload_string_any(lane, &["inFlightCommandId"]))
+        {
+            self.in_flight_command_id = Some(command_id);
+        }
+        if let Some(pid) = payload
+            .get("childProcess")
+            .and_then(|process| process.get("pid"))
+            .map(compact_scalar)
+        {
+            self.child_pid = Some(pid);
+        }
+        if let Some(request_id) = payload_string_any(payload, &["requestId", "request_id", "id"]) {
+            self.requests
+                .entry(request_id.clone())
+                .or_insert_with(|| ObservedRequest::new(request_id))
+                .apply(event, payload);
+        }
+        if event.event_type == "codex.turn.planUpdated" || event.event_type == "codex.plan.delta" {
+            if let Some(plan) = summarize_plan(payload) {
+                self.plans.push(plan);
+            }
+        }
+        if event.event_type.starts_with("codex.cloudTask.") {
+            if let Some(task_id) = cloud_task_id(payload) {
+                let status = payload_string_any(payload, &["status"])
+                    .unwrap_or_else(|| event.event_type.clone());
+                self.cloud_tasks.insert(task_id, status);
+            }
+        }
+        if is_conversation_event(&event.event_type) {
+            self.conversation.push(summarize_observer_event(event));
+        }
+        self.history.push(summarize_observer_event(event));
+    }
+
+    fn active_task_count(&self) -> usize {
+        let active_turns = self
+            .turns
+            .values()
+            .filter(|turn| turn.status.is_active())
+            .count();
+        let active_cloud_tasks = self
+            .cloud_tasks
+            .values()
+            .filter(|status| !terminal_status(status))
+            .count();
+        active_turns + active_cloud_tasks + usize::from(self.in_flight_command_id.is_some())
+    }
+
+    fn pending_request_count(&self) -> usize {
+        self.requests
+            .values()
+            .filter(|request| request.status == ObservedRequestStatus::Pending)
+            .count()
+    }
+}
+
+#[derive(Debug)]
+struct ObservedTurn {
+    turn_id: String,
+    status: ObservedTurnStatus,
+    last_event: String,
+}
+
+impl ObservedTurn {
+    fn new(turn_id: String) -> Self {
+        Self {
+            turn_id,
+            status: ObservedTurnStatus::Active,
+            last_event: String::new(),
+        }
+    }
+
+    fn apply(&mut self, event: &EventRecord, payload: &Value) {
+        self.last_event = event.event_type.clone();
+        self.status = match event.event_type.as_str() {
+            "codex.turn.completed" => ObservedTurnStatus::Completed,
+            "codex.turn.interrupted" => ObservedTurnStatus::Interrupted,
+            "codex.turn.failed" | "codex.error" => ObservedTurnStatus::Failed,
+            _ => payload_string_any(payload, &["status", "lifecycleState"])
+                .map(|status| ObservedTurnStatus::from_status(&status))
+                .unwrap_or(self.status),
+        };
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObservedTurnStatus {
+    Active,
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+impl ObservedTurnStatus {
+    fn from_status(status: &str) -> Self {
+        match status {
+            "completed" | "ready" | "success" => Self::Completed,
+            "interrupted" | "cancelled" | "canceled" => Self::Interrupted,
+            "failed" | "error" => Self::Failed,
+            _ => Self::Active,
+        }
+    }
+
+    fn is_active(self) -> bool {
+        self == Self::Active
+    }
+}
+
+#[derive(Debug)]
+struct ObservedRequest {
+    request_id: String,
+    request_type: String,
+    status: ObservedRequestStatus,
+}
+
+impl ObservedRequest {
+    fn new(request_id: String) -> Self {
+        Self {
+            request_id,
+            request_type: "-".to_owned(),
+            status: ObservedRequestStatus::Observed,
+        }
+    }
+
+    fn apply(&mut self, event: &EventRecord, payload: &Value) {
+        self.request_type = payload_string_any(payload, &["operation", "responseType"])
+            .unwrap_or_else(|| event.event_type.clone());
+        let outcome = payload_string_any(payload, &["outcome", "decision"]);
+        self.status =
+            if outcome.as_deref() == Some("pending") || event.event_type.ends_with(".request") {
+                ObservedRequestStatus::Pending
+            } else if event.event_type == "codex.serverRequest.resolved"
+                || event.event_type.ends_with(".resolved")
+                || outcome.is_some()
+            {
+                ObservedRequestStatus::Resolved
+            } else {
+                ObservedRequestStatus::Observed
+            };
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObservedRequestStatus {
+    Observed,
+    Pending,
+    Resolved,
+}
+
+impl ObservedRequestStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Pending => "pending",
+            Self::Resolved => "resolved",
+        }
+    }
+}
+
+fn session_detail_lines(session: &ObservedSession) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Session: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(session.session_id.clone()),
+    ]));
+    lines.push(Line::from(format!(
+        "First event: {} | Last event: {} | Events: {}",
+        session.first_time.format("%H:%M:%S"),
+        session.last_time.format("%H:%M:%S"),
+        session.event_count
+    )));
+    lines.push(Line::from(format!(
+        "Adapter: {} | In-flight: {} | Child PID: {}",
+        session.adapter_state.as_deref().unwrap_or("-"),
+        session.in_flight_command_id.as_deref().unwrap_or("-"),
+        session.child_pid.as_deref().unwrap_or("-")
+    )));
+    lines.push(Line::from(format!(
+        "Threads: {} | Turns: {} | Pending requests: {} | Cloud tasks: {}",
+        session.threads.len(),
+        session.turns.len(),
+        session.pending_request_count(),
+        session.cloud_tasks.len()
+    )));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Current Running Tasks",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let mut active_lines = Vec::new();
+    if let Some(command_id) = &session.in_flight_command_id {
+        active_lines.push(format!("command in flight: {command_id}"));
+    }
+    active_lines.extend(
+        session
+            .turns
+            .values()
+            .filter(|turn| turn.status.is_active())
+            .map(|turn| format!("turn {} ({})", turn.turn_id, turn.last_event)),
+    );
+    active_lines.extend(
+        session
+            .requests
+            .values()
+            .filter(|request| request.status == ObservedRequestStatus::Pending)
+            .map(|request| {
+                format!(
+                    "pending request {} ({})",
+                    request.request_id, request.request_type
+                )
+            }),
+    );
+    active_lines.extend(
+        session
+            .cloud_tasks
+            .iter()
+            .filter(|(_, status)| !terminal_status(status))
+            .map(|(task_id, status)| format!("cloud task {task_id} ({status})")),
+    );
+    if active_lines.is_empty() {
+        lines.push(Line::from("No active task inferred from current events."));
+    } else {
+        lines.extend(active_lines.into_iter().map(Line::from));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Conversation Records",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if session.conversation.is_empty() {
+        lines.push(Line::from("No conversation item events observed yet."));
+    } else {
+        lines.extend(
+            session
+                .conversation
+                .iter()
+                .map(|line| Line::from(line.clone())),
+        );
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Plans",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if session.plans.is_empty() {
+        lines.push(Line::from("No plan updates observed yet."));
+    } else {
+        lines.extend(
+            session
+                .plans
+                .iter()
+                .rev()
+                .take(12)
+                .map(|line| Line::from(line.clone())),
+        );
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Requests",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if session.requests.is_empty() {
+        lines.push(Line::from("No request records observed yet."));
+    } else {
+        lines.extend(session.requests.values().map(|request| {
+            Line::from(format!(
+                "{} [{}] {}",
+                request.request_id,
+                request.status.as_str(),
+                request.request_type
+            ))
+        }));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Full Event History",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.extend(session.history.iter().map(|line| Line::from(line.clone())));
+    lines
+}
+
+fn event_session_id(event: &EventRecord) -> Option<String> {
+    payload_string_any(
+        &event.payload,
+        &[
+            "codex_session_id",
+            "codexSessionId",
+            "sessionId",
+            "session_id",
+        ],
+    )
+    .or_else(|| {
+        event.payload.get("data").and_then(|data| {
+            payload_string_any(
+                data,
+                &[
+                    "codex_session_id",
+                    "codexSessionId",
+                    "sessionId",
+                    "session_id",
+                ],
+            )
+        })
+    })
+}
+
+fn event_thread_id(event: &EventRecord) -> Option<String> {
+    payload_string_any(
+        &event.payload,
+        &["codex_thread_id", "codexThreadId", "threadId", "thread_id"],
+    )
+    .or_else(|| {
+        event.payload.get("data").and_then(|data| {
+            payload_string_any(
+                data,
+                &["codex_thread_id", "codexThreadId", "threadId", "thread_id"],
+            )
+        })
+    })
+}
+
+fn event_turn_id(event: &EventRecord) -> Option<String> {
+    payload_string_any(
+        &event.payload,
+        &["codex_turn_id", "codexTurnId", "turnId", "turn_id"],
+    )
+    .or_else(|| {
+        event.payload.get("data").and_then(|data| {
+            payload_string_any(data, &["codex_turn_id", "codexTurnId", "turnId", "turn_id"])
+        })
+    })
+}
+
+fn event_payload_source(event: &EventRecord) -> &Value {
+    event.payload.get("data").unwrap_or(&event.payload)
+}
+
+fn payload_string_any(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn summarize_observer_event(event: &EventRecord) -> String {
+    let cursor = event
+        .payload
+        .get("cursor")
+        .map(compact_scalar)
+        .map(|cursor| format!("#{cursor} "))
+        .unwrap_or_default();
+    format!("{}{}", cursor, summarize_event(event))
+}
+
+fn summarize_plan(payload: &Value) -> Option<String> {
+    if let Some(plan) = payload
+        .get("plan")
+        .or_else(|| payload.get("items"))
+        .and_then(Value::as_array)
+    {
+        let summary = plan
+            .iter()
+            .filter_map(|item| {
+                let text = payload_string_any(item, &["step", "text"])?;
+                let status =
+                    payload_string_any(item, &["status"]).unwrap_or_else(|| "pending".to_owned());
+                Some(format!("{status}: {}", truncate_text(&text, 56)))
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Some(truncate_text(&summary, 180));
+    }
+    payload_string_any(payload, &["delta", "explanation"]).map(|text| truncate_text(&text, 180))
+}
+
+fn cloud_task_id(payload: &Value) -> Option<String> {
+    payload_string_any(payload, &["taskId", "task_id", "id"]).or_else(|| {
+        payload
+            .get("task")
+            .and_then(|task| payload_string_any(task, &["taskId", "task_id", "id"]))
+    })
+}
+
+fn terminal_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed"
+            | "complete"
+            | "succeeded"
+            | "success"
+            | "failed"
+            | "error"
+            | "interrupted"
+            | "cancelled"
+            | "canceled"
+            | "ready"
+            | "stopped"
+    )
+}
+
+fn is_conversation_event(event_type: &str) -> bool {
+    event_type.starts_with("codex.item.")
+        || matches!(
+            event_type,
+            "codex.turn.started"
+                | "codex.turn.completed"
+                | "codex.turn.failed"
+                | "codex.turn.interrupted"
+                | "codex.turn.planUpdated"
+        )
 }
 
 fn lines_width(lines: &[Line<'_>]) -> u16 {
@@ -1075,7 +1820,10 @@ fn pairing_encryption_label(value: PairingEncryption) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_host, validate_port};
+    use serde_json::json;
+
+    use super::{validate_host, validate_port, ObservedRequestStatus, ObserverState};
+    use crate::event::EventRecord;
 
     #[test]
     fn validate_host_accepts_ip_addresses() {
@@ -1100,5 +1848,72 @@ mod tests {
         assert!(validate_port("0").is_err());
         assert!(validate_port("65536").is_err());
         assert!(validate_port("abc").is_err());
+    }
+
+    #[test]
+    fn observer_state_groups_session_history_and_active_requests() {
+        let events = vec![
+            EventRecord::new(
+                "codex.control.ready",
+                None,
+                None,
+                None,
+                json!({
+                    "cursor": 1,
+                    "codex_session_id": "session-1",
+                    "data": {
+                        "codexSessionId": "session-1",
+                        "lifecycleState": "ready",
+                        "childProcess": { "pid": 42 }
+                    }
+                }),
+            ),
+            EventRecord::new(
+                "codex.turn.started",
+                None,
+                None,
+                None,
+                json!({
+                    "cursor": 2,
+                    "codex_session_id": "session-1",
+                    "codex_turn_id": "turn-1",
+                    "data": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1"
+                    }
+                }),
+            ),
+            EventRecord::new(
+                "codex.approval.commandExecution.request",
+                None,
+                None,
+                None,
+                json!({
+                    "cursor": 3,
+                    "codex_session_id": "session-1",
+                    "data": {
+                        "requestId": "approval-1",
+                        "outcome": "pending"
+                    }
+                }),
+            ),
+        ];
+
+        let state = ObserverState::from_events(&events);
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.active_task_count, 1);
+        assert_eq!(state.pending_request_count, 1);
+
+        let session = &state.sessions[0];
+        assert_eq!(session.session_id, "session-1");
+        assert_eq!(session.event_count, 3);
+        assert_eq!(session.adapter_state.as_deref(), Some("ready"));
+        assert_eq!(session.child_pid.as_deref(), Some("42"));
+        assert!(session.threads.contains("thread-1"));
+        assert_eq!(
+            session.requests["approval-1"].status,
+            ObservedRequestStatus::Pending
+        );
+        assert_eq!(session.conversation.len(), 1);
     }
 }

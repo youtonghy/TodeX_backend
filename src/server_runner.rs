@@ -86,7 +86,10 @@ impl ManagedServer {
         self.state.events.subscribe()
     }
 
-    pub fn pairing_qr_payloads(&self, preferred_encryption: PairingEncryption) -> Result<Vec<String>> {
+    pub fn pairing_qr_payloads(
+        &self,
+        preferred_encryption: PairingEncryption,
+    ) -> Result<Vec<String>> {
         Ok(self.state.pairing_keys.pairing_qr_payloads(
             &self.config,
             self.addr.port(),
