@@ -25,7 +25,7 @@ use crate::config::{Config, PairingEncryption};
 use crate::error::AppError;
 
 const PAIRING_VERSION: u8 = 1;
-const PAIRING_QR_SEGMENT_DATA_LENGTH: usize = 384;
+const PAIRING_QR_SEGMENT_DATA_LENGTH: usize = 160;
 const WRAPPER_TYPE: &str = "todex.crypto.v1";
 const AAD: &[u8] = b"todex-ws-transport-crypto-v1";
 
@@ -471,7 +471,6 @@ fn decode_fixed_24(value: &str, label: &str) -> Result<[u8; 24], AppError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QrRenderMode {
     HalfBlock,
-    Braille,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -492,9 +491,6 @@ pub(crate) fn render_qr_text_for_bounds(
         (QrRenderMode::HalfBlock, 2),
         (QrRenderMode::HalfBlock, 1),
         (QrRenderMode::HalfBlock, 0),
-        (QrRenderMode::Braille, 2),
-        (QrRenderMode::Braille, 1),
-        (QrRenderMode::Braille, 0),
     ];
     let mut best = None;
     for (mode, border) in candidates {
@@ -521,7 +517,6 @@ fn render_qr_text(payload: &str) -> Result<String, AppError> {
 fn render_qr_with_mode(qr: &QrCode, mode: QrRenderMode, border: i32) -> RenderedQrText {
     let text = match mode {
         QrRenderMode::HalfBlock => render_qr_half_block(qr, border),
-        QrRenderMode::Braille => render_qr_braille(qr, border),
     };
     let width = text
         .lines()
@@ -559,47 +554,6 @@ fn render_qr_half_block(qr: &QrCode, border: i32) -> String {
         y += 2;
     }
     lines.join("\n")
-}
-
-fn render_qr_braille(qr: &QrCode, border: i32) -> String {
-    let size = qr.size();
-    let min = -border;
-    let max = size + border;
-    let mut lines = Vec::new();
-    let mut y = min;
-    while y < max {
-        let mut line = String::new();
-        let mut x = min;
-        while x < max {
-            let mut pattern = 0u8;
-            for dy in 0..4 {
-                for dx in 0..2 {
-                    if qr.get_module(x + dx, y + dy) {
-                        pattern |= braille_dot(dx, dy);
-                    }
-                }
-            }
-            line.push(char::from_u32(0x2800 + pattern as u32).unwrap_or(' '));
-            x += 2;
-        }
-        lines.push(line);
-        y += 4;
-    }
-    lines.join("\n")
-}
-
-fn braille_dot(dx: i32, dy: i32) -> u8 {
-    match (dx, dy) {
-        (0, 0) => 0x01,
-        (0, 1) => 0x02,
-        (0, 2) => 0x04,
-        (0, 3) => 0x40,
-        (1, 0) => 0x08,
-        (1, 1) => 0x10,
-        (1, 2) => 0x20,
-        (1, 3) => 0x80,
-        _ => 0,
-    }
 }
 
 fn qr_area(rendered: &RenderedQrText) -> u32 {
@@ -687,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_qr_renderer_scales_to_short_terminal_height() {
+    fn pairing_qr_renderer_uses_block_cells_instead_of_braille_dots() {
         let keys = PairingKeys::generate();
         let config = test_config();
         let payload = keys
@@ -697,13 +651,19 @@ mod tests {
 
         assert!(
             rendered.width <= 76,
-            "scaled pairing QR should fit terminal content width, got {}",
+            "pairing QR should fit terminal content width, got {}",
             rendered.width
         );
         assert!(
-            rendered.height <= 20,
-            "scaled pairing QR should fit terminal content height, got {}",
-            rendered.height
+            rendered.height > 20,
+            "block-cell pairing QR should report that this terminal height is too short"
+        );
+        assert!(
+            !rendered
+                .text
+                .chars()
+                .any(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch)),
+            "pairing QR must not use Braille dot cells"
         );
     }
 
