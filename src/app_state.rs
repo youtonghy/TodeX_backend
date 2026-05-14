@@ -31,7 +31,7 @@ impl AppState {
         let codex_gateway = CodexGatewayStore::new(config.data_dir.clone());
         let codex_local_adapters =
             CodexLocalAdapterSupervisor::new(codex_gateway.clone(), events.clone());
-        let pairing_keys = PairingKeys::generate();
+        let pairing_keys = PairingKeys::load_or_generate(&config.data_dir).await?;
         let websocket_connections = Arc::new(AtomicUsize::new(0));
 
         Ok(Self {

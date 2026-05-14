@@ -1,4 +1,5 @@
 use std::net::{IpAddr, UdpSocket};
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -12,7 +13,8 @@ use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use pqcrypto_mlkem::mlkem768;
 use pqcrypto_traits::kem::{
-    Ciphertext as MlKemCiphertext, PublicKey as MlKemPublicKey, SharedSecret as MlKemSharedSecret,
+    Ciphertext as MlKemCiphertext, PublicKey as MlKemPublicKey, SecretKey as MlKemSecretKey,
+    SharedSecret as MlKemSharedSecret,
 };
 use qrcodegen::{QrCode, QrCodeEcc};
 use rand_core::OsRng;
@@ -26,6 +28,7 @@ use crate::error::AppError;
 
 const PAIRING_VERSION: u8 = 1;
 const PAIRING_QR_SEGMENT_DATA_LENGTH: usize = 160;
+const PAIRING_KEYS_FILE: &str = "pairing_keys.json";
 const WRAPPER_TYPE: &str = "todex.crypto.v1";
 const AAD: &[u8] = b"todex-ws-transport-crypto-v1";
 
@@ -49,6 +52,67 @@ impl PairingKeys {
             ml_kem_secret: Arc::new(ml_kem_secret),
             ml_kem_public: ml_kem_public.as_bytes().to_vec(),
         }
+    }
+
+    pub async fn load_or_generate(data_dir: &Path) -> Result<Self, AppError> {
+        let path = data_dir.join(PAIRING_KEYS_FILE);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(raw) => Self::from_persisted_json(&raw, "pairing keys file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let keys = Self::generate();
+                keys.persist(&path).await?;
+                Ok(keys)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn persist(&self, path: &Path) -> Result<(), AppError> {
+        let persisted = PersistedPairingKeys {
+            version: PAIRING_VERSION,
+            x25519_secret: encode_b64(self.x25519_secret.to_bytes().as_slice()),
+            ml_kem_public: encode_b64(&self.ml_kem_public),
+            ml_kem_secret: encode_b64(self.ml_kem_secret.as_bytes()),
+        };
+        let json = serde_json::to_string_pretty(&persisted)?;
+        let tmp_path = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp_path, json).await?;
+        set_owner_only_permissions(&tmp_path).await?;
+        tokio::fs::rename(&tmp_path, path).await?;
+        Ok(())
+    }
+
+    fn from_persisted_json(raw: &str, label: &str) -> Result<Self, AppError> {
+        let persisted: PersistedPairingKeys = serde_json::from_str(raw)
+            .map_err(|error| AppError::InvalidRequest(format!("invalid {label}: {error}")))?;
+        if persisted.version != PAIRING_VERSION {
+            return Err(AppError::InvalidRequest(format!(
+                "{label} version {} is not supported",
+                persisted.version
+            )));
+        }
+        let x25519_secret = X25519Secret::from(decode_fixed_32(
+            &persisted.x25519_secret,
+            "x25519 pairing secret",
+        )?);
+        let x25519_public = X25519PublicKey::from(&x25519_secret).to_bytes();
+        let ml_kem_secret_bytes =
+            decode_b64(&persisted.ml_kem_secret, "ml-kem-768 pairing secret")?;
+        let ml_kem_secret =
+            mlkem768::SecretKey::from_bytes(&ml_kem_secret_bytes).map_err(|_| {
+                AppError::InvalidRequest("ml-kem-768 pairing secret is invalid".to_owned())
+            })?;
+        let ml_kem_public = decode_b64(&persisted.ml_kem_public, "ml-kem-768 pairing public key")?;
+        mlkem768::PublicKey::from_bytes(&ml_kem_public).map_err(|_| {
+            AppError::InvalidRequest("ml-kem-768 pairing public key is invalid".to_owned())
+        })?;
+
+        Ok(Self {
+            x25519_secret: Arc::new(x25519_secret),
+            x25519_public,
+            ml_kem_secret: Arc::new(ml_kem_secret),
+            ml_kem_public,
+        })
     }
 
     #[cfg(test)]
@@ -142,6 +206,15 @@ impl PairingKeys {
             })
             .collect()
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedPairingKeys {
+    version: u8,
+    x25519_secret: String,
+    ml_kem_public: String,
+    ml_kem_secret: String,
 }
 
 fn pairing_advertise_host(config_host: &str) -> String {
@@ -468,6 +541,19 @@ fn decode_fixed_24(value: &str, label: &str) -> Result<[u8; 24], AppError> {
         .map_err(|_| AppError::InvalidRequest(format!("{label} must be 24 bytes")))
 }
 
+#[cfg(unix)]
+async fn set_owner_only_permissions(path: &Path) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn set_owner_only_permissions(_path: &Path) -> Result<(), AppError> {
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QrRenderMode {
     HalfBlock,
@@ -722,6 +808,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pairing_keys_persist_across_restarts() {
+        let data_dir = unique_tmp_dir("todex-pairing-keys-persist");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let config = test_config();
+        let first = PairingKeys::load_or_generate(&data_dir).await.unwrap();
+        let first_x25519 = first
+            .pairing_link_json(&config, 7345, PairingEncryption::X25519)
+            .unwrap();
+        let first_ml_kem = first
+            .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
+            .unwrap();
+
+        let second = PairingKeys::load_or_generate(&data_dir).await.unwrap();
+        assert_eq!(
+            second
+                .pairing_link_json(&config, 7345, PairingEncryption::X25519)
+                .unwrap(),
+            first_x25519
+        );
+        assert_eq!(
+            second
+                .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
+                .unwrap(),
+            first_ml_kem
+        );
+
+        let first_value: serde_json::Value = serde_json::from_str(&first_x25519).unwrap();
+        let server_public = decode_fixed_32(
+            first_value["protocol"]["publicKey"].as_str().unwrap(),
+            "persisted x25519 public key",
+        )
+        .unwrap();
+        let client = X25519Secret::random_from_rng(OsRng);
+        let client_public = X25519PublicKey::from(&client).to_bytes();
+        let query = format!("enc=x25519&client_key={}", encode_b64(&client_public));
+        let session = TransportCryptoSession::from_headers_and_query(
+            &second,
+            &HeaderMap::new(),
+            Some(&query),
+        )
+        .unwrap()
+        .unwrap();
+        let shared = client.diffie_hellman(&X25519PublicKey::from(server_public));
+        let salt = [server_public.as_slice(), client_public.as_slice()].concat();
+        let mut key = [0_u8; 32];
+        Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes())
+            .expand(b"x25519", &mut key)
+            .unwrap();
+        let client_session = TransportCryptoSession {
+            protocol: EncryptionProtocol::X25519,
+            cipher: Arc::new(XChaCha20Poly1305::new(Key::from_slice(&key))),
+            send_counter: Arc::new(AtomicU64::new(0)),
+        };
+
+        let wrapped = session.encrypt_server_text(r#"{"type":"pong"}"#).unwrap();
+        assert_eq!(
+            client_session
+                .decrypt_server_text_for_tests(&wrapped)
+                .unwrap(),
+            r#"{"type":"pong"}"#
+        );
+
+        tokio::fs::remove_dir_all(&data_dir).await.unwrap();
+    }
+
     #[test]
     fn ml_kem_768_encrypted_frame_round_trips() {
         let keys = PairingKeys::generate();
@@ -773,5 +925,9 @@ mod tests {
                 auth_token: Some("token".to_owned()),
             },
         }
+    }
+
+    fn unique_tmp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
     }
 }
