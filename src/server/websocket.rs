@@ -1,3 +1,8 @@
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
 use axum::extract::ws::{Message, WebSocket};
 use axum::http::HeaderMap;
 use futures_util::{SinkExt, StreamExt};
@@ -17,6 +22,11 @@ use crate::{
         ClientMessage, ClientMessageKind, CodexCloudTaskApplyRequest, CodexCloudTaskCreateRequest,
         CodexCloudTaskIdRequest, CodexCloudTaskListRequest, CodexCloudTaskSiblingAttemptsRequest,
         CodexGatewayAction, CodexLifecycleRequest, CodexLocalErrorCode, ServerEvent,
+    },
+    transport::{
+        encode_server_event, encode_transport_error, parse_transport_message,
+        transport_hello_state, TransportChunkReassembler, TransportClientMessage,
+        TransportHelloState,
     },
     transport_crypto::TransportCryptoSession,
 };
@@ -100,6 +110,11 @@ pub async fn handle_socket(
     let (mut sender, mut receiver) = socket.split();
     let mut event_rx = state.events.subscribe();
     let send_crypto = crypto.clone();
+    let transport_state = Arc::new(tokio::sync::Mutex::new(None::<TransportHelloState>));
+    let send_transport_state = transport_state.clone();
+    let stream_id = format!("ws_{}", uuid::Uuid::new_v4().simple());
+    let seq_id = Arc::new(AtomicU64::new(0));
+    let send_seq_id = seq_id.clone();
 
     let send_task = tokio::spawn(async move {
         loop {
@@ -109,6 +124,9 @@ pub async fn handle_socket(
                     if send_serialized_event(
                         &mut sender,
                         &send_crypto,
+                        send_transport_state.clone(),
+                        &stream_id,
+                        send_seq_id.clone(),
                         ServerEvent::from(error_event(
                             AppError::StreamLagged(skipped),
                             None,
@@ -127,6 +145,9 @@ pub async fn handle_socket(
                     let _ = send_serialized_event(
                         &mut sender,
                         &send_crypto,
+                        send_transport_state.clone(),
+                        &stream_id,
+                        send_seq_id.clone(),
                         ServerEvent::from(error_event(AppError::StreamClosed, None, None, None)),
                     )
                     .await;
@@ -134,14 +155,23 @@ pub async fn handle_socket(
                 }
             };
 
-            if send_serialized_event(&mut sender, &send_crypto, ServerEvent::from(event))
-                .await
-                .is_err()
+            if send_serialized_event(
+                &mut sender,
+                &send_crypto,
+                send_transport_state.clone(),
+                &stream_id,
+                send_seq_id.clone(),
+                ServerEvent::from(event),
+            )
+            .await
+            .is_err()
             {
                 break;
             }
         }
     });
+
+    let mut chunk_reassembler = TransportChunkReassembler::default();
 
     while let Some(frame) = receiver.next().await {
         let frame = match frame {
@@ -167,6 +197,34 @@ pub async fn handle_socket(
                     },
                     None => text.to_string(),
                 };
+                match handle_transport_frame(
+                    &text,
+                    &state,
+                    &transport_state,
+                    &mut chunk_reassembler,
+                )
+                .await
+                {
+                    Ok(TransportFrameAction::Dispatch(text)) => {
+                        if let Err(error) = dispatch_client_text(&text, &state, auth.as_ref()).await
+                        {
+                            state
+                                .events
+                                .publish(error_event(error, None, None, None))
+                                .await;
+                        }
+                        continue;
+                    }
+                    Ok(TransportFrameAction::Consumed) => continue,
+                    Ok(TransportFrameAction::Passthrough) => {}
+                    Err(error) => {
+                        state
+                            .events
+                            .publish(error_event(error, None, None, None))
+                            .await;
+                        continue;
+                    }
+                }
                 match serde_json::from_str::<ClientMessage>(&text) {
                     Ok(message) => {
                         if let Err(error) = dispatch(message, &state, auth.as_ref()).await {
@@ -872,17 +930,161 @@ async fn dispatch(
     Ok(())
 }
 
+enum TransportFrameAction {
+    Consumed,
+    Dispatch(String),
+    Passthrough,
+}
+
+async fn handle_transport_frame(
+    text: &str,
+    state: &AppState,
+    transport_state: &Arc<tokio::sync::Mutex<Option<TransportHelloState>>>,
+    chunk_reassembler: &mut TransportChunkReassembler,
+) -> Result<TransportFrameAction, AppError> {
+    let Some(message) = parse_transport_message(text)? else {
+        return Ok(TransportFrameAction::Passthrough);
+    };
+
+    match message {
+        TransportClientMessage::Hello(hello) => {
+            let hello = transport_hello_state(hello)?;
+            state.transport_acks.apply_hello(&hello).await;
+            *transport_state.lock().await = Some(hello.clone());
+            state
+                .events
+                .publish(EventRecord::new(
+                    "transport.handshake.ready",
+                    None,
+                    None,
+                    None,
+                    json!({
+                        "clientId": hello.client_id.clone(),
+                        "transportVersion": crate::transport::TRANSPORT_VERSION,
+                        "capabilities": hello.capabilities.clone(),
+                    }),
+                ))
+                .await;
+            replay_ack_cursors_for_hello(state, &hello).await?;
+            Ok(TransportFrameAction::Consumed)
+        }
+        TransportClientMessage::Ack(ack) => {
+            if let Some(hello) = transport_state.lock().await.clone() {
+                state.transport_acks.apply_ack(&hello.client_id, &ack).await;
+            }
+            Ok(TransportFrameAction::Consumed)
+        }
+        TransportClientMessage::Event(event) => {
+            let text = serde_json::to_string(&event.payload).map_err(|err| {
+                AppError::InvalidRequest(format!("failed to decode transport event payload: {err}"))
+            })?;
+            Ok(TransportFrameAction::Dispatch(text))
+        }
+        TransportClientMessage::Chunk(chunk) => match chunk_reassembler.push(chunk)? {
+            Some(text) => {
+                let Some(message) = parse_transport_message(&text)? else {
+                    return Ok(TransportFrameAction::Dispatch(text));
+                };
+                match message {
+                    TransportClientMessage::Event(event) => {
+                        let text = serde_json::to_string(&event.payload).map_err(|err| {
+                            AppError::InvalidRequest(format!(
+                                "failed to decode chunked transport event payload: {err}"
+                            ))
+                        })?;
+                        Ok(TransportFrameAction::Dispatch(text))
+                    }
+                    TransportClientMessage::Ack(ack) => {
+                        if let Some(hello) = transport_state.lock().await.clone() {
+                            state.transport_acks.apply_ack(&hello.client_id, &ack).await;
+                        }
+                        Ok(TransportFrameAction::Consumed)
+                    }
+                    TransportClientMessage::Hello(hello) => {
+                        let hello = transport_hello_state(hello)?;
+                        state.transport_acks.apply_hello(&hello).await;
+                        *transport_state.lock().await = Some(hello.clone());
+                        replay_ack_cursors_for_hello(state, &hello).await?;
+                        Ok(TransportFrameAction::Consumed)
+                    }
+                    TransportClientMessage::Chunk(_) => Err(AppError::InvalidRequest(
+                        "nested transport chunks are not supported".to_owned(),
+                    )),
+                }
+            }
+            None => Ok(TransportFrameAction::Consumed),
+        },
+    }
+}
+
+async fn replay_ack_cursors_for_hello(
+    state: &AppState,
+    hello: &TransportHelloState,
+) -> Result<(), AppError> {
+    for (session_id, cursor) in &hello.session_cursors {
+        let cursor = state
+            .transport_acks
+            .cursor_for(&hello.client_id, session_id)
+            .await
+            .unwrap_or(*cursor);
+        let replay = state
+            .codex_gateway
+            .replay_events(session_id, Some(cursor), 5000)
+            .await?;
+        for record in replay.events {
+            publish_codex_gateway_record(state, record).await;
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch_client_text(
+    text: &str,
+    state: &AppState,
+    auth: Option<&AuthContext>,
+) -> Result<(), AppError> {
+    let message = serde_json::from_str::<ClientMessage>(text).map_err(|err| {
+        AppError::InvalidRequest(format!("failed to parse client message: {err}"))
+    })?;
+    dispatch(message, state, auth).await
+}
+
 async fn send_serialized_event(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     crypto: &Option<TransportCryptoSession>,
+    transport_state: Arc<tokio::sync::Mutex<Option<TransportHelloState>>>,
+    stream_id: &str,
+    seq_id: Arc<AtomicU64>,
     event: ServerEvent,
 ) -> Result<(), axum::Error> {
-    let json = match serde_json::to_string(&event) {
-        Ok(json) => json,
-        Err(err) => {
-            warn!(error = %err, "failed to serialize server event");
-            return Ok(());
+    let frames = if transport_state.lock().await.is_some() {
+        let next_seq_id = seq_id.fetch_add(1, Ordering::Relaxed) + 1;
+        encode_server_event(event, stream_id, next_seq_id)
+    } else {
+        match serde_json::to_string(&event) {
+            Ok(json) => vec![json],
+            Err(err) => {
+                warn!(error = %err, "failed to serialize server event");
+                return Ok(());
+            }
         }
+    };
+
+    for json in frames {
+        send_serialized_text(sender, crypto, json).await?;
+    }
+    Ok(())
+}
+
+async fn send_serialized_text(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    crypto: &Option<TransportCryptoSession>,
+    json: String,
+) -> Result<(), axum::Error> {
+    let json = if json.is_empty() {
+        encode_transport_error("EMPTY_FRAME", "transport produced an empty frame")
+    } else {
+        json
     };
     let json = match crypto {
         Some(crypto) => match crypto.encrypt_server_text(&json) {
