@@ -31,6 +31,8 @@ use crate::{
     transport_crypto::TransportCryptoSession,
 };
 
+const TRANSPORT_HELLO_REPLAY_LIMIT: usize = 200;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthContext {
     pub principal_id: String,
@@ -1029,7 +1031,7 @@ async fn replay_ack_cursors_for_hello(
             .unwrap_or(*cursor);
         let replay = state
             .codex_gateway
-            .replay_events(session_id, Some(cursor), 5000)
+            .replay_events(session_id, Some(cursor), TRANSPORT_HELLO_REPLAY_LIMIT)
             .await?;
         for record in replay.events {
             publish_codex_gateway_record(state, record).await;
