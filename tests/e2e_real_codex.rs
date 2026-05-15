@@ -34,6 +34,70 @@ impl Drop for Daemon {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fake_codex_history_thread_list_read_and_resume_over_websocket() {
+    let daemon = spawn_fake_history_daemon().await;
+    let mut ws = connect_ws(daemon.port, Some(TOKEN)).await;
+    let session = "cdxs_fake_history";
+
+    start_session(&mut ws, session, &daemon.workspace_root).await;
+    let list = send_local_request(
+        &mut ws,
+        session,
+        "thread-list-cli",
+        "thread/list",
+        json!({
+            "cwd": daemon.workspace_root.display().to_string(),
+            "limit": 100,
+            "sortKey": "updated_at",
+            "sortDirection": "desc",
+            "sourceKinds": ["cli", "vscode", "appServer"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        list["payload"]["data"]["result"]["data"][0]["id"],
+        "thr_cli_shared"
+    );
+
+    let read = send_local_request(
+        &mut ws,
+        session,
+        "thread-read-cli",
+        "thread/read",
+        json!({ "threadId": "thr_cli_shared", "includeTurns": true }),
+    )
+    .await;
+    let turns = &read["payload"]["data"]["result"]["thread"]["turns"];
+    assert_eq!(
+        turns[0]["items"][0]["content"][0]["text"],
+        "CLI created prompt"
+    );
+    assert_eq!(turns[0]["items"][1]["text"], "History visible in app");
+
+    let resume = send_local_request(
+        &mut ws,
+        session,
+        "thread-resume-cli",
+        "thread/resume",
+        json!({ "threadId": "thr_cli_shared" }),
+    )
+    .await;
+    assert_eq!(
+        resume["payload"]["data"]["result"]["thread"]["id"],
+        "thr_cli_shared"
+    );
+
+    let wire_log = fs::read_to_string(daemon.root.join("wire.log"))
+        .expect("fake codex should receive app-server wire messages");
+    assert!(wire_log.contains("\"method\":\"thread/list\""));
+    assert!(wire_log.contains("\"method\":\"thread/read\""));
+    assert!(wire_log.contains("\"method\":\"thread/resume\""));
+    assert!(wire_log.contains("\"sourceKinds\":[\"cli\",\"vscode\",\"appServer\"]"));
+
+    stop_session(&mut ws, session).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires TODEX_REAL_E2E=1, real codex binary, Codex login, and model access"]
 async fn real_codex_http_ws_auth_and_protocol_boundaries() {
     require_real_e2e();
@@ -559,6 +623,87 @@ async fn spawn_daemon() -> Daemon {
     };
     wait_for_health(daemon.port).await;
     daemon
+}
+
+async fn spawn_fake_history_daemon() -> Daemon {
+    let root = unique_tmp_dir("todex-fake-history-e2e");
+    let data_dir = root.join("data");
+    let workspace_root = root.join("workspace");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    fs::create_dir_all(&workspace_root).expect("create workspace dir");
+    let fake_codex = write_fake_history_codex_binary(&root, &workspace_root);
+    let port = free_port();
+    let bin = env!("CARGO_BIN_EXE_todex-agentd");
+    let child = Command::new(bin)
+        .arg("serve")
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--workspace-root")
+        .arg(&workspace_root)
+        .env("TODEX_AGENTD_AUTH_TOKEN", TOKEN)
+        .env("TODEX_AGENTD_CODEX_BIN", &fake_codex)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn todex-agentd with fake codex");
+
+    let daemon = Daemon {
+        child,
+        port,
+        root,
+        data_dir,
+        workspace_root,
+    };
+    wait_for_health(daemon.port).await;
+    daemon
+}
+
+fn write_fake_history_codex_binary(root: &Path, workspace_root: &Path) -> PathBuf {
+    fs::create_dir_all(root).expect("create fake codex dir");
+    let binary = root.join("codex-fake-history");
+    let wire_log = root.join("wire.log");
+    let cwd_json = serde_json::to_string(&workspace_root.display().to_string())
+        .expect("serialize cwd for fake response");
+    let script = format!(
+        r#"#!/bin/sh
+printf '{{"type":"codex.control.ready"}}\n'
+while IFS= read -r line; do
+printf '%s\n' "$line" >> '{wire_log}'
+case "$line" in
+*'"method":"thread/list"'*)
+printf '{{"id":"thread-list-cli","result":{{"data":[{{"id":"thr_cli_shared","sessionId":"sess_cli_shared","name":"CLI shared thread","preview":"CLI created prompt","cwd":{cwd},"status":{{"type":"notLoaded"}},"createdAt":1700000000,"updatedAt":1700000060,"source":"cli"}}]}}}}\n'
+;;
+*'"method":"thread/read"'*)
+printf '{{"id":"thread-read-cli","result":{{"thread":{{"id":"thr_cli_shared","sessionId":"sess_cli_shared","name":"CLI shared thread","preview":"CLI created prompt","cwd":{cwd},"status":{{"type":"notLoaded"}},"createdAt":1700000000,"updatedAt":1700000060,"source":"cli","turns":[{{"id":"turn_cli_1","status":"completed","startedAt":1700000001,"completedAt":1700000005,"items":[{{"type":"userMessage","id":"user_cli_1","content":[{{"type":"text","text":"CLI created prompt"}}]}},{{"type":"agentMessage","id":"agent_cli_1","text":"History visible in app"}}]}}]}}}}}}\n'
+;;
+*'"method":"thread/resume"'*)
+printf '{{"id":"thread-resume-cli","result":{{"thread":{{"id":"thr_cli_shared","sessionId":"sess_cli_shared","name":"CLI shared thread","preview":"CLI created prompt","cwd":{cwd},"status":{{"type":"ready"}},"createdAt":1700000000,"updatedAt":1700000060,"source":"cli","turns":[{{"id":"turn_cli_1","status":"completed","startedAt":1700000001,"completedAt":1700000005,"items":[{{"type":"userMessage","id":"user_cli_1","content":[{{"type":"text","text":"CLI created prompt"}}]}},{{"type":"agentMessage","id":"agent_cli_1","text":"History visible in app"}}]}}]}}}}}}\n'
+;;
+*'"method":"stop"'*)
+printf '{{"type":"codex.control.stopped","payload":{{"lifecycleState":"stopped"}}}}\n'
+;;
+esac
+done
+"#,
+        wire_log = wire_log.display(),
+        cwd = cwd_json,
+    );
+    fs::write(&binary, script).expect("write fake codex binary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&binary)
+            .expect("fake codex metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).expect("chmod fake codex");
+    }
+    binary
 }
 
 async fn start_session(ws: &mut Ws, session: &str, cwd: impl AsRef<Path>) {
