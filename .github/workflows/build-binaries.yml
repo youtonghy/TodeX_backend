@@ -1,0 +1,89 @@
+name: Build backend binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      timezone:
+        description: Timezone used for YYMMDDHHMM build versions
+        required: true
+        default: Australia/Victoria
+        type: string
+  push:
+    tags:
+      - "backend-v*"
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  BUILD_TIMEZONE: ${{ github.event.inputs.timezone || 'Australia/Victoria' }}
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Generate build version
+        shell: bash
+        run: |
+          build_version="$(TZ="${BUILD_TIMEZONE}" date +'%y%m%d%H%M')"
+          echo "TODEX_BUILD_VERSION=${build_version}" >> "${GITHUB_ENV}"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package binary
+        id: package
+        shell: bash
+        run: |
+          platform="$(printf '%s-%s' "${RUNNER_OS}" "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
+          package_name="todex-agentd-${TODEX_BUILD_VERSION}-${platform}"
+          package_dir="dist/${package_name}"
+          binary_name="todex-agentd"
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            binary_name="todex-agentd.exe"
+          fi
+
+          mkdir -p "${package_dir}"
+          cp "target/release/${binary_name}" "${package_dir}/"
+          cp README.md LICENSE "${package_dir}/"
+          cp docs/BUILD_RUN.md "${package_dir}/"
+
+          pushd dist
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            archive_name="${package_name}.zip"
+            7z a "${archive_name}" "${package_name}" > /dev/null
+          else
+            archive_name="${package_name}.tar.gz"
+            tar -czf "${archive_name}" "${package_name}"
+          fi
+          popd
+
+          echo "artifact_name=${package_name}" >> "${GITHUB_OUTPUT}"
+          echo "artifact_path=dist/${archive_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.artifact_path }}
+          if-no-files-found: error
