@@ -11,14 +11,16 @@
 - 本地 Codex 会话管理：`start`、`status`、`stop`、`turn`、`attach`、`replay`、`interrupt`
 - 工作区文件检索：为前端 `@` 引用提供目录和文件建议
 - 认证与配置：支持 Bearer token、环境变量、`config.toml`
-- 交互式 TUI：可启动、停止服务，保存监听地址，并显示 App 配对二维码
+- 后台进程模式：可作为独立 daemon 持续运行，并通过 pidfile 管理状态
+- 交互式 TUI：作为控制器启动、停止 daemon，保存监听地址，并显示 App 配对二维码
 
 - HTTP endpoints: `/health`, `/v1/version`, `/v1/workspace/entries`
 - WebSocket endpoint: `/v1/ws`, with optional X25519 or ML-KEM-768 transport encryption
 - Local Codex session control: `start`, `status`, `stop`, `turn`, `attach`, `replay`, `interrupt`
 - Workspace file lookup for the frontend `@` picker
 - Auth and config via Bearer token, environment variables, and `config.toml`
-- Interactive TUI for starting/stopping the service, saving host/port, and showing the app pairing QR
+- Persistent daemon mode managed through a pidfile
+- Interactive TUI as a controller for starting/stopping the daemon, saving host/port, and showing the app pairing QR
 
 ## 快速开始 / Quick Start
 
@@ -30,14 +32,34 @@ cargo build
 
 ### 2. 启动服务 / Run the server
 
+后台 daemon：
+
+Persistent daemon:
+
+```bash
+cargo run -- daemon start
+```
+
+前台运行：
+
+Foreground server:
+
 ```bash
 cargo run -- serve
 ```
 
-### 3. 或者使用 TUI / Or use the TUI
+### 3. 或者使用 TUI 控制 daemon / Or control the daemon with the TUI
 
 ```bash
 cargo run -- tui
+```
+
+在 TUI 中启动后，退出 TUI 不会停止 daemon；TUI 只是控制器。停止服务可在 TUI 中执行 Stop，或运行：
+
+After the TUI starts the daemon, quitting the TUI leaves it running. Stop it from the TUI or run:
+
+```bash
+cargo run -- daemon stop
 ```
 
 默认监听 `127.0.0.1:7345`，数据目录是 `~/.todex-agent`，默认 workspace 根目录是 `~/projects`。
@@ -74,13 +96,13 @@ Priority order:
 
 ## 使用方式 / How to Use
 
-1. 先启动后端服务。
+1. 先启动后端 daemon，或用 `serve` 前台运行。
 2. 让前端客户端连接到 `http://127.0.0.1:7345` 或你自己的地址。
 3. 在设置里填写 `Auth token` 和 `Tenant id`，或从 TUI 扫描配对二维码一键导入地址、token 和加密公钥。
 4. 通过 `/v1/workspace/entries` 为 `@` 引用提供文件建议。
 5. 通过 WebSocket `/v1/ws` 收发协议事件。
 
-1. Start the backend service first.
+1. Start the backend daemon first, or run `serve` in the foreground.
 2. Point the frontend client to `http://127.0.0.1:7345` or your own host.
 3. Fill in `Auth token` and `Tenant id` in the client settings, or scan the TUI pairing QR to import the address, token, and encryption public key.
 4. Use `/v1/workspace/entries` to power `@` file suggestions.

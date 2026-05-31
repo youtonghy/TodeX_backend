@@ -6,6 +6,7 @@
 
 - 包名：`todex-agentd`
 - 非交互运行入口：`cargo run -- serve`
+- 后台 daemon 控制入口：`cargo run -- daemon start|stop|restart|status`
 - 交互式 TUI 启动入口：`cargo run -- tui`
 - 默认监听：`127.0.0.1:7345`
 - 默认 WebSocket：`ws://127.0.0.1:7345/v1/ws`
@@ -122,6 +123,18 @@ TODEX_REAL_E2E=1 cargo test --test e2e_real_codex -- --ignored --test-threads=1
 
 ### 默认运行
 
+后台 daemon 运行：
+
+```bash
+cargo run -- daemon start
+cargo run -- daemon status
+cargo run -- daemon stop
+```
+
+daemon 启动后会写入 `~/.todex-agent/daemon.json`，日志写入 `~/.todex-agent/logs/todex-agentd-daemon.log`。
+
+前台运行：
+
 ```bash
 cargo run -- serve
 ```
@@ -132,16 +145,16 @@ cargo run -- serve
 cargo run -- tui
 ```
 
-TUI 默认进入未启动状态，可以在界面里查看当前监听地址、数据目录、workspace 根目录、运行状态、运行时长和活跃 Codex adapter 数量。常用快捷键：
+TUI 是 daemon 控制器，不再承载核心服务进程。可以在界面里查看当前监听地址、数据目录、workspace 根目录、daemon pid 和运行时长。常用快捷键：
 
 | 按键 | 作用 |
 | --- | --- |
-| `s` | 启动或停止服务 |
-| `r` | 重启服务 |
+| `s` | 启动或停止 daemon |
+| `r` | 重启 daemon |
 | `h` | 修改监听 IP |
 | `p` | 修改监听端口 |
 | `w` | 保存监听 IP 和端口到 `$TODEX_AGENTD_DATA_DIR/config.toml` |
-| `q` / `Esc` | 退出 TUI，并停止由 TUI 启动的服务 |
+| `q` / `Esc` | 退出 TUI；如果 daemon 已启动，它会继续在后台运行 |
 
 也可以用方向键选择操作项，然后按 Enter 执行。
 

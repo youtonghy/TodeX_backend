@@ -48,10 +48,6 @@ impl AppState {
         })
     }
 
-    pub fn websocket_connection_count(&self) -> usize {
-        self.websocket_connections.load(Ordering::Relaxed)
-    }
-
     pub fn increment_websocket_connections(&self) -> usize {
         self.websocket_connections.fetch_add(1, Ordering::Relaxed) + 1
     }

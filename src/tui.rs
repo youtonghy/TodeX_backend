@@ -20,11 +20,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use serde_json::Value;
-use tokio::sync::broadcast;
 
 use crate::config::{Config, PairingEncryption, ServeArgs};
+use crate::daemon::{self, DaemonProcess};
 use crate::event::EventRecord;
-use crate::server_runner::ManagedServer;
 use crate::transport_crypto::render_qr_text_for_bounds;
 
 const ACTION_COUNT: usize = 9;
@@ -39,8 +38,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let mut app = TuiApp::new(config);
 
     loop {
-        app.refresh_server_status().await;
-        app.drain_live_events();
+        app.refresh_daemon_status();
         terminal.draw(|frame| app.render(frame))?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -60,7 +58,6 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         }
     }
 
-    app.stop_server().await?;
     Ok(())
 }
 
@@ -106,7 +103,7 @@ struct PairingQrPopup {
 
 struct TuiApp {
     config: Config,
-    server: Option<ManagedServer>,
+    daemon: Option<DaemonProcess>,
     view: TuiView,
     selected_action: usize,
     selected_session: usize,
@@ -119,7 +116,6 @@ struct TuiApp {
     observer_scroll: usize,
     log_follow_tail: bool,
     pairing_qr: Option<PairingQr>,
-    event_rx: Option<broadcast::Receiver<EventRecord>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,55 +128,19 @@ impl TuiApp {
     fn new(config: Config) -> Self {
         Self {
             config,
-            server: None,
+            daemon: None,
             view: TuiView::Control,
             selected_action: 0,
             selected_session: 0,
             input: None,
             last_error: None,
-            notice: "Service is stopped. Select Start when ready.".to_owned(),
+            notice: "Daemon is stopped. Select Start when ready.".to_owned(),
             live_logs: VecDeque::new(),
             live_events: Vec::new(),
             log_scroll: 0,
             observer_scroll: 0,
             log_follow_tail: true,
             pairing_qr: None,
-            event_rx: None,
-        }
-    }
-
-    fn drain_live_events(&mut self) {
-        loop {
-            let result = match self.event_rx.as_mut() {
-                Some(event_rx) => event_rx.try_recv(),
-                None => return,
-            };
-
-            match result {
-                Ok(event) => {
-                    self.push_log(summarize_event(&event));
-                    self.push_event(event);
-                }
-                Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                    self.push_log(format!("Live event stream skipped {skipped} stale events."));
-                }
-                Err(broadcast::error::TryRecvError::Closed) => {
-                    self.push_log("Live event stream closed.".to_owned());
-                    self.event_rx = None;
-                    break;
-                }
-            }
-        }
-    }
-
-    fn push_event(&mut self, event: EventRecord) {
-        self.live_events.push(event);
-        let session_count = self.observer_state().sessions.len();
-        if session_count == 0 {
-            self.selected_session = 0;
-        } else {
-            self.selected_session = self.selected_session.min(session_count - 1);
         }
     }
 
@@ -240,14 +200,16 @@ impl TuiApp {
         self.observer_scroll = 0;
     }
 
-    fn show_pairing_qr(&mut self) {
-        let qr = match self.server.as_ref() {
-            Some(server) => server.pairing_qr_payloads(self.config.pairing_encryption),
-            None => {
-                self.notice = "Start the service before showing a pairing QR.".to_owned();
-                return;
-            }
+    async fn show_pairing_qr(&mut self) {
+        let Some(process) = self.daemon.as_ref() else {
+            self.notice = "Start the daemon before showing a pairing QR.".to_owned();
+            return;
         };
+
+        let mut config = self.config.clone();
+        config.host = process.host.clone();
+        config.port = process.port;
+        let qr = daemon::pairing_qr_payloads(&config, process.port).await;
         match qr {
             Ok(payloads) => {
                 let total = payloads.len();
@@ -264,8 +226,9 @@ impl TuiApp {
             Err(error) => {
                 self.notice = "Failed to render pairing QR.".to_owned();
                 self.last_error = Some(error.to_string());
+                return;
             }
-        }
+        };
     }
 
     fn close_pairing_qr(&mut self) {
@@ -354,14 +317,14 @@ impl TuiApp {
                     return Ok(true);
                 }
             }
-            KeyCode::Char('s') => self.toggle_server().await?,
-            KeyCode::Char('r') => self.restart_server().await?,
+            KeyCode::Char('s') => self.toggle_daemon().await?,
+            KeyCode::Char('r') => self.restart_daemon().await?,
             KeyCode::Char('h') => self.start_host_edit(),
             KeyCode::Char('p') => self.start_port_edit(),
             KeyCode::Char('e') => self.cycle_pairing_encryption(),
             KeyCode::Char('w') => self.save_config()?,
             KeyCode::Char('l') => self.save_logs()?,
-            KeyCode::Char('g') => self.show_pairing_qr(),
+            KeyCode::Char('g') => self.show_pairing_qr().await,
             KeyCode::PageUp => self.scroll_logs_up(LOG_SCROLL_STEP),
             KeyCode::PageDown => self.scroll_logs_down(LOG_SCROLL_STEP),
             KeyCode::Home => self.scroll_logs_to_top(),
@@ -397,13 +360,13 @@ impl TuiApp {
 
     async fn run_selected_action(&mut self) -> Result<bool> {
         match self.selected_action {
-            0 => self.toggle_server().await?,
-            1 => self.restart_server().await?,
+            0 => self.toggle_daemon().await?,
+            1 => self.restart_daemon().await?,
             2 => self.start_host_edit(),
             3 => self.start_port_edit(),
             4 => self.cycle_pairing_encryption(),
             5 => self.save_config()?,
-            6 => self.show_pairing_qr(),
+            6 => self.show_pairing_qr().await,
             7 => self.save_logs()?,
             8 => return Ok(true),
             _ => {}
@@ -411,95 +374,120 @@ impl TuiApp {
         Ok(false)
     }
 
-    async fn toggle_server(&mut self) -> Result<()> {
-        if self.server.is_some() {
-            self.stop_server().await
+    async fn toggle_daemon(&mut self) -> Result<()> {
+        if self.daemon.is_some() {
+            self.stop_daemon().await
         } else {
-            self.start_server().await
+            self.start_daemon().await
         }
     }
 
-    async fn start_server(&mut self) -> Result<()> {
-        if self.server.is_some() {
-            self.notice = "Service is already running.".to_owned();
+    async fn start_daemon(&mut self) -> Result<()> {
+        if self.daemon.is_some() {
+            self.notice = "Daemon is already running.".to_owned();
             return Ok(());
         }
 
         let mut config = self.config.clone();
         config.host = self.config.host.trim().to_owned();
         config.port = self.config.port;
-        self.notice = "Starting service...".to_owned();
-        match ManagedServer::start(config).await {
-            Ok(server) => {
-                self.notice = format!("Service started on {}.", server.addr());
+        self.notice = "Starting daemon...".to_owned();
+        match daemon::start(config).await {
+            Ok(process) => {
+                self.notice = format!(
+                    "Daemon started on {} with pid {}. It will keep running after the TUI exits.",
+                    process.listen_addr(),
+                    process.pid
+                );
                 self.last_error = None;
                 self.push_log(self.notice.clone());
-                self.event_rx = Some(server.subscribe_events());
-                self.server = Some(server);
+                self.daemon = Some(process);
             }
             Err(error) => {
                 self.last_error = Some(error.to_string());
-                self.notice = "Service failed to start.".to_owned();
+                self.notice = "Daemon failed to start.".to_owned();
                 self.push_log(format!("{} {error}", self.notice.clone()));
             }
         }
         Ok(())
     }
 
-    async fn stop_server(&mut self) -> Result<()> {
-        let Some(server) = self.server.take() else {
-            self.notice = "Service is already stopped.".to_owned();
-            return Ok(());
-        };
-
-        self.notice = "Stopping service...".to_owned();
+    async fn stop_daemon(&mut self) -> Result<()> {
+        self.notice = "Stopping daemon...".to_owned();
         self.push_log(self.notice.clone());
-        match server.stop().await {
-            Ok(()) => {
-                self.notice = "Service stopped.".to_owned();
+        match daemon::stop(&self.config).await {
+            Ok(Some(process)) => {
+                self.notice = format!("Daemon stopped (pid {}).", process.pid);
                 self.last_error = None;
                 self.push_log(self.notice.clone());
+                self.daemon = None;
+            }
+            Ok(None) => {
+                self.notice = "Daemon is already stopped.".to_owned();
+                self.last_error = None;
+                self.push_log(self.notice.clone());
+                self.daemon = None;
             }
             Err(error) => {
-                self.notice = "Service stopped with an error.".to_owned();
+                self.notice = "Daemon stop failed.".to_owned();
                 self.last_error = Some(error.to_string());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
             }
         }
-        self.drain_live_events();
-        self.event_rx = None;
         Ok(())
     }
 
-    async fn restart_server(&mut self) -> Result<()> {
-        if self.server.is_some() {
-            self.stop_server().await?;
+    async fn restart_daemon(&mut self) -> Result<()> {
+        let mut config = self.config.clone();
+        config.host = self.config.host.trim().to_owned();
+        config.port = self.config.port;
+        self.notice = "Restarting daemon...".to_owned();
+        self.push_log(self.notice.clone());
+        match daemon::restart(config).await {
+            Ok(process) => {
+                self.notice = format!(
+                    "Daemon restarted on {} with pid {}.",
+                    process.listen_addr(),
+                    process.pid
+                );
+                self.last_error = None;
+                self.push_log(self.notice.clone());
+                self.daemon = Some(process);
+            }
+            Err(error) => {
+                self.notice = "Daemon restart failed.".to_owned();
+                self.last_error = Some(error.to_string());
+                self.push_log(format!("{} {}", self.notice.clone(), error));
+            }
         }
-        self.start_server().await
+        Ok(())
     }
 
-    async fn refresh_server_status(&mut self) {
-        let Some(server) = self.server.as_ref() else {
-            return;
-        };
-        if !server.is_finished() {
-            return;
-        }
-        if let Some(server) = self.server.take() {
-            match server.wait().await {
-                Ok(()) => {
-                    self.notice = "Service exited.".to_owned();
-                    self.last_error = None;
-                    self.push_log(self.notice.clone());
+    fn refresh_daemon_status(&mut self) {
+        let previous_pid = self.daemon.as_ref().map(|process| process.pid);
+        match daemon::status(&self.config) {
+            Ok(next) => {
+                let next_pid = next.as_ref().map(|process| process.pid);
+                if previous_pid != next_pid {
+                    match next.as_ref() {
+                        Some(process) => self.push_log(format!(
+                            "Detected daemon pid {} on {}.",
+                            process.pid,
+                            process.listen_addr()
+                        )),
+                        None if previous_pid.is_some() => {
+                            self.push_log("Daemon is no longer running.".to_owned())
+                        }
+                        None => {}
+                    }
                 }
-                Err(error) => {
-                    self.notice = "Service exited unexpectedly.".to_owned();
-                    self.last_error = Some(error.to_string());
-                    self.push_log(format!("{} {}", self.notice.clone(), error));
-                }
+                self.daemon = next;
             }
-            self.drain_live_events();
-            self.event_rx = None;
+            Err(error) => {
+                self.notice = "Failed to read daemon status.".to_owned();
+                self.last_error = Some(error.to_string());
+                self.push_log(format!("{} {}", self.notice.clone(), error));
+            }
         }
     }
 
@@ -584,23 +572,33 @@ impl TuiApp {
         let text_path = dir.join(format!("todex-tui-{timestamp}.log"));
         let jsonl_path = dir.join(format!("todex-tui-{timestamp}.jsonl"));
 
-        let runtime_config = self
-            .server
+        let listen_host = self
+            .daemon
             .as_ref()
-            .map(ManagedServer::config)
-            .unwrap_or(&self.config);
+            .map(|process| process.host.as_str())
+            .unwrap_or(self.config.host.as_str());
+        let listen_port = self
+            .daemon
+            .as_ref()
+            .map(|process| process.port)
+            .unwrap_or(self.config.port);
         let mut text = String::new();
         text.push_str("TodeX TUI log export\n");
         text.push_str(&format!("exported_at={}\n", Utc::now().to_rfc3339()));
-        text.push_str(&format!(
-            "listen={}:{}\n",
-            runtime_config.host, runtime_config.port
-        ));
-        text.push_str(&format!("data_dir={}\n", runtime_config.data_dir.display()));
+        text.push_str(&format!("listen={listen_host}:{listen_port}\n"));
+        text.push_str(&format!("data_dir={}\n", self.config.data_dir.display()));
         text.push_str(&format!(
             "workspace_root={}\n",
-            runtime_config.workspace_root.display()
+            self.config.workspace_root.display()
         ));
+        text.push_str(&format!(
+            "daemon_log={}\n",
+            daemon::log_file_path(&self.config.data_dir).display()
+        ));
+        if let Some(process) = &self.daemon {
+            text.push_str(&format!("daemon_pid={}\n", process.pid));
+            text.push_str(&format!("daemon_started_at={}\n", process.started_at));
+        }
         text.push_str(&format!("notice={}\n", self.notice));
         if let Some(error) = &self.last_error {
             text.push_str(&format!("last_error={error}\n"));
@@ -717,44 +715,43 @@ impl TuiApp {
     }
 
     fn status_panel(&self) -> Paragraph<'_> {
-        let status = if self.server.is_some() {
+        let process = self.daemon.as_ref();
+        let status = if process.is_some() {
             Span::styled("Running", Style::default().fg(Color::Green))
         } else if self.last_error.is_some() {
             Span::styled("Failed", Style::default().fg(Color::Red))
         } else {
             Span::styled("Stopped", Style::default().fg(Color::Yellow))
         };
-        let uptime = self
-            .server
-            .as_ref()
-            .map(|server| format_duration(server.started_at().elapsed()))
+        let uptime = process
+            .and_then(|process| (Utc::now() - process.started_at).to_std().ok())
+            .map(format_duration)
             .unwrap_or_else(|| "-".to_owned());
-        let adapters = self
-            .server
-            .as_ref()
-            .map(ManagedServer::active_codex_adapters)
-            .unwrap_or(0);
-        let connections = self
-            .server
-            .as_ref()
-            .map(ManagedServer::websocket_connection_count)
-            .unwrap_or(0);
-        let connection_state = if self.server.is_none() {
-            Span::styled("offline", Style::default().fg(Color::Yellow))
-        } else if connections > 0 {
+        let daemon_pid = process
+            .map(|process| process.pid.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        let connection_state = if let Some(process) = process {
             Span::styled(
-                format!("connected ({connections} active)"),
-                Style::default().fg(Color::Green),
+                format!("daemon pid {} listening", process.pid),
+                Style::default().fg(Color::Cyan),
             )
         } else {
-            Span::styled("listening (0 active)", Style::default().fg(Color::Cyan))
+            Span::styled("offline", Style::default().fg(Color::Yellow))
         };
-        let runtime_config = self
-            .server
-            .as_ref()
-            .map(ManagedServer::config)
-            .unwrap_or(&self.config);
-        let token = runtime_config
+        let listen_host = process
+            .map(|process| process.host.as_str())
+            .unwrap_or(self.config.host.as_str());
+        let listen_port = process
+            .map(|process| process.port)
+            .unwrap_or(self.config.port);
+        let data_dir = process
+            .map(|process| process.data_dir.as_path())
+            .unwrap_or(self.config.data_dir.as_path());
+        let workspace_root = process
+            .map(|process| process.workspace_root.as_path())
+            .unwrap_or(self.config.workspace_root.as_path());
+        let token = self
+            .config
             .security
             .auth_token
             .as_deref()
@@ -769,7 +766,7 @@ impl TuiApp {
                 Span::styled("not set", Style::default().fg(Color::Red)),
             ]),
         };
-        let auth_state = if runtime_config.security.enable_auth {
+        let auth_state = if self.config.security.enable_auth {
             Span::styled("enabled", Style::default().fg(Color::Yellow))
         } else {
             Span::styled("disabled", Style::default().fg(Color::Green))
@@ -777,30 +774,20 @@ impl TuiApp {
 
         Paragraph::new(vec![
             Line::from(vec![Span::raw("Status: "), status]),
+            Line::from(format!("Listen: {listen_host}:{listen_port}")),
             Line::from(format!(
-                "Listen: {}:{}",
-                runtime_config.host, runtime_config.port
-            )),
-            Line::from(format!(
-                "WS endpoint: ws://{}:{}/v1/ws",
-                runtime_config.host, runtime_config.port
+                "WS endpoint: ws://{listen_host}:{listen_port}/v1/ws"
             )),
             Line::from(format!(
                 "Pairing encryption: {} (action e)",
-                pairing_encryption_label(runtime_config.pairing_encryption)
+                pairing_encryption_label(self.config.pairing_encryption)
             )),
             Line::from("Pairing QR: one-click link + auth token; app fetches protocol key"),
             Line::from(vec![Span::raw("Auth: "), auth_state]),
             token_line,
-            Line::from(format!("Data dir: {}", runtime_config.data_dir.display())),
-            Line::from(format!(
-                "Workspace root: {}",
-                runtime_config.workspace_root.display()
-            )),
-            Line::from(format!(
-                "Uptime: {} | Active Codex adapters: {}",
-                uptime, adapters
-            )),
+            Line::from(format!("Data dir: {}", data_dir.display())),
+            Line::from(format!("Workspace root: {}", workspace_root.display())),
+            Line::from(format!("Uptime: {} | Daemon PID: {}", uptime, daemon_pid)),
             Line::from(vec![Span::raw("Connection: "), connection_state]),
         ])
         .block(
@@ -840,14 +827,14 @@ impl TuiApp {
     }
 
     fn action_panel(&self) -> List<'_> {
-        let start_stop = if self.server.is_some() {
-            "Stop service"
+        let start_stop = if self.daemon.is_some() {
+            "Stop daemon"
         } else {
-            "Start service"
+            "Start daemon"
         };
         let actions = [
             start_stop,
-            "Restart service",
+            "Restart daemon",
             "Edit listen IP",
             "Edit listen port",
             "Edit pairing encryption",
@@ -904,7 +891,7 @@ impl TuiApp {
                 Line::from(
                     "Shortcuts: s start/stop, r restart, h host, p port, e encryption, w config, g QR, l logs, o observer, q quit.",
                 ),
-                Line::from("The TUI starts stopped by default and stops its service on exit."),
+                Line::from("The TUI is only a controller; quitting leaves a running daemon online."),
             ]
         };
 
@@ -1021,7 +1008,7 @@ impl TuiApp {
     }
 
     fn observer_summary_panel(&self, state: &ObserverState) -> Paragraph<'_> {
-        let runtime_state = if self.server.is_some() {
+        let runtime_state = if self.daemon.is_some() {
             "running"
         } else {
             "stopped"

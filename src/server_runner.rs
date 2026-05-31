@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
@@ -9,15 +8,12 @@ use tracing::info;
 
 use crate::app_state::AppState;
 use crate::config::Config;
-use crate::config::PairingEncryption;
-use crate::event::EventRecord;
 use crate::server;
 
 pub struct ManagedServer {
     config: Config,
     addr: SocketAddr,
     state: AppState,
-    started_at: Instant,
     shutdown: Option<oneshot::Sender<()>>,
     handle: JoinHandle<Result<()>>,
 }
@@ -56,7 +52,6 @@ impl ManagedServer {
             config,
             addr,
             state,
-            started_at: Instant::now(),
             shutdown: Some(shutdown_tx),
             handle,
         })
@@ -68,33 +63,6 @@ impl ManagedServer {
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
-    }
-
-    pub fn started_at(&self) -> Instant {
-        self.started_at
-    }
-
-    pub fn active_codex_adapters(&self) -> usize {
-        self.state.codex_local_adapters.len()
-    }
-
-    pub fn websocket_connection_count(&self) -> usize {
-        self.state.websocket_connection_count()
-    }
-
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventRecord> {
-        self.state.events.subscribe()
-    }
-
-    pub fn pairing_qr_payloads(
-        &self,
-        preferred_encryption: PairingEncryption,
-    ) -> Result<Vec<String>> {
-        Ok(self.state.pairing_keys.pairing_qr_payloads(
-            &self.config,
-            self.addr.port(),
-            preferred_encryption,
-        )?)
     }
 
     pub fn is_finished(&self) -> bool {
@@ -153,7 +121,7 @@ mod tests {
         };
 
         let server = ManagedServer::start(config).await.expect("start server");
-        assert_eq!(server.active_codex_adapters(), 0);
+        assert!(server.addr().port() > 0);
         server.stop().await.expect("stop server");
 
         let _ = fs::remove_dir_all(root);
