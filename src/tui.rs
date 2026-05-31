@@ -1923,8 +1923,8 @@ fn format_duration(duration: Duration) -> String {
 
 fn pairing_encryption_label(value: PairingEncryption) -> &'static str {
     match value {
-        PairingEncryption::None => "无",
-        PairingEncryption::MlKem768 => "后量子",
+        PairingEncryption::None => "None",
+        PairingEncryption::MlKem768 => "ML-KEM-768",
         PairingEncryption::X25519 => "X25519",
     }
 }
