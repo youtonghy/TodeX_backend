@@ -75,6 +75,8 @@ GET /v1/version
 
 移动端工作区清单由后端持久化到 `$TODEX_AGENTD_DATA_DIR/workspaces.json`。App 本地 AsyncStorage 只作为离线缓存；连接成功后会拉取后端快照并把本地较新的缓存合并回后端。
 
+后端会把 `workspace_root` 作为移动端可用工作区的权限边界。`PUT /v1/workspaces`、`/v1/workspace/entries`、本地 Codex 启动和本地终端启动都会拒绝 `workspace_root` 之外的目录；目录必须存在且是目录。
+
 ```http
 GET /v1/workspaces
 PUT /v1/workspaces
@@ -106,7 +108,33 @@ PUT /v1/workspaces
 }
 ```
 
-`PUT` 请求体使用同样的 `workspaces` 数组，后端会校验 `id`、`name`、`path` 并整体替换快照。
+`PUT` 请求体使用同样的 `workspaces` 数组，后端会校验 `id`、`name`、`path`、路径存在性和根目录边界，并整体替换快照。后端保存时会把路径规范化为 canonical path。
+
+### Workspace 目录浏览
+
+```http
+GET /v1/workspace/directories
+GET /v1/workspace/directories?path=/home/user/projects/demo
+```
+
+响应：
+
+```json
+{
+  "root": "/home/user/projects",
+  "current": "/home/user/projects",
+  "parent": null,
+  "entries": [
+    {
+      "name": "demo",
+      "path": "/home/user/projects/demo",
+      "kind": "directory"
+    }
+  ]
+}
+```
+
+`path` 为空时从当前 `workspace_root` 开始。返回值只包含可进入的子目录，会跳过隐藏目录、文件，以及 canonical path 落在 `workspace_root` 之外的目录或符号链接。
 
 ## WebSocket 协议
 

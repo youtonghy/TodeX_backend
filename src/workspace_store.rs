@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::error::AppError;
+use crate::{error::AppError, workspace_paths::validate_workspace_directory_text};
 
 const WORKSPACES_FILE: &str = "workspaces.json";
 
@@ -45,16 +45,18 @@ pub struct WorkspaceRecord {
 #[derive(Clone)]
 pub struct WorkspaceStore {
     path: Arc<PathBuf>,
+    workspace_root: Arc<PathBuf>,
     inner: Arc<RwLock<WorkspaceSnapshot>>,
 }
 
 impl WorkspaceStore {
-    pub async fn new(data_dir: PathBuf) -> Result<Self, AppError> {
+    pub async fn new(data_dir: PathBuf, workspace_root: PathBuf) -> Result<Self, AppError> {
         tokio::fs::create_dir_all(&data_dir).await?;
         let path = data_dir.join(WORKSPACES_FILE);
-        let snapshot = load_snapshot(&path).await?;
+        let snapshot = load_snapshot(&path, &workspace_root).await?;
         Ok(Self {
             path: Arc::new(path),
+            workspace_root: Arc::new(workspace_root),
             inner: Arc::new(RwLock::new(snapshot)),
         })
     }
@@ -67,7 +69,7 @@ impl WorkspaceStore {
         &self,
         workspaces: Vec<WorkspaceRecord>,
     ) -> Result<WorkspaceSnapshot, AppError> {
-        validate_workspaces(&workspaces)?;
+        let workspaces = normalize_workspaces(workspaces, &self.workspace_root)?;
         let snapshot = WorkspaceSnapshot {
             workspaces,
             updated_at: now_millis(),
@@ -78,7 +80,7 @@ impl WorkspaceStore {
     }
 }
 
-async fn load_snapshot(path: &Path) -> Result<WorkspaceSnapshot, AppError> {
+async fn load_snapshot(path: &Path, workspace_root: &Path) -> Result<WorkspaceSnapshot, AppError> {
     let text = match tokio::fs::read_to_string(path).await {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -92,7 +94,7 @@ async fn load_snapshot(path: &Path) -> Result<WorkspaceSnapshot, AppError> {
     }
 
     let mut snapshot: WorkspaceSnapshot = serde_json::from_str(&text)?;
-    validate_workspaces(&snapshot.workspaces)?;
+    snapshot.workspaces = normalize_workspaces(snapshot.workspaces, workspace_root)?;
     snapshot
         .workspaces
         .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
@@ -110,9 +112,13 @@ async fn write_snapshot(path: &Path, snapshot: &WorkspaceSnapshot) -> Result<(),
     Ok(())
 }
 
-fn validate_workspaces(workspaces: &[WorkspaceRecord]) -> Result<(), AppError> {
+fn normalize_workspaces(
+    workspaces: Vec<WorkspaceRecord>,
+    workspace_root: &Path,
+) -> Result<Vec<WorkspaceRecord>, AppError> {
     let mut seen_ids = HashSet::new();
-    for workspace in workspaces {
+    let mut normalized = Vec::with_capacity(workspaces.len());
+    for mut workspace in workspaces {
         if workspace.id.trim().is_empty() {
             return Err(AppError::InvalidRequest(
                 "workspace id is required".to_owned(),
@@ -134,8 +140,11 @@ fn validate_workspaces(workspaces: &[WorkspaceRecord]) -> Result<(), AppError> {
                 workspace.id
             )));
         }
+        let path = validate_workspace_directory_text(workspace_root, &workspace.path)?;
+        workspace.path = path.display().to_string();
+        normalized.push(workspace);
     }
-    Ok(())
+    Ok(normalized)
 }
 
 fn now_millis() -> u64 {
@@ -153,12 +162,17 @@ mod tests {
     #[tokio::test]
     async fn workspace_store_persists_and_reloads_snapshot() {
         let root = make_temp_dir("todex-workspace-store");
-        let store = WorkspaceStore::new(root.clone()).await.unwrap();
+        let workspace_root = root.join("workspaces");
+        let workspace_path = workspace_root.join("app");
+        fs::create_dir_all(&workspace_path).unwrap();
+        let store = WorkspaceStore::new(root.clone(), workspace_root.clone())
+            .await
+            .unwrap();
         let snapshot = store
             .replace(vec![WorkspaceRecord {
                 id: "workspace-1".to_owned(),
                 name: "App".to_owned(),
-                path: "/workspace/app".to_owned(),
+                path: workspace_path.display().to_string(),
                 session_id: "cdxs_app".to_owned(),
                 tenant_id: "local".to_owned(),
                 thread_id: String::new(),
@@ -176,13 +190,19 @@ mod tests {
 
         assert_eq!(snapshot.workspaces.len(), 1);
 
-        let reloaded = WorkspaceStore::new(root.clone())
+        let reloaded = WorkspaceStore::new(root.clone(), workspace_root)
             .await
             .unwrap()
             .snapshot()
             .await;
         assert_eq!(reloaded.workspaces[0].id, "workspace-1");
-        assert_eq!(reloaded.workspaces[0].path, "/workspace/app");
+        assert_eq!(
+            reloaded.workspaces[0].path,
+            fs::canonicalize(&workspace_path)
+                .unwrap()
+                .display()
+                .to_string()
+        );
         assert!(reloaded.updated_at > 0);
 
         let _ = fs::remove_dir_all(root);
@@ -191,11 +211,16 @@ mod tests {
     #[tokio::test]
     async fn workspace_store_rejects_duplicate_ids() {
         let root = make_temp_dir("todex-workspace-store-duplicate");
-        let store = WorkspaceStore::new(root.clone()).await.unwrap();
+        let workspace_root = root.join("workspaces");
+        let workspace_path = workspace_root.join("app");
+        fs::create_dir_all(&workspace_path).unwrap();
+        let store = WorkspaceStore::new(root.clone(), workspace_root)
+            .await
+            .unwrap();
         let workspace = WorkspaceRecord {
             id: "workspace-1".to_owned(),
             name: "App".to_owned(),
-            path: "/workspace/app".to_owned(),
+            path: workspace_path.display().to_string(),
             session_id: "cdxs_app".to_owned(),
             tenant_id: "local".to_owned(),
             thread_id: String::new(),

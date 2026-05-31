@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
 use crate::error::AppError;
+use crate::workspace_paths::{canonical_workspace_root, validate_workspace_directory_text};
 use crate::workspace_store::WorkspaceRecord;
 
 use super::websocket;
@@ -22,6 +23,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/version", get(version))
         .route("/v1/workspaces", get(workspaces).put(replace_workspaces))
         .route("/v1/workspace/entries", get(workspace_entries))
+        .route("/v1/workspace/directories", get(workspace_directories))
         .route("/v1/ws", get(ws))
 }
 
@@ -70,10 +72,7 @@ async fn workspace_entries(
 ) -> Result<Json<WorkspaceEntriesResponse>, AppError> {
     authorize_http(&state, &headers)?;
 
-    let cwd = PathBuf::from(query.cwd.trim());
-    if !cwd.exists() || !cwd.is_dir() {
-        return Err(AppError::WorkspacePathNotFound);
-    }
+    let cwd = validate_workspace_directory_text(&state.config.workspace_root, &query.cwd)?;
 
     let raw_query = query.query.as_deref().unwrap_or("");
     let relative_query = normalize_relative_query(raw_query)?;
@@ -86,6 +85,38 @@ async fn workspace_entries(
     .await?;
 
     Ok(Json(WorkspaceEntriesResponse { entries }))
+}
+
+async fn workspace_directories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceDirectoriesQuery>,
+) -> Result<Json<WorkspaceDirectoriesResponse>, AppError> {
+    authorize_http(&state, &headers)?;
+
+    let root = canonical_workspace_root(&state.config.workspace_root)?;
+    let current = match query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        Some(path) => validate_workspace_directory_text(&state.config.workspace_root, path)?,
+        None => root.clone(),
+    };
+    let limit = query.limit.unwrap_or(100).clamp(1, 300);
+    let entries = list_workspace_directories(&root, &current, limit).await?;
+    let parent = current
+        .parent()
+        .filter(|parent| current != root && parent.starts_with(&root))
+        .map(|parent| parent.display().to_string());
+
+    Ok(Json(WorkspaceDirectoriesResponse {
+        root: root.display().to_string(),
+        current: current.display().to_string(),
+        parent,
+        entries,
+    }))
 }
 
 async fn list_workspace_entries(
@@ -190,6 +221,53 @@ async fn list_direct_workspace_entries(
     }
 
     sort_workspace_entries(&mut entries);
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+async fn list_workspace_directories(
+    root: &Path,
+    current: &Path,
+    limit: usize,
+) -> Result<Vec<WorkspaceDirectory>, AppError> {
+    let mut entries = Vec::new();
+    let mut read_dir = tokio::fs::read_dir(current).await?;
+    while let Some(entry) = read_dir.next_entry().await? {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if file_name.is_empty() || file_name.starts_with('.') {
+            continue;
+        }
+
+        let path = entry.path();
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let canonical = match tokio::fs::canonicalize(&path).await {
+            Ok(canonical) if canonical.starts_with(root) => canonical,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        entries.push(WorkspaceDirectory {
+            name: file_name,
+            path: canonical.display().to_string(),
+            kind: WorkspaceEntryKind::Directory,
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+    });
     entries.truncate(limit);
     Ok(entries)
 }
@@ -326,9 +404,27 @@ struct WorkspaceEntriesQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceDirectoriesQuery {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 struct WorkspaceEntriesResponse {
     entries: Vec<WorkspaceEntry>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceDirectoriesResponse {
+    root: String,
+    current: String,
+    parent: Option<String>,
+    entries: Vec<WorkspaceDirectory>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -340,6 +436,13 @@ enum WorkspaceEntryKind {
 
 #[derive(Debug, Serialize)]
 struct WorkspaceEntry {
+    name: String,
+    path: String,
+    kind: WorkspaceEntryKind,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceDirectory {
     name: String,
     path: String,
     kind: WorkspaceEntryKind,
@@ -392,6 +495,46 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn workspace_directories_lists_only_directories_under_root() {
+        let root = make_temp_workspace("directory-browser");
+        fs::create_dir_all(root.join("app")).unwrap();
+        fs::create_dir_all(root.join("backend")).unwrap();
+        fs::create_dir_all(root.join(".hidden")).unwrap();
+        fs::write(root.join("README.md"), "").unwrap();
+
+        let entries = list_workspace_directories(&root, &root, 20).await.unwrap();
+        let paths = entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["app", "backend"]);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.kind == WorkspaceEntryKind::Directory));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn workspace_directories_skip_symlink_escape() {
+        let root = make_temp_workspace("directory-browser-symlink");
+        let outside = make_temp_workspace("directory-browser-outside");
+        fs::create_dir_all(root.join("safe")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+
+        let entries = list_workspace_directories(&root, &root, 20).await.unwrap();
+        let names = entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["safe"]);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 
     fn entry_paths(entries: &[WorkspaceEntry]) -> Vec<String> {

@@ -33,6 +33,7 @@ use crate::{
         TransportHelloState,
     },
     transport_crypto::TransportCryptoSession,
+    workspace_paths::validate_workspace_directory_text,
 };
 
 const TRANSPORT_HELLO_REPLAY_LIMIT: usize = 80;
@@ -330,7 +331,7 @@ async fn dispatch(
                 .start(CodexLocalAdapterStartOptions::new(
                     payload.codex_session_id.clone(),
                     message.id.clone(),
-                    payload.cwd,
+                    validate_workspace_directory_text(&state.config.workspace_root, &payload.cwd)?,
                     state.config.agent.codex_bin.clone(),
                 ))
                 .await
@@ -761,7 +762,12 @@ async fn dispatch(
                     terminal_id: payload.terminal_id,
                     tenant_id: payload.tenant_id,
                     workspace_id: payload.workspace_id,
-                    cwd: payload.cwd,
+                    cwd: validate_workspace_directory_text(
+                        &state.config.workspace_root,
+                        &payload.cwd,
+                    )?
+                    .display()
+                    .to_string(),
                     shell: payload.shell,
                     rows: payload.rows,
                     cols: payload.cols,

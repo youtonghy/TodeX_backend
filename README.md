@@ -6,17 +6,19 @@
 
 ## 功能 / Features
 
-- HTTP 接口：`/health`、`/v1/version`、`/v1/workspace/entries`
+- HTTP 接口：`/health`、`/v1/version`、`/v1/workspaces`、`/v1/workspace/entries`、`/v1/workspace/directories`
 - WebSocket 接口：`/v1/ws`，可选 X25519 或 ML-KEM-768 传输加密
 - 本地 Codex 会话管理：`start`、`status`、`stop`、`turn`、`attach`、`replay`、`interrupt`
+- 工作区权限边界：后端 `workspace_root` 限制移动端只能创建和使用该根目录内的工作区
 - 工作区文件检索：为前端 `@` 引用提供目录和文件建议
 - 认证与配置：支持 Bearer token、环境变量、`config.toml`
 - 后台进程模式：可作为独立 daemon 持续运行，并通过 pidfile 管理状态
 - 交互式 TUI：作为控制器启动、停止 daemon，保存监听地址，并显示 App 配对二维码
 
-- HTTP endpoints: `/health`, `/v1/version`, `/v1/workspace/entries`
+- HTTP endpoints: `/health`, `/v1/version`, `/v1/workspaces`, `/v1/workspace/entries`, `/v1/workspace/directories`
 - WebSocket endpoint: `/v1/ws`, with optional X25519 or ML-KEM-768 transport encryption
 - Local Codex session control: `start`, `status`, `stop`, `turn`, `attach`, `replay`, `interrupt`
+- Workspace boundary enforcement: backend `workspace_root` restricts mobile-created and mobile-used workspaces to that root
 - Workspace file lookup for the frontend `@` picker
 - Auth and config via Bearer token, environment variables, and `config.toml`
 - Persistent daemon mode managed through a pidfile

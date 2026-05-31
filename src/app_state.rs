@@ -31,6 +31,7 @@ impl AppState {
     pub async fn new(config: Config) -> Result<Self> {
         tokio::fs::create_dir_all(config.data_dir.join("logs")).await?;
         tokio::fs::create_dir_all(config.data_dir.join("audit")).await?;
+        tokio::fs::create_dir_all(&config.workspace_root).await?;
 
         let config = Arc::new(config);
         let events = EventBus::new(4096);
@@ -40,7 +41,8 @@ impl AppState {
         let local_terminals = LocalTerminalManager::new(events.clone());
         let transport_acks = TransportAckStore::new();
         let pairing_keys = PairingKeys::load_or_generate(&config.data_dir).await?;
-        let workspaces = WorkspaceStore::new(config.data_dir.clone()).await?;
+        let workspaces =
+            WorkspaceStore::new(config.data_dir.clone(), config.workspace_root.clone()).await?;
         let websocket_connections = Arc::new(AtomicUsize::new(0));
 
         Ok(Self {
