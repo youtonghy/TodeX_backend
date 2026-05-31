@@ -10,6 +10,7 @@ mod server_runner;
 mod transport;
 mod transport_crypto;
 mod tui;
+mod workspace_store;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};

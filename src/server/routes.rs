@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
 use crate::error::AppError;
+use crate::workspace_store::WorkspaceRecord;
 
 use super::websocket;
 
@@ -19,6 +20,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/v1/version", get(version))
+        .route("/v1/workspaces", get(workspaces).put(replace_workspaces))
         .route("/v1/workspace/entries", get(workspace_entries))
         .route("/v1/ws", get(ws))
 }
@@ -34,6 +36,31 @@ async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
         data_dir: state.config.data_dir.display().to_string(),
         workspace_root: state.config.workspace_root.display().to_string(),
     })
+}
+
+async fn workspaces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WorkspacesResponse>, AppError> {
+    authorize_http(&state, &headers)?;
+    let snapshot = state.workspaces.snapshot().await;
+    Ok(Json(WorkspacesResponse {
+        workspaces: snapshot.workspaces,
+        updated_at: snapshot.updated_at,
+    }))
+}
+
+async fn replace_workspaces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReplaceWorkspacesRequest>,
+) -> Result<Json<WorkspacesResponse>, AppError> {
+    authorize_http(&state, &headers)?;
+    let snapshot = state.workspaces.replace(request.workspaces).await?;
+    Ok(Json(WorkspacesResponse {
+        workspaces: snapshot.workspaces,
+        updated_at: snapshot.updated_at,
+    }))
 }
 
 async fn workspace_entries(
@@ -274,6 +301,19 @@ struct VersionResponse {
     version: &'static str,
     data_dir: String,
     workspace_root: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplaceWorkspacesRequest {
+    workspaces: Vec<WorkspaceRecord>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspacesResponse {
+    workspaces: Vec<WorkspaceRecord>,
+    updated_at: u64,
 }
 
 #[derive(Debug, Deserialize)]

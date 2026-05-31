@@ -71,6 +71,43 @@ GET /v1/version
 | `data_dir` | string | 当前数据目录 |
 | `workspace_root` | string | 当前 workspace 根目录 |
 
+## Workspace 缓存同步
+
+移动端工作区清单由后端持久化到 `$TODEX_AGENTD_DATA_DIR/workspaces.json`。App 本地 AsyncStorage 只作为离线缓存；连接成功后会拉取后端快照并把本地较新的缓存合并回后端。
+
+```http
+GET /v1/workspaces
+PUT /v1/workspaces
+```
+
+`GET` 响应：
+
+```json
+{
+  "workspaces": [
+    {
+      "id": "workspace-1",
+      "name": "demo",
+      "path": "/home/user/projects/demo",
+      "sessionId": "cdxs_demo",
+      "tenantId": "local",
+      "threadId": "",
+      "model": "gpt-5.5",
+      "reasoningEffort": "medium",
+      "approvalPolicy": "on-request",
+      "sandboxMode": "workspace-write",
+      "serviceTier": null,
+      "localAdapterState": "idle",
+      "createdAt": 1700000000000,
+      "updatedAt": 1700000000000
+    }
+  ],
+  "updatedAt": 1700000001000
+}
+```
+
+`PUT` 请求体使用同样的 `workspaces` 数组，后端会校验 `id`、`name`、`path` 并整体替换快照。
+
 ## WebSocket 协议
 
 客户端发送文本帧，内容必须是 JSON。二进制帧会被忽略。默认仍支持明文 JSON；如果 WebSocket URL 带上加密握手参数，业务 JSON 会被包装在 `todex.crypto.v1` 加密帧中。

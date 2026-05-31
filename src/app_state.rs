@@ -11,6 +11,7 @@ use crate::{
     local_terminal::LocalTerminalManager,
     transport::TransportAckStore,
     transport_crypto::PairingKeys,
+    workspace_store::WorkspaceStore,
 };
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ pub struct AppState {
     pub local_terminals: LocalTerminalManager,
     pub transport_acks: TransportAckStore,
     pub pairing_keys: PairingKeys,
+    pub workspaces: WorkspaceStore,
     websocket_connections: Arc<AtomicUsize>,
 }
 
@@ -38,6 +40,7 @@ impl AppState {
         let local_terminals = LocalTerminalManager::new(events.clone());
         let transport_acks = TransportAckStore::new();
         let pairing_keys = PairingKeys::load_or_generate(&config.data_dir).await?;
+        let workspaces = WorkspaceStore::new(config.data_dir.clone()).await?;
         let websocket_connections = Arc::new(AtomicUsize::new(0));
 
         Ok(Self {
@@ -48,6 +51,7 @@ impl AppState {
             local_terminals,
             transport_acks,
             pairing_keys,
+            workspaces,
             websocket_connections,
         })
     }
