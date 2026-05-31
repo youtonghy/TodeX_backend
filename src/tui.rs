@@ -24,9 +24,9 @@ use serde_json::Value;
 use crate::config::{Config, PairingEncryption, ServeArgs};
 use crate::daemon::{self, DaemonProcess};
 use crate::event::EventRecord;
-use crate::transport_crypto::render_qr_text_for_bounds;
+use crate::transport_crypto::{render_qr_text_for_bounds, PairingKeys};
 
-const ACTION_COUNT: usize = 7;
+const ACTION_COUNT: usize = 8;
 const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
@@ -326,6 +326,7 @@ impl TuiApp {
             KeyCode::Char('h') => self.start_host_edit(),
             KeyCode::Char('p') => self.start_port_edit(),
             KeyCode::Char('e') => self.start_pairing_encryption_edit(),
+            KeyCode::Char('x') => self.start_reset_edit(),
             KeyCode::Char('g') => self.show_pairing_qr().await,
             KeyCode::PageUp => self.scroll_logs_up(LOG_SCROLL_STEP),
             KeyCode::PageDown => self.scroll_logs_down(LOG_SCROLL_STEP),
@@ -356,18 +357,30 @@ impl TuiApp {
                     if ch == 'e' {
                         *value = (*value).next();
                     }
+                } else if let Some(EditMode::Reset { target }) = &mut self.edit {
+                    if ch == 'x' {
+                        *target = next_reset_target(*target);
+                    }
                 }
             }
-            KeyCode::Left | KeyCode::PageUp => {
-                if let Some(EditMode::Encryption { value }) = &mut self.edit {
+            KeyCode::Left | KeyCode::PageUp => match &mut self.edit {
+                Some(EditMode::Encryption { value }) => {
                     *value = previous_pairing_encryption(*value);
                 }
-            }
-            KeyCode::Right | KeyCode::PageDown => {
-                if let Some(EditMode::Encryption { value }) = &mut self.edit {
+                Some(EditMode::Reset { target }) => {
+                    *target = previous_reset_target(*target);
+                }
+                _ => {}
+            },
+            KeyCode::Right | KeyCode::PageDown => match &mut self.edit {
+                Some(EditMode::Encryption { value }) => {
                     *value = (*value).next();
                 }
-            }
+                Some(EditMode::Reset { target }) => {
+                    *target = next_reset_target(*target);
+                }
+                _ => {}
+            },
             _ => {}
         }
 
@@ -381,8 +394,9 @@ impl TuiApp {
             2 => self.start_host_edit(),
             3 => self.start_port_edit(),
             4 => self.start_pairing_encryption_edit(),
-            5 => self.show_pairing_qr().await,
-            6 => return Ok(true),
+            5 => self.start_reset_edit(),
+            6 => self.show_pairing_qr().await,
+            7 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -531,6 +545,14 @@ impl TuiApp {
             "Pairing encryption edit window is open. Use Left/Right to switch.".to_owned();
     }
 
+    fn start_reset_edit(&mut self) {
+        self.edit = Some(EditMode::Reset {
+            target: ResetTarget::Auth,
+        });
+        self.notice =
+            "Reset window is open. Use Left/Right to choose Auth or Encryption.".to_owned();
+    }
+
     async fn commit_edit(&mut self) -> Result<()> {
         let Some(edit) = self.edit.take() else {
             return Ok(());
@@ -567,9 +589,75 @@ impl TuiApp {
                 self.config.pairing_encryption = value;
                 self.auto_save_settings("Pairing encryption updated");
             }
+            EditMode::Reset { target } => self.reset_target(target).await?,
         }
 
         Ok(())
+    }
+
+    async fn reset_target(&mut self, target: ResetTarget) -> Result<()> {
+        match target {
+            ResetTarget::Auth => self.reset_auth().await,
+            ResetTarget::Encryption => self.reset_encryption().await,
+        }
+    }
+
+    async fn reset_auth(&mut self) -> Result<()> {
+        match Config::reset_auth_token(self.config.data_dir.clone()) {
+            Ok(token) => {
+                self.config.security.auth_token = Some(token);
+                self.finish_reset("Auth reset").await;
+            }
+            Err(error) => {
+                self.notice = "Auth reset failed.".to_owned();
+                self.last_error = Some(error.to_string());
+                self.push_log(format!("{} {}", self.notice.clone(), error));
+            }
+        }
+        Ok(())
+    }
+
+    async fn reset_encryption(&mut self) -> Result<()> {
+        match PairingKeys::reset(&self.config.data_dir).await {
+            Ok(_) => self.finish_reset("Encryption reset").await,
+            Err(error) => {
+                self.notice = "Encryption reset failed.".to_owned();
+                self.last_error = Some(error.to_string());
+                self.push_log(format!("{} {}", self.notice.clone(), error));
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_reset(&mut self, subject: &str) {
+        if self.daemon.is_none() {
+            self.notice = format!("{subject}. It will apply the next time the daemon starts.");
+            self.last_error = None;
+            self.push_log(self.notice.clone());
+            return;
+        }
+
+        self.push_log(format!("{subject}; restarting daemon to apply it."));
+        let mut config = self.config.clone();
+        config.host = self.config.host.trim().to_owned();
+        config.port = self.config.port;
+        match daemon::restart(config).await {
+            Ok(process) => {
+                self.notice = format!(
+                    "{subject} and daemon restarted on {} with pid {}.",
+                    process.listen_addr(),
+                    process.pid
+                );
+                self.last_error = None;
+                self.push_log(self.notice.clone());
+                self.daemon = Some(process);
+            }
+            Err(error) => {
+                self.notice = format!("{subject}, but daemon restart failed.");
+                self.last_error = Some(error.to_string());
+                self.push_log(format!("{} {}", self.notice.clone(), error));
+            }
+        }
     }
 
     fn auto_save_settings(&mut self, subject: &str) {
@@ -873,6 +961,7 @@ impl TuiApp {
             "Edit listen IP",
             "Edit listen port",
             "Edit pairing encryption",
+            "Reset",
             "Show pairing QR",
             "Quit",
         ];
@@ -903,7 +992,7 @@ impl TuiApp {
         let lines = vec![
             Line::from("Use Up/Down or j/k to choose an action, Enter to run it."),
             Line::from(
-                "Shortcuts: s start/stop, r restart, h host, p port, e encryption, g QR, o observer, q quit.",
+                "Shortcuts: s start/stop, r restart, h host, p port, e encryption, x reset, g QR, o observer, q quit.",
             ),
             Line::from("Settings auto-save after edits. Logs auto-export when the TUI exits."),
             Line::from("The TUI is only a controller; quitting leaves a running daemon online."),
@@ -932,6 +1021,7 @@ impl TuiApp {
         let height = match edit {
             EditMode::Text { .. } => 8,
             EditMode::Encryption { .. } => 9,
+            EditMode::Reset { .. } => 10,
         };
         centered_area(area, EDIT_POPUP_WIDTH, height)
     }
@@ -1018,6 +1108,38 @@ impl TuiApp {
                     Line::from(""),
                     Line::from("Left/Right switches the encryption method."),
                     Line::from("Enter applies and auto-saves. Esc cancels."),
+                ],
+            ),
+            EditMode::Reset { target } => (
+                "Reset".to_owned(),
+                vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(
+                            "[<]",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            reset_target_label(*target),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            "[>]",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from(reset_target_description(*target)),
+                    Line::from("Enter resets the selected item. Esc cancels."),
+                    Line::from("A running daemon restarts automatically."),
                 ],
             ),
         };
@@ -1879,11 +2001,18 @@ fn truncate_text(value: &str, limit: usize) -> String {
 enum EditMode {
     Text { field: EditField, value: String },
     Encryption { value: PairingEncryption },
+    Reset { target: ResetTarget },
 }
 
 enum EditField {
     Host,
     Port,
+}
+
+#[derive(Clone, Copy)]
+enum ResetTarget {
+    Auth,
+    Encryption,
 }
 
 fn validate_host(value: &str) -> std::result::Result<String, String> {
@@ -1935,6 +2064,31 @@ fn previous_pairing_encryption(value: PairingEncryption) -> PairingEncryption {
         PairingEncryption::X25519 => PairingEncryption::MlKem768,
         PairingEncryption::MlKem768 => PairingEncryption::None,
     }
+}
+
+fn reset_target_label(target: ResetTarget) -> &'static str {
+    match target {
+        ResetTarget::Auth => "Auth",
+        ResetTarget::Encryption => "Encryption",
+    }
+}
+
+fn reset_target_description(target: ResetTarget) -> &'static str {
+    match target {
+        ResetTarget::Auth => "Generates a new bearer token and updates config.toml.",
+        ResetTarget::Encryption => "Regenerates X25519 and ML-KEM-768 pairing keys.",
+    }
+}
+
+fn next_reset_target(target: ResetTarget) -> ResetTarget {
+    match target {
+        ResetTarget::Auth => ResetTarget::Encryption,
+        ResetTarget::Encryption => ResetTarget::Auth,
+    }
+}
+
+fn previous_reset_target(target: ResetTarget) -> ResetTarget {
+    next_reset_target(target)
 }
 
 #[cfg(test)]

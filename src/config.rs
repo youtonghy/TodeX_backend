@@ -234,6 +234,12 @@ impl Config {
         write_config_document(&data_dir, &document)?;
         Ok(())
     }
+
+    pub fn reset_auth_token(data_dir: PathBuf) -> anyhow::Result<String> {
+        let token = generate_auth_token();
+        Self::save_auth_token(data_dir, &token)?;
+        Ok(token)
+    }
 }
 
 impl Default for Config {
@@ -413,6 +419,28 @@ mod tests {
         let updated = fs::read_to_string(root.join("config.toml")).expect("read config");
         assert!(updated.contains("auth_token"));
         assert!(updated.contains(token));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reset_auth_token_replaces_persisted_token() {
+        let root = env::temp_dir().join(format!(
+            "todex-config-reset-token-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        let first = Config::reset_auth_token(root.clone()).expect("write first token");
+        let second = Config::reset_auth_token(root.clone()).expect("write second token");
+
+        assert!(first.starts_with("todex_"));
+        assert!(second.starts_with("todex_"));
+        assert_ne!(first, second);
+
+        let updated = fs::read_to_string(root.join("config.toml")).expect("read config");
+        assert!(updated.contains(&second));
+        assert!(!updated.contains(&first));
 
         let _ = fs::remove_dir_all(root);
     }

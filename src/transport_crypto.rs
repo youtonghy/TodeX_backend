@@ -67,6 +67,14 @@ impl PairingKeys {
         }
     }
 
+    pub async fn reset(data_dir: &Path) -> Result<Self, AppError> {
+        tokio::fs::create_dir_all(data_dir).await?;
+        let path = data_dir.join(PAIRING_KEYS_FILE);
+        let keys = Self::generate();
+        keys.persist(&path).await?;
+        Ok(keys)
+    }
+
     async fn persist(&self, path: &Path) -> Result<(), AppError> {
         let persisted = PersistedPairingKeys {
             version: PAIRING_VERSION,
@@ -869,6 +877,46 @@ mod tests {
                 .decrypt_server_text_for_tests(&wrapped)
                 .unwrap(),
             r#"{"type":"pong"}"#
+        );
+
+        tokio::fs::remove_dir_all(&data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pairing_keys_reset_replaces_persisted_public_keys() {
+        let data_dir = unique_tmp_dir("todex-pairing-keys-reset");
+        let config = test_config();
+
+        let first = PairingKeys::reset(&data_dir).await.unwrap();
+        let first_x25519 = first
+            .pairing_link_json(&config, 7345, PairingEncryption::X25519)
+            .unwrap();
+        let first_ml_kem = first
+            .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
+            .unwrap();
+
+        let second = PairingKeys::reset(&data_dir).await.unwrap();
+        assert_ne!(
+            second
+                .pairing_link_json(&config, 7345, PairingEncryption::X25519)
+                .unwrap(),
+            first_x25519
+        );
+        assert_ne!(
+            second
+                .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
+                .unwrap(),
+            first_ml_kem
+        );
+
+        let reloaded = PairingKeys::load_or_generate(&data_dir).await.unwrap();
+        assert_eq!(
+            reloaded
+                .pairing_link_json(&config, 7345, PairingEncryption::X25519)
+                .unwrap(),
+            second
+                .pairing_link_json(&config, 7345, PairingEncryption::X25519)
+                .unwrap()
         );
 
         tokio::fs::remove_dir_all(&data_dir).await.unwrap();
