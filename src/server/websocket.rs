@@ -35,7 +35,8 @@ use crate::{
     transport_crypto::TransportCryptoSession,
 };
 
-const TRANSPORT_HELLO_REPLAY_LIMIT: usize = 200;
+const TRANSPORT_HELLO_REPLAY_LIMIT: usize = 80;
+const TRANSPORT_HELLO_MAX_SESSIONS: usize = 12;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthContext {
@@ -1127,7 +1128,11 @@ async fn replay_ack_cursors_for_hello(
     state: &AppState,
     hello: &TransportHelloState,
 ) -> Result<(), AppError> {
-    for (session_id, cursor) in &hello.session_cursors {
+    for (session_id, cursor) in hello
+        .session_cursors
+        .iter()
+        .take(TRANSPORT_HELLO_MAX_SESSIONS)
+    {
         let cursor = state
             .transport_acks
             .cursor_for(&hello.client_id, session_id)
