@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod error;
 mod event;
+mod local_terminal;
 mod server;
 mod server_runner;
 mod transport;

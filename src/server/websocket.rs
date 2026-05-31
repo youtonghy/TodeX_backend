@@ -18,6 +18,10 @@ use crate::{
     },
     error::AppError,
     event::EventRecord,
+    local_terminal::{
+        TerminalInputOptions, TerminalResizeOptions, TerminalStartOptions, TerminalStatusOptions,
+        TerminalStopOptions,
+    },
     server::protocol::{
         ClientMessage, ClientMessageKind, CodexCloudTaskApplyRequest, CodexCloudTaskCreateRequest,
         CodexCloudTaskIdRequest, CodexCloudTaskListRequest, CodexCloudTaskSiblingAttemptsRequest,
@@ -740,6 +744,106 @@ async fn dispatch(
                 .await?;
             publish_codex_gateway_record(state, record).await;
         }
+        ClientMessageKind::TerminalStart(payload) => {
+            authorize_terminal_request(
+                &message.id,
+                &payload.tenant_id,
+                "terminal.start",
+                auth,
+                state,
+            )
+            .await?;
+            state
+                .local_terminals
+                .start(TerminalStartOptions {
+                    request_id: message.id,
+                    terminal_id: payload.terminal_id,
+                    tenant_id: payload.tenant_id,
+                    workspace_id: payload.workspace_id,
+                    cwd: payload.cwd,
+                    shell: payload.shell,
+                    rows: payload.rows,
+                    cols: payload.cols,
+                })
+                .await?;
+        }
+        ClientMessageKind::TerminalInput(payload) => {
+            authorize_terminal_request(
+                &message.id,
+                &payload.tenant_id,
+                "terminal.input",
+                auth,
+                state,
+            )
+            .await?;
+            state
+                .local_terminals
+                .input(TerminalInputOptions {
+                    request_id: message.id,
+                    terminal_id: payload.terminal_id,
+                    tenant_id: payload.tenant_id,
+                    data: payload.data,
+                })
+                .await?;
+        }
+        ClientMessageKind::TerminalStop(payload) => {
+            authorize_terminal_request(
+                &message.id,
+                &payload.tenant_id,
+                "terminal.stop",
+                auth,
+                state,
+            )
+            .await?;
+            state
+                .local_terminals
+                .stop(TerminalStopOptions {
+                    request_id: message.id,
+                    terminal_id: payload.terminal_id,
+                    tenant_id: payload.tenant_id,
+                    force: payload.force,
+                })
+                .await?;
+        }
+        ClientMessageKind::TerminalResize(payload) => {
+            authorize_terminal_request(
+                &message.id,
+                &payload.tenant_id,
+                "terminal.resize",
+                auth,
+                state,
+            )
+            .await?;
+            state
+                .local_terminals
+                .resize(TerminalResizeOptions {
+                    request_id: message.id,
+                    terminal_id: payload.terminal_id,
+                    tenant_id: payload.tenant_id,
+                    rows: payload.rows,
+                    cols: payload.cols,
+                })
+                .await?;
+        }
+        ClientMessageKind::TerminalStatus(payload) => {
+            authorize_terminal_request(
+                &message.id,
+                &payload.tenant_id,
+                "terminal.status",
+                auth,
+                state,
+            )
+            .await?;
+            state
+                .local_terminals
+                .status(TerminalStatusOptions {
+                    request_id: message.id,
+                    tenant_id: payload.tenant_id,
+                    workspace_id: payload.workspace_id,
+                    terminal_id: payload.terminal_id,
+                })
+                .await?;
+        }
         ClientMessageKind::CodexThreadStart(payload) => {
             handle_codex_lifecycle(
                 &message.id,
@@ -1350,6 +1454,84 @@ async fn authorize_local_codex_request(
         operation,
     )
     .await
+}
+
+async fn authorize_terminal_request(
+    request_id: &str,
+    tenant_id: &str,
+    operation: &str,
+    auth: Option<&AuthContext>,
+    state: &AppState,
+) -> Result<(), AppError> {
+    let Some(auth) = auth else {
+        if state.config.security.auth_token.is_some() {
+            return Err(AppError::Unauthenticated);
+        }
+        let event = EventRecord::new(
+            "terminal.audit",
+            None,
+            None,
+            None,
+            json!({
+                "request_id": request_id,
+                "requested_tenant_id": tenant_id,
+                "action": operation,
+                "decision": "allow",
+                "reason_code": "NO_AUTH_REQUIRED",
+                "target_kind": "terminal",
+                "protocol": "todex-terminal.v1",
+            }),
+        );
+        append_audit_event(state, &event).await?;
+        state.events.publish(event).await;
+        return Ok(());
+    };
+
+    if auth.tenant_id != tenant_id {
+        let event = EventRecord::new(
+            "terminal.audit",
+            None,
+            None,
+            None,
+            json!({
+                "request_id": request_id,
+                "principal_id": auth.principal_id.as_str(),
+                "tenant_id": auth.tenant_id.as_str(),
+                "requested_tenant_id": tenant_id,
+                "token_id": auth.token_id.as_str(),
+                "action": operation,
+                "decision": "deny",
+                "reason_code": "TENANT_MISMATCH",
+                "target_kind": "terminal",
+                "protocol": "todex-terminal.v1",
+            }),
+        );
+        append_audit_event(state, &event).await?;
+        state.events.publish(event).await;
+        return Err(AppError::Unauthorized("tenant mismatch".to_owned()));
+    }
+
+    let event = EventRecord::new(
+        "terminal.audit",
+        None,
+        None,
+        None,
+        json!({
+            "request_id": request_id,
+            "principal_id": auth.principal_id.as_str(),
+            "tenant_id": auth.tenant_id.as_str(),
+            "requested_tenant_id": tenant_id,
+            "token_id": auth.token_id.as_str(),
+            "action": operation,
+            "decision": "allow",
+            "reason_code": "AUTHORIZED",
+            "target_kind": "terminal",
+            "protocol": "todex-terminal.v1",
+        }),
+    );
+    append_audit_event(state, &event).await?;
+    state.events.publish(event).await;
+    Ok(())
 }
 
 async fn authorize_codex_access(

@@ -46,6 +46,16 @@ pub enum ClientMessageKind {
     CodexLocalSnapshot(CodexLocalSnapshotRequest),
     #[serde(rename = "codex.local.unsupported")]
     CodexLocalUnsupported(CodexLocalUnsupportedRequest),
+    #[serde(rename = "terminal.start")]
+    TerminalStart(TerminalStartRequest),
+    #[serde(rename = "terminal.input")]
+    TerminalInput(TerminalInputRequest),
+    #[serde(rename = "terminal.stop")]
+    TerminalStop(TerminalStopRequest),
+    #[serde(rename = "terminal.resize")]
+    TerminalResize(TerminalResizeRequest),
+    #[serde(rename = "terminal.status")]
+    TerminalStatus(TerminalStatusRequest),
     #[serde(rename = "codex.thread.start")]
     CodexThreadStart(CodexLifecycleRequest),
     #[serde(rename = "codex.turn.start")]
@@ -246,6 +256,66 @@ pub struct CodexLocalUnsupportedRequest {
     pub operation: String,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct TerminalStartRequest {
+    #[serde(default)]
+    pub terminal_id: Option<String>,
+    pub tenant_id: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    pub cwd: String,
+    #[serde(default)]
+    pub shell: Option<String>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+    #[serde(default)]
+    pub cols: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct TerminalInputRequest {
+    pub terminal_id: String,
+    pub tenant_id: String,
+    pub data: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct TerminalStopRequest {
+    pub terminal_id: String,
+    pub tenant_id: String,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct TerminalResizeRequest {
+    pub terminal_id: String,
+    pub tenant_id: String,
+    #[serde(default)]
+    pub rows: Option<u16>,
+    #[serde(default)]
+    pub cols: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct TerminalStatusRequest {
+    pub tenant_id: String,
+    #[serde(default)]
+    pub terminal_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -658,6 +728,81 @@ mod tests {
         }));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn terminal_control_json_deserializes() {
+        let start = parse_message(json!({
+            "id": "terminal-start-1",
+            "type": "terminal.start",
+            "payload": {
+                "terminalId": "term-1",
+                "tenantId": "local",
+                "workspaceId": "workspace-1",
+                "cwd": "/tmp/project",
+                "shell": "/bin/sh",
+                "rows": 30,
+                "cols": 100
+            }
+        }));
+        match start.kind {
+            ClientMessageKind::TerminalStart(payload) => {
+                assert_eq!(payload.terminal_id.as_deref(), Some("term-1"));
+                assert_eq!(payload.tenant_id, "local");
+                assert_eq!(payload.workspace_id.as_deref(), Some("workspace-1"));
+                assert_eq!(payload.cwd, "/tmp/project");
+                assert_eq!(payload.rows, Some(30));
+                assert_eq!(payload.cols, Some(100));
+            }
+            other => panic!("unexpected message kind: {other:?}"),
+        }
+
+        let input = parse_message(json!({
+            "id": "terminal-input-1",
+            "type": "terminal.input",
+            "payload": {
+                "terminalId": "term-1",
+                "tenantId": "local",
+                "data": "pwd\n"
+            }
+        }));
+        assert!(matches!(input.kind, ClientMessageKind::TerminalInput(_)));
+
+        let resize = parse_message(json!({
+            "id": "terminal-resize-1",
+            "type": "terminal.resize",
+            "payload": {
+                "terminalId": "term-1",
+                "tenantId": "local",
+                "rows": 40,
+                "cols": 120
+            }
+        }));
+        assert!(matches!(resize.kind, ClientMessageKind::TerminalResize(_)));
+
+        let status = parse_message(json!({
+            "id": "terminal-status-1",
+            "type": "terminal.status",
+            "payload": {
+                "tenantId": "local",
+                "terminalId": "term-1"
+            }
+        }));
+        assert!(matches!(status.kind, ClientMessageKind::TerminalStatus(_)));
+
+        let stop = parse_message(json!({
+            "id": "terminal-stop-1",
+            "type": "terminal.stop",
+            "payload": {
+                "terminalId": "term-1",
+                "tenantId": "local",
+                "force": true
+            }
+        }));
+        match stop.kind {
+            ClientMessageKind::TerminalStop(payload) => assert!(payload.force),
+            other => panic!("unexpected message kind: {other:?}"),
+        }
     }
 
     #[test]
