@@ -2,7 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -18,6 +18,7 @@ const PID_FILE_NAME: &str = "daemon.json";
 const LOG_FILE_NAME: &str = "todex-agentd-daemon.log";
 const START_TIMEOUT: Duration = Duration::from_secs(8);
 const STOP_TIMEOUT: Duration = Duration::from_secs(8);
+const STOP_FORCE_AFTER: Duration = Duration::from_secs(2);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -94,6 +95,7 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
         }
 
         if let Some(process) = status(&config)? {
+            reap_daemon_child(child);
             return Ok(process);
         }
 
@@ -109,15 +111,42 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
     }
 }
 
+fn reap_daemon_child(mut child: Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
 pub async fn stop(config: &Config) -> Result<Option<DaemonProcess>> {
-    let Some(process) = status(config)? else {
+    let Some(process) = read_pid_file(&config.data_dir)? else {
         return Ok(None);
     };
 
+    if process_has_exited(process.pid) && !daemon_health_check(&process) {
+        remove_pid_file(&config.data_dir)?;
+        return Ok(None);
+    }
+
+    continue_process(process.pid)?;
     terminate_process(process.pid)?;
 
     let started = Instant::now();
-    while process_is_running(process.pid) || daemon_health_check(&process) {
+    let mut forced = false;
+    loop {
+        let liveness = process_liveness(process.pid);
+        if liveness.has_exited() && !daemon_health_check(&process) {
+            break;
+        }
+
+        if liveness.is_stopped() {
+            continue_process(process.pid)?;
+        }
+
+        if !forced && !liveness.has_exited() && started.elapsed() >= STOP_FORCE_AFTER {
+            force_kill_process(process.pid)?;
+            forced = true;
+        }
+
         if started.elapsed() >= STOP_TIMEOUT {
             bail!(
                 "daemon pid {} did not stop within {:?}",
@@ -142,7 +171,7 @@ pub fn status(config: &Config) -> Result<Option<DaemonProcess>> {
         return Ok(None);
     };
 
-    if process_is_running(process.pid) || daemon_health_check(&process) {
+    if process_liveness(process.pid).is_running() || daemon_health_check(&process) {
         return Ok(Some(process));
     }
 
@@ -275,6 +304,22 @@ async fn shutdown_signal() -> Result<()> {
     }
 }
 
+fn continue_process(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let status = Command::new("kill")
+            .arg("-CONT")
+            .arg(pid.to_string())
+            .status()
+            .with_context(|| format!("failed to send SIGCONT to daemon pid {pid}"))?;
+        if !status.success() && !process_has_exited(pid) {
+            bail!("failed to send SIGCONT to daemon pid {pid}");
+        }
+    }
+
+    Ok(())
+}
+
 fn terminate_process(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
@@ -302,29 +347,116 @@ fn terminate_process(pid: u32) -> Result<()> {
     Ok(())
 }
 
+fn force_kill_process(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let status = Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status()
+            .with_context(|| format!("failed to send SIGKILL to daemon pid {pid}"))?;
+        if !status.success() && !process_has_exited(pid) {
+            bail!("failed to send SIGKILL to daemon pid {pid}");
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .with_context(|| format!("failed to force stop daemon pid {pid}"))?;
+        if !status.success() && !process_has_exited(pid) {
+            bail!("failed to force stop daemon pid {pid}");
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLiveness {
+    Missing,
+    Running,
+    Stopped,
+    Zombie,
+}
+
+impl ProcessLiveness {
+    fn is_running(self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    fn is_stopped(self) -> bool {
+        matches!(self, Self::Stopped)
+    }
+
+    fn has_exited(self) -> bool {
+        matches!(self, Self::Missing | Self::Zombie)
+    }
+}
+
+fn process_has_exited(pid: u32) -> bool {
+    process_liveness(pid).has_exited()
+}
+
 fn process_is_running(pid: u32) -> bool {
+    matches!(
+        process_liveness(pid),
+        ProcessLiveness::Running | ProcessLiveness::Stopped
+    )
+}
+
+fn process_liveness(pid: u32) -> ProcessLiveness {
     #[cfg(target_os = "linux")]
     {
-        Path::new("/proc").join(pid.to_string()).exists()
+        let status_path = Path::new("/proc").join(pid.to_string()).join("status");
+        let raw = match fs::read_to_string(status_path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ProcessLiveness::Missing;
+            }
+            Err(_) => return ProcessLiveness::Running,
+        };
+        let state = raw
+            .lines()
+            .find_map(|line| line.strip_prefix("State:"))
+            .and_then(|value| value.trim().chars().next());
+        match state {
+            Some('T') | Some('t') => ProcessLiveness::Stopped,
+            Some('Z') => ProcessLiveness::Zombie,
+            Some(_) => ProcessLiveness::Running,
+            None => ProcessLiveness::Running,
+        }
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        Command::new("kill")
+        if Command::new("kill")
             .arg("-0")
             .arg(pid.to_string())
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+        {
+            ProcessLiveness::Running
+        } else {
+            ProcessLiveness::Missing
+        }
     }
 
     #[cfg(windows)]
     {
-        Command::new("tasklist")
+        if Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}")])
             .output()
             .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
             .unwrap_or(false)
+        {
+            ProcessLiveness::Running
+        } else {
+            ProcessLiveness::Missing
+        }
     }
 }
 
@@ -384,9 +516,12 @@ impl Drop for PidFileGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs};
+    use std::{env, fs, process::Command, thread, time::Duration};
 
-    use super::{pid_file_path, process_is_running, status, DaemonProcess};
+    use super::{
+        pid_file_path, process_has_exited, process_is_running, process_liveness, status,
+        DaemonProcess, ProcessLiveness,
+    };
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use chrono::Utc;
 
@@ -440,6 +575,80 @@ mod tests {
         assert!(status(&config).expect("read daemon status").is_none());
         assert!(pid_file_path(&config.data_dir).exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_ignores_stopped_pid_file() {
+        let root = unique_tmp_dir("todex-daemon-status-stopped");
+        let config = test_config(root.clone());
+        fs::create_dir_all(&config.data_dir).expect("create data dir");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn sleeping process");
+        let pid = child.id();
+        send_signal("-STOP", pid);
+        wait_for_liveness(pid, ProcessLiveness::Stopped);
+        let process = DaemonProcess {
+            pid,
+            host: config.host.clone(),
+            port: config.port,
+            data_dir: config.data_dir.clone(),
+            workspace_root: config.workspace_root.clone(),
+            started_at: Utc::now(),
+            executable: env::current_exe().unwrap(),
+        };
+        fs::write(
+            pid_file_path(&config.data_dir),
+            serde_json::to_string_pretty(&process).unwrap(),
+        )
+        .expect("write pid file");
+
+        assert!(status(&config).expect("read daemon status").is_none());
+
+        send_signal("-CONT", pid);
+        send_signal("-TERM", pid);
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_has_exited_treats_zombies_as_exited() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn exiting process");
+        let pid = child.id();
+        wait_for_liveness(pid, ProcessLiveness::Zombie);
+
+        assert!(process_has_exited(pid));
+
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    fn send_signal(signal: &str, pid: u32) {
+        let status = Command::new("kill")
+            .arg(signal)
+            .arg(pid.to_string())
+            .status()
+            .expect("send signal");
+        assert!(status.success(), "failed to send {signal} to pid {pid}");
+    }
+
+    #[cfg(any(unix, target_os = "linux"))]
+    fn wait_for_liveness(pid: u32, expected: ProcessLiveness) {
+        for _ in 0..50 {
+            if process_liveness(pid) == expected {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(process_liveness(pid), expected);
     }
 
     fn test_config(root: std::path::PathBuf) -> Config {
