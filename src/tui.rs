@@ -26,10 +26,11 @@ use crate::daemon::{self, DaemonProcess};
 use crate::event::EventRecord;
 use crate::transport_crypto::render_qr_text_for_bounds;
 
-const ACTION_COUNT: usize = 9;
+const ACTION_COUNT: usize = 7;
 const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
+const EDIT_POPUP_WIDTH: u16 = 64;
 
 pub async fn run(args: ServeArgs) -> Result<()> {
     let config = Config::load(args).context("failed to load configuration")?;
@@ -57,6 +58,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             }
         }
     }
+
+    app.push_log("TUI exiting; exporting logs automatically.".to_owned());
+    app.save_logs().context("failed to auto-save TUI logs")?;
 
     Ok(())
 }
@@ -107,7 +111,7 @@ struct TuiApp {
     view: TuiView,
     selected_action: usize,
     selected_session: usize,
-    input: Option<InputMode>,
+    edit: Option<EditMode>,
     last_error: Option<String>,
     notice: String,
     live_logs: VecDeque<String>,
@@ -132,7 +136,7 @@ impl TuiApp {
             view: TuiView::Control,
             selected_action: 0,
             selected_session: 0,
-            input: None,
+            edit: None,
             last_error: None,
             notice: "Daemon is stopped. Select Start when ready.".to_owned(),
             live_logs: VecDeque::new(),
@@ -269,8 +273,8 @@ impl TuiApp {
             return Ok(false);
         }
 
-        if self.input.is_some() {
-            self.handle_input_key(key).await?;
+        if self.edit.is_some() {
+            self.handle_edit_key(key).await?;
             return Ok(false);
         }
 
@@ -321,9 +325,7 @@ impl TuiApp {
             KeyCode::Char('r') => self.restart_daemon().await?,
             KeyCode::Char('h') => self.start_host_edit(),
             KeyCode::Char('p') => self.start_port_edit(),
-            KeyCode::Char('e') => self.cycle_pairing_encryption(),
-            KeyCode::Char('w') => self.save_config()?,
-            KeyCode::Char('l') => self.save_logs()?,
+            KeyCode::Char('e') => self.start_pairing_encryption_edit(),
             KeyCode::Char('g') => self.show_pairing_qr().await,
             KeyCode::PageUp => self.scroll_logs_up(LOG_SCROLL_STEP),
             KeyCode::PageDown => self.scroll_logs_down(LOG_SCROLL_STEP),
@@ -335,21 +337,35 @@ impl TuiApp {
         Ok(false)
     }
 
-    async fn handle_input_key(&mut self, key: KeyEvent) -> Result<()> {
+    async fn handle_edit_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
-                self.input = None;
+                self.edit = None;
                 self.notice = "Edit canceled.".to_owned();
             }
-            KeyCode::Enter => self.commit_input().await?,
+            KeyCode::Enter => self.commit_edit().await?,
             KeyCode::Backspace => {
-                if let Some(input) = &mut self.input {
-                    input.value.pop();
+                if let Some(EditMode::Text { value, .. }) = &mut self.edit {
+                    value.pop();
                 }
             }
             KeyCode::Char(ch) => {
-                if let Some(input) = &mut self.input {
-                    input.value.push(ch);
+                if let Some(EditMode::Text { value, .. }) = &mut self.edit {
+                    value.push(ch);
+                } else if let Some(EditMode::Encryption { value }) = &mut self.edit {
+                    if ch == 'e' {
+                        *value = (*value).next();
+                    }
+                }
+            }
+            KeyCode::Left | KeyCode::PageUp => {
+                if let Some(EditMode::Encryption { value }) = &mut self.edit {
+                    *value = previous_pairing_encryption(*value);
+                }
+            }
+            KeyCode::Right | KeyCode::PageDown => {
+                if let Some(EditMode::Encryption { value }) = &mut self.edit {
+                    *value = (*value).next();
                 }
             }
             _ => {}
@@ -364,11 +380,9 @@ impl TuiApp {
             1 => self.restart_daemon().await?,
             2 => self.start_host_edit(),
             3 => self.start_port_edit(),
-            4 => self.cycle_pairing_encryption(),
-            5 => self.save_config()?,
-            6 => self.show_pairing_qr().await,
-            7 => self.save_logs()?,
-            8 => return Ok(true),
+            4 => self.start_pairing_encryption_edit(),
+            5 => self.show_pairing_qr().await,
+            6 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -492,76 +506,92 @@ impl TuiApp {
     }
 
     fn start_host_edit(&mut self) {
-        self.input = Some(InputMode {
-            field: InputField::Host,
+        self.edit = Some(EditMode::Text {
+            field: EditField::Host,
             value: self.config.host.clone(),
         });
-        self.notice = "Editing host. Press Enter to apply or Esc to cancel.".to_owned();
+        self.notice =
+            "Listen IP edit window is open. Press Enter to apply or Esc to cancel.".to_owned();
     }
 
     fn start_port_edit(&mut self) {
-        self.input = Some(InputMode {
-            field: InputField::Port,
+        self.edit = Some(EditMode::Text {
+            field: EditField::Port,
             value: self.config.port.to_string(),
         });
-        self.notice = "Editing port. Press Enter to apply or Esc to cancel.".to_owned();
+        self.notice =
+            "Listen port edit window is open. Press Enter to apply or Esc to cancel.".to_owned();
     }
 
-    async fn commit_input(&mut self) -> Result<()> {
-        let Some(input) = self.input.take() else {
+    fn start_pairing_encryption_edit(&mut self) {
+        self.edit = Some(EditMode::Encryption {
+            value: self.config.pairing_encryption,
+        });
+        self.notice =
+            "Pairing encryption edit window is open. Use Left/Right to switch.".to_owned();
+    }
+
+    async fn commit_edit(&mut self) -> Result<()> {
+        let Some(edit) = self.edit.take() else {
             return Ok(());
         };
 
-        match input.field {
-            InputField::Host => match validate_host(&input.value) {
+        match edit {
+            EditMode::Text {
+                field: EditField::Host,
+                value,
+            } => match validate_host(&value) {
                 Ok(host) => {
                     self.config.host = host;
-                    self.notice = "Host updated. Save config to persist it.".to_owned();
-                    self.last_error = None;
+                    self.auto_save_settings("Listen IP updated");
                 }
                 Err(error) => {
                     self.last_error = Some(error);
                     self.notice = "Host was not changed.".to_owned();
                 }
             },
-            InputField::Port => match validate_port(&input.value) {
+            EditMode::Text {
+                field: EditField::Port,
+                value,
+            } => match validate_port(&value) {
                 Ok(port) => {
                     self.config.port = port;
-                    self.notice = "Port updated. Save config to persist it.".to_owned();
-                    self.last_error = None;
+                    self.auto_save_settings("Listen port updated");
                 }
                 Err(error) => {
                     self.last_error = Some(error);
                     self.notice = "Port was not changed.".to_owned();
                 }
             },
+            EditMode::Encryption { value } => {
+                self.config.pairing_encryption = value;
+                self.auto_save_settings("Pairing encryption updated");
+            }
         }
 
         Ok(())
     }
 
-    fn save_config(&mut self) -> Result<()> {
-        Config::save_tui_settings(
-            self.config.data_dir.clone(),
+    fn auto_save_settings(&mut self, subject: &str) {
+        let data_dir = self.config.data_dir.clone();
+        let config_path = data_dir.join("config.toml");
+        match Config::save_tui_settings(
+            data_dir,
             &self.config.host,
             self.config.port,
             self.config.pairing_encryption,
-        )?;
-        self.notice = format!(
-            "Saved host, port, and pairing encryption to {}/config.toml.",
-            self.config.data_dir.display()
-        );
-        self.last_error = None;
-        Ok(())
-    }
-
-    fn cycle_pairing_encryption(&mut self) {
-        self.config.pairing_encryption = self.config.pairing_encryption.next();
-        self.notice = format!(
-            "Pairing encryption updated to {}. Save config to persist it.",
-            pairing_encryption_label(self.config.pairing_encryption)
-        );
-        self.last_error = None;
+        ) {
+            Ok(()) => {
+                self.notice = format!("{subject} and auto-saved to {}.", config_path.display());
+                self.last_error = None;
+                self.push_log(self.notice.clone());
+            }
+            Err(error) => {
+                self.notice = format!("{subject}, but settings auto-save failed.");
+                self.last_error = Some(error.to_string());
+                self.push_log(format!("{} {}", self.notice.clone(), error));
+            }
+        }
     }
 
     fn save_logs(&mut self) -> Result<()> {
@@ -621,7 +651,7 @@ impl TuiApp {
             .with_context(|| format!("failed to write {}", jsonl_path.display()))?;
 
         self.notice = format!(
-            "Saved logs to {} and {}.",
+            "Auto-saved logs to {} and {}.",
             text_path.display(),
             jsonl_path.display()
         );
@@ -651,7 +681,7 @@ impl TuiApp {
             .constraints([
                 Constraint::Length(11),
                 Constraint::Min(10),
-                Constraint::Length(5),
+                Constraint::Length(6),
                 Constraint::Length(4),
             ])
             .split(frame.area());
@@ -682,6 +712,11 @@ impl TuiApp {
                 self.pairing_qr_paragraph(popup.lines, popup.title),
                 popup.area,
             );
+        }
+        if let Some(edit) = &self.edit {
+            let area = self.edit_popup_area(frame.area(), edit);
+            frame.render_widget(Clear, area);
+            frame.render_widget(self.edit_popup_paragraph(edit), area);
         }
     }
 
@@ -838,9 +873,7 @@ impl TuiApp {
             "Edit listen IP",
             "Edit listen port",
             "Edit pairing encryption",
-            "Save settings",
             "Show pairing QR",
-            "Save logs",
             "Quit",
         ];
         let items = actions
@@ -867,33 +900,14 @@ impl TuiApp {
     }
 
     fn help_panel(&self) -> Paragraph<'_> {
-        let input_line = self.input.as_ref().map(|input| {
-            let name = match input.field {
-                InputField::Host => "Host",
-                InputField::Port => "Port",
-            };
-            Line::from(vec![
-                Span::styled(
-                    format!("{name}: "),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(input.value.clone()),
-            ])
-        });
-        let lines = if let Some(input_line) = input_line {
-            vec![
-                input_line,
-                Line::from("Enter applies the value. Esc cancels the edit."),
-            ]
-        } else {
-            vec![
-                Line::from("Use Up/Down or j/k to choose an action, Enter to run it."),
-                Line::from(
-                    "Shortcuts: s start/stop, r restart, h host, p port, e encryption, w config, g QR, l logs, o observer, q quit.",
-                ),
-                Line::from("The TUI is only a controller; quitting leaves a running daemon online."),
-            ]
-        };
+        let lines = vec![
+            Line::from("Use Up/Down or j/k to choose an action, Enter to run it."),
+            Line::from(
+                "Shortcuts: s start/stop, r restart, h host, p port, e encryption, g QR, o observer, q quit.",
+            ),
+            Line::from("Settings auto-save after edits. Logs auto-export when the TUI exits."),
+            Line::from("The TUI is only a controller; quitting leaves a running daemon online."),
+        ];
 
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
@@ -912,6 +926,105 @@ impl TuiApp {
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
             .block(Block::default().title("Messages").borders(Borders::ALL))
+    }
+
+    fn edit_popup_area(&self, area: Rect, edit: &EditMode) -> Rect {
+        let height = match edit {
+            EditMode::Text { .. } => 8,
+            EditMode::Encryption { .. } => 9,
+        };
+        centered_area(area, EDIT_POPUP_WIDTH, height)
+    }
+
+    fn edit_popup_paragraph(&self, edit: &EditMode) -> Paragraph<'static> {
+        let (title, lines) = match edit {
+            EditMode::Text {
+                field: EditField::Host,
+                value,
+            } => (
+                "Edit Listen IP".to_owned(),
+                vec![
+                    Line::from(vec![
+                        Span::styled("Listen IP: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            if value.is_empty() {
+                                " ".to_owned()
+                            } else {
+                                value.clone()
+                            },
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from("IPv4 or IPv6 address only."),
+                    Line::from("Enter applies and auto-saves. Esc cancels."),
+                ],
+            ),
+            EditMode::Text {
+                field: EditField::Port,
+                value,
+            } => (
+                "Edit Listen Port".to_owned(),
+                vec![
+                    Line::from(vec![
+                        Span::styled(
+                            "Listen port: ",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            if value.is_empty() {
+                                " ".to_owned()
+                            } else {
+                                value.clone()
+                            },
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from("Use a port from 1 to 65535."),
+                    Line::from("Enter applies and auto-saves. Esc cancels."),
+                ],
+            ),
+            EditMode::Encryption { value } => (
+                "Edit Pairing Encryption".to_owned(),
+                vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(
+                            "[<]",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            pairing_encryption_label(*value),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            "[>]",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from("Left/Right switches the encryption method."),
+                    Line::from("Enter applies and auto-saves. Esc cancels."),
+                ],
+            ),
+        };
+
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title(title).borders(Borders::ALL))
     }
 
     fn pairing_qr_area(&self, area: Rect, content_width: u16, content_height: u16) -> Rect {
@@ -1657,6 +1770,17 @@ fn lines_width(lines: &[Line<'_>]) -> u16 {
         .unwrap_or(0)
 }
 
+fn centered_area(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
+    let width = desired_width.min(area.width.saturating_sub(2)).max(1);
+    let height = desired_height.min(area.height.saturating_sub(2)).max(1);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
 fn summarize_event(event: &EventRecord) -> String {
     let timestamp = event.time.format("%H:%M:%S");
     let detail = summarize_value(&event.payload);
@@ -1752,12 +1876,12 @@ fn truncate_text(value: &str, limit: usize) -> String {
     }
 }
 
-struct InputMode {
-    field: InputField,
-    value: String,
+enum EditMode {
+    Text { field: EditField, value: String },
+    Encryption { value: PairingEncryption },
 }
 
-enum InputField {
+enum EditField {
     Host,
     Port,
 }
@@ -1802,6 +1926,14 @@ fn pairing_encryption_label(value: PairingEncryption) -> &'static str {
         PairingEncryption::None => "无",
         PairingEncryption::MlKem768 => "后量子",
         PairingEncryption::X25519 => "X25519",
+    }
+}
+
+fn previous_pairing_encryption(value: PairingEncryption) -> PairingEncryption {
+    match value {
+        PairingEncryption::None => PairingEncryption::X25519,
+        PairingEncryption::X25519 => PairingEncryption::MlKem768,
+        PairingEncryption::MlKem768 => PairingEncryption::None,
     }
 }
 
