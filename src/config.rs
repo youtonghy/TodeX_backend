@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::Args;
@@ -217,12 +217,14 @@ impl Config {
         host: &str,
         port: u16,
         pairing_encryption: PairingEncryption,
+        workspace_root: &Path,
     ) -> anyhow::Result<()> {
         let data_dir = expand_home(data_dir);
         let mut document = load_config_document(&data_dir)?;
         document["host"] = value(host);
         document["port"] = value(i64::from(port));
         document["pairing_encryption"] = value(pairing_encryption.as_str());
+        document["workspace_root"] = value(workspace_root.display().to_string());
         write_config_document(&data_dir, &document)?;
         Ok(())
     }
@@ -371,7 +373,12 @@ pub(crate) fn expand_home_with_home(path: PathBuf, home: Option<OsString>) -> Pa
 
 #[cfg(test)]
 mod tests {
-    use std::{env, ffi::OsString, fs, path::PathBuf};
+    use std::{
+        env,
+        ffi::OsString,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use super::{expand_home_with_home, Config, PairingEncryption, ServeArgs};
 
@@ -462,14 +469,20 @@ codex_bin = "codex"
         )
         .expect("write config");
 
-        Config::save_tui_settings(root.clone(), "0.0.0.0", 8080, PairingEncryption::X25519)
-            .expect("save TUI settings");
+        Config::save_tui_settings(
+            root.clone(),
+            "0.0.0.0",
+            8080,
+            PairingEncryption::X25519,
+            Path::new("/tmp/mobile-workspaces"),
+        )
+        .expect("save TUI settings");
         let updated = fs::read_to_string(root.join("config.toml")).expect("read updated config");
 
         assert!(updated.contains("host = \"0.0.0.0\""));
         assert!(updated.contains("port = 8080"));
         assert!(updated.contains("pairing_encryption = \"x25519\""));
-        assert!(updated.contains("workspace_root = \"/tmp/workspaces\""));
+        assert!(updated.contains("workspace_root = \"/tmp/mobile-workspaces\""));
         assert!(updated.contains("custom_value = \"kept\""));
         assert!(updated.contains("[agent]"));
 

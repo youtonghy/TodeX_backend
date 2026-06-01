@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -25,8 +26,9 @@ use crate::config::{Config, PairingEncryption, ServeArgs};
 use crate::daemon::{self, DaemonProcess};
 use crate::event::EventRecord;
 use crate::transport_crypto::{render_qr_text_for_bounds, PairingKeys};
+use crate::workspace_paths::canonical_workspace_root;
 
-const ACTION_COUNT: usize = 8;
+const ACTION_COUNT: usize = 9;
 const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
@@ -120,6 +122,7 @@ struct TuiApp {
     observer_scroll: usize,
     log_follow_tail: bool,
     pairing_qr: Option<PairingQr>,
+    folder_picker: Option<FolderPicker>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +148,7 @@ impl TuiApp {
             observer_scroll: 0,
             log_follow_tail: true,
             pairing_qr: None,
+            folder_picker: None,
         }
     }
 
@@ -273,6 +277,11 @@ impl TuiApp {
             return Ok(false);
         }
 
+        if self.folder_picker.is_some() {
+            self.handle_folder_picker_key(key).await?;
+            return Ok(false);
+        }
+
         if self.edit.is_some() {
             self.handle_edit_key(key).await?;
             return Ok(false);
@@ -325,6 +334,7 @@ impl TuiApp {
             KeyCode::Char('r') => self.restart_daemon().await?,
             KeyCode::Char('h') => self.start_host_edit(),
             KeyCode::Char('p') => self.start_port_edit(),
+            KeyCode::Char('w') => self.start_workspace_root_picker(),
             KeyCode::Char('e') => self.start_pairing_encryption_edit(),
             KeyCode::Char('x') => self.start_reset_edit(),
             KeyCode::Char('g') => self.show_pairing_qr().await,
@@ -336,6 +346,59 @@ impl TuiApp {
         }
 
         Ok(false)
+    }
+
+    async fn handle_folder_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.folder_picker = None;
+                self.notice = "Workspace root selection canceled.".to_owned();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(picker) = &mut self.folder_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(picker) = &mut self.folder_picker {
+                    picker.select_next();
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(picker) = &mut self.folder_picker {
+                    picker.selected = picker.selected.saturating_sub(LOG_SCROLL_STEP);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(picker) = &mut self.folder_picker {
+                    picker.select_next_by(LOG_SCROLL_STEP);
+                }
+            }
+            KeyCode::Left | KeyCode::Backspace => {
+                if let Some(picker) = &mut self.folder_picker {
+                    picker.open_parent();
+                }
+            }
+            KeyCode::Right | KeyCode::Enter => {
+                if let Some(picker) = &mut self.folder_picker {
+                    picker.open_selected();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(picker) = &mut self.folder_picker {
+                    picker.open_home();
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(picker) = &mut self.folder_picker {
+                    picker.refresh();
+                }
+            }
+            KeyCode::Char(' ') => self.apply_selected_workspace_root().await?,
+            _ => {}
+        }
+
+        Ok(())
     }
 
     async fn handle_edit_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -393,10 +456,11 @@ impl TuiApp {
             1 => self.restart_daemon().await?,
             2 => self.start_host_edit(),
             3 => self.start_port_edit(),
-            4 => self.start_pairing_encryption_edit(),
-            5 => self.start_reset_edit(),
-            6 => self.show_pairing_qr().await,
-            7 => return Ok(true),
+            4 => self.start_workspace_root_picker(),
+            5 => self.start_pairing_encryption_edit(),
+            6 => self.start_reset_edit(),
+            7 => self.show_pairing_qr().await,
+            8 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -537,6 +601,13 @@ impl TuiApp {
             "Listen port edit window is open. Press Enter to apply or Esc to cancel.".to_owned();
     }
 
+    fn start_workspace_root_picker(&mut self) {
+        self.folder_picker = Some(FolderPicker::new(self.config.workspace_root.clone()));
+        self.notice =
+            "Workspace root selector is open. Enter descends; Space selects current directory."
+                .to_owned();
+    }
+
     fn start_pairing_encryption_edit(&mut self) {
         self.edit = Some(EditMode::Encryption {
             value: self.config.pairing_encryption,
@@ -551,6 +622,29 @@ impl TuiApp {
         });
         self.notice =
             "Reset window is open. Use Left/Right to choose Auth or Encryption.".to_owned();
+    }
+
+    async fn apply_selected_workspace_root(&mut self) -> Result<()> {
+        let Some(picker) = self.folder_picker.take() else {
+            return Ok(());
+        };
+
+        match canonical_workspace_root(&picker.current) {
+            Ok(root) => {
+                self.config.workspace_root = root;
+                let saved = self.auto_save_settings("Workspace root updated");
+                if saved && self.daemon.is_some() {
+                    self.restart_daemon().await?;
+                }
+            }
+            Err(error) => {
+                self.folder_picker = Some(picker);
+                self.last_error = Some(error.to_string());
+                self.notice = "Workspace root was not changed.".to_owned();
+            }
+        }
+
+        Ok(())
     }
 
     async fn commit_edit(&mut self) -> Result<()> {
@@ -660,7 +754,7 @@ impl TuiApp {
         }
     }
 
-    fn auto_save_settings(&mut self, subject: &str) {
+    fn auto_save_settings(&mut self, subject: &str) -> bool {
         let data_dir = self.config.data_dir.clone();
         let config_path = data_dir.join("config.toml");
         match Config::save_tui_settings(
@@ -668,16 +762,19 @@ impl TuiApp {
             &self.config.host,
             self.config.port,
             self.config.pairing_encryption,
+            &self.config.workspace_root,
         ) {
             Ok(()) => {
                 self.notice = format!("{subject} and auto-saved to {}.", config_path.display());
                 self.last_error = None;
                 self.push_log(self.notice.clone());
+                true
             }
             Err(error) => {
                 self.notice = format!("{subject}, but settings auto-save failed.");
                 self.last_error = Some(error.to_string());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
+                false
             }
         }
     }
@@ -806,6 +903,11 @@ impl TuiApp {
             frame.render_widget(Clear, area);
             frame.render_widget(self.edit_popup_paragraph(edit), area);
         }
+        if let Some(picker) = &self.folder_picker {
+            let area = self.folder_picker_area(frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(self.folder_picker_widget(picker), area);
+        }
     }
 
     fn render_observer(&self, frame: &mut Frame<'_>) {
@@ -909,7 +1011,10 @@ impl TuiApp {
             Line::from(vec![Span::raw("Auth: "), auth_state]),
             token_line,
             Line::from(format!("Data dir: {}", data_dir.display())),
-            Line::from(format!("Workspace root: {}", workspace_root.display())),
+            Line::from(format!(
+                "Workspace root: {} (action w)",
+                workspace_root.display()
+            )),
             Line::from(format!("Uptime: {} | Daemon PID: {}", uptime, daemon_pid)),
             Line::from(vec![Span::raw("Connection: "), connection_state]),
         ])
@@ -960,6 +1065,7 @@ impl TuiApp {
             "Restart daemon",
             "Edit listen IP",
             "Edit listen port",
+            "Choose workspace root",
             "Edit pairing encryption",
             "Reset",
             "Show pairing QR",
@@ -992,7 +1098,7 @@ impl TuiApp {
         let lines = vec![
             Line::from("Use Up/Down or j/k to choose an action, Enter to run it."),
             Line::from(
-                "Shortcuts: s start/stop, r restart, h host, p port, e encryption, x reset, g QR, o observer, q quit.",
+                "Shortcuts: s start/stop, r restart, h host, p port, w workspace root, e encryption, x reset, g QR, o observer, q quit.",
             ),
             Line::from("Settings auto-save after edits. Logs auto-export when the TUI exits."),
             Line::from("The TUI is only a controller; quitting leaves a running daemon online."),
@@ -1147,6 +1253,56 @@ impl TuiApp {
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
             .block(Block::default().title(title).borders(Borders::ALL))
+    }
+
+    fn folder_picker_area(&self, area: Rect) -> Rect {
+        centered_area(area, 82, 24)
+    }
+
+    fn folder_picker_widget(&self, picker: &FolderPicker) -> List<'static> {
+        let mut items = Vec::new();
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("Current: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                picker.current.display().to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+        ])));
+        items.push(ListItem::new(Line::from(
+            "Space selects current. Enter/Right opens selected. Left/Backspace goes parent. Home jumps home.",
+        )));
+        if let Some(error) = &picker.error {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("Error: ", Style::default().fg(Color::Red)),
+                Span::raw(error.clone()),
+            ])));
+        }
+        items.push(ListItem::new(Line::from("")));
+
+        if picker.entries.is_empty() {
+            items.push(ListItem::new(Line::from("No readable subdirectories.")));
+        } else {
+            for (idx, entry) in picker.entries.iter().enumerate() {
+                let marker = if idx == picker.selected { "> " } else { "  " };
+                let style = if idx == picker.selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                items.push(
+                    ListItem::new(Line::from(format!("{marker}{}/", entry.display_name())))
+                        .style(style),
+                );
+            }
+        }
+
+        List::new(items).block(
+            Block::default()
+                .title("Choose Workspace Root")
+                .borders(Borders::ALL),
+        )
     }
 
     fn pairing_qr_area(&self, area: Rect, content_width: u16, content_height: u16) -> Rect {
@@ -1996,6 +2152,140 @@ fn truncate_text(value: &str, limit: usize) -> String {
     } else {
         text.to_owned()
     }
+}
+
+struct FolderPicker {
+    current: PathBuf,
+    entries: Vec<FolderEntry>,
+    selected: usize,
+    error: Option<String>,
+}
+
+impl FolderPicker {
+    fn new(start: PathBuf) -> Self {
+        let current = canonical_workspace_root(&start)
+            .ok()
+            .or_else(|| {
+                start
+                    .parent()
+                    .and_then(|parent| canonical_workspace_root(parent).ok())
+            })
+            .unwrap_or_else(default_picker_root);
+        let mut picker = Self {
+            current,
+            entries: Vec::new(),
+            selected: 0,
+            error: None,
+        };
+        picker.refresh();
+        picker
+    }
+
+    fn refresh(&mut self) {
+        match read_directory_entries(&self.current) {
+            Ok(entries) => {
+                self.entries = entries;
+                self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+                self.error = None;
+            }
+            Err(error) => {
+                self.entries.clear();
+                self.selected = 0;
+                self.error = Some(error);
+            }
+        }
+    }
+
+    fn select_next(&mut self) {
+        self.select_next_by(1);
+    }
+
+    fn select_next_by(&mut self, amount: usize) {
+        if !self.entries.is_empty() {
+            self.selected = (self.selected + amount).min(self.entries.len() - 1);
+        }
+    }
+
+    fn open_selected(&mut self) {
+        let Some(entry) = self.entries.get(self.selected) else {
+            return;
+        };
+        self.current = entry.path.clone();
+        self.selected = 0;
+        self.refresh();
+    }
+
+    fn open_parent(&mut self) {
+        let Some(parent) = self.current.parent() else {
+            return;
+        };
+        self.current = parent.to_path_buf();
+        self.selected = 0;
+        self.refresh();
+    }
+
+    fn open_home(&mut self) {
+        self.current = default_picker_root();
+        self.selected = 0;
+        self.refresh();
+    }
+}
+
+struct FolderEntry {
+    path: PathBuf,
+    name: String,
+}
+
+impl FolderEntry {
+    fn display_name(&self) -> &str {
+        self.name.as_str()
+    }
+}
+
+fn read_directory_entries(path: &Path) -> std::result::Result<Vec<FolderEntry>, String> {
+    let mut entries = Vec::new();
+    let read_dir = fs::read_dir(path)
+        .map_err(|error| format!("failed to read {}: {}", path.display(), error))?;
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() || name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let canonical = match fs::canonicalize(&path) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        entries.push(FolderEntry {
+            path: canonical,
+            name,
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+    });
+    Ok(entries)
+}
+
+fn default_picker_root() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 enum EditMode {

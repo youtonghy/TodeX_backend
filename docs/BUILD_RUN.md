@@ -153,10 +153,10 @@ TUI 是 daemon 控制器，不再承载核心服务进程。可以在界面里�
 | `r` | 重启 daemon |
 | `h` | 修改监听 IP |
 | `p` | 修改监听端口 |
-| `w` | 保存监听 IP 和端口到 `$TODEX_AGENTD_DATA_DIR/config.toml` |
+| `w` | 打开 workspace 根目录选择器，并保存到 `$TODEX_AGENTD_DATA_DIR/config.toml` |
 | `q` / `Esc` | 退出 TUI；如果 daemon 已启动，它会继续在后台运行 |
 
-也可以用方向键选择操作项，然后按 Enter 执行。
+也可以用方向键选择操作项，然后按 Enter 执行。workspace 根目录选择器中，Enter/Right 进入选中的子目录，Left/Backspace 返回上级，Space 把当前目录保存为移动端最高层目录；如果 daemon 正在运行，TUI 会用新目录重启 daemon。
 
 ### 指定监听地址和端口
 
