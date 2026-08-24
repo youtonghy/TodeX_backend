@@ -1,13 +1,14 @@
 # TodeX Backend API 调用文档
 
-本文档基于当前代码实现整理。当前控制面已经切换为 Codex 原生 app-server 通道，WebSocket 只暴露 `codex.local.*` 和保留的 `codex.*` 网关兼容消息；旧的本地终端 workspace/window/pane 控制请求已从协议中移除。
+本文档基于当前代码实现整理。TodeX 2.0 的主控制面是 `/v2/conversations` 与 `/v2/ws`，统一支持 ACP、Codex、Pi 和 Claude Code。`/v1/ws` 仅作为原 Codex 网关的有限兼容层保留。
 
 ## 基本信息
 
 - 服务名称：`todex-agentd`
 - 默认监听地址：`127.0.0.1:7345`
 - 默认 HTTP Base URL：`http://127.0.0.1:7345`
-- 默认 WebSocket URL：`ws://127.0.0.1:7345/v1/ws`
+- 默认 WebSocket URL：`ws://127.0.0.1:7345/v2/ws`
+- v1 兼容 WebSocket URL：`ws://127.0.0.1:7345/v1/ws`
 - 可选传输加密：`x25519` 或 `ml-kem-768`，由 TUI 配对二维码携带的服务端公钥协商
 - 数据格式：JSON
 - 字符编码：UTF-8
@@ -36,11 +37,92 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 | 数据目录 | `--data-dir` | `TODEX_AGENTD_DATA_DIR` | `~/.todex-agent` |
 | Workspace 根目录 | `--workspace-root` | `TODEX_AGENTD_WORKSPACE_ROOT` | `~/projects` |
 | Codex 可执行文件 | 无 | `TODEX_AGENTD_CODEX_BIN` | `codex` |
+| Claude Code 可执行文件 | 无 | `TODEX_AGENTD_CLAUDE_BIN` | `claude` |
+| Pi 可执行文件 | 无 | `TODEX_AGENTD_PI_BIN` | `pi` |
 | 默认 agent 名称 | 无 | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` |
 | 是否开启认证 | 无 | `TODEX_AGENTD_ENABLE_AUTH` | `true` |
 | Bearer token | 无 | `TODEX_AGENTD_AUTH_TOKEN` | 无 |
 
-当前 HTTP 层没有实现 TLS 终止；生产环境不应直接暴露明文端口到公网。`TODEX_AGENTD_AUTH_TOKEN` 是 WebSocket Bearer token 来源。所有 WebSocket 业务消息都必须在握手时提供 `Authorization: Bearer <TODEX_AGENTD_AUTH_TOKEN>`。如果服务端没有配置 token，WebSocket 握手仍可建立，但业务消息会返回 `UNAUTHENTICATED`。
+当前 HTTP 层没有实现 TLS 终止，配置 `enable_tls = true` 时服务会拒绝启动，避免产生“已经启用 TLS”的错误安全假设。生产环境应在可信反向代理终止 TLS，且不应直接暴露明文端口。v2 HTTP 和 WebSocket 都使用 `Authorization: Bearer <TODEX_AGENTD_AUTH_TOKEN>`；conversation 持久化 owner tenant，所有读取、订阅与变更入口都会校验 tenant。
+
+## v2 Conversation API
+
+Provider 标识为 `acp`、`codex`、`pi`、`claude-code`。未指定时使用 `[agent].default_agent`，默认是 `codex`。ACP 必须使用后端 `config.toml` 中预配置的 `providerProfile`；客户端不能提交任意 command、args 或 env。
+
+Provider 子进程只继承运行所需的基础系统环境；ACP 额外使用管理员在 profile 中明确配置的 env。Codex、Pi 和 Claude Code 应先由运行 daemon 的同一系统用户完成原生登录。Pi RPC 当前没有覆盖所有工具调用的通用审批接口，因此首期以 `--approve` 启动，`permissions` capability 为 `false`；extension UI 请求仍会转成 TodeX permission 事件，但不能把它等同于逐工具审批。
+
+```http
+GET /v2/providers
+GET /v2/conversations
+POST /v2/conversations
+GET /v2/conversations/{conversationId}
+GET /v2/conversations/{conversationId}/events?afterSequence=0&limit=200
+POST /v2/conversations/{conversationId}/prompt
+POST /v2/conversations/{conversationId}/cancel
+POST /v2/conversations/{conversationId}/permissions/{permissionId}
+```
+
+创建对话：
+
+```json
+{
+  "provider": "codex",
+  "workspace": "/home/user/projects/demo",
+  "title": "Review backend",
+  "providerProfile": null
+}
+```
+
+发送 prompt：
+
+```json
+{
+  "text": "检查认证边界",
+  "model": null
+}
+```
+
+每个 conversation 同时只允许一个 mutating turn；并发 prompt 返回 `409 CONFLICT`，不会排队。daemon 重启会把未完成 turn 标记为 `interrupted`，不会通过重放 prompt 猜测恢复。原生会话 ID 由 `provider-state.json` 保存，Provider 支持时下一 turn 使用原生 resume。
+
+### v2 WebSocket
+
+客户端命令 envelope：
+
+```json
+{
+  "id": "request-1",
+  "type": "conversation.subscribe",
+  "payload": {
+    "conversationId": "00000000-0000-4000-8000-000000000000",
+    "afterSequence": 0,
+    "limit": 500
+  }
+}
+```
+
+支持 `conversation.subscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.permission.respond` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence。
+
+### 只读 Skill/MCP Catalog
+
+```http
+GET /v2/catalog/skills?provider=claude-code&workspace=/home/user/projects/demo
+GET /v2/catalog/skills/{resourceId}?provider=claude-code&workspace=/home/user/projects/demo
+GET /v2/catalog/mcp?provider=claude-code&workspace=/home/user/projects/demo
+```
+
+Catalog 只读取 Provider 的用户级和项目级原生配置，项目级同名资源优先。Skill 正文只能通过后端生成的 `resourceId` 读取；MCP 响应仅返回名称、来源、scope、transport 和 active 状态，不返回 command、args、env、URL 或凭据。后端不提供安装、启停、删除或改写接口。
+
+### Conversation Folder 与旧数据迁移
+
+```text
+$DATA_DIR/conversations/<uuid-v4>/
+  manifest.json
+  events.jsonl
+  snapshot.json
+  provider-state.json
+```
+
+`events.jsonl` 是规范事件日志，sequence 从 1 连续递增。启动时会复制迁移旧 `$DATA_DIR/codex_gateway/sessions`；旧文件不修改，迁移可重复执行，并会去除 approval response 和常见 secret 字段。
 
 ## HTTP 接口
 
@@ -146,10 +228,12 @@ GET /v1/workspace/directories?path=/home/user/projects/demo
 websocat -H "Authorization: Bearer ${TODEX_AGENTD_AUTH_TOKEN}" ws://127.0.0.1:7345/v1/ws
 ```
 
-TUI 配对二维码会一次性携带后端地址、Bearer token、当前首选加密方式，以及该加密方式对应的服务端公钥。扫码后客户端用这些信息发起可选加密握手：
+TUI 配对二维码携带后端地址、当前首选加密方式和服务端公钥。仅 loopback 监听时二维码携带 Bearer token；非 loopback 监听会省略长期 token，需通过独立可信通道录入。客户端每次连接必须生成新的 X25519 client key 或 ML-KEM ciphertext，服务端会拒绝当前进程生命周期内重复使用的握手材料。进程内最多登记 65,536 份已使用握手材料；达到上限后新加密握手会失败关闭，需要重启 daemon 清空登记表。
 
-- X25519：客户端从配对信息读取服务端 X25519 公钥，连接 `ws://.../v1/ws?enc=x25519&client_key=<base64url-client-public-key>`。
-- ML-KEM-768：客户端从配对信息读取服务端 ML-KEM-768 公钥，连接 `ws://.../v1/ws?enc=ml-kem-768&ciphertext=<base64url-kem-ciphertext>`。
+- X25519：客户端从配对信息读取服务端 X25519 公钥，连接 `ws://.../v2/ws?enc=x25519&client_key=<base64url-client-public-key>`。
+- ML-KEM-768：客户端从配对信息读取服务端 ML-KEM-768 公钥，连接 `ws://.../v2/ws?enc=ml-kem-768&ciphertext=<base64url-kem-ciphertext>`。
+
+兼容端点 `/v1/ws` 接受相同的握手查询参数；新客户端应使用 `/v2/ws`。
 - 双方用 HKDF-SHA256 派生 32 字节会话密钥，并用 XChaCha20-Poly1305 加密每个业务文本帧。
 
 消息 envelope：
@@ -191,6 +275,8 @@ TUI 配对二维码会一次性携带后端地址、Bearer token、当前首选�
 并发 mutating command 默认拒绝，不排队。
 
 ## codex.local 请求
+
+以下内容属于 v1 兼容接口，新客户端应使用上面的 v2 Conversation API。
 
 ### `codex.local.start`
 

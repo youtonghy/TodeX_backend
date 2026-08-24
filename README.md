@@ -1,13 +1,17 @@
 # TodeX Backend / TodeX 后端
 
-`todex-agentd` 是 TodeX 的后端服务，负责提供 HTTP 健康检查、版本信息、工作区文件检索，以及 WebSocket 协议网关，并通过 `codex app-server --listen stdio://` 管理本地 Codex 会话。
+`todex-agentd` 是 TodeX 2.0 后端。它以 conversation folder 为持久化核心，统一驱动 ACP、Codex、Pi 和 Claude Code，并保留 v1 Codex 网关作为有限兼容层。
 
-`todex-agentd` is the backend service for TodeX. It provides HTTP health/version/workspace-entry endpoints, a WebSocket protocol gateway, and local Codex session management through `codex app-server --listen stdio://`.
+`todex-agentd` is the TodeX 2.0 backend. Conversation folders are the persistence core for ACP, Codex, Pi, and Claude Code; the v1 Codex gateway remains a limited compatibility surface.
 
 ## 功能 / Features
 
 - HTTP 接口：`/health`、`/v1/version`、`/v1/workspaces`、`/v1/workspace/entries`、`/v1/workspace/directories`
-- WebSocket 接口：`/v1/ws`，可选 X25519 或 ML-KEM-768 传输加密
+- v2 对话接口：`/v2/providers`、`/v2/conversations`、`/v2/ws`
+- Provider：ACP 配置 profile、Codex app-server、Pi RPC、Claude Code stream-json
+- 只读 Catalog：读取各 Provider 原生 Skill/MCP 配置，应用 project-over-user 优先级，不安装、不切换、不改写
+- Conversation folder：`$DATA_DIR/conversations/<uuid>/` 下保存 manifest、事件日志、快照与原生 Provider 状态
+- WebSocket 接口：规范 `/v2/ws` 与兼容 `/v1/ws`，均可选 X25519 或 ML-KEM-768 传输加密
 - 本地 Codex 会话管理：`start`、`status`、`stop`、`turn`、`attach`、`replay`、`interrupt`
 - 工作区权限边界：后端 `workspace_root` 限制移动端只能创建和使用该根目录内的工作区
 - 工作区文件检索：为前端 `@` 引用提供目录和文件建议
@@ -16,7 +20,11 @@
 - 交互式 TUI：作为控制器启动、停止 daemon，保存监听地址，并显示 App 配对二维码
 
 - HTTP endpoints: `/health`, `/v1/version`, `/v1/workspaces`, `/v1/workspace/entries`, `/v1/workspace/directories`
-- WebSocket endpoint: `/v1/ws`, with optional X25519 or ML-KEM-768 transport encryption
+- v2 conversation endpoints: `/v2/providers`, `/v2/conversations`, and `/v2/ws`
+- ACP profiles, Codex app-server, Pi RPC, and Claude Code stream-json drivers
+- Read-only native Skill/MCP catalogs with project-over-user precedence
+- Per-conversation manifests, journals, snapshots, and native provider state under `$DATA_DIR/conversations/<uuid>/`
+- WebSocket endpoints: canonical `/v2/ws` and compatible `/v1/ws`, both with optional X25519 or ML-KEM-768 transport encryption
 - Local Codex session control: `start`, `status`, `stop`, `turn`, `attach`, `replay`, `interrupt`
 - Workspace boundary enforcement: backend `workspace_root` restricts mobile-created and mobile-used workspaces to that root
 - Workspace file lookup for the frontend `@` picker
@@ -91,6 +99,8 @@ Priority order:
 - `TODEX_AGENTD_DATA_DIR`
 - `TODEX_AGENTD_WORKSPACE_ROOT`
 - `TODEX_AGENTD_CODEX_BIN`
+- `TODEX_AGENTD_CLAUDE_BIN`
+- `TODEX_AGENTD_PI_BIN`
 - `TODEX_AGENTD_DEFAULT_AGENT`
 - `TODEX_AGENTD_ENABLE_AUTH`
 - `TODEX_AGENTD_ENABLE_TLS`
@@ -100,22 +110,22 @@ Priority order:
 
 1. 先启动后端 daemon，或用 `serve` 前台运行。
 2. 让前端客户端连接到 `http://127.0.0.1:7345` 或你自己的地址。
-3. 在设置里填写 `Auth token` 和 `Tenant id`，或从 TUI 扫描配对二维码一键导入地址、token 和加密公钥。
+3. 在设置里填写 `Auth token` 和 `Tenant id`，或从 TUI 扫描配对二维码导入地址和加密公钥。仅 loopback 二维码携带 token；非 loopback 二维码会省略长期 token。
 4. 通过 `/v1/workspace/entries` 为 `@` 引用提供文件建议。
 5. 通过 WebSocket `/v1/ws` 收发协议事件。
 
 1. Start the backend daemon first, or run `serve` in the foreground.
 2. Point the frontend client to `http://127.0.0.1:7345` or your own host.
-3. Fill in `Auth token` and `Tenant id` in the client settings, or scan the TUI pairing QR to import the address, token, and encryption public key.
+3. Fill in `Auth token` and `Tenant id` in the client settings, or scan the TUI pairing QR. Loopback QR payloads include the token; non-loopback QR payloads intentionally omit the long-lived token.
 4. Use `/v1/workspace/entries` to power `@` file suggestions.
-5. Exchange protocol events over WebSocket `/v1/ws`.
+5. Use `/v2/ws` for canonical conversation events. `/v1/ws` is retained for compatibility only.
 
 ## 常用检查 / Common Checks
 
 ```bash
 cargo check
-cargo fmt --check
-cargo clippy
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features
 curl http://127.0.0.1:7345/health
 curl http://127.0.0.1:7345/v1/version
 ```

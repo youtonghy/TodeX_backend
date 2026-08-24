@@ -9,16 +9,17 @@
 - 后台 daemon 控制入口：`cargo run -- daemon start|stop|restart|status`
 - 交互式 TUI 启动入口：`cargo run -- tui`
 - 默认监听：`127.0.0.1:7345`
-- 默认 WebSocket：`ws://127.0.0.1:7345/v1/ws`
+- 默认 WebSocket：`ws://127.0.0.1:7345/v2/ws`
 - 默认数据目录：`~/.todex-agent`
 - 默认 workspace 根目录：`~/projects`
-- 本地 Codex 控制：`codex app-server --listen stdio://`
+- 首期 Provider：ACP、Codex、Pi、Claude Code
 
 ## 环境要求
 
 - Rust 工具链
 - `cargo`
-- `codex` 可执行文件在 `PATH` 中，或通过 `TODEX_AGENTD_CODEX_BIN` 指定路径
+- 至少安装要使用的 Provider CLI，并放在 `PATH` 中或通过对应环境变量指定路径
+- Codex、Pi 和 Claude Code 使用 daemon 所属系统用户的原生配置与登录状态
 
 建议先检查版本：
 
@@ -26,6 +27,8 @@
 rustc --version
 cargo --version
 codex --version
+pi --version
+claude --version
 ```
 
 ## 配置方式
@@ -46,6 +49,8 @@ codex --version
 | `TODEX_AGENTD_DATA_DIR` | 数据目录 |
 | `TODEX_AGENTD_WORKSPACE_ROOT` | workspace 根目录 |
 | `TODEX_AGENTD_CODEX_BIN` | `codex` 命令路径 |
+| `TODEX_AGENTD_CLAUDE_BIN` | `claude` 命令路径 |
+| `TODEX_AGENTD_PI_BIN` | `pi` 命令路径 |
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
@@ -62,12 +67,36 @@ workspace_root = "/home/user/projects"
 [agent]
 default_agent = "codex"
 codex_bin = "codex"
+claude_bin = "claude"
+pi_bin = "pi"
+
+[agent.acp_profiles.example]
+command = "example-acp-agent"
+args = []
 
 [security]
 enable_auth = true
 enable_tls = false
 auth_token = "replace-me"
 ```
+
+`enable_tls = true` 会直接拒绝启动，因为当前 binary 没有证书/私钥配置入口。需要 TLS 时应由可信反向代理终止 TLS；不要把明文监听端口直接暴露到公网。
+
+Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径、用户目录、locale、代理和 SSH agent 等运行环境。ACP profile 中的 `env` 会显式传入，但名称以 `TODEX_AGENTD_` 开头的变量会被拒绝。Codex、Pi 和 Claude Code 因此应优先使用各自保存在用户目录中的原生登录配置。Pi 首期使用 RPC `--approve`，因为其 RPC 协议没有通用的逐工具审批接口；只应在可信 workspace 与可信 Pi 配置下启用。
+
+## Conversation 数据目录
+
+每个 v2 对话使用服务端生成的 UUID v4 目录：
+
+```text
+$TODEX_AGENTD_DATA_DIR/conversations/<conversation-id>/
+  manifest.json
+  events.jsonl
+  snapshot.json
+  provider-state.json
+```
+
+旧 `$DATA_DIR/codex_gateway/sessions` 会在启动时复制迁移到该结构，源文件保持不变；迁移映射保存在 `$DATA_DIR/migrations/codex-gateway-v1.json`。
 
 ## 如何编译
 
