@@ -123,6 +123,7 @@ fn reap_daemon_child(mut child: Child) {
 }
 
 async fn terminate_spawned_child(child: &mut Child) {
+    #[cfg(unix)]
     let pid = child.id();
     #[cfg(unix)]
     unsafe {
@@ -329,6 +330,8 @@ fn set_owner_only_file(path: &Path) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("failed to protect {}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -339,6 +342,8 @@ fn set_owner_only_directory(path: &Path) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("failed to protect {}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -389,6 +394,8 @@ fn continue_process(pid: u32) -> Result<()> {
             bail!("failed to send SIGCONT to daemon pid {pid}");
         }
     }
+    #[cfg(not(unix))]
+    let _ = pid;
 
     Ok(())
 }
@@ -443,7 +450,9 @@ fn force_kill_process(pid: u32) -> Result<()> {
 enum ProcessLiveness {
     Missing,
     Running,
+    #[cfg(unix)]
     Stopped,
+    #[cfg(unix)]
     Zombie,
 }
 
@@ -453,11 +462,25 @@ impl ProcessLiveness {
     }
 
     fn is_stopped(self) -> bool {
-        matches!(self, Self::Stopped)
+        #[cfg(unix)]
+        {
+            matches!(self, Self::Stopped)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     fn has_exited(self) -> bool {
-        matches!(self, Self::Missing | Self::Zombie)
+        #[cfg(unix)]
+        {
+            matches!(self, Self::Missing | Self::Zombie)
+        }
+        #[cfg(not(unix))]
+        {
+            matches!(self, Self::Missing)
+        }
     }
 }
 
@@ -466,10 +489,8 @@ fn process_has_exited(pid: u32) -> bool {
 }
 
 fn process_is_running(pid: u32) -> bool {
-    matches!(
-        process_liveness(pid),
-        ProcessLiveness::Running | ProcessLiveness::Stopped
-    )
+    let liveness = process_liveness(pid);
+    liveness.is_running() || liveness.is_stopped()
 }
 
 fn process_matches_record(process: &DaemonProcess) -> bool {
@@ -650,14 +671,16 @@ impl Drop for PidFileGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, process::Command, thread, time::Duration};
+    use std::{env, fs};
+
+    #[cfg(unix)]
+    use std::{process::Command, thread, time::Duration};
 
     #[cfg(target_os = "linux")]
     use super::process_has_exited;
-    use super::{
-        pid_file_path, process_is_running, process_liveness, process_matches_record, status,
-        DaemonProcess, ProcessLiveness,
-    };
+    use super::{pid_file_path, process_is_running, process_matches_record, status, DaemonProcess};
+    #[cfg(unix)]
+    use super::{process_liveness, ProcessLiveness};
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use chrono::Utc;
 

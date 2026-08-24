@@ -625,7 +625,7 @@ async fn set_owner_only(path: &Path, directory: bool) -> Result<(), AppError> {
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await?;
     }
     #[cfg(not(unix))]
-    let _ = directory;
+    let _ = (path, directory);
     Ok(())
 }
 

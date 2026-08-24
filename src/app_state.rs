@@ -109,5 +109,7 @@ async fn set_owner_only_directory(path: &std::path::Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }

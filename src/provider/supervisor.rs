@@ -549,7 +549,7 @@ fn normalize_profile(
     Ok(Some(requested))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;

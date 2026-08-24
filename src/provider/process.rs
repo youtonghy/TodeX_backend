@@ -141,7 +141,10 @@ impl JsonLineProcess {
         #[cfg(unix)]
         signal_process_group(pid, libc::SIGTERM);
         #[cfg(not(unix))]
-        let _ = self.child.start_kill();
+        {
+            let _ = pid;
+            let _ = self.child.start_kill();
+        }
 
         if timeout(GRACEFUL_STOP_TIMEOUT, self.child.wait())
             .await
@@ -161,6 +164,8 @@ impl Drop for JsonLineProcess {
         if let Some(pid) = self.pid.take() {
             #[cfg(unix)]
             signal_process_group(pid, libc::SIGKILL);
+            #[cfg(not(unix))]
+            let _ = pid;
             let _ = self.child.start_kill();
         }
         self.stderr_task.abort();

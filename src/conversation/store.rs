@@ -572,6 +572,8 @@ async fn sync_directory(path: &Path) -> Result<(), AppError> {
     {
         tokio::fs::File::open(path).await?.sync_all().await?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -582,6 +584,8 @@ async fn set_owner_only(path: &Path, directory: bool) -> Result<(), AppError> {
         let mode = if directory { 0o700 } else { 0o600 };
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await?;
     }
+    #[cfg(not(unix))]
+    let _ = (path, directory);
     Ok(())
 }
 

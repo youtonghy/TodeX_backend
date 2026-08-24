@@ -2090,6 +2090,8 @@ async fn set_owner_only_file(path: &std::path::Path) -> Result<(), AppError> {
         use std::os::unix::fs::PermissionsExt;
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -2263,12 +2265,16 @@ mod tests {
         server::protocol::{
             ClientMessage, ClientMessageKind, CodexCloudTaskApplyRequest,
             CodexCloudTaskCreateRequest, CodexGatewayAction, CodexGatewayControlRequest,
-            CodexLifecycleRequest, CodexLocalApprovalRespondRequest, CodexLocalAttachRequest,
-            CodexLocalInterruptRequest, CodexLocalReplayRequest, CodexLocalRequestRequest,
-            CodexLocalSessionRequest, CodexLocalSnapshotRequest, CodexLocalStartRequest,
-            CodexLocalSteerRequest, CodexLocalStopRequest, CodexLocalTurnRequest,
-            CodexLocalUnsupportedRequest,
+            CodexLifecycleRequest, CodexLocalSessionRequest, CodexLocalStartRequest,
+            CodexLocalStopRequest, CodexLocalTurnRequest, CodexLocalUnsupportedRequest,
         },
+    };
+
+    #[cfg(unix)]
+    use crate::server::protocol::{
+        CodexLocalApprovalRespondRequest, CodexLocalAttachRequest, CodexLocalInterruptRequest,
+        CodexLocalReplayRequest, CodexLocalRequestRequest, CodexLocalSnapshotRequest,
+        CodexLocalSteerRequest,
     };
 
     use super::{
@@ -3977,6 +3983,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn local_start_message(
         id: &str,
         codex_session_id: &str,
@@ -3996,6 +4003,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn payload_u64(payload: &Value, key: &str) -> Option<u64> {
         payload.get(key).and_then(Value::as_u64)
     }
@@ -4058,6 +4066,7 @@ mod tests {
         payload.get(key).and_then(Value::as_str)
     }
 
+    #[cfg(unix)]
     fn event_field_str<'a>(event: &'a EventRecord, key: &str) -> Option<&'a str> {
         event
             .payload

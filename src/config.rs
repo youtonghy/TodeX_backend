@@ -407,7 +407,7 @@ fn set_owner_only(path: &Path, directory: bool) -> anyhow::Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     #[cfg(not(unix))]
-    let _ = directory;
+    let _ = (path, directory);
     Ok(())
 }
 
