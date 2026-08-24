@@ -1,10 +1,13 @@
 mod app_state;
+mod catalog;
 mod codex_gateway;
 mod config;
+mod conversation;
 mod daemon;
 mod error;
 mod event;
 mod local_terminal;
+mod provider;
 mod server;
 mod server_runner;
 mod transport;

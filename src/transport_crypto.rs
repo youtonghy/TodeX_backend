@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::net::{IpAddr, UdpSocket};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex, OnceLock,
 };
 
 use axum::http::HeaderMap;
@@ -31,6 +32,8 @@ const PAIRING_QR_SEGMENT_DATA_LENGTH: usize = 160;
 const PAIRING_KEYS_FILE: &str = "pairing_keys.json";
 const WRAPPER_TYPE: &str = "todex.crypto.v1";
 const AAD: &[u8] = b"todex-ws-transport-crypto-v1";
+const MAX_USED_HANDSHAKES: usize = 65_536;
+static USED_HANDSHAKES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct PairingKeys {
@@ -86,6 +89,10 @@ impl PairingKeys {
         let tmp_path = path.with_extension("json.tmp");
         tokio::fs::write(&tmp_path, json).await?;
         set_owner_only_permissions(&tmp_path).await?;
+        #[cfg(windows)]
+        if tokio::fs::try_exists(path).await? {
+            tokio::fs::remove_file(path).await?;
+        }
         tokio::fs::rename(&tmp_path, path).await?;
         Ok(())
     }
@@ -168,7 +175,11 @@ impl PairingKeys {
             kind: "todex-pairing-link".to_owned(),
             version: PAIRING_VERSION,
             server_url: format!("http://{advertise_host}:{port}"),
-            auth_token: config.security.auth_token.clone(),
+            // Do not put a long-lived bearer token in a QR advertised for a
+            // non-loopback listener. Remote clients can provide it manually.
+            auth_token: is_loopback_host(&config.host)
+                .then(|| config.security.auth_token.clone())
+                .flatten(),
             preferred_encryption: Some(preferred_encryption),
             protocol: self.pairing_protocol_for(preferred_encryption),
         })?)
@@ -237,6 +248,10 @@ fn pairing_advertise_host(config_host: &str) -> String {
     }
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host.trim(), "127.0.0.1" | "localhost" | "::1")
+}
+
 fn default_route_ipv4() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
@@ -294,6 +309,7 @@ struct PairingLinkPayload {
     kind: String,
     version: u8,
     server_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     auth_token: Option<String>,
     preferred_encryption: Option<PairingEncryption>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -305,6 +321,7 @@ pub struct TransportCryptoSession {
     protocol: EncryptionProtocol,
     cipher: Arc<XChaCha20Poly1305>,
     send_counter: Arc<AtomicU64>,
+    receive_counter: Arc<AtomicU64>,
 }
 
 impl TransportCryptoSession {
@@ -334,6 +351,11 @@ impl TransportCryptoSession {
                 let client_key = decode_fixed_32(&client_key, "x25519 client public key")?;
                 let client_public = X25519PublicKey::from(client_key);
                 let shared = keys.x25519_secret.diffie_hellman(&client_public);
+                if shared.as_bytes().iter().all(|byte| *byte == 0) {
+                    return Err(AppError::InvalidRequest(
+                        "x25519 client public key produced an invalid shared secret".to_owned(),
+                    ));
+                }
                 let salt = [keys.x25519_public.as_slice(), client_key.as_slice()].concat();
                 (shared.as_bytes().to_vec(), salt)
             }
@@ -353,6 +375,28 @@ impl TransportCryptoSession {
             }
         };
 
+        let handshake_id = URL_SAFE_NO_PAD.encode(Sha256::digest(
+            [protocol.as_str().as_bytes(), salt.as_slice()].concat(),
+        ));
+        let used = USED_HANDSHAKES.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut used = used.lock().map_err(|_| {
+            AppError::InvalidRequest("transport handshake registry is unavailable".to_owned())
+        })?;
+        if used.contains(&handshake_id) {
+            return Err(AppError::InvalidRequest(
+                "transport handshake material was already used; generate fresh client key material"
+                    .to_owned(),
+            ));
+        }
+        if used.len() >= MAX_USED_HANDSHAKES {
+            return Err(AppError::InvalidRequest(
+                "transport handshake registry capacity reached; restart the daemon before pairing new clients"
+                    .to_owned(),
+            ));
+        }
+        used.insert(handshake_id);
+        drop(used);
+
         let mut key = [0_u8; 32];
         let hk = Hkdf::<Sha256>::new(Some(&salt), &shared);
         hk.expand(protocol.as_str().as_bytes(), &mut key)
@@ -363,6 +407,7 @@ impl TransportCryptoSession {
             protocol,
             cipher: Arc::new(cipher),
             send_counter: Arc::new(AtomicU64::new(0)),
+            receive_counter: Arc::new(AtomicU64::new(0)),
         }))
     }
 
@@ -389,7 +434,16 @@ impl TransportCryptoSession {
     }
 
     fn encrypt_text(&self, direction: u8, plaintext: &str) -> Result<String, AppError> {
-        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+        let counter = self
+            .send_counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |counter| {
+                counter.checked_add(1)
+            })
+            .map_err(|_| {
+                AppError::InvalidRequest(
+                    "encrypted websocket frame counter is exhausted".to_owned(),
+                )
+            })?;
         let nonce = nonce_for(direction, counter);
         let ciphertext = self
             .cipher
@@ -431,6 +485,25 @@ impl TransportCryptoSession {
                 "encrypted websocket frame direction mismatch".to_owned(),
             ));
         }
+        if nonce[1..8].iter().any(|byte| *byte != 0) || nonce[16..].iter().any(|byte| *byte != 0) {
+            return Err(AppError::InvalidRequest(
+                "encrypted websocket frame nonce is malformed".to_owned(),
+            ));
+        }
+        let counter = u64::from_le_bytes(
+            nonce[8..16]
+                .try_into()
+                .expect("validated nonce counter slice has eight bytes"),
+        );
+        let expected_counter = self.receive_counter.load(Ordering::Acquire);
+        let next_counter = expected_counter.checked_add(1).ok_or_else(|| {
+            AppError::InvalidRequest("encrypted websocket frame counter is exhausted".to_owned())
+        })?;
+        if counter != expected_counter {
+            return Err(AppError::InvalidRequest(
+                "encrypted websocket frame was replayed or arrived out of order".to_owned(),
+            ));
+        }
         let ciphertext = decode_b64(&wrapper.ciphertext, "encrypted frame ciphertext")?;
         let plaintext = self
             .cipher
@@ -443,6 +516,18 @@ impl TransportCryptoSession {
             )
             .map_err(|_| {
                 AppError::InvalidRequest("failed to decrypt websocket frame".to_owned())
+            })?;
+        self.receive_counter
+            .compare_exchange(
+                expected_counter,
+                next_counter,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| {
+                AppError::InvalidRequest(
+                    "encrypted websocket frame was replayed or arrived out of order".to_owned(),
+                )
             })?;
         String::from_utf8(plaintext)
             .map_err(|_| AppError::InvalidRequest("encrypted frame was not UTF-8".to_owned()))
@@ -772,6 +857,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&link).unwrap();
 
         assert_ne!(value["serverUrl"], "http://0.0.0.0:7345");
+        assert!(value.get("authToken").is_none());
         assert!(value.get("pairingUrl").is_none());
     }
 
@@ -785,6 +871,14 @@ mod tests {
             TransportCryptoSession::from_headers_and_query(&keys, &HeaderMap::new(), Some(&query))
                 .unwrap()
                 .unwrap();
+        assert!(matches!(
+            TransportCryptoSession::from_headers_and_query(
+                &keys,
+                &HeaderMap::new(),
+                Some(&query)
+            ),
+            Err(AppError::InvalidRequest(message)) if message.contains("already used")
+        ));
 
         let server_public = X25519PublicKey::from(keys.x25519_public);
         let shared = client.diffie_hellman(&server_public);
@@ -797,6 +891,7 @@ mod tests {
             protocol: EncryptionProtocol::X25519,
             cipher: Arc::new(XChaCha20Poly1305::new(Key::from_slice(&key))),
             send_counter: Arc::new(AtomicU64::new(0)),
+            receive_counter: Arc::new(AtomicU64::new(0)),
         };
 
         let wrapped = client_session
@@ -806,6 +901,10 @@ mod tests {
             session.decrypt_client_text(&wrapped).unwrap(),
             r#"{"type":"ping"}"#
         );
+        assert!(matches!(
+            session.decrypt_client_text(&wrapped),
+            Err(AppError::InvalidRequest(message)) if message.contains("replayed")
+        ));
 
         let wrapped = session.encrypt_server_text(r#"{"type":"pong"}"#).unwrap();
         assert_eq!(
@@ -814,6 +913,34 @@ mod tests {
                 .unwrap(),
             r#"{"type":"pong"}"#
         );
+
+        session.send_counter.store(u64::MAX, Ordering::Release);
+        assert!(matches!(
+            session.encrypt_server_text("exhausted"),
+            Err(AppError::InvalidRequest(message)) if message.contains("counter is exhausted")
+        ));
+        let client_wrapped = client_session
+            .encrypt_client_text_for_tests("exhausted")
+            .unwrap();
+        session.receive_counter.store(u64::MAX, Ordering::Release);
+        assert!(matches!(
+            session.decrypt_client_text(&client_wrapped),
+            Err(AppError::InvalidRequest(message)) if message.contains("counter is exhausted")
+        ));
+    }
+
+    #[test]
+    fn x25519_rejects_low_order_client_public_key() {
+        let keys = PairingKeys::generate();
+        let query = format!("enc=x25519&client_key={}", encode_b64(&[0_u8; 32]));
+        assert!(matches!(
+            TransportCryptoSession::from_headers_and_query(
+                &keys,
+                &HeaderMap::new(),
+                Some(&query)
+            ),
+            Err(AppError::InvalidRequest(message)) if message.contains("invalid shared secret")
+        ));
     }
 
     #[tokio::test]
@@ -869,6 +996,7 @@ mod tests {
             protocol: EncryptionProtocol::X25519,
             cipher: Arc::new(XChaCha20Poly1305::new(Key::from_slice(&key))),
             send_counter: Arc::new(AtomicU64::new(0)),
+            receive_counter: Arc::new(AtomicU64::new(0)),
         };
 
         let wrapped = session.encrypt_server_text(r#"{"type":"pong"}"#).unwrap();
@@ -945,6 +1073,7 @@ mod tests {
             protocol: EncryptionProtocol::MlKem768,
             cipher: Arc::new(XChaCha20Poly1305::new(Key::from_slice(&key))),
             send_counter: Arc::new(AtomicU64::new(0)),
+            receive_counter: Arc::new(AtomicU64::new(0)),
         };
 
         let wrapped = client_session
@@ -966,6 +1095,9 @@ mod tests {
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
+                claude_bin: "claude".to_owned(),
+                pi_bin: "pi".to_owned(),
+                acp_profiles: Default::default(),
             },
             security: SecurityConfig {
                 enable_auth: true,

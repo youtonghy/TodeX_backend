@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -13,7 +14,13 @@ use crate::{codex_gateway::CodexGatewayCursor, error::AppError, server::protocol
 
 pub const TRANSPORT_VERSION: u16 = 1;
 pub const TRANSPORT_CHUNK_TARGET_BYTES: usize = 100 * 1024;
-pub const TRANSPORT_REASSEMBLY_LIMIT_BYTES: usize = 100 * 1024 * 1024;
+pub const TRANSPORT_REASSEMBLY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TRANSPORT_CLIENTS: usize = 256;
+const MAX_TRANSPORT_SCOPES: usize = 128;
+const MAX_TRANSPORT_CHUNKS: usize = 256;
+const MAX_PARTIAL_MESSAGES: usize = 32;
+const MAX_PARTIAL_BYTES: usize = 64 * 1024 * 1024;
+const PARTIAL_MESSAGE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "camelCase")]
@@ -126,23 +133,49 @@ impl TransportAckStore {
 
     pub async fn apply_hello(&self, hello: &TransportHelloState) {
         let mut inner = self.inner.lock().await;
+        if !inner.contains_key(&hello.client_id) && inner.len() >= MAX_TRANSPORT_CLIENTS {
+            return;
+        }
         let state = inner.entry(hello.client_id.clone()).or_default();
         for (session_id, cursor) in &hello.session_cursors {
+            if !state.session_cursors.contains_key(session_id)
+                && state.session_cursors.len() >= MAX_TRANSPORT_SCOPES
+            {
+                break;
+            }
             let entry = state.session_cursors.entry(session_id.clone()).or_default();
             *entry = (*entry).max(*cursor);
         }
     }
 
     pub async fn apply_ack(&self, client_id: &str, ack: &TransportAckPayload) {
+        if client_id.is_empty() || client_id.len() > 128 {
+            return;
+        }
         let mut inner = self.inner.lock().await;
+        if !inner.contains_key(client_id) && inner.len() >= MAX_TRANSPORT_CLIENTS {
+            return;
+        }
         let state = inner.entry(client_id.to_owned()).or_default();
         if let (Some(session_id), Some(cursor)) = (&ack.session_id, ack.cursor) {
-            let entry = state.session_cursors.entry(session_id.clone()).or_default();
-            *entry = (*entry).max(cursor);
+            if !session_id.is_empty()
+                && session_id.len() <= 256
+                && (state.session_cursors.contains_key(session_id)
+                    || state.session_cursors.len() < MAX_TRANSPORT_SCOPES)
+            {
+                let entry = state.session_cursors.entry(session_id.clone()).or_default();
+                *entry = (*entry).max(cursor);
+            }
         }
         if let (Some(stream_id), Some(seq_id)) = (&ack.stream_id, ack.seq_id) {
-            let entry = state.stream_seq_ids.entry(stream_id.clone()).or_default();
-            *entry = (*entry).max(seq_id);
+            if !stream_id.is_empty()
+                && stream_id.len() <= 256
+                && (state.stream_seq_ids.contains_key(stream_id)
+                    || state.stream_seq_ids.len() < MAX_TRANSPORT_SCOPES)
+            {
+                let entry = state.stream_seq_ids.entry(stream_id.clone()).or_default();
+                *entry = (*entry).max(seq_id);
+            }
         }
     }
 
@@ -161,17 +194,21 @@ impl TransportAckStore {
 #[derive(Default)]
 pub struct TransportChunkReassembler {
     chunks: HashMap<String, PartialChunk>,
+    partial_bytes: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PartialChunk {
     total: usize,
     total_bytes: usize,
+    encoded_bytes: usize,
+    created_at: Instant,
     parts: BTreeMap<usize, String>,
 }
 
 impl TransportChunkReassembler {
     pub fn push(&mut self, chunk: TransportChunkPayload) -> Result<Option<String>, AppError> {
+        self.evict_expired();
         if chunk.encoding != "base64" {
             return Err(AppError::InvalidRequest(format!(
                 "unsupported transport chunk encoding {}",
@@ -183,9 +220,21 @@ impl TransportChunkReassembler {
                 "invalid transport chunk index".to_owned(),
             ));
         }
-        if chunk.total_bytes > TRANSPORT_REASSEMBLY_LIMIT_BYTES {
+        if chunk.total > MAX_TRANSPORT_CHUNKS
+            || chunk.total_bytes == 0
+            || chunk.total_bytes > TRANSPORT_REASSEMBLY_LIMIT_BYTES
+            || chunk.chunk_id.is_empty()
+            || chunk.chunk_id.len() > 128
+            || chunk.data.len() > TRANSPORT_CHUNK_TARGET_BYTES * 2
+        {
             return Err(AppError::InvalidRequest(
-                "transport chunk payload exceeds reassembly limit".to_owned(),
+                "transport chunk payload exceeds reassembly limits".to_owned(),
+            ));
+        }
+
+        if !self.chunks.contains_key(&chunk.chunk_id) && self.chunks.len() >= MAX_PARTIAL_MESSAGES {
+            return Err(AppError::Conflict(
+                "too many incomplete transport messages".to_owned(),
             ));
         }
 
@@ -195,6 +244,8 @@ impl TransportChunkReassembler {
             .or_insert_with(|| PartialChunk {
                 total: chunk.total,
                 total_bytes: chunk.total_bytes,
+                encoded_bytes: 0,
+                created_at: Instant::now(),
                 parts: BTreeMap::new(),
             });
         if entry.total != chunk.total || entry.total_bytes != chunk.total_bytes {
@@ -202,11 +253,37 @@ impl TransportChunkReassembler {
                 "transport chunk metadata changed mid-message".to_owned(),
             ));
         }
+        let previous_bytes = entry.parts.get(&chunk.index).map_or(0, String::len);
+        let encoded_bytes = entry
+            .encoded_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(chunk.data.len());
+        if encoded_bytes > TRANSPORT_REASSEMBLY_LIMIT_BYTES.saturating_mul(2) {
+            return Err(AppError::InvalidRequest(
+                "encoded transport chunks exceed reassembly limits".to_owned(),
+            ));
+        }
+        let aggregate = self
+            .partial_bytes
+            .saturating_sub(entry.encoded_bytes)
+            .saturating_add(encoded_bytes);
+        if aggregate > MAX_PARTIAL_BYTES {
+            return Err(AppError::Conflict(
+                "transport chunk reassembly budget exceeded".to_owned(),
+            ));
+        }
+        self.partial_bytes = aggregate;
+        entry.encoded_bytes = encoded_bytes;
         entry.parts.insert(chunk.index, chunk.data);
         if entry.parts.len() != entry.total {
             return Ok(None);
         }
 
+        let entry = self
+            .chunks
+            .remove(&chunk.chunk_id)
+            .expect("completed transport chunk entry must exist");
+        self.partial_bytes = self.partial_bytes.saturating_sub(entry.encoded_bytes);
         let mut bytes = Vec::with_capacity(entry.total_bytes);
         for index in 0..entry.total {
             let data = entry.parts.get(&index).ok_or_else(|| {
@@ -222,10 +299,22 @@ impl TransportChunkReassembler {
                 "transport chunk decoded size mismatch".to_owned(),
             ));
         }
-        self.chunks.remove(&chunk.chunk_id);
         String::from_utf8(bytes).map(Some).map_err(|err| {
             AppError::InvalidRequest(format!("invalid utf-8 transport chunk: {err}"))
         })
+    }
+
+    fn evict_expired(&mut self) {
+        let now = Instant::now();
+        let mut removed = 0usize;
+        self.chunks.retain(|_, partial| {
+            let keep = now.duration_since(partial.created_at) <= PARTIAL_MESSAGE_TTL;
+            if !keep {
+                removed = removed.saturating_add(partial.encoded_bytes);
+            }
+            keep
+        });
+        self.partial_bytes = self.partial_bytes.saturating_sub(removed);
     }
 }
 
@@ -253,9 +342,24 @@ pub fn transport_hello_state(
             hello.transport_version
         )));
     }
-    if hello.client_id.trim().is_empty() {
+    if hello.client_id.trim().is_empty() || hello.client_id.len() > 128 {
         return Err(AppError::InvalidRequest(
-            "transport hello requires clientId".to_owned(),
+            "transport hello requires a valid clientId".to_owned(),
+        ));
+    }
+    if hello.capabilities.len() > 64
+        || hello
+            .capabilities
+            .iter()
+            .any(|capability| capability.trim().is_empty() || capability.len() > 128)
+        || hello.session_cursors.len() > MAX_TRANSPORT_SCOPES
+        || hello
+            .session_cursors
+            .keys()
+            .any(|session_id| session_id.is_empty() || session_id.len() > 256)
+    {
+        return Err(AppError::InvalidRequest(
+            "transport hello exceeds capability or session limits".to_owned(),
         ));
     }
     Ok(TransportHelloState {
@@ -386,6 +490,47 @@ mod tests {
         let value: Value = serde_json::from_str(&completed).unwrap();
         assert_eq!(value["type"], "transport.event");
         assert_eq!(value["payload"]["payload"]["cursor"], 7);
+    }
+
+    #[test]
+    fn chunk_reassembly_enforces_connection_budget_and_evicts_expired_messages() {
+        let mut reassembler = TransportChunkReassembler::default();
+        reassembler.chunks.insert(
+            "expired".to_owned(),
+            PartialChunk {
+                total: 2,
+                total_bytes: 2,
+                encoded_bytes: 4,
+                created_at: Instant::now() - PARTIAL_MESSAGE_TTL - Duration::from_secs(1),
+                parts: BTreeMap::from([(0, "eA==".to_owned())]),
+            },
+        );
+        reassembler.partial_bytes = 4;
+        assert!(reassembler
+            .push(TransportChunkPayload {
+                chunk_id: "current".to_owned(),
+                index: 0,
+                total: 2,
+                encoding: "base64".to_owned(),
+                total_bytes: 2,
+                data: "eA==".to_owned(),
+            })
+            .unwrap()
+            .is_none());
+        assert!(!reassembler.chunks.contains_key("expired"));
+
+        reassembler.partial_bytes = MAX_PARTIAL_BYTES;
+        assert!(matches!(
+            reassembler.push(TransportChunkPayload {
+                chunk_id: "over-budget".to_owned(),
+                index: 0,
+                total: 2,
+                encoding: "base64".to_owned(),
+                total_bytes: 2,
+                data: "eA==".to_owned(),
+            }),
+            Err(AppError::Conflict(message)) if message.contains("budget")
+        ));
     }
 
     #[tokio::test]

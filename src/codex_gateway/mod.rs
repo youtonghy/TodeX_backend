@@ -9,21 +9,24 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, Mutex as AsyncMutex},
-    time::{sleep, timeout, Duration, Instant},
+    time::{sleep, Duration, Instant},
 };
 use uuid::Uuid;
 
 use crate::{
     config::expand_home,
+    conversation::redact_secrets,
     error::{AppError, Result},
     event::{EventBus, EventRecord},
 };
@@ -524,7 +527,7 @@ pub type CodexGatewayCursor = u64;
 
 pub type CodexLocalAdapterCommandId = String;
 
-const CODEX_LOCAL_ADAPTER_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
+const CODEX_LOCAL_ADAPTER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_LOCAL_ADAPTER_IDLE_SHUTDOWN_AFTER: Duration = Duration::from_secs(5 * 60);
 const CODEX_LOCAL_ADAPTER_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -1346,14 +1349,19 @@ impl CodexLocalAdapterSupervisor {
                 if !adapter.is_idle_shutdown_due(idle_shutdown_after).await {
                     continue;
                 }
-                let Some((_, registered_adapter)) = adapters.remove(&codex_session_id) else {
+                let Some(registered_adapter) = adapters
+                    .get(&codex_session_id)
+                    .map(|entry| entry.value().clone())
+                else {
                     break;
                 };
                 if !Arc::ptr_eq(&registered_adapter, &adapter) {
-                    adapters.insert(codex_session_id.clone(), registered_adapter);
                     continue;
                 }
                 let _ = adapter.stop("idle-shutdown", false).await;
+                adapters.remove_if(&codex_session_id, |_, registered| {
+                    Arc::ptr_eq(registered, &adapter)
+                });
                 break;
             }
         });
@@ -1682,9 +1690,20 @@ impl LocalCodexAdapter {
             pending_server_requests.clone(),
             ready_tx,
         );
-        let ready = timeout(options.startup_timeout(), ready_rx).await;
-        match ready {
-            Ok(Ok(Ok(()))) => {
+        enum StartupOutcome {
+            ChildExited(std::io::Result<std::process::ExitStatus>),
+            Ready(std::result::Result<std::result::Result<(), String>, oneshot::error::RecvError>),
+            TimedOut,
+        }
+
+        let startup_outcome = tokio::select! {
+            biased;
+            status = child.wait() => StartupOutcome::ChildExited(status),
+            ready = ready_rx => StartupOutcome::Ready(ready),
+            _ = sleep(options.startup_timeout()) => StartupOutcome::TimedOut,
+        };
+        match startup_outcome {
+            StartupOutcome::Ready(Ok(Ok(()))) => {
                 write_json_line_to_child_stdin(
                     &mut stdin,
                     &json!({
@@ -1727,7 +1746,7 @@ impl LocalCodexAdapter {
                     pending_server_requests,
                 })
             }
-            Ok(Ok(Err(error))) => {
+            StartupOutcome::Ready(Ok(Err(error))) => {
                 let mut runtime = runtime.lock().await;
                 runtime.fail();
                 let _ = child.kill().await;
@@ -1741,7 +1760,7 @@ impl LocalCodexAdapter {
                 append_local_error_event(&store, &runtime, &process_error.payload).await?;
                 Err(process_error)
             }
-            Ok(Err(_)) => {
+            StartupOutcome::Ready(Err(_)) => {
                 let mut runtime = runtime.lock().await;
                 runtime.fail();
                 let _ = child.kill().await;
@@ -1755,13 +1774,62 @@ impl LocalCodexAdapter {
                 append_local_error_event(&store, &runtime, &process_error.payload).await?;
                 Err(process_error)
             }
-            Err(_) => {
+            StartupOutcome::ChildExited(exit_status) => {
                 let mut runtime = runtime.lock().await;
                 runtime.fail();
-                let _ = child.kill().await;
+                let (code, message) = match exit_status {
+                    Ok(status) => (
+                        CodexLocalErrorCode::AdapterCrash,
+                        format!(
+                            "Codex app-server exited with status {status} before emitting structured codex.control.ready"
+                        ),
+                    ),
+                    Err(error) => (
+                        CodexLocalErrorCode::AdapterCrash,
+                        format!(
+                            "failed to wait for Codex app-server during startup: {error}"
+                        ),
+                    ),
+                };
                 let process_error = CodexLocalAdapterProcessError::new(
-                    CodexLocalErrorCode::StartupTimeout,
-                    "Codex app-server did not emit structured codex.control.ready before startup timeout",
+                    code,
+                    message,
+                    &options.codex_session_id,
+                    Some(&options.request_id),
+                    "codex.local.start",
+                );
+                append_local_error_event(&store, &runtime, &process_error.payload).await?;
+                Err(process_error)
+            }
+            StartupOutcome::TimedOut => {
+                let exit_status = child.try_wait().map_err(|error| error.to_string());
+                let mut runtime = runtime.lock().await;
+                runtime.fail();
+                if !matches!(exit_status, Ok(Some(_))) {
+                    let _ = child.kill().await;
+                }
+                let (code, message) = match exit_status {
+                    Ok(Some(status)) => (
+                        CodexLocalErrorCode::AdapterCrash,
+                        format!(
+                            "Codex app-server exited with status {status} before emitting structured codex.control.ready"
+                        ),
+                    ),
+                    Ok(None) => (
+                        CodexLocalErrorCode::StartupTimeout,
+                        "Codex app-server did not emit structured codex.control.ready before startup timeout"
+                            .to_owned(),
+                    ),
+                    Err(error) => (
+                        CodexLocalErrorCode::AdapterCrash,
+                        format!(
+                            "failed to inspect Codex app-server after startup timeout: {error}"
+                        ),
+                    ),
+                };
+                let process_error = CodexLocalAdapterProcessError::new(
+                    code,
+                    message,
                     &options.codex_session_id,
                     Some(&options.request_id),
                     "codex.local.start",
@@ -1964,7 +2032,7 @@ impl LocalCodexAdapter {
             &json!({
                 "requestId": upstream_request_id,
                 "responseType": response_type,
-                "response": response,
+                "responseOmitted": true,
             }),
         )
         .await?;
@@ -2213,10 +2281,6 @@ fn validate_local_codex_cwd(
 
 fn normalize_local_codex_cwd(path: PathBuf) -> PathBuf {
     let path = expand_home(path);
-    if path.exists() {
-        return path;
-    }
-
     resolve_case_insensitive_path(&path).unwrap_or(path)
 }
 
@@ -2228,13 +2292,15 @@ fn resolve_case_insensitive_path(path: &Path) -> Option<PathBuf> {
     for component in components {
         let segment = component.as_os_str();
         let candidate = resolved.join(segment);
+        if let Some(corrected) = unique_case_insensitive_child(&resolved, segment) {
+            resolved = corrected;
+            continue;
+        }
         if candidate.exists() {
             resolved = candidate;
             continue;
         }
-
-        let corrected = unique_case_insensitive_child(&resolved, segment)?;
-        resolved = corrected;
+        return None;
     }
 
     Some(resolved)
@@ -3290,7 +3356,7 @@ impl CodexGatewayEvent {
                 request_id: response.id.clone(),
                 outcome,
                 response_type: response.response_type.clone(),
-                response: response.payload.clone(),
+                response: Value::String("[REDACTED]".to_owned()),
             })?,
         }))
     }
@@ -3307,7 +3373,7 @@ impl CodexGatewayEvent {
                 request_id: response.id.clone(),
                 outcome,
                 response_type: response.response_type.clone(),
-                response: response.payload.clone(),
+                response: Value::String("[REDACTED]".to_owned()),
             })?,
         )))
     }
@@ -3662,8 +3728,9 @@ impl CodexGatewayStore {
     pub async fn append_event(
         &self,
         session_id: &str,
-        event: CodexGatewayEvent,
+        mut event: CodexGatewayEvent,
     ) -> Result<CodexGatewayEventRecord> {
+        redact_secrets(&mut event.payload);
         let lock = self.session_lock(session_id).lock_owned().await;
         let mut state = self.recover_session_locked(session_id).await?;
         let record = CodexGatewayEventRecord::new(session_id, state.last_cursor + 1, event);
@@ -3714,6 +3781,12 @@ impl CodexGatewayStore {
         let state = self.recover_session_locked(session_id).await?;
         drop(lock);
         Ok(state)
+    }
+
+    pub async fn session_exists(&self, session_id: &str) -> Result<bool> {
+        let dir = self.session_dir(session_id);
+        Ok(fs::try_exists(dir.join("events.jsonl")).await?
+            || fs::try_exists(dir.join("state.json")).await?)
     }
 
     async fn recover_session_locked(&self, session_id: &str) -> Result<CodexGatewaySessionState> {
@@ -3776,11 +3849,28 @@ impl CodexGatewayStore {
     }
 
     fn session_dir(&self, session_id: &str) -> PathBuf {
+        let component = legacy_session_component(session_id);
         self.data_dir
             .join("codex_gateway")
             .join("sessions")
-            .join(session_id)
+            .join(component)
     }
+}
+
+fn legacy_session_component(session_id: &str) -> String {
+    let safe = !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && session_id != "."
+        && session_id != "..";
+    if safe {
+        return session_id.to_owned();
+    }
+
+    let digest = Sha256::digest(session_id.as_bytes());
+    format!("legacy_{}", URL_SAFE_NO_PAD.encode(digest))
 }
 
 fn with_request_metadata(mut payload: Value, request_id: &str) -> Value {
@@ -5116,6 +5206,7 @@ mod tests {
         std::env::temp_dir().join(format!("{}-{}", prefix, Uuid::new_v4().simple()))
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn local_codex_adapter_supervisor_start_ready_persists_recovered_state() {
         let root = unique_tmp_dir("todex-codex-local-adapter-ready");
@@ -5126,15 +5217,12 @@ mod tests {
         let supervisor = CodexLocalAdapterSupervisor::new(store.clone(), EventBus::new(16));
 
         let adapter = supervisor
-            .start(CodexLocalAdapterStartOptions {
-                startup_timeout_ms: 1_000,
-                ..CodexLocalAdapterStartOptions::new(
-                    "cdxs_adapter_ready",
-                    "local-start-1",
-                    cwd,
-                    binary.to_string_lossy(),
-                )
-            })
+            .start(CodexLocalAdapterStartOptions::new(
+                "cdxs_adapter_ready",
+                "local-start-1",
+                cwd,
+                binary.to_string_lossy(),
+            ))
             .await
             .unwrap();
 
@@ -5175,6 +5263,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn local_codex_adapter_supervisor_stop_cleans_up_child_and_registry() {
         let root = unique_tmp_dir("todex-codex-local-adapter-stop");
@@ -5184,15 +5273,12 @@ mod tests {
         let store = CodexGatewayStore::new(root.join("data"));
         let supervisor = CodexLocalAdapterSupervisor::new(store.clone(), EventBus::new(16));
         supervisor
-            .start(CodexLocalAdapterStartOptions {
-                startup_timeout_ms: 1_000,
-                ..CodexLocalAdapterStartOptions::new(
-                    "cdxs_adapter_stop",
-                    "local-start-1",
-                    cwd,
-                    binary.to_string_lossy(),
-                )
-            })
+            .start(CodexLocalAdapterStartOptions::new(
+                "cdxs_adapter_stop",
+                "local-start-1",
+                cwd,
+                binary.to_string_lossy(),
+            ))
             .await
             .unwrap();
 
@@ -5230,6 +5316,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn local_codex_adapter_supervisor_reaps_completed_idle_sessions() {
         let root = unique_tmp_dir("todex-codex-local-adapter-idle");
@@ -5243,15 +5330,12 @@ mod tests {
             Duration::from_millis(50),
         );
         supervisor
-            .start(CodexLocalAdapterStartOptions {
-                startup_timeout_ms: 1_000,
-                ..CodexLocalAdapterStartOptions::new(
-                    "cdxs_adapter_idle",
-                    "local-start-1",
-                    &cwd,
-                    binary.to_string_lossy(),
-                )
-            })
+            .start(CodexLocalAdapterStartOptions::new(
+                "cdxs_adapter_idle",
+                "local-start-1",
+                &cwd,
+                binary.to_string_lossy(),
+            ))
             .await
             .unwrap();
 
@@ -5269,7 +5353,7 @@ mod tests {
             .await
             .unwrap();
 
-        timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if supervisor.len() == 0 {
                     break;
@@ -5302,6 +5386,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn local_codex_adapter_supervisor_maps_start_failures_to_typed_errors() {
         let root = unique_tmp_dir("todex-codex-local-adapter-failures");
@@ -5368,15 +5453,12 @@ mod tests {
 
         let crash_binary = write_fake_codex_binary(&root, "crash").await;
         let crash = supervisor
-            .start(CodexLocalAdapterStartOptions {
-                startup_timeout_ms: 1_000,
-                ..CodexLocalAdapterStartOptions::new(
-                    "cdxs_crash_process",
-                    "local-start-crash",
-                    &cwd,
-                    crash_binary.to_string_lossy(),
-                )
-            })
+            .start(CodexLocalAdapterStartOptions::new(
+                "cdxs_crash_process",
+                "local-start-crash",
+                &cwd,
+                crash_binary.to_string_lossy(),
+            ))
             .await
             .unwrap_err();
         assert_eq!(crash.payload.code, CodexLocalErrorCode::AdapterCrash);
@@ -5416,6 +5498,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn local_codex_adapter_supervisor_rejects_duplicate_session_ownership() {
         let root = unique_tmp_dir("todex-codex-local-adapter-duplicate");
@@ -5424,15 +5507,12 @@ mod tests {
         let binary = write_fake_codex_binary(&root, "ready").await;
         let store = CodexGatewayStore::new(root.join("data"));
         let supervisor = CodexLocalAdapterSupervisor::new(store, EventBus::new(16));
-        let options = CodexLocalAdapterStartOptions {
-            startup_timeout_ms: 1_000,
-            ..CodexLocalAdapterStartOptions::new(
-                "cdxs_duplicate",
-                "local-start-1",
-                &cwd,
-                binary.to_string_lossy(),
-            )
-        };
+        let options = CodexLocalAdapterStartOptions::new(
+            "cdxs_duplicate",
+            "local-start-1",
+            &cwd,
+            binary.to_string_lossy(),
+        );
 
         supervisor.start(options.clone()).await.unwrap();
         let duplicate = supervisor.start(options).await.unwrap_err();
@@ -5449,6 +5529,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
+    #[cfg(unix)]
     async fn write_fake_codex_binary(root: &std::path::Path, mode: &str) -> std::path::PathBuf {
         let path = root.join(format!("fake-codex-{mode}"));
         let script = match mode {
@@ -5467,6 +5548,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     async fn set_executable(path: &std::path::Path, executable: bool) {
         #[cfg(unix)]
         {

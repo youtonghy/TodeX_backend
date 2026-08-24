@@ -1,6 +1,9 @@
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use axum::extract::ws::{Message, WebSocket};
@@ -25,7 +28,8 @@ use crate::{
     server::protocol::{
         ClientMessage, ClientMessageKind, CodexCloudTaskApplyRequest, CodexCloudTaskCreateRequest,
         CodexCloudTaskIdRequest, CodexCloudTaskListRequest, CodexCloudTaskSiblingAttemptsRequest,
-        CodexGatewayAction, CodexLifecycleRequest, CodexLocalErrorCode, ServerEvent,
+        CodexGatewayAction, CodexLifecycleRequest, CodexLocalErrorCode, CodexLocalErrorPayload,
+        ServerEvent,
     },
     transport::{
         encode_server_event, encode_transport_error, parse_transport_message,
@@ -38,12 +42,20 @@ use crate::{
 
 const TRANSPORT_HELLO_REPLAY_LIMIT: usize = 80;
 const TRANSPORT_HELLO_MAX_SESSIONS: usize = 12;
+const MAX_LEGACY_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONNECTION_SCOPES: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthContext {
     pub principal_id: String,
     pub tenant_id: String,
     pub token_id: String,
+}
+
+#[derive(Default)]
+struct LegacyEventScope {
+    codex_sessions: HashSet<String>,
+    terminals: HashSet<String>,
 }
 
 pub fn authenticate_headers(state: &AppState, headers: &HeaderMap) -> Option<AuthContext> {
@@ -123,53 +135,68 @@ pub async fn handle_socket(
     let stream_id = format!("ws_{}", uuid::Uuid::new_v4().simple());
     let seq_id = Arc::new(AtomicU64::new(0));
     let send_seq_id = seq_id.clone();
+    let event_scope = Arc::new(tokio::sync::RwLock::new(LegacyEventScope::default()));
+    let bus_event_scope = event_scope.clone();
+    let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::channel::<ServerEvent>(256);
+    let bus_outgoing_tx = outgoing_tx.clone();
 
-    let send_task = tokio::spawn(async move {
+    let bus_task = tokio::spawn(async move {
         loop {
-            let event = match event_rx.recv().await {
-                Ok(event) => event,
+            match event_rx.recv().await {
+                Ok(event) => {
+                    let visible = {
+                        let scope = bus_event_scope.read().await;
+                        legacy_event_is_visible(&event, &scope)
+                    };
+                    if !visible {
+                        continue;
+                    }
+                    if bus_outgoing_tx
+                        .send(ServerEvent::from(event))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    if send_serialized_event(
-                        &mut sender,
-                        &send_crypto,
-                        send_transport_state.clone(),
-                        &stream_id,
-                        send_seq_id.clone(),
-                        ServerEvent::from(error_event(
+                    if bus_outgoing_tx
+                        .send(ServerEvent::from(error_event(
                             AppError::StreamLagged(skipped),
                             None,
                             None,
                             None,
-                        )),
-                    )
-                    .await
-                    .is_err()
+                        )))
+                        .await
+                        .is_err()
                     {
                         break;
                     }
-                    continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    let _ = send_serialized_event(
-                        &mut sender,
-                        &send_crypto,
-                        send_transport_state.clone(),
-                        &stream_id,
-                        send_seq_id.clone(),
-                        ServerEvent::from(error_event(AppError::StreamClosed, None, None, None)),
-                    )
-                    .await;
+                    let _ = bus_outgoing_tx
+                        .send(ServerEvent::from(error_event(
+                            AppError::StreamClosed,
+                            None,
+                            None,
+                            None,
+                        )))
+                        .await;
                     break;
                 }
-            };
+            }
+        }
+    });
 
+    let send_task = tokio::spawn(async move {
+        while let Some(event) = outgoing_rx.recv().await {
             if send_serialized_event(
                 &mut sender,
                 &send_crypto,
                 send_transport_state.clone(),
                 &stream_id,
                 send_seq_id.clone(),
-                ServerEvent::from(event),
+                event,
             )
             .await
             .is_err()
@@ -192,69 +219,68 @@ pub async fn handle_socket(
 
         match frame {
             Message::Text(text) => {
+                if text.len() > MAX_LEGACY_WS_MESSAGE_BYTES {
+                    let _ = send_direct_error(
+                        &outgoing_tx,
+                        AppError::InvalidRequest("websocket message is too large".to_owned()),
+                    )
+                    .await;
+                    continue;
+                }
                 let text = match &crypto {
                     Some(crypto) => match crypto.decrypt_client_text(&text) {
                         Ok(text) => text,
                         Err(error) => {
-                            state
-                                .events
-                                .publish(error_event(error, None, None, None))
-                                .await;
+                            let _ = send_direct_error(&outgoing_tx, error).await;
                             continue;
                         }
                     },
                     None => text.to_string(),
                 };
+                if text.len() > MAX_LEGACY_WS_MESSAGE_BYTES {
+                    let _ = send_direct_error(
+                        &outgoing_tx,
+                        AppError::InvalidRequest("websocket message is too large".to_owned()),
+                    )
+                    .await;
+                    continue;
+                }
                 match handle_transport_frame(
                     &text,
                     &state,
                     &transport_state,
                     &mut chunk_reassembler,
+                    &event_scope,
                 )
                 .await
                 {
                     Ok(TransportFrameAction::Dispatch(text)) => {
-                        if let Err(error) = dispatch_client_text(&text, &state, auth.as_ref()).await
+                        match dispatch_scoped_client_text(
+                            &text,
+                            &state,
+                            auth.as_ref(),
+                            &event_scope,
+                        )
+                        .await
                         {
-                            state
-                                .events
-                                .publish(error_event(error, None, None, None))
-                                .await;
+                            Ok(()) => {}
+                            Err(error) => {
+                                let _ = send_direct_error(&outgoing_tx, error).await;
+                            }
                         }
                         continue;
                     }
                     Ok(TransportFrameAction::Consumed) => continue,
                     Ok(TransportFrameAction::Passthrough) => {}
                     Err(error) => {
-                        state
-                            .events
-                            .publish(error_event(error, None, None, None))
-                            .await;
+                        let _ = send_direct_error(&outgoing_tx, error).await;
                         continue;
                     }
                 }
-                match serde_json::from_str::<ClientMessage>(&text) {
-                    Ok(message) => {
-                        if let Err(error) = dispatch(message, &state, auth.as_ref()).await {
-                            state
-                                .events
-                                .publish(error_event(error, None, None, None))
-                                .await;
-                        }
-                    }
-                    Err(err) => {
-                        state
-                            .events
-                            .publish(error_event(
-                                AppError::InvalidRequest(format!(
-                                    "failed to parse client message: {err}"
-                                )),
-                                None,
-                                None,
-                                None,
-                            ))
-                            .await;
-                    }
+                if let Err(error) =
+                    dispatch_scoped_client_text(&text, &state, auth.as_ref(), &event_scope).await
+                {
+                    let _ = send_direct_error(&outgoing_tx, error).await;
                 }
             }
             Message::Ping(_) | Message::Pong(_) => {}
@@ -263,6 +289,8 @@ pub async fn handle_socket(
         }
     }
 
+    bus_task.abort();
+    drop(outgoing_tx);
     send_task.abort();
 
     let active_connections = state.decrement_websocket_connections();
@@ -282,6 +310,305 @@ pub async fn handle_socket(
             }),
         ))
         .await;
+}
+
+#[derive(Default)]
+struct LegacyScopeCandidate {
+    tenant_id: String,
+    codex_sessions: Vec<String>,
+    terminals: Vec<String>,
+}
+
+#[derive(Default)]
+struct LegacyScopeRegistration {
+    codex_sessions: Vec<String>,
+    terminals: Vec<String>,
+}
+
+async fn dispatch_scoped_client_text(
+    text: &str,
+    state: &AppState,
+    auth: Option<&AuthContext>,
+    event_scope: &tokio::sync::RwLock<LegacyEventScope>,
+) -> Result<(), AppError> {
+    let mut message = serde_json::from_str::<ClientMessage>(text).map_err(|err| {
+        AppError::InvalidRequest(format!("failed to parse client message: {err}"))
+    })?;
+    ensure_terminal_start_id(&mut message);
+    let mut candidate = legacy_scope_candidate(&message);
+    if matches!(
+        &message.kind,
+        ClientMessageKind::TerminalStatus(payload) if payload.terminal_id.is_none()
+    ) {
+        if let ClientMessageKind::TerminalStatus(payload) = &message.kind {
+            candidate.terminals = state.local_terminals.session_ids(
+                &payload.tenant_id,
+                payload.workspace_id.as_deref(),
+                MAX_CONNECTION_SCOPES,
+            );
+        }
+    }
+
+    let registration = if legacy_scope_candidate_is_authorized(&candidate, state, auth) {
+        register_scope_candidate(event_scope, &candidate).await?
+    } else {
+        LegacyScopeRegistration::default()
+    };
+
+    match dispatch(message, state, auth).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            rollback_scope_registration(event_scope, registration).await;
+            Err(error)
+        }
+    }
+}
+
+fn ensure_terminal_start_id(message: &mut ClientMessage) {
+    if let ClientMessageKind::TerminalStart(payload) = &mut message.kind {
+        let has_id = payload
+            .terminal_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|id| !id.is_empty());
+        if !has_id {
+            payload.terminal_id = Some(format!("term_{}", uuid::Uuid::new_v4().simple()));
+        }
+    }
+}
+
+fn legacy_scope_candidate(message: &ClientMessage) -> LegacyScopeCandidate {
+    let codex = |tenant_id: &str, session_id: &str| LegacyScopeCandidate {
+        tenant_id: tenant_id.to_owned(),
+        codex_sessions: vec![session_id.to_owned()],
+        terminals: Vec::new(),
+    };
+    let terminal = |tenant_id: &str, terminal_id: Option<&str>| LegacyScopeCandidate {
+        tenant_id: tenant_id.to_owned(),
+        codex_sessions: Vec::new(),
+        terminals: terminal_id.map(ToOwned::to_owned).into_iter().collect(),
+    };
+
+    match &message.kind {
+        ClientMessageKind::CodexGatewayControl(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalStart(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalStatus(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalStop(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalTurn(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalInput(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalSteer(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalInterrupt(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalApprovalRespond(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalRequest(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalReplay(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalAttach(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalSnapshot(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexLocalUnsupported(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::TerminalStart(payload) => {
+            terminal(&payload.tenant_id, payload.terminal_id.as_deref())
+        }
+        ClientMessageKind::TerminalInput(payload) => {
+            terminal(&payload.tenant_id, Some(&payload.terminal_id))
+        }
+        ClientMessageKind::TerminalStop(payload) => {
+            terminal(&payload.tenant_id, Some(&payload.terminal_id))
+        }
+        ClientMessageKind::TerminalResize(payload) => {
+            terminal(&payload.tenant_id, Some(&payload.terminal_id))
+        }
+        ClientMessageKind::TerminalStatus(payload) => {
+            terminal(&payload.tenant_id, payload.terminal_id.as_deref())
+        }
+        ClientMessageKind::CodexThreadStart(payload)
+        | ClientMessageKind::CodexTurnStart(payload)
+        | ClientMessageKind::CodexTurnSteer(payload)
+        | ClientMessageKind::CodexTurnInterrupt(payload)
+        | ClientMessageKind::CodexMcpServerListStatus(payload)
+        | ClientMessageKind::CodexMcpResourceRead(payload)
+        | ClientMessageKind::CodexMcpToolCall(payload)
+        | ClientMessageKind::CodexMcpServerRefresh(payload)
+        | ClientMessageKind::CodexMcpOauthLogin(payload)
+        | ClientMessageKind::CodexMcpElicitationRespond(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexCloudTaskCreate(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexCloudTaskList(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexCloudTaskGetSummary(payload)
+        | ClientMessageKind::CodexCloudTaskGetDiff(payload)
+        | ClientMessageKind::CodexCloudTaskGetMessages(payload)
+        | ClientMessageKind::CodexCloudTaskGetText(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexCloudTaskListSiblingAttempts(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+        ClientMessageKind::CodexCloudTaskApplyPreflight(payload)
+        | ClientMessageKind::CodexCloudTaskApply(payload) => {
+            codex(&payload.tenant_id, &payload.codex_session_id)
+        }
+    }
+}
+
+fn legacy_scope_candidate_is_authorized(
+    candidate: &LegacyScopeCandidate,
+    state: &AppState,
+    auth: Option<&AuthContext>,
+) -> bool {
+    match auth {
+        Some(auth) => auth.tenant_id == candidate.tenant_id,
+        None => state.config.security.auth_token.is_none(),
+    }
+}
+
+async fn register_scope_candidate(
+    scope: &tokio::sync::RwLock<LegacyEventScope>,
+    candidate: &LegacyScopeCandidate,
+) -> Result<LegacyScopeRegistration, AppError> {
+    let mut scope = scope.write().await;
+    for session_id in &candidate.codex_sessions {
+        validate_scope_id(session_id)?;
+    }
+    for terminal_id in &candidate.terminals {
+        validate_scope_id(terminal_id)?;
+    }
+
+    let new_codex_sessions = candidate
+        .codex_sessions
+        .iter()
+        .filter(|session_id| !scope.codex_sessions.contains(*session_id))
+        .cloned()
+        .collect::<HashSet<_>>();
+    let new_terminals = candidate
+        .terminals
+        .iter()
+        .filter(|terminal_id| !scope.terminals.contains(*terminal_id))
+        .cloned()
+        .collect::<HashSet<_>>();
+    if scope.codex_sessions.len() + new_codex_sessions.len() > MAX_CONNECTION_SCOPES {
+        return Err(AppError::InvalidRequest(
+            "connection Codex session scope limit reached".to_owned(),
+        ));
+    }
+    if scope.terminals.len() + new_terminals.len() > MAX_CONNECTION_SCOPES {
+        return Err(AppError::InvalidRequest(
+            "connection terminal scope limit reached".to_owned(),
+        ));
+    }
+
+    scope
+        .codex_sessions
+        .extend(new_codex_sessions.iter().cloned());
+    scope.terminals.extend(new_terminals.iter().cloned());
+    let registration = LegacyScopeRegistration {
+        codex_sessions: new_codex_sessions.into_iter().collect(),
+        terminals: new_terminals.into_iter().collect(),
+    };
+    Ok(registration)
+}
+
+async fn rollback_scope_registration(
+    scope: &tokio::sync::RwLock<LegacyEventScope>,
+    registration: LegacyScopeRegistration,
+) {
+    let mut scope = scope.write().await;
+    for session_id in registration.codex_sessions {
+        scope.codex_sessions.remove(&session_id);
+    }
+    for terminal_id in registration.terminals {
+        scope.terminals.remove(&terminal_id);
+    }
+}
+
+fn validate_scope_id(id: &str) -> Result<(), AppError> {
+    let id = id.trim();
+    if id.is_empty() || id.len() > 256 {
+        return Err(AppError::InvalidRequest(
+            "connection scope id must be between 1 and 256 characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn send_direct_error(
+    outgoing: &tokio::sync::mpsc::Sender<ServerEvent>,
+    error: AppError,
+) -> Result<(), tokio::sync::mpsc::error::SendError<ServerEvent>> {
+    outgoing
+        .send(ServerEvent::from(error_event(error, None, None, None)))
+        .await
+}
+
+fn legacy_event_is_visible(event: &EventRecord, scope: &LegacyEventScope) -> bool {
+    if event.event_type.ends_with(".audit")
+        || event.event_type == "server.error"
+        || event.event_type.starts_with("server.websocket.")
+    {
+        return false;
+    }
+    if event.event_type.starts_with("codex.") {
+        return find_string_field(&event.payload, &["codexSessionId", "codex_session_id"], 0)
+            .is_some_and(|id| scope.codex_sessions.contains(id));
+    }
+    if event.event_type.starts_with("terminal.") {
+        return find_string_field(&event.payload, &["terminalId", "terminal_id"], 0)
+            .or(event.pane_id.as_deref())
+            .is_some_and(|id| scope.terminals.contains(id));
+    }
+    true
+}
+
+fn find_string_field<'a>(value: &'a Value, keys: &[&str], depth: usize) -> Option<&'a str> {
+    if depth > 8 {
+        return None;
+    }
+    match value {
+        Value::Object(object) => {
+            for key in keys {
+                if let Some(value) = object.get(*key).and_then(Value::as_str) {
+                    return Some(value);
+                }
+            }
+            object
+                .values()
+                .find_map(|value| find_string_field(value, keys, depth + 1))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_string_field(value, keys, depth + 1)),
+        _ => None,
+    }
 }
 
 async fn dispatch(
@@ -326,12 +653,36 @@ async fn dispatch(
                 .recover_session(&payload.codex_session_id)
                 .await?
                 .last_cursor;
+            let cwd =
+                match validate_workspace_directory_text(&state.config.workspace_root, &payload.cwd)
+                {
+                    Ok(cwd) => cwd,
+                    Err(error) => {
+                        publish_local_codex_error_after(
+                            state,
+                            &payload.codex_session_id,
+                            last_cursor,
+                            CodexLocalAdapterProcessError {
+                                payload: CodexLocalErrorPayload {
+                                    code: CodexLocalErrorCode::InvalidCwd,
+                                    message: error.to_string(),
+                                    codex_session_id: payload.codex_session_id.clone(),
+                                    request_id: Some(message.id.clone()),
+                                    operation: Some("codex.local.start".to_owned()),
+                                    upstream_request_id: None,
+                                },
+                            },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
             if let Err(error) = state
                 .codex_local_adapters
                 .start(CodexLocalAdapterStartOptions::new(
                     payload.codex_session_id.clone(),
                     message.id.clone(),
-                    validate_workspace_directory_text(&state.config.workspace_root, &payload.cwd)?,
+                    cwd,
                     state.config.agent.codex_bin.clone(),
                 ))
                 .await
@@ -1054,6 +1405,7 @@ async fn handle_transport_frame(
     state: &AppState,
     transport_state: &Arc<tokio::sync::Mutex<Option<TransportHelloState>>>,
     chunk_reassembler: &mut TransportChunkReassembler,
+    event_scope: &tokio::sync::RwLock<LegacyEventScope>,
 ) -> Result<TransportFrameAction, AppError> {
     let Some(message) = parse_transport_message(text)? else {
         return Ok(TransportFrameAction::Passthrough);
@@ -1078,6 +1430,7 @@ async fn handle_transport_frame(
                     }),
                 ))
                 .await;
+            authorize_hello_scope(state, event_scope, &hello).await?;
             replay_ack_cursors_for_hello(state, &hello).await?;
             Ok(TransportFrameAction::Consumed)
         }
@@ -1117,6 +1470,7 @@ async fn handle_transport_frame(
                         let hello = transport_hello_state(hello)?;
                         state.transport_acks.apply_hello(&hello).await;
                         *transport_state.lock().await = Some(hello.clone());
+                        authorize_hello_scope(state, event_scope, &hello).await?;
                         replay_ack_cursors_for_hello(state, &hello).await?;
                         Ok(TransportFrameAction::Consumed)
                     }
@@ -1128,6 +1482,31 @@ async fn handle_transport_frame(
             None => Ok(TransportFrameAction::Consumed),
         },
     }
+}
+
+async fn authorize_hello_scope(
+    state: &AppState,
+    event_scope: &tokio::sync::RwLock<LegacyEventScope>,
+    hello: &TransportHelloState,
+) -> Result<(), AppError> {
+    let mut valid_sessions = Vec::new();
+    for session_id in hello
+        .session_cursors
+        .keys()
+        .take(TRANSPORT_HELLO_MAX_SESSIONS)
+    {
+        if state.codex_gateway.session_exists(session_id).await? {
+            valid_sessions.push(session_id.clone());
+        }
+    }
+    let mut scope = event_scope.write().await;
+    for session_id in valid_sessions {
+        if scope.codex_sessions.len() >= MAX_CONNECTION_SCOPES {
+            break;
+        }
+        scope.codex_sessions.insert(session_id);
+    }
+    Ok(())
 }
 
 async fn replay_ack_cursors_for_hello(
@@ -1153,17 +1532,6 @@ async fn replay_ack_cursors_for_hello(
         }
     }
     Ok(())
-}
-
-async fn dispatch_client_text(
-    text: &str,
-    state: &AppState,
-    auth: Option<&AuthContext>,
-) -> Result<(), AppError> {
-    let message = serde_json::from_str::<ClientMessage>(text).map_err(|err| {
-        AppError::InvalidRequest(format!("failed to parse client message: {err}"))
-    })?;
-    dispatch(message, state, auth).await
 }
 
 async fn send_serialized_event(
@@ -1425,6 +1793,20 @@ async fn authorize_local_codex_request(
     state: &AppState,
 ) -> Result<(), AppError> {
     let Some(auth) = auth else {
+        if state.config.security.auth_token.is_some() {
+            audit_codex_decision(
+                state,
+                request_id,
+                None,
+                Some(tenant_id),
+                codex_session_id,
+                "deny",
+                "AUTHENTICATION_REQUIRED",
+                operation,
+            )
+            .await?;
+            return Err(AppError::Unauthenticated);
+        }
         audit_codex_decision(
             state,
             request_id,
@@ -1554,6 +1936,20 @@ async fn authorize_codex_access(
     auth: Option<&AuthContext>,
 ) -> Result<(), AppError> {
     let Some(auth) = auth else {
+        if state.config.security.auth_token.is_some() {
+            audit_codex_decision(
+                state,
+                request_id,
+                None,
+                tenant_id,
+                codex_session_id,
+                "deny",
+                "AUTHENTICATION_REQUIRED",
+                codex_action_name(action),
+            )
+            .await?;
+            return Err(AppError::Unauthenticated);
+        }
         audit_codex_decision(
             state,
             request_id,
@@ -1670,17 +2066,30 @@ async fn audit_codex_decision(
 }
 
 async fn append_audit_event(state: &AppState, event: &EventRecord) -> Result<(), AppError> {
+    let _guard = state.audit_write_lock.lock().await;
     let dir = state.config.data_dir.join("audit");
     tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join("audit.jsonl");
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
         .await?;
-    file.write_all(serde_json::to_string(event)?.as_bytes())
-        .await?;
-    file.write_all(b"\n").await?;
+    set_owner_only_file(&path).await?;
+    let mut line = serde_json::to_vec(event)?;
+    line.push(b'\n');
+    file.write_all(&line).await?;
+    file.flush().await?;
+    file.sync_data().await?;
+    Ok(())
+}
+
+async fn set_owner_only_file(path: &std::path::Path) -> Result<(), AppError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
     Ok(())
 }
 
@@ -1849,6 +2258,7 @@ mod tests {
             CodexReviewTarget, CodexServerRequest, CodexServerResponse,
         },
         config::{AgentConfig, Config, SecurityConfig},
+        error::AppError,
         event::EventRecord,
         server::protocol::{
             ClientMessage, ClientMessageKind, CodexCloudTaskApplyRequest,
@@ -1861,7 +2271,10 @@ mod tests {
         },
     };
 
-    use super::{dispatch, AuthContext};
+    use super::{
+        dispatch, ensure_terminal_start_id, legacy_event_is_visible, legacy_scope_candidate,
+        register_scope_candidate, AuthContext, LegacyEventScope,
+    };
 
     #[derive(Default)]
     struct RecordingTransport {
@@ -1882,9 +2295,61 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn typed_legacy_scope_ignores_nested_ids_and_reserves_terminal_ids() {
+        let codex_message: ClientMessage = serde_json::from_value(json!({
+            "id": "scope-codex",
+            "type": "codex.local.status",
+            "payload": {
+                "codexSessionId": "cdxs_scoped",
+                "tenantId": "local",
+                "metadata": { "codexSessionId": "cdxs_injected" }
+            }
+        }))
+        .unwrap();
+        let candidate = legacy_scope_candidate(&codex_message);
+        assert_eq!(candidate.codex_sessions, vec!["cdxs_scoped".to_owned()]);
+
+        let scope = tokio::sync::RwLock::new(LegacyEventScope::default());
+        register_scope_candidate(&scope, &candidate).await.unwrap();
+        let allowed = EventRecord::new(
+            "codex.control.ready",
+            None,
+            None,
+            None,
+            json!({ "codexSessionId": "cdxs_scoped" }),
+        );
+        let rejected = EventRecord::new(
+            "codex.control.ready",
+            None,
+            None,
+            None,
+            json!({ "codexSessionId": "cdxs_injected" }),
+        );
+        let scope = scope.read().await;
+        assert!(legacy_event_is_visible(&allowed, &scope));
+        assert!(!legacy_event_is_visible(&rejected, &scope));
+        drop(scope);
+
+        let mut terminal_message: ClientMessage = serde_json::from_value(json!({
+            "id": "scope-terminal",
+            "type": "terminal.start",
+            "payload": {
+                "tenantId": "local",
+                "cwd": "/tmp"
+            }
+        }))
+        .unwrap();
+        ensure_terminal_start_id(&mut terminal_message);
+        let candidate = legacy_scope_candidate(&terminal_message);
+        assert_eq!(candidate.terminals.len(), 1);
+        assert!(candidate.terminals[0].starts_with("term_"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unauthenticated_local_codex_start_is_allowed_without_token() {
-        let state = test_state().await;
+        let mut state = test_state().await;
+        Arc::make_mut(&mut state.config).security.auth_token = None;
         let mut events = state.events.subscribe();
 
         dispatch(
@@ -1922,6 +2387,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authenticated_local_codex_start_status_stop_publishes_lifecycle() {
         let mut state = test_state().await;
@@ -2166,6 +2632,7 @@ mod tests {
             .is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authenticated_local_codex_turn_streams_typed_events() {
         let mut state = test_state().await;
@@ -2287,6 +2754,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authenticated_local_codex_permission_and_question_requests_can_be_replied_to() {
         let mut state = test_state().await;
@@ -2444,6 +2912,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_codex_second_turn_is_rejected_when_busy() {
         let mut state = test_state().await;
@@ -2550,6 +3019,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authenticated_local_codex_steer_interrupt_replay_attach_and_snapshot_publish_events() {
         let mut state = test_state().await;
@@ -2782,30 +3252,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unauthenticated_codex_control_is_allowed_and_audited() {
+    async fn unauthenticated_codex_control_is_denied_and_audited() {
         let state = test_state().await;
         let mut events = state.events.subscribe();
         let message = codex_control_message("deny-1", "cdxs_denied", "local");
 
-        dispatch(message, &state, None)
+        let error = dispatch(message, &state, None)
             .await
-            .expect("unauthenticated control should be allowed");
+            .expect_err("configured auth token must reject unauthenticated control");
+        assert!(matches!(error, AppError::Unauthenticated));
 
         let audit = wait_for_event(&mut events, |event| {
             event.event_type == "codex.audit"
                 && payload_str(&event.payload, "request_id") == Some("deny-1")
         })
         .await;
-        assert_eq!(payload_str(&audit.payload, "decision"), Some("allow"));
+        assert_eq!(payload_str(&audit.payload, "decision"), Some("deny"));
         assert_eq!(
             payload_str(&audit.payload, "reason_code"),
-            Some("NO_AUTH_REQUIRED")
+            Some("AUTHENTICATION_REQUIRED")
         );
 
         let audit_file = tokio::fs::read_to_string(state.config.data_dir.join("audit/audit.jsonl"))
             .await
             .expect("audit log should be persisted");
-        assert!(audit_file.contains("NO_AUTH_REQUIRED"));
+        assert!(audit_file.contains("AUTHENTICATION_REQUIRED"));
         assert!(audit_file.contains("cdxs_denied"));
     }
 
@@ -3535,10 +4006,13 @@ mod tests {
             port: 0,
             pairing_encryption: crate::config::PairingEncryption::default(),
             data_dir: unique_tmp_dir("todex-codex-auth-test-data"),
-            workspace_root: unique_tmp_dir("todex-codex-auth-test-workspaces"),
+            workspace_root: std::env::temp_dir(),
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
+                claude_bin: "claude".to_owned(),
+                pi_bin: "pi".to_owned(),
+                acp_profiles: Default::default(),
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -3597,6 +4071,7 @@ mod tests {
         std::env::temp_dir().join(format!("{}-{}", prefix, uuid::Uuid::new_v4().simple()))
     }
 
+    #[cfg(unix)]
     async fn write_fake_codex_binary(root: &std::path::Path) -> PathBuf {
         let binary = root.join("codex-fake");
         let wire_log = root.join("wire.log");
@@ -3622,6 +4097,7 @@ mod tests {
         binary
     }
 
+    #[cfg(unix)]
     async fn write_requesting_fake_codex_binary(root: &std::path::Path) -> PathBuf {
         let binary = root.join("codex-requesting-fake");
         let wire_log = root.join("wire.log");
@@ -3647,6 +4123,7 @@ mod tests {
         binary
     }
 
+    #[cfg(unix)]
     async fn write_holding_fake_codex_binary(root: &std::path::Path) -> PathBuf {
         let binary = root.join("codex-holding-fake");
         tokio::fs::create_dir_all(root).await.unwrap();

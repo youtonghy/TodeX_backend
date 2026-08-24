@@ -1,5 +1,6 @@
 pub mod protocol;
 mod routes;
+mod v2;
 mod websocket;
 
 use axum::Router;

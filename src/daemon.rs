@@ -17,8 +17,8 @@ use crate::transport_crypto::PairingKeys;
 const PID_FILE_NAME: &str = "daemon.json";
 const LOG_FILE_NAME: &str = "todex-agentd-daemon.log";
 const START_TIMEOUT: Duration = Duration::from_secs(8);
-const STOP_TIMEOUT: Duration = Duration::from_secs(8);
-const STOP_FORCE_AFTER: Duration = Duration::from_secs(2);
+const STOP_TIMEOUT: Duration = Duration::from_secs(12);
+const STOP_FORCE_AFTER: Duration = Duration::from_secs(8);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -43,6 +43,7 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
     if let Some(process) = status(&config)? {
         return Ok(process);
     }
+    remove_stale_pid_file(&config.data_dir)?;
 
     fs::create_dir_all(log_dir(&config.data_dir)).with_context(|| {
         format!(
@@ -50,6 +51,8 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
             log_dir(&config.data_dir).display()
         )
     })?;
+    set_owner_only_directory(&config.data_dir)?;
+    set_owner_only_directory(&log_dir(&config.data_dir))?;
 
     let log_path = log_file_path(&config.data_dir);
     let log = OpenOptions::new()
@@ -57,6 +60,7 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
         .append(true)
         .open(&log_path)
         .with_context(|| format!("failed to open daemon log {}", log_path.display()))?;
+    set_owner_only_file(&log_path)?;
     let executable = std::env::current_exe().context("failed to resolve current executable")?;
     let mut command = Command::new(&executable);
     command
@@ -100,6 +104,7 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
         }
 
         if started.elapsed() >= START_TIMEOUT {
+            terminate_spawned_child(&mut child).await;
             bail!(
                 "daemon did not become ready within {:?}; see {}",
                 START_TIMEOUT,
@@ -117,6 +122,31 @@ fn reap_daemon_child(mut child: Child) {
     });
 }
 
+async fn terminate_spawned_child(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    let _ = child.kill();
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 pub async fn stop(config: &Config) -> Result<Option<DaemonProcess>> {
     let Some(process) = read_pid_file(&config.data_dir)? else {
         return Ok(None);
@@ -125,6 +155,13 @@ pub async fn stop(config: &Config) -> Result<Option<DaemonProcess>> {
     if process_has_exited(process.pid) && !daemon_health_check(&process) {
         remove_pid_file(&config.data_dir)?;
         return Ok(None);
+    }
+    if !process_matches_record(&process) {
+        bail!(
+            "refusing to stop pid {} because it does not match the recorded daemon executable {}",
+            process.pid,
+            process.executable.display()
+        );
     }
 
     continue_process(process.pid)?;
@@ -171,7 +208,9 @@ pub fn status(config: &Config) -> Result<Option<DaemonProcess>> {
         return Ok(None);
     };
 
-    if process_liveness(process.pid).is_running() || daemon_health_check(&process) {
+    if process_matches_record(&process)
+        && (process_liveness(process.pid).is_running() || daemon_health_check(&process))
+    {
         return Ok(Some(process));
     }
 
@@ -235,8 +274,8 @@ fn write_pid_file(config: &Config, port: u16) -> Result<DaemonProcess> {
             config.data_dir.display()
         )
     })?;
+    set_owner_only_directory(&config.data_dir)?;
     let path = pid_file_path(&config.data_dir);
-    let tmp_path = path.with_extension("json.tmp");
     let process = DaemonProcess {
         pid: std::process::id(),
         host: config.host.clone(),
@@ -247,9 +286,27 @@ fn write_pid_file(config: &Config, port: u16) -> Result<DaemonProcess> {
         executable: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("todex-agentd")),
     };
     let raw = serde_json::to_string_pretty(&process)?;
-    fs::write(&tmp_path, raw).with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    fs::rename(&tmp_path, &path).with_context(|| format!("failed to write {}", path.display()))?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to exclusively create {}", path.display()))?;
+    file.write_all(raw.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))?;
+    set_owner_only_file(&path)?;
     Ok(process)
+}
+
+fn remove_stale_pid_file(data_dir: &Path) -> Result<()> {
+    let Some(process) = read_pid_file(data_dir)? else {
+        return Ok(());
+    };
+    if process_has_exited(process.pid) || !process_matches_record(&process) {
+        remove_pid_file(data_dir)?;
+    }
+    Ok(())
 }
 
 fn remove_pid_file(data_dir: &Path) -> Result<()> {
@@ -263,6 +320,26 @@ fn remove_pid_file(data_dir: &Path) -> Result<()> {
             )
         }),
     }
+}
+
+fn set_owner_only_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to protect {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn set_owner_only_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to protect {}", path.display()))?;
+    }
+    Ok(())
 }
 
 async fn wait_for_shutdown_or_server_exit(server: ManagedServer) -> Result<()> {
@@ -307,12 +384,8 @@ async fn shutdown_signal() -> Result<()> {
 fn continue_process(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        let status = Command::new("kill")
-            .arg("-CONT")
-            .arg(pid.to_string())
-            .status()
-            .with_context(|| format!("failed to send SIGCONT to daemon pid {pid}"))?;
-        if !status.success() && !process_has_exited(pid) {
+        let result = unsafe { libc::kill(-(pid as i32), libc::SIGCONT) };
+        if result != 0 && !process_has_exited(pid) {
             bail!("failed to send SIGCONT to daemon pid {pid}");
         }
     }
@@ -323,12 +396,8 @@ fn continue_process(pid: u32) -> Result<()> {
 fn terminate_process(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        let status = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status()
-            .with_context(|| format!("failed to send SIGTERM to daemon pid {pid}"))?;
-        if !status.success() && process_is_running(pid) {
+        let result = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+        if result != 0 && process_is_running(pid) {
             bail!("failed to send SIGTERM to daemon pid {pid}");
         }
     }
@@ -350,12 +419,8 @@ fn terminate_process(pid: u32) -> Result<()> {
 fn force_kill_process(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        let status = Command::new("kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .status()
-            .with_context(|| format!("failed to send SIGKILL to daemon pid {pid}"))?;
-        if !status.success() && !process_has_exited(pid) {
+        let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if result != 0 && !process_has_exited(pid) {
             bail!("failed to send SIGKILL to daemon pid {pid}");
         }
     }
@@ -407,6 +472,68 @@ fn process_is_running(pid: u32) -> bool {
     )
 }
 
+fn process_matches_record(process: &DaemonProcess) -> bool {
+    let Some(actual) = process_executable(process.pid) else {
+        return false;
+    };
+    canonical_or_original(&actual) == canonical_or_original(&process.executable)
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    fs::read_link(Path::new("/proc").join(pid.to_string()).join("exe")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    Some(PathBuf::from(String::from_utf8_lossy(&buffer).into_owned()))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+}
+
+#[cfg(windows)]
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-Process -Id {pid} -ErrorAction Stop).Path"),
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+}
+
 fn process_liveness(pid: u32) -> ProcessLiveness {
     #[cfg(target_os = "linux")]
     {
@@ -432,16 +559,23 @@ fn process_liveness(pid: u32) -> ProcessLiveness {
 
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        if Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-        {
-            ProcessLiveness::Running
-        } else {
-            ProcessLiveness::Missing
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "state="])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                match String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .chars()
+                    .next()
+                {
+                    Some('T') | Some('t') => ProcessLiveness::Stopped,
+                    Some('Z') => ProcessLiveness::Zombie,
+                    Some(_) => ProcessLiveness::Running,
+                    None => ProcessLiveness::Missing,
+                }
+            }
+            _ => ProcessLiveness::Missing,
         }
     }
 
@@ -518,8 +652,10 @@ impl Drop for PidFileGuard {
 mod tests {
     use std::{env, fs, process::Command, thread, time::Duration};
 
+    #[cfg(target_os = "linux")]
+    use super::process_has_exited;
     use super::{
-        pid_file_path, process_has_exited, process_is_running, process_liveness, status,
+        pid_file_path, process_is_running, process_liveness, process_matches_record, status,
         DaemonProcess, ProcessLiveness,
     };
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
@@ -577,6 +713,20 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn daemon_identity_rejects_a_reused_pid_with_another_executable() {
+        let process = DaemonProcess {
+            pid: std::process::id(),
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            data_dir: std::env::temp_dir(),
+            workspace_root: std::env::temp_dir(),
+            started_at: Utc::now(),
+            executable: std::env::temp_dir().join("definitely-not-todex-agentd"),
+        };
+        assert!(!process_matches_record(&process));
+    }
+
     #[cfg(unix)]
     #[test]
     fn status_ignores_stopped_pid_file() {
@@ -590,6 +740,13 @@ mod tests {
             .expect("spawn sleeping process");
         let pid = child.id();
         send_signal("-STOP", pid);
+        if process_liveness(pid) != ProcessLiveness::Stopped {
+            send_signal("-CONT", pid);
+            send_signal("-TERM", pid);
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
         wait_for_liveness(pid, ProcessLiveness::Stopped);
         let process = DaemonProcess {
             pid,
@@ -661,6 +818,9 @@ mod tests {
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
+                claude_bin: "claude".to_owned(),
+                pi_bin: "pi".to_owned(),
+                acp_profiles: Default::default(),
             },
             security: SecurityConfig {
                 enable_auth: true,

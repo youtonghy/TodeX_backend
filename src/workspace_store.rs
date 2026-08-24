@@ -6,7 +6,9 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::{error::AppError, workspace_paths::validate_workspace_directory_text};
 
@@ -74,8 +76,9 @@ impl WorkspaceStore {
             workspaces,
             updated_at: now_millis(),
         };
+        let mut current = self.inner.write().await;
         write_snapshot(&self.path, &snapshot).await?;
-        *self.inner.write().await = snapshot.clone();
+        *current = snapshot.clone();
         Ok(snapshot)
     }
 }
@@ -105,10 +108,34 @@ async fn write_snapshot(path: &Path, snapshot: &WorkspaceSnapshot) -> Result<(),
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let tmp_path = path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(snapshot)?;
-    tokio::fs::write(&tmp_path, text).await?;
-    tokio::fs::rename(tmp_path, path).await?;
+    let tmp_path = path.with_file_name(format!(".workspaces.{}.tmp", Uuid::new_v4().simple()));
+    let mut bytes = serde_json::to_vec_pretty(snapshot)?;
+    bytes.push(b'\n');
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)
+        .await?;
+    set_owner_only(&tmp_path).await?;
+    file.write_all(&bytes).await?;
+    file.flush().await?;
+    file.sync_all().await?;
+    drop(file);
+    #[cfg(windows)]
+    if tokio::fs::try_exists(path).await? {
+        tokio::fs::remove_file(path).await?;
+    }
+    tokio::fs::rename(&tmp_path, path).await?;
+    set_owner_only(path).await?;
+    Ok(())
+}
+
+async fn set_owner_only(path: &Path) -> Result<(), AppError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
     Ok(())
 }
 

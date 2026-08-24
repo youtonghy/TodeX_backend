@@ -18,6 +18,12 @@ pub enum AppError {
     CodexNotFound,
     #[error("unsupported capability: {0}")]
     Unsupported(String),
+    #[error("resource not found: {0}")]
+    NotFound(String),
+    #[error("resource is busy: {0}")]
+    Conflict(String),
+    #[error("provider unavailable: {0}")]
+    ProviderUnavailable(String),
     #[error("event stream lagged by {0} messages")]
     StreamLagged(u64),
     #[error("event stream closed")]
@@ -40,6 +46,9 @@ impl AppError {
             Self::WorkspacePathOutsideRoot => "WORKSPACE_PATH_OUTSIDE_ROOT",
             Self::CodexNotFound => "CODEX_NOT_FOUND",
             Self::Unsupported(_) => "UNSUPPORTED",
+            Self::NotFound(_) => "NOT_FOUND",
+            Self::Conflict(_) => "CONFLICT",
+            Self::ProviderUnavailable(_) => "PROVIDER_UNAVAILABLE",
             Self::StreamLagged(_) => "EVENT_STREAM_LAGGED",
             Self::StreamClosed => "EVENT_STREAM_CLOSED",
             Self::Serialization(_) => "SERIALIZATION_FAILED",
@@ -58,6 +67,9 @@ impl IntoResponse for AppError {
             Self::WorkspacePathNotFound => StatusCode::NOT_FOUND,
             Self::WorkspacePathOutsideRoot => StatusCode::FORBIDDEN,
             Self::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::ProviderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::StreamLagged(_) | Self::StreamClosed => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

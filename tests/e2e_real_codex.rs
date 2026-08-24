@@ -33,6 +33,7 @@ impl Drop for Daemon {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fake_codex_history_thread_list_read_and_resume_over_websocket() {
     let daemon = spawn_fake_history_daemon().await;
@@ -625,6 +626,7 @@ async fn spawn_daemon() -> Daemon {
     daemon
 }
 
+#[cfg(unix)]
 async fn spawn_fake_history_daemon() -> Daemon {
     let root = unique_tmp_dir("todex-fake-history-e2e");
     let data_dir = root.join("data");
@@ -663,6 +665,7 @@ async fn spawn_fake_history_daemon() -> Daemon {
     daemon
 }
 
+#[cfg(unix)]
 fn write_fake_history_codex_binary(root: &Path, workspace_root: &Path) -> PathBuf {
     fs::create_dir_all(root).expect("create fake codex dir");
     let binary = root.join("codex-fake-history");

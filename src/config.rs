@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -79,6 +81,18 @@ impl Default for PairingEncryption {
 pub struct AgentConfig {
     pub default_agent: String,
     pub codex_bin: String,
+    pub claude_bin: String,
+    pub pi_bin: String,
+    pub acp_profiles: BTreeMap<String, AcpProfileConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcpProfileConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,6 +117,9 @@ struct FileConfig {
 struct PartialAgentConfig {
     default_agent: Option<String>,
     codex_bin: Option<String>,
+    claude_bin: Option<String>,
+    pi_bin: Option<String>,
+    acp_profiles: Option<BTreeMap<String, AcpProfileConfig>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -193,6 +210,21 @@ impl Config {
                     agent_file.codex_bin,
                     defaults.agent.codex_bin,
                 ),
+                claude_bin: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_CLAUDE_BIN").ok(),
+                    agent_file.claude_bin,
+                    defaults.agent.claude_bin,
+                ),
+                pi_bin: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_PI_BIN").ok(),
+                    agent_file.pi_bin,
+                    defaults.agent.pi_bin,
+                ),
+                acp_profiles: agent_file
+                    .acp_profiles
+                    .unwrap_or(defaults.agent.acp_profiles),
             },
             security: SecurityConfig {
                 enable_auth: coalesce(
@@ -264,6 +296,9 @@ impl Default for Config {
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
+                claude_bin: "claude".to_owned(),
+                pi_bin: "pi".to_owned(),
+                acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -334,9 +369,45 @@ fn load_config_document(data_dir: &PathBuf) -> anyhow::Result<DocumentMut> {
 }
 
 fn write_config_document(data_dir: &PathBuf, document: &DocumentMut) -> anyhow::Result<()> {
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("failed to create config directory {}", data_dir.display()))?;
+    set_owner_only(data_dir, true)?;
     let path = data_dir.join("config.toml");
-    fs::write(&path, document.to_string())
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    let temporary = data_dir.join(format!(".config.{}.tmp", Uuid::new_v4().simple()));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(document.to_string().as_bytes())
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", temporary.display()))?;
+    drop(file);
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| format!("failed to replace {}", path.display()))?;
+    }
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    set_owner_only(&path, false)?;
+    Ok(())
+}
+
+fn set_owner_only(path: &Path, directory: bool) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if directory { 0o700 } else { 0o600 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
     Ok(())
 }
 

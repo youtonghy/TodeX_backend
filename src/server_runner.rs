@@ -20,6 +20,11 @@ pub struct ManagedServer {
 
 impl ManagedServer {
     pub async fn start(config: Config) -> Result<Self> {
+        if config.security.enable_tls {
+            anyhow::bail!(
+                "TLS is configured but this build has no certificate/key listener; terminate TLS at a trusted reverse proxy or disable enable_tls"
+            );
+        }
         let addr = bind_addr(&config)?;
         let state = AppState::new(config.clone()).await?;
         let app = server::router(state.clone());
@@ -38,6 +43,12 @@ impl ManagedServer {
             workspace_root = %config.workspace_root.display(),
             "todex-agentd listening"
         );
+        if !config.security.enable_tls && config.host != "127.0.0.1" && config.host != "::1" {
+            tracing::warn!(
+                host = %config.host,
+                "non-loopback listener is using plaintext HTTP; pairing encryption protects websocket frames but not bearer headers"
+            );
+        }
 
         let handle = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -70,6 +81,7 @@ impl ManagedServer {
     }
 
     pub async fn stop(mut self) -> Result<()> {
+        self.state.conversations.shutdown_all().await;
         self.state.codex_local_adapters.shutdown_all().await;
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -78,7 +90,10 @@ impl ManagedServer {
     }
 
     pub async fn wait(self) -> Result<()> {
-        self.handle.await.context("server task join failed")?
+        let result = self.handle.await.context("server task join failed")?;
+        self.state.conversations.shutdown_all().await;
+        self.state.codex_local_adapters.shutdown_all().await;
+        result
     }
 }
 
@@ -112,6 +127,9 @@ mod tests {
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
+                claude_bin: "claude".to_owned(),
+                pi_bin: "pi".to_owned(),
+                acp_profiles: Default::default(),
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -124,6 +142,34 @@ mod tests {
         assert!(server.addr().port() > 0);
         server.stop().await.expect("stop server");
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn managed_server_rejects_unimplemented_tls_configuration() {
+        let root = env::temp_dir().join(format!("todex-server-tls-test-{}", uuid::Uuid::new_v4()));
+        let workspace_root = root.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
+        let config = Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::default(),
+            data_dir: root.join("data"),
+            workspace_root,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: "codex".to_owned(),
+                claude_bin: "claude".to_owned(),
+                pi_bin: "pi".to_owned(),
+                acp_profiles: Default::default(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: true,
+                auth_token: Some("token".to_owned()),
+            },
+        };
+        assert!(ManagedServer::start(config).await.is_err());
         let _ = fs::remove_dir_all(root);
     }
 }

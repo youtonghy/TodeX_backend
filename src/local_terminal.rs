@@ -98,6 +98,25 @@ impl LocalTerminalManager {
         }
     }
 
+    pub fn session_ids(
+        &self,
+        tenant_id: &str,
+        workspace_id: Option<&str>,
+        limit: usize,
+    ) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|entry| {
+                entry.tenant_id == tenant_id
+                    && workspace_id.is_none_or(|workspace_id| {
+                        entry.workspace_id.as_deref() == Some(workspace_id)
+                    })
+            })
+            .take(limit)
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     pub async fn start(&self, options: TerminalStartOptions) -> Result<String, AppError> {
         let terminal_id = options
             .terminal_id

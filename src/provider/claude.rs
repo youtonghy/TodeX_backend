@@ -1,0 +1,341 @@
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use tokio::sync::watch;
+
+use crate::config::AgentConfig;
+use crate::conversation::ProviderKind;
+use crate::error::AppError;
+
+use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
+use super::types::{
+    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, PermissionOutcome,
+    ProviderCapabilities, ProviderDescriptor, ProviderDriver,
+};
+
+pub struct ClaudeDriver {
+    binary: String,
+}
+
+impl ClaudeDriver {
+    pub fn new(config: &AgentConfig) -> Self {
+        Self {
+            binary: config.claude_bin.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderDriver for ClaudeDriver {
+    fn descriptor(&self) -> ProviderDescriptor {
+        let available = executable_available(&self.binary);
+        ProviderDescriptor {
+            id: ProviderKind::ClaudeCode,
+            display_name: "Claude Code",
+            available,
+            unavailable_reason: (!available)
+                .then(|| format!("executable '{}' was not found", self.binary)),
+            profiles: Vec::new(),
+            capabilities: ProviderCapabilities {
+                native_resume: true,
+                cancel: true,
+                permissions: true,
+                tool_events: true,
+                native_skills: true,
+                native_mcp: true,
+            },
+        }
+    }
+
+    async fn run_turn(
+        &self,
+        context: DriverContext,
+        prompt: DriverPrompt,
+        sink: DriverEventSink,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<DriverTurnResult, AppError> {
+        let requested_session_id = context
+            .provider_state
+            .native_session_id
+            .clone()
+            .unwrap_or_else(|| context.manifest.id.clone());
+        let mut spec = CommandSpec::new(&self.binary, &context.manifest.workspace);
+        spec.args = vec![
+            "-p".to_owned(),
+            "--input-format".to_owned(),
+            "stream-json".to_owned(),
+            "--output-format".to_owned(),
+            "stream-json".to_owned(),
+            "--verbose".to_owned(),
+            "--include-partial-messages".to_owned(),
+            "--replay-user-messages".to_owned(),
+            "--permission-mode".to_owned(),
+            "manual".to_owned(),
+        ];
+        if context.provider_state.native_session_id.is_some() {
+            spec.args.push("--resume".to_owned());
+        } else {
+            spec.args.push("--session-id".to_owned());
+        }
+        spec.args.push(requested_session_id.clone());
+        if let Some(model) = &prompt.model {
+            spec.args.push("--model".to_owned());
+            spec.args.push(model.clone());
+        }
+
+        let mut process = JsonLineProcess::spawn(&spec).await?;
+        let result = run_claude_turn(
+            &mut process,
+            context,
+            prompt,
+            requested_session_id,
+            &sink,
+            &mut cancel,
+        )
+        .await;
+        process.terminate().await;
+        result
+    }
+}
+
+async fn run_claude_turn(
+    process: &mut JsonLineProcess,
+    context: DriverContext,
+    prompt: DriverPrompt,
+    requested_session_id: String,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<DriverTurnResult, AppError> {
+    process
+        .send(&json!({
+            "type": "user",
+            "session_id": requested_session_id,
+            "parent_tool_use_id": null,
+            "message": {
+                "role": "user",
+                "content": prompt.text,
+            }
+        }))
+        .await?;
+
+    loop {
+        let message = tokio::select! {
+            message = process.read() => message?,
+                changed = cancel.changed() => {
+                    let _ = changed;
+                    return Ok(DriverTurnResult {
+                    native_session_id: Some(requested_session_id.clone()),
+                    stop_reason: "cancelled".to_owned(),
+                    cancelled: true,
+                });
+            }
+        };
+        let Some(message) = message else {
+            return Err(provider_exit_error(process, "Claude Code closed stdout").await);
+        };
+        if message.is_null() {
+            continue;
+        }
+        match message.get("type").and_then(Value::as_str) {
+            Some("result") => {
+                let native_session_id = message
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&requested_session_id)
+                    .to_owned();
+                let is_error = message
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if is_error {
+                    return Err(AppError::ProviderUnavailable(
+                        message
+                            .get("result")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Claude Code returned an error")
+                            .chars()
+                            .take(1000)
+                            .collect(),
+                    ));
+                }
+                let mut provider_state = context.provider_state;
+                provider_state.native_session_id = Some(native_session_id.clone());
+                provider_state.recoverable = true;
+                provider_state.last_error = None;
+                sink.save_provider_state(provider_state).await?;
+                return Ok(DriverTurnResult {
+                    native_session_id: Some(native_session_id),
+                    stop_reason: message
+                        .get("subtype")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed")
+                        .to_owned(),
+                    cancelled: false,
+                });
+            }
+            Some("stream_event") => handle_stream_event(&message, sink).await?,
+            Some("assistant") => {
+                sink.emit(
+                    "message.completed",
+                    json!({ "provider": "claude-code", "message": message.get("message") }),
+                )
+                .await?;
+            }
+            Some("tool_progress") => {
+                sink.emit(
+                    "tool.updated",
+                    json!({
+                        "provider": "claude-code",
+                        "toolUseId": message.get("tool_use_id"),
+                        "toolName": message.get("tool_name"),
+                        "elapsedSeconds": message.get("elapsed_time_seconds"),
+                    }),
+                )
+                .await?;
+            }
+            Some("control_request") => {
+                handle_control_request(process, message, sink, cancel).await?;
+            }
+            Some("system") => {
+                sink.emit(
+                    "provider.event",
+                    json!({
+                        "provider": "claude-code",
+                        "providerMethod": message.get("subtype"),
+                        "metadata": {
+                            "sessionId": message.get("session_id"),
+                            "model": message.get("model"),
+                            "permissionMode": message.get("permissionMode"),
+                        }
+                    }),
+                )
+                .await?;
+            }
+            Some("user" | "control_response") => {}
+            Some(event_type) => {
+                sink.emit(
+                    "provider.event",
+                    json!({ "provider": "claude-code", "providerMethod": event_type }),
+                )
+                .await?;
+            }
+            None => {}
+        }
+    }
+}
+
+async fn handle_stream_event(message: &Value, sink: &DriverEventSink) -> Result<(), AppError> {
+    let event = message.get("event").cloned().unwrap_or(Value::Null);
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+    match event_type {
+        "content_block_delta" => {
+            let delta = event.get("delta").cloned().unwrap_or(Value::Null);
+            let event_type = if delta.get("type").and_then(Value::as_str) == Some("thinking_delta")
+            {
+                "thought.delta"
+            } else {
+                "message.delta"
+            };
+            sink.emit(
+                event_type,
+                json!({ "provider": "claude-code", "role": "assistant", "delta": delta }),
+            )
+            .await?;
+        }
+        "content_block_start" => {
+            let content = event.get("content_block").cloned().unwrap_or(Value::Null);
+            if content.get("type").and_then(Value::as_str) == Some("tool_use") {
+                sink.emit(
+                    "tool.started",
+                    json!({ "provider": "claude-code", "tool": content }),
+                )
+                .await?;
+            }
+        }
+        "message_stop" | "message_start" | "content_block_stop" => {}
+        _ => {
+            sink.emit(
+                "provider.event",
+                json!({ "provider": "claude-code", "providerMethod": event_type }),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_control_request(
+    process: &mut JsonLineProcess,
+    message: Value,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    let request_id = message
+        .get("request_id")
+        .or_else(|| message.pointer("/request/request_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AppError::InvalidRequest("Claude control request is missing request_id".to_owned())
+        })?;
+    let request = message.get("request").cloned().unwrap_or(Value::Null);
+    let subtype = request
+        .get("subtype")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if subtype != "can_use_tool" {
+        process
+            .send(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": request_id,
+                    "error": "control request is not supported by TodeX"
+                }
+            }))
+            .await?;
+        return Ok(());
+    }
+
+    let decision = sink
+        .request_permission(
+            request_id.to_owned(),
+            "tool",
+            format!(
+                "Allow Claude tool {}?",
+                request
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("operation")
+            ),
+            request.clone(),
+            json!([
+                { "id": "allow_once", "kind": "allow_once", "name": "Allow once" },
+                { "id": "reject_once", "kind": "reject_once", "name": "Reject" }
+            ]),
+            cancel,
+        )
+        .await?;
+    let response = match decision.outcome {
+        PermissionOutcome::AllowOnce
+        | PermissionOutcome::AllowAlways
+        | PermissionOutcome::Answer => {
+            json!({
+                "behavior": "allow",
+                "updatedInput": request.get("input").cloned().unwrap_or_else(|| json!({})),
+            })
+        }
+        PermissionOutcome::RejectOnce | PermissionOutcome::RejectAlways => json!({
+            "behavior": "deny",
+            "message": "User rejected this tool request",
+        }),
+    };
+    process
+        .send(&json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": response,
+            }
+        }))
+        .await
+}

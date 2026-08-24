@@ -25,6 +25,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/workspace/entries", get(workspace_entries))
         .route("/v1/workspace/directories", get(workspace_directories))
         .route("/v1/ws", get(ws))
+        .merge(super::v2::routes())
 }
 
 async fn health() -> &'static str {
@@ -230,8 +231,10 @@ async fn list_workspace_directories(
     current: &Path,
     limit: usize,
 ) -> Result<Vec<WorkspaceDirectory>, AppError> {
+    let root = tokio::fs::canonicalize(root).await?;
+    let current = tokio::fs::canonicalize(current).await?;
     let mut entries = Vec::new();
-    let mut read_dir = tokio::fs::read_dir(current).await?;
+    let mut read_dir = tokio::fs::read_dir(&current).await?;
     while let Some(entry) = read_dir.next_entry().await? {
         let file_name = entry.file_name().to_string_lossy().to_string();
         if file_name.is_empty() || file_name.starts_with('.') {
@@ -250,7 +253,7 @@ async fn list_workspace_directories(
         }
 
         let canonical = match tokio::fs::canonicalize(&path).await {
-            Ok(canonical) if canonical.starts_with(root) => canonical,
+            Ok(canonical) if canonical.starts_with(&root) => canonical,
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -367,10 +370,13 @@ async fn ws(
     headers: HeaderMap,
     uri: Uri,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let auth = websocket::authenticate_headers(&state, &headers);
+    if state.config.security.auth_token.is_some() && auth.is_none() {
+        return Err(AppError::Unauthenticated);
+    }
     let crypto = websocket::transport_crypto_from_handshake(&state, &headers, uri.query());
-    ws.on_upgrade(move |socket| websocket::handle_socket(state, socket, auth, crypto))
+    Ok(ws.on_upgrade(move |socket| websocket::handle_socket(state, socket, auth, crypto)))
 }
 
 #[derive(Debug, Serialize)]
