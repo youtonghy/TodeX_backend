@@ -71,6 +71,7 @@ impl ConversationStore {
                 .await?;
             file.flush().await?;
             file.sync_all().await?;
+            drop(file);
             set_owner_only(&event_file, false).await?;
 
             write_atomic_json(&temporary.join(MANIFEST_FILE), &manifest).await?;

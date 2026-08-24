@@ -586,7 +586,7 @@ fn interactive_shell_args(shell: &str) -> Vec<&'static str> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::{fs, time::Duration};
 
