@@ -148,7 +148,67 @@ TODEX_REAL_E2E=1 cargo test --test e2e_real_codex -- --ignored --test-threads=1
 
 测试覆盖 HTTP `/health`、`/v1/version`、WebSocket `/v1/ws`、认证失败、租户不匹配、旧协议拒绝、本地 Codex start/status/stop、真实 turn、Plan 模式、approval 响应、replay/attach/snapshot、并行多 session 和同 session busy rejection。
 
+### 真实 Provider E2E
+
+ACP、Pi 和 Claude Code 的 v2 round-trip 测试默认忽略，不会在普通 CI 中启动真实 CLI。测试会检查 `/v2/providers`，创建 conversation，通过 `/v2/ws` 订阅，再调用 `/v2/conversations/{id}/prompt` 并等待事件。先用 daemon 用户完成登录：
+
+```bash
+TODEX_REAL_E2E=1 TODEX_REAL_PROVIDERS=pi,claude-code \
+  cargo test --test e2e_real_codex real_v2_provider_http_ws_roundtrip -- --ignored --nocapture
+```
+
+ACP 需要在 `config.toml` 配置受信任的 `[agent.acp_profiles.<name>]`，并把该 provider/profile 配置为可用后再加入 `TODEX_REAL_PROVIDERS`。测试不会接受客户端传入任意 command、args 或 env。真实测试会消耗模型额度，只应在隔离 workspace 和专用账号运行。
+
 ## 如何运行
+
+### 生产部署
+
+生产环境建议让 `todex-agentd` 作为单独系统用户运行，数据目录和 workspace 根目录使用该用户可读写的绝对路径。服务只监听 loopback，反向代理负责 HTTPS/WSS 和访问控制。
+
+systemd 示例（`/etc/systemd/system/todex-agentd.service`）：
+
+```ini
+[Unit]
+Description=TodeX Agent daemon
+After=network-online.target
+
+[Service]
+User=todex
+Group=todex
+WorkingDirectory=/var/lib/todex
+EnvironmentFile=/etc/todex-agentd.env
+ExecStart=/usr/local/bin/todex-agentd serve --host 127.0.0.1 --port 7345 --data-dir /var/lib/todex/data --workspace-root /srv/todex/workspaces
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/todex /srv/todex/workspaces
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now todex-agentd
+sudo systemctl status todex-agentd
+```
+
+macOS 可使用 launchd 的 `ProgramArguments` 指向同一 `serve` 命令，并把 `TODEX_AGENTD_AUTH_TOKEN` 放在 root-only 的 plist 或环境文件中；Windows 则使用 NSSM 或 Windows Service wrapper，服务账户必须拥有数据目录、workspace 和各 Provider CLI 的原生登录配置。不要把 token 写入命令行参数或提交到仓库。
+
+反向代理至少需要转发 `/health`、`/v1/*`、`/v2/*`，启用 WebSocket upgrade，设置合理的 request/body timeout，并只允许 HTTPS 来源。代理到 daemon 的 upstream 仍使用 `http://127.0.0.1:7345`；移动端使用代理公开的 HTTPS/WSS 地址重新生成配对二维码。
+
+生产检查清单：
+
+- `TODEX_AGENTD_ENABLE_AUTH=true`，token 使用随机高熵值，并定期轮换。
+- `enable_tls=false` 仅表示由代理终止 TLS；禁止直接暴露 7345 明文端口。
+- daemon 用户与登录 Provider 的用户一致，且 workspace 目录最小授权。
+- 日志、`daemon.json`、`audit/` 和配置文件设置为仅 daemon 用户可读。
+- 监控 `/health`、进程重启次数、数据目录剩余空间和 Provider CLI 退出率。
+- 备份前停止写入或使用文件系统快照，备份后做一次临时目录恢复和事件 replay 校验。
+
+升级前先停止 daemon，复制整个数据目录到带时间戳的备份目录，再升级 binary 并启动。启动迁移是幂等的：旧 `codex_gateway/sessions` 只读复制到 `conversations/`，不会删除或覆盖源文件。升级失败时停止新 binary，恢复备份目录和旧 binary；不要手工编辑 `events.jsonl` 或 `provider-state.json`。
 
 ### 默认运行
 

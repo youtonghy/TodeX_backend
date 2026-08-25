@@ -173,6 +173,82 @@ async fn real_codex_http_ws_auth_and_protocol_boundaries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TODEX_REAL_E2E=1, provider logins, and TODEX_REAL_PROVIDERS"]
+async fn real_v2_provider_http_ws_roundtrip() {
+    require_real_e2e();
+    let daemon = spawn_daemon().await;
+    let requested_source =
+        env::var("TODEX_REAL_PROVIDERS").unwrap_or_else(|_| "pi,claude-code".to_owned());
+    let requested_raw = requested_source
+        .split(',')
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let providers = http_request(daemon.port, "GET", "/v2/providers", Some(TOKEN), None).await;
+    assert_eq!(
+        providers.0, 200,
+        "provider catalog response: {}",
+        providers.1
+    );
+    let provider_catalog: Value =
+        serde_json::from_str(&providers.1).expect("provider catalog JSON");
+    for provider in requested_raw {
+        assert!(
+            provider_catalog["providers"]
+                .as_array()
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| item["id"] == provider && item["available"] == true)),
+            "provider {provider} is not available: {provider_catalog}"
+        );
+        let create = http_request(
+            daemon.port,
+            "POST",
+            "/v2/conversations",
+            Some(TOKEN),
+            Some(json!({ "provider": provider, "workspace": daemon.workspace_root, "title": format!("real {provider}") })),
+        ).await;
+        assert_eq!(create.0, 201, "create {provider}: {}", create.1);
+        let conversation: Value = serde_json::from_str(&create.1).expect("conversation JSON");
+        let conversation_id = conversation["id"].as_str().expect("conversation id");
+
+        let mut ws = connect_v2_ws(daemon.port, Some(TOKEN)).await;
+        send_json(
+            &mut ws,
+            json!({
+                "id": format!("subscribe-{provider}"),
+                "type": "conversation.subscribe",
+                "payload": { "conversationId": conversation_id, "afterSequence": 0, "limit": 200 }
+            }),
+        )
+        .await;
+        wait_for_event(&mut ws, |event| event["type"] == "server.result").await;
+        let prompt = http_request(
+            daemon.port,
+            "POST",
+            &format!("/v2/conversations/{conversation_id}/prompt"),
+            Some(TOKEN),
+            Some(json!({ "text": "Reply with one short sentence. Do not modify files." })),
+        )
+        .await;
+        assert_eq!(prompt.0, 202, "prompt {provider}: {}", prompt.1);
+        let event = wait_for_event_maybe(&mut ws, Duration::from_secs(180), |event| {
+            event["type"] == "conversation.event"
+                && event["payload"]["conversationId"] == conversation_id
+                && event["payload"]["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.ends_with("completed") || kind.ends_with("message"))
+        })
+        .await;
+        assert!(
+            event.is_ok(),
+            "provider {provider} did not emit a terminal/message event: {event:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires TODEX_REAL_E2E=1, real codex binary, Codex login, and model access"]
 async fn real_codex_single_session_plan_input_approval_replay_and_snapshot() {
     require_real_e2e();
@@ -851,6 +927,22 @@ async fn connect_ws(port: u16, token: Option<&str>) -> Ws {
     ws
 }
 
+async fn connect_v2_ws(port: u16, token: Option<&str>) -> Ws {
+    let mut request = format!("ws://127.0.0.1:{port}/v2/ws")
+        .into_client_request()
+        .expect("build v2 websocket request");
+    if let Some(token) = token {
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {token}")
+                .parse()
+                .expect("valid auth header"),
+        );
+    }
+    let (ws, _) = connect_async(request).await.expect("connect v2 websocket");
+    ws
+}
+
 async fn send_json(ws: &mut Ws, value: Value) {
     ws.send(Message::Text(value.to_string().into()))
         .await
@@ -939,6 +1031,52 @@ async fn http_get(port: u16, path: &str) -> (u16, String) {
         .and_then(|code| code.parse().ok())
         .unwrap_or(0);
     (status, response)
+}
+
+async fn http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> (u16, String) {
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)).await else {
+        return (0, String::new());
+    };
+    let body = body.map_or_else(String::new, |value| value.to_string());
+    let auth = token.map_or_else(String::new, |value| {
+        format!("Authorization: Bearer {value}\r\n")
+    });
+    let content_type = if body.is_empty() {
+        String::new()
+    } else {
+        "Content-Type: application/json\r\n".to_owned()
+    };
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n{auth}{content_type}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write http request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .expect("read http response");
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let body = response
+        .split_once("\r\n\r\n")
+        .map_or("", |(_, body)| body)
+        .to_owned();
+    (status, body)
 }
 
 fn codex_binary() -> PathBuf {
