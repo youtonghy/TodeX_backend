@@ -175,7 +175,7 @@ async fn real_codex_http_ws_auth_and_protocol_boundaries() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires TODEX_REAL_E2E=1, provider logins, and TODEX_REAL_PROVIDERS"]
 async fn real_v2_provider_http_ws_roundtrip() {
-    require_real_e2e();
+    require_real_v2_e2e();
     let daemon = spawn_daemon().await;
     let requested_source =
         env::var("TODEX_REAL_PROVIDERS").unwrap_or_else(|_| "pi,claude-code".to_owned());
@@ -207,7 +207,12 @@ async fn real_v2_provider_http_ws_roundtrip() {
             "POST",
             "/v2/conversations",
             Some(TOKEN),
-            Some(json!({ "provider": provider, "workspace": daemon.workspace_root, "title": format!("real {provider}") })),
+            Some(json!({
+                "provider": provider,
+                "workspace": daemon.workspace_root,
+                "title": format!("real {provider}"),
+                "providerProfile": (provider == "acp").then(|| env::var("TODEX_REAL_ACP_PROFILE").unwrap_or_else(|_| "real".to_owned()))
+            })),
         ).await;
         assert_eq!(create.0, 201, "create {provider}: {}", create.1);
         let conversation: Value = serde_json::from_str(&create.1).expect("conversation JSON");
@@ -245,6 +250,49 @@ async fn real_v2_provider_http_ws_roundtrip() {
             event.is_ok(),
             "provider {provider} did not emit a terminal/message event: {event:?}"
         );
+    }
+}
+
+fn require_real_v2_e2e() {
+    assert_eq!(
+        env::var("TODEX_REAL_E2E").as_deref(),
+        Ok("1"),
+        "set TODEX_REAL_E2E=1 to run real provider E2E tests"
+    );
+    let requested =
+        env::var("TODEX_REAL_PROVIDERS").unwrap_or_else(|_| "pi,claude-code".to_owned());
+    for provider in requested
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let binary = match provider {
+            "codex" => codex_binary(),
+            "pi" => env::var_os("TODEX_REAL_PI_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("pi")),
+            "claude-code" => env::var_os("TODEX_REAL_CLAUDE_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("claude")),
+            "acp" => PathBuf::from(
+                env::var_os("TODEX_REAL_ACP_COMMAND")
+                    .expect("TODEX_REAL_ACP_COMMAND is required for ACP E2E"),
+            ),
+            other => panic!("unsupported provider {other}"),
+        };
+        if provider != "acp" {
+            let output = Command::new(&binary)
+                .arg("--version")
+                .output()
+                .unwrap_or_else(|error| {
+                    panic!("failed to run {provider} '{}': {error}", binary.display())
+                });
+            assert!(
+                output.status.success(),
+                "{provider} --version failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
 
@@ -671,6 +719,7 @@ async fn spawn_daemon() -> Daemon {
     fs::create_dir_all(&data_dir).expect("create data dir");
     fs::create_dir_all(&workspace_root).expect("create workspace dir");
     let port = free_port();
+    write_real_acp_profile(&data_dir);
     let bin = env!("CARGO_BIN_EXE_todex-agentd");
     let child = Command::new(bin)
         .arg("serve")
@@ -700,6 +749,27 @@ async fn spawn_daemon() -> Daemon {
     };
     wait_for_health(daemon.port).await;
     daemon
+}
+
+fn write_real_acp_profile(data_dir: &Path) {
+    let Some(command) = env::var_os("TODEX_REAL_ACP_COMMAND") else {
+        return;
+    };
+    let profile = env::var("TODEX_REAL_ACP_PROFILE").unwrap_or_else(|_| "real".to_owned());
+    let args = env::var("TODEX_REAL_ACP_ARGS").unwrap_or_default();
+    let args = args
+        .split('\u{1f}')
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let command = command
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let content =
+        format!("[agent.acp_profiles.{profile}]\ncommand = \"{command}\"\nargs = [{args}]\n");
+    fs::write(data_dir.join("config.toml"), content).expect("write real ACP profile config");
 }
 
 #[cfg(unix)]
