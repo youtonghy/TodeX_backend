@@ -2,7 +2,7 @@
 
 ## 范围与状态
 
-审计范围是 `TodeX_backend` 当前 `main` 的 v2 REST/WebSocket、conversation folder store、Provider subprocess、ACP profile、MCP/Skill catalog、配对与传输加密路径。宿主 Codex Security Standard scan `6231ccc4-9aa3-436c-984b-e3ead6a0769d` 已创建，但当前环境没有暴露要求的 `security_scan` preflight capability，扫描停留在 preflight，不能作为已完成的独立扫描报告。
+审计范围是 `TodeX_backend` 当前 `main` 的 v2 REST/WebSocket、conversation folder store、Provider subprocess、ACP profile、MCP/Skill catalog、配对与传输加密路径。Codex Security Standard scan `00166df0-f462-4330-ba3b-8977d7351748` 已完成，coverage 为 complete，生成 canonical findings、coverage、manifest、Markdown 和 SARIF artifacts；结果为 0 个报告项。
 
 以下结论来自源码、现有测试和本地命令，可由同一仓库状态复核；它们不替代宿主扫描。
 
@@ -43,6 +43,5 @@ TODEX_REAL_E2E=1 TODEX_REAL_PROVIDERS=pi,claude-code \
 
 ## 剩余事项
 
-1. 在提供 `security_scan` preflight capability 的宿主重新加入现有 scan，完成单次 Standard scan、记录 canonical findings/coverage 并生成报告。
-2. 生产部署前验证反向代理仅开放 HTTPS/WSS，daemon 仅监听 loopback，token、audit 和 provider 登录目录使用最小文件权限。
-3. 如果 replay 成为主要 CPU/IO 热点，先用生产规模 journal 做基准，再设计 checkpoint/index；不要以取消完整校验换取未经测量的优化。
+1. 生产部署前验证反向代理仅开放 HTTPS/WSS，daemon 仅监听 loopback，token、audit 和 provider 登录目录使用最小文件权限。
+2. 如果 replay 成为主要 CPU/IO 热点，先用生产规模 journal 做基准，再设计 checkpoint/index；不要以取消完整校验换取未经测量的优化。
