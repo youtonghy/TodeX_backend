@@ -39,6 +39,8 @@ TODEX_REAL_E2E=1 TODEX_REAL_PROVIDERS=pi,claude-code \
   cargo test --test e2e_real_codex real_v2_provider_http_ws_roundtrip -- --ignored --nocapture
 ```
 
+2026-08-25 本机验证结果：Pi 0.84.2 与 Claude Code 2.1.226 的组合 round-trip 通过；`pi-acp` adapter 的独立 ACP round-trip 通过。测试均经过 v2 HTTP 创建、v2 WebSocket 订阅、真实 prompt 和 Provider 事件返回。
+
 ## 剩余事项
 
 1. 在提供 `security_scan` preflight capability 的宿主重新加入现有 scan，完成单次 Standard scan、记录 canonical findings/coverage 并生成报告。

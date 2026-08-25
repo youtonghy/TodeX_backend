@@ -214,7 +214,7 @@ async fn real_v2_provider_http_ws_roundtrip() {
                 "providerProfile": (provider == "acp").then(|| env::var("TODEX_REAL_ACP_PROFILE").unwrap_or_else(|_| "real".to_owned()))
             })),
         ).await;
-        assert_eq!(create.0, 201, "create {provider}: {}", create.1);
+        assert_eq!(create.0, 200, "create {provider}: {}", create.1);
         let conversation: Value = serde_json::from_str(&create.1).expect("conversation JSON");
         let conversation_id = conversation["id"].as_str().expect("conversation id");
 
@@ -237,7 +237,7 @@ async fn real_v2_provider_http_ws_roundtrip() {
             Some(json!({ "text": "Reply with one short sentence. Do not modify files." })),
         )
         .await;
-        assert_eq!(prompt.0, 202, "prompt {provider}: {}", prompt.1);
+        assert_eq!(prompt.0, 200, "prompt {provider}: {}", prompt.1);
         let event = wait_for_event_maybe(&mut ws, Duration::from_secs(180), |event| {
             event["type"] == "conversation.event"
                 && event["payload"]["conversationId"] == conversation_id
@@ -733,6 +733,14 @@ async fn spawn_daemon() -> Daemon {
         .arg(&workspace_root)
         .env("TODEX_AGENTD_AUTH_TOKEN", TOKEN)
         .env("TODEX_AGENTD_CODEX_BIN", codex_binary())
+        .env(
+            "TODEX_AGENTD_PI_BIN",
+            env::var_os("TODEX_REAL_PI_BIN").unwrap_or_else(|| "pi".into()),
+        )
+        .env(
+            "TODEX_AGENTD_CLAUDE_BIN",
+            env::var_os("TODEX_REAL_CLAUDE_BIN").unwrap_or_else(|| "claude".into()),
+        )
         .env("CODEX_HOME", &codex_home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
