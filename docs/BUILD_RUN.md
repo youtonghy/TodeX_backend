@@ -157,7 +157,7 @@ TODEX_REAL_E2E=1 TODEX_REAL_PROVIDERS=pi,claude-code \
   cargo test --test e2e_real_codex real_v2_provider_http_ws_roundtrip -- --ignored --nocapture
 ```
 
-ACP 需要在 `config.toml` 配置受信任的 `[agent.acp_profiles.<name>]`，并把该 provider/profile 配置为可用后再加入 `TODEX_REAL_PROVIDERS`。测试不会接受客户端传入任意 command、args 或 env。真实测试会消耗模型额度，只应在隔离 workspace 和专用账号运行。
+ACP 需要在 `config.toml` 配置受信任的 `[agent.acp_profiles.<name>]`，并把该 provider/profile 配置为可用后再加入 `TODEX_REAL_PROVIDERS`。集成测试也支持用临时配置注入 profile：`TODEX_REAL_ACP_COMMAND=/absolute/path/to/acp-server TODEX_REAL_ACP_PROFILE=real TODEX_REAL_ACP_ARGS='arg1\u001farg2'`。测试不会接受客户端传入任意 command、args 或 env。真实测试会消耗模型额度，只应在隔离 workspace 和专用账号运行。
 
 ## 如何运行
 
