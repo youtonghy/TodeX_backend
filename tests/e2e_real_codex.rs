@@ -756,7 +756,9 @@ fn write_real_acp_profile(data_dir: &Path) {
         return;
     };
     let profile = env::var("TODEX_REAL_ACP_PROFILE").unwrap_or_else(|_| "real".to_owned());
-    let args = env::var("TODEX_REAL_ACP_ARGS").unwrap_or_default();
+    let args = env::var("TODEX_REAL_ACP_ARGS")
+        .unwrap_or_default()
+        .replace("\\u001f", "\u{1f}");
     let args = args
         .split('\u{1f}')
         .filter(|arg| !arg.is_empty())
