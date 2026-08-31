@@ -23,6 +23,8 @@ use crate::workspace_paths::validate_workspace_directory_text;
 
 use super::websocket::{self, AuthContext};
 
+/// Maximum WebSocket message size (4MB)
+/// Must match MAX_MESSAGE_SIZE in client v2.ts
 const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WS_SUBSCRIPTIONS: usize = 128;
 
@@ -238,7 +240,8 @@ async fn ws(
     uri: Uri,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
-    let auth = require_auth(&state, &headers)?;
+    let auth = websocket::authenticate_headers_or_query(&state, &headers, uri.query())
+        .ok_or(AppError::Unauthenticated)?;
     let crypto = websocket::transport_crypto_from_handshake(&state, &headers, uri.query())?;
     Ok(ws.on_upgrade(move |socket| handle_socket(state, socket, crypto, auth)))
 }

@@ -42,8 +42,18 @@ use crate::{
 
 const TRANSPORT_HELLO_REPLAY_LIMIT: usize = 80;
 const TRANSPORT_HELLO_MAX_SESSIONS: usize = 12;
+// The legacy client has no outbound chunking: `TodeXTransportClient` sends every
+// message as a single frame, and image attachments travel as base64 data URLs
+// (up to 8 attachments of 8 MiB each, inflated ~4/3 by base64). Narrowing this to
+// the v2 limit of 4 MiB rejected source images larger than ~3 MiB, which is a
+// common phone-photo size. Keep 8 MiB until outbound chunking lands, then align
+// with MAX_WS_MESSAGE_BYTES in v2.rs.
 const MAX_LEGACY_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONNECTION_SCOPES: usize = 128;
+const CLIENT_TIMEOUT_SECS: u64 = 90;
+// Well under CLIENT_TIMEOUT_SECS so two consecutive Pongs can be lost before the
+// connection is considered idle.
+const PING_INTERVAL_SECS: u64 = 30;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthContext {
@@ -74,6 +84,26 @@ pub fn authenticate_headers(state: &AppState, headers: &HeaderMap) -> Option<Aut
     }
 
     Some(AuthContext {
+        principal_id: "gateway-token".to_owned(),
+        tenant_id: "local".to_owned(),
+        token_id: "configured-token".to_owned(),
+    })
+}
+
+pub fn authenticate_headers_or_query(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Option<AuthContext> {
+    if let Some(auth) = authenticate_headers(state, headers) {
+        return Some(auth);
+    }
+    let token = query
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|part| part.strip_prefix("access_token="))?;
+    let expected = state.config.security.auth_token.as_deref()?;
+    (token == expected).then(|| AuthContext {
         principal_id: "gateway-token".to_owned(),
         tenant_id: "local".to_owned(),
         token_id: "configured-token".to_owned(),
@@ -189,26 +219,68 @@ pub async fn handle_socket(
     });
 
     let send_task = tokio::spawn(async move {
-        while let Some(event) = outgoing_rx.recv().await {
-            if send_serialized_event(
-                &mut sender,
-                &send_crypto,
-                send_transport_state.clone(),
-                &stream_id,
-                send_seq_id.clone(),
-                event,
-            )
-            .await
-            .is_err()
-            {
-                break;
+        // Keep idle connections alive. The receive loop below closes the socket after
+        // CLIENT_TIMEOUT_SECS without an inbound frame, but the legacy client has no
+        // heartbeat message: while no workspace is selected it sends nothing at all,
+        // and its health probe is plain HTTP, which never touches this socket. A Ping
+        // draws an automatic Pong from any RFC 6455 client, and that Pong counts as
+        // activity, so a healthy idle connection is no longer reaped.
+        let mut ping_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(PING_INTERVAL_SECS));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                event = outgoing_rx.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    if send_serialized_event(
+                        &mut sender,
+                        &send_crypto,
+                        send_transport_state.clone(),
+                        &stream_id,
+                        send_seq_id.clone(),
+                        event,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    if sender.send(Message::Ping(Default::default())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
+    let client_timeout = tokio::time::Duration::from_secs(CLIENT_TIMEOUT_SECS);
+
     let mut chunk_reassembler = TransportChunkReassembler::default();
 
-    while let Some(frame) = receiver.next().await {
+    // Inactivity detection has to gate the receive itself. A separate watchdog task
+    // can observe the timeout but cannot end the connection: this loop would stay
+    // parked on `receiver.next()`, holding a connection slot and leaving the codex
+    // and terminal sessions alive. Wrapping the receive means expiry breaks here and
+    // falls through to the existing teardown below.
+    loop {
+        let frame = match tokio::time::timeout(client_timeout, receiver.next()).await {
+            Ok(Some(frame)) => frame,
+            // Stream ended: the peer closed.
+            Ok(None) => break,
+            Err(_) => {
+                debug!(
+                    timeout_secs = CLIENT_TIMEOUT_SECS,
+                    "websocket client inactive, closing connection"
+                );
+                break;
+            }
+        };
+
         let frame = match frame {
             Ok(frame) => frame,
             Err(err) => {
