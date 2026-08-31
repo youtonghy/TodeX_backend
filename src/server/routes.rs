@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, Uri};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/workspaces", get(workspaces).put(replace_workspaces))
         .route("/v1/workspace/entries", get(workspace_entries))
         .route("/v1/workspace/directories", get(workspace_directories))
+        .route("/v1/workspace/file", get(workspace_file))
+        .route("/v1/browser/fetch", post(browser_fetch))
         .route("/v1/ws", get(ws))
         .merge(super::v2::routes())
 }
@@ -118,6 +120,138 @@ async fn workspace_directories(
         parent,
         entries,
     }))
+}
+
+async fn workspace_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceFileQuery>,
+) -> Result<Json<WorkspaceFileResponse>, AppError> {
+    authorize_http(&state, &headers)?;
+    let path = validate_workspace_directory_text(&state.config.workspace_root, &query.path)?;
+    let metadata = tokio::fs::metadata(&path).await?;
+    if !metadata.is_file() {
+        return Err(AppError::InvalidRequest("path must be a file".to_owned()));
+    }
+    const MAX_PREVIEW_BYTES: u64 = 1024 * 1024;
+    if metadata.len() > MAX_PREVIEW_BYTES {
+        return Err(AppError::InvalidRequest(
+            "file is too large to preview".to_owned(),
+        ));
+    }
+    let bytes = tokio::fs::read(&path).await?;
+    let name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("file")
+        .to_owned();
+    let mime_type = mime_for_name(&name);
+    let text = if mime_type.starts_with("text/") || mime_type == "application/json" {
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    } else {
+        None
+    };
+    Ok(Json(WorkspaceFileResponse {
+        name,
+        path: path.display().to_string(),
+        mime_type,
+        size_bytes: bytes.len() as u64,
+        text,
+    }))
+}
+
+async fn browser_fetch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<BrowserFetchRequest>,
+) -> Result<Json<BrowserFetchResponse>, AppError> {
+    authorize_http(&state, &headers)?;
+    let url = validate_browser_url(&request.url)?;
+    let host = url
+        .split('/')
+        .nth(2)
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    if host.eq_ignore_ascii_case("169.254.169.254")
+        || host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+    {
+        return Err(AppError::InvalidRequest(
+            "browser target is not allowed".to_owned(),
+        ));
+    }
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "--fail-with-body",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-redirs",
+            "3",
+            "--max-time",
+            "15",
+            "--max-filesize",
+            "2097152",
+            &url,
+        ])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(AppError::ProviderUnavailable(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(Json(BrowserFetchResponse {
+        url,
+        status: 200,
+        content_type: "text/html".to_owned(),
+        body,
+    }))
+}
+
+fn validate_browser_url(raw: &str) -> Result<String, AppError> {
+    let url = raw.trim();
+    if url.len() > 2048
+        || !(url.starts_with("http://") || url.starts_with("https://"))
+        || !url[8..].contains('/')
+    {
+        return Err(AppError::InvalidRequest(
+            "only valid http and https URLs are allowed".to_owned(),
+        ));
+    }
+    Ok(url.to_owned())
+}
+
+fn mime_for_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".md") {
+        "text/markdown"
+    } else if lower.ends_with(".json") {
+        "application/json"
+    } else if lower.ends_with(".html") {
+        "text/html"
+    } else if lower.ends_with(".css") {
+        "text/css"
+    } else if lower.ends_with(".js")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".rs")
+        || lower.ends_with(".go")
+        || lower.ends_with(".c")
+        || lower.ends_with(".cpp")
+        || lower.ends_with(".py")
+        || lower.ends_with(".toml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".sh")
+    {
+        "text/plain"
+    } else {
+        "application/octet-stream"
+    }
+    .to_owned()
 }
 
 async fn list_workspace_entries(
@@ -417,6 +551,35 @@ struct WorkspaceDirectoriesQuery {
     path: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceFileQuery {
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceFileResponse {
+    name: String,
+    path: String,
+    mime_type: String,
+    size_bytes: u64,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserFetchRequest {
+    url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserFetchResponse {
+    url: String,
+    status: u16,
+    content_type: String,
+    body: String,
 }
 
 #[derive(Debug, Serialize)]
