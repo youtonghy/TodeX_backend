@@ -105,7 +105,7 @@ async fn real_codex_http_ws_auth_and_protocol_boundaries() {
     let daemon = spawn_daemon().await;
 
     assert_eq!(http_get(daemon.port, "/health").await.0, 200);
-    let version = http_get(daemon.port, "/v1/version").await;
+    let version = http_get(daemon.port, "/v2/version").await;
     assert_eq!(version.0, 200);
     assert!(version.1.contains("\"name\":\"todex-agentd\""));
     assert!(version.1.contains(&daemon.data_dir.display().to_string()));
@@ -114,24 +114,52 @@ async fn real_codex_http_ws_auth_and_protocol_boundaries() {
         .contains(&daemon.workspace_root.display().to_string()));
     assert_ne!(http_get(daemon.port, "/missing").await.0, 200);
 
-    let mut unauth = connect_ws(daemon.port, None).await;
+    // Fail-closed authentication: with a token configured, anonymous and
+    // wrong-token WebSocket handshakes are rejected before the upgrade, so
+    // unauthenticated traffic never reaches the business dispatcher.
+    for label in ["anonymous", "wrong token"] {
+        let token = if label == "anonymous" {
+            None
+        } else {
+            Some("definitely-not-the-token")
+        };
+        let rejected = try_connect_ws(daemon.port, token).await;
+        let error = rejected.expect_err(&format!("{label} handshake must be rejected"));
+        assert!(
+            error.to_string().contains("401"),
+            "{label} handshake should fail with 401, got {error}"
+        );
+    }
+
+    // The header-token connection drives the control-plane checks below.
+    let mut ws = connect_ws(daemon.port, Some(TOKEN)).await;
+
+    // Query-token authentication (Electron/browser clients cannot set
+    // WebSocket headers): the handshake succeeds and business commands work.
+    let mut query_ws = connect_ws_query_token(daemon.port).await;
     send_json(
-        &mut unauth,
+        &mut query_ws,
         json!({
-            "id": "unauth-status",
+            "id": "query-auth-status",
             "type": "codex.local.status",
             "payload": { "codexSessionId": "cdxs_auth", "tenantId": "local" }
         }),
     )
     .await;
-    let status = wait_for_event(&mut unauth, |event| {
+    let query_status = wait_for_event(&mut query_ws, |event| {
         event["type"] == "codex.control.status"
-            && event["payload"]["data"]["requestId"] == "unauth-status"
+            && event["payload"]["data"]["requestId"] == "query-auth-status"
     })
     .await;
-    assert_eq!(status["payload"]["data"]["lifecycleState"], json!("idle"));
+    assert_eq!(
+        query_status["payload"]["data"]["lifecycleState"],
+        json!("idle")
+    );
+    query_ws
+        .close(None)
+        .await
+        .expect("close query-token socket");
 
-    let mut ws = connect_ws(daemon.port, Some(TOKEN)).await;
     send_json(
         &mut ws,
         json!({
@@ -165,10 +193,18 @@ async fn real_codex_http_ws_auth_and_protocol_boundaries() {
         assert_eq!(data_code(&parse_error), Some("INVALID_REQUEST"));
     }
 
+    // Fail-closed audit contract: authenticated tenants are audited with the
+    // gateway-token principal, anonymous access is never granted, and no
+    // NO_AUTH_REQUIRED decision may appear for the WebSocket control plane.
+    let audit = fs::read_to_string(daemon.data_dir.join("audit/audit.jsonl"))
+        .expect("audit log should exist");
     assert!(
-        fs::read_to_string(daemon.data_dir.join("audit/audit.jsonl"))
-            .expect("audit log should exist")
-            .contains("NO_AUTH_REQUIRED")
+        audit.contains("\"tenant_id\":\"local\"") && audit.contains("gateway-token"),
+        "authenticated control decisions must be audited under the gateway token principal"
+    );
+    assert!(
+        !audit.contains("NO_AUTH_REQUIRED"),
+        "anonymous WebSocket control must never be granted while a token is configured"
     );
 }
 
@@ -499,28 +535,33 @@ async fn real_codex_common_native_controls_model_goal_permission_and_review() {
         json!({ "includeLayers": false, "cwd": daemon.workspace_root }),
     )
     .await;
-    assert_eq!(
-        config_read["payload"]["data"]["result"]["config"]["model"],
-        real_codex_model()
-    );
+    // The effective default model moves with the installed Codex CLI (e.g.
+    // 0.145.0 defaults to `gpt-5.6-sol`); only pin it when the operator
+    // explicitly provides TODEX_REAL_CODEX_MODEL.
+    let effective_model = config_read["payload"]["data"]["result"]["config"]["model"]
+        .as_str()
+        .filter(|model| !model.trim().is_empty());
+    match (effective_model, env::var("TODEX_REAL_CODEX_MODEL").ok()) {
+        (Some(effective), Some(expected)) => assert_eq!(effective, expected),
+        (Some(_), None) => {}
+        (None, _) => panic!("config/read returned no usable model: {}", config_read),
+    }
 
+    // Canonical thread/start shape — identical to the production adapter in
+    // src/provider/codex.rs: string approvalPolicy + sandbox + cwd. The old
+    // granular approvalPolicy map / permissions profile shape was removed
+    // from newer Codex app-servers (-32600 invalid type: map, expected a
+    // string), so the E2E must not depend on it.
     let thread_start = send_local_request(
         &mut ws,
         session,
         "thread-start-controls",
         "thread/start",
         json!({
-            "ephemeral": false,
-            "approvalPolicy": {
-                "granular": {
-                    "sandbox_approval": true,
-                    "rules": true,
-                    "skill_approval": false,
-                    "request_permissions": true,
-                    "mcp_elicitations": true
-                }
-            },
-            "permissions": { "type": "profile", "id": ":workspace", "modifications": null }
+            "cwd": daemon.workspace_root,
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write",
+            "ephemeral": false
         }),
     )
     .await;
@@ -984,15 +1025,27 @@ async fn send_local_request(
     })
     .await;
     assert_eq!(
-        response["type"], "codex.control.response",
-        "{method} returned error: {}",
+        response["type"],
+        "codex.control.response",
+        "{method} returned error: code={} message={} wire={}",
+        response["payload"]["data"]["error"]["code"],
+        response["payload"]["data"]["error"]["message"],
         response
     );
     response
 }
 
 async fn connect_ws(port: u16, token: Option<&str>) -> Ws {
-    let mut request = format!("ws://127.0.0.1:{port}/v1/ws")
+    try_connect_ws(port, token)
+        .await
+        .expect("connect websocket")
+}
+
+async fn try_connect_ws(
+    port: u16,
+    token: Option<&str>,
+) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
+    let mut request = format!("ws://127.0.0.1:{port}/v2/ws")
         .into_client_request()
         .expect("build websocket request");
     if let Some(token) = token {
@@ -1003,7 +1056,16 @@ async fn connect_ws(port: u16, token: Option<&str>) -> Ws {
                 .expect("valid auth header"),
         );
     }
-    let (ws, _) = connect_async(request).await.expect("connect websocket");
+    connect_async(request).await.map(|(ws, _)| ws)
+}
+
+async fn connect_ws_query_token(port: u16) -> Ws {
+    let request = format!("ws://127.0.0.1:{port}/v2/ws?access_token={TOKEN}")
+        .into_client_request()
+        .expect("build query-token websocket request");
+    let (ws, _) = connect_async(request)
+        .await
+        .expect("connect with access_token query parameter");
     ws
 }
 

@@ -1,17 +1,9 @@
-use std::{
-    collections::HashSet,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
+use std::collections::HashSet;
 
-use axum::extract::ws::{Message, WebSocket};
 use axum::http::HeaderMap;
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::{
     app_state::AppState,
@@ -31,11 +23,6 @@ use crate::{
         CodexGatewayAction, CodexLifecycleRequest, CodexLocalErrorCode, CodexLocalErrorPayload,
         ServerEvent,
     },
-    transport::{
-        encode_server_event, encode_transport_error, parse_transport_message,
-        transport_hello_state, TransportChunkReassembler, TransportClientMessage,
-        TransportHelloState,
-    },
     transport_crypto::TransportCryptoSession,
     workspace_paths::validate_workspace_directory_text,
 };
@@ -48,12 +35,7 @@ const TRANSPORT_HELLO_MAX_SESSIONS: usize = 12;
 // the v2 limit of 4 MiB rejected source images larger than ~3 MiB, which is a
 // common phone-photo size. Keep 8 MiB until outbound chunking lands, then align
 // with MAX_WS_MESSAGE_BYTES in v2.rs.
-const MAX_LEGACY_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONNECTION_SCOPES: usize = 128;
-const CLIENT_TIMEOUT_SECS: u64 = 90;
-// Well under CLIENT_TIMEOUT_SECS so two consecutive Pongs can be lost before the
-// connection is considered idle.
-const PING_INTERVAL_SECS: u64 = 30;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthContext {
@@ -62,8 +44,12 @@ pub struct AuthContext {
     pub token_id: String,
 }
 
+/// Per-connection event visibility for the legacy command plane. A connection
+/// only receives `codex.*` / `terminal.*` events for sessions and terminals it
+/// has touched (or resumed via `session.resume`). Shared by the unified
+/// `/v2/ws` socket in `v2.rs`.
 #[derive(Default)]
-struct LegacyEventScope {
+pub(super) struct LegacyEventScope {
     codex_sessions: HashSet<String>,
     terminals: HashSet<String>,
 }
@@ -103,11 +89,43 @@ pub fn authenticate_headers_or_query(
         .split('&')
         .find_map(|part| part.strip_prefix("access_token="))?;
     let expected = state.config.security.auth_token.as_deref()?;
-    (token == expected).then(|| AuthContext {
+    // Browser/Electron clients build the URL with URLSearchParams, which
+    // percent-encodes `&`, `=` and friends; decode before comparing so tokens
+    // containing reserved characters authenticate. Plain tokens are unchanged
+    // by decoding.
+    (percent_decode(token) == expected).then(|| AuthContext {
         principal_id: "gateway-token".to_owned(),
         tenant_id: "local".to_owned(),
         token_id: "configured-token".to_owned(),
     })
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
+            && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit)
+        {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+            match u8::from_str_radix(hex, 16) {
+                Ok(byte) => {
+                    decoded.push(byte);
+                    index += 3;
+                }
+                Err(_) => {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                }
+            }
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 pub fn transport_crypto_from_handshake(
@@ -116,272 +134,6 @@ pub fn transport_crypto_from_handshake(
     query: Option<&str>,
 ) -> Result<Option<TransportCryptoSession>, AppError> {
     TransportCryptoSession::from_headers_and_query(&state.pairing_keys, headers, query)
-}
-
-pub async fn handle_socket(
-    state: AppState,
-    socket: WebSocket,
-    auth: Option<AuthContext>,
-    crypto: Result<Option<TransportCryptoSession>, AppError>,
-) {
-    let crypto = match crypto {
-        Ok(crypto) => crypto,
-        Err(error) => {
-            let mut socket = socket;
-            let json =
-                serde_json::to_string(&ServerEvent::from(error_event(error, None, None, None)))
-                    .unwrap_or_else(|_| {
-                        r#"{"type":"server.error","payload":{"code":"INVALID_REQUEST"}}"#.to_owned()
-                    });
-            let _ = socket.send(Message::Text(json.into())).await;
-            let _ = socket.close().await;
-            return;
-        }
-    };
-
-    let active_connections = state.increment_websocket_connections();
-    state
-        .events
-        .publish(EventRecord::new(
-            "server.websocket.connected",
-            None,
-            None,
-            None,
-            json!({
-                "active_connections": active_connections,
-                "authenticated": auth.is_some(),
-                "principal_id": auth.as_ref().map(|auth| auth.principal_id.as_str()),
-                "encrypted": crypto.is_some(),
-                "encryption_protocol": crypto.as_ref().map(|crypto| crypto.protocol().as_str()),
-            }),
-        ))
-        .await;
-
-    let (mut sender, mut receiver) = socket.split();
-    let mut event_rx = state.events.subscribe();
-    let send_crypto = crypto.clone();
-    let transport_state = Arc::new(tokio::sync::Mutex::new(None::<TransportHelloState>));
-    let send_transport_state = transport_state.clone();
-    let stream_id = format!("ws_{}", uuid::Uuid::new_v4().simple());
-    let seq_id = Arc::new(AtomicU64::new(0));
-    let send_seq_id = seq_id.clone();
-    let event_scope = Arc::new(tokio::sync::RwLock::new(LegacyEventScope::default()));
-    let bus_event_scope = event_scope.clone();
-    let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::channel::<ServerEvent>(256);
-    let bus_outgoing_tx = outgoing_tx.clone();
-
-    let bus_task = tokio::spawn(async move {
-        loop {
-            match event_rx.recv().await {
-                Ok(event) => {
-                    let visible = {
-                        let scope = bus_event_scope.read().await;
-                        legacy_event_is_visible(&event, &scope)
-                    };
-                    if !visible {
-                        continue;
-                    }
-                    if bus_outgoing_tx
-                        .send(ServerEvent::from(event))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    if bus_outgoing_tx
-                        .send(ServerEvent::from(error_event(
-                            AppError::StreamLagged(skipped),
-                            None,
-                            None,
-                            None,
-                        )))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    let _ = bus_outgoing_tx
-                        .send(ServerEvent::from(error_event(
-                            AppError::StreamClosed,
-                            None,
-                            None,
-                            None,
-                        )))
-                        .await;
-                    break;
-                }
-            }
-        }
-    });
-
-    let send_task = tokio::spawn(async move {
-        // Keep idle connections alive. The receive loop below closes the socket after
-        // CLIENT_TIMEOUT_SECS without an inbound frame, but the legacy client has no
-        // heartbeat message: while no workspace is selected it sends nothing at all,
-        // and its health probe is plain HTTP, which never touches this socket. A Ping
-        // draws an automatic Pong from any RFC 6455 client, and that Pong counts as
-        // activity, so a healthy idle connection is no longer reaped.
-        let mut ping_interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(PING_INTERVAL_SECS));
-        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            tokio::select! {
-                event = outgoing_rx.recv() => {
-                    let Some(event) = event else {
-                        break;
-                    };
-                    if send_serialized_event(
-                        &mut sender,
-                        &send_crypto,
-                        send_transport_state.clone(),
-                        &stream_id,
-                        send_seq_id.clone(),
-                        event,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
-                    }
-                }
-                _ = ping_interval.tick() => {
-                    if sender.send(Message::Ping(Default::default())).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let client_timeout = tokio::time::Duration::from_secs(CLIENT_TIMEOUT_SECS);
-
-    let mut chunk_reassembler = TransportChunkReassembler::default();
-
-    // Inactivity detection has to gate the receive itself. A separate watchdog task
-    // can observe the timeout but cannot end the connection: this loop would stay
-    // parked on `receiver.next()`, holding a connection slot and leaving the codex
-    // and terminal sessions alive. Wrapping the receive means expiry breaks here and
-    // falls through to the existing teardown below.
-    loop {
-        let frame = match tokio::time::timeout(client_timeout, receiver.next()).await {
-            Ok(Some(frame)) => frame,
-            // Stream ended: the peer closed.
-            Ok(None) => break,
-            Err(_) => {
-                debug!(
-                    timeout_secs = CLIENT_TIMEOUT_SECS,
-                    "websocket client inactive, closing connection"
-                );
-                break;
-            }
-        };
-
-        let frame = match frame {
-            Ok(frame) => frame,
-            Err(err) => {
-                warn!(error = %err, "websocket receive failed");
-                break;
-            }
-        };
-
-        match frame {
-            Message::Text(text) => {
-                if text.len() > MAX_LEGACY_WS_MESSAGE_BYTES {
-                    let _ = send_direct_error(
-                        &outgoing_tx,
-                        AppError::InvalidRequest("websocket message is too large".to_owned()),
-                    )
-                    .await;
-                    continue;
-                }
-                let text = match &crypto {
-                    Some(crypto) => match crypto.decrypt_client_text(&text) {
-                        Ok(text) => text,
-                        Err(error) => {
-                            let _ = send_direct_error(&outgoing_tx, error).await;
-                            continue;
-                        }
-                    },
-                    None => text.to_string(),
-                };
-                if text.len() > MAX_LEGACY_WS_MESSAGE_BYTES {
-                    let _ = send_direct_error(
-                        &outgoing_tx,
-                        AppError::InvalidRequest("websocket message is too large".to_owned()),
-                    )
-                    .await;
-                    continue;
-                }
-                match handle_transport_frame(
-                    &text,
-                    &state,
-                    &transport_state,
-                    &mut chunk_reassembler,
-                    &event_scope,
-                )
-                .await
-                {
-                    Ok(TransportFrameAction::Dispatch(text)) => {
-                        match dispatch_scoped_client_text(
-                            &text,
-                            &state,
-                            auth.as_ref(),
-                            &event_scope,
-                        )
-                        .await
-                        {
-                            Ok(()) => {}
-                            Err(error) => {
-                                let _ = send_direct_error(&outgoing_tx, error).await;
-                            }
-                        }
-                        continue;
-                    }
-                    Ok(TransportFrameAction::Consumed) => continue,
-                    Ok(TransportFrameAction::Passthrough) => {}
-                    Err(error) => {
-                        let _ = send_direct_error(&outgoing_tx, error).await;
-                        continue;
-                    }
-                }
-                if let Err(error) =
-                    dispatch_scoped_client_text(&text, &state, auth.as_ref(), &event_scope).await
-                {
-                    let _ = send_direct_error(&outgoing_tx, error).await;
-                }
-            }
-            Message::Ping(_) | Message::Pong(_) => {}
-            Message::Close(_) => break,
-            Message::Binary(_) => debug!("ignored binary websocket frame"),
-        }
-    }
-
-    bus_task.abort();
-    drop(outgoing_tx);
-    send_task.abort();
-
-    let active_connections = state.decrement_websocket_connections();
-    state
-        .events
-        .publish(EventRecord::new(
-            "server.websocket.disconnected",
-            None,
-            None,
-            None,
-            json!({
-                "active_connections": active_connections,
-                "authenticated": auth.is_some(),
-                "principal_id": auth.as_ref().map(|auth| auth.principal_id.as_str()),
-                "encrypted": crypto.is_some(),
-                "encryption_protocol": crypto.as_ref().map(|crypto| crypto.protocol().as_str()),
-            }),
-        ))
-        .await;
 }
 
 #[derive(Default)]
@@ -397,7 +149,7 @@ struct LegacyScopeRegistration {
     terminals: Vec<String>,
 }
 
-async fn dispatch_scoped_client_text(
+pub(super) async fn dispatch_scoped_client_text(
     text: &str,
     state: &AppState,
     auth: Option<&AuthContext>,
@@ -633,16 +385,48 @@ fn validate_scope_id(id: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn send_direct_error(
-    outgoing: &tokio::sync::mpsc::Sender<ServerEvent>,
-    error: AppError,
-) -> Result<(), tokio::sync::mpsc::error::SendError<ServerEvent>> {
-    outgoing
-        .send(ServerEvent::from(error_event(error, None, None, None)))
-        .await
+pub(super) fn direct_error_event(error: AppError) -> ServerEvent {
+    ServerEvent::from(error_event(error, None, None, None))
 }
 
-fn legacy_event_is_visible(event: &EventRecord, scope: &LegacyEventScope) -> bool {
+/// `session.resume` support for the unified `/v2/ws` socket: grants the
+/// connection visibility for every still-existing Codex session it carried a
+/// cursor for, then replays gateway events after each client cursor. Replaces
+/// the transport-hello replay without the envelope/ack layer.
+pub(super) async fn resume_session_cursors(
+    state: &AppState,
+    event_scope: &tokio::sync::RwLock<LegacyEventScope>,
+    cursors: &std::collections::BTreeMap<String, u64>,
+) -> Result<Vec<String>, AppError> {
+    let mut valid_sessions = Vec::new();
+    for session_id in cursors.keys().take(TRANSPORT_HELLO_MAX_SESSIONS) {
+        if state.codex_gateway.session_exists(session_id).await? {
+            valid_sessions.push(session_id.clone());
+        }
+    }
+    let mut scope = event_scope.write().await;
+    for session_id in &valid_sessions {
+        if scope.codex_sessions.len() >= MAX_CONNECTION_SCOPES {
+            break;
+        }
+        scope.codex_sessions.insert(session_id.clone());
+    }
+    drop(scope);
+
+    for session_id in &valid_sessions {
+        let cursor = cursors[session_id];
+        let replay = state
+            .codex_gateway
+            .replay_events(session_id, Some(cursor), TRANSPORT_HELLO_REPLAY_LIMIT)
+            .await?;
+        for record in replay.events {
+            publish_codex_gateway_record(state, record).await;
+        }
+    }
+    Ok(valid_sessions)
+}
+
+pub(super) fn legacy_event_is_visible(event: &EventRecord, scope: &LegacyEventScope) -> bool {
     if event.event_type.ends_with(".audit")
         || event.event_type == "server.error"
         || event.event_type.starts_with("server.websocket.")
@@ -1464,196 +1248,6 @@ async fn dispatch(
     }
 
     Ok(())
-}
-
-enum TransportFrameAction {
-    Consumed,
-    Dispatch(String),
-    Passthrough,
-}
-
-async fn handle_transport_frame(
-    text: &str,
-    state: &AppState,
-    transport_state: &Arc<tokio::sync::Mutex<Option<TransportHelloState>>>,
-    chunk_reassembler: &mut TransportChunkReassembler,
-    event_scope: &tokio::sync::RwLock<LegacyEventScope>,
-) -> Result<TransportFrameAction, AppError> {
-    let Some(message) = parse_transport_message(text)? else {
-        return Ok(TransportFrameAction::Passthrough);
-    };
-
-    match message {
-        TransportClientMessage::Hello(hello) => {
-            let hello = transport_hello_state(hello)?;
-            state.transport_acks.apply_hello(&hello).await;
-            *transport_state.lock().await = Some(hello.clone());
-            state
-                .events
-                .publish(EventRecord::new(
-                    "transport.handshake.ready",
-                    None,
-                    None,
-                    None,
-                    json!({
-                        "clientId": hello.client_id.clone(),
-                        "transportVersion": crate::transport::TRANSPORT_VERSION,
-                        "capabilities": hello.capabilities.clone(),
-                    }),
-                ))
-                .await;
-            authorize_hello_scope(state, event_scope, &hello).await?;
-            replay_ack_cursors_for_hello(state, &hello).await?;
-            Ok(TransportFrameAction::Consumed)
-        }
-        TransportClientMessage::Ack(ack) => {
-            if let Some(hello) = transport_state.lock().await.clone() {
-                state.transport_acks.apply_ack(&hello.client_id, &ack).await;
-            }
-            Ok(TransportFrameAction::Consumed)
-        }
-        TransportClientMessage::Event(event) => {
-            let text = serde_json::to_string(&event.payload).map_err(|err| {
-                AppError::InvalidRequest(format!("failed to decode transport event payload: {err}"))
-            })?;
-            Ok(TransportFrameAction::Dispatch(text))
-        }
-        TransportClientMessage::Chunk(chunk) => match chunk_reassembler.push(chunk)? {
-            Some(text) => {
-                let Some(message) = parse_transport_message(&text)? else {
-                    return Ok(TransportFrameAction::Dispatch(text));
-                };
-                match message {
-                    TransportClientMessage::Event(event) => {
-                        let text = serde_json::to_string(&event.payload).map_err(|err| {
-                            AppError::InvalidRequest(format!(
-                                "failed to decode chunked transport event payload: {err}"
-                            ))
-                        })?;
-                        Ok(TransportFrameAction::Dispatch(text))
-                    }
-                    TransportClientMessage::Ack(ack) => {
-                        if let Some(hello) = transport_state.lock().await.clone() {
-                            state.transport_acks.apply_ack(&hello.client_id, &ack).await;
-                        }
-                        Ok(TransportFrameAction::Consumed)
-                    }
-                    TransportClientMessage::Hello(hello) => {
-                        let hello = transport_hello_state(hello)?;
-                        state.transport_acks.apply_hello(&hello).await;
-                        *transport_state.lock().await = Some(hello.clone());
-                        authorize_hello_scope(state, event_scope, &hello).await?;
-                        replay_ack_cursors_for_hello(state, &hello).await?;
-                        Ok(TransportFrameAction::Consumed)
-                    }
-                    TransportClientMessage::Chunk(_) => Err(AppError::InvalidRequest(
-                        "nested transport chunks are not supported".to_owned(),
-                    )),
-                }
-            }
-            None => Ok(TransportFrameAction::Consumed),
-        },
-    }
-}
-
-async fn authorize_hello_scope(
-    state: &AppState,
-    event_scope: &tokio::sync::RwLock<LegacyEventScope>,
-    hello: &TransportHelloState,
-) -> Result<(), AppError> {
-    let mut valid_sessions = Vec::new();
-    for session_id in hello
-        .session_cursors
-        .keys()
-        .take(TRANSPORT_HELLO_MAX_SESSIONS)
-    {
-        if state.codex_gateway.session_exists(session_id).await? {
-            valid_sessions.push(session_id.clone());
-        }
-    }
-    let mut scope = event_scope.write().await;
-    for session_id in valid_sessions {
-        if scope.codex_sessions.len() >= MAX_CONNECTION_SCOPES {
-            break;
-        }
-        scope.codex_sessions.insert(session_id);
-    }
-    Ok(())
-}
-
-async fn replay_ack_cursors_for_hello(
-    state: &AppState,
-    hello: &TransportHelloState,
-) -> Result<(), AppError> {
-    for (session_id, cursor) in hello
-        .session_cursors
-        .iter()
-        .take(TRANSPORT_HELLO_MAX_SESSIONS)
-    {
-        let cursor = state
-            .transport_acks
-            .cursor_for(&hello.client_id, session_id)
-            .await
-            .unwrap_or(*cursor);
-        let replay = state
-            .codex_gateway
-            .replay_events(session_id, Some(cursor), TRANSPORT_HELLO_REPLAY_LIMIT)
-            .await?;
-        for record in replay.events {
-            publish_codex_gateway_record(state, record).await;
-        }
-    }
-    Ok(())
-}
-
-async fn send_serialized_event(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    crypto: &Option<TransportCryptoSession>,
-    transport_state: Arc<tokio::sync::Mutex<Option<TransportHelloState>>>,
-    stream_id: &str,
-    seq_id: Arc<AtomicU64>,
-    event: ServerEvent,
-) -> Result<(), axum::Error> {
-    let frames = if transport_state.lock().await.is_some() {
-        let next_seq_id = seq_id.fetch_add(1, Ordering::Relaxed) + 1;
-        encode_server_event(event, stream_id, next_seq_id)
-    } else {
-        match serde_json::to_string(&event) {
-            Ok(json) => vec![json],
-            Err(err) => {
-                warn!(error = %err, "failed to serialize server event");
-                return Ok(());
-            }
-        }
-    };
-
-    for json in frames {
-        send_serialized_text(sender, crypto, json).await?;
-    }
-    Ok(())
-}
-
-async fn send_serialized_text(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    crypto: &Option<TransportCryptoSession>,
-    json: String,
-) -> Result<(), axum::Error> {
-    let json = if json.is_empty() {
-        encode_transport_error("EMPTY_FRAME", "transport produced an empty frame")
-    } else {
-        json
-    };
-    let json = match crypto {
-        Some(crypto) => match crypto.encrypt_server_text(&json) {
-            Ok(json) => json,
-            Err(err) => {
-                warn!(error = %err, "failed to encrypt server event");
-                return Ok(());
-            }
-        },
-        None => json,
-    };
-    sender.send(Message::Text(json.into())).await
 }
 
 async fn handle_codex_cloud_task_create(

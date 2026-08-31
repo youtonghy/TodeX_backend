@@ -12,7 +12,6 @@ use crate::{
     event::EventBus,
     local_terminal::LocalTerminalManager,
     provider::ConversationSupervisor,
-    transport::TransportAckStore,
     transport_crypto::PairingKeys,
     workspace_store::WorkspaceStore,
 };
@@ -26,7 +25,6 @@ pub struct AppState {
     pub codex_local_adapters: CodexLocalAdapterSupervisor,
     pub conversations: ConversationSupervisor,
     pub local_terminals: LocalTerminalManager,
-    pub transport_acks: TransportAckStore,
     pub pairing_keys: PairingKeys,
     pub workspaces: WorkspaceStore,
     pub(crate) audit_write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -69,7 +67,6 @@ impl AppState {
             ConversationSupervisor::new(config.clone(), conversation_store, conversation_hub);
         conversations.recover_all().await?;
         let local_terminals = LocalTerminalManager::new(events.clone());
-        let transport_acks = TransportAckStore::new();
         let pairing_keys = PairingKeys::load_or_generate(&config.data_dir).await?;
         let workspaces =
             WorkspaceStore::new(config.data_dir.clone(), config.workspace_root.clone()).await?;
@@ -84,7 +81,6 @@ impl AppState {
             codex_local_adapters,
             conversations,
             local_terminals,
-            transport_acks,
             pairing_keys,
             workspaces,
             audit_write_lock,

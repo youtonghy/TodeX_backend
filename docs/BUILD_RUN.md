@@ -140,13 +140,17 @@ TODEX_REAL_E2E=1 cargo test --test e2e_real_codex -- --ignored --test-threads=1
 
 前置条件：
 
-- `codex` 已安装并可执行，或设置 `TODEX_REAL_CODEX_BIN=/absolute/path/to/codex`
+- `codex` 已安装并可执行，或设置 `TODEX_REAL_CODEX_BIN=/absolute/path/to/codex`。当前验证版本：`codex-cli 0.145.0`（更早版本的 granular `approvalPolicy` 参数已不再被 app-server 接受）
 - 默认使用临时 workspace；如需指定真实任务目录，设置 `TODEX_REAL_WORKSPACE=/absolute/path/to/workspace`
 - 默认从当前 `CODEX_HOME`/`~/.codex` 复制登录凭据到临时 `CODEX_HOME`，并移除 MCP/marketplace 配置，避免本机 MCP 启动状态影响后端控制链路测试；如需完全指定 Codex home，设置 `TODEX_REAL_CODEX_HOME=/absolute/path/to/codex-home`
 - Codex 已登录，且当前环境能连接模型
 - 允许测试消耗少量模型调用额度
+- 测试环境必须允许监听 127.0.0.1 随机端口、启动 Provider 子进程并读取其状态（不支持无监听能力的沙箱环境）
+- 默认模型预期取自安装 CLI 的 `config/read` 实际值；需要钉住版本时设置 `TODEX_REAL_CODEX_MODEL=<model>`
 
-测试覆盖 HTTP `/health`、`/v1/version`、WebSocket `/v1/ws`、认证失败、租户不匹配、旧协议拒绝、本地 Codex start/status/stop、真实 turn、Plan 模式、approval 响应、replay/attach/snapshot、并行多 session 和同 session busy rejection。
+`thread/start` 一律使用与生产适配器一致的 canonical 最小参数（`cwd` + 字符串 `approvalPolicy` + 字符串 `sandbox`）；granular approval map 与 permission profile 属于已被 CLI 移除的旧 schema，不再进入真实 E2E。
+
+测试覆盖 HTTP `/health`、`/v2/version`、WebSocket `/v2/ws`（含统一命令面上的终端与本地 Codex 控制、`session.resume` 断线恢复）、认证矩阵（匿名/错 token 拒绝、header 与 URL 编码 query token 成功）、租户不匹配、旧协议拒绝、本地 Codex start/status/stop、真实 turn、Plan 模式、approval 响应、replay/attach/snapshot、并行多 session 和同 session busy rejection，以及 `/v1/*` 的 404 回归。
 
 ### 真实 Provider E2E
 
@@ -206,7 +210,7 @@ sudo systemctl status todex-agentd
 
 macOS 可使用 launchd 的 `ProgramArguments` 指向同一 `serve` 命令，并把 `TODEX_AGENTD_AUTH_TOKEN` 放在 root-only 的 plist 或环境文件中；Windows 则使用 NSSM 或 Windows Service wrapper，服务账户必须拥有数据目录、workspace 和各 Provider CLI 的原生登录配置。不要把 token 写入命令行参数或提交到仓库。
 
-反向代理至少需要转发 `/health`、`/v1/*`、`/v2/*`，启用 WebSocket upgrade，设置合理的 request/body timeout，并只允许 HTTPS 来源。代理到 daemon 的 upstream 仍使用 `http://127.0.0.1:7345`；移动端使用代理公开的 HTTPS/WSS 地址重新生成配对二维码。
+反向代理至少需要转发 `/health` 与 `/v2/*`，启用 WebSocket upgrade，设置合理的 request/body timeout，并只允许 HTTPS 来源。代理到 daemon 的 upstream 仍使用 `http://127.0.0.1:7345`；移动端使用代理公开的 HTTPS/WSS 地址重新生成配对二维码。注意 `access_token` 查询参数可能进入代理访问日志：生产环境优先使用 `Authorization` header 认证。
 
 生产检查清单：
 
@@ -302,14 +306,16 @@ todex-agentd listening
 
 ```bash
 curl http://127.0.0.1:7345/health
-curl http://127.0.0.1:7345/v1/version
+curl http://127.0.0.1:7345/v2/version
 ```
 
 ## WebSocket 连接验证
 
 ```bash
-websocat -H "Authorization: Bearer ${TODEX_AGENTD_AUTH_TOKEN}" ws://127.0.0.1:7345/v1/ws
+websocat -H "Authorization: Bearer ${TODEX_AGENTD_AUTH_TOKEN}" ws://127.0.0.1:7345/v2/ws
 ```
+
+无法设置 header 的客户端可使用查询参数：`ws://127.0.0.1:7345/v2/ws?access_token=<url-encoded-token>`。
 
 发送状态查询消息：
 
@@ -323,6 +329,22 @@ websocat -H "Authorization: Bearer ${TODEX_AGENTD_AUTH_TOKEN}" ws://127.0.0.1:73
   }
 }
 ```
+
+## 从 /v1 迁移到 /v2（已完成）
+
+本次迁移删除了全部 `/v1/*` 接口（HTTP 与 `/v1/ws`）。要点：
+
+- 旧 `/v1/ws` 的终端、本地 Codex 控制、Cloud Code、MCP 命令与事件流已并入 `/v2/ws`，同一连接可同时使用 `conversation.*` 与 `terminal.*` / `codex.*` 命令。
+- 断线恢复不再使用 transport hello/chunk/ack 封装：连接建立后发送 `session.resume`，携带客户端持久化的 Codex session cursor，由服务端重放。
+- WebSocket 消息上限统一为 8 MiB（聊天附件 base64 传输需要）。
+- `/v2/version` 与 `/health` 一样免认证，供 daemon 自检使用。
+
+部署顺序：
+
+1. 本版本 Backend 已删除 `/v1/*`，Backend 与 Desktop/TodeX_app 必须同步升级发布；旧客户端访问本版本 Backend 会在 `/v1/*` 上得到 404。
+2. 无法同步发布时的过渡方案：先部署同时提供 `/v1` 与 `/v2` 的过渡版本，客户端切换完成并通过 E2E 后，再部署本版本。
+
+回滚说明：本版本 Backend 与客户端需一起回滚（只回滚 Backend 会让新客户端缺少 `/v2` 资源接口与统一 `/v2/ws` 命令面；只回滚客户端会让旧客户端撞上已删除的 `/v1`）。数据格式未变（conversation folder、workspace 缓存、认证 token 均沿用），回滚不涉及数据迁移。
 
 ## 常见错误
 

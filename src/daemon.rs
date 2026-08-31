@@ -625,7 +625,7 @@ fn daemon_health_check(process: &DaemonProcess) -> bool {
 
     let _ = stream.set_read_timeout(Some(HEALTH_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HEALTH_TIMEOUT));
-    let request = format!("GET /v1/version HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let request = format!("GET /v2/version HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }

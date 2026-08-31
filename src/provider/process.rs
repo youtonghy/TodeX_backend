@@ -16,6 +16,10 @@ use crate::error::AppError;
 const MAX_PROTOCOL_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+// How much stderr travels with a failure message. The buffer holds up to
+// MAX_STDERR_BYTES, which is more than a user can read and more than an error
+// payload should carry, but the first line alone is often just a stack frame.
+const STDERR_EXCERPT_CHARS: usize = 2000;
 
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
@@ -173,14 +177,44 @@ impl Drop for JsonLineProcess {
 }
 
 pub async fn provider_exit_error(process: &JsonLineProcess, message: &str) -> AppError {
-    let stderr_bytes = process.stderr.lock().await.len();
-    if stderr_bytes == 0 {
-        AppError::ProviderUnavailable(message.to_owned())
-    } else {
-        AppError::ProviderUnavailable(format!(
-            "{message}; provider wrote {stderr_bytes} bytes to stderr"
-        ))
+    let excerpt = {
+        let buffer = process.stderr.lock().await;
+        stderr_excerpt(&buffer)
+    };
+    match excerpt {
+        Some(excerpt) => AppError::ProviderUnavailable(format!("{message}: {excerpt}")),
+        None => AppError::ProviderUnavailable(message.to_owned()),
     }
+}
+
+/// The tail of a provider's stderr, for attaching to a failure message.
+///
+/// The reason a provider died — a missing API key, an unknown model, an expired
+/// login — is almost always in what it printed, so reporting only a byte count
+/// leaves the user with nothing to act on. `drain_stderr` already keeps the last
+/// MAX_STDERR_BYTES, so the tail is the part worth showing.
+fn stderr_excerpt(buffer: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(buffer);
+    // Providers pad their diagnostics with blank lines and progress spinners.
+    let collapsed = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    // Count characters, not bytes: truncating a UTF-8 sequence mid-way would
+    // panic on a str slice, and provider output is frequently non-ASCII.
+    if collapsed.chars().count() <= STDERR_EXCERPT_CHARS {
+        return Some(collapsed);
+    }
+    let kept = collapsed
+        .chars()
+        .skip(collapsed.chars().count() - STDERR_EXCERPT_CHARS)
+        .collect::<String>();
+    Some(format!("...{kept}"))
 }
 
 pub fn executable_available(program: &str) -> bool {
@@ -340,5 +374,27 @@ mod tests {
             read_bounded_line(&mut reader, 4).await,
             Err(AppError::InvalidRequest(message)) if message.contains("too large")
         ));
+    }
+
+    #[test]
+    fn stderr_excerpt_reports_content_not_byte_counts() {
+        assert_eq!(stderr_excerpt(b""), None);
+        assert_eq!(stderr_excerpt(b"   \n \n"), None);
+        assert_eq!(
+            stderr_excerpt(b"Error: invalid API key\n\n  run `codex login` to authenticate\n"),
+            Some("Error: invalid API key | run `codex login` to authenticate".to_owned())
+        );
+    }
+
+    #[test]
+    fn stderr_excerpt_keeps_the_tail_and_survives_multibyte_boundaries() {
+        // Repeating a multi-byte character exercises the char-based truncation:
+        // a byte-based slice here would panic on a UTF-8 boundary.
+        let noise = "错".repeat(STDERR_EXCERPT_CHARS * 2);
+        let input = format!("{noise}\nfinal cause");
+        let excerpt = stderr_excerpt(input.as_bytes()).unwrap();
+        assert!(excerpt.starts_with("..."));
+        assert!(excerpt.ends_with("final cause"));
+        assert!(excerpt.chars().count() <= STDERR_EXCERPT_CHARS + 3);
     }
 }

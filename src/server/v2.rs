@@ -1,15 +1,17 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::cmp::Ordering;
+use std::collections::{HashSet, VecDeque};
+use std::fs::FileType;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
+use axum::extract::{Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 use tracing::warn;
@@ -19,17 +21,51 @@ use crate::conversation::{ConversationManifest, ProviderKind};
 use crate::error::AppError;
 use crate::provider::PermissionDecision;
 use crate::transport_crypto::TransportCryptoSession;
-use crate::workspace_paths::validate_workspace_directory_text;
+use crate::workspace_paths::{canonical_workspace_root, validate_workspace_directory_text};
+use crate::workspace_store::WorkspaceRecord;
 
+use super::protocol::ServerEvent;
 use super::websocket::{self, AuthContext};
 
-/// Maximum WebSocket message size (4MB)
-/// Must match MAX_MESSAGE_SIZE in client v2.ts
-const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum WebSocket message size for the unified `/v2/ws` socket (8MB).
+/// Matches MAX_LEGACY_WS_MESSAGE_BYTES: chat attachments travel as base64
+/// data URLs (up to 8 MiB per image) and the legacy plane has no outbound
+/// chunking, so a tighter cap would reject source images the v1 plane accepted.
+/// Client v2.ts keeps a stricter 4MB guard for `conversation.*` commands.
+const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WS_SUBSCRIPTIONS: usize = 128;
+/// Keep idle connections alive; mirrors the legacy `/v1/ws` socket so clients
+/// without an application-level heartbeat are not reaped. A Ping draws an
+/// automatic Pong, which counts as receive activity below.
+const WS_PING_INTERVAL_SECS: u64 = 30;
+const WS_CLIENT_TIMEOUT_SECS: u64 = 90;
+
+/// Command types handled natively by the v2 dispatcher. Everything else on the
+/// socket is a legacy `ClientMessage` (`terminal.*`, `codex.local.*`,
+/// `codex.gateway.control`, `codex.mcp.*`, `codex.cloudTask.*`) dispatched
+/// through the shared scoped legacy machinery.
+fn is_v2_native_command(command_type: &str) -> bool {
+    matches!(
+        command_type,
+        "conversation.subscribe"
+            | "conversation.create"
+            | "conversation.prompt"
+            | "conversation.cancel"
+            | "conversation.stop"
+            | "conversation.permission.respond"
+            | "server.ping"
+            | "session.resume"
+    )
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/v2/version", get(version))
+        .route("/v2/workspaces", get(workspaces).put(replace_workspaces))
+        .route("/v2/workspace/entries", get(workspace_entries))
+        .route("/v2/workspace/directories", get(workspace_directories))
+        .route("/v2/workspace/file", get(workspace_file))
+        .route("/v2/browser/fetch", post(browser_fetch))
         .route("/v2/providers", get(providers))
         .route("/v2/catalog/skills", get(skills))
         .route("/v2/catalog/skills/{resource_id}", get(skill_resource))
@@ -68,10 +104,485 @@ async fn skills(
     Ok(Json(state.catalog.skills(query.provider, workspace).await?))
 }
 
+/// Daemon self-checks and connection cards poll this without a token, matching
+/// the historical `/v1/version` contract. No workspace or file data is exposed.
+pub(super) async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
+    Json(VersionResponse {
+        name: env!("CARGO_PKG_NAME"),
+        version: env!("CARGO_PKG_VERSION"),
+        data_dir: state.config.data_dir.display().to_string(),
+        workspace_root: state.config.workspace_root.display().to_string(),
+    })
+}
+
+pub(super) async fn workspaces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WorkspacesResponse>, AppError> {
+    require_auth(&state, &headers)?;
+    let snapshot = state.workspaces.snapshot().await;
+    Ok(Json(WorkspacesResponse {
+        workspaces: snapshot.workspaces,
+        updated_at: snapshot.updated_at,
+    }))
+}
+
+pub(super) async fn replace_workspaces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReplaceWorkspacesRequest>,
+) -> Result<Json<WorkspacesResponse>, AppError> {
+    require_auth(&state, &headers)?;
+    let snapshot = state.workspaces.replace(request.workspaces).await?;
+    Ok(Json(WorkspacesResponse {
+        workspaces: snapshot.workspaces,
+        updated_at: snapshot.updated_at,
+    }))
+}
+
+pub(super) async fn workspace_entries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceEntriesQuery>,
+) -> Result<Json<WorkspaceEntriesResponse>, AppError> {
+    require_auth(&state, &headers)?;
+
+    let cwd = validate_workspace_directory_text(&state.config.workspace_root, &query.cwd)?;
+
+    let raw_query = query.query.as_deref().unwrap_or("");
+    let relative_query = normalize_relative_query(raw_query)?;
+    let entries = list_workspace_entries(
+        &cwd,
+        &relative_query,
+        raw_query.trim().ends_with('/'),
+        query.limit.unwrap_or(40).clamp(1, 100),
+    )
+    .await?;
+
+    Ok(Json(WorkspaceEntriesResponse { entries }))
+}
+
+pub(super) async fn workspace_directories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceDirectoriesQuery>,
+) -> Result<Json<WorkspaceDirectoriesResponse>, AppError> {
+    require_auth(&state, &headers)?;
+
+    let root = canonical_workspace_root(&state.config.workspace_root)?;
+    let current = match query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        Some(path) => validate_workspace_directory_text(&state.config.workspace_root, path)?,
+        None => root.clone(),
+    };
+    let limit = query.limit.unwrap_or(100).clamp(1, 300);
+    let entries = list_workspace_directories(&root, &current, limit).await?;
+    let parent = current
+        .parent()
+        .filter(|parent| current != root && parent.starts_with(&root))
+        .map(|parent| parent.display().to_string());
+
+    Ok(Json(WorkspaceDirectoriesResponse {
+        root: root.display().to_string(),
+        current: current.display().to_string(),
+        parent,
+        entries,
+    }))
+}
+
+pub(super) async fn workspace_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceFileQuery>,
+) -> Result<Json<WorkspaceFileResponse>, AppError> {
+    require_auth(&state, &headers)?;
+    let path = validate_workspace_file_text(&state.config.workspace_root, &query.path)?;
+    let metadata = tokio::fs::metadata(&path).await?;
+    if !metadata.is_file() {
+        return Err(AppError::InvalidRequest("path must be a file".to_owned()));
+    }
+    const MAX_PREVIEW_BYTES: u64 = 1024 * 1024;
+    if metadata.len() > MAX_PREVIEW_BYTES {
+        return Err(AppError::InvalidRequest(
+            "file is too large to preview".to_owned(),
+        ));
+    }
+    let bytes = tokio::fs::read(&path).await?;
+    let name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("file")
+        .to_owned();
+    let mime_type = mime_for_name(&name);
+    let text = if mime_type.starts_with("text/") || mime_type == "application/json" {
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    } else {
+        None
+    };
+    Ok(Json(WorkspaceFileResponse {
+        name,
+        path: path.display().to_string(),
+        mime_type,
+        size_bytes: bytes.len() as u64,
+        text,
+    }))
+}
+
+fn validate_workspace_file_text(root: &Path, raw: &str) -> Result<PathBuf, AppError> {
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        return Err(AppError::InvalidRequest(
+            "workspace file path must be absolute".to_owned(),
+        ));
+    }
+    let root = std::fs::canonicalize(root)?;
+    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AppError::WorkspacePathNotFound
+        } else {
+            AppError::Io(error)
+        }
+    })?;
+    if !canonical.starts_with(&root) {
+        return Err(AppError::WorkspacePathOutsideRoot);
+    }
+    Ok(canonical)
+}
+
+pub(super) async fn browser_fetch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<BrowserFetchRequest>,
+) -> Result<Json<BrowserFetchResponse>, AppError> {
+    require_auth(&state, &headers)?;
+    let url = validate_browser_url(&request.url)?;
+    let host_port = url.split('/').nth(2).unwrap_or("");
+    let host = host_port.split(':').next().unwrap_or("");
+    let backend_target = (host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1")
+        && host_port.ends_with(&format!(":{}", state.config.port));
+    if host.eq_ignore_ascii_case("169.254.169.254")
+        || ((host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1") && !backend_target)
+    {
+        return Err(AppError::InvalidRequest(
+            "browser target is not allowed".to_owned(),
+        ));
+    }
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "--fail-with-body",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-redirs",
+            "3",
+            "--max-time",
+            "15",
+            "--max-filesize",
+            "2097152",
+            &url,
+        ])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(AppError::ProviderUnavailable(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(Json(BrowserFetchResponse {
+        url,
+        status: 200,
+        content_type: "text/html".to_owned(),
+        body,
+    }))
+}
+
+fn validate_browser_url(raw: &str) -> Result<String, AppError> {
+    let url = raw.trim();
+    if url.len() > 2048
+        || !(url.starts_with("http://") || url.starts_with("https://"))
+        || !url[8..].contains('/')
+    {
+        return Err(AppError::InvalidRequest(
+            "only valid http and https URLs are allowed".to_owned(),
+        ));
+    }
+    Ok(url.to_owned())
+}
+
+fn mime_for_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".md") {
+        "text/markdown"
+    } else if lower.ends_with(".json") {
+        "application/json"
+    } else if lower.ends_with(".html") {
+        "text/html"
+    } else if lower.ends_with(".css") {
+        "text/css"
+    } else if lower.ends_with(".js")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".rs")
+        || lower.ends_with(".go")
+        || lower.ends_with(".c")
+        || lower.ends_with(".cpp")
+        || lower.ends_with(".py")
+        || lower.ends_with(".toml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".sh")
+    {
+        "text/plain"
+    } else {
+        "application/octet-stream"
+    }
+    .to_owned()
+}
+
+async fn list_workspace_entries(
+    cwd: &Path,
+    relative_query: &Path,
+    trailing_slash_query: bool,
+    limit: usize,
+) -> Result<Vec<WorkspaceEntry>, AppError> {
+    let query_text = slash_path(relative_query);
+    if query_text.is_empty() {
+        return list_direct_workspace_entries(cwd, Path::new(""), "", limit).await;
+    }
+
+    let include_hidden = query_includes_hidden_path(&query_text);
+    if trailing_slash_query {
+        let directory = cwd.join(relative_query);
+        if !directory.exists() || !directory.is_dir() {
+            return Ok(vec![]);
+        }
+        return list_direct_workspace_entries(cwd, relative_query, "", limit).await;
+    }
+
+    let mut entries = Vec::new();
+    let mut queue = VecDeque::from([PathBuf::new()]);
+    let query = query_text.to_ascii_lowercase();
+    while let Some(directory_query) = queue.pop_front() {
+        let directory = cwd.join(&directory_query);
+        let mut read_dir = match tokio::fs::read_dir(&directory).await {
+            Ok(read_dir) => read_dir,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error.into()),
+        };
+
+        while let Some(entry) = read_dir.next_entry().await? {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.is_empty() || (!include_hidden && file_name.starts_with('.')) {
+                continue;
+            }
+
+            let file_type = entry.file_type().await?;
+            if !file_type.is_dir() && !file_type.is_file() {
+                continue;
+            }
+
+            let relative_path = directory_query.join(&file_name);
+            let relative_path_text = slash_path(&relative_path);
+            if relative_path_text
+                .to_ascii_lowercase()
+                .contains(query.as_str())
+            {
+                entries.push(workspace_entry(
+                    file_name.clone(),
+                    &relative_path,
+                    &file_type,
+                ));
+            }
+
+            if file_type.is_dir()
+                && should_descend_workspace_directory(&file_name, include_hidden, query.as_str())
+            {
+                queue.push_back(relative_path);
+            }
+        }
+    }
+
+    sort_workspace_entries(&mut entries);
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+async fn list_direct_workspace_entries(
+    cwd: &Path,
+    directory_query: &Path,
+    filter: &str,
+    limit: usize,
+) -> Result<Vec<WorkspaceEntry>, AppError> {
+    let directory = cwd.join(directory_query);
+    if !directory.exists() || !directory.is_dir() {
+        return Ok(vec![]);
+    }
+
+    let mut entries = Vec::new();
+    let filter = filter.to_ascii_lowercase();
+    let include_hidden = filter.starts_with('.');
+    let mut read_dir = tokio::fs::read_dir(&directory).await?;
+    while let Some(entry) = read_dir.next_entry().await? {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if file_name.is_empty() || (!include_hidden && file_name.starts_with('.')) {
+            continue;
+        }
+        if !filter.is_empty() && !file_name.to_ascii_lowercase().contains(&filter) {
+            continue;
+        }
+
+        let file_type = entry.file_type().await?;
+        if !file_type.is_dir() && !file_type.is_file() {
+            continue;
+        }
+
+        let relative_path = directory_query.join(&file_name);
+        entries.push(workspace_entry(file_name, &relative_path, &file_type));
+    }
+
+    sort_workspace_entries(&mut entries);
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+async fn list_workspace_directories(
+    root: &Path,
+    current: &Path,
+    limit: usize,
+) -> Result<Vec<WorkspaceDirectory>, AppError> {
+    let root = tokio::fs::canonicalize(root).await?;
+    let current = tokio::fs::canonicalize(current).await?;
+    let mut entries = Vec::new();
+    let mut read_dir = tokio::fs::read_dir(&current).await?;
+    while let Some(entry) = read_dir.next_entry().await? {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if file_name.is_empty() || file_name.starts_with('.') {
+            continue;
+        }
+
+        let path = entry.path();
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let canonical = match tokio::fs::canonicalize(&path).await {
+            Ok(canonical) if canonical.starts_with(&root) => canonical,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        entries.push(WorkspaceDirectory {
+            name: file_name,
+            path: canonical.display().to_string(),
+            kind: WorkspaceEntryKind::Directory,
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+    });
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+fn workspace_entry(name: String, relative_path: &Path, file_type: &FileType) -> WorkspaceEntry {
+    let mut path = slash_path(relative_path);
+    let kind = if file_type.is_dir() {
+        path.push('/');
+        WorkspaceEntryKind::Directory
+    } else {
+        WorkspaceEntryKind::File
+    };
+    WorkspaceEntry { name, path, kind }
+}
+
+fn sort_workspace_entries(entries: &mut [WorkspaceEntry]) {
+    entries.sort_by(|left, right| match (&left.kind, &right.kind) {
+        (WorkspaceEntryKind::Directory, WorkspaceEntryKind::File) => Ordering::Less,
+        (WorkspaceEntryKind::File, WorkspaceEntryKind::Directory) => Ordering::Greater,
+        _ => left
+            .path
+            .to_ascii_lowercase()
+            .cmp(&right.path.to_ascii_lowercase()),
+    });
+}
+
+fn query_includes_hidden_path(query: &str) -> bool {
+    query
+        .split('/')
+        .any(|part| part.starts_with('.') && part.len() > 1)
+}
+
+fn should_descend_workspace_directory(name: &str, include_hidden: bool, query: &str) -> bool {
+    if name.starts_with('.') && !include_hidden {
+        return false;
+    }
+
+    const LARGE_DIRECTORY_NAMES: &[&str] = &[
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        ".git",
+        ".expo",
+        ".next",
+    ];
+    !LARGE_DIRECTORY_NAMES
+        .iter()
+        .any(|large_name| name == *large_name && !query.contains(large_name))
+}
+
+fn normalize_relative_query(raw: &str) -> Result<PathBuf, AppError> {
+    let trimmed = raw.trim().trim_start_matches("./");
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(AppError::InvalidRequest(
+            "absolute mention paths are not allowed".to_string(),
+        ));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(AppError::InvalidRequest(
+                    "mention path cannot escape the workspace".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 async fn skill_resource(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(resource_id): Path<String>,
+    AxumPath(resource_id): AxumPath<String>,
     Query(query): Query<CatalogQuery>,
 ) -> Result<Json<crate::catalog::SkillResource>, AppError> {
     require_auth(&state, &headers)?;
@@ -149,7 +660,7 @@ async fn create_conversation(
 async fn get_conversation(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(conversation_id): Path<String>,
+    AxumPath(conversation_id): AxumPath<String>,
 ) -> Result<Json<ConversationManifest>, AppError> {
     let auth = require_auth(&state, &headers)?;
     Ok(Json(
@@ -163,7 +674,7 @@ async fn get_conversation(
 async fn replay_conversation(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(conversation_id): Path<String>,
+    AxumPath(conversation_id): AxumPath<String>,
     Query(query): Query<ReplayQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
@@ -183,7 +694,7 @@ async fn replay_conversation(
 async fn prompt_conversation(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(conversation_id): Path<String>,
+    AxumPath(conversation_id): AxumPath<String>,
     Json(request): Json<PromptRequest>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
@@ -204,7 +715,7 @@ async fn prompt_conversation(
 async fn cancel_conversation(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(conversation_id): Path<String>,
+    AxumPath(conversation_id): AxumPath<String>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
     state
@@ -219,7 +730,7 @@ async fn cancel_conversation(
 async fn resolve_permission(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((conversation_id, permission_id)): Path<(String, String)>,
+    AxumPath((conversation_id, permission_id)): AxumPath<(String, String)>,
     Json(decision): Json<PermissionDecision>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
@@ -240,8 +751,18 @@ async fn ws(
     uri: Uri,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
-    let auth = websocket::authenticate_headers_or_query(&state, &headers, uri.query())
-        .ok_or(AppError::Unauthenticated)?;
+    // Parity with the v2 HTTP `require_auth` and the retired `/v1/ws`: a
+    // deployment without a configured token accepts anonymous local
+    // connections under the synthetic `local` principal.
+    let auth = match websocket::authenticate_headers_or_query(&state, &headers, uri.query()) {
+        Some(auth) => auth,
+        None if state.config.security.auth_token.is_none() => AuthContext {
+            principal_id: "local".to_owned(),
+            tenant_id: "local".to_owned(),
+            token_id: "none".to_owned(),
+        },
+        None => return Err(AppError::Unauthenticated),
+    };
     let crypto = websocket::transport_crypto_from_handshake(&state, &headers, uri.query())?;
     Ok(ws.on_upgrade(move |socket| handle_socket(state, socket, crypto, auth)))
 }
@@ -252,37 +773,131 @@ async fn handle_socket(
     crypto: Option<TransportCryptoSession>,
     auth: AuthContext,
 ) {
+    let authenticated = state.config.security.auth_token.is_some();
+    let active_connections = state.increment_websocket_connections();
+    state
+        .events
+        .publish(crate::event::EventRecord::new(
+            "server.websocket.connected",
+            None,
+            None,
+            None,
+            json!({
+                "active_connections": active_connections,
+                "authenticated": authenticated,
+                "principal_id": auth.principal_id,
+                "encrypted": crypto.is_some(),
+                "encryption_protocol": crypto.as_ref().map(|crypto| crypto.protocol().as_str()),
+                "plane": "v2",
+            }),
+        ))
+        .await;
+
+    // Legacy-plane authorization parity with `/v1/ws`: without a configured
+    // token the legacy dispatcher trusted any tenant, so pass `None` instead
+    // of the synthetic local principal the v2 layer always produces.
+    let legacy_auth = authenticated.then(|| auth.clone());
+
     let (mut sender, mut receiver) = socket.split();
+    let mut event_rx = state.events.subscribe();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Value>(256);
     let sender_crypto = crypto.clone();
     let send_task = tokio::spawn(async move {
-        while let Some(value) = outgoing_rx.recv().await {
-            let text = match serde_json::to_string(&value) {
-                Ok(text) => text,
-                Err(error) => {
-                    warn!(error = %error, "failed to serialize v2 websocket event");
-                    continue;
-                }
-            };
-            let text = match &sender_crypto {
-                Some(crypto) => match crypto.encrypt_server_text(&text) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        warn!(error = %error, "failed to encrypt v2 websocket event");
+        let mut ping_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(WS_PING_INTERVAL_SECS));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                value = outgoing_rx.recv() => {
+                    let Some(value) = value else { break };
+                    let text = match serde_json::to_string(&value) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            warn!(error = %error, "failed to serialize v2 websocket event");
+                            continue;
+                        }
+                    };
+                    let text = match &sender_crypto {
+                        Some(crypto) => match crypto.encrypt_server_text(&text) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                warn!(error = %error, "failed to encrypt v2 websocket event");
+                                break;
+                            }
+                        },
+                        None => text,
+                    };
+                    if sender.send(Message::Text(text.into())).await.is_err() {
                         break;
                     }
-                },
-                None => text,
-            };
-            if sender.send(Message::Text(text.into())).await.is_err() {
-                break;
+                }
+                _ = ping_interval.tick() => {
+                    if sender.send(Message::Ping(Default::default())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let event_scope = Arc::new(tokio::sync::RwLock::new(
+        websocket::LegacyEventScope::default(),
+    ));
+    let bus_event_scope = event_scope.clone();
+    let bus_outgoing_tx = outgoing_tx.clone();
+    let bus_task = tokio::spawn(async move {
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    let visible = {
+                        let scope = bus_event_scope.read().await;
+                        websocket::legacy_event_is_visible(&event, &scope)
+                    };
+                    if !visible {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::to_value(ServerEvent::from(event)) {
+                        if bus_outgoing_tx.send(value).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    if let Ok(value) = serde_json::to_value(websocket::direct_error_event(
+                        AppError::StreamLagged(skipped),
+                    )) {
+                        if bus_outgoing_tx.send(value).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    if let Ok(value) =
+                        serde_json::to_value(websocket::direct_error_event(AppError::StreamClosed))
+                    {
+                        let _ = bus_outgoing_tx.send(value).await;
+                    }
+                    break;
+                }
             }
         }
     });
 
     let subscriptions = Arc::new(Mutex::new(HashSet::<String>::new()));
     let mut subscription_tasks = Vec::new();
-    while let Some(frame) = receiver.next().await {
+    let client_timeout = tokio::time::Duration::from_secs(WS_CLIENT_TIMEOUT_SECS);
+    loop {
+        let frame = match tokio::time::timeout(client_timeout, receiver.next()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => {
+                warn!(
+                    timeout_secs = WS_CLIENT_TIMEOUT_SECS,
+                    "v2 websocket client inactive, closing connection"
+                );
+                break;
+            }
+        };
         let frame = match frame {
             Ok(frame) => frame,
             Err(error) => {
@@ -315,43 +930,89 @@ async fn handle_socket(
             },
             None => text.to_string(),
         };
-        let command: V2Command = match serde_json::from_str(&text) {
-            Ok(command) => command,
-            Err(error) => {
-                let _ = outgoing_tx
-                    .send(error_response(
-                        None,
-                        AppError::InvalidRequest(format!("invalid v2 websocket command: {error}")),
-                    ))
-                    .await;
-                continue;
+        let command_type = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned));
+        match command_type.as_deref() {
+            Some(command_type) if is_v2_native_command(command_type) => {
+                let command: V2Command = match serde_json::from_str(&text) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        let _ = outgoing_tx
+                            .send(error_response(
+                                None,
+                                AppError::InvalidRequest(format!(
+                                    "invalid v2 websocket command: {error}"
+                                )),
+                            ))
+                            .await;
+                        continue;
+                    }
+                };
+                let response = dispatch_command(
+                    &state,
+                    &outgoing_tx,
+                    &subscriptions,
+                    &event_scope,
+                    &mut subscription_tasks,
+                    &auth.tenant_id,
+                    command,
+                )
+                .await;
+                if let Some(response) = response {
+                    let _ = outgoing_tx.send(response).await;
+                }
             }
-        };
-        let response = dispatch_command(
-            &state,
-            &outgoing_tx,
-            &subscriptions,
-            &mut subscription_tasks,
-            &auth.tenant_id,
-            command,
-        )
-        .await;
-        if let Some(response) = response {
-            let _ = outgoing_tx.send(response).await;
+            _ => {
+                // Legacy command plane: same scoped dispatch, error events and
+                // scope semantics as the previous `/v1/ws` socket.
+                if let Err(error) = websocket::dispatch_scoped_client_text(
+                    &text,
+                    &state,
+                    legacy_auth.as_ref(),
+                    &event_scope,
+                )
+                .await
+                {
+                    if let Ok(value) = serde_json::to_value(websocket::direct_error_event(error)) {
+                        let _ = outgoing_tx.send(value).await;
+                    }
+                }
+            }
         }
     }
 
     for task in subscription_tasks {
         task.abort();
     }
+    bus_task.abort();
     drop(outgoing_tx);
     let _ = send_task.await;
+
+    let active_connections = state.decrement_websocket_connections();
+    state
+        .events
+        .publish(crate::event::EventRecord::new(
+            "server.websocket.disconnected",
+            None,
+            None,
+            None,
+            json!({
+                "active_connections": active_connections,
+                "authenticated": authenticated,
+                "encrypted": crypto.is_some(),
+                "encryption_protocol": crypto.as_ref().map(|crypto| crypto.protocol().as_str()),
+                "plane": "v2",
+            }),
+        ))
+        .await;
 }
 
 async fn dispatch_command(
     state: &AppState,
     outgoing: &mpsc::Sender<Value>,
     subscriptions: &Arc<Mutex<HashSet<String>>>,
+    event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
     subscription_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     owner_id: &str,
     command: V2Command,
@@ -360,6 +1021,7 @@ async fn dispatch_command(
         state,
         outgoing,
         subscriptions,
+        event_scope,
         subscription_tasks,
         owner_id,
         &command,
@@ -379,6 +1041,7 @@ async fn dispatch_command_inner(
     state: &AppState,
     outgoing: &mpsc::Sender<Value>,
     subscriptions: &Arc<Mutex<HashSet<String>>>,
+    event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
     subscription_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     owner_id: &str,
     command: &V2Command,
@@ -542,6 +1205,17 @@ async fn dispatch_command_inner(
             }))
         }
         "server.ping" => Ok(json!({ "pong": true })),
+        "session.resume" => {
+            // Replaces the transport-hello session cursor replay: grant this
+            // connection visibility for still-existing Codex sessions and
+            // replay gateway events after each client cursor. Replay events
+            // reach the client through the scoped legacy event stream above.
+            let request: SessionResumeRequest = serde_json::from_value(command.payload.clone())?;
+            let resumed =
+                websocket::resume_session_cursors(state, event_scope, &request.session_cursors)
+                    .await?;
+            Ok(json!({ "resumed": resumed }))
+        }
         other => Err(AppError::Unsupported(format!(
             "v2 websocket command {other}"
         ))),
@@ -565,6 +1239,110 @@ fn error_response(id: Option<String>, error: AppError) -> Value {
         "type": "server.error",
         "payload": { "code": error.code(), "message": error.to_string() },
     })
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct VersionResponse {
+    name: &'static str,
+    version: &'static str,
+    data_dir: String,
+    workspace_root: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ReplaceWorkspacesRequest {
+    workspaces: Vec<WorkspaceRecord>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WorkspacesResponse {
+    workspaces: Vec<WorkspaceRecord>,
+    updated_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WorkspaceEntriesQuery {
+    cwd: String,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WorkspaceDirectoriesQuery {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkspaceFileQuery {
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WorkspaceFileResponse {
+    name: String,
+    path: String,
+    mime_type: String,
+    size_bytes: u64,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct BrowserFetchRequest {
+    url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BrowserFetchResponse {
+    url: String,
+    status: u16,
+    content_type: String,
+    body: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct WorkspaceEntriesResponse {
+    entries: Vec<WorkspaceEntry>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WorkspaceDirectoriesResponse {
+    root: String,
+    current: String,
+    parent: Option<String>,
+    entries: Vec<WorkspaceDirectory>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum WorkspaceEntryKind {
+    Directory,
+    File,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceEntry {
+    name: String,
+    path: String,
+    kind: WorkspaceEntryKind,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceDirectory {
+    name: String,
+    path: String,
+    kind: WorkspaceEntryKind,
 }
 
 #[derive(Debug, Deserialize)]
@@ -624,6 +1402,13 @@ struct SubscribeRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SessionResumeRequest {
+    #[serde(default)]
+    session_cursors: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WsConversationRequest {
     conversation_id: String,
     #[serde(default)]
@@ -644,10 +1429,12 @@ struct WsPermissionRequest {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -799,11 +1586,15 @@ mod tests {
 
         let (outgoing, mut events) = mpsc::channel(16);
         let subscriptions = Arc::new(Mutex::new(HashSet::new()));
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
         let mut subscription_tasks = Vec::new();
         let result = dispatch_command_inner(
             &state,
             &outgoing,
             &subscriptions,
+            &event_scope,
             &mut subscription_tasks,
             "local",
             &V2Command {
@@ -833,11 +1624,15 @@ mod tests {
 
         let (future_outgoing, mut future_events) = mpsc::channel(16);
         let future_subscriptions = Arc::new(Mutex::new(HashSet::new()));
+        let future_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
         let mut future_tasks = Vec::new();
         let result = dispatch_command_inner(
             &state,
             &future_outgoing,
             &future_subscriptions,
+            &future_scope,
             &mut future_tasks,
             "local",
             &V2Command {
@@ -871,5 +1666,600 @@ mod tests {
             task.abort();
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn recursive_workspace_entries_match_nested_paths() {
+        let root = make_temp_workspace("recursive-match");
+        fs::create_dir_all(root.join("src/server")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("src/server/routes.rs"), "").unwrap();
+        fs::write(root.join("docs/routes.md"), "").unwrap();
+        fs::write(root.join("README.md"), "").unwrap();
+
+        let entries = list_workspace_entries(&root, Path::new("routes"), false, 20)
+            .await
+            .unwrap();
+        let paths = entry_paths(&entries);
+
+        assert_eq!(paths, vec!["docs/routes.md", "src/server/routes.rs"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn recursive_workspace_entries_hide_hidden_paths_until_requested() {
+        let root = make_temp_workspace("hidden-match");
+        fs::create_dir_all(root.join(".config")).unwrap();
+        fs::write(root.join(".config/settings.json"), "").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/settings.json"), "").unwrap();
+
+        let visible = list_workspace_entries(&root, Path::new("settings"), false, 20)
+            .await
+            .unwrap();
+        assert_eq!(entry_paths(&visible), vec!["src/settings.json"]);
+
+        let hidden = list_workspace_entries(&root, Path::new(".config"), false, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            entry_paths(&hidden),
+            vec![".config/", ".config/settings.json"]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn workspace_directories_lists_only_directories_under_root() {
+        let root = make_temp_workspace("directory-browser");
+        fs::create_dir_all(root.join("app")).unwrap();
+        fs::create_dir_all(root.join("backend")).unwrap();
+        fs::create_dir_all(root.join(".hidden")).unwrap();
+        fs::write(root.join("README.md"), "").unwrap();
+
+        let entries = list_workspace_directories(&root, &root, 20).await.unwrap();
+        let paths = entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["app", "backend"]);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.kind == WorkspaceEntryKind::Directory));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn workspace_directories_skip_symlink_escape() {
+        let root = make_temp_workspace("directory-browser-symlink");
+        let outside = make_temp_workspace("directory-browser-outside");
+        fs::create_dir_all(root.join("safe")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+
+        let entries = list_workspace_directories(&root, &root, 20).await.unwrap();
+        let names = entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["safe"]);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[tokio::test]
+    async fn v2_http_resources_cover_version_workspaces_files_and_browser_guards() {
+        let root = std::env::temp_dir().join(format!("todex-v2-http-res-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(workspace.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(workspace.join("README.md"), "# readme").unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "nope").unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_root,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable,
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+                auth_token: Some("v2-token".to_owned()),
+            },
+        })
+        .await
+        .unwrap();
+        let app = crate::server::router(state);
+
+        // `/v2/version` mirrors the unauthenticated daemon self-check contract.
+        let version = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(version.status(), StatusCode::OK);
+        let version_body = to_bytes(version.into_body(), 1024 * 1024).await.unwrap();
+        let version_json: serde_json::Value = serde_json::from_slice(&version_body).unwrap();
+        assert_eq!(version_json["name"], "todex-agentd");
+
+        // Workspace endpoints require the bearer token.
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/workspaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let auth = "Bearer v2-token";
+        let replaced = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v2/workspaces")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "workspaces": [] }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced.status(), StatusCode::OK);
+
+        let entries = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/workspace/entries?cwd={}&query=main",
+                        workspace.display()
+                    ))
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entries.status(), StatusCode::OK);
+        let entries_body = to_bytes(entries.into_body(), 1024 * 1024).await.unwrap();
+        let entries_json: serde_json::Value = serde_json::from_slice(&entries_body).unwrap();
+        assert_eq!(entries_json["entries"][0]["path"], "src/main.rs");
+
+        let directories = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/workspace/directories?path={}",
+                        workspace.display()
+                    ))
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(directories.status(), StatusCode::OK);
+
+        let file = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/workspace/file?path={}",
+                        workspace.join("README.md").display()
+                    ))
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(file.status(), StatusCode::OK);
+        let file_body = to_bytes(file.into_body(), 1024 * 1024).await.unwrap();
+        let file_json: serde_json::Value = serde_json::from_slice(&file_body).unwrap();
+        assert_eq!(file_json["mimeType"], "text/markdown");
+        assert_eq!(file_json["text"], "# readme");
+
+        let escaped = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/workspace/file?path={}",
+                        outside.join("secret.txt").display()
+                    ))
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(escaped.status(), StatusCode::FORBIDDEN);
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/workspace/file?path={}",
+                        workspace.join("missing.rs").display()
+                    ))
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let blocked_browser = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/browser/fetch")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "url": "http://169.254.169.254/latest/meta-data" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked_browser.status(), StatusCode::BAD_REQUEST);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v1_routes_are_retired_and_return_404() {
+        let root = std::env::temp_dir().join(format!("todex-v1-404-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_root,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable,
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: false,
+                enable_tls: false,
+                auth_token: None,
+            },
+        })
+        .await
+        .unwrap();
+        let app = crate::server::router(state);
+
+        for (method, path) in [
+            ("GET", "/v1/version"),
+            ("GET", "/v1/workspaces"),
+            ("PUT", "/v1/workspaces"),
+            ("GET", "/v1/workspace/entries"),
+            ("GET", "/v1/workspace/directories"),
+            ("GET", "/v1/workspace/file"),
+            ("POST", "/v1/browser/fetch"),
+            ("GET", "/v1/ws"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {path} must stay retired"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn entry_paths(entries: &[WorkspaceEntry]) -> Vec<String> {
+        entries.iter().map(|entry| entry.path.clone()).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_ws_accepts_query_token_and_dispatches_legacy_and_resume_commands() {
+        let root = std::env::temp_dir().join(format!("todex-v2-ws-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_root,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable,
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+                auth_token: Some("v2-ws-token".to_owned()),
+            },
+        })
+        .await
+        .unwrap();
+
+        // Seed a gateway session with two events; only the event after the
+        // client cursor should come back via session.resume.
+        for index in 1..=2u64 {
+            state
+                .codex_gateway
+                .append_event(
+                    "cdxs_resume",
+                    crate::codex_gateway::CodexGatewayEvent::new(
+                        "codex.thread.started",
+                        json!({ "index": index, "threadId": format!("thread-{index}") }),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let app = crate::server::router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // Missing token is rejected at handshake.
+        assert!(
+            tokio_tungstenite::connect_async(format!("ws://{addr}/v2/ws"))
+                .await
+                .is_err()
+        );
+
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/v2/ws?access_token=v2-ws-token"))
+                .await
+                .expect("connect with query token");
+
+        // v2-native command: server.ping result envelope.
+        ws.send(WsMessage::Text(
+            json!({ "id": "ping-1", "type": "server.ping", "payload": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let ping = wait_for_ws_message(&mut ws, |message| {
+            message["id"] == "ping-1" && message["type"] == "server.result"
+        })
+        .await;
+        assert_eq!(ping["payload"]["pong"], true);
+
+        // Legacy plane: codex.local.status still flows through the scoped
+        // legacy dispatcher and answers as a plain ServerEvent.
+        ws.send(WsMessage::Text(
+            json!({
+                "id": "status-1",
+                "type": "codex.local.status",
+                "payload": { "codexSessionId": "cdxs_probe", "tenantId": "local" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let status = wait_for_ws_message(&mut ws, |message| {
+            message["type"] == "codex.control.status"
+                && message["payload"]["data"]["requestId"] == "status-1"
+        })
+        .await;
+        assert_eq!(status["payload"]["data"]["codexSessionId"], "cdxs_probe");
+
+        // session.resume replaces the transport hello: scope + replay after
+        // the client cursor, answered by a v2 result envelope.
+        ws.send(WsMessage::Text(
+            json!({
+                "id": "resume-1",
+                "type": "session.resume",
+                "payload": { "sessionCursors": { "cdxs_resume": 1 } }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let result = wait_for_ws_message(&mut ws, |message| {
+            message["id"] == "resume-1" && message["type"] == "server.result"
+        })
+        .await;
+        assert_eq!(result["payload"]["resumed"], json!(["cdxs_resume"]));
+        let replayed = wait_for_ws_message(&mut ws, |message| {
+            message["type"] == "codex.thread.started" && message["payload"]["cursor"] == 2
+        })
+        .await;
+        assert_eq!(replayed["payload"]["codex_session_id"], "cdxs_resume");
+
+        let _ = ws.close(None).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_ws_auth_matrix_covers_anonymous_wrong_and_encoded_query_tokens() {
+        let root = std::env::temp_dir().join(format!("todex-v2-ws-auth-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let base = Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_root,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable,
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: false,
+                enable_tls: false,
+                auth_token: None,
+            },
+        };
+
+        // Token-less deployments keep the historical local trust model: the
+        // handshake succeeds under the synthetic `local` principal.
+        let state = AppState::new(base.clone()).await.unwrap();
+        let app = crate::server::router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v2/ws"))
+            .await
+            .expect("anonymous connect allowed without configured token");
+        ws.send(WsMessage::Text(
+            json!({ "id": "ping-open", "type": "server.ping", "payload": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let pong = wait_for_ws_message(&mut ws, |message| {
+            message["id"] == "ping-open" && message["type"] == "server.result"
+        })
+        .await;
+        assert_eq!(pong["payload"]["pong"], true);
+        let _ = ws.close(None).await;
+
+        // Token-secured deployments: wrong tokens fail, and query tokens that
+        // need URL encoding (browser/Electron path) succeed.
+        let mut secured = base;
+        secured.security.auth_token = Some("tok&x=1".to_owned());
+        let state = AppState::new(secured).await.unwrap();
+        let app = crate::server::router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        assert!(
+            tokio_tungstenite::connect_async(format!("ws://{addr}/v2/ws?access_token=wrong"))
+                .await
+                .is_err()
+        );
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/v2/ws?access_token=tok%26x%3D1"))
+                .await
+                .expect("url-encoded query token should authenticate");
+        ws.send(WsMessage::Text(
+            json!({ "id": "ping-secured", "type": "server.ping", "payload": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let pong = wait_for_ws_message(&mut ws, |message| {
+            message["id"] == "ping-secured" && message["type"] == "server.result"
+        })
+        .await;
+        assert_eq!(pong["payload"]["pong"], true);
+        let _ = ws.close(None).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    async fn wait_for_ws_message<Filter>(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        filter: Filter,
+    ) -> serde_json::Value
+    where
+        Filter: Fn(&serde_json::Value) -> bool,
+    {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("websocket message timeout")
+                .expect("websocket stream open")
+                .expect("websocket frame ok");
+            let WsMessage::Text(text) = frame else {
+                continue;
+            };
+            let message: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+            if filter(&message) {
+                return message;
+            }
+        }
+    }
+
+    fn make_temp_workspace(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("todex-{name}-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 }

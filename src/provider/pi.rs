@@ -251,7 +251,17 @@ async fn handle_extension_ui(
             json!({ "provider": "pi", "providerMethod": "extension_ui_request", "metadata": request }),
         )
         .await?;
-        return Ok(());
+        // Pi blocks waiting for a response to this id, so reporting the request
+        // without answering it would hang the turn until the process is killed.
+        // Cancelling is the only honest answer: TodeX cannot render this UI.
+        return process
+            .send(&json!({
+                "type": "extension_ui_response",
+                "id": id,
+                "cancelled": true,
+                "error": format!("TodeX does not support the '{method}' extension UI"),
+            }))
+            .await;
     }
     let decision = sink
         .request_permission(

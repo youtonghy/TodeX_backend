@@ -1001,7 +1001,7 @@ impl TuiApp {
             Line::from(vec![Span::raw("Status: "), status]),
             Line::from(format!("Listen: {listen_host}:{listen_port}")),
             Line::from(format!(
-                "WS endpoint: ws://{listen_host}:{listen_port}/v1/ws"
+                "WS endpoint: ws://{listen_host}:{listen_port}/v2/ws"
             )),
             Line::from(format!(
                 "Pairing encryption: {} (action e)",

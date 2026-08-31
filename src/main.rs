@@ -10,7 +10,6 @@ mod local_terminal;
 mod provider;
 mod server;
 mod server_runner;
-mod transport;
 mod transport_crypto;
 mod tui;
 mod workspace_paths;
