@@ -19,7 +19,7 @@ use tracing::warn;
 use crate::app_state::AppState;
 use crate::conversation::{ConversationManifest, ProviderKind};
 use crate::error::AppError;
-use crate::provider::PermissionDecision;
+use crate::provider::{PermissionDecision, PromptSkillRef};
 use crate::transport_crypto::TransportCryptoSession;
 use crate::workspace_paths::{canonical_workspace_root, validate_workspace_directory_text};
 use crate::workspace_store::WorkspaceRecord;
@@ -53,6 +53,9 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.cancel"
             | "conversation.stop"
             | "conversation.permission.respond"
+            | "mcp.list"
+            | "mcp.refresh"
+            | "mcp.call"
             | "server.ping"
             | "session.resume"
     )
@@ -705,6 +708,7 @@ async fn prompt_conversation(
             &conversation_id,
             request.text,
             request.model,
+            prompt_skills(request.skills),
         )
         .await?;
     Ok(Json(
@@ -1170,12 +1174,21 @@ async fn dispatch_command_inner(
         }
         "conversation.prompt" => {
             let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
-            let text = request.text.ok_or_else(|| {
-                AppError::InvalidRequest("conversation.prompt requires text".to_owned())
-            })?;
+            let text = request.text.unwrap_or_default();
+            if text.trim().is_empty() && request.skills.is_empty() {
+                return Err(AppError::InvalidRequest(
+                    "conversation.prompt requires text or skills".to_owned(),
+                ));
+            }
             let turn_id = state
                 .conversations
-                .prompt_owned(owner_id, &request.conversation_id, text, request.model)
+                .prompt_owned(
+                    owner_id,
+                    &request.conversation_id,
+                    text,
+                    request.model,
+                    prompt_skills(request.skills),
+                )
                 .await?;
             Ok(json!({ "conversationId": request.conversation_id, "turnId": turn_id }))
         }
@@ -1204,6 +1217,52 @@ async fn dispatch_command_inner(
                 "accepted": true,
             }))
         }
+        "mcp.list" => {
+            let request: WsMcpRequest = serde_json::from_value(command.payload.clone())?;
+            Ok(serde_json::to_value(
+                state
+                    .conversations
+                    .list_mcp_owned(owner_id, &request.conversation_id)
+                    .await?,
+            )?)
+        }
+        "mcp.refresh" => {
+            let request: WsMcpRequest = serde_json::from_value(command.payload.clone())?;
+            let resource_id = request.resource_id.ok_or_else(|| {
+                AppError::InvalidRequest("mcp.refresh requires resourceId".to_owned())
+            })?;
+            Ok(serde_json::to_value(
+                state
+                    .conversations
+                    .refresh_mcp_owned(owner_id, &request.conversation_id, &resource_id)
+                    .await?,
+            )?)
+        }
+        "mcp.call" => {
+            let request: WsMcpRequest = serde_json::from_value(command.payload.clone())?;
+            let resource_id = request.resource_id.ok_or_else(|| {
+                AppError::InvalidRequest("mcp.call requires resourceId".to_owned())
+            })?;
+            let tool_name = request.tool_name.ok_or_else(|| {
+                AppError::InvalidRequest("mcp.call requires toolName".to_owned())
+            })?;
+            let result = state
+                .conversations
+                .call_mcp_owned(
+                    owner_id,
+                    &request.conversation_id,
+                    &resource_id,
+                    &tool_name,
+                    request.arguments.unwrap_or(Value::Null),
+                )
+                .await?;
+            Ok(json!({
+                "conversationId": request.conversation_id,
+                "resourceId": resource_id,
+                "toolName": tool_name,
+                "result": result,
+            }))
+        }
         "server.ping" => Ok(json!({ "pong": true })),
         "session.resume" => {
             // Replaces the transport-hello session cursor replay: grant this
@@ -1220,6 +1279,16 @@ async fn dispatch_command_inner(
             "v2 websocket command {other}"
         ))),
     }
+}
+
+fn prompt_skills(skills: Vec<PromptSkillRequest>) -> Vec<PromptSkillRef> {
+    skills
+        .into_iter()
+        .map(|skill| PromptSkillRef {
+            resource_id: skill.resource_id,
+            name: skill.name,
+        })
+        .collect()
 }
 
 fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<AuthContext, AppError> {
@@ -1368,10 +1437,21 @@ struct ReplayQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PromptSkillRequest {
+    resource_id: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PromptRequest {
+    #[serde(default)]
     text: String,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    skills: Vec<PromptSkillRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1415,6 +1495,20 @@ struct WsConversationRequest {
     text: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    skills: Vec<PromptSkillRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WsMcpRequest {
+    conversation_id: String,
+    #[serde(default)]
+    resource_id: Option<String>,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    arguments: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -7,6 +7,7 @@ mod daemon;
 mod error;
 mod event;
 mod local_terminal;
+mod mcp;
 mod provider;
 mod server;
 mod server_runner;

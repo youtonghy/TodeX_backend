@@ -79,9 +79,14 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 ```json
 {
   "text": "检查认证边界",
-  "model": null
+  "model": null,
+  "skills": [
+    { "resourceId": "skill_abc", "name": "review" }
+  ]
 }
 ```
+
+`skills` 可选。Backend 按 `resourceId` 读取 Skill 正文并注入到 Provider prompt；客户端不要拼接完整 Skill 文件。只带 Skill、不带 `text` 时允许发送。注入成功后会发出 `skill.injected` 事件；用户可见的 `message.created` 仍是原始输入。
 
 每个 conversation 同时只允许一个 mutating turn；并发 prompt 返回 `409 CONFLICT`，不会排队。daemon 重启会把未完成 turn 标记为 `interrupted`，不会通过重放 prompt 猜测恢复。原生会话 ID 由 `provider-state.json` 保存，Provider 支持时下一 turn 使用原生 resume。
 
@@ -101,7 +106,9 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 }
 ```
 
-支持 `conversation.subscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.permission.respond` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence。
+支持 `conversation.subscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence。
+
+MCP 真实调用只走 Backend：客户端只发送 `resourceId`、`toolName` 和 `arguments`。Catalog JSON 不含 command、URL 或凭据。调用前必须通过权限 broker，默认拒绝；仅 `allow_once` / `allow_always` 会放行。
 
 ### 只读 Skill/MCP Catalog
 
@@ -111,7 +118,7 @@ GET /v2/catalog/skills/{resourceId}?provider=claude-code&workspace=/home/user/pr
 GET /v2/catalog/mcp?provider=claude-code&workspace=/home/user/projects/demo
 ```
 
-Catalog 只读取 Provider 的用户级和项目级原生配置，项目级同名资源优先。Skill 正文只能通过后端生成的 `resourceId` 读取；MCP 响应仅返回名称、来源、scope、transport 和 active 状态，不返回 command、args、env、URL 或凭据。后端不提供安装、启停、删除或改写接口。
+Catalog 只读取 Provider 的用户级和项目级原生配置，项目级同名资源优先。Skill 正文只能通过后端生成的 `resourceId` 读取；MCP 响应仅返回名称、来源、scope、transport、active 状态以及可选的 tools/authStatus/error，不返回 command、args、env、URL 或凭据。后端不提供安装、启停、删除或改写接口。实际 MCP 调用使用 `mcp.call`，由 daemon 按内部配置执行。
 
 ### Conversation Folder 与旧数据迁移
 

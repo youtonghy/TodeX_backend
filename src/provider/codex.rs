@@ -30,7 +30,7 @@ impl ProviderDriver for CodexDriver {
         let available = executable_available(&self.binary);
         ProviderDescriptor {
             id: ProviderKind::Codex,
-            display_name: "Codex",
+            display_name: "Codex CLI",
             available,
             unavailable_reason: (!available)
                 .then(|| format!("executable '{}' was not found", self.binary)),

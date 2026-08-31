@@ -9,12 +9,14 @@ use tokio::sync::watch;
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
+use crate::catalog::CatalogService;
 use crate::config::Config;
 use crate::conversation::{
     ConversationEventHub, ConversationManifest, ConversationReplay, ConversationStatus,
     ConversationStore, ProviderKind,
 };
 use crate::error::AppError;
+use crate::mcp;
 use crate::workspace_paths::validate_workspace_directory_text;
 
 use super::acp::AcpDriver;
@@ -23,11 +25,17 @@ use super::codex::CodexDriver;
 use super::pi::PiDriver;
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, PermissionBroker, PermissionDecision,
-    ProviderDescriptor, ProviderDriver,
+    PermissionOutcome, ProviderDescriptor, ProviderDriver,
 };
 
 const MAX_PROMPT_BYTES: usize = 512 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug)]
+pub struct PromptSkillRef {
+    pub resource_id: String,
+    pub name: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct DriverRegistry {
@@ -80,6 +88,7 @@ pub struct ConversationSupervisor {
     config: Arc<Config>,
     store: ConversationStore,
     hub: ConversationEventHub,
+    catalog: CatalogService,
     registry: DriverRegistry,
     permissions: PermissionBroker,
     active: Arc<DashMap<String, ActiveTurn>>,
@@ -103,11 +112,22 @@ impl Drop for ActiveTurnCleanup {
 
 impl ConversationSupervisor {
     pub fn new(config: Arc<Config>, store: ConversationStore, hub: ConversationEventHub) -> Self {
+        let catalog = CatalogService::new(config.clone());
+        Self::new_with_catalog(config, store, hub, catalog)
+    }
+
+    pub fn new_with_catalog(
+        config: Arc<Config>,
+        store: ConversationStore,
+        hub: ConversationEventHub,
+        catalog: CatalogService,
+    ) -> Self {
         Self {
             registry: DriverRegistry::new(&config),
             config,
             store,
             hub,
+            catalog,
             permissions: PermissionBroker::default(),
             active: Arc::new(DashMap::new()),
         }
@@ -255,7 +275,7 @@ impl ConversationSupervisor {
         text: String,
         model: Option<String>,
     ) -> Result<String, AppError> {
-        self.prompt_owned("local", conversation_id, text, model)
+        self.prompt_owned("local", conversation_id, text, model, Vec::new())
             .await
     }
 
@@ -265,9 +285,10 @@ impl ConversationSupervisor {
         conversation_id: &str,
         text: String,
         model: Option<String>,
+        skills: Vec<PromptSkillRef>,
     ) -> Result<String, AppError> {
         let text = text.trim().to_owned();
-        if text.is_empty() {
+        if text.is_empty() && skills.is_empty() {
             return Err(AppError::InvalidRequest(
                 "prompt cannot be empty".to_owned(),
             ));
@@ -279,6 +300,18 @@ impl ConversationSupervisor {
         }
         let manifest = self.store.get(conversation_id).await?;
         ensure_owner(&manifest, owner_id)?;
+        let injected = self.load_prompt_skills(&manifest, &skills).await?;
+        let user_text = if text.is_empty() {
+            "请使用已选择的 Skill。".to_owned()
+        } else {
+            text
+        };
+        let provider_text = compose_prompt_with_skills(&user_text, &injected);
+        if provider_text.len() > MAX_PROMPT_BYTES {
+            return Err(AppError::InvalidRequest(format!(
+                "prompt exceeds {MAX_PROMPT_BYTES} bytes after skill injection"
+            )));
+        }
         let driver = self.registry.driver(manifest.provider)?;
         let descriptor = driver.descriptor();
         if !descriptor.available {
@@ -311,12 +344,31 @@ impl ConversationSupervisor {
             .emit(
                 conversation_id,
                 "message.created",
-                json!({ "turnId": turn_id, "role": "user", "content": text }),
+                json!({ "turnId": turn_id, "role": "user", "content": user_text }),
             )
             .await
         {
             self.active.remove(conversation_id);
             return Err(error);
+        }
+        if !injected.is_empty() {
+            if let Err(error) = self
+                .emit(
+                    conversation_id,
+                    "skill.injected",
+                    json!({
+                        "turnId": turn_id,
+                        "skills": injected.iter().map(|(name, content)| json!({
+                            "name": name,
+                            "bytes": content.len(),
+                        })).collect::<Vec<_>>(),
+                    }),
+                )
+                .await
+            {
+                self.active.remove(conversation_id);
+                return Err(error);
+            }
         }
         if let Err(error) = self
             .emit(
@@ -329,6 +381,13 @@ impl ConversationSupervisor {
             self.active.remove(conversation_id);
             return Err(error);
         }
+
+        tracing::info!(
+            conversation_id,
+            skill_count = injected.len(),
+            prompt_bytes = provider_text.len(),
+            "provider prompt includes injected skill context"
+        );
 
         let supervisor = self.clone();
         let conversation_id = conversation_id.to_owned();
@@ -353,7 +412,7 @@ impl ConversationSupervisor {
                     },
                     DriverPrompt {
                         turn_id: spawned_turn_id.clone(),
-                        text,
+                        text: provider_text,
                         model,
                     },
                     sink,
@@ -474,6 +533,196 @@ impl ConversationSupervisor {
         self.hub.subscribe(conversation_id)
     }
 
+    pub async fn list_mcp_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+    ) -> Result<crate::catalog::McpCatalog, AppError> {
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        let mut catalog = self
+            .catalog
+            .mcp(manifest.provider, manifest.workspace.clone())
+            .await?;
+        catalog.servers.retain(|server| server.enabled);
+        Ok(catalog)
+    }
+
+    pub async fn refresh_mcp_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        resource_id: &str,
+    ) -> Result<crate::catalog::McpServerDescriptor, AppError> {
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        let mut target = self
+            .catalog
+            .mcp_target(manifest.provider, manifest.workspace.clone(), resource_id)
+            .await?;
+        match mcp::list_tools(&target).await {
+            Ok(tools) => {
+                target.descriptor.tools = tools;
+                target.descriptor.error = None;
+                target.descriptor.auth_status = Some("ready".to_owned());
+            }
+            Err(error) => {
+                target.descriptor.error = Some(error.to_string());
+                target.descriptor.auth_status = Some("error".to_owned());
+            }
+        }
+        Ok(target.descriptor)
+    }
+
+    pub async fn call_mcp_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        resource_id: &str,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<Value, AppError> {
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        let target = self
+            .catalog
+            .mcp_target(manifest.provider, manifest.workspace.clone(), resource_id)
+            .await?;
+        let request_id = format!("mcp_{}", Uuid::new_v4().simple());
+        self.emit(
+            conversation_id,
+            "mcp.requested",
+            json!({
+                "requestId": request_id,
+                "resourceId": resource_id,
+                "server": target.descriptor.name,
+                "tool": tool_name,
+            }),
+        )
+        .await?;
+        let sink = DriverEventSink::new(
+            self.store.clone(),
+            self.hub.clone(),
+            self.permissions.clone(),
+            conversation_id,
+        );
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let decision = sink
+            .request_permission(
+                request_id.clone(),
+                "mcp_tool",
+                format!("Allow MCP tool {}", tool_name),
+                json!({
+                    "server": target.descriptor.name,
+                    "tool": tool_name,
+                    "resourceId": resource_id,
+                }),
+                json!([
+                    { "id": "allow_once", "label": "Allow once" },
+                    { "id": "reject_once", "label": "Reject" }
+                ]),
+                &mut cancel_rx,
+            )
+            .await?;
+        if !matches!(
+            decision.outcome,
+            PermissionOutcome::AllowOnce | PermissionOutcome::AllowAlways
+        ) {
+            self.emit(
+                conversation_id,
+                "mcp.failed",
+                json!({
+                    "requestId": request_id,
+                    "code": "PERMISSION_DENIED",
+                    "message": "mcp tool call was rejected",
+                }),
+            )
+            .await?;
+            return Err(AppError::Unauthorized(
+                "mcp tool call was rejected".to_owned(),
+            ));
+        }
+        self.emit(
+            conversation_id,
+            "mcp.started",
+            json!({
+                "requestId": request_id,
+                "server": target.descriptor.name,
+                "tool": tool_name,
+            }),
+        )
+        .await?;
+        match mcp::call_tool(&target, tool_name, arguments).await {
+            Ok(result) => {
+                let event_type = if result.is_error {
+                    "mcp.failed"
+                } else {
+                    "mcp.completed"
+                };
+                self.emit(
+                    conversation_id,
+                    event_type,
+                    json!({
+                        "requestId": request_id,
+                        "server": target.descriptor.name,
+                        "tool": tool_name,
+                        "result": result.content,
+                    }),
+                )
+                .await?;
+                if result.is_error {
+                    Err(AppError::InvalidRequest("mcp tool returned an error".to_owned()))
+                } else {
+                    Ok(result.content)
+                }
+            }
+            Err(error) => {
+                self.emit(
+                    conversation_id,
+                    "mcp.failed",
+                    json!({
+                        "requestId": request_id,
+                        "code": error.code(),
+                        "message": error.to_string(),
+                    }),
+                )
+                .await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn load_prompt_skills(
+        &self,
+        manifest: &ConversationManifest,
+        skills: &[PromptSkillRef],
+    ) -> Result<Vec<(String, String)>, AppError> {
+        let mut injected = Vec::new();
+        for skill in skills {
+            let resource = self
+                .catalog
+                .skill_resource(
+                    manifest.provider,
+                    manifest.workspace.clone(),
+                    &skill.resource_id,
+                )
+                .await?;
+            if !resource.descriptor.valid || !resource.descriptor.active {
+                return Err(AppError::InvalidRequest(format!(
+                    "skill {} is not active",
+                    resource.descriptor.name
+                )));
+            }
+            if let Some(name) = skill.name.as_deref() {
+                if !name.trim().is_empty() && name.trim() != resource.descriptor.name {
+                    return Err(AppError::InvalidRequest(format!(
+                        "skill name '{name}' does not match resource {}",
+                        resource.descriptor.name
+                    )));
+                }
+            }
+            injected.push((resource.descriptor.name, resource.content));
+        }
+        Ok(injected)
+    }
+
     pub async fn shutdown_all(&self) {
         for entry in self.active.iter() {
             let _ = entry.cancel.send(true);
@@ -504,6 +753,25 @@ impl ConversationSupervisor {
         self.hub.publish(event);
         Ok(())
     }
+}
+
+pub(crate) fn compose_prompt_with_skills(user_text: &str, skills: &[(String, String)]) -> String {
+    if skills.is_empty() {
+        return user_text.to_owned();
+    }
+    let mut composed = String::from(
+        "The following skills are attached to this request. Follow their instructions.\n",
+    );
+    for (name, content) in skills {
+        composed.push_str("\n<skill name=\"");
+        composed.push_str(name);
+        composed.push_str("\">\n");
+        composed.push_str(content);
+        composed.push_str("\n</skill>\n");
+    }
+    composed.push('\n');
+    composed.push_str(user_text);
+    composed
 }
 
 fn validate_owner_id(owner_id: &str) -> Result<(), AppError> {
@@ -860,5 +1128,69 @@ fi
 
     fn temp_dir(prefix: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4().simple()))
+    }
+
+    #[test]
+    fn skill_context_is_prefixed_to_provider_text() {
+        let composed = super::compose_prompt_with_skills(
+            "do the task",
+            &[("build".to_owned(), "use pnpm install".to_owned())],
+        );
+        assert!(composed.contains("use pnpm install"));
+        assert!(composed.contains("do the task"));
+        assert!(composed.contains("<skill name=\"build\">"));
+    }
+
+    #[tokio::test]
+    async fn unknown_skill_resource_is_rejected() {
+        let root = temp_dir("todex-skill-reject");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let config = Arc::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_root,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable,
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+                auth_token: Some("token".to_owned()),
+            },
+        });
+        let store = ConversationStore::new(config.data_dir.clone()).await.unwrap();
+        let supervisor =
+            ConversationSupervisor::new(config, store, ConversationEventHub::default());
+        let manifest = supervisor
+            .create_owned("owner-a", ProviderKind::Codex, workspace, None, None)
+            .await
+            .unwrap();
+        let error = supervisor
+            .prompt_owned(
+                "owner-a",
+                &manifest.id,
+                "hello".to_owned(),
+                None,
+                vec![PromptSkillRef {
+                    resource_id: "res_missing".to_owned(),
+                    name: Some("missing".to_owned()),
+                }],
+            )
+            .await
+            .expect_err("missing skill must be rejected");
+        assert!(error.to_string().contains("skill resource"));
+        let _ = fs::remove_dir_all(root);
     }
 }

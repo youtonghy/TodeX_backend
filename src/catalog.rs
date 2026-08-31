@@ -67,6 +67,14 @@ pub struct McpCatalog {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct McpToolDescriptor {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McpServerDescriptor {
     pub resource_id: String,
     pub name: String,
@@ -78,8 +86,32 @@ pub struct McpServerDescriptor {
     pub active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shadowed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<McpToolDescriptor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(skip)]
     priority: u8,
+    #[serde(skip)]
+    command: Vec<String>,
+    #[serde(skip)]
+    env: BTreeMap<String, String>,
+    #[serde(skip)]
+    url: Option<String>,
+    #[serde(skip)]
+    headers: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct McpRuntimeTarget {
+    pub descriptor: McpServerDescriptor,
+    pub command: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub url: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub workspace: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -165,15 +197,106 @@ impl CatalogService {
         workspace: PathBuf,
     ) -> Result<McpCatalog, AppError> {
         let home = self.home.clone();
-        let servers =
-            tokio::task::spawn_blocking(move || scan_mcp(home.as_deref(), &workspace, provider))
-                .await
-                .map_err(|error| AppError::Anyhow(error.into()))??;
+        let workspace_for_scan = workspace.clone();
+        let servers = tokio::task::spawn_blocking(move || {
+            scan_mcp(home.as_deref(), &workspace_for_scan, provider)
+        })
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))??;
         Ok(McpCatalog { provider, servers })
+    }
+
+    pub async fn mcp_target(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_id: &str,
+    ) -> Result<McpRuntimeTarget, AppError> {
+        let catalog = self.mcp(provider, workspace.clone()).await?;
+        let descriptor = catalog
+            .servers
+            .into_iter()
+            .find(|server| server.resource_id == resource_id)
+            .ok_or_else(|| AppError::NotFound(format!("mcp resource {resource_id}")))?;
+        if !descriptor.enabled || !descriptor.active {
+            return Err(AppError::InvalidRequest(format!(
+                "mcp server {} is not active",
+                descriptor.name
+            )));
+        }
+        Ok(McpRuntimeTarget {
+            command: descriptor.command.clone(),
+            env: descriptor.env.clone(),
+            url: descriptor.url.clone(),
+            headers: descriptor.headers.clone(),
+            workspace,
+            descriptor,
+        })
     }
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+}
+
+#[cfg(test)]
+impl McpRuntimeTarget {
+    pub(crate) fn stdio_fixture(name: &str, command: Vec<String>, workspace: PathBuf) -> Self {
+        Self {
+            descriptor: McpServerDescriptor {
+                resource_id: format!("mcp_{name}"),
+                name: name.to_owned(),
+                provider: ProviderKind::Codex,
+                scope: CatalogScope::User,
+                source: "test".to_owned(),
+                transport: McpTransport::Stdio,
+                enabled: true,
+                active: true,
+                shadowed_by: None,
+                tools: Vec::new(),
+                auth_status: None,
+                error: None,
+                priority: 1,
+                command: command.clone(),
+                env: BTreeMap::new(),
+                url: None,
+                headers: BTreeMap::new(),
+            },
+            command,
+            env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+            workspace,
+        }
+    }
+
+    pub(crate) fn http_fixture(name: &str, url: String, workspace: PathBuf) -> Self {
+        Self {
+            descriptor: McpServerDescriptor {
+                resource_id: format!("mcp_{name}"),
+                name: name.to_owned(),
+                provider: ProviderKind::Codex,
+                scope: CatalogScope::User,
+                source: "test".to_owned(),
+                transport: McpTransport::Http,
+                enabled: true,
+                active: true,
+                shadowed_by: None,
+                tools: Vec::new(),
+                auth_status: None,
+                error: None,
+                priority: 1,
+                command: Vec::new(),
+                env: BTreeMap::new(),
+                url: Some(url.clone()),
+                headers: BTreeMap::new(),
+            },
+            command: Vec::new(),
+            env: BTreeMap::new(),
+            url: Some(url),
+            headers: BTreeMap::new(),
+            workspace,
+        }
     }
 }
 
@@ -444,18 +567,25 @@ fn scan_mcp(
                 continue;
             }
         };
-        for (name, transport, enabled) in entries {
+        for entry in entries {
             descriptors.push(McpServerDescriptor {
-                resource_id: resource_id(&format!("mcp:{name}"), &source.path),
-                name,
+                resource_id: resource_id(&format!("mcp:{}", entry.name), &source.path),
+                name: entry.name,
                 provider,
                 scope: source.scope,
                 source: source.source.to_owned(),
-                transport,
-                enabled,
+                transport: entry.transport,
+                enabled: entry.enabled,
                 active: true,
                 shadowed_by: None,
+                tools: Vec::new(),
+                auth_status: None,
+                error: None,
                 priority: source.priority,
+                command: entry.command,
+                env: entry.env,
+                url: entry.url,
+                headers: entry.headers,
             });
         }
     }
@@ -546,7 +676,17 @@ fn mcp_sources(home: Option<&Path>, workspace: &Path, provider: ProviderKind) ->
     sources
 }
 
-fn parse_toml_mcp(raw: &str) -> Result<Vec<(String, McpTransport, bool)>, AppError> {
+struct ParsedMcpServer {
+    name: String,
+    transport: McpTransport,
+    enabled: bool,
+    command: Vec<String>,
+    env: BTreeMap<String, String>,
+    url: Option<String>,
+    headers: BTreeMap<String, String>,
+}
+
+fn parse_toml_mcp(raw: &str) -> Result<Vec<ParsedMcpServer>, AppError> {
     let value: toml::Value = toml::from_str(raw)
         .map_err(|error| AppError::InvalidRequest(format!("invalid MCP TOML config: {error}")))?;
     let Some(servers) = value.get("mcp_servers").and_then(toml::Value::as_table) else {
@@ -556,23 +696,74 @@ fn parse_toml_mcp(raw: &str) -> Result<Vec<(String, McpTransport, bool)>, AppErr
         .iter()
         .filter_map(|(name, value)| {
             let table = value.as_table()?;
-            let transport = if table.contains_key("command") {
-                McpTransport::Stdio
-            } else if table.contains_key("url") {
-                McpTransport::Http
-            } else {
-                McpTransport::Unknown
-            };
-            let enabled = table
-                .get("enabled")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(true);
-            Some((clean_name(name.clone()), transport, enabled))
+            Some(parsed_mcp_from_toml(clean_name(name.clone()), table))
         })
         .collect())
 }
 
-fn parse_json_mcp(raw: &str) -> Result<Vec<(String, McpTransport, bool)>, AppError> {
+fn parsed_mcp_from_toml(name: String, table: &toml::Table) -> ParsedMcpServer {
+    let command = table
+        .get("command")
+        .and_then(toml::Value::as_str)
+        .map(|command| {
+            let mut parts = vec![command.to_owned()];
+            if let Some(args) = table.get("args").and_then(toml::Value::as_array) {
+                parts.extend(
+                    args.iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(ToOwned::to_owned),
+                );
+            }
+            parts
+        })
+        .unwrap_or_default();
+    let url = table
+        .get("url")
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned);
+    let transport = if !command.is_empty() {
+        McpTransport::Stdio
+    } else if url.is_some() {
+        McpTransport::Http
+    } else {
+        McpTransport::Unknown
+    };
+    let env = table
+        .get("env")
+        .and_then(toml::Value::as_table)
+        .map(|env| {
+            env.iter()
+                .filter_map(|(key, value)| {
+                    Some((key.clone(), value.as_str()?.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let headers = table
+        .get("headers")
+        .and_then(toml::Value::as_table)
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default();
+    ParsedMcpServer {
+        name,
+        transport,
+        enabled: table
+            .get("enabled")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true),
+        command,
+        env,
+        url,
+        headers,
+    }
+}
+
+fn parse_json_mcp(raw: &str) -> Result<Vec<ParsedMcpServer>, AppError> {
     let value: Value = serde_json::from_str(raw)
         .map_err(|error| AppError::InvalidRequest(format!("invalid MCP JSON config: {error}")))?;
     let mut maps = Vec::new();
@@ -583,31 +774,79 @@ fn parse_json_mcp(raw: &str) -> Result<Vec<(String, McpTransport, bool)>, AppErr
             let Some(server) = value.as_object() else {
                 continue;
             };
-            let transport = if server.contains_key("command")
-                || server.get("type").and_then(Value::as_str) == Some("stdio")
-            {
-                McpTransport::Stdio
-            } else if server.contains_key("url")
-                || matches!(
-                    server.get("type").and_then(Value::as_str),
-                    Some("http" | "sse")
-                )
-            {
-                McpTransport::Http
-            } else {
-                McpTransport::Unknown
-            };
-            let enabled = server
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            entries.insert(clean_name(name.clone()), (transport, enabled));
+            entries.insert(clean_name(name.clone()), parsed_mcp_from_json(server));
         }
     }
     Ok(entries
         .into_iter()
-        .map(|(name, (transport, enabled))| (name, transport, enabled))
+        .map(|(name, mut entry)| {
+            entry.name = name;
+            entry
+        })
         .collect())
+}
+
+fn parsed_mcp_from_json(server: &serde_json::Map<String, Value>) -> ParsedMcpServer {
+    let mut command = Vec::new();
+    if let Some(bin) = server.get("command").and_then(Value::as_str) {
+        command.push(bin.to_owned());
+        if let Some(args) = server.get("args").and_then(Value::as_array) {
+            command.extend(
+                args.iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned),
+            );
+        }
+    }
+    let url = server
+        .get("url")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let transport = if !command.is_empty()
+        || server.get("type").and_then(Value::as_str) == Some("stdio")
+    {
+        McpTransport::Stdio
+    } else if url.is_some()
+        || matches!(
+            server.get("type").and_then(Value::as_str),
+            Some("http" | "sse")
+        )
+    {
+        McpTransport::Http
+    } else {
+        McpTransport::Unknown
+    };
+    let env = server
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|env| {
+            env.iter()
+                .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let headers = server
+        .get("headers")
+        .and_then(Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default();
+    ParsedMcpServer {
+        name: String::new(),
+        transport,
+        enabled: server
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        command,
+        env,
+        url,
+        headers,
+    }
 }
 
 fn find_mcp_server_maps<'a>(

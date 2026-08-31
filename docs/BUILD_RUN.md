@@ -12,7 +12,21 @@
 - 默认 WebSocket：`ws://127.0.0.1:7345/v2/ws`
 - 默认数据目录：`~/.todex-agent`
 - 默认 workspace 根目录：`~/projects`
-- 首期 Provider：ACP、Codex、Pi、Claude Code
+- 首期 Provider：ACP、Codex CLI、Pi、Claude Code
+
+客户端启动（Backend 先于客户端）：
+
+```bash
+# Backend
+cd TodeX_backend && cargo run -- tui
+# 或非交互：cargo run -- serve --host 127.0.0.1 --port 7345
+
+# Desktop（三栏）
+cd TodeX_desktop && pnpm run dev
+
+# App（移动端堆叠导航）
+cd TodeX_app && pnpm start
+```
 
 ## 环境要求
 

@@ -8,5 +8,5 @@ mod process;
 mod supervisor;
 mod types;
 
-pub use supervisor::ConversationSupervisor;
+pub use supervisor::{ConversationSupervisor, PromptSkillRef};
 pub use types::PermissionDecision;
