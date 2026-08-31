@@ -167,16 +167,12 @@ async fn browser_fetch(
 ) -> Result<Json<BrowserFetchResponse>, AppError> {
     authorize_http(&state, &headers)?;
     let url = validate_browser_url(&request.url)?;
-    let host = url
-        .split('/')
-        .nth(2)
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
+    let host_port = url.split('/').nth(2).unwrap_or("");
+    let host = host_port.split(':').next().unwrap_or("");
+    let backend_target = (host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1")
+        && host_port.ends_with(&format!(":{}", state.config.port));
     if host.eq_ignore_ascii_case("169.254.169.254")
-        || host.eq_ignore_ascii_case("localhost")
-        || host == "127.0.0.1"
+        || ((host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1") && !backend_target)
     {
         return Err(AppError::InvalidRequest(
             "browser target is not allowed".to_owned(),
