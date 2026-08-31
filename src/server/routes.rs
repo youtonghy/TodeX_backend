@@ -522,7 +522,7 @@ async fn ws(
     uri: Uri,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
-    let auth = websocket::authenticate_headers(&state, &headers);
+    let auth = websocket::authenticate_headers_or_query(&state, &headers, uri.query());
     if state.config.security.auth_token.is_some() && auth.is_none() {
         return Err(AppError::Unauthenticated);
     }
