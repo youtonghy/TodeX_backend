@@ -128,7 +128,7 @@ async fn workspace_file(
     Query(query): Query<WorkspaceFileQuery>,
 ) -> Result<Json<WorkspaceFileResponse>, AppError> {
     authorize_http(&state, &headers)?;
-    let path = validate_workspace_directory_text(&state.config.workspace_root, &query.path)?;
+    let path = validate_workspace_file_text(&state.config.workspace_root, &query.path)?;
     let metadata = tokio::fs::metadata(&path).await?;
     if !metadata.is_file() {
         return Err(AppError::InvalidRequest("path must be a file".to_owned()));
@@ -158,6 +158,27 @@ async fn workspace_file(
         size_bytes: bytes.len() as u64,
         text,
     }))
+}
+
+fn validate_workspace_file_text(root: &Path, raw: &str) -> Result<PathBuf, AppError> {
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        return Err(AppError::InvalidRequest(
+            "workspace file path must be absolute".to_owned(),
+        ));
+    }
+    let root = std::fs::canonicalize(root)?;
+    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AppError::WorkspacePathNotFound
+        } else {
+            AppError::Io(error)
+        }
+    })?;
+    if !canonical.starts_with(&root) {
+        return Err(AppError::WorkspacePathOutsideRoot);
+    }
+    Ok(canonical)
 }
 
 async fn browser_fetch(
