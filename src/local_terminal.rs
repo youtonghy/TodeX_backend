@@ -159,9 +159,6 @@ impl LocalTerminalManager {
         };
 
         let mut command = Command::new(&shell);
-        for arg in interactive_shell_args(&shell) {
-            command.arg(arg);
-        }
         command
             .current_dir(&cwd)
             .env("TERM", "dumb")
@@ -571,18 +568,6 @@ fn default_shell() -> String {
         std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
     } else {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
-    }
-}
-
-fn interactive_shell_args(shell: &str) -> Vec<&'static str> {
-    if cfg!(windows) {
-        return vec![];
-    }
-
-    let shell_name = shell.rsplit('/').next().unwrap_or(shell);
-    match shell_name {
-        "bash" | "zsh" | "sh" | "dash" | "fish" => vec!["-i"],
-        _ => vec![],
     }
 }
 
