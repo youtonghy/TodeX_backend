@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 use std::fs::FileType;
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -265,12 +266,9 @@ pub(super) async fn browser_fetch(
 ) -> Result<Json<BrowserFetchResponse>, AppError> {
     require_auth(&state, &headers)?;
     let url = validate_browser_url(&request.url)?;
-    let host = reqwest::Url::parse(&url)
-        .ok()
-        .and_then(|parsed| parsed.host_str().map(str::to_owned))
-        .unwrap_or_default();
-    if host.eq_ignore_ascii_case("169.254.169.254")
-    {
+    let parsed = reqwest::Url::parse(&url)
+        .map_err(|_| AppError::InvalidRequest("browser target is not allowed".to_owned()))?;
+    if !is_allowed_browser_target(&parsed) {
         return Err(AppError::InvalidRequest(
             "browser target is not allowed".to_owned(),
         ));
@@ -303,6 +301,13 @@ pub(super) async fn browser_fetch(
         content_type: "text/html".to_owned(),
         body,
     }))
+}
+
+fn is_allowed_browser_target(url: &reqwest::Url) -> bool {
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().map(|address| address.is_loopback()).unwrap_or(false);
+    is_loopback && url.username().is_empty() && url.password().is_none()
 }
 
 fn validate_browser_url(raw: &str) -> Result<String, AppError> {
@@ -1584,6 +1589,18 @@ mod tests {
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use crate::conversation::{ConversationEventHub, ConversationStore};
     use crate::provider::ConversationSupervisor;
+
+    #[test]
+    fn browser_url_allowlist_accepts_only_loopback_hosts() {
+        for url in ["http://localhost", "http://127.0.0.1:5173", "http://[::1]:3000"] {
+            let parsed = reqwest::Url::parse(&validate_browser_url(url).unwrap()).unwrap();
+            assert!(is_allowed_browser_target(&parsed), "expected allowed URL: {url}");
+        }
+        for url in ["https://example.com", "http://192.168.1.2", "http://localhost.evil"] {
+            let parsed = reqwest::Url::parse(&validate_browser_url(url).unwrap()).unwrap();
+            assert!(!is_allowed_browser_target(&parsed), "expected blocked URL: {url}");
+        }
+    }
 
     #[tokio::test]
     async fn v2_http_requires_auth_and_persists_an_owned_conversation() {
