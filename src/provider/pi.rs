@@ -87,7 +87,7 @@ impl ProviderDriver for PiDriver {
                     .map(str::to_owned)
                     .collect()
             };
-            Some(super::types::ProviderModelDescriptor { id, display_name: item.get("name").or_else(|| item.get("displayName")).and_then(Value::as_str).unwrap_or("Pi model").to_owned(), description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(), is_default: item.get("isDefault").and_then(Value::as_bool).unwrap_or(false), supported_reasoning_efforts: efforts })
+            Some(super::types::ProviderModelDescriptor { id, display_name: item.get("name").or_else(|| item.get("displayName")).and_then(Value::as_str).unwrap_or("Pi model").to_owned(), description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(), is_default: item.get("isDefault").and_then(Value::as_bool).unwrap_or(false), supported_reasoning_efforts: efforts, context_window: item.get("contextWindow").and_then(Value::as_u64) })
         }).collect())
     }
 

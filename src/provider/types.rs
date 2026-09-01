@@ -37,6 +37,8 @@ pub struct ProviderModelDescriptor {
     pub description: String,
     pub is_default: bool,
     pub supported_reasoning_efforts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

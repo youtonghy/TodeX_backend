@@ -46,7 +46,7 @@ impl ProviderDriver for ClaudeDriver {
                 model_selection: true,
             },
             models: ["default", "sonnet", "opus", "haiku"].into_iter().map(|id| super::types::ProviderModelDescriptor {
-                id: id.to_owned(), display_name: id.to_owned(), description: "Claude Code model alias".to_owned(), is_default: id == "default", supported_reasoning_efforts: ["low", "medium", "high"].into_iter().map(str::to_owned).collect(),
+                id: id.to_owned(), display_name: id.to_owned(), description: "Claude Code model alias".to_owned(), is_default: id == "default", supported_reasoning_efforts: ["low", "medium", "high"].into_iter().map(str::to_owned).collect(), context_window: None,
             }).collect(),
         }
     }
@@ -60,7 +60,7 @@ impl ProviderDriver for ClaudeDriver {
         let payload: Value = response.json().await.map_err(|error| AppError::ProviderUnavailable(format!("Claude model catalog invalid: {error}")))?;
         Ok(payload.get("data").and_then(Value::as_array).into_iter().flatten().filter_map(|item| {
             let id = item.get("id").and_then(Value::as_str)?.to_owned();
-            Some(super::types::ProviderModelDescriptor { display_name: item.get("display_name").or_else(|| item.get("displayName")).and_then(Value::as_str).unwrap_or(&id).to_owned(), id, description: "Claude gateway model".to_owned(), is_default: false, supported_reasoning_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()] })
+            Some(super::types::ProviderModelDescriptor { display_name: item.get("display_name").or_else(|| item.get("displayName")).and_then(Value::as_str).unwrap_or(&id).to_owned(), id, description: "Claude gateway model".to_owned(), is_default: false, supported_reasoning_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()], context_window: item.get("context_window").or_else(|| item.get("contextWindow")).and_then(Value::as_u64) })
         }).collect())
     }
 
