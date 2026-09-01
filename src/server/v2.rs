@@ -307,16 +307,21 @@ pub(super) async fn browser_fetch(
 }
 
 fn validate_browser_url(raw: &str) -> Result<String, AppError> {
-    let url = raw.trim();
-    if url.len() > 2048
-        || !(url.starts_with("http://") || url.starts_with("https://"))
-        || !url[8..].contains('/')
-    {
+    let value = raw.trim();
+    let Ok(mut parsed) = reqwest::Url::parse(value) else {
+        return Err(AppError::InvalidRequest(
+            "only valid http and https URLs are allowed".to_owned(),
+        ));
+    };
+    if value.len() > 2048 || !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err(AppError::InvalidRequest(
             "only valid http and https URLs are allowed".to_owned(),
         ));
     }
-    Ok(url.to_owned())
+    if parsed.path().is_empty() {
+        parsed.set_path("/");
+    }
+    Ok(parsed.to_string())
 }
 
 fn mime_for_name(name: &str) -> String {
