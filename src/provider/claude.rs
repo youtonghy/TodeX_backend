@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::path::Path;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
@@ -42,8 +43,25 @@ impl ProviderDriver for ClaudeDriver {
                 tool_events: true,
                 native_skills: true,
                 native_mcp: true,
+                model_selection: true,
             },
+            models: ["default", "sonnet", "opus", "haiku"].into_iter().map(|id| super::types::ProviderModelDescriptor {
+                id: id.to_owned(), display_name: id.to_owned(), description: "Claude Code model alias".to_owned(), is_default: id == "default", supported_reasoning_efforts: ["low", "medium", "high"].into_iter().map(str::to_owned).collect(),
+            }).collect(),
         }
+    }
+
+    async fn discover_models(&self, _workspace: &Path) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
+        let Some(base) = std::env::var("ANTHROPIC_BASE_URL").ok().filter(|value| !value.trim().is_empty()) else {
+            return Ok(Vec::new());
+        };
+        let url = format!("{}/v1/models", base.trim_end_matches('/'));
+        let response = reqwest::Client::new().get(url).send().await.map_err(|error| AppError::ProviderUnavailable(format!("Claude model discovery failed: {error}")))?;
+        let payload: Value = response.json().await.map_err(|error| AppError::ProviderUnavailable(format!("Claude model catalog invalid: {error}")))?;
+        Ok(payload.get("data").and_then(Value::as_array).into_iter().flatten().filter_map(|item| {
+            let id = item.get("id").and_then(Value::as_str)?.to_owned();
+            Some(super::types::ProviderModelDescriptor { display_name: item.get("display_name").or_else(|| item.get("displayName")).and_then(Value::as_str).unwrap_or(&id).to_owned(), id, description: "Claude gateway model".to_owned(), is_default: false, supported_reasoning_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()] })
+        }).collect())
     }
 
     async fn run_turn(
@@ -80,6 +98,10 @@ impl ProviderDriver for ClaudeDriver {
         if let Some(model) = &prompt.model {
             spec.args.push("--model".to_owned());
             spec.args.push(model.clone());
+        }
+        if let Some(effort) = &prompt.reasoning_effort {
+            spec.args.push("--effort".to_owned());
+            spec.args.push(effort.clone());
         }
 
         let mut process = JsonLineProcess::spawn(&spec).await?;

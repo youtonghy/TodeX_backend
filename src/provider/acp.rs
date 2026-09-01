@@ -75,7 +75,9 @@ impl ProviderDriver for AcpDriver {
                 tool_events: true,
                 native_skills: true,
                 native_mcp: true,
+                model_selection: false,
             },
+            models: Vec::new(),
         }
     }
 

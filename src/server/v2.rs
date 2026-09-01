@@ -70,6 +70,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v2/workspace/file", get(workspace_file))
         .route("/v2/browser/fetch", post(browser_fetch))
         .route("/v2/providers", get(providers))
+        .route("/v2/providers/models", get(provider_models))
+        .route("/v2/providers/commands", get(provider_commands))
         .route("/v2/catalog/skills", get(skills))
         .route("/v2/catalog/skills/{resource_id}", get(skill_resource))
         .route("/v2/catalog/mcp", get(mcp))
@@ -622,6 +624,42 @@ async fn providers(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderModelsQuery {
+    provider: ProviderKind,
+    workspace: String,
+}
+
+async fn provider_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ProviderModelsQuery>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_workspace_directory_text(&state.config.workspace_root, &query.workspace)?;
+    let descriptor = state.conversations.providers_live(&workspace).await
+        .into_iter().find(|item| item.id == query.provider)
+        .ok_or_else(|| AppError::Unsupported(format!("provider {}", query.provider.as_str())))?;
+    Ok(Json(json!({ "provider": descriptor.id, "models": descriptor.models, "source": "provider-discovery", "fetchedAt": chrono::Utc::now().to_rfc3339() })))
+}
+
+async fn provider_commands(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ProviderModelsQuery>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_workspace_directory_text(&state.config.workspace_root, &query.workspace)?;
+    let commands = state.conversations.commands_live(query.provider, &workspace).await?;
+    Ok(Json(json!({
+        "provider": query.provider,
+        "commands": commands,
+        "source": "provider-discovery",
+        "fetchedAt": chrono::Utc::now().to_rfc3339(),
+    })))
+}
+
 async fn list_conversations(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -708,6 +746,7 @@ async fn prompt_conversation(
             &conversation_id,
             request.text,
             request.model,
+            request.reasoning_effort,
             prompt_skills(request.skills),
         )
         .await?;
@@ -1187,6 +1226,7 @@ async fn dispatch_command_inner(
                     &request.conversation_id,
                     text,
                     request.model,
+                    request.reasoning_effort,
                     prompt_skills(request.skills),
                 )
                 .await?;
@@ -1451,6 +1491,8 @@ struct PromptRequest {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
     skills: Vec<PromptSkillRequest>,
 }
 
@@ -1495,6 +1537,8 @@ struct WsConversationRequest {
     text: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
     #[serde(default)]
     skills: Vec<PromptSkillRequest>,
 }

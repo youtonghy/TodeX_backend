@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,6 +26,27 @@ pub struct ProviderCapabilities {
     pub tool_events: bool,
     pub native_skills: bool,
     pub native_mcp: bool,
+    pub model_selection: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelDescriptor {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub is_default: bool,
+    pub supported_reasoning_efforts: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCommandDescriptor {
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub invocation: String,
+    pub argument_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -37,6 +59,7 @@ pub struct ProviderDescriptor {
     pub unavailable_reason: Option<String>,
     pub profiles: Vec<String>,
     pub capabilities: ProviderCapabilities,
+    pub models: Vec<ProviderModelDescriptor>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +73,7 @@ pub struct DriverPrompt {
     pub turn_id: String,
     pub text: String,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +183,14 @@ impl DriverEventSink {
 #[async_trait]
 pub trait ProviderDriver: Send + Sync {
     fn descriptor(&self) -> ProviderDescriptor;
+
+    async fn discover_models(&self, _workspace: &Path) -> Result<Vec<ProviderModelDescriptor>, AppError> {
+        Ok(self.descriptor().models)
+    }
+
+    async fn discover_commands(&self, _workspace: &Path) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
+        Ok(Vec::new())
+    }
 
     async fn run_turn(
         &self,

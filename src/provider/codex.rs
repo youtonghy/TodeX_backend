@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::path::Path;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
@@ -9,7 +10,7 @@ use crate::error::AppError;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, PermissionOutcome,
-    ProviderCapabilities, ProviderDescriptor, ProviderDriver,
+    ProviderCapabilities, ProviderCommandDescriptor, ProviderDescriptor, ProviderDriver,
 };
 
 pub struct CodexDriver {
@@ -42,8 +43,56 @@ impl ProviderDriver for CodexDriver {
                 tool_events: true,
                 native_skills: true,
                 native_mcp: true,
+                model_selection: true,
             },
+            models: Vec::new(),
         }
+    }
+
+    async fn discover_models(&self, workspace: &Path) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
+        let mut spec = CommandSpec::new(&self.binary, workspace);
+        spec.args = vec!["app-server".to_owned(), "--listen".to_owned(), "stdio://".to_owned()];
+        let mut process = JsonLineProcess::spawn(&spec).await?;
+        process.send(&json!({"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"todex-agentd","version":env!("CARGO_PKG_VERSION")}}})).await?;
+        let _ = read_rpc_response(&mut process, "initialize").await?;
+        process.send(&json!({"id":"models","method":"model/list","params":{"includeHidden":false}})).await?;
+        let response = read_rpc_response(&mut process, "models").await?;
+        process.terminate().await;
+        Ok(response.get("data").and_then(Value::as_array).into_iter().flatten().filter_map(|item| {
+            let id = item.get("model").or_else(|| item.get("id")).and_then(Value::as_str)?.to_owned();
+            Some(super::types::ProviderModelDescriptor { id, display_name: item.get("displayName").and_then(Value::as_str).unwrap_or("Codex model").to_owned(), description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(), is_default: item.get("isDefault").and_then(Value::as_bool).unwrap_or(false), supported_reasoning_efforts: item.get("supportedReasoningEfforts").and_then(Value::as_array).map(|items| items.iter().filter_map(|x| x.get("reasoningEffort").and_then(Value::as_str).map(ToOwned::to_owned)).collect()).unwrap_or_default() })
+        }).collect())
+    }
+
+    async fn discover_commands(&self, _workspace: &Path) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
+        // Codex exposes these as TUI commands rather than an app-server catalog.
+        // Keep this adapter aligned with the installed source version; actions
+        // are dispatched by the desktop's native Codex control plane.
+        const COMMANDS: &[(&str, &str)] = &[
+            ("model", "choose what model and reasoning effort to use"),
+            ("permissions", "choose what Codex is allowed to do"),
+            ("skills", "use skills to improve task execution"),
+            ("hooks", "view and manage lifecycle hooks"),
+            ("review", "review current changes and find issues"),
+            ("rename", "rename the current thread"),
+            ("new", "start a new chat"),
+            ("archive", "archive this session"),
+            ("resume", "resume a saved chat"),
+            ("fork", "fork the current chat"),
+            ("compact", "summarize conversation context"),
+            ("plan", "switch to Plan mode"),
+            ("goal", "set or view the task goal"),
+            ("mcp", "list configured MCP tools"),
+            ("apps", "manage apps"),
+            ("plugins", "browse plugins"),
+            ("status", "show session configuration and usage"),
+            ("diff", "show git diff"),
+            ("mention", "mention a file"),
+            ("logout", "log out of Codex"),
+        ];
+        Ok(COMMANDS.iter().map(|(name, description)| ProviderCommandDescriptor {
+            name: (*name).to_owned(), description: (*description).to_owned(), source: "builtin".to_owned(), invocation: "desktop".to_owned(), argument_hint: None,
+        }).collect())
     }
 
     async fn run_turn(
@@ -63,6 +112,13 @@ impl ProviderDriver for CodexDriver {
         let result = run_codex_turn(&mut process, context, prompt, &sink, &mut cancel).await;
         process.terminate().await;
         result
+    }
+}
+
+async fn read_rpc_response(process: &mut JsonLineProcess, id: &str) -> Result<Value, AppError> {
+    loop {
+        let Some(value) = process.read().await? else { return Err(AppError::ProviderUnavailable("Codex app-server closed stdout".to_owned())); };
+        if value.get("id").and_then(Value::as_str) == Some(id) { return Ok(value.get("result").cloned().unwrap_or(value)); }
     }
 }
 
@@ -95,14 +151,21 @@ async fn run_codex_turn(
 
     let native_session_id = match context.provider_state.native_session_id.as_deref() {
         Some(thread_id) => {
+            let mut resume_params = json!({
+                "threadId": thread_id,
+                "cwd": context.manifest.workspace,
+            });
+            if let Some(model) = &prompt.model {
+                resume_params["model"] = Value::String(model.clone());
+            }
+            if let Some(effort) = &prompt.reasoning_effort {
+                resume_params["config"] = json!({ "model_reasoning_effort": effort });
+            }
             process
                 .send(&json!({
                     "id": "thread",
                     "method": "thread/resume",
-                    "params": {
-                        "threadId": thread_id,
-                        "cwd": context.manifest.workspace,
-                    }
+                    "params": resume_params,
                 }))
                 .await?;
             wait_for_response(process, "thread", sink, cancel).await?;
@@ -150,6 +213,8 @@ async fn run_codex_turn(
             "params": {
                 "threadId": native_session_id,
                 "input": [{ "type": "text", "text": prompt.text }],
+                "model": prompt.model.clone(),
+                "effort": prompt.reasoning_effort.clone(),
             }
         }))
         .await?;

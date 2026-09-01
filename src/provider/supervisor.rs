@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use serde_json::{json, Value};
 use tokio::sync::watch;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, timeout, Duration, Instant};
 use uuid::Uuid;
 
 use crate::catalog::CatalogService;
@@ -25,7 +25,7 @@ use super::codex::CodexDriver;
 use super::pi::PiDriver;
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, PermissionBroker, PermissionDecision,
-    PermissionOutcome, ProviderDescriptor, ProviderDriver,
+    PermissionOutcome, ProviderCommandDescriptor, ProviderDescriptor, ProviderDriver,
 };
 
 const MAX_PROMPT_BYTES: usize = 512 * 1024;
@@ -160,6 +160,22 @@ impl ConversationSupervisor {
         self.registry.descriptors()
     }
 
+    pub async fn providers_live(&self, workspace: &Path) -> Vec<ProviderDescriptor> {
+        let mut descriptors = self.registry.descriptors();
+        for descriptor in &mut descriptors {
+            if let Ok(driver) = self.registry.driver(descriptor.id) {
+                if let Ok(Ok(models)) = tokio::time::timeout(Duration::from_secs(8), driver.discover_models(workspace)).await {
+                    descriptor.models = models;
+                }
+            }
+        }
+        descriptors
+    }
+
+    pub async fn commands_live(&self, provider: ProviderKind, workspace: &Path) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
+        self.registry.driver(provider)?.discover_commands(workspace).await
+    }
+
     #[allow(dead_code)]
     pub async fn create(
         &self,
@@ -275,7 +291,7 @@ impl ConversationSupervisor {
         text: String,
         model: Option<String>,
     ) -> Result<String, AppError> {
-        self.prompt_owned("local", conversation_id, text, model, Vec::new())
+        self.prompt_owned("local", conversation_id, text, model, None, Vec::new())
             .await
     }
 
@@ -285,6 +301,7 @@ impl ConversationSupervisor {
         conversation_id: &str,
         text: String,
         model: Option<String>,
+        reasoning_effort: Option<String>,
         skills: Vec<PromptSkillRef>,
     ) -> Result<String, AppError> {
         let text = text.trim().to_owned();
@@ -404,8 +421,9 @@ impl ConversationSupervisor {
                 supervisor.permissions.clone(),
                 conversation_id.clone(),
             );
-            let result = driver
-                .run_turn(
+            let result = timeout(
+                Duration::from_secs(120),
+                driver.run_turn(
                     DriverContext {
                         manifest,
                         provider_state: provider_state.clone(),
@@ -414,11 +432,14 @@ impl ConversationSupervisor {
                         turn_id: spawned_turn_id.clone(),
                         text: provider_text,
                         model,
+                        reasoning_effort,
                     },
                     sink,
                     cancel_rx,
-                )
-                .await;
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| Err(AppError::ProviderUnavailable("provider turn timed out after 120 seconds".to_owned())));
             match result {
                 Ok(result) if result.cancelled => {
                     if let Err(error) = supervisor
@@ -1182,6 +1203,7 @@ fi
                 "owner-a",
                 &manifest.id,
                 "hello".to_owned(),
+                None,
                 None,
                 vec![PromptSkillRef {
                     resource_id: "res_missing".to_owned(),

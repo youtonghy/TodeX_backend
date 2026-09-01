@@ -54,6 +54,7 @@ Provider 子进程只继承运行所需的基础系统环境；ACP 额外使用�
 
 ```http
 GET /v2/providers
+GET /v2/providers/models?provider=codex&workspace=/home/user/projects/demo
 GET /v2/conversations
 POST /v2/conversations
 GET /v2/conversations/{conversationId}
@@ -62,6 +63,10 @@ POST /v2/conversations/{conversationId}/prompt
 POST /v2/conversations/{conversationId}/cancel
 POST /v2/conversations/{conversationId}/permissions/{permissionId}
 ```
+
+`/v2/providers/models` 会实时向指定 Agent 查询模型目录，返回 `source` 与 `fetchedAt`。Codex 使用 app-server `model/list`，Pi 使用 RPC `get_available_models`，Claude Code 在配置了 `ANTHROPIC_BASE_URL` 时读取 `/v1/models`。查询失败时客户端应保留 Agent 默认模型，并展示可恢复错误。
+
+`GET /v2/providers/commands?provider=pi&workspace=/path` 会实时读取 Agent 命令目录。Pi 使用 RPC `get_commands` 返回扩展、Prompt Template 和 Skill；Codex 返回与本机 CLI 版本同步的 TUI 命令适配目录。命令描述包含 `invocation`，客户端应据此选择原生 RPC、桌面动作或 Provider prompt，不要把所有 `/` 输入都当作普通 prompt。
 
 创建对话：
 
@@ -80,6 +85,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 {
   "text": "检查认证边界",
   "model": null,
+  "reasoningEffort": null,
   "skills": [
     { "resourceId": "skill_abc", "name": "review" }
   ]

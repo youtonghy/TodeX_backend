@@ -179,16 +179,26 @@ impl Config {
         let agent_file = file_config.agent.unwrap_or_default();
         let security_file = file_config.security.unwrap_or_default();
         let data_dir = expand_home(data_dir);
-        let auth_token = optional_non_empty(env::var("TODEX_AGENTD_AUTH_TOKEN").ok())
-            .or_else(|| optional_non_empty(security_file.auth_token))
-            .or(defaults.security.auth_token);
-        let auth_token = match auth_token {
-            Some(token) => Some(token),
-            None => {
-                let token = generate_auth_token();
-                Self::save_auth_token(data_dir.clone(), &token)?;
-                Some(token)
+        let enable_auth = coalesce(
+            None,
+            env_bool("TODEX_AGENTD_ENABLE_AUTH"),
+            security_file.enable_auth,
+            defaults.security.enable_auth,
+        );
+        let auth_token = if enable_auth {
+            let configured = optional_non_empty(env::var("TODEX_AGENTD_AUTH_TOKEN").ok())
+                .or_else(|| optional_non_empty(security_file.auth_token))
+                .or(defaults.security.auth_token);
+            match configured {
+                Some(token) => Some(token),
+                None => {
+                    let token = generate_auth_token();
+                    Self::save_auth_token(data_dir.clone(), &token)?;
+                    Some(token)
+                }
             }
+        } else {
+            None
         };
 
         Ok(Config {
@@ -227,12 +237,7 @@ impl Config {
                     .unwrap_or(defaults.agent.acp_profiles),
             },
             security: SecurityConfig {
-                enable_auth: coalesce(
-                    None,
-                    env_bool("TODEX_AGENTD_ENABLE_AUTH"),
-                    security_file.enable_auth,
-                    defaults.security.enable_auth,
-                ),
+                enable_auth,
                 enable_tls: coalesce(
                     None,
                     env_bool("TODEX_AGENTD_ENABLE_TLS"),

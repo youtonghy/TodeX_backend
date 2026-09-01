@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::path::Path;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
@@ -9,6 +10,7 @@ use crate::error::AppError;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, PermissionOutcome,
+    ProviderCommandDescriptor,
     ProviderCapabilities, ProviderDescriptor, ProviderDriver,
 };
 
@@ -43,8 +45,73 @@ impl ProviderDriver for PiDriver {
                 tool_events: true,
                 native_skills: true,
                 native_mcp: true,
+                model_selection: true,
             },
+            models: Vec::new(),
         }
+    }
+
+    async fn discover_models(&self, workspace: &Path) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
+        let mut spec = CommandSpec::new(&self.binary, workspace);
+        spec.args = vec!["--mode".to_owned(), "rpc".to_owned(), "--no-session".to_owned(), "--approve".to_owned()];
+        let mut process = JsonLineProcess::spawn(&spec).await?;
+        process.send(&json!({"id":"models","type":"get_available_models"})).await?;
+        let response = loop {
+            let Some(value) = process.read().await? else { return Err(AppError::ProviderUnavailable("Pi RPC process closed stdout".to_owned())); };
+            if value.get("id").and_then(Value::as_str) == Some("models") { break value; }
+        };
+        process.terminate().await;
+        Ok(response.pointer("/data/models").or_else(|| response.get("data")).and_then(Value::as_array).into_iter().flatten().filter_map(|item| {
+            let model_id = item.get("id").or_else(|| item.get("modelId")).and_then(Value::as_str)?.to_owned();
+            let id = item.get("provider").and_then(Value::as_str).map(|provider| format!("{provider}/{model_id}")).unwrap_or(model_id);
+            // Match Pi's getSupportedThinkingLevels semantics: ordinary levels are
+            // supported when omitted (the provider default), while xhigh/max must
+            // be explicitly mapped. A null mapping explicitly disables a level.
+            let efforts = if item.get("reasoning").and_then(Value::as_bool) == Some(false) {
+                vec!["off".to_owned()]
+            } else {
+                let map = item.get("thinkingLevelMap").and_then(Value::as_object);
+                ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .filter(|level| {
+                        let mapped = map.and_then(|values| values.get(*level));
+                        if mapped.is_some_and(Value::is_null) {
+                            return false;
+                        }
+                        if matches!(*level, "xhigh" | "max") {
+                            mapped.is_some()
+                        } else {
+                            true
+                        }
+                    })
+                    .map(str::to_owned)
+                    .collect()
+            };
+            Some(super::types::ProviderModelDescriptor { id, display_name: item.get("name").or_else(|| item.get("displayName")).and_then(Value::as_str).unwrap_or("Pi model").to_owned(), description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(), is_default: item.get("isDefault").and_then(Value::as_bool).unwrap_or(false), supported_reasoning_efforts: efforts })
+        }).collect())
+    }
+
+    async fn discover_commands(&self, workspace: &Path) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
+        let mut spec = CommandSpec::new(&self.binary, workspace);
+        spec.args = vec!["--mode".to_owned(), "rpc".to_owned(), "--no-session".to_owned(), "--approve".to_owned()];
+        let mut process = JsonLineProcess::spawn(&spec).await?;
+        process.send(&json!({"id":"commands","type":"get_commands"})).await?;
+        let response = loop {
+            let Some(value) = process.read().await? else { return Err(AppError::ProviderUnavailable("Pi RPC process closed stdout".to_owned())); };
+            if value.get("id").and_then(Value::as_str) == Some("commands") { break value; }
+        };
+        process.terminate().await;
+        Ok(response.pointer("/data/commands").and_then(Value::as_array).map(|items| items.iter().filter_map(|item| {
+            let name = item.get("name").and_then(Value::as_str)?.trim().trim_start_matches('/');
+            if name.is_empty() { return None; }
+            Some(ProviderCommandDescriptor {
+                name: name.to_owned(),
+                description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                source: item.get("source").and_then(Value::as_str).unwrap_or("extension").to_owned(),
+                invocation: "prompt".to_owned(),
+                argument_hint: None,
+            })
+        }).collect()).unwrap_or_default())
     }
 
     async fn run_turn(
@@ -70,6 +137,10 @@ impl ProviderDriver for PiDriver {
         if let Some(model) = &prompt.model {
             spec.args.push("--model".to_owned());
             spec.args.push(model.clone());
+        }
+        if let Some(effort) = &prompt.reasoning_effort {
+            spec.args.push("--thinking".to_owned());
+            spec.args.push(effort.clone());
         }
 
         let mut process = JsonLineProcess::spawn(&spec).await?;
@@ -251,17 +322,10 @@ async fn handle_extension_ui(
             json!({ "provider": "pi", "providerMethod": "extension_ui_request", "metadata": request }),
         )
         .await?;
-        // Pi blocks waiting for a response to this id, so reporting the request
-        // without answering it would hang the turn until the process is killed.
-        // Cancelling is the only honest answer: TodeX cannot render this UI.
-        return process
-            .send(&json!({
-                "type": "extension_ui_response",
-                "id": id,
-                "cancelled": true,
-                "error": format!("TodeX does not support the '{method}' extension UI"),
-            }))
-            .await;
+        // Pi documents notify/setStatus/setWidget/setTitle/set_editor_text as
+        // fire-and-forget requests. Sending a response for these messages is
+        // itself a protocol violation and can stall the agent process.
+        return Ok(());
     }
     let decision = sink
         .request_permission(

@@ -70,6 +70,8 @@ claude --version
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
 | `TODEX_AGENTD_AUTH_TOKEN` | WebSocket Bearer token |
 
+本机临时测试可设置 `TODEX_AGENTD_ENABLE_AUTH=false`；此时后端不会生成或要求 Auth token。生产环境应保持认证开启。
+
 配置文件示例：
 
 ```toml
