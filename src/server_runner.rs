@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio::time::interval;
 use tracing::info;
 
 use crate::app_state::AppState;
@@ -16,6 +17,7 @@ pub struct ManagedServer {
     state: AppState,
     shutdown: Option<oneshot::Sender<()>>,
     handle: JoinHandle<Result<()>>,
+    retention_task: Option<JoinHandle<()>>,
 }
 
 impl ManagedServer {
@@ -27,6 +29,26 @@ impl ManagedServer {
         }
         let addr = bind_addr(&config)?;
         let state = AppState::new(config.clone()).await?;
+        let retention_task = config.history_retention_days.map(|days| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let mut ticker = interval(std::time::Duration::from_secs(24 * 60 * 60));
+                loop {
+                    let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+                    match state.conversations.cleanup_expired(cutoff).await {
+                        Ok(removed) if !removed.is_empty() => tracing::info!(
+                            removed = removed.len(),
+                            "conversation retention cleanup removed histories"
+                        ),
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(error = %error, "conversation retention cleanup failed")
+                        }
+                    }
+                    ticker.tick().await;
+                }
+            })
+        });
         let app = server::router(state.clone());
         let listener = TcpListener::bind(addr)
             .await
@@ -65,6 +87,7 @@ impl ManagedServer {
             state,
             shutdown: Some(shutdown_tx),
             handle,
+            retention_task,
         })
     }
 
@@ -81,6 +104,9 @@ impl ManagedServer {
     }
 
     pub async fn stop(mut self) -> Result<()> {
+        if let Some(task) = self.retention_task.take() {
+            task.abort();
+        }
         self.state.conversations.shutdown_all().await;
         self.state.codex_local_adapters.shutdown_all().await;
         if let Some(shutdown) = self.shutdown.take() {
@@ -90,6 +116,9 @@ impl ManagedServer {
     }
 
     pub async fn wait(self) -> Result<()> {
+        if let Some(task) = self.retention_task {
+            task.abort();
+        }
         let result = self.handle.await.context("server task join failed")?;
         self.state.conversations.shutdown_all().await;
         self.state.codex_local_adapters.shutdown_all().await;
@@ -124,6 +153,7 @@ mod tests {
             pairing_encryption: PairingEncryption::default(),
             data_dir,
             workspace_root,
+            history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
@@ -156,6 +186,7 @@ mod tests {
             pairing_encryption: PairingEncryption::default(),
             data_dir: root.join("data"),
             workspace_root,
+            history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),

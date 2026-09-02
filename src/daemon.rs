@@ -838,6 +838,7 @@ mod tests {
             pairing_encryption: PairingEncryption::default(),
             data_dir: root.join("data"),
             workspace_root: root.join("workspace"),
+            history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),

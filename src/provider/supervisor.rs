@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout, Duration, Instant};
 use uuid::Uuid;
@@ -164,7 +166,10 @@ impl ConversationSupervisor {
         let mut descriptors = self.registry.descriptors();
         for descriptor in &mut descriptors {
             if let Ok(driver) = self.registry.driver(descriptor.id) {
-                if let Ok(Ok(models)) = tokio::time::timeout(Duration::from_secs(8), driver.discover_models(workspace)).await {
+                if let Ok(Ok(models)) =
+                    tokio::time::timeout(Duration::from_secs(8), driver.discover_models(workspace))
+                        .await
+                {
                     descriptor.models = models;
                 }
             }
@@ -172,8 +177,15 @@ impl ConversationSupervisor {
         descriptors
     }
 
-    pub async fn commands_live(&self, provider: ProviderKind, workspace: &Path) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
-        self.registry.driver(provider)?.discover_commands(workspace).await
+    pub async fn commands_live(
+        &self,
+        provider: ProviderKind,
+        workspace: &Path,
+    ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
+        self.registry
+            .driver(provider)?
+            .discover_commands(workspace)
+            .await
     }
 
     #[allow(dead_code)]
@@ -218,6 +230,7 @@ impl ConversationSupervisor {
         let manifest = ConversationManifest::new(provider, workspace, title, provider_profile);
         let mut manifest = manifest;
         manifest.owner_id = owner_id.to_owned();
+        manifest.workspace_id = Some(stable_workspace_id(&manifest.workspace));
         let manifest = self.store.create(manifest).await?;
         self.emit(
             &manifest.id,
@@ -260,6 +273,46 @@ impl ConversationSupervisor {
         let manifest = self.get(conversation_id).await?;
         ensure_owner(&manifest, owner_id)?;
         Ok(manifest)
+    }
+
+    pub async fn update_metadata_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        title: Option<Option<String>>,
+        archived: Option<bool>,
+    ) -> Result<ConversationManifest, AppError> {
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        let updated = self
+            .store
+            .update_metadata(&manifest.id, title, archived)
+            .await?;
+        Ok(updated)
+    }
+
+    pub async fn delete_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationManifest, AppError> {
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        if matches!(
+            manifest.status,
+            ConversationStatus::Running | ConversationStatus::WaitingPermission
+        ) {
+            return Err(AppError::Conflict(
+                "active conversation cannot be deleted".to_owned(),
+            ));
+        }
+        self.store.delete(&manifest.id).await?;
+        Ok(manifest)
+    }
+
+    pub async fn cleanup_expired(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<ConversationManifest>, AppError> {
+        self.store.cleanup_before(cutoff).await
     }
 
     pub async fn replay(
@@ -439,7 +492,11 @@ impl ConversationSupervisor {
                 ),
             )
             .await
-            .unwrap_or_else(|_| Err(AppError::ProviderUnavailable("provider turn timed out after 120 seconds".to_owned())));
+            .unwrap_or_else(|_| {
+                Err(AppError::ProviderUnavailable(
+                    "provider turn timed out after 120 seconds".to_owned(),
+                ))
+            });
             match result {
                 Ok(result) if result.cancelled => {
                     if let Err(error) = supervisor
@@ -689,7 +746,9 @@ impl ConversationSupervisor {
                 )
                 .await?;
                 if result.is_error {
-                    Err(AppError::InvalidRequest("mcp tool returned an error".to_owned()))
+                    Err(AppError::InvalidRequest(
+                        "mcp tool returned an error".to_owned(),
+                    ))
                 } else {
                     Ok(result.content)
                 }
@@ -774,6 +833,17 @@ impl ConversationSupervisor {
         self.hub.publish(event);
         Ok(())
     }
+}
+
+fn stable_workspace_id(path: &Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(path.to_string_lossy().as_bytes());
+    let bytes = digest.finalize();
+    let encoded = bytes[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("ws_{encoded}")
 }
 
 pub(crate) fn compose_prompt_with_skills(user_text: &str, skills: &[(String, String)]) -> String {
@@ -876,6 +946,7 @@ mod tests {
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
             workspace_root,
+            history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: fixture_text.clone(),
@@ -970,6 +1041,7 @@ mod tests {
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
             workspace_root,
+            history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: fixture.to_string_lossy().to_string(),
@@ -1018,6 +1090,7 @@ mod tests {
             pairing_encryption: PairingEncryption::None,
             data_dir: data_dir.clone(),
             workspace_root,
+            history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: fixture.to_string_lossy().to_string(),
@@ -1178,6 +1251,7 @@ fi
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
             workspace_root,
+            history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -1191,7 +1265,9 @@ fi
                 auth_token: Some("token".to_owned()),
             },
         });
-        let store = ConversationStore::new(config.data_dir.clone()).await.unwrap();
+        let store = ConversationStore::new(config.data_dir.clone())
+            .await
+            .unwrap();
         let supervisor =
             ConversationSupervisor::new(config, store, ConversationEventHub::default());
         let manifest = supervisor

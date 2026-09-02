@@ -64,11 +64,15 @@ pub struct ConversationManifest {
     #[serde(default = "default_owner_id")]
     pub owner_id: String,
     pub workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_profile: Option<String>,
     pub status: ConversationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
     pub last_sequence: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -88,9 +92,11 @@ impl ConversationManifest {
             provider,
             owner_id: default_owner_id(),
             workspace,
+            workspace_id: None,
             title,
             provider_profile,
             status: ConversationStatus::Idle,
+            archived_at: None,
             last_sequence: 0,
             created_at: now,
             updated_at: now,

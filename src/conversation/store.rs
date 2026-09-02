@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -125,6 +125,82 @@ impl ConversationStore {
         }
         manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.updated_at));
         Ok(manifests)
+    }
+
+    pub async fn update_metadata(
+        &self,
+        conversation_id: &str,
+        title: Option<Option<String>>,
+        archived: Option<bool>,
+    ) -> Result<ConversationManifest, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let directory = self.directory(conversation_id)?;
+        let mut manifest = self.get_unlocked(conversation_id).await?;
+        if let Some(title) = title {
+            manifest.title = title
+                .map(|value| value.trim().chars().take(200).collect::<String>())
+                .filter(|value| !value.is_empty());
+        }
+        if let Some(archived) = archived {
+            manifest.archived_at = archived.then(Utc::now);
+        }
+        manifest.updated_at = Utc::now();
+        write_atomic_json(&directory.join(MANIFEST_FILE), &manifest).await?;
+        write_atomic_json(
+            &directory.join(SNAPSHOT_FILE),
+            &ConversationSnapshot::from_manifest(&manifest),
+        )
+        .await?;
+        Ok(manifest)
+    }
+
+    pub async fn delete(&self, conversation_id: &str) -> Result<(), AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let directory = self.directory(conversation_id)?;
+        if !tokio::fs::try_exists(&directory).await? {
+            return Err(AppError::NotFound(format!(
+                "conversation {conversation_id}"
+            )));
+        }
+        tokio::fs::remove_dir_all(directory).await?;
+        Ok(())
+    }
+
+    pub async fn cleanup_before(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<ConversationManifest>, AppError> {
+        let manifests = self.list().await?;
+        let mut removed = Vec::new();
+        for manifest in manifests {
+            if manifest.updated_at >= cutoff
+                || matches!(
+                    manifest.status,
+                    super::ConversationStatus::Running
+                        | super::ConversationStatus::WaitingPermission
+                )
+            {
+                continue;
+            }
+            let id = manifest.id.clone();
+            let _guard = self.lock(&id).await;
+            let current = match self.get_unlocked(&id).await {
+                Ok(value) => value,
+                Err(AppError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            if current.updated_at < cutoff
+                && !matches!(
+                    current.status,
+                    super::ConversationStatus::Running
+                        | super::ConversationStatus::WaitingPermission
+                )
+            {
+                tokio::fs::remove_dir_all(self.directory(&id)?).await?;
+                removed.push(current);
+            }
+        }
+        Ok(removed)
     }
 
     pub async fn append(

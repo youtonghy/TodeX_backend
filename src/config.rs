@@ -21,6 +21,8 @@ pub struct ServeArgs {
     pub data_dir: Option<PathBuf>,
     #[arg(long)]
     pub workspace_root: Option<PathBuf>,
+    #[arg(long)]
+    pub history_retention_days: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +32,7 @@ pub struct Config {
     pub pairing_encryption: PairingEncryption,
     pub data_dir: PathBuf,
     pub workspace_root: PathBuf,
+    pub history_retention_days: Option<u64>,
     pub agent: AgentConfig,
     pub security: SecurityConfig,
 }
@@ -109,6 +112,7 @@ struct FileConfig {
     pairing_encryption: Option<PairingEncryption>,
     data_dir: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
+    history_retention_days: Option<u64>,
     agent: Option<PartialAgentConfig>,
     security: Option<PartialSecurityConfig>,
 }
@@ -153,6 +157,15 @@ impl Config {
             file_config.workspace_root,
             defaults.workspace_root,
         );
+        let history_retention_days = args
+            .history_retention_days
+            .or_else(|| {
+                env::var("TODEX_AGENTD_HISTORY_RETENTION_DAYS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            })
+            .or(file_config.history_retention_days)
+            .or(defaults.history_retention_days);
         let host = coalesce(
             args.host,
             env::var("TODEX_AGENTD_HOST").ok(),
@@ -207,6 +220,7 @@ impl Config {
             pairing_encryption,
             data_dir,
             workspace_root: expand_home(workspace_root),
+            history_retention_days,
             agent: AgentConfig {
                 default_agent: coalesce(
                     None,
@@ -298,6 +312,7 @@ impl Default for Config {
             pairing_encryption: PairingEncryption::default(),
             data_dir,
             workspace_root,
+            history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
@@ -473,6 +488,7 @@ mod tests {
             port: None,
             data_dir: None,
             workspace_root: None,
+            history_retention_days: None,
         })
         .expect("load default config");
 
@@ -489,6 +505,7 @@ mod tests {
             port: None,
             data_dir: Some(root.clone()),
             workspace_root: None,
+            history_retention_days: None,
         })
         .expect("load config and generate auth token");
 
