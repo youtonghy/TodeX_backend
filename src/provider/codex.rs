@@ -340,6 +340,13 @@ async fn handle_codex_message(
         return Ok(());
     }
 
+    if matches!(method, "item/started" | "item/completed") {
+        if let Some((event_type, payload)) = codex_item_event(method, &params) {
+            sink.emit(event_type, payload).await?;
+        }
+        return Ok(());
+    }
+
     let (event_type, payload) = match method {
         "item/agentMessage/delta" => (
             "message.delta",
@@ -355,14 +362,6 @@ async fn handle_codex_message(
                 "delta": params.get("delta").cloned().unwrap_or(Value::Null),
                 "provider": "codex",
             }),
-        ),
-        "item/started" => (
-            "tool.started",
-            json!({ "provider": "codex", "item": params.get("item") }),
-        ),
-        "item/completed" => (
-            "tool.completed",
-            json!({ "provider": "codex", "item": params.get("item") }),
         ),
         "turn/plan/updated" => (
             "plan.updated",
@@ -384,6 +383,24 @@ async fn handle_codex_message(
     };
     sink.emit(event_type, payload).await?;
     Ok(())
+}
+
+fn codex_item_event(method: &str, params: &Value) -> Option<(&'static str, Value)> {
+    let item = params.get("item")?;
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    if matches!(item_type, "agentMessage" | "agent_message") {
+        return (method == "item/completed").then(|| (
+            "message.completed",
+            json!({ "provider": "codex", "role": "assistant", "message": item }),
+        ));
+    }
+    if matches!(item_type, "reasoning" | "reasoningItem" | "reasoning_item") {
+        return None;
+    }
+    Some((
+        if method == "item/completed" { "tool.completed" } else { "tool.started" },
+        json!({ "provider": "codex", "item": item }),
+    ))
 }
 
 fn is_codex_permission_method(method: &str) -> bool {
@@ -477,4 +494,25 @@ fn safe_error_text(error: &Value) -> String {
         .chars()
         .take(500)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_message_completion_is_not_emitted_as_a_tool() {
+        let params = json!({ "item": { "type": "agentMessage", "text": "done" } });
+        assert!(codex_item_event("item/started", &params).is_none());
+        let (event_type, payload) = codex_item_event("item/completed", &params).unwrap();
+        assert_eq!(event_type, "message.completed");
+        assert_eq!(payload["message"]["text"], "done");
+    }
+
+    #[test]
+    fn command_item_keeps_tool_lifecycle() {
+        let params = json!({ "item": { "type": "commandExecution", "command": "pwd" } });
+        assert_eq!(codex_item_event("item/started", &params).unwrap().0, "tool.started");
+        assert_eq!(codex_item_event("item/completed", &params).unwrap().0, "tool.completed");
+    }
 }
