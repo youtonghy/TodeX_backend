@@ -6,10 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arboard::Clipboard;
 use chrono::Utc;
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -28,7 +27,7 @@ use crate::event::EventRecord;
 use crate::transport_crypto::{render_qr_text_for_bounds, PairingKeys};
 use crate::workspace_paths::canonical_workspace_root;
 
-const ACTION_COUNT: usize = 9;
+const ACTION_COUNT: usize = 11;
 const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
@@ -51,17 +50,18 @@ pub async fn run(args: ServeArgs) -> Result<()> {
                         break;
                     }
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => app.scroll_logs_up(LOG_SCROLL_STEP),
-                    MouseEventKind::ScrollDown => app.scroll_logs_down(LOG_SCROLL_STEP),
-                    _ => {}
-                },
                 _ => {}
             }
         }
     }
 
-    app.push_log("TUI exiting; exporting logs automatically.".to_owned());
+    let exit_notice = app
+        .text(
+            "TUI exiting; exporting logs automatically.",
+            "TUI 正在退出并自动导出日志。",
+        )
+        .to_owned();
+    app.push_log(exit_notice);
     app.save_logs().context("failed to auto-save TUI logs")?;
 
     Ok(())
@@ -71,7 +71,6 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    execute!(io::stdout(), EnableMouseCapture)?;
     match Terminal::new(CrosstermBackend::new(stdout)) {
         Ok(mut terminal) => {
             terminal.clear()?;
@@ -79,7 +78,6 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
         }
         Err(error) => {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableMouseCapture);
             let _ = execute!(io::stdout(), LeaveAlternateScreen);
             Err(error).context("failed to initialize terminal")
         }
@@ -91,7 +89,6 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableMouseCapture);
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
 }
@@ -105,6 +102,56 @@ struct PairingQrPopup {
     area: Rect,
     lines: Vec<Line<'static>>,
     title: String,
+}
+
+struct CredentialsPopup {
+    auth_token: Option<String>,
+    public_key: Option<String>,
+    selected: usize,
+    scroll: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TuiLanguage {
+    English,
+    Chinese,
+}
+
+impl TuiLanguage {
+    fn detect() -> Self {
+        let locale = std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LC_MESSAGES"))
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if locale.starts_with("zh") {
+            Self::Chinese
+        } else {
+            Self::English
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "zh" | "zh-cn" | "zh-tw" | "chinese" => Some(Self::Chinese),
+            "en" | "en-us" | "english" => Some(Self::English),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::English => "en",
+            Self::Chinese => "zh-CN",
+        }
+    }
+
+    fn text<'a>(self, english: &'a str, chinese: &'a str) -> &'a str {
+        match self {
+            Self::English => english,
+            Self::Chinese => chinese,
+        }
+    }
 }
 
 struct TuiApp {
@@ -122,7 +169,9 @@ struct TuiApp {
     observer_scroll: usize,
     log_follow_tail: bool,
     pairing_qr: Option<PairingQr>,
+    credentials: Option<CredentialsPopup>,
     folder_picker: Option<FolderPicker>,
+    language: TuiLanguage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +182,11 @@ enum TuiView {
 
 impl TuiApp {
     fn new(config: Config) -> Self {
+        let language = Config::load_tui_language(&config.data_dir)
+            .ok()
+            .flatten()
+            .and_then(|value| TuiLanguage::parse(&value))
+            .unwrap_or_else(TuiLanguage::detect);
         Self {
             config,
             daemon: None,
@@ -141,15 +195,26 @@ impl TuiApp {
             selected_session: 0,
             edit: None,
             last_error: None,
-            notice: "Daemon is stopped. Select Start when ready.".to_owned(),
+            notice: language
+                .text(
+                    "Daemon is stopped. Select Start when ready.",
+                    "Daemon 已停止，请选择启动。",
+                )
+                .to_owned(),
             live_logs: VecDeque::new(),
             live_events: Vec::new(),
             log_scroll: 0,
             observer_scroll: 0,
             log_follow_tail: true,
             pairing_qr: None,
+            credentials: None,
             folder_picker: None,
+            language,
         }
+    }
+
+    fn text<'a>(&self, english: &'a str, chinese: &'a str) -> &'a str {
+        self.language.text(english, chinese)
     }
 
     fn push_log(&mut self, line: String) {
@@ -210,7 +275,12 @@ impl TuiApp {
 
     async fn show_pairing_qr(&mut self) {
         let Some(process) = self.daemon.as_ref() else {
-            self.notice = "Start the daemon before showing a pairing QR.".to_owned();
+            self.notice = self
+                .text(
+                    "Start the daemon before showing a pairing QR.",
+                    "请先启动 daemon，再显示配对二维码。",
+                )
+                .to_owned();
             return;
         };
 
@@ -225,24 +295,129 @@ impl TuiApp {
                     payloads,
                     active_index: 0,
                 });
-                self.notice = if total > 1 {
-                    format!("Pairing QR is open in the center window. Use Left/Right to switch {total} segments.")
-                } else {
-                    "Pairing QR is open in the center window.".to_owned()
+                self.notice = match (self.language, total > 1) {
+                    (TuiLanguage::English, true) => format!("Pairing QR is open in the center window. Use Left/Right to switch {total} segments."),
+                    (TuiLanguage::Chinese, true) => format!("配对二维码已打开。使用左右方向键切换 {total} 个分段。"),
+                    (TuiLanguage::English, false) => "Pairing QR is open in the center window.".to_owned(),
+                    (TuiLanguage::Chinese, false) => "配对二维码已在中央窗口打开。".to_owned(),
                 };
             }
             Err(error) => {
-                self.notice = "Failed to render pairing QR.".to_owned();
+                self.notice = self
+                    .text("Failed to render pairing QR.", "无法生成配对二维码。")
+                    .to_owned();
                 self.last_error = Some(error.to_string());
                 return;
             }
         };
     }
 
+    async fn show_credentials(&mut self) {
+        match PairingKeys::load_or_generate(&self.config.data_dir).await {
+            Ok(keys) => {
+                self.credentials = Some(CredentialsPopup {
+                    auth_token: self.config.security.auth_token.clone(),
+                    public_key: keys.pairing_public_key(self.config.pairing_encryption),
+                    selected: 0,
+                    scroll: 0,
+                });
+                self.notice = self
+                    .text(
+                        "Credentials are open. Select an item and press Enter or c to copy.",
+                        "凭据窗口已打开。选择项目后按 Enter 或 c 复制。",
+                    )
+                    .to_owned();
+            }
+            Err(error) => {
+                self.notice = self
+                    .text("Failed to load pairing keys.", "无法读取配对密钥。")
+                    .to_owned();
+                self.last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn close_credentials(&mut self) {
+        self.credentials = None;
+        self.notice = self
+            .text("Credentials closed.", "凭据窗口已关闭。")
+            .to_owned();
+    }
+
+    fn copy_selected_credential(&mut self) {
+        let Some(credentials) = self.credentials.as_ref() else {
+            return;
+        };
+        let (label, value) = if credentials.selected == 0 {
+            (
+                self.text("Auth Token", "认证令牌").to_owned(),
+                credentials.auth_token.clone(),
+            )
+        } else {
+            (
+                self.text("Encryption public key", "加密公钥").to_owned(),
+                credentials.public_key.clone(),
+            )
+        };
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            self.notice = self
+                .text(
+                    "The selected credential is not available.",
+                    "所选凭据不可用。",
+                )
+                .to_owned();
+            return;
+        };
+        match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(value)) {
+            Ok(()) => {
+                self.notice = match self.language {
+                    TuiLanguage::English => format!("{label} copied to the system clipboard."),
+                    TuiLanguage::Chinese => format!("{label}已复制到系统剪贴板。"),
+                };
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.notice = self
+                    .text("Clipboard copy failed.", "复制到剪贴板失败。")
+                    .to_owned();
+                self.last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn toggle_language(&mut self) {
+        self.language = match self.language {
+            TuiLanguage::English => TuiLanguage::Chinese,
+            TuiLanguage::Chinese => TuiLanguage::English,
+        };
+        match Config::save_tui_language(self.config.data_dir.clone(), self.language.as_str()) {
+            Ok(()) => {
+                self.notice = self
+                    .text(
+                        "Language changed to English and saved.",
+                        "界面语言已切换为中文并保存。",
+                    )
+                    .to_owned();
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.notice = self
+                    .text(
+                        "Language changed, but saving the preference failed.",
+                        "界面语言已切换，但保存语言偏好失败。",
+                    )
+                    .to_owned();
+                self.last_error = Some(error.to_string());
+            }
+        }
+    }
+
     fn close_pairing_qr(&mut self) {
         if self.pairing_qr.is_some() {
             self.pairing_qr = None;
-            self.notice = "Pairing QR closed.".to_owned();
+            self.notice = self
+                .text("Pairing QR closed.", "配对二维码已关闭。")
+                .to_owned();
         }
     }
 
@@ -267,6 +442,42 @@ impl TuiApp {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.credentials.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.close_credentials(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(credentials) = &mut self.credentials {
+                        credentials.selected = credentials.selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(credentials) = &mut self.credentials {
+                        credentials.selected = (credentials.selected + 1).min(1);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(credentials) = &mut self.credentials {
+                        credentials.scroll =
+                            credentials.scroll.saturating_sub(LOG_SCROLL_STEP as u16);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(credentials) = &mut self.credentials {
+                        credentials.scroll =
+                            credentials.scroll.saturating_add(LOG_SCROLL_STEP as u16);
+                    }
+                }
+                KeyCode::Home => {
+                    if let Some(credentials) = &mut self.credentials {
+                        credentials.scroll = 0;
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char('c') => self.copy_selected_credential(),
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         if self.pairing_qr.is_some() {
             match key.code {
                 KeyCode::Left | KeyCode::PageUp => self.previous_pairing_qr(),
@@ -291,7 +502,9 @@ impl TuiApp {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('o') | KeyCode::Tab => {
                     self.view = TuiView::Control;
-                    self.notice = "Returned to the control view.".to_owned();
+                    self.notice = self
+                        .text("Returned to the control view.", "已返回控制视图。")
+                        .to_owned();
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.selected_session = self.selected_session.saturating_sub(1);
@@ -317,7 +530,12 @@ impl TuiApp {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Char('o') | KeyCode::Tab => {
                 self.view = TuiView::Observer;
-                self.notice = "Observer is read-only. Use q, Esc, o, or Tab to return.".to_owned();
+                self.notice = self
+                    .text(
+                        "Observer is read-only. Use q, Esc, o, or Tab to return.",
+                        "观察器为只读视图。按 q、Esc、o 或 Tab 返回。",
+                    )
+                    .to_owned();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected_action = self.selected_action.saturating_sub(1);
@@ -338,6 +556,8 @@ impl TuiApp {
             KeyCode::Char('e') => self.start_pairing_encryption_edit(),
             KeyCode::Char('x') => self.start_reset_edit(),
             KeyCode::Char('g') => self.show_pairing_qr().await,
+            KeyCode::Char('c') => self.show_credentials().await,
+            KeyCode::Char('l') => self.toggle_language(),
             KeyCode::PageUp => self.scroll_logs_up(LOG_SCROLL_STEP),
             KeyCode::PageDown => self.scroll_logs_down(LOG_SCROLL_STEP),
             KeyCode::Home => self.scroll_logs_to_top(),
@@ -352,7 +572,12 @@ impl TuiApp {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.folder_picker = None;
-                self.notice = "Workspace root selection canceled.".to_owned();
+                self.notice = self
+                    .text(
+                        "Workspace root selection canceled.",
+                        "已取消选择工作区根目录。",
+                    )
+                    .to_owned();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if let Some(picker) = &mut self.folder_picker {
@@ -405,7 +630,7 @@ impl TuiApp {
         match key.code {
             KeyCode::Esc => {
                 self.edit = None;
-                self.notice = "Edit canceled.".to_owned();
+                self.notice = self.text("Edit canceled.", "已取消编辑。").to_owned();
             }
             KeyCode::Enter => self.commit_edit().await?,
             KeyCode::Backspace => {
@@ -460,7 +685,9 @@ impl TuiApp {
             5 => self.start_pairing_encryption_edit(),
             6 => self.start_reset_edit(),
             7 => self.show_pairing_qr().await,
-            8 => return Ok(true),
+            8 => self.show_credentials().await,
+            9 => self.toggle_language(),
+            10 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -476,28 +703,39 @@ impl TuiApp {
 
     async fn start_daemon(&mut self) -> Result<()> {
         if self.daemon.is_some() {
-            self.notice = "Daemon is already running.".to_owned();
+            self.notice = self
+                .text("Daemon is already running.", "Daemon 已在运行。")
+                .to_owned();
             return Ok(());
         }
 
         let mut config = self.config.clone();
         config.host = self.config.host.trim().to_owned();
         config.port = self.config.port;
-        self.notice = "Starting daemon...".to_owned();
+        self.notice = self
+            .text("Starting daemon...", "正在启动 daemon...")
+            .to_owned();
         match daemon::start(config).await {
             Ok(process) => {
-                self.notice = format!(
-                    "Daemon started on {} with pid {}. It will keep running after the TUI exits.",
-                    process.listen_addr(),
-                    process.pid
-                );
+                self.notice = match self.language {
+                    TuiLanguage::English => format!(
+                        "Daemon started on {} with pid {}. It will keep running after the TUI exits.",
+                        process.listen_addr(), process.pid
+                    ),
+                    TuiLanguage::Chinese => format!(
+                        "Daemon 已在 {} 启动，PID 为 {}；退出 TUI 后仍会继续运行。",
+                        process.listen_addr(), process.pid
+                    ),
+                };
                 self.last_error = None;
                 self.push_log(self.notice.clone());
                 self.daemon = Some(process);
             }
             Err(error) => {
                 self.last_error = Some(error.to_string());
-                self.notice = "Daemon failed to start.".to_owned();
+                self.notice = self
+                    .text("Daemon failed to start.", "Daemon 启动失败。")
+                    .to_owned();
                 self.push_log(format!("{} {error}", self.notice.clone()));
             }
         }
@@ -505,23 +743,32 @@ impl TuiApp {
     }
 
     async fn stop_daemon(&mut self) -> Result<()> {
-        self.notice = "Stopping daemon...".to_owned();
+        self.notice = self
+            .text("Stopping daemon...", "正在停止 daemon...")
+            .to_owned();
         self.push_log(self.notice.clone());
         match daemon::stop(&self.config).await {
             Ok(Some(process)) => {
-                self.notice = format!("Daemon stopped (pid {}).", process.pid);
+                self.notice = match self.language {
+                    TuiLanguage::English => format!("Daemon stopped (pid {}).", process.pid),
+                    TuiLanguage::Chinese => format!("Daemon 已停止（PID {}）。", process.pid),
+                };
                 self.last_error = None;
                 self.push_log(self.notice.clone());
                 self.daemon = None;
             }
             Ok(None) => {
-                self.notice = "Daemon is already stopped.".to_owned();
+                self.notice = self
+                    .text("Daemon is already stopped.", "Daemon 已经停止。")
+                    .to_owned();
                 self.last_error = None;
                 self.push_log(self.notice.clone());
                 self.daemon = None;
             }
             Err(error) => {
-                self.notice = "Daemon stop failed.".to_owned();
+                self.notice = self
+                    .text("Daemon stop failed.", "Daemon 停止失败。")
+                    .to_owned();
                 self.last_error = Some(error.to_string());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
             }
@@ -533,21 +780,32 @@ impl TuiApp {
         let mut config = self.config.clone();
         config.host = self.config.host.trim().to_owned();
         config.port = self.config.port;
-        self.notice = "Restarting daemon...".to_owned();
+        self.notice = self
+            .text("Restarting daemon...", "正在重启 daemon...")
+            .to_owned();
         self.push_log(self.notice.clone());
         match daemon::restart(config).await {
             Ok(process) => {
-                self.notice = format!(
-                    "Daemon restarted on {} with pid {}.",
-                    process.listen_addr(),
-                    process.pid
-                );
+                self.notice = match self.language {
+                    TuiLanguage::English => format!(
+                        "Daemon restarted on {} with pid {}.",
+                        process.listen_addr(),
+                        process.pid
+                    ),
+                    TuiLanguage::Chinese => format!(
+                        "Daemon 已在 {} 重启，PID 为 {}。",
+                        process.listen_addr(),
+                        process.pid
+                    ),
+                };
                 self.last_error = None;
                 self.push_log(self.notice.clone());
                 self.daemon = Some(process);
             }
             Err(error) => {
-                self.notice = "Daemon restart failed.".to_owned();
+                self.notice = self
+                    .text("Daemon restart failed.", "Daemon 重启失败。")
+                    .to_owned();
                 self.last_error = Some(error.to_string());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
             }
@@ -562,13 +820,23 @@ impl TuiApp {
                 let next_pid = next.as_ref().map(|process| process.pid);
                 if previous_pid != next_pid {
                     match next.as_ref() {
-                        Some(process) => self.push_log(format!(
-                            "Detected daemon pid {} on {}.",
-                            process.pid,
-                            process.listen_addr()
-                        )),
+                        Some(process) => self.push_log(match self.language {
+                            TuiLanguage::English => format!(
+                                "Detected daemon pid {} on {}.",
+                                process.pid,
+                                process.listen_addr()
+                            ),
+                            TuiLanguage::Chinese => format!(
+                                "检测到 daemon PID {}，监听地址为 {}。",
+                                process.pid,
+                                process.listen_addr()
+                            ),
+                        }),
                         None if previous_pid.is_some() => {
-                            self.push_log("Daemon is no longer running.".to_owned())
+                            let line = self
+                                .text("Daemon is no longer running.", "Daemon 已停止运行。")
+                                .to_owned();
+                            self.push_log(line)
                         }
                         None => {}
                     }
@@ -576,7 +844,9 @@ impl TuiApp {
                 self.daemon = next;
             }
             Err(error) => {
-                self.notice = "Failed to read daemon status.".to_owned();
+                self.notice = self
+                    .text("Failed to read daemon status.", "无法读取 daemon 状态。")
+                    .to_owned();
                 self.last_error = Some(error.to_string());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
             }
@@ -588,8 +858,12 @@ impl TuiApp {
             field: EditField::Host,
             value: self.config.host.clone(),
         });
-        self.notice =
-            "Listen IP edit window is open. Press Enter to apply or Esc to cancel.".to_owned();
+        self.notice = self
+            .text(
+                "Listen IP edit window is open. Press Enter to apply or Esc to cancel.",
+                "监听 IP 编辑窗口已打开。按 Enter 应用，按 Esc 取消。",
+            )
+            .to_owned();
     }
 
     fn start_port_edit(&mut self) {
@@ -597,31 +871,46 @@ impl TuiApp {
             field: EditField::Port,
             value: self.config.port.to_string(),
         });
-        self.notice =
-            "Listen port edit window is open. Press Enter to apply or Esc to cancel.".to_owned();
+        self.notice = self
+            .text(
+                "Listen port edit window is open. Press Enter to apply or Esc to cancel.",
+                "监听端口编辑窗口已打开。按 Enter 应用，按 Esc 取消。",
+            )
+            .to_owned();
     }
 
     fn start_workspace_root_picker(&mut self) {
         self.folder_picker = Some(FolderPicker::new(self.config.workspace_root.clone()));
-        self.notice =
-            "Workspace root selector is open. Enter descends; Space selects current directory."
-                .to_owned();
+        self.notice = self
+            .text(
+                "Workspace root selector is open. Enter descends; Space selects current directory.",
+                "工作区根目录选择器已打开。Enter 进入目录，Space 选择当前目录。",
+            )
+            .to_owned();
     }
 
     fn start_pairing_encryption_edit(&mut self) {
         self.edit = Some(EditMode::Encryption {
             value: self.config.pairing_encryption,
         });
-        self.notice =
-            "Pairing encryption edit window is open. Use Left/Right to switch.".to_owned();
+        self.notice = self
+            .text(
+                "Pairing encryption edit window is open. Use Left/Right to switch.",
+                "配对加密编辑窗口已打开。使用左右方向键切换。",
+            )
+            .to_owned();
     }
 
     fn start_reset_edit(&mut self) {
         self.edit = Some(EditMode::Reset {
             target: ResetTarget::Auth,
         });
-        self.notice =
-            "Reset window is open. Use Left/Right to choose Auth or Encryption.".to_owned();
+        self.notice = self
+            .text(
+                "Reset window is open. Use Left/Right to choose Auth or Encryption.",
+                "重置窗口已打开。使用左右方向键选择认证或加密。",
+            )
+            .to_owned();
     }
 
     async fn apply_selected_workspace_root(&mut self) -> Result<()> {
@@ -632,7 +921,10 @@ impl TuiApp {
         match canonical_workspace_root(&picker.current) {
             Ok(root) => {
                 self.config.workspace_root = root;
-                let saved = self.auto_save_settings("Workspace root updated");
+                let subject = self
+                    .text("Workspace root updated", "工作区根目录已更新")
+                    .to_owned();
+                let saved = self.auto_save_settings(&subject);
                 if saved && self.daemon.is_some() {
                     self.restart_daemon().await?;
                 }
@@ -640,7 +932,9 @@ impl TuiApp {
             Err(error) => {
                 self.folder_picker = Some(picker);
                 self.last_error = Some(error.to_string());
-                self.notice = "Workspace root was not changed.".to_owned();
+                self.notice = self
+                    .text("Workspace root was not changed.", "工作区根目录未更改。")
+                    .to_owned();
             }
         }
 
@@ -659,11 +953,14 @@ impl TuiApp {
             } => match validate_host(&value) {
                 Ok(host) => {
                     self.config.host = host;
-                    self.auto_save_settings("Listen IP updated");
+                    let subject = self.text("Listen IP updated", "监听 IP 已更新").to_owned();
+                    self.auto_save_settings(&subject);
                 }
                 Err(error) => {
                     self.last_error = Some(error);
-                    self.notice = "Host was not changed.".to_owned();
+                    self.notice = self
+                        .text("Host was not changed.", "监听 IP 未更改。")
+                        .to_owned();
                 }
             },
             EditMode::Text {
@@ -672,16 +969,24 @@ impl TuiApp {
             } => match validate_port(&value) {
                 Ok(port) => {
                     self.config.port = port;
-                    self.auto_save_settings("Listen port updated");
+                    let subject = self
+                        .text("Listen port updated", "监听端口已更新")
+                        .to_owned();
+                    self.auto_save_settings(&subject);
                 }
                 Err(error) => {
                     self.last_error = Some(error);
-                    self.notice = "Port was not changed.".to_owned();
+                    self.notice = self
+                        .text("Port was not changed.", "监听端口未更改。")
+                        .to_owned();
                 }
             },
             EditMode::Encryption { value } => {
                 self.config.pairing_encryption = value;
-                self.auto_save_settings("Pairing encryption updated");
+                let subject = self
+                    .text("Pairing encryption updated", "配对加密已更新")
+                    .to_owned();
+                self.auto_save_settings(&subject);
             }
             EditMode::Reset { target } => self.reset_target(target).await?,
         }
@@ -700,10 +1005,11 @@ impl TuiApp {
         match Config::reset_auth_token(self.config.data_dir.clone()) {
             Ok(token) => {
                 self.config.security.auth_token = Some(token);
-                self.finish_reset("Auth reset").await;
+                let subject = self.text("Auth reset", "认证已重置").to_owned();
+                self.finish_reset(&subject).await;
             }
             Err(error) => {
-                self.notice = "Auth reset failed.".to_owned();
+                self.notice = self.text("Auth reset failed.", "认证重置失败。").to_owned();
                 self.last_error = Some(error.to_string());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
             }
@@ -713,9 +1019,14 @@ impl TuiApp {
 
     async fn reset_encryption(&mut self) -> Result<()> {
         match PairingKeys::reset(&self.config.data_dir).await {
-            Ok(_) => self.finish_reset("Encryption reset").await,
+            Ok(_) => {
+                let subject = self.text("Encryption reset", "加密密钥已重置").to_owned();
+                self.finish_reset(&subject).await
+            }
             Err(error) => {
-                self.notice = "Encryption reset failed.".to_owned();
+                self.notice = self
+                    .text("Encryption reset failed.", "加密密钥重置失败。")
+                    .to_owned();
                 self.last_error = Some(error.to_string());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
             }
@@ -725,29 +1036,53 @@ impl TuiApp {
 
     async fn finish_reset(&mut self, subject: &str) {
         if self.daemon.is_none() {
-            self.notice = format!("{subject}. It will apply the next time the daemon starts.");
+            self.notice = match self.language {
+                TuiLanguage::English => {
+                    format!("{subject}. It will apply the next time the daemon starts.")
+                }
+                TuiLanguage::Chinese => {
+                    format!("{subject}，将在 daemon 下次启动时生效。")
+                }
+            };
             self.last_error = None;
             self.push_log(self.notice.clone());
             return;
         }
 
-        self.push_log(format!("{subject}; restarting daemon to apply it."));
+        self.push_log(match self.language {
+            TuiLanguage::English => {
+                format!("{subject}; restarting daemon to apply it.")
+            }
+            TuiLanguage::Chinese => format!("{subject}；正在重启 daemon 以应用更改。"),
+        });
         let mut config = self.config.clone();
         config.host = self.config.host.trim().to_owned();
         config.port = self.config.port;
         match daemon::restart(config).await {
             Ok(process) => {
-                self.notice = format!(
-                    "{subject} and daemon restarted on {} with pid {}.",
-                    process.listen_addr(),
-                    process.pid
-                );
+                self.notice = match self.language {
+                    TuiLanguage::English => format!(
+                        "{subject} and daemon restarted on {} with pid {}.",
+                        process.listen_addr(),
+                        process.pid
+                    ),
+                    TuiLanguage::Chinese => format!(
+                        "{subject}，daemon 已在 {} 重启，PID 为 {}。",
+                        process.listen_addr(),
+                        process.pid
+                    ),
+                };
                 self.last_error = None;
                 self.push_log(self.notice.clone());
                 self.daemon = Some(process);
             }
             Err(error) => {
-                self.notice = format!("{subject}, but daemon restart failed.");
+                self.notice = match self.language {
+                    TuiLanguage::English => {
+                        format!("{subject}, but daemon restart failed.")
+                    }
+                    TuiLanguage::Chinese => format!("{subject}，但 daemon 重启失败。"),
+                };
                 self.last_error = Some(error.to_string());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
             }
@@ -765,13 +1100,25 @@ impl TuiApp {
             &self.config.workspace_root,
         ) {
             Ok(()) => {
-                self.notice = format!("{subject} and auto-saved to {}.", config_path.display());
+                self.notice = match self.language {
+                    TuiLanguage::English => {
+                        format!("{subject} and auto-saved to {}.", config_path.display())
+                    }
+                    TuiLanguage::Chinese => {
+                        format!("{subject}，并已自动保存到 {}。", config_path.display())
+                    }
+                };
                 self.last_error = None;
                 self.push_log(self.notice.clone());
                 true
             }
             Err(error) => {
-                self.notice = format!("{subject}, but settings auto-save failed.");
+                self.notice = match self.language {
+                    TuiLanguage::English => {
+                        format!("{subject}, but settings auto-save failed.")
+                    }
+                    TuiLanguage::Chinese => format!("{subject}，但设置自动保存失败。"),
+                };
                 self.last_error = Some(error.to_string());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
                 false
@@ -835,11 +1182,18 @@ impl TuiApp {
         fs::write(&jsonl_path, jsonl)
             .with_context(|| format!("failed to write {}", jsonl_path.display()))?;
 
-        self.notice = format!(
-            "Auto-saved logs to {} and {}.",
-            text_path.display(),
-            jsonl_path.display()
-        );
+        self.notice = match self.language {
+            TuiLanguage::English => format!(
+                "Auto-saved logs to {} and {}.",
+                text_path.display(),
+                jsonl_path.display()
+            ),
+            TuiLanguage::Chinese => format!(
+                "日志已自动保存到 {} 和 {}。",
+                text_path.display(),
+                jsonl_path.display()
+            ),
+        };
         self.last_error = None;
         self.push_log(self.notice.clone());
         Ok(())
@@ -857,6 +1211,11 @@ impl TuiApp {
                     popup.area,
                 );
             }
+            if let Some(credentials) = &self.credentials {
+                let area = self.credentials_area(frame.area());
+                frame.render_widget(Clear, area);
+                frame.render_widget(self.credentials_widget(credentials), area);
+            }
             return;
         }
 
@@ -864,7 +1223,7 @@ impl TuiApp {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(11),
+                Constraint::Length(13),
                 Constraint::Min(10),
                 Constraint::Length(6),
                 Constraint::Length(4),
@@ -908,6 +1267,11 @@ impl TuiApp {
             frame.render_widget(Clear, area);
             frame.render_widget(self.folder_picker_widget(picker), area);
         }
+        if let Some(credentials) = &self.credentials {
+            let area = self.credentials_area(frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(self.credentials_widget(credentials), area);
+        }
     }
 
     fn render_observer(&self, frame: &mut Frame<'_>) {
@@ -942,11 +1306,17 @@ impl TuiApp {
     fn status_panel(&self) -> Paragraph<'_> {
         let process = self.daemon.as_ref();
         let status = if process.is_some() {
-            Span::styled("Running", Style::default().fg(Color::Green))
+            Span::styled(
+                self.text("Running", "运行中"),
+                Style::default().fg(Color::Green),
+            )
         } else if self.last_error.is_some() {
-            Span::styled("Failed", Style::default().fg(Color::Red))
+            Span::styled(self.text("Failed", "失败"), Style::default().fg(Color::Red))
         } else {
-            Span::styled("Stopped", Style::default().fg(Color::Yellow))
+            Span::styled(
+                self.text("Stopped", "已停止"),
+                Style::default().fg(Color::Yellow),
+            )
         };
         let uptime = process
             .and_then(|process| (Utc::now() - process.started_at).to_std().ok())
@@ -957,11 +1327,17 @@ impl TuiApp {
             .unwrap_or_else(|| "-".to_owned());
         let connection_state = if let Some(process) = process {
             Span::styled(
-                format!("daemon pid {} listening", process.pid),
+                match self.language {
+                    TuiLanguage::English => format!("daemon pid {} listening", process.pid),
+                    TuiLanguage::Chinese => format!("daemon 进程 {} 正在监听", process.pid),
+                },
                 Style::default().fg(Color::Cyan),
             )
         } else {
-            Span::styled("offline", Style::default().fg(Color::Yellow))
+            Span::styled(
+                self.text("offline", "离线"),
+                Style::default().fg(Color::Yellow),
+            )
         };
         let listen_host = process
             .map(|process| process.host.as_str())
@@ -983,40 +1359,74 @@ impl TuiApp {
             .filter(|token| !token.trim().is_empty());
         let token_line = match token {
             Some(token) => Line::from(vec![
-                Span::raw("Token: "),
+                Span::raw(self.text("Token: ", "令牌：")),
                 Span::styled(token.to_owned(), Style::default().fg(Color::Green)),
             ]),
             None => Line::from(vec![
-                Span::raw("Token: "),
-                Span::styled("not set", Style::default().fg(Color::Red)),
+                Span::raw(self.text("Token: ", "令牌：")),
+                Span::styled(
+                    self.text("not set", "未设置"),
+                    Style::default().fg(Color::Red),
+                ),
             ]),
         };
         let auth_state = if self.config.security.enable_auth {
-            Span::styled("enabled", Style::default().fg(Color::Yellow))
+            Span::styled(
+                self.text("enabled", "已启用"),
+                Style::default().fg(Color::Yellow),
+            )
         } else {
-            Span::styled("disabled", Style::default().fg(Color::Green))
+            Span::styled(
+                self.text("disabled", "已禁用"),
+                Style::default().fg(Color::Green),
+            )
         };
 
         Paragraph::new(vec![
-            Line::from(vec![Span::raw("Status: "), status]),
-            Line::from(format!("Listen: {listen_host}:{listen_port}")),
+            Line::from(vec![Span::raw(self.text("Status: ", "状态：")), status]),
+            Line::from(match self.language {
+                TuiLanguage::English => format!("Listen: {listen_host}:{listen_port}"),
+                TuiLanguage::Chinese => format!("监听：{listen_host}:{listen_port}"),
+            }),
             Line::from(format!(
                 "WS endpoint: ws://{listen_host}:{listen_port}/v2/ws"
             )),
-            Line::from(format!(
-                "Pairing encryption: {} (action e)",
-                pairing_encryption_label(self.config.pairing_encryption)
+            Line::from(match self.language {
+                TuiLanguage::English => format!(
+                    "Pairing encryption: {} (action e)",
+                    pairing_encryption_label(self.config.pairing_encryption)
+                ),
+                TuiLanguage::Chinese => format!(
+                    "配对加密：{}（操作 e）",
+                    pairing_encryption_label(self.config.pairing_encryption)
+                ),
+            }),
+            Line::from(self.text(
+                "Pairing QR: one-click link + auth token; app fetches protocol key",
+                "配对二维码：包含一键链接和认证令牌；应用会获取协议公钥",
             )),
-            Line::from("Pairing QR: one-click link + auth token; app fetches protocol key"),
-            Line::from(vec![Span::raw("Auth: "), auth_state]),
+            Line::from(vec![Span::raw(self.text("Auth: ", "认证：")), auth_state]),
             token_line,
-            Line::from(format!("Data dir: {}", data_dir.display())),
-            Line::from(format!(
-                "Workspace root: {} (action w)",
-                workspace_root.display()
-            )),
-            Line::from(format!("Uptime: {} | Daemon PID: {}", uptime, daemon_pid)),
-            Line::from(vec![Span::raw("Connection: "), connection_state]),
+            Line::from(match self.language {
+                TuiLanguage::English => format!("Data dir: {}", data_dir.display()),
+                TuiLanguage::Chinese => format!("数据目录：{}", data_dir.display()),
+            }),
+            Line::from(match self.language {
+                TuiLanguage::English => {
+                    format!("Workspace root: {} (action w)", workspace_root.display())
+                }
+                TuiLanguage::Chinese => {
+                    format!("工作区根目录：{}（操作 w）", workspace_root.display())
+                }
+            }),
+            Line::from(match self.language {
+                TuiLanguage::English => format!("Uptime: {uptime} | Daemon PID: {daemon_pid}"),
+                TuiLanguage::Chinese => format!("运行时间：{uptime} | Daemon PID：{daemon_pid}"),
+            }),
+            Line::from(vec![
+                Span::raw(self.text("Connection: ", "连接：")),
+                connection_state,
+            ]),
         ])
         .block(
             Block::default()
@@ -1028,7 +1438,9 @@ impl TuiApp {
 
     fn log_panel(&self, area: ratatui::layout::Rect) -> Paragraph<'_> {
         let lines = if self.live_logs.is_empty() {
-            vec![Line::from("No runtime events yet.")]
+            vec![Line::from(
+                self.text("No runtime events yet.", "暂无运行事件。"),
+            )]
         } else {
             self.live_logs
                 .iter()
@@ -1043,9 +1455,15 @@ impl TuiApp {
             self.log_scroll.min(max_scroll)
         };
         let title = if self.log_follow_tail {
-            format!("Live Logs [follow {}]", lines.len())
+            match self.language {
+                TuiLanguage::English => format!("Live Logs [follow {}]", lines.len()),
+                TuiLanguage::Chinese => format!("实时日志 [跟随 {}]", lines.len()),
+            }
         } else {
-            format!("Live Logs [{} / {}]", scroll, lines.len())
+            match self.language {
+                TuiLanguage::English => format!("Live Logs [{} / {}]", scroll, lines.len()),
+                TuiLanguage::Chinese => format!("实时日志 [{} / {}]", scroll, lines.len()),
+            }
         };
 
         Paragraph::new(lines)
@@ -1056,20 +1474,22 @@ impl TuiApp {
 
     fn action_panel(&self) -> List<'_> {
         let start_stop = if self.daemon.is_some() {
-            "Stop daemon"
+            self.text("Stop daemon", "停止 daemon")
         } else {
-            "Start daemon"
+            self.text("Start daemon", "启动 daemon")
         };
         let actions = [
             start_stop,
-            "Restart daemon",
-            "Edit listen IP",
-            "Edit listen port",
-            "Choose workspace root",
-            "Edit pairing encryption",
-            "Reset",
-            "Show pairing QR",
-            "Quit",
+            self.text("Restart daemon", "重启 daemon"),
+            self.text("Edit listen IP", "编辑监听 IP"),
+            self.text("Edit listen port", "编辑监听端口"),
+            self.text("Choose workspace root", "选择工作区根目录"),
+            self.text("Edit pairing encryption", "编辑配对加密"),
+            self.text("Reset", "重置"),
+            self.text("Show pairing QR", "显示配对二维码"),
+            self.text("Credentials & copy", "凭据与复制"),
+            self.text("Language: English", "语言：中文"),
+            self.text("Quit", "退出"),
         ];
         let items = actions
             .iter()
@@ -1091,36 +1511,129 @@ impl TuiApp {
             })
             .collect::<Vec<_>>();
 
-        List::new(items).block(Block::default().title("Actions").borders(Borders::ALL))
+        List::new(items).block(
+            Block::default()
+                .title(self.text("Actions", "操作"))
+                .borders(Borders::ALL),
+        )
     }
 
     fn help_panel(&self) -> Paragraph<'_> {
         let lines = vec![
-            Line::from("Use Up/Down or j/k to choose an action, Enter to run it."),
-            Line::from(
-                "Shortcuts: s start/stop, r restart, h host, p port, w workspace root, e encryption, x reset, g QR, o observer, q quit.",
-            ),
-            Line::from("Settings auto-save after edits. Logs auto-export when the TUI exits."),
-            Line::from("The TUI is only a controller; quitting leaves a running daemon online."),
+            Line::from(self.text(
+                "Use Up/Down or j/k to choose an action, Enter to run it.",
+                "使用上下方向键或 j/k 选择操作，按 Enter 执行。",
+            )),
+            Line::from(self.text(
+                "Shortcuts: s start/stop, r restart, h host, p port, w workspace, e encryption, x reset, g QR, c credentials, l language, o observer, q quit.",
+                "快捷键：s 启停、r 重启、h 主机、p 端口、w 工作区、e 加密、x 重置、g 二维码、c 凭据、l 语言、o 观察器、q 退出。",
+            )),
+            Line::from(self.text(
+                "Mouse drag selects terminal text. PageUp/PageDown/Home/End scroll logs.",
+                "鼠标拖动可选择终端文本；PageUp/PageDown/Home/End 滚动日志。",
+            )),
+            Line::from(self.text(
+                "Settings auto-save. Quitting leaves a running daemon online and exports logs.",
+                "设置会自动保存；退出时导出日志，已运行的 daemon 会保持在线。",
+            )),
         ];
 
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().title("Controls").borders(Borders::ALL))
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title(self.text("Controls", "控制"))
+                .borders(Borders::ALL),
+        )
     }
 
     fn message_panel(&self) -> Paragraph<'_> {
         let mut lines = vec![Line::from(self.notice.clone())];
         if let Some(error) = &self.last_error {
             lines.push(Line::from(vec![
-                Span::styled("Error: ", Style::default().fg(Color::Red)),
+                Span::styled(
+                    self.text("Error: ", "错误："),
+                    Style::default().fg(Color::Red),
+                ),
                 Span::raw(error.clone()),
             ]));
         }
 
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title(self.text("Messages", "消息"))
+                .borders(Borders::ALL),
+        )
+    }
+
+    fn credentials_area(&self, area: Rect) -> Rect {
+        centered_area(area, 96, 24)
+    }
+
+    fn credentials_widget(&self, credentials: &CredentialsPopup) -> Paragraph<'static> {
+        let selected = |index| {
+            if credentials.selected == index {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            }
+        };
+        let unavailable = self.text("Not available", "不可用").to_owned();
+        let token = credentials
+            .auth_token
+            .clone()
+            .unwrap_or_else(|| unavailable.clone());
+        let public_key = credentials
+            .public_key
+            .clone()
+            .unwrap_or_else(|| unavailable.clone());
+        let encryption = pairing_encryption_label(self.config.pairing_encryption);
+        let token_marker = if credentials.selected == 0 {
+            "> "
+        } else {
+            "  "
+        };
+        let key_marker = if credentials.selected == 1 {
+            "> "
+        } else {
+            "  "
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("{token_marker}{}", self.text("Auth Token", "认证令牌")),
+                selected(0),
+            )),
+            Line::from(token),
+            Line::from(""),
+            Line::from(Span::styled(
+                match self.language {
+                    TuiLanguage::English => {
+                        format!("{key_marker}Encryption public key ({encryption})")
+                    }
+                    TuiLanguage::Chinese => format!("{key_marker}加密公钥（{encryption}）"),
+                },
+                selected(1),
+            )),
+            Line::from(public_key),
+            Line::from(""),
+            Line::from(self.text(
+                "Up/Down selects. Enter or c copies. PageUp/PageDown scrolls. Esc closes.",
+                "上下方向键选择，Enter 或 c 复制，PageUp/PageDown 滚动，Esc 关闭。",
+            )),
+            Line::from(self.text(
+                "Only the public encryption key is shown; private keys never appear here.",
+                "这里只显示加密公钥，私钥绝不会在此展示。",
+            )),
+        ];
+
         Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().title("Messages").borders(Borders::ALL))
+            .scroll((credentials.scroll, 0))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(self.text("Credentials & Copy", "凭据与复制"))
+                    .borders(Borders::ALL),
+            )
     }
 
     fn edit_popup_area(&self, area: Rect, edit: &EditMode) -> Rect {
@@ -1138,35 +1651,11 @@ impl TuiApp {
                 field: EditField::Host,
                 value,
             } => (
-                "Edit Listen IP".to_owned(),
-                vec![
-                    Line::from(vec![
-                        Span::styled("Listen IP: ", Style::default().add_modifier(Modifier::BOLD)),
-                        Span::styled(
-                            if value.is_empty() {
-                                " ".to_owned()
-                            } else {
-                                value.clone()
-                            },
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]),
-                    Line::from(""),
-                    Line::from("IPv4 or IPv6 address only."),
-                    Line::from("Enter applies and auto-saves. Esc cancels."),
-                ],
-            ),
-            EditMode::Text {
-                field: EditField::Port,
-                value,
-            } => (
-                "Edit Listen Port".to_owned(),
+                self.text("Edit Listen IP", "编辑监听 IP").to_owned(),
                 vec![
                     Line::from(vec![
                         Span::styled(
-                            "Listen port: ",
+                            self.text("Listen IP: ", "监听 IP："),
                             Style::default().add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
@@ -1181,12 +1670,48 @@ impl TuiApp {
                         ),
                     ]),
                     Line::from(""),
-                    Line::from("Use a port from 1 to 65535."),
-                    Line::from("Enter applies and auto-saves. Esc cancels."),
+                    Line::from(
+                        self.text("IPv4 or IPv6 address only.", "仅支持 IPv4 或 IPv6 地址。"),
+                    ),
+                    Line::from(self.text(
+                        "Enter applies and auto-saves. Esc cancels.",
+                        "Enter 应用并自动保存，Esc 取消。",
+                    )),
+                ],
+            ),
+            EditMode::Text {
+                field: EditField::Port,
+                value,
+            } => (
+                self.text("Edit Listen Port", "编辑监听端口").to_owned(),
+                vec![
+                    Line::from(vec![
+                        Span::styled(
+                            self.text("Listen port: ", "监听端口："),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            if value.is_empty() {
+                                " ".to_owned()
+                            } else {
+                                value.clone()
+                            },
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from(self.text("Use a port from 1 to 65535.", "端口范围为 1 到 65535。")),
+                    Line::from(self.text(
+                        "Enter applies and auto-saves. Esc cancels.",
+                        "Enter 应用并自动保存，Esc 取消。",
+                    )),
                 ],
             ),
             EditMode::Encryption { value } => (
-                "Edit Pairing Encryption".to_owned(),
+                self.text("Edit Pairing Encryption", "编辑配对加密")
+                    .to_owned(),
                 vec![
                     Line::from(""),
                     Line::from(vec![
@@ -1212,12 +1737,18 @@ impl TuiApp {
                         ),
                     ]),
                     Line::from(""),
-                    Line::from("Left/Right switches the encryption method."),
-                    Line::from("Enter applies and auto-saves. Esc cancels."),
+                    Line::from(self.text(
+                        "Left/Right switches the encryption method.",
+                        "使用左右方向键切换加密方式。",
+                    )),
+                    Line::from(self.text(
+                        "Enter applies and auto-saves. Esc cancels.",
+                        "Enter 应用并自动保存，Esc 取消。",
+                    )),
                 ],
             ),
             EditMode::Reset { target } => (
-                "Reset".to_owned(),
+                self.text("Reset", "重置").to_owned(),
                 vec![
                     Line::from(""),
                     Line::from(vec![
@@ -1229,7 +1760,11 @@ impl TuiApp {
                         ),
                         Span::raw("  "),
                         Span::styled(
-                            reset_target_label(*target),
+                            match (self.language, target) {
+                                (TuiLanguage::Chinese, ResetTarget::Auth) => "认证",
+                                (TuiLanguage::Chinese, ResetTarget::Encryption) => "加密",
+                                _ => reset_target_label(*target),
+                            },
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
@@ -1243,9 +1778,23 @@ impl TuiApp {
                         ),
                     ]),
                     Line::from(""),
-                    Line::from(reset_target_description(*target)),
-                    Line::from("Enter resets the selected item. Esc cancels."),
-                    Line::from("A running daemon restarts automatically."),
+                    Line::from(match (self.language, target) {
+                        (TuiLanguage::Chinese, ResetTarget::Auth) => {
+                            "生成新的认证令牌并替换已保存的值。"
+                        }
+                        (TuiLanguage::Chinese, ResetTarget::Encryption) => {
+                            "重新生成 X25519 和 ML-KEM-768 配对密钥。"
+                        }
+                        _ => reset_target_description(*target),
+                    }),
+                    Line::from(self.text(
+                        "Enter resets the selected item. Esc cancels.",
+                        "Enter 重置所选项目，Esc 取消。",
+                    )),
+                    Line::from(self.text(
+                        "A running daemon restarts automatically.",
+                        "运行中的 daemon 会自动重启。",
+                    )),
                 ],
             ),
         };
@@ -1262,25 +1811,36 @@ impl TuiApp {
     fn folder_picker_widget(&self, picker: &FolderPicker) -> List<'static> {
         let mut items = Vec::new();
         items.push(ListItem::new(Line::from(vec![
-            Span::styled("Current: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                self.text("Current: ", "当前目录："),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 picker.current.display().to_string(),
                 Style::default().fg(Color::Cyan),
             ),
         ])));
         items.push(ListItem::new(Line::from(
-            "Space selects current. Enter/Right opens selected. Left/Backspace goes parent. Home jumps home.",
+            self.text(
+                "Space selects current. Enter/Right opens selected. Left/Backspace goes parent. Home jumps home.",
+                "Space 选择当前目录；Enter/右键打开所选目录；左键/Backspace 返回上级；Home 返回主目录。",
+            ),
         )));
         if let Some(error) = &picker.error {
             items.push(ListItem::new(Line::from(vec![
-                Span::styled("Error: ", Style::default().fg(Color::Red)),
+                Span::styled(
+                    self.text("Error: ", "错误："),
+                    Style::default().fg(Color::Red),
+                ),
                 Span::raw(error.clone()),
             ])));
         }
         items.push(ListItem::new(Line::from("")));
 
         if picker.entries.is_empty() {
-            items.push(ListItem::new(Line::from("No readable subdirectories.")));
+            items.push(ListItem::new(Line::from(
+                self.text("No readable subdirectories.", "没有可读取的子目录。"),
+            )));
         } else {
             for (idx, entry) in picker.entries.iter().enumerate() {
                 let marker = if idx == picker.selected { "> " } else { "  " };
@@ -1300,7 +1860,7 @@ impl TuiApp {
 
         List::new(items).block(
             Block::default()
-                .title("Choose Workspace Root")
+                .title(self.text("Choose Workspace Root", "选择工作区根目录"))
                 .borders(Borders::ALL),
         )
     }
@@ -1326,13 +1886,21 @@ impl TuiApp {
 
     fn pairing_qr_popup(&self, area: Rect) -> PairingQrPopup {
         let title = match self.pairing_qr.as_ref() {
-            Some(qr) if qr.payloads.len() > 1 => format!(
-                "Pairing QR {}/{} - Left/Right switch, Esc closes",
-                qr.active_index + 1,
-                qr.payloads.len()
-            ),
-            Some(_) => "Pairing QR - any key closes".to_owned(),
-            None => "Pairing QR - any key closes".to_owned(),
+            Some(qr) if qr.payloads.len() > 1 => match self.language {
+                TuiLanguage::English => format!(
+                    "Pairing QR {}/{} - Left/Right switch, Esc closes",
+                    qr.active_index + 1,
+                    qr.payloads.len()
+                ),
+                TuiLanguage::Chinese => format!(
+                    "配对二维码 {}/{} - 左右键切换，Esc 关闭",
+                    qr.active_index + 1,
+                    qr.payloads.len()
+                ),
+            },
+            Some(_) | None => self
+                .text("Pairing QR - any key closes", "配对二维码 - 按任意键关闭")
+                .to_owned(),
         };
         let max_popup_width = area
             .width
@@ -1354,10 +1922,14 @@ impl TuiApp {
 
     fn pairing_qr_lines(&self, max_width: u16, max_height: u16) -> Vec<Line<'static>> {
         let Some(qr) = self.pairing_qr.as_ref() else {
-            return vec![Line::from("Failed to render pairing QR.")];
+            return vec![Line::from(
+                self.text("Failed to render pairing QR.", "无法生成配对二维码。"),
+            )];
         };
         let Some(payload) = qr.payloads.get(qr.active_index) else {
-            return vec![Line::from("Failed to render pairing QR.")];
+            return vec![Line::from(
+                self.text("Failed to render pairing QR.", "无法生成配对二维码。"),
+            )];
         };
         match render_qr_text_for_bounds(payload, max_width, max_height) {
             Ok(rendered) if rendered.width <= max_width && rendered.height <= max_height => {
@@ -1368,15 +1940,27 @@ impl TuiApp {
                     .collect()
             }
             Ok(rendered) => vec![
-                Line::from("Terminal is too small for the pairing QR."),
-                Line::from(format!(
-                    "Need at least {}x{} cells for the compact code.",
-                    rendered.width, rendered.height
+                Line::from(self.text(
+                    "Terminal is too small for the pairing QR.",
+                    "终端尺寸太小，无法显示配对二维码。",
                 )),
-                Line::from("Resize the window and it will redraw automatically."),
+                Line::from(match self.language {
+                    TuiLanguage::English => format!(
+                        "Need at least {}x{} cells for the compact code.",
+                        rendered.width, rendered.height
+                    ),
+                    TuiLanguage::Chinese => format!(
+                        "紧凑二维码至少需要 {}x{} 个字符单元。",
+                        rendered.width, rendered.height
+                    ),
+                }),
+                Line::from(self.text(
+                    "Resize the window and it will redraw automatically.",
+                    "调整窗口大小后会自动重绘。",
+                )),
             ],
             Err(error) => vec![
-                Line::from("Failed to render pairing QR."),
+                Line::from(self.text("Failed to render pairing QR.", "无法生成配对二维码。")),
                 Line::from(error.to_string()),
             ],
         }
@@ -1400,9 +1984,9 @@ impl TuiApp {
 
     fn observer_summary_panel(&self, state: &ObserverState) -> Paragraph<'_> {
         let runtime_state = if self.daemon.is_some() {
-            "running"
+            self.text("running", "运行中")
         } else {
-            "stopped"
+            self.text("stopped", "已停止")
         };
         let selected = state
             .sessions
@@ -1413,28 +1997,47 @@ impl TuiApp {
         Paragraph::new(vec![
             Line::from(vec![
                 Span::styled(
-                    "Observer ",
+                    self.text("Observer ", "观察器 "),
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("read-only view for this TUI session"),
+                Span::raw(self.text(
+                    "read-only view for this TUI session",
+                    "当前 TUI 会话的只读视图",
+                )),
             ]),
-            Line::from(format!(
-                "Service: {runtime_state} | Sessions: {} | Active tasks: {} | Pending requests: {} | Events: {}",
-                state.sessions.len(),
-                state.active_task_count,
-                state.pending_request_count,
-                self.live_events.len()
+            Line::from(match self.language {
+                TuiLanguage::English => format!(
+                    "Service: {runtime_state} | Sessions: {} | Active tasks: {} | Pending requests: {} | Events: {}",
+                    state.sessions.len(), state.active_task_count, state.pending_request_count, self.live_events.len()
+                ),
+                TuiLanguage::Chinese => format!(
+                    "服务：{runtime_state} | 会话：{} | 活跃任务：{} | 待处理请求：{} | 事件：{}",
+                    state.sessions.len(), state.active_task_count, state.pending_request_count, self.live_events.len()
+                ),
+            }),
+            Line::from(match self.language {
+                TuiLanguage::English => format!("Selected session: {selected}"),
+                TuiLanguage::Chinese => format!("所选会话：{selected}"),
+            }),
+            Line::from(self.text(
+                "No service commands are available on this page.",
+                "此页面不提供服务控制命令。",
             )),
-            Line::from(format!("Selected session: {selected}")),
-            Line::from("No service commands are available on this page."),
         ])
         .wrap(Wrap { trim: true })
-        .block(Block::default().title("Session Observer").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(self.text("Session Observer", "会话观察器"))
+                .borders(Borders::ALL),
+        )
     }
 
     fn session_panel(&self, state: &ObserverState) -> List<'_> {
         let items = if state.sessions.is_empty() {
-            vec![ListItem::new(Line::from("No Codex session events yet."))]
+            vec![ListItem::new(Line::from(self.text(
+                "No Codex session events yet.",
+                "暂无 Codex 会话事件。",
+            )))]
         } else {
             state
                 .sessions
@@ -1456,27 +2059,40 @@ impl TuiApp {
                     ListItem::new(Line::from(vec![
                         Span::raw(marker),
                         Span::raw(truncate_text(&session.session_id, 22)),
-                        Span::raw(format!(
-                            " {} ev {} turn {} req",
-                            session.event_count,
-                            session.turns.len(),
-                            session.pending_request_count()
-                        )),
+                        Span::raw(match self.language {
+                            TuiLanguage::English => format!(
+                                " {} ev {} turn {} req",
+                                session.event_count,
+                                session.turns.len(),
+                                session.pending_request_count()
+                            ),
+                            TuiLanguage::Chinese => format!(
+                                " {} 事件 {} 轮次 {} 请求",
+                                session.event_count,
+                                session.turns.len(),
+                                session.pending_request_count()
+                            ),
+                        }),
                     ]))
                     .style(style)
                 })
                 .collect()
         };
 
-        List::new(items).block(Block::default().title("Sessions").borders(Borders::ALL))
+        List::new(items).block(
+            Block::default()
+                .title(self.text("Sessions", "会话"))
+                .borders(Borders::ALL),
+        )
     }
 
     fn session_detail_panel(&self, state: &ObserverState, area: Rect) -> Paragraph<'_> {
         let lines = match state.sessions.get(self.selected_session) {
-            Some(session) => session_detail_lines(session),
-            None => vec![Line::from(
+            Some(session) => session_detail_lines(session, self.language),
+            None => vec![Line::from(self.text(
                 "Start or connect a client to populate this observer.",
-            )],
+                "启动或连接客户端后，此观察器将显示会话内容。",
+            ))],
         };
         let content_height = area.height.saturating_sub(2) as usize;
         let max_scroll = lines.len().saturating_sub(content_height);
@@ -1488,20 +2104,35 @@ impl TuiApp {
             .wrap(Wrap { trim: true })
             .block(
                 Block::default()
-                    .title(format!(
-                        "History / Conversation / Current Tasks [{line_count}]"
-                    ))
+                    .title(match self.language {
+                        TuiLanguage::English => {
+                            format!("History / Conversation / Current Tasks [{line_count}]")
+                        }
+                        TuiLanguage::Chinese => {
+                            format!("历史 / 对话 / 当前任务 [{line_count}]")
+                        }
+                    })
                     .borders(Borders::ALL),
             )
     }
 
     fn observer_help_panel(&self) -> Paragraph<'_> {
         Paragraph::new(vec![
-            Line::from("Read-only navigation: Up/Down selects session, PageUp/PageDown scrolls details, Home/End jumps."),
-            Line::from("q, Esc, o, or Tab returns to the control view. This page does not start, stop, approve, or send anything."),
+            Line::from(self.text(
+                "Read-only navigation: Up/Down selects session, PageUp/PageDown scrolls details, Home/End jumps.",
+                "只读导航：上下方向键选择会话，PageUp/PageDown 滚动详情，Home/End 跳转。",
+            )),
+            Line::from(self.text(
+                "q, Esc, o, or Tab returns to the control view. This page does not start, stop, approve, or send anything.",
+                "按 q、Esc、o 或 Tab 返回控制视图；本页不会启停、审批或发送任何内容。",
+            )),
         ])
         .wrap(Wrap { trim: true })
-        .block(Block::default().title("Observer Controls").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(self.text("Observer Controls", "观察器控制"))
+                .borders(Borders::ALL),
+        )
     }
 }
 
@@ -1769,60 +2400,99 @@ impl ObservedRequestStatus {
     }
 }
 
-fn session_detail_lines(session: &ObservedSession) -> Vec<Line<'static>> {
+fn session_detail_lines(session: &ObservedSession, language: TuiLanguage) -> Vec<Line<'static>> {
+    let text = |english: &'static str, chinese: &'static str| language.text(english, chinese);
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("Session: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            text("Session: ", "会话："),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::raw(session.session_id.clone()),
     ]));
-    lines.push(Line::from(format!(
-        "First event: {} | Last event: {} | Events: {}",
-        session.first_time.format("%H:%M:%S"),
-        session.last_time.format("%H:%M:%S"),
-        session.event_count
-    )));
-    lines.push(Line::from(format!(
-        "Adapter: {} | In-flight: {} | Child PID: {}",
-        session.adapter_state.as_deref().unwrap_or("-"),
-        session.in_flight_command_id.as_deref().unwrap_or("-"),
-        session.child_pid.as_deref().unwrap_or("-")
-    )));
-    lines.push(Line::from(format!(
-        "Threads: {} | Turns: {} | Pending requests: {} | Cloud tasks: {}",
-        session.threads.len(),
-        session.turns.len(),
-        session.pending_request_count(),
-        session.cloud_tasks.len()
-    )));
+    lines.push(Line::from(match language {
+        TuiLanguage::English => format!(
+            "First event: {} | Last event: {} | Events: {}",
+            session.first_time.format("%H:%M:%S"),
+            session.last_time.format("%H:%M:%S"),
+            session.event_count
+        ),
+        TuiLanguage::Chinese => format!(
+            "首个事件：{} | 最近事件：{} | 事件数：{}",
+            session.first_time.format("%H:%M:%S"),
+            session.last_time.format("%H:%M:%S"),
+            session.event_count
+        ),
+    }));
+    lines.push(Line::from(match language {
+        TuiLanguage::English => format!(
+            "Adapter: {} | In-flight: {} | Child PID: {}",
+            session.adapter_state.as_deref().unwrap_or("-"),
+            session.in_flight_command_id.as_deref().unwrap_or("-"),
+            session.child_pid.as_deref().unwrap_or("-")
+        ),
+        TuiLanguage::Chinese => format!(
+            "适配器：{} | 执行中：{} | 子进程 PID：{}",
+            session.adapter_state.as_deref().unwrap_or("-"),
+            session.in_flight_command_id.as_deref().unwrap_or("-"),
+            session.child_pid.as_deref().unwrap_or("-")
+        ),
+    }));
+    lines.push(Line::from(match language {
+        TuiLanguage::English => format!(
+            "Threads: {} | Turns: {} | Pending requests: {} | Cloud tasks: {}",
+            session.threads.len(),
+            session.turns.len(),
+            session.pending_request_count(),
+            session.cloud_tasks.len()
+        ),
+        TuiLanguage::Chinese => format!(
+            "线程：{} | 轮次：{} | 待处理请求：{} | 云任务：{}",
+            session.threads.len(),
+            session.turns.len(),
+            session.pending_request_count(),
+            session.cloud_tasks.len()
+        ),
+    }));
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Current Running Tasks",
+        text("Current Running Tasks", "当前运行任务"),
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
     let mut active_lines = Vec::new();
     if let Some(command_id) = &session.in_flight_command_id {
-        active_lines.push(format!("command in flight: {command_id}"));
+        active_lines.push(match language {
+            TuiLanguage::English => format!("command in flight: {command_id}"),
+            TuiLanguage::Chinese => format!("执行中的命令：{command_id}"),
+        });
     }
     active_lines.extend(
         session
             .turns
             .values()
             .filter(|turn| turn.status.is_active())
-            .map(|turn| format!("turn {} ({})", turn.turn_id, turn.last_event)),
+            .map(|turn| match language {
+                TuiLanguage::English => format!("turn {} ({})", turn.turn_id, turn.last_event),
+                TuiLanguage::Chinese => format!("轮次 {}（{}）", turn.turn_id, turn.last_event),
+            }),
     );
     active_lines.extend(
         session
             .requests
             .values()
             .filter(|request| request.status == ObservedRequestStatus::Pending)
-            .map(|request| {
-                format!(
+            .map(|request| match language {
+                TuiLanguage::English => format!(
                     "pending request {} ({})",
                     request.request_id, request.request_type
-                )
+                ),
+                TuiLanguage::Chinese => format!(
+                    "待处理请求 {}（{}）",
+                    request.request_id, request.request_type
+                ),
             }),
     );
     active_lines.extend(
@@ -1830,23 +2500,32 @@ fn session_detail_lines(session: &ObservedSession) -> Vec<Line<'static>> {
             .cloud_tasks
             .iter()
             .filter(|(_, status)| !terminal_status(status))
-            .map(|(task_id, status)| format!("cloud task {task_id} ({status})")),
+            .map(|(task_id, status)| match language {
+                TuiLanguage::English => format!("cloud task {task_id} ({status})"),
+                TuiLanguage::Chinese => format!("云任务 {task_id}（{status}）"),
+            }),
     );
     if active_lines.is_empty() {
-        lines.push(Line::from("No active task inferred from current events."));
+        lines.push(Line::from(text(
+            "No active task inferred from current events.",
+            "当前事件中未发现活跃任务。",
+        )));
     } else {
         lines.extend(active_lines.into_iter().map(Line::from));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Conversation Records",
+        text("Conversation Records", "对话记录"),
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
     if session.conversation.is_empty() {
-        lines.push(Line::from("No conversation item events observed yet."));
+        lines.push(Line::from(text(
+            "No conversation item events observed yet.",
+            "尚未观察到对话项目事件。",
+        )));
     } else {
         lines.extend(
             session
@@ -1858,13 +2537,16 @@ fn session_detail_lines(session: &ObservedSession) -> Vec<Line<'static>> {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Plans",
+        text("Plans", "计划"),
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
     if session.plans.is_empty() {
-        lines.push(Line::from("No plan updates observed yet."));
+        lines.push(Line::from(text(
+            "No plan updates observed yet.",
+            "尚未观察到计划更新。",
+        )));
     } else {
         lines.extend(
             session
@@ -1878,13 +2560,16 @@ fn session_detail_lines(session: &ObservedSession) -> Vec<Line<'static>> {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Requests",
+        text("Requests", "请求"),
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
     if session.requests.is_empty() {
-        lines.push(Line::from("No request records observed yet."));
+        lines.push(Line::from(text(
+            "No request records observed yet.",
+            "尚未观察到请求记录。",
+        )));
     } else {
         lines.extend(session.requests.values().map(|request| {
             Line::from(format!(
@@ -1898,7 +2583,7 @@ fn session_detail_lines(session: &ObservedSession) -> Vec<Line<'static>> {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Full Event History",
+        text("Full Event History", "完整事件历史"),
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -2385,7 +3070,10 @@ fn previous_reset_target(target: ResetTarget) -> ResetTarget {
 mod tests {
     use serde_json::json;
 
-    use super::{validate_host, validate_port, ObservedRequestStatus, ObserverState};
+    use super::{
+        validate_host, validate_port, ObservedRequestStatus, ObserverState, TuiLanguage,
+        ACTION_COUNT,
+    };
     use crate::event::EventRecord;
 
     #[test]
@@ -2411,6 +3099,17 @@ mod tests {
         assert!(validate_port("0").is_err());
         assert!(validate_port("65536").is_err());
         assert!(validate_port("abc").is_err());
+    }
+
+    #[test]
+    fn tui_language_parses_persisted_values() {
+        assert_eq!(TuiLanguage::parse("zh-CN"), Some(TuiLanguage::Chinese));
+        assert_eq!(TuiLanguage::parse("zh-tw"), Some(TuiLanguage::Chinese));
+        assert_eq!(TuiLanguage::parse("en"), Some(TuiLanguage::English));
+        assert_eq!(TuiLanguage::parse("invalid"), None);
+        assert_eq!(TuiLanguage::Chinese.as_str(), "zh-CN");
+        assert_eq!(TuiLanguage::English.as_str(), "en");
+        assert_eq!(ACTION_COUNT, 11);
     }
 
     #[test]

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 agent-client-protocol = "2.0"
 anyhow = "1"
+arboard = { version = "3", default-features = false }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"

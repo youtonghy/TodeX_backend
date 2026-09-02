@@ -16,7 +16,7 @@ use crate::transport_crypto::PairingKeys;
 
 const PID_FILE_NAME: &str = "daemon.json";
 const LOG_FILE_NAME: &str = "todex-agentd-daemon.log";
-const START_TIMEOUT: Duration = Duration::from_secs(8);
+const START_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 const STOP_FORCE_AFTER: Duration = Duration::from_secs(8);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -44,6 +44,13 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
         return Ok(process);
     }
     remove_stale_pid_file(&config.data_dir)?;
+    if port_is_listening(&config.host, config.port) {
+        bail!(
+            "cannot start daemon because {}:{} is already in use by an unmanaged process; stop that service or choose another port",
+            config.host,
+            config.port
+        );
+    }
 
     fs::create_dir_all(log_dir(&config.data_dir)).with_context(|| {
         format!(
@@ -637,6 +644,15 @@ fn daemon_health_check(process: &DaemonProcess) -> bool {
     }
 }
 
+fn port_is_listening(host: &str, port: u16) -> bool {
+    if port == 0 {
+        return false;
+    }
+    health_addr(host, port)
+        .and_then(|addr| TcpStream::connect_timeout(&addr, HEALTH_TIMEOUT).ok())
+        .is_some()
+}
+
 fn health_addr(host: &str, port: u16) -> Option<SocketAddr> {
     let host = match host {
         "0.0.0.0" => "127.0.0.1",
@@ -671,18 +687,31 @@ impl Drop for PidFileGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs};
+    use std::{env, fs, net::TcpListener};
 
     #[cfg(unix)]
     use std::{process::Command, thread, time::Duration};
 
     #[cfg(target_os = "linux")]
     use super::process_has_exited;
-    use super::{pid_file_path, process_is_running, process_matches_record, status, DaemonProcess};
+    use super::{
+        pid_file_path, port_is_listening, process_is_running, process_matches_record, status,
+        DaemonProcess,
+    };
     #[cfg(unix)]
     use super::{process_liveness, ProcessLiveness};
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use chrono::Utc;
+
+    #[test]
+    fn port_preflight_detects_an_existing_listener() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let port = listener.local_addr().expect("listener address").port();
+
+        assert!(port_is_listening("127.0.0.1", port));
+        assert!(port_is_listening("0.0.0.0", port));
+        assert!(!port_is_listening("127.0.0.1", 0));
+    }
 
     #[test]
     fn status_reports_current_process_from_pid_file() {

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::Args;
 use serde::{Deserialize, Serialize};
-use toml_edit::{value, DocumentMut};
+use toml_edit::{value, DocumentMut, Item, Table};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Args)]
@@ -286,6 +286,25 @@ impl Config {
         document["security"]["auth_token"] = value(auth_token);
         write_config_document(&data_dir, &document)?;
         Ok(())
+    }
+
+    pub fn load_tui_language(data_dir: &Path) -> anyhow::Result<Option<String>> {
+        let document = load_config_document(&data_dir.to_path_buf())?;
+        Ok(document
+            .get("tui")
+            .and_then(|item| item.get("language"))
+            .and_then(|item| item.as_str())
+            .map(ToOwned::to_owned))
+    }
+
+    pub fn save_tui_language(data_dir: PathBuf, language: &str) -> anyhow::Result<()> {
+        let data_dir = expand_home(data_dir);
+        let mut document = load_config_document(&data_dir)?;
+        if !document.get("tui").is_some_and(Item::is_table) {
+            document.insert("tui", Item::Table(Table::new()));
+        }
+        document["tui"]["language"] = value(language);
+        write_config_document(&data_dir, &document)
     }
 
     pub fn reset_auth_token(data_dir: PathBuf) -> anyhow::Result<String> {
@@ -579,6 +598,31 @@ codex_bin = "codex"
         assert!(updated.contains("custom_value = \"kept\""));
         assert!(updated.contains("[agent]"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_tui_language_round_trips_and_preserves_existing_sections() {
+        let root =
+            env::temp_dir().join(format!("todex-config-language-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp config dir");
+        fs::write(
+            root.join("config.toml"),
+            "custom_value = \"kept\"\n\n[agent]\ndefault_agent = \"pi\"\n",
+        )
+        .expect("write config");
+
+        Config::save_tui_language(root.clone(), "zh-CN").expect("save language");
+
+        assert_eq!(
+            Config::load_tui_language(&root).expect("load language"),
+            Some("zh-CN".to_owned())
+        );
+        let updated = fs::read_to_string(root.join("config.toml")).expect("read config");
+        assert!(updated.contains("custom_value = \"kept\""));
+        assert!(updated.contains("[agent]"));
+        assert!(updated.contains("[tui]"));
         let _ = fs::remove_dir_all(root);
     }
 

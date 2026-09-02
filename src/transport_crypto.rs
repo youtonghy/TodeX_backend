@@ -78,6 +78,14 @@ impl PairingKeys {
         Ok(keys)
     }
 
+    pub(crate) fn pairing_public_key(&self, encryption: PairingEncryption) -> Option<String> {
+        match encryption {
+            PairingEncryption::None => None,
+            PairingEncryption::X25519 => Some(encode_b64(&self.x25519_public)),
+            PairingEncryption::MlKem768 => Some(encode_b64(&self.ml_kem_public)),
+        }
+    }
+
     async fn persist(&self, path: &Path) -> Result<(), AppError> {
         let persisted = PersistedPairingKeys {
             version: PAIRING_VERSION,
@@ -769,6 +777,25 @@ mod tests {
         assert!(
             max_width <= 80,
             "x25519 pairing QR should fit common terminal widths, got {max_width}"
+        );
+    }
+
+    #[test]
+    fn pairing_public_key_returns_only_the_selected_public_material() {
+        let keys = PairingKeys::generate();
+
+        assert_eq!(keys.pairing_public_key(PairingEncryption::None), None);
+        assert_eq!(
+            keys.pairing_public_key(PairingEncryption::X25519),
+            Some(encode_b64(&keys.x25519_public))
+        );
+        assert_eq!(
+            keys.pairing_public_key(PairingEncryption::MlKem768),
+            Some(encode_b64(&keys.ml_kem_public))
+        );
+        assert_ne!(
+            keys.pairing_public_key(PairingEncryption::X25519),
+            Some(encode_b64(&keys.x25519_secret.to_bytes()))
         );
     }
 
