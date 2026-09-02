@@ -9,6 +9,7 @@ use tokio::sync::watch;
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
+use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{run_acp_turn, AcpRuntimeOptions};
 use super::process::{
@@ -154,10 +155,13 @@ impl ProviderDriver for GrokBuildDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         mut cancel: watch::Receiver<bool>,
+        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
-        let mut process =
-            JsonLineProcess::spawn(&self.command_spec(&context.manifest.workspace, Some(&prompt)))
-                .await?;
+        let mut process = JsonLineProcess::spawn_trusted(
+            &self.command_spec(&context.manifest.workspace, Some(&prompt)),
+            launch_permit,
+        )
+        .await?;
         let result = run_acp_turn(
             &mut process,
             context,

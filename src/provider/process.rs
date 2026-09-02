@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 use crate::error::AppError;
+use crate::workspace_trust::WorkspaceTrustPermit;
 
 const MAX_PROTOCOL_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
@@ -110,6 +111,15 @@ impl JsonLineProcess {
             stderr_task,
             pid,
         })
+    }
+
+    pub async fn spawn_trusted(
+        spec: &CommandSpec,
+        permit: WorkspaceTrustPermit,
+    ) -> Result<Self, AppError> {
+        let process = Self::spawn(spec).await?;
+        drop(permit);
+        Ok(process)
     }
 
     pub async fn send(&mut self, value: &Value) -> Result<(), AppError> {

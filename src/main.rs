@@ -18,7 +18,7 @@ mod workspace_store;
 mod workspace_trust;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::config::{Config, ServeArgs};
 use crate::server_runner::ManagedServer;
@@ -41,6 +41,11 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    #[command(about = "Run read-only backend diagnostics")]
+    Doctor {
+        #[command(subcommand)]
+        command: DoctorCommand,
+    },
     #[command(name = "daemon-run", hide = true)]
     DaemonRun(ServeArgs),
 }
@@ -55,6 +60,24 @@ enum DaemonCommand {
     Restart(ServeArgs),
     #[command(about = "Show backend daemon status")]
     Status(ServeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum DoctorCommand {
+    #[command(about = "Check Codex and Pi installation, login, and RPC discovery")]
+    Providers(ProviderDoctorArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProviderDoctorArgs {
+    #[arg(long, value_delimiter = ',', default_value = "codex,pi")]
+    provider: Vec<String>,
+    #[arg(long)]
+    data_dir: Option<std::path::PathBuf>,
+    #[arg(long)]
+    workspace_root: Option<std::path::PathBuf>,
+    #[arg(long, default_value = "json")]
+    format: String,
 }
 
 #[tokio::main]
@@ -74,11 +97,36 @@ async fn main() -> anyhow::Result<()> {
             init_serve_logging();
             daemon_command(command).await
         }
+        Command::Doctor { command } => doctor_command(command).await,
         Command::DaemonRun(args) => {
             init_serve_logging();
             daemon_run(args).await
         }
     }
+}
+
+async fn doctor_command(command: DoctorCommand) -> anyhow::Result<()> {
+    match command {
+        DoctorCommand::Providers(args) => {
+            if args.format != "json" {
+                anyhow::bail!("doctor providers currently supports only --format json");
+            }
+            let config = Config::load_read_only(ServeArgs {
+                host: None,
+                port: None,
+                data_dir: args.data_dir,
+                workspace_root: args.workspace_root,
+                history_retention_days: None,
+            })
+            .context("failed to read configuration")?;
+            let report = provider::inspect_providers(&config, &args.provider).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.success {
+                anyhow::bail!("one or more provider checks failed");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn init_serve_logging() {

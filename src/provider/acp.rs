@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use crate::config::{AcpProfileConfig, AgentConfig};
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
+use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process::{
     executable_available, provider_exit_error, redact_sensitive_text, CommandSpec, JsonLineProcess,
@@ -104,6 +105,7 @@ impl ProviderDriver for AcpDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         mut cancel: watch::Receiver<bool>,
+        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         let profile = self.profile(&context)?;
         let mut spec = CommandSpec::new(&profile.command, &context.manifest.workspace);
@@ -114,7 +116,7 @@ impl ProviderDriver for AcpDriver {
             .filter(|(key, _)| !key.starts_with("TODEX_AGENTD_"))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let mut process = JsonLineProcess::spawn(&spec).await?;
+        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
         let result = run_acp_turn(
             &mut process,
             context,

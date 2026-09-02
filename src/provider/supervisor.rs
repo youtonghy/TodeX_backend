@@ -216,8 +216,9 @@ impl ConversationSupervisor {
         provider: ProviderKind,
         workspace: &Path,
     ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
-        self.workspace_trust
-            .ensure_trusted(owner_id, workspace)
+        let _launch_permit = self
+            .workspace_trust
+            .acquire_owned(owner_id, workspace)
             .await?;
         tokio::time::timeout(
             Duration::from_secs(8),
@@ -238,8 +239,9 @@ impl ConversationSupervisor {
         provider: ProviderKind,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
-        self.workspace_trust
-            .ensure_trusted(owner_id, workspace)
+        let _launch_permit = self
+            .workspace_trust
+            .acquire_owned(owner_id, workspace)
             .await?;
         tokio::time::timeout(
             Duration::from_secs(8),
@@ -509,6 +511,18 @@ impl ConversationSupervisor {
             }
         }
 
+        let launch_permit = match self
+            .workspace_trust
+            .acquire_owned(owner_id, &manifest.workspace)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.active.remove(conversation_id);
+                return Err(error);
+            }
+        };
+
         if let Err(error) = self
             .emit(
                 conversation_id,
@@ -589,6 +603,7 @@ impl ConversationSupervisor {
                     },
                     sink,
                     cancel_rx,
+                    launch_permit,
                 )
                 .await;
             match result {
@@ -1327,6 +1342,131 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pi_launches_only_after_workspace_trust_and_keeps_full_auto_argv() {
+        let root = temp_dir("todex-pi-trust-contract");
+        let data_dir = root.join("data");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace_root = fs::canonicalize(workspace_root).unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let marker = root.join("pi-launches.log");
+        let fixture = write_pi_launch_fixture(&root, &marker);
+        let fixture_text = fixture.to_string_lossy().to_string();
+        let config = Arc::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir,
+            workspace_root,
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "pi".to_owned(),
+                codex_bin: fixture_text.clone(),
+                claude_bin: fixture_text.clone(),
+                pi_bin: fixture_text.clone(),
+                grok_bin: fixture_text,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+                auth_token: Some("token".to_owned()),
+            },
+        });
+        let store = ConversationStore::new(config.data_dir.clone())
+            .await
+            .unwrap();
+        let trust = trust_store(&config, "local", None).await;
+        let supervisor = ConversationSupervisor::new(
+            config,
+            store.clone(),
+            ConversationEventHub::default(),
+            trust.clone(),
+        );
+        let manifest = supervisor
+            .create(ProviderKind::Pi, workspace.clone(), None, None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            supervisor
+                .models_live("local", ProviderKind::Pi, &workspace)
+                .await,
+            Err(AppError::WorkspaceTrustRequired(_))
+        ));
+        assert!(matches!(
+            supervisor
+                .commands_live("local", ProviderKind::Pi, &workspace)
+                .await,
+            Err(AppError::WorkspaceTrustRequired(_))
+        ));
+        assert!(matches!(
+            supervisor
+                .prompt(&manifest.id, "before trust".to_owned(), None)
+                .await,
+            Err(AppError::WorkspaceTrustRequired(_))
+        ));
+        assert!(!marker.exists(), "untrusted Pi must not be spawned");
+
+        trust.set_owned("local", &workspace, true).await.unwrap();
+        supervisor
+            .models_live("local", ProviderKind::Pi, &workspace)
+            .await
+            .unwrap();
+        supervisor
+            .commands_live("local", ProviderKind::Pi, &workspace)
+            .await
+            .unwrap();
+        supervisor
+            .prompt(&manifest.id, "after trust".to_owned(), None)
+            .await
+            .unwrap();
+        let replay = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let replay = supervisor.replay(&manifest.id, 0, 100).await.unwrap();
+                if replay
+                    .events
+                    .iter()
+                    .any(|event| event.event_type == "turn.completed")
+                {
+                    break replay;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!replay
+            .events
+            .iter()
+            .any(|event| event.event_type == "permission.requested"));
+        assert!(
+            !supervisor
+                .providers()
+                .into_iter()
+                .find(|descriptor| descriptor.id == ProviderKind::Pi)
+                .unwrap()
+                .capabilities
+                .permissions
+        );
+
+        let launches = fs::read_to_string(&marker).unwrap();
+        let launches = launches.lines().collect::<Vec<_>>();
+        assert_eq!(launches.len(), 3, "unexpected Pi launches: {launches:?}");
+        assert!(launches.iter().all(|args| {
+            args.split_whitespace()
+                .filter(|arg| *arg == "--approve")
+                .count()
+                == 1
+        }));
+        supervisor.shutdown_all().await;
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn conversation_owner_scope_prevents_cross_owner_access() {
@@ -1511,6 +1651,8 @@ elif [ "$mode" = "app-server" ]; then
       *'"method":"initialize"'*)
         printf '{"id":"initialize","result":{}}\n'
         ;;
+      *'"method":"initialized"'*)
+        ;;
       *'"method":"thread/start"'*)
         printf '{"id":"thread","result":{"thread":{"id":"codex-native"}}}\n'
         ;;
@@ -1548,6 +1690,43 @@ fi
 "#,
         )
         .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn write_pi_launch_fixture(root: &Path, marker: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = root.join("pi-launch-fixture.sh");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+extract_id() {{
+  printf '%s' "$1" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'
+}}
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"get_available_models"'*)
+      printf '{{"id":"models","type":"response","success":true,"data":{{"models":[]}}}}\n'
+      ;;
+    *'"type":"get_commands"'*)
+      printf '{{"id":"commands","type":"response","success":true,"data":{{"commands":[]}}}}\n'
+      ;;
+    *'"type":"get_state"'*)
+      printf '{{"id":"state","type":"response","success":true,"data":{{}}}}\n'
+      ;;
+    *'"type":"prompt"'*)
+      id=$(extract_id "$line")
+      printf '{{"id":"%s","type":"response","success":true}}\n' "$id"
+      printf '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","delta":"pi fixture"}}}}\n'
+      printf '{{"type":"agent_settled"}}\n'
+      ;;
+  esac
+done
+"#,
+            marker.display()
+        );
+        fs::write(&path, script).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
     }

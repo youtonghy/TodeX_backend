@@ -14,6 +14,7 @@ use crate::conversation::{
     ProviderState,
 };
 use crate::error::AppError;
+use crate::workspace_trust::WorkspaceTrustPermit;
 
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -233,6 +234,7 @@ pub trait ProviderDriver: Send + Sync {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
+        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError>;
 }
 

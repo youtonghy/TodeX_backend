@@ -252,8 +252,13 @@ cargo clippy --locked --all-targets --all-features
 # Run unit tests
 cargo test
 
-# Run real end-to-end test against local Codex (requires authenticated codex CLI)
-TODEX_REAL_E2E=1 cargo test --test e2e_real_codex -- --ignored --test-threads=1
+# Read-only Codex/Pi installation, login, and RPC discovery
+cargo run -- doctor providers --provider codex,pi --format json
+
+# Run the billable Codex/Pi smoke explicitly
+TODEX_REAL_E2E=1 TODEX_REAL_ALLOW_BILLABLE=1 TODEX_REAL_PROVIDERS=codex,pi \
+  cargo test --test e2e_real_codex real_v2_provider_http_ws_roundtrip \
+  -- --ignored --test-threads=1
 ```
 
 ---

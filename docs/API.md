@@ -56,7 +56,7 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 
 Provider 标识为 `acp`、`codex`、`pi`、`claude-code`、`grok-build`（创建请求也接受 `grok` 与 `grok_build` 别名）。未指定时使用 `[agent].default_agent`，默认是 `codex`。ACP 必须使用后端 `config.toml` 中预配置的 `providerProfile`；客户端不能提交任意 command、args 或 env。
 
-Provider 子进程只继承运行所需的基础系统环境；ACP 额外使用管理员在 profile 中明确配置的 env。Codex、Pi、Claude Code 和 Grok Build 应先由运行 daemon 的同一系统用户完成原生登录。Grok Build 也可通过白名单传入 `XAI_API_KEY`；daemon 不会启动浏览器/OIDC 交互认证。Grok 的工具授权、提问、计划审批和 MCP elicitation 会转换为 TodeX `permission.requested`，客户端按服务器提供的 `optionId` 和 `kind` 回复。Pi RPC 当前没有覆盖所有工具调用的通用审批接口，因此首期以 `--approve` 启动，`permissions` capability 为 `false`；extension UI 请求仍会转成 TodeX permission 事件，但不能把它等同于逐工具审批。
+Provider 子进程只继承运行所需的基础系统环境；ACP 额外使用管理员在 profile 中明确配置的 env。Codex、Pi、Claude Code 和 Grok Build 应先由运行 daemon 的同一系统用户完成原生登录。Grok Build 也可通过白名单传入 `XAI_API_KEY`；daemon 不会启动浏览器/OIDC 交互认证。Grok 的工具授权、提问、计划审批和 MCP elicitation 会转换为 TodeX `permission.requested`，客户端按服务器提供的 `optionId` 和 `kind` 回复。Pi 只有全自动执行模式：工作区获得 TodeX 信任后以 `--approve` 启动，工具与项目扩展按 daemon 用户权限运行。Pi 没有通用逐工具审批或 OS sandbox，因此 `permissions` capability 为 `false`；extension UI 请求仍可转成交互事件，但不能把它等同于工具授权。
 
 ```http
 GET /v2/providers
@@ -228,7 +228,7 @@ DELETE /v2/workspaces/{workspaceId}
 
 `PUT` 请求体使用同样的 `workspaces` 数组。后端会校验 `name`、`path`、路径存在性和根目录边界，按当前认证身份和规范化路径合并记录，并返回后端生成的稳定 ID。它不会接受客户端伪造的租户，也不会持久化设备本地的 `threadId` 和 `localAdapterState`。
 
-新工作区默认不信任。`GET /v2/workspaces/{workspaceId}/trust` 返回当前状态；`PUT` 请求体为 `{ "trusted": true }` 或 `{ "trusted": false }`。信任记录同时绑定认证 owner 和规范化路径，独立保存在 `$DATA_DIR/workspace-trust.json`。Provider 模型/命令发现、prompt、MCP 调用、Git 写操作、本地终端和本地 Codex 启动前都必须通过信任检查；只读目录、文件预览与 Git 扫描仍受 `workspace_root` 边界约束。撤销信任会取消该 owner 在该工作区的活动 turn。删除工作区会先撤销信任并取消活动 turn，但不会删除已有对话历史。
+新工作区默认不信任。`GET /v2/workspaces/{workspaceId}/trust` 返回当前状态；`PUT` 请求体为 `{ "trusted": true }` 或 `{ "trusted": false }`。信任记录同时绑定认证 owner 和规范化路径，独立保存在 `$DATA_DIR/workspace-trust.json`。Provider 模型/命令发现、prompt、MCP 调用、Git 写操作、本地终端和本地 Codex 启动前都必须通过信任检查；只读目录、文件预览与 Git 扫描仍受 `workspace_root` 边界约束。Provider 启动许可持有信任读锁直至子进程完成 spawn；撤销先取得写锁，再取消该 owner 在工作区内已登记的活动 turn，因此不会漏过处于检查与启动之间的任务。删除工作区会先撤销信任并取消活动 turn，但不会删除已有对话历史。
 
 ### Workspace 目录浏览
 

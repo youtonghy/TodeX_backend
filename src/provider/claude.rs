@@ -6,6 +6,7 @@ use tokio::sync::watch;
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
+use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
@@ -123,6 +124,7 @@ impl ProviderDriver for ClaudeDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         mut cancel: watch::Receiver<bool>,
+        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         let requested_session_id = context
             .provider_state
@@ -157,7 +159,7 @@ impl ProviderDriver for ClaudeDriver {
             spec.args.push(effort.clone());
         }
 
-        let mut process = JsonLineProcess::spawn(&spec).await?;
+        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
         let result = run_claude_turn(
             &mut process,
             context,

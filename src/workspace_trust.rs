@@ -7,7 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use uuid::Uuid;
 
 use crate::{error::AppError, workspace_paths::validate_workspace_directory_text};
@@ -45,6 +45,10 @@ pub struct WorkspaceTrustStore {
     path: Arc<PathBuf>,
     workspace_root: Arc<PathBuf>,
     inner: Arc<RwLock<WorkspaceTrustSnapshot>>,
+}
+
+pub(crate) struct WorkspaceTrustPermit {
+    _snapshot: OwnedRwLockReadGuard<WorkspaceTrustSnapshot>,
 }
 
 impl WorkspaceTrustStore {
@@ -87,7 +91,8 @@ impl WorkspaceTrustStore {
     ) -> Result<WorkspaceTrustStatus, AppError> {
         let workspace = self.validate(workspace)?;
         let workspace_path = workspace.display().to_string();
-        let mut snapshot = self.inner.write().await;
+        let mut current = self.inner.write().await;
+        let mut snapshot = current.clone();
         snapshot
             .entries
             .retain(|entry| entry.owner_id != owner_id || entry.workspace_path != workspace_path);
@@ -106,6 +111,7 @@ impl WorkspaceTrustStore {
         });
         snapshot.updated_at = now_millis();
         write_snapshot(&self.path, &snapshot).await?;
+        *current = snapshot;
         Ok(WorkspaceTrustStatus {
             workspace_path,
             trusted,
@@ -119,6 +125,27 @@ impl WorkspaceTrustStore {
             Ok(())
         } else {
             Err(AppError::WorkspaceTrustRequired(status.workspace_path))
+        }
+    }
+
+    pub(crate) async fn acquire_owned(
+        &self,
+        owner_id: &str,
+        workspace: &Path,
+    ) -> Result<WorkspaceTrustPermit, AppError> {
+        let workspace = self.validate(workspace)?;
+        let workspace_path = workspace.display().to_string();
+        let snapshot = self.inner.clone().read_owned().await;
+        if snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.owner_id == owner_id && entry.workspace_path == workspace_path)
+        {
+            Ok(WorkspaceTrustPermit {
+                _snapshot: snapshot,
+            })
+        } else {
+            Err(AppError::WorkspaceTrustRequired(workspace_path))
         }
     }
 
@@ -261,6 +288,68 @@ mod tests {
                 .trusted
         );
 
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn permit_linearizes_revoke_and_blocks_future_launches() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-workspace-permit-{}",
+            Uuid::new_v4().simple()
+        ));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        let store = WorkspaceTrustStore::new(root.clone(), workspace_root)
+            .await
+            .unwrap();
+        store.set_owned("owner", &workspace, true).await.unwrap();
+        let permit = store.acquire_owned("owner", &workspace).await.unwrap();
+
+        let revoke_store = store.clone();
+        let revoke_workspace = workspace.clone();
+        let mut revoke = tokio::spawn(async move {
+            revoke_store
+                .set_owned("owner", &revoke_workspace, false)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut revoke)
+                .await
+                .is_err()
+        );
+
+        drop(permit);
+        assert!(!revoke.await.unwrap().unwrap().trusted);
+        assert!(matches!(
+            store.acquire_owned("owner", &workspace).await,
+            Err(AppError::WorkspaceTrustRequired(_))
+        ));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn failed_persistence_does_not_change_in_memory_trust() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-workspace-trust-rollback-{}",
+            Uuid::new_v4().simple()
+        ));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        let store = WorkspaceTrustStore::new(root.clone(), workspace_root)
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&*store.path).await.unwrap();
+
+        assert!(store.set_owned("owner", &workspace, true).await.is_err());
+        assert!(
+            !store
+                .status_owned("owner", &workspace)
+                .await
+                .unwrap()
+                .trusted
+        );
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

@@ -1,0 +1,127 @@
+name: Real provider E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      providers:
+        description: Providers to test
+        required: true
+        default: codex,pi
+        type: choice
+        options:
+          - codex,pi
+          - codex
+          - pi
+      codex_version:
+        description: Codex CLI version
+        required: true
+        default: 0.145.0
+        type: string
+      pi_version:
+        description: Pi coding agent version
+        required: true
+        default: 0.84.3
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: real-provider-e2e
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    environment: provider-e2e
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install provider CLIs
+        env:
+          CODEX_VERSION: ${{ inputs.codex_version }}
+          PI_VERSION: ${{ inputs.pi_version }}
+        run: |
+          npm install --global "@openai/codex@${CODEX_VERSION}"
+          npm install --global "@earendil-works/pi-coding-agent@${PI_VERSION}"
+
+      - name: Prepare isolated credentials
+        env:
+          PROVIDERS: ${{ inputs.providers }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          CODEX_CONFIG_TOML: ${{ secrets.CODEX_CONFIG_TOML }}
+          PI_AUTH_JSON: ${{ secrets.PI_AUTH_JSON }}
+          PI_MODELS_JSON: ${{ secrets.PI_MODELS_JSON }}
+        run: |
+          install -d -m 700 "${RUNNER_TEMP}/codex-home" "${RUNNER_TEMP}/pi-home"
+          if [[ "${PROVIDERS}" == *codex* ]]; then
+            test -n "${CODEX_AUTH_JSON}" || { echo "CODEX_AUTH_JSON is required" >&2; exit 2; }
+            printf '%s' "${CODEX_AUTH_JSON}" > "${RUNNER_TEMP}/codex-home/auth.json"
+            chmod 600 "${RUNNER_TEMP}/codex-home/auth.json"
+            if [[ -n "${CODEX_CONFIG_TOML}" ]]; then
+              printf '%s' "${CODEX_CONFIG_TOML}" > "${RUNNER_TEMP}/codex-home/config.toml"
+              chmod 600 "${RUNNER_TEMP}/codex-home/config.toml"
+            fi
+          fi
+          if [[ "${PROVIDERS}" == *pi* ]]; then
+            test -n "${PI_AUTH_JSON}" || { echo "PI_AUTH_JSON is required" >&2; exit 2; }
+            printf '%s' "${PI_AUTH_JSON}" > "${RUNNER_TEMP}/pi-home/auth.json"
+            chmod 600 "${RUNNER_TEMP}/pi-home/auth.json"
+            if [[ -n "${PI_MODELS_JSON}" ]]; then
+              printf '%s' "${PI_MODELS_JSON}" > "${RUNNER_TEMP}/pi-home/models.json"
+              chmod 600 "${RUNNER_TEMP}/pi-home/models.json"
+            fi
+          fi
+
+      - name: Build backend tests
+        run: cargo test --locked --test e2e_real_codex --no-run
+
+      - name: Run read-only provider doctor
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-home
+          PROVIDERS: ${{ inputs.providers }}
+        run: |
+          mkdir -p artifacts
+          cargo run --locked -- doctor providers --provider "${PROVIDERS}" --format json > artifacts/provider-doctor.json
+
+      - name: Run billable provider smoke
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-home
+          TODEX_REAL_ALLOW_BILLABLE: "1"
+          TODEX_REAL_E2E: "1"
+          TODEX_REAL_PROVIDERS: ${{ inputs.providers }}
+        run: |
+          set +e
+          cargo test --locked --test e2e_real_codex real_v2_provider_http_ws_roundtrip -- --ignored --nocapture --test-threads=1
+          status=$?
+          set -e
+          jq -n \
+            --arg commit "${GITHUB_SHA}" \
+            --arg providers "${TODEX_REAL_PROVIDERS}" \
+            --arg status "${status}" \
+            '{schemaVersion: 1, commit: $commit, providers: $providers, billable: true, exitCode: ($status | tonumber), success: ($status == "0")}' \
+            > artifacts/provider-e2e.json
+          exit "${status}"
+
+      - name: Upload diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-e2e-${{ github.sha }}
+          path: artifacts/*.json
+          if-no-files-found: warn
+          retention-days: 14

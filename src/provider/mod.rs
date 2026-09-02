@@ -3,12 +3,14 @@
 mod acp;
 mod claude;
 mod codex;
+mod doctor;
 mod grok;
 mod pi;
 pub(crate) mod process;
 mod supervisor;
 mod types;
 
+pub(crate) use doctor::inspect_providers;
 pub(crate) use grok::inspect_grok;
 pub use supervisor::{
     ConversationPrompt, ConversationSupervisor, PromptContentRef, PromptSkillRef,

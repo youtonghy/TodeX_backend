@@ -110,7 +110,7 @@ language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
 
 TUI 默认不捕获鼠标，终端中的文本可以直接拖选复制。按 `c` 打开“凭据与复制”，可完整查看并复制 Auth Token 与当前加密方式的公钥；私钥不会显示或复制。日志使用 `PageUp`、`PageDown`、`Home`、`End` 滚动。daemon 启动会先检查端口占用，并等待最多 30 秒完成迁移和初始化后再报告超时。
 
-Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径、用户目录、locale、代理和 SSH agent 等运行环境。ACP profile 中的 `env` 会显式传入，但名称以 `TODEX_AGENTD_` 开头的变量会被拒绝。Codex、Pi、Claude Code 和 Grok Build 因此应优先使用各自保存在用户目录中的原生登录配置。Grok Build 通过 `grok --no-auto-update agent --no-leader stdio` 启动；仅 `grok_env_allowlist` 中名称合法的变量会额外传入。首次运行前使用 daemon 用户执行 `grok login`，或在白名单中保留 `XAI_API_KEY`。Pi 首期使用 RPC `--approve`，因为其 RPC 协议没有通用的逐工具审批接口；只应在可信 workspace 与可信 Pi 配置下启用。
+Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径、用户目录、locale、代理和 SSH agent 等运行环境。ACP profile 中的 `env` 会显式传入，但名称以 `TODEX_AGENTD_` 开头的变量会被拒绝。Codex、Pi、Claude Code 和 Grok Build 因此应优先使用各自保存在用户目录中的原生登录配置。Grok Build 通过 `grok --no-auto-update agent --no-leader stdio` 启动；仅 `grok_env_allowlist` 中名称合法的变量会额外传入。首次运行前使用 daemon 用户执行 `grok login`，或在白名单中保留 `XAI_API_KEY`。Pi 始终使用 RPC `--approve`：工作区通过 TodeX 信任门禁后，Pi 的工具和项目资源按 daemon 用户权限全自动运行。Pi 没有通用逐工具审批，也没有 OS sandbox；`permissions` capability 因此保持 `false`。
 
 ## Conversation 数据目录
 
@@ -158,47 +158,42 @@ cargo fmt --check
 cargo clippy
 ```
 
-### 真实 Codex E2E
+### Provider 只读预检
 
-真实 E2E 会启动 `todex-agentd` 子进程，并通过 WebSocket 驱动真实 `codex app-server --listen stdio://`。默认不会运行，必须显式开启：
+以下命令检查 Codex/Pi 二进制、版本、现有登录、RPC 初始化、模型和命令发现，不发送 prompt，也不会消耗模型推理额度：
 
 ```bash
-TODEX_REAL_E2E=1 cargo test --test e2e_real_codex -- --ignored --test-threads=1
+cargo run -- doctor providers --provider codex,pi --format json
+```
+
+报告中的 `success` 只有在所请求 provider 的全部阶段通过时才为 `true`。命令不会自动登录，也不会输出 credential 或原始 provider payload。
+
+### 真实 Codex/Pi E2E
+
+真实 smoke 会启动 `todex-agentd` 子进程，经公开 workspace trust API 建立信任，并通过 v2 HTTP/WebSocket 驱动真实 Codex/Pi。默认不会运行，必须同时显式确认测试和模型额度：
+
+```bash
+TODEX_REAL_E2E=1 TODEX_REAL_ALLOW_BILLABLE=1 TODEX_REAL_PROVIDERS=codex,pi \
+  cargo test --test e2e_real_codex real_v2_provider_http_ws_roundtrip \
+  -- --ignored --nocapture --test-threads=1
 ```
 
 前置条件：
 
 - `codex` 已安装并可执行，或设置 `TODEX_REAL_CODEX_BIN=/absolute/path/to/codex`。当前验证版本：`codex-cli 0.145.0`（更早版本的 granular `approvalPolicy` 参数已不再被 app-server 接受）
-- 默认使用临时 workspace；如需指定真实任务目录，设置 `TODEX_REAL_WORKSPACE=/absolute/path/to/workspace`
-- 默认从当前 `CODEX_HOME`/`~/.codex` 复制登录凭据到临时 `CODEX_HOME`，并移除 MCP/marketplace 配置，避免本机 MCP 启动状态影响后端控制链路测试；如需完全指定 Codex home，设置 `TODEX_REAL_CODEX_HOME=/absolute/path/to/codex-home`
-- Codex 已登录，且当前环境能连接模型
-- 允许测试消耗少量模型调用额度
+- `codex` 与 `pi` 已安装并由运行测试的用户完成登录；也可分别设置 `TODEX_REAL_CODEX_BIN`、`TODEX_REAL_PI_BIN`
+- 默认使用临时 workspace；如需指定目录，设置 `TODEX_REAL_WORKSPACE=/absolute/path/to/workspace`，测试提示仍要求不修改文件
+- Codex 始终从当前 `CODEX_HOME`/`~/.codex` 或 `TODEX_REAL_CODEX_HOME` 复制必要登录文件到临时 home，并移除 MCP/marketplace 配置
+- Pi 始终从当前 `PI_CODING_AGENT_DIR`/`~/.pi/agent` 或 `TODEX_REAL_PI_HOME` 复制 `auth.json`、`models.json` 到临时 home；不会加载宿主 session
+- 设置 `TODEX_REAL_ALLOW_BILLABLE=1`，确认允许测试消耗少量模型额度
 - 测试环境必须允许监听 127.0.0.1 随机端口、启动 Provider 子进程并读取其状态（不支持无监听能力的沙箱环境）
 - 默认模型预期取自安装 CLI 的 `config/read` 实际值；需要钉住版本时设置 `TODEX_REAL_CODEX_MODEL=<model>`
 
-`thread/start` 一律使用与生产适配器一致的 canonical 最小参数（`cwd` + 字符串 `approvalPolicy` + 字符串 `sandbox`）；granular approval map 与 permission profile 属于已被 CLI 移除的旧 schema，不再进入真实 E2E。
+测试先验证模型和命令发现，再要求 assistant 返回随机 sentinel，并且必须观察到同一 conversation/turn 的 assistant 完成事件和 `turn.completed`。任何 `turn.failed`、`turn.cancelled`、缺失 turn ID 或缺失 Codex terminal status 都会失败。
 
 测试覆盖 HTTP `/health`、`/v2/version`、WebSocket `/v2/ws`（含统一命令面上的终端与本地 Codex 控制、`session.resume` 断线恢复）、认证矩阵（匿名/错 token 拒绝、header 与 URL 编码 query token 成功）、租户不匹配、旧协议拒绝、本地 Codex start/status/stop、真实 turn、Plan 模式、approval 响应、replay/attach/snapshot、并行多 session 和同 session busy rejection，以及 `/v1/*` 的 404 回归。
 
-### 真实 Provider E2E
-
-ACP、Pi 和 Claude Code 的 v2 round-trip 测试默认忽略，不会在普通 CI 中启动真实 CLI。测试会检查 `/v2/providers`，创建 conversation，通过 `/v2/ws` 订阅，再调用 `/v2/conversations/{id}/prompt` 并等待事件。先用 daemon 用户完成登录：
-
-```bash
-TODEX_REAL_E2E=1 TODEX_REAL_PROVIDERS=pi,claude-code \
-  cargo test --test e2e_real_codex real_v2_provider_http_ws_roundtrip -- --ignored --nocapture
-```
-
-ACP 需要在 `config.toml` 配置受信任的 `[agent.acp_profiles.<name>]`，并把该 provider/profile 配置为可用后再加入 `TODEX_REAL_PROVIDERS`。集成测试也支持用临时配置注入 profile：`TODEX_REAL_ACP_COMMAND=/absolute/path/to/acp-server TODEX_REAL_ACP_PROFILE=real TODEX_REAL_ACP_ARGS='arg1\u001farg2'`。测试不会接受客户端传入任意 command、args 或 env。真实测试会消耗模型额度，只应在隔离 workspace 和专用账号运行。
-
-已验证的 ACP adapter 是 `pi-acp`。它要求 Node.js 22+、Pi 0.80.4+，并复用 Pi 的模型配置：
-
-```bash
-npm install -g pi-acp
-TODEX_REAL_E2E=1 TODEX_REAL_PROVIDERS=acp \
-TODEX_REAL_ACP_COMMAND="$(command -v pi-acp)" TODEX_REAL_ACP_PROFILE=real \
-  cargo test --test e2e_real_codex real_v2_provider_http_ws_roundtrip -- --ignored --nocapture
-```
+更深的 Codex Plan、approval、review 和并发测试仍是独立 ignored 测试，不应使用不带测试名的 `--ignored` 一次性运行。GitHub Actions 中的 `Real provider E2E` workflow 只允许手动触发，使用受保护的 `provider-e2e` environment 和专用 secrets，并上传脱敏 JSON 结果。
 
 ## 如何运行
 

@@ -27,6 +27,12 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_dir_all(&self.root);
@@ -214,7 +220,7 @@ async fn real_v2_provider_http_ws_roundtrip() {
     require_real_v2_e2e();
     let daemon = spawn_daemon().await;
     let requested_source =
-        env::var("TODEX_REAL_PROVIDERS").unwrap_or_else(|_| "pi,claude-code".to_owned());
+        env::var("TODEX_REAL_PROVIDERS").expect("TODEX_REAL_PROVIDERS must be explicit");
     let requested_raw = requested_source
         .split(',')
         .map(str::trim)
@@ -265,70 +271,114 @@ async fn real_v2_provider_http_ws_roundtrip() {
         )
         .await;
         wait_for_event(&mut ws, |event| event["type"] == "server.result").await;
+        let mut selected_model = None;
+        for endpoint in ["models", "commands"] {
+            let discovery = http_request(
+                daemon.port,
+                "GET",
+                &format!(
+                    "/v2/providers/{endpoint}?provider={provider}&workspace={}",
+                    daemon.workspace_root.display()
+                ),
+                Some(TOKEN),
+                None,
+            )
+            .await;
+            assert_eq!(
+                discovery.0, 200,
+                "{provider} {endpoint} discovery: {}",
+                discovery.1
+            );
+            if endpoint == "models" {
+                let payload: Value =
+                    serde_json::from_str(&discovery.1).expect("model discovery JSON");
+                let models = payload["models"]
+                    .as_array()
+                    .expect("model discovery must return an array");
+                selected_model = models
+                    .iter()
+                    .find(|model| model["isDefault"] == true)
+                    .or_else(|| models.first())
+                    .and_then(|model| model["id"].as_str())
+                    .map(ToOwned::to_owned);
+                assert!(
+                    selected_model.is_some(),
+                    "provider {provider} returned no usable models: {payload}"
+                );
+            }
+        }
+        let sentinel = format!(
+            "TODEX_E2E_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
         let prompt = http_request(
             daemon.port,
             "POST",
             &format!("/v2/conversations/{conversation_id}/prompt"),
             Some(TOKEN),
-            Some(json!({ "text": "Reply with one short sentence. Do not modify files." })),
+            Some(json!({
+                "text": format!("Reply with exactly {sentinel} and nothing else. Do not use tools or modify files."),
+                "model": selected_model,
+            })),
         )
         .await;
         assert_eq!(prompt.0, 200, "prompt {provider}: {}", prompt.1);
-        let event = wait_for_event_maybe(&mut ws, Duration::from_secs(180), |event| {
-            event["type"] == "conversation.event"
-                && event["payload"]["conversationId"] == conversation_id
-                && event["payload"]["type"]
-                    .as_str()
-                    .is_some_and(|kind| kind.ends_with("completed") || kind.ends_with("message"))
-        })
+        let prompt: Value = serde_json::from_str(&prompt.1).expect("prompt response JSON");
+        let turn_id = prompt["turnId"].as_str().expect("prompt turn id");
+        wait_for_successful_conversation_turn(
+            &mut ws,
+            conversation_id,
+            turn_id,
+            &sentinel,
+            &provider,
+        )
         .await;
-        assert!(
-            event.is_ok(),
-            "provider {provider} did not emit a terminal/message event: {event:?}"
-        );
     }
 }
 
 fn require_real_v2_e2e() {
+    assert_eq!(
+        env::var("TODEX_REAL_ALLOW_BILLABLE").as_deref(),
+        Ok("1"),
+        "set TODEX_REAL_ALLOW_BILLABLE=1 to acknowledge model usage"
+    );
     assert_eq!(
         env::var("TODEX_REAL_E2E").as_deref(),
         Ok("1"),
         "set TODEX_REAL_E2E=1 to run real provider E2E tests"
     );
     let requested =
-        env::var("TODEX_REAL_PROVIDERS").unwrap_or_else(|_| "pi,claude-code".to_owned());
+        env::var("TODEX_REAL_PROVIDERS").expect("TODEX_REAL_PROVIDERS must be explicit");
     for provider in requested
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
+        assert!(
+            matches!(provider, "codex" | "pi"),
+            "real v2 smoke supports only codex and pi, got {provider}"
+        );
         let binary = match provider {
             "codex" => codex_binary(),
             "pi" => env::var_os("TODEX_REAL_PI_BIN")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("pi")),
-            "claude-code" => env::var_os("TODEX_REAL_CLAUDE_BIN")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("claude")),
-            "acp" => PathBuf::from(
-                env::var_os("TODEX_REAL_ACP_COMMAND")
-                    .expect("TODEX_REAL_ACP_COMMAND is required for ACP E2E"),
-            ),
             other => panic!("unsupported provider {other}"),
         };
-        if provider != "acp" {
-            let output = Command::new(&binary)
-                .arg("--version")
-                .output()
-                .unwrap_or_else(|error| {
-                    panic!("failed to run {provider} '{}': {error}", binary.display())
-                });
-            assert!(
-                output.status.success(),
-                "{provider} --version failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+        let output = Command::new(&binary)
+            .arg("--version")
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to run {provider} '{}': {error}", binary.display())
+            });
+        assert!(
+            output.status.success(),
+            "{provider} --version failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -756,14 +806,15 @@ async fn spawn_daemon() -> Daemon {
     let root = unique_tmp_dir("todex-real-e2e");
     let data_dir = root.join("data");
     let codex_home = prepare_codex_home(&root);
+    let pi_home = prepare_pi_home(&root);
     let workspace_root = real_workspace_root().unwrap_or_else(|| root.join("workspace"));
     fs::create_dir_all(&data_dir).expect("create data dir");
     fs::create_dir_all(&workspace_root).expect("create workspace dir");
-    write_workspace_trust(&data_dir, &workspace_root);
     let port = free_port();
     write_real_acp_profile(&data_dir);
     let bin = env!("CARGO_BIN_EXE_todex-agentd");
-    let child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .arg("serve")
         .arg("--host")
         .arg("127.0.0.1")
@@ -784,11 +835,12 @@ async fn spawn_daemon() -> Daemon {
             env::var_os("TODEX_REAL_CLAUDE_BIN").unwrap_or_else(|| "claude".into()),
         )
         .env("CODEX_HOME", &codex_home)
+        .env("PI_CODING_AGENT_DIR", &pi_home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn todex-agentd");
+        .stderr(Stdio::null());
+    isolate_process_group(&mut command);
+    let child = command.spawn().expect("spawn todex-agentd");
 
     let daemon = Daemon {
         child,
@@ -798,7 +850,52 @@ async fn spawn_daemon() -> Daemon {
         workspace_root,
     };
     wait_for_health(daemon.port).await;
+    register_and_trust_workspace(&daemon).await;
     daemon
+}
+
+async fn register_and_trust_workspace(daemon: &Daemon) {
+    let replaced = http_request(
+        daemon.port,
+        "PUT",
+        "/v2/workspaces",
+        Some(TOKEN),
+        Some(json!({
+            "workspaces": [{
+                "id": "real-provider-e2e",
+                "name": "real-provider-e2e",
+                "path": daemon.workspace_root.display().to_string(),
+                "sessionId": "real-provider-e2e",
+                "tenantId": "local",
+                "threadId": "",
+                "model": "",
+                "reasoningEffort": null,
+                "approvalPolicy": "on-request",
+                "sandboxMode": "workspace-write",
+                "serviceTier": null,
+                "localAdapterState": "idle",
+                "createdAt": 1,
+                "updatedAt": 1
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(replaced.0, 200, "register E2E workspace: {}", replaced.1);
+    let replaced: Value = serde_json::from_str(&replaced.1).expect("workspace response JSON");
+    let workspace_id = replaced["workspaces"][0]["id"]
+        .as_str()
+        .expect("workspace id");
+    let trusted = http_request(
+        daemon.port,
+        "PUT",
+        &format!("/v2/workspaces/{workspace_id}/trust"),
+        Some(TOKEN),
+        Some(json!({ "trusted": true })),
+    )
+    .await;
+    assert_eq!(trusted.0, 200, "trust E2E workspace: {}", trusted.1);
+    let trusted: Value = serde_json::from_str(&trusted.1).expect("trust response JSON");
+    assert_eq!(trusted["trusted"], true);
 }
 
 fn write_real_acp_profile(data_dir: &Path) {
@@ -831,11 +928,11 @@ async fn spawn_fake_history_daemon() -> Daemon {
     let workspace_root = root.join("workspace");
     fs::create_dir_all(&data_dir).expect("create data dir");
     fs::create_dir_all(&workspace_root).expect("create workspace dir");
-    write_workspace_trust(&data_dir, &workspace_root);
     let fake_codex = write_fake_history_codex_binary(&root, &workspace_root);
     let port = free_port();
     let bin = env!("CARGO_BIN_EXE_todex-agentd");
-    let child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .arg("serve")
         .arg("--host")
         .arg("127.0.0.1")
@@ -849,9 +946,9 @@ async fn spawn_fake_history_daemon() -> Daemon {
         .env("TODEX_AGENTD_CODEX_BIN", &fake_codex)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn todex-agentd with fake codex");
+        .stderr(Stdio::null());
+    isolate_process_group(&mut command);
+    let child = command.spawn().expect("spawn todex-agentd with fake codex");
 
     let daemon = Daemon {
         child,
@@ -861,6 +958,7 @@ async fn spawn_fake_history_daemon() -> Daemon {
         workspace_root,
     };
     wait_for_health(daemon.port).await;
+    register_and_trust_workspace(&daemon).await;
     daemon
 }
 
@@ -906,23 +1004,6 @@ done
         fs::set_permissions(&binary, permissions).expect("chmod fake codex");
     }
     binary
-}
-
-fn write_workspace_trust(data_dir: &Path, workspace: &Path) {
-    let workspace = fs::canonicalize(workspace).expect("canonicalize trusted workspace");
-    let snapshot = json!({
-        "entries": [{
-            "ownerId": "local",
-            "workspacePath": workspace.display().to_string(),
-            "trustedAt": 1
-        }],
-        "updatedAt": 1
-    });
-    fs::write(
-        data_dir.join("workspace-trust.json"),
-        serde_json::to_vec_pretty(&snapshot).expect("serialize workspace trust fixture"),
-    )
-    .expect("write workspace trust fixture");
 }
 
 async fn start_session(ws: &mut Ws, session: &str, cwd: impl AsRef<Path>) {
@@ -1140,6 +1221,62 @@ async fn wait_for_event_maybe(
     .map_err(|_| format!("timeout; recent events: {}", recent_events(&seen)))?
 }
 
+async fn wait_for_successful_conversation_turn(
+    ws: &mut Ws,
+    conversation_id: &str,
+    turn_id: &str,
+    sentinel: &str,
+    provider: &str,
+) {
+    let mut saw_assistant = false;
+    let mut seen_types = Vec::new();
+    timeout(Duration::from_secs(180), async {
+        while let Some(message) = ws.next().await {
+            let message = message.expect("read provider WebSocket event");
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let event: Value = serde_json::from_str(&text).expect("provider WebSocket JSON");
+            if event["type"] != "conversation.event"
+                || event["payload"]["conversationId"] != conversation_id
+            {
+                continue;
+            }
+            let Some(event_type) = event["payload"]["type"].as_str() else {
+                continue;
+            };
+            seen_types.push(event_type.to_owned());
+            if seen_types.len() > 30 {
+                seen_types.remove(0);
+            }
+            let payload = &event["payload"]["payload"];
+            let matching_turn = payload["turnId"].as_str() == Some(turn_id);
+            if matching_turn && matches!(event_type, "turn.failed" | "turn.cancelled") {
+                panic!(
+                    "provider {provider} ended turn {turn_id} with {event_type}; recent event types: {seen_types:?}"
+                );
+            }
+            if event_type == "message.completed" && payload.to_string().contains(sentinel) {
+                saw_assistant = true;
+            }
+            if matching_turn && event_type == "turn.completed" {
+                assert!(
+                    saw_assistant,
+                    "provider {provider} completed turn {turn_id} without the sentinel assistant message; recent event types: {seen_types:?}"
+                );
+                return;
+            }
+        }
+        panic!("provider {provider} WebSocket closed before turn {turn_id} completed");
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "provider {provider} timed out waiting for turn {turn_id}; recent event types: {seen_types:?}"
+        )
+    });
+}
+
 async fn wait_for_health(port: u16) {
     timeout(Duration::from_secs(15), async {
         loop {
@@ -1258,16 +1395,15 @@ fn real_workspace_root() -> Option<PathBuf> {
 }
 
 fn prepare_codex_home(root: &Path) -> PathBuf {
-    if let Some(path) = env::var_os("TODEX_REAL_CODEX_HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(path);
-    }
-
-    let source = env::var_os("CODEX_HOME")
+    let source = env::var_os("TODEX_REAL_CODEX_HOME")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .or_else(|| env::var_os("CODEX_HOME").map(PathBuf::from))
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
         .expect("CODEX_HOME or HOME should be set");
     let target = root.join("codex-home");
     fs::create_dir_all(&target).expect("create isolated CODEX_HOME");
+    set_owner_only(&target, true);
 
     copy_if_exists(&source.join("auth.json"), &target.join("auth.json"));
     copy_if_exists(
@@ -1285,13 +1421,30 @@ fn prepare_codex_home(root: &Path) -> PathBuf {
             table.remove("mcp_servers");
             table.remove("marketplaces");
         }
+        let target_config = target.join("config.toml");
         fs::write(
-            target.join("config.toml"),
+            &target_config,
             toml::to_string_pretty(&value).expect("serialize isolated Codex config.toml"),
         )
         .expect("write isolated Codex config.toml");
+        set_owner_only(&target_config, false);
     }
 
+    target
+}
+
+fn prepare_pi_home(root: &Path) -> PathBuf {
+    let source = env::var_os("TODEX_REAL_PI_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from))
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi").join("agent")))
+        .expect("TODEX_REAL_PI_HOME, PI_CODING_AGENT_DIR, or HOME should be set");
+    let target = root.join("pi-home");
+    fs::create_dir_all(&target).expect("create isolated PI_CODING_AGENT_DIR");
+    set_owner_only(&target, true);
+    copy_if_exists(&source.join("auth.json"), &target.join("auth.json"));
+    copy_if_exists(&source.join("models.json"), &target.join("models.json"));
     target
 }
 
@@ -1299,7 +1452,31 @@ fn copy_if_exists(source: &Path, target: &Path) {
     if source.exists() {
         fs::copy(source, target)
             .unwrap_or_else(|error| panic!("copy '{}' failed: {error}", source.display()));
+        set_owner_only(target, false);
     }
+}
+
+fn set_owner_only(path: &Path, directory: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if directory { 0o700 } else { 0o600 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap_or_else(|error| {
+            panic!("set permissions on '{}' failed: {error}", path.display())
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = (path, directory);
+}
+
+fn isolate_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
 }
 
 fn free_port() -> u16 {

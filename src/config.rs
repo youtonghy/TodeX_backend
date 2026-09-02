@@ -141,6 +141,14 @@ struct PartialSecurityConfig {
 
 impl Config {
     pub fn load(args: ServeArgs) -> anyhow::Result<Self> {
+        Self::load_internal(args, true)
+    }
+
+    pub fn load_read_only(args: ServeArgs) -> anyhow::Result<Self> {
+        Self::load_internal(args, false)
+    }
+
+    fn load_internal(args: ServeArgs, persist_generated_token: bool) -> anyhow::Result<Self> {
         let defaults = Config::default();
         let env_data_dir = env_path("TODEX_AGENTD_DATA_DIR");
         let bootstrap_data_dir = expand_home(
@@ -203,11 +211,12 @@ impl Config {
                 .or(defaults.security.auth_token);
             match configured {
                 Some(token) => Some(token),
-                None => {
+                None if persist_generated_token => {
                     let token = generate_auth_token();
                     Self::save_auth_token(data_dir.clone(), &token)?;
                     Some(token)
                 }
+                None => None,
             }
         } else {
             None
@@ -697,6 +706,27 @@ mod tests {
         assert!(updated.contains(token));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_only_config_load_does_not_generate_or_persist_auth_token() {
+        let root = env::temp_dir().join(format!(
+            "todex-config-read-only-test-{}",
+            Uuid::new_v4().simple()
+        ));
+
+        let config = Config::load_read_only(ServeArgs {
+            host: None,
+            port: None,
+            data_dir: Some(root.clone()),
+            workspace_root: None,
+            history_retention_days: None,
+        })
+        .expect("load config without writes");
+
+        assert!(config.security.enable_auth);
+        assert!(config.security.auth_token.is_none());
+        assert!(!root.exists());
     }
 
     #[test]

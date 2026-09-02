@@ -7,6 +7,7 @@ use tokio::time::{timeout, Duration};
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
+use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
@@ -66,6 +67,7 @@ impl ProviderDriver for CodexDriver {
         let mut process = JsonLineProcess::spawn(&spec).await?;
         process.send(&json!({"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"todex-agentd","version":env!("CARGO_PKG_VERSION")}}})).await?;
         let _ = read_rpc_response(&mut process, "initialize").await?;
+        process.send(&json!({ "method": "initialized" })).await?;
         process
             .send(&json!({"id":"models","method":"model/list","params":{"includeHidden":false}}))
             .await?;
@@ -170,6 +172,7 @@ impl ProviderDriver for CodexDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         mut cancel: watch::Receiver<bool>,
+        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         let mut spec = CommandSpec::new(&self.binary, &context.manifest.workspace);
         spec.args = vec![
@@ -177,7 +180,7 @@ impl ProviderDriver for CodexDriver {
             "--listen".to_owned(),
             "stdio://".to_owned(),
         ];
-        let mut process = JsonLineProcess::spawn(&spec).await?;
+        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
         let result = run_codex_turn(&mut process, context, prompt, &sink, &mut cancel).await;
         process.terminate().await;
         result
@@ -187,12 +190,20 @@ impl ProviderDriver for CodexDriver {
 async fn read_rpc_response(process: &mut JsonLineProcess, id: &str) -> Result<Value, AppError> {
     loop {
         let Some(value) = process.read().await? else {
-            return Err(AppError::ProviderUnavailable(
-                "Codex app-server closed stdout".to_owned(),
-            ));
+            return Err(provider_exit_error(process, "Codex app-server closed stdout").await);
         };
         if jsonrpc_id_matches(&value, id) {
-            return Ok(value.get("result").cloned().unwrap_or(value));
+            if let Some(error) = value.get("error") {
+                return Err(AppError::ProviderUnavailable(format!(
+                    "Codex app-server request failed: {}",
+                    safe_error_text(error)
+                )));
+            }
+            return value.get("result").cloned().ok_or_else(|| {
+                AppError::ProviderUnavailable(
+                    "Codex app-server response did not include a result".to_owned(),
+                )
+            });
         }
     }
 }
@@ -327,7 +338,7 @@ async fn run_codex_turn(
         if message.is_null() {
             continue;
         }
-        if let Some(stop_reason) = turn_completion_status(&message, native_turn_id.as_deref()) {
+        if let Some(stop_reason) = turn_completion_status(&message, native_turn_id.as_deref())? {
             if stop_reason == "failed" {
                 return Err(codex_turn_failure(&message));
             }
@@ -625,7 +636,7 @@ async fn interrupt_codex_turn(
                     )));
                 }
                 acknowledged = true;
-            } else if let Some(status) = turn_completion_status(&message, Some(native_turn_id)) {
+            } else if let Some(status) = turn_completion_status(&message, Some(native_turn_id))? {
                 if status == "failed" {
                     return Err(codex_turn_failure(&message));
                 }
@@ -649,21 +660,32 @@ async fn interrupt_codex_turn(
     })
 }
 
-fn turn_completion_status<'a>(message: &'a Value, native_turn_id: Option<&str>) -> Option<&'a str> {
+fn turn_completion_status<'a>(
+    message: &'a Value,
+    native_turn_id: Option<&str>,
+) -> Result<Option<&'a str>, AppError> {
     if message.get("method").and_then(Value::as_str) != Some("turn/completed") {
-        return None;
+        return Ok(None);
     }
     if native_turn_id.is_some_and(|expected| {
         message.pointer("/params/turn/id").and_then(Value::as_str) != Some(expected)
     }) {
-        return None;
+        return Ok(None);
     }
-    Some(
-        message
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str)
-            .unwrap_or("completed"),
-    )
+    let status = message
+        .pointer("/params/turn/status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AppError::ProviderUnavailable(
+                "Codex turn/completed notification did not include a status".to_owned(),
+            )
+        })?;
+    if !matches!(status, "completed" | "interrupted" | "failed") {
+        return Err(AppError::ProviderUnavailable(format!(
+            "Codex turn/completed notification used unknown status '{status}'"
+        )));
+    }
+    Ok(Some(status))
 }
 
 fn codex_turn_failure(message: &Value) -> AppError {
@@ -748,10 +770,12 @@ mod tests {
             "params": { "turn": { "id": "turn-1", "status": "failed", "error": "boom" } }
         });
         assert_eq!(
-            turn_completion_status(&failed, Some("turn-1")),
+            turn_completion_status(&failed, Some("turn-1")).unwrap(),
             Some("failed")
         );
-        assert!(turn_completion_status(&failed, Some("turn-2")).is_none());
+        assert!(turn_completion_status(&failed, Some("turn-2"))
+            .unwrap()
+            .is_none());
         assert!(codex_turn_failure(&failed).to_string().contains("boom"));
 
         let interrupted = json!({
@@ -759,9 +783,15 @@ mod tests {
             "params": { "turn": { "id": "turn-1", "status": "interrupted" } }
         });
         assert_eq!(
-            turn_completion_status(&interrupted, Some("turn-1")),
+            turn_completion_status(&interrupted, Some("turn-1")).unwrap(),
             Some("interrupted")
         );
+
+        let missing_status = json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-1" } }
+        });
+        assert!(turn_completion_status(&missing_status, Some("turn-1")).is_err());
     }
 
     #[test]
