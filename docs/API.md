@@ -1,6 +1,6 @@
 # TodeX Backend API 调用文档
 
-本文档基于当前代码实现整理。TodeX 2.0 的主控制面是 `/v2/conversations` 与 `/v2/ws`，统一支持 ACP、Codex、Pi 和 Claude Code。所有 `/v1/*` 接口已移除：旧 `/v1/ws` 的终端、本地 Codex 控制、Cloud Code、MCP 和事件流能力已并入 `/v2/ws`，旧 HTTP 资源接口已迁至 `/v2/*`。
+本文档基于当前代码实现整理。TodeX 2.0 的主控制面是 `/v2/conversations` 与 `/v2/ws`，统一支持 ACP、Codex、Pi、Claude Code 和 Grok Build。所有 `/v1/*` 接口已移除：旧 `/v1/ws` 的终端、本地 Codex 控制、Cloud Code、MCP 和事件流能力已并入 `/v2/ws`，旧 HTTP 资源接口已迁至 `/v2/*`。
 
 ## 基本信息
 
@@ -38,6 +38,9 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 | Codex 可执行文件 | 无 | `TODEX_AGENTD_CODEX_BIN` | `codex` |
 | Claude Code 可执行文件 | 无 | `TODEX_AGENTD_CLAUDE_BIN` | `claude` |
 | Pi 可执行文件 | 无 | `TODEX_AGENTD_PI_BIN` | `pi` |
+| Grok Build 可执行文件 | 无 | `TODEX_AGENTD_GROK_BIN` | `grok` |
+| Grok Build 认证方法 | 无 | `TODEX_AGENTD_GROK_AUTH_METHOD` | 上游默认方法 |
+| Grok Build 环境白名单 | 无 | `TODEX_AGENTD_GROK_ENV_ALLOWLIST` | Grok 配置变量与 `XAI_API_KEY` |
 | 默认 agent 名称 | 无 | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` |
 | 是否开启认证 | 无 | `TODEX_AGENTD_ENABLE_AUTH` | `true` |
 | Bearer token | 无 | `TODEX_AGENTD_AUTH_TOKEN` | 无 |
@@ -48,9 +51,9 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 
 ## v2 Conversation API
 
-Provider 标识为 `acp`、`codex`、`pi`、`claude-code`。未指定时使用 `[agent].default_agent`，默认是 `codex`。ACP 必须使用后端 `config.toml` 中预配置的 `providerProfile`；客户端不能提交任意 command、args 或 env。
+Provider 标识为 `acp`、`codex`、`pi`、`claude-code`、`grok-build`（创建请求也接受 `grok` 与 `grok_build` 别名）。未指定时使用 `[agent].default_agent`，默认是 `codex`。ACP 必须使用后端 `config.toml` 中预配置的 `providerProfile`；客户端不能提交任意 command、args 或 env。
 
-Provider 子进程只继承运行所需的基础系统环境；ACP 额外使用管理员在 profile 中明确配置的 env。Codex、Pi 和 Claude Code 应先由运行 daemon 的同一系统用户完成原生登录。Pi RPC 当前没有覆盖所有工具调用的通用审批接口，因此首期以 `--approve` 启动，`permissions` capability 为 `false`；extension UI 请求仍会转成 TodeX permission 事件，但不能把它等同于逐工具审批。
+Provider 子进程只继承运行所需的基础系统环境；ACP 额外使用管理员在 profile 中明确配置的 env。Codex、Pi、Claude Code 和 Grok Build 应先由运行 daemon 的同一系统用户完成原生登录。Grok Build 也可通过白名单传入 `XAI_API_KEY`；daemon 不会启动浏览器/OIDC 交互认证。Grok 的工具授权、提问、计划审批和 MCP elicitation 会转换为 TodeX `permission.requested`，客户端按服务器提供的 `optionId` 和 `kind` 回复。Pi RPC 当前没有覆盖所有工具调用的通用审批接口，因此首期以 `--approve` 启动，`permissions` capability 为 `false`；extension UI 请求仍会转成 TodeX permission 事件，但不能把它等同于逐工具审批。
 
 ```http
 GET /v2/providers
@@ -66,7 +69,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 模型目录中的 `contextWindow` 来自 Provider 原生模型元数据；Provider 未公开该值时省略。客户端应结合实时 usage 事件显示上下文占用，不得用静态模型表猜测窗口大小。
 
-`/v2/providers/models` 会实时向指定 Agent 查询模型目录，返回 `source` 与 `fetchedAt`。每个模型包含 `supportedReasoningEfforts`，并可通过 `defaultReasoningEffort` 声明后端当前默认强度。Codex 使用 app-server `model/list`，Pi 使用 RPC `get_available_models` 与 `get_state`，Claude Code 在配置了 `ANTHROPIC_BASE_URL` 时读取 `/v1/models`。查询失败时客户端应保留上一次成功目录，并展示可恢复错误。
+`/v2/providers/models` 会实时向指定 Agent 查询模型目录，返回 `source` 与 `fetchedAt`。每个模型包含 `supportedReasoningEfforts`，并可通过 `defaultReasoningEffort` 声明后端当前默认强度。Codex 使用 app-server `model/list`，Pi 使用 RPC `get_available_models` 与 `get_state`，Claude Code 在配置了 `ANTHROPIC_BASE_URL` 时读取 `/v1/models`，Grok Build 从 ACP initialize 的原生模型状态读取。查询失败时客户端应保留上一次成功目录，并展示可恢复错误。
 
 `GET /v2/providers/commands?provider=pi&workspace=/path` 会实时读取 Agent 命令目录。Pi 使用 RPC `get_commands` 返回扩展、Prompt Template 和 Skill；Codex 返回与本机 CLI 版本同步的 TUI 命令适配目录。命令描述包含 `invocation`，客户端应据此选择原生 RPC、桌面动作或 Provider prompt，不要把所有 `/` 输入都当作普通 prompt。
 

@@ -3,6 +3,7 @@
 mod acp;
 mod claude;
 mod codex;
+mod grok;
 mod pi;
 mod process;
 mod supervisor;
@@ -10,3 +11,4 @@ mod types;
 
 pub use supervisor::{ConversationSupervisor, PromptSkillRef};
 pub use types::PermissionDecision;
+pub(crate) use grok::inspect_grok;

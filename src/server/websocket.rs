@@ -3681,11 +3681,15 @@ mod tests {
             pairing_encryption: crate::config::PairingEncryption::default(),
             data_dir: unique_tmp_dir("todex-codex-auth-test-data"),
             workspace_root: std::env::temp_dir(),
+            history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
                 claude_bin: "claude".to_owned(),
                 pi_bin: "pi".to_owned(),
+                grok_bin: "grok".to_owned(),
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
                 acp_profiles: Default::default(),
             },
             security: SecurityConfig {

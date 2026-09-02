@@ -267,7 +267,21 @@ impl PermissionBroker {
             }
         };
         self.pending.remove(&permission_id);
-        let decision = decision?;
+        let decision = match decision {
+            Ok(decision) => decision,
+            Err(error) => {
+                sink.emit(
+                    "permission.resolved",
+                    json!({
+                        "permissionId": permission_id,
+                        "outcome": "cancelled",
+                        "optionId": Value::Null,
+                    }),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         sink.emit(
             "permission.resolved",
             json!({

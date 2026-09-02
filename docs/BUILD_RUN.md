@@ -12,7 +12,7 @@
 - 默认 WebSocket：`ws://127.0.0.1:7345/v2/ws`
 - 默认数据目录：`~/.todex-agent`
 - 默认 workspace 根目录：`~/projects`
-- 首期 Provider：ACP、Codex CLI、Pi、Claude Code
+- Provider：ACP、Codex CLI、Pi、Claude Code、Grok Build
 
 客户端启动（Backend 先于客户端）：
 
@@ -33,7 +33,7 @@ cd TodeX_app && pnpm start
 - Rust 工具链
 - `cargo`
 - 至少安装要使用的 Provider CLI，并放在 `PATH` 中或通过对应环境变量指定路径
-- Codex、Pi 和 Claude Code 使用 daemon 所属系统用户的原生配置与登录状态
+- Codex、Pi、Claude Code 和 Grok Build 使用 daemon 所属系统用户的原生配置与登录状态
 
 建议先检查版本：
 
@@ -43,6 +43,7 @@ cargo --version
 codex --version
 pi --version
 claude --version
+grok --version
 ```
 
 ## 配置方式
@@ -65,6 +66,9 @@ claude --version
 | `TODEX_AGENTD_CODEX_BIN` | `codex` 命令路径 |
 | `TODEX_AGENTD_CLAUDE_BIN` | `claude` 命令路径 |
 | `TODEX_AGENTD_PI_BIN` | `pi` 命令路径 |
+| `TODEX_AGENTD_GROK_BIN` | `grok` 命令路径 |
+| `TODEX_AGENTD_GROK_AUTH_METHOD` | 可选的非交互认证方法 |
+| `TODEX_AGENTD_GROK_ENV_ALLOWLIST` | 允许传给 Grok 的逗号分隔环境变量名 |
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
@@ -85,6 +89,9 @@ default_agent = "codex"
 codex_bin = "codex"
 claude_bin = "claude"
 pi_bin = "pi"
+grok_bin = "grok"
+grok_auth_method = "cached_token"
+grok_env_allowlist = ["GROK_HOME", "GROK_CONFIG", "GROK_CONFIG_PATH", "XAI_API_KEY"]
 
 [agent.acp_profiles.example]
 command = "example-acp-agent"
@@ -103,7 +110,7 @@ language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
 
 TUI 默认不捕获鼠标，终端中的文本可以直接拖选复制。按 `c` 打开“凭据与复制”，可完整查看并复制 Auth Token 与当前加密方式的公钥；私钥不会显示或复制。日志使用 `PageUp`、`PageDown`、`Home`、`End` 滚动。daemon 启动会先检查端口占用，并等待最多 30 秒完成迁移和初始化后再报告超时。
 
-Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径、用户目录、locale、代理和 SSH agent 等运行环境。ACP profile 中的 `env` 会显式传入，但名称以 `TODEX_AGENTD_` 开头的变量会被拒绝。Codex、Pi 和 Claude Code 因此应优先使用各自保存在用户目录中的原生登录配置。Pi 首期使用 RPC `--approve`，因为其 RPC 协议没有通用的逐工具审批接口；只应在可信 workspace 与可信 Pi 配置下启用。
+Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径、用户目录、locale、代理和 SSH agent 等运行环境。ACP profile 中的 `env` 会显式传入，但名称以 `TODEX_AGENTD_` 开头的变量会被拒绝。Codex、Pi、Claude Code 和 Grok Build 因此应优先使用各自保存在用户目录中的原生登录配置。Grok Build 通过 `grok --no-auto-update agent --no-leader stdio` 启动；仅 `grok_env_allowlist` 中名称合法的变量会额外传入。首次运行前使用 daemon 用户执行 `grok login`，或在白名单中保留 `XAI_API_KEY`。Pi 首期使用 RPC `--approve`，因为其 RPC 协议没有通用的逐工具审批接口；只应在可信 workspace 与可信 Pi 配置下启用。
 
 ## Conversation 数据目录
 

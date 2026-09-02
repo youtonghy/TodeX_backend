@@ -161,6 +161,13 @@ impl CatalogService {
         provider: ProviderKind,
         workspace: PathBuf,
     ) -> Result<SkillCatalog, AppError> {
+        if provider == ProviderKind::GrokBuild {
+            let inspect = crate::provider::inspect_grok(&self.config.agent, &workspace).await?;
+            return Ok(SkillCatalog {
+                provider,
+                skills: parse_grok_skills(&inspect, &workspace),
+            });
+        }
         let roots = skill_roots(self.home.as_deref(), &workspace, provider);
         let skills = tokio::task::spawn_blocking(move || scan_skills(roots))
             .await
@@ -180,6 +187,14 @@ impl CatalogService {
             .into_iter()
             .find(|skill| skill.resource_id == resource_id)
             .ok_or_else(|| AppError::NotFound(format!("skill resource {resource_id}")))?;
+        if !descriptor.valid {
+            return Err(AppError::InvalidRequest(
+                descriptor
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "skill resource is not readable".to_owned()),
+            ));
+        }
         let path = descriptor.path.clone();
         let content =
             tokio::task::spawn_blocking(move || read_limited_text(&path, MAX_SKILL_BYTES))
@@ -196,6 +211,13 @@ impl CatalogService {
         provider: ProviderKind,
         workspace: PathBuf,
     ) -> Result<McpCatalog, AppError> {
+        if provider == ProviderKind::GrokBuild {
+            let inspect = crate::provider::inspect_grok(&self.config.agent, &workspace).await?;
+            return Ok(McpCatalog {
+                provider,
+                servers: parse_grok_mcp(&inspect, &workspace),
+            });
+        }
         let home = self.home.clone();
         let workspace_for_scan = workspace.clone();
         let servers = tokio::task::spawn_blocking(move || {
@@ -212,6 +234,11 @@ impl CatalogService {
         workspace: PathBuf,
         resource_id: &str,
     ) -> Result<McpRuntimeTarget, AppError> {
+        if provider == ProviderKind::GrokBuild {
+            return Err(AppError::Unsupported(
+                "Grok Build MCP servers are invoked natively during provider sessions".to_owned(),
+            ));
+        }
         let catalog = self.mcp(provider, workspace.clone()).await?;
         let descriptor = catalog
             .servers
@@ -343,6 +370,10 @@ fn provider_user_skill_root(home: &Path, provider: ProviderKind) -> PathBuf {
             .unwrap_or_else(|| home.join(".pi/agent"))
             .join("skills"),
         ProviderKind::ClaudeCode => home.join(".claude/skills"),
+        ProviderKind::GrokBuild => std::env::var_os("GROK_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".grok"))
+            .join("skills"),
     }
 }
 
@@ -352,6 +383,7 @@ fn provider_project_skill_root(workspace: &Path, provider: ProviderKind) -> Path
         ProviderKind::Codex => workspace.join(".codex/skills"),
         ProviderKind::Pi => workspace.join(".pi/skills"),
         ProviderKind::ClaudeCode => workspace.join(".claude/skills"),
+        ProviderKind::GrokBuild => workspace.join(".grok/skills"),
     }
 }
 
@@ -531,7 +563,7 @@ fn scan_mcp(
     workspace: &Path,
     provider: ProviderKind,
 ) -> Result<Vec<McpServerDescriptor>, AppError> {
-    if provider == ProviderKind::Acp {
+    if matches!(provider, ProviderKind::Acp | ProviderKind::GrokBuild) {
         return Ok(Vec::new());
     }
     let mut descriptors = Vec::new();
@@ -672,8 +704,150 @@ fn mcp_sources(home: Option<&Path>, workspace: &Path, provider: ProviderKind) ->
             }
         }
         ProviderKind::Acp => {}
+        ProviderKind::GrokBuild => {}
     }
     sources
+}
+
+fn parse_grok_skills(inspect: &Value, workspace: &Path) -> Vec<SkillDescriptor> {
+    let mut skills = inspect
+        .get("skills")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|skill| {
+            let name = skill.get("name").and_then(Value::as_str)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let path = skill
+                .pointer("/source/path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            let source_type = skill
+                .pointer("/source/type")
+                .and_then(Value::as_str)
+                .unwrap_or("grok");
+            let valid = safe_grok_skill_path(&path);
+            Some(SkillDescriptor {
+                resource_id: resource_id("skill", &path),
+                name: clean_name(name.to_owned()),
+                description: skill
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(1000)
+                    .collect(),
+                scope: grok_scope(source_type, &path, workspace),
+                source: format!("grok-{source_type}"),
+                active: skill
+                    .get("userInvocable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+                    && valid,
+                shadowed_by: None,
+                valid,
+                error: (!valid).then(|| {
+                    "Grok reported a skill path that is not a readable regular file".to_owned()
+                }),
+                path,
+                priority: 100,
+            })
+        })
+        .collect::<Vec<_>>();
+    skills.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.resource_id.cmp(&right.resource_id))
+    });
+    skills
+}
+
+fn parse_grok_mcp(inspect: &Value, workspace: &Path) -> Vec<McpServerDescriptor> {
+    let mut servers = inspect
+        .get("mcpServers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|server| {
+            let name = server.get("name").and_then(Value::as_str)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let source_path = server
+                .pointer("/source/path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            let source_type = server
+                .pointer("/source/type")
+                .and_then(Value::as_str)
+                .unwrap_or("grok");
+            let target = server
+                .get("target")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let transport = match server.get("transport").and_then(Value::as_str) {
+                Some("stdio") => McpTransport::Stdio,
+                Some("http" | "sse") => McpTransport::Http,
+                _ => McpTransport::Unknown,
+            };
+            let enabled = server
+                .get("compatibilityStatus")
+                .and_then(Value::as_str)
+                != Some("disabled");
+            Some(McpServerDescriptor {
+                resource_id: resource_id(&format!("mcp:{name}"), &source_path),
+                name: clean_name(name.to_owned()),
+                provider: ProviderKind::GrokBuild,
+                scope: grok_scope(source_type, &source_path, workspace),
+                source: format!("grok-{source_type}"),
+                transport,
+                enabled,
+                active: enabled,
+                shadowed_by: None,
+                tools: Vec::new(),
+                auth_status: None,
+                error: None,
+                priority: 100,
+                command: Vec::new(),
+                env: BTreeMap::new(),
+                url: matches!(transport, McpTransport::Http)
+                    .then(|| target.to_owned())
+                    .filter(|value| !value.is_empty()),
+                headers: BTreeMap::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    servers.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.resource_id.cmp(&right.resource_id))
+    });
+    servers
+}
+
+fn safe_grok_skill_path(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+}
+
+fn grok_scope(source_type: &str, path: &Path, workspace: &Path) -> CatalogScope {
+    if source_type.eq_ignore_ascii_case("project") || path.starts_with(workspace) {
+        CatalogScope::Project
+    } else {
+        CatalogScope::User
+    }
 }
 
 struct ParsedMcpServer {
@@ -1042,11 +1216,15 @@ mod tests {
             pairing_encryption: PairingEncryption::None,
             data_dir,
             workspace_root,
+            history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
                 claude_bin: "claude".to_owned(),
                 pi_bin: "pi".to_owned(),
+                grok_bin: "grok".to_owned(),
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {

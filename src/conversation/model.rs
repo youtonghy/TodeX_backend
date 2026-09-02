@@ -15,10 +15,17 @@ pub enum ProviderKind {
     Codex,
     Pi,
     ClaudeCode,
+    GrokBuild,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 4] = [Self::Acp, Self::Codex, Self::Pi, Self::ClaudeCode];
+    pub const ALL: [Self; 5] = [
+        Self::Acp,
+        Self::Codex,
+        Self::Pi,
+        Self::ClaudeCode,
+        Self::GrokBuild,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -26,6 +33,7 @@ impl ProviderKind {
             Self::Codex => "codex",
             Self::Pi => "pi",
             Self::ClaudeCode => "claude-code",
+            Self::GrokBuild => "grok-build",
         }
     }
 }
@@ -39,6 +47,7 @@ impl std::str::FromStr for ProviderKind {
             "codex" => Ok(Self::Codex),
             "pi" => Ok(Self::Pi),
             "claude" | "claude-code" | "claude_code" => Ok(Self::ClaudeCode),
+            "grok" | "grok-build" | "grok_build" => Ok(Self::GrokBuild),
             other => Err(format!("unsupported provider: {other}")),
         }
     }
@@ -232,5 +241,37 @@ pub fn redact_secrets(value: &mut Value) {
         }
         Value::Array(values) => values.iter_mut().for_each(redact_secrets),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod provider_kind_tests {
+    use std::str::FromStr;
+
+    use super::ProviderKind;
+
+    #[test]
+    fn grok_build_provider_kind_has_stable_wire_name_and_aliases() {
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::GrokBuild).unwrap(),
+            "\"grok-build\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderKind>("\"grok-build\"").unwrap(),
+            ProviderKind::GrokBuild
+        );
+        for alias in ["grok", "grok-build", "grok_build", " GROK "] {
+            assert_eq!(
+                ProviderKind::from_str(alias).unwrap(),
+                ProviderKind::GrokBuild
+            );
+        }
+        assert_eq!(
+            ProviderKind::ALL
+                .iter()
+                .filter(|provider| **provider == ProviderKind::GrokBuild)
+                .count(),
+            1
+        );
     }
 }

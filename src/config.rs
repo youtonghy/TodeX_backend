@@ -86,6 +86,9 @@ pub struct AgentConfig {
     pub codex_bin: String,
     pub claude_bin: String,
     pub pi_bin: String,
+    pub grok_bin: String,
+    pub grok_auth_method: Option<String>,
+    pub grok_env_allowlist: Vec<String>,
     pub acp_profiles: BTreeMap<String, AcpProfileConfig>,
 }
 
@@ -123,6 +126,9 @@ struct PartialAgentConfig {
     codex_bin: Option<String>,
     claude_bin: Option<String>,
     pi_bin: Option<String>,
+    grok_bin: Option<String>,
+    grok_auth_method: Option<String>,
+    grok_env_allowlist: Option<Vec<String>>,
     acp_profiles: Option<BTreeMap<String, AcpProfileConfig>>,
 }
 
@@ -246,6 +252,20 @@ impl Config {
                     agent_file.pi_bin,
                     defaults.agent.pi_bin,
                 ),
+                grok_bin: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_GROK_BIN").ok(),
+                    agent_file.grok_bin,
+                    defaults.agent.grok_bin,
+                ),
+                grok_auth_method: optional_non_empty(
+                    env::var("TODEX_AGENTD_GROK_AUTH_METHOD").ok(),
+                )
+                .or_else(|| optional_non_empty(agent_file.grok_auth_method))
+                .or(defaults.agent.grok_auth_method),
+                grok_env_allowlist: env_list("TODEX_AGENTD_GROK_ENV_ALLOWLIST")
+                    .or(agent_file.grok_env_allowlist)
+                    .unwrap_or(defaults.agent.grok_env_allowlist),
                 acp_profiles: agent_file
                     .acp_profiles
                     .unwrap_or(defaults.agent.acp_profiles),
@@ -337,6 +357,9 @@ impl Default for Config {
                 codex_bin: "codex".to_owned(),
                 claude_bin: "claude".to_owned(),
                 pi_bin: "pi".to_owned(),
+                grok_bin: "grok".to_owned(),
+                grok_auth_method: None,
+                grok_env_allowlist: default_grok_env_allowlist(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -370,6 +393,33 @@ fn env_bool(key: &str) -> Option<bool> {
         })
 }
 
+fn env_list(key: &str) -> Option<Vec<String>> {
+    env::var(key).ok().map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    })
+}
+
+fn default_grok_env_allowlist() -> Vec<String> {
+    [
+        "GROK_HOME",
+        "GROK_CONFIG",
+        "GROK_CONFIG_PATH",
+        "GROK_OIDC_ISSUER",
+        "GROK_OIDC_CLIENT_ID",
+        "GROK_CLI_CHAT_PROXY_BASE_URL",
+        "GROK_EXTRA_CA_BUNDLE",
+        "XAI_API_KEY",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 fn coalesce<T>(cli: Option<T>, env: Option<T>, file: Option<T>, default: T) -> T {
     cli.or(env).or(file).unwrap_or(default)
 }
@@ -380,7 +430,7 @@ fn optional_non_empty(value: Option<String>) -> Option<String> {
         if trimmed.is_empty() {
             None
         } else {
-            Some(value)
+            Some(trimmed.to_owned())
         }
     })
 }
@@ -490,7 +540,25 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use super::{expand_home_with_home, Config, PairingEncryption, ServeArgs};
+    use super::{expand_home_with_home, optional_non_empty, Config, PairingEncryption, ServeArgs};
+
+    #[test]
+    fn default_grok_config_is_safe() {
+        let config = Config::default();
+        assert_eq!(config.agent.grok_bin, "grok");
+        assert!(config.agent.grok_auth_method.is_none());
+        assert!(config.agent.grok_env_allowlist.contains(&"GROK_HOME".to_owned()));
+        assert!(config.agent.grok_env_allowlist.contains(&"XAI_API_KEY".to_owned()));
+        assert!(config
+            .agent
+            .grok_env_allowlist
+            .iter()
+            .all(|name| !name.starts_with("TODEX_AGENTD_")));
+        assert_eq!(
+            optional_non_empty(Some(" cached_token ".to_owned())).as_deref(),
+            Some("cached_token")
+        );
+    }
 
     #[test]
     fn default_config_requires_auth() {

@@ -21,6 +21,12 @@ const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 // payload should carry, but the first line alone is often just a stack frame.
 const STDERR_EXCERPT_CHARS: usize = 2000;
 
+pub struct BoundedCommandOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub success: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
     pub program: String,
@@ -176,6 +182,87 @@ impl Drop for JsonLineProcess {
     }
 }
 
+pub async fn run_bounded_command(
+    spec: &CommandSpec,
+    max_stdout_bytes: usize,
+    timeout_duration: Duration,
+) -> Result<BoundedCommandOutput, AppError> {
+    if !spec.cwd.is_absolute() {
+        return Err(AppError::InvalidRequest(
+            "provider working directory must be absolute".to_owned(),
+        ));
+    }
+    let mut command = secure_command(&spec.program);
+    command
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AppError::ProviderUnavailable(format!(
+                "provider executable '{}' was not found",
+                spec.program
+            ))
+        } else {
+            AppError::Io(error)
+        }
+    })?;
+    let pid = child.id();
+    let stdout = child.stdout.take().ok_or_else(|| {
+        AppError::ProviderUnavailable("provider process did not expose stdout".to_owned())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        AppError::ProviderUnavailable("provider process did not expose stderr".to_owned())
+    })?;
+    let stdout_task = tokio::spawn(drain_bounded(stdout, max_stdout_bytes));
+    let stderr_task = tokio::spawn(drain_bounded(stderr, MAX_STDERR_BYTES));
+
+    let status = match timeout(timeout_duration, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                signal_process_group(pid, libc::SIGKILL);
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(AppError::ProviderUnavailable(
+                "provider diagnostic command timed out".to_owned(),
+            ));
+        }
+    };
+    let (stdout, stdout_exceeded) = stdout_task
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))??;
+    let (stderr, _) = stderr_task
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))??;
+    if stdout_exceeded {
+        return Err(AppError::InvalidRequest(
+            "provider diagnostic output is too large".to_owned(),
+        ));
+    }
+    Ok(BoundedCommandOutput {
+        stdout,
+        stderr,
+        success: status.success(),
+    })
+}
+
 pub async fn provider_exit_error(process: &JsonLineProcess, message: &str) -> AppError {
     let excerpt = {
         let buffer = process.stderr.lock().await;
@@ -207,6 +294,7 @@ fn stderr_excerpt(buffer: &[u8]) -> Option<String> {
     }
     // Count characters, not bytes: truncating a UTF-8 sequence mid-way would
     // panic on a str slice, and provider output is frequently non-ASCII.
+    let collapsed = redact_sensitive_text(&collapsed);
     if collapsed.chars().count() <= STDERR_EXCERPT_CHARS {
         return Some(collapsed);
     }
@@ -217,14 +305,94 @@ fn stderr_excerpt(buffer: &[u8]) -> Option<String> {
     Some(format!("...{kept}"))
 }
 
+pub(super) fn redact_sensitive_text(input: &str) -> String {
+    let mut output = input.to_owned();
+    for prefix in ["xai-", "Bearer "] {
+        let mut search_from = 0;
+        while let Some(relative) = output[search_from..].find(prefix) {
+            let start = search_from + relative;
+            let value_start = start + prefix.len();
+            let value_end = output[value_start..]
+                .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '}' | ']'))
+                .map_or(output.len(), |offset| value_start + offset);
+            output.replace_range(start..value_end, "[REDACTED]");
+            search_from = start + "[REDACTED]".len();
+        }
+    }
+    for key in ["api_key", "access_token", "refresh_token", "authorization"] {
+        redact_json_string_value(&mut output, key);
+    }
+    output
+}
+
+fn redact_json_string_value(output: &mut String, key: &str) {
+    let marker = format!("\"{key}\"");
+    let mut search_from = 0;
+    while let Some(relative) = output[search_from..].find(&marker) {
+        let marker_start = search_from + relative;
+        let Some(colon_offset) = output[marker_start + marker.len()..].find(':') else {
+            break;
+        };
+        let after_colon = marker_start + marker.len() + colon_offset + 1;
+        let Some(quote_offset) = output[after_colon..].find('"') else {
+            break;
+        };
+        let value_start = after_colon + quote_offset + 1;
+        let Some(end_offset) = output[value_start..].find('"') else {
+            break;
+        };
+        let value_end = value_start + end_offset;
+        output.replace_range(value_start..value_end, "[REDACTED]");
+        search_from = value_start + "[REDACTED]".len();
+    }
+}
+
 pub fn executable_available(program: &str) -> bool {
+    resolve_executable(program).is_some()
+}
+
+fn resolve_executable(program: &str) -> Option<PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 {
-        return executable_file(path);
+        if executable_file(path) {
+            return Some(path.to_owned());
+        }
+        #[cfg(windows)]
+        if path.extension().is_none() {
+            let directory = path.parent().unwrap_or_else(|| Path::new("."));
+            let file_name = path.file_name()?.to_str()?;
+            return executable_with_platform_extension(directory, file_name);
+        }
+        return None;
     }
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|directory| executable_file(&directory.join(program)))
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .find_map(|directory| executable_in_directory(&directory, program))
     })
+}
+
+fn executable_in_directory(directory: &Path, program: &str) -> Option<PathBuf> {
+    let direct = directory.join(program);
+    if executable_file(&direct) {
+        return Some(direct);
+    }
+    #[cfg(windows)]
+    {
+        if Path::new(program).extension().is_none() {
+            return executable_with_platform_extension(directory, program);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn executable_with_platform_extension(directory: &Path, program: &str) -> Option<PathBuf> {
+    std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned())
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| directory.join(format!("{program}{extension}")))
+        .find(|candidate| executable_file(candidate))
 }
 
 fn executable_file(path: &Path) -> bool {
@@ -246,7 +414,12 @@ fn executable_file(path: &Path) -> bool {
 }
 
 fn secure_command(program: impl AsRef<OsStr>) -> Command {
-    let mut command = Command::new(program);
+    let program = program.as_ref();
+    let resolved = program
+        .to_str()
+        .and_then(resolve_executable)
+        .unwrap_or_else(|| PathBuf::from(program));
+    let mut command = Command::new(resolved);
     command.env_clear();
     for key in [
         "PATH",
@@ -313,6 +486,25 @@ async fn drain_stderr(stderr: tokio::process::ChildStderr, destination: Arc<Mute
             }
         }
     }
+}
+
+async fn drain_bounded<R>(mut reader: R, max_bytes: usize) -> Result<(Vec<u8>, bool), AppError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut exceeded = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(output.len());
+        output.extend_from_slice(&chunk[..count.min(remaining)]);
+        exceeded |= count > remaining;
+    }
+    Ok((output, exceeded))
 }
 
 async fn read_bounded_line<R>(reader: &mut R, max_bytes: usize) -> Result<Option<Vec<u8>>, AppError>
@@ -396,5 +588,38 @@ mod tests {
         assert!(excerpt.starts_with("..."));
         assert!(excerpt.ends_with("final cause"));
         assert!(excerpt.chars().count() <= STDERR_EXCERPT_CHARS + 3);
+    }
+
+    #[test]
+    fn sensitive_provider_diagnostics_are_redacted() {
+        let redacted = redact_sensitive_text(
+            r#"failed api xai-secret and Bearer token-value {"api_key":"raw-secret"}"#,
+        );
+        assert!(!redacted.contains("xai-secret"));
+        assert!(!redacted.contains("token-value"));
+        assert!(!redacted.contains("raw-secret"));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_resolution_rejects_non_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "todex-provider-executable-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("grok");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!executable_available(path.to_str().unwrap()));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_executable(path.to_str().unwrap()),
+            Some(path.clone())
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

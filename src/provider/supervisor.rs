@@ -24,6 +24,7 @@ use crate::workspace_paths::validate_workspace_directory_text;
 use super::acp::AcpDriver;
 use super::claude::ClaudeDriver;
 use super::codex::CodexDriver;
+use super::grok::GrokBuildDriver;
 use super::pi::PiDriver;
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, PermissionBroker, PermissionDecision,
@@ -63,6 +64,10 @@ impl DriverRegistry {
             (
                 ProviderKind::ClaudeCode,
                 Arc::new(ClaudeDriver::new(&config.agent)) as Arc<dyn ProviderDriver>,
+            ),
+            (
+                ProviderKind::GrokBuild,
+                Arc::new(GrokBuildDriver::new(&config.agent)) as Arc<dyn ProviderDriver>,
             ),
         ]);
         Self {
@@ -950,7 +955,10 @@ mod tests {
                 default_agent: "codex".to_owned(),
                 codex_bin: fixture_text.clone(),
                 claude_bin: fixture_text.clone(),
-                pi_bin: fixture_text,
+                pi_bin: fixture_text.clone(),
+                grok_bin: fixture_text,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
             },
             security: SecurityConfig {
@@ -1046,6 +1054,9 @@ mod tests {
                 codex_bin: fixture.to_string_lossy().to_string(),
                 claude_bin: fixture.to_string_lossy().to_string(),
                 pi_bin: fixture.to_string_lossy().to_string(),
+                grok_bin: "grok".to_owned(),
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -1095,6 +1106,9 @@ mod tests {
                 codex_bin: fixture.to_string_lossy().to_string(),
                 claude_bin: fixture.to_string_lossy().to_string(),
                 pi_bin: fixture.to_string_lossy().to_string(),
+                grok_bin: "grok".to_owned(),
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -1154,7 +1168,25 @@ extract_id() {
   printf '%s' "$1" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'
 }
 
-if [ "$mode" = "acp" ]; then
+if [ "$mode" = "--no-auto-update" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      *'"method":"initialize"'*)
+        printf '{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"_meta":{"modelState":{"currentModelId":"grok-fixture","availableModels":[{"modelId":"grok-fixture","name":"Grok Fixture","_meta":{"supportsReasoningEffort":true}}]}}}}\n'
+        ;;
+      *'"method":"session/new"'*)
+        printf '{"jsonrpc":"2.0","id":"session","result":{"sessionId":"grok-native","models":{"currentModelId":"grok-fixture","availableModels":[{"modelId":"grok-fixture","name":"Grok Fixture","_meta":{"supportsReasoningEffort":true}}]}}}\n'
+        ;;
+      *'"method":"session/load"'*)
+        printf '{"jsonrpc":"2.0","id":"session","result":{"models":{"currentModelId":"grok-fixture","availableModels":[{"modelId":"grok-fixture","name":"Grok Fixture","_meta":{"supportsReasoningEffort":true}}]}}}\n'
+        ;;
+      *'"method":"session/prompt"'*)
+        id=$(extract_id "$line")
+        printf '{"jsonrpc":"2.0","id":"%s","result":{"stopReason":"end_turn"}}\n' "$id"
+        ;;
+    esac
+  done
+elif [ "$mode" = "acp" ]; then
   while IFS= read -r line; do
     case "$line" in
       *'"method":"initialize"'*)
@@ -1255,7 +1287,10 @@ fi
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
                 claude_bin: executable.clone(),
-                pi_bin: executable,
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {

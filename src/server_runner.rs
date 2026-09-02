@@ -159,6 +159,9 @@ mod tests {
                 codex_bin: "codex".to_owned(),
                 claude_bin: "claude".to_owned(),
                 pi_bin: "pi".to_owned(),
+                grok_bin: "grok".to_owned(),
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
                 acp_profiles: Default::default(),
             },
             security: SecurityConfig {
@@ -192,6 +195,9 @@ mod tests {
                 codex_bin: "codex".to_owned(),
                 claude_bin: "claude".to_owned(),
                 pi_bin: "pi".to_owned(),
+                grok_bin: "grok".to_owned(),
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
                 acp_profiles: Default::default(),
             },
             security: SecurityConfig {
