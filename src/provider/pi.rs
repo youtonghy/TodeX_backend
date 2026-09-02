@@ -60,35 +60,20 @@ impl ProviderDriver for PiDriver {
             let Some(value) = process.read().await? else { return Err(AppError::ProviderUnavailable("Pi RPC process closed stdout".to_owned())); };
             if value.get("id").and_then(Value::as_str) == Some("models") { break value; }
         };
+        if response.get("success").and_then(Value::as_bool) != Some(true) {
+            process.terminate().await;
+            return Err(pi_response_error(&response, "get_available_models"));
+        }
+        process.send(&json!({"id":"state","type":"get_state"})).await?;
+        let state = loop {
+            let Some(value) = process.read().await? else { return Err(AppError::ProviderUnavailable("Pi RPC process closed stdout".to_owned())); };
+            if value.get("id").and_then(Value::as_str) == Some("state") { break value; }
+        };
         process.terminate().await;
-        Ok(response.pointer("/data/models").or_else(|| response.get("data")).and_then(Value::as_array).into_iter().flatten().filter_map(|item| {
-            let model_id = item.get("id").or_else(|| item.get("modelId")).and_then(Value::as_str)?.to_owned();
-            let id = item.get("provider").and_then(Value::as_str).map(|provider| format!("{provider}/{model_id}")).unwrap_or(model_id);
-            // Match Pi's getSupportedThinkingLevels semantics: ordinary levels are
-            // supported when omitted (the provider default), while xhigh/max must
-            // be explicitly mapped. A null mapping explicitly disables a level.
-            let efforts = if item.get("reasoning").and_then(Value::as_bool) == Some(false) {
-                vec!["off".to_owned()]
-            } else {
-                let map = item.get("thinkingLevelMap").and_then(Value::as_object);
-                ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-                    .into_iter()
-                    .filter(|level| {
-                        let mapped = map.and_then(|values| values.get(*level));
-                        if mapped.is_some_and(Value::is_null) {
-                            return false;
-                        }
-                        if matches!(*level, "xhigh" | "max") {
-                            mapped.is_some()
-                        } else {
-                            true
-                        }
-                    })
-                    .map(str::to_owned)
-                    .collect()
-            };
-            Some(super::types::ProviderModelDescriptor { id, display_name: item.get("name").or_else(|| item.get("displayName")).and_then(Value::as_str).unwrap_or("Pi model").to_owned(), description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(), is_default: item.get("isDefault").and_then(Value::as_bool).unwrap_or(false), supported_reasoning_efforts: efforts, context_window: item.get("contextWindow").and_then(Value::as_u64) })
-        }).collect())
+        if state.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(pi_response_error(&state, "get_state"));
+        }
+        Ok(parse_pi_models(&response, &state))
     }
 
     async fn discover_commands(&self, workspace: &Path) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
@@ -156,6 +141,41 @@ impl ProviderDriver for PiDriver {
         process.terminate().await;
         result
     }
+}
+
+fn parse_pi_models(response: &Value, state: &Value) -> Vec<super::types::ProviderModelDescriptor> {
+    let default_model = state.pointer("/data/model").and_then(pi_model_id);
+    let default_effort = state.pointer("/data/thinkingLevel").and_then(Value::as_str);
+    response.pointer("/data/models").or_else(|| response.get("data")).and_then(Value::as_array).into_iter().flatten().filter_map(|item| {
+        let id = pi_model_id(item)?;
+        let is_default = default_model.as_deref() == Some(id.as_str()) || item.get("isDefault").and_then(Value::as_bool).unwrap_or(false);
+        let efforts = pi_supported_thinking_levels(item);
+        Some(super::types::ProviderModelDescriptor {
+            id,
+            display_name: item.get("name").or_else(|| item.get("displayName")).and_then(Value::as_str).unwrap_or("Pi model").to_owned(),
+            description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(),
+            is_default,
+            supported_reasoning_efforts: efforts.clone(),
+            default_reasoning_effort: is_default.then(|| default_effort.filter(|effort| efforts.iter().any(|item| item == effort))).flatten().map(str::to_owned),
+            context_window: item.get("contextWindow").and_then(Value::as_u64),
+        })
+    }).collect()
+}
+
+fn pi_model_id(item: &Value) -> Option<String> {
+    let model_id = item.get("id").or_else(|| item.get("modelId")).and_then(Value::as_str)?;
+    Some(item.get("provider").and_then(Value::as_str).map(|provider| format!("{provider}/{model_id}")).unwrap_or_else(|| model_id.to_owned()))
+}
+
+fn pi_supported_thinking_levels(item: &Value) -> Vec<String> {
+    if item.get("reasoning").and_then(Value::as_bool) != Some(true) {
+        return vec!["off".to_owned()];
+    }
+    let map = item.get("thinkingLevelMap").and_then(Value::as_object);
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"].into_iter().filter(|level| {
+        let mapped = map.and_then(|values| values.get(*level));
+        !mapped.is_some_and(Value::is_null) && (!matches!(*level, "xhigh" | "max") || mapped.is_some())
+    }).map(str::to_owned).collect()
 }
 
 async fn run_pi_turn(
@@ -379,4 +399,32 @@ fn pi_response_error(response: &Value, command: &str) -> AppError {
         .and_then(Value::as_str)
         .unwrap_or("Pi rejected the command");
     AppError::ProviderUnavailable(format!("Pi {command} failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_model_specific_thinking_levels_and_default() {
+        let response = json!({"data":{"models":[
+            {"provider":"zai","id":"glm-5.3","reasoning":true,"thinkingLevelMap":{"off":null,"xhigh":"xhigh","max":"max"}},
+            {"provider":"retoo","id":"deepseek-v4","reasoning":true,"thinkingLevelMap":{"off":null,"minimal":null,"low":null,"medium":null,"high":null,"xhigh":null,"max":"max"}},
+            {"provider":"plain","id":"chat","reasoning":false}
+        ]}});
+        let state = json!({"data":{"model":{"provider":"zai","id":"glm-5.3"},"thinkingLevel":"high"}});
+        let models = parse_pi_models(&response, &state);
+        assert_eq!(models[0].supported_reasoning_efforts, ["minimal", "low", "medium", "high", "xhigh", "max"]);
+        assert!(models[0].is_default);
+        assert_eq!(models[0].default_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(models[1].supported_reasoning_efforts, ["max"]);
+        assert_eq!(models[2].supported_reasoning_efforts, ["off"]);
+    }
+
+    #[test]
+    fn omits_an_invalid_default_thinking_level() {
+        let response = json!({"data":{"models":[{"provider":"retoo","id":"deepseek-v4","reasoning":true,"thinkingLevelMap":{"off":null,"minimal":null,"low":null,"medium":null,"high":null,"xhigh":null,"max":"max"}}]}});
+        let state = json!({"data":{"model":{"provider":"retoo","id":"deepseek-v4"},"thinkingLevel":"high"}});
+        assert_eq!(parse_pi_models(&response, &state)[0].default_reasoning_effort, None);
+    }
 }

@@ -60,7 +60,7 @@ impl ProviderDriver for CodexDriver {
         process.terminate().await;
         Ok(response.get("data").and_then(Value::as_array).into_iter().flatten().filter_map(|item| {
             let id = item.get("model").or_else(|| item.get("id")).and_then(Value::as_str)?.to_owned();
-            Some(super::types::ProviderModelDescriptor { id, display_name: item.get("displayName").and_then(Value::as_str).unwrap_or("Codex model").to_owned(), description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(), is_default: item.get("isDefault").and_then(Value::as_bool).unwrap_or(false), supported_reasoning_efforts: item.get("supportedReasoningEfforts").and_then(Value::as_array).map(|items| items.iter().filter_map(|x| x.get("reasoningEffort").and_then(Value::as_str).map(ToOwned::to_owned)).collect()).unwrap_or_default(), context_window: None })
+            Some(super::types::ProviderModelDescriptor { id, display_name: item.get("displayName").and_then(Value::as_str).unwrap_or("Codex model").to_owned(), description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(), is_default: item.get("isDefault").and_then(Value::as_bool).unwrap_or(false), supported_reasoning_efforts: item.get("supportedReasoningEfforts").and_then(Value::as_array).map(|items| items.iter().filter_map(|x| x.get("reasoningEffort").and_then(Value::as_str).map(ToOwned::to_owned)).collect()).unwrap_or_default(), default_reasoning_effort: item.get("defaultReasoningEffort").and_then(Value::as_str).map(ToOwned::to_owned), context_window: None })
         }).collect())
     }
 

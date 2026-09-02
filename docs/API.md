@@ -66,7 +66,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 模型目录中的 `contextWindow` 来自 Provider 原生模型元数据；Provider 未公开该值时省略。客户端应结合实时 usage 事件显示上下文占用，不得用静态模型表猜测窗口大小。
 
-`/v2/providers/models` 会实时向指定 Agent 查询模型目录，返回 `source` 与 `fetchedAt`。Codex 使用 app-server `model/list`，Pi 使用 RPC `get_available_models`，Claude Code 在配置了 `ANTHROPIC_BASE_URL` 时读取 `/v1/models`。查询失败时客户端应保留 Agent 默认模型，并展示可恢复错误。
+`/v2/providers/models` 会实时向指定 Agent 查询模型目录，返回 `source` 与 `fetchedAt`。每个模型包含 `supportedReasoningEfforts`，并可通过 `defaultReasoningEffort` 声明后端当前默认强度。Codex 使用 app-server `model/list`，Pi 使用 RPC `get_available_models` 与 `get_state`，Claude Code 在配置了 `ANTHROPIC_BASE_URL` 时读取 `/v1/models`。查询失败时客户端应保留上一次成功目录，并展示可恢复错误。
 
 `GET /v2/providers/commands?provider=pi&workspace=/path` 会实时读取 Agent 命令目录。Pi 使用 RPC `get_commands` 返回扩展、Prompt Template 和 Skill；Codex 返回与本机 CLI 版本同步的 TUI 命令适配目录。命令描述包含 `invocation`，客户端应据此选择原生 RPC、桌面动作或 Provider prompt，不要把所有 `/` 输入都当作普通 prompt。
 

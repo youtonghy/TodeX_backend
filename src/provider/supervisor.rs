@@ -28,6 +28,7 @@ use super::pi::PiDriver;
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, PermissionBroker, PermissionDecision,
     PermissionOutcome, ProviderCommandDescriptor, ProviderDescriptor, ProviderDriver,
+    ProviderModelDescriptor,
 };
 
 const MAX_PROMPT_BYTES: usize = 512 * 1024;
@@ -162,19 +163,17 @@ impl ConversationSupervisor {
         self.registry.descriptors()
     }
 
-    pub async fn providers_live(&self, workspace: &Path) -> Vec<ProviderDescriptor> {
-        let mut descriptors = self.registry.descriptors();
-        for descriptor in &mut descriptors {
-            if let Ok(driver) = self.registry.driver(descriptor.id) {
-                if let Ok(Ok(models)) =
-                    tokio::time::timeout(Duration::from_secs(8), driver.discover_models(workspace))
-                        .await
-                {
-                    descriptor.models = models;
-                }
-            }
-        }
-        descriptors
+    pub async fn models_live(
+        &self,
+        provider: ProviderKind,
+        workspace: &Path,
+    ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            self.registry.driver(provider)?.discover_models(workspace),
+        )
+        .await
+        .map_err(|_| AppError::ProviderUnavailable(format!("{} model discovery timed out", provider.as_str())))?
     }
 
     pub async fn commands_live(

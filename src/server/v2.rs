@@ -646,11 +646,15 @@ async fn provider_models(
     Query(query): Query<ProviderModelsQuery>,
 ) -> Result<Json<Value>, AppError> {
     require_auth(&state, &headers)?;
-    let workspace = validate_workspace_directory_text(&state.config.workspace_root, &query.workspace)?;
-    let descriptor = state.conversations.providers_live(&workspace).await
-        .into_iter().find(|item| item.id == query.provider)
-        .ok_or_else(|| AppError::Unsupported(format!("provider {}", query.provider.as_str())))?;
-    Ok(Json(json!({ "provider": descriptor.id, "models": descriptor.models, "source": "provider-discovery", "fetchedAt": chrono::Utc::now().to_rfc3339() })))
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace)?;
+    let models = state
+        .conversations
+        .models_live(query.provider, &workspace)
+        .await?;
+    Ok(Json(
+        json!({ "provider": query.provider, "models": models, "source": "provider-discovery", "fetchedAt": chrono::Utc::now().to_rfc3339() }),
+    ))
 }
 
 async fn provider_commands(
