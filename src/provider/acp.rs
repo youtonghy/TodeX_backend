@@ -91,6 +91,7 @@ impl ProviderDriver for AcpDriver {
                 tool_events: true,
                 native_skills: true,
                 native_mcp: true,
+                managed_mcp: false,
                 model_selection: false,
             },
             models: Vec::new(),
@@ -294,7 +295,7 @@ pub(super) async fn run_acp_turn(
         }
         if let Err(error) = handle_acp_message(process, message, sink, cancel, provider, true).await
         {
-            if matches!(error, AppError::Conflict(_)) && *cancel.borrow() {
+            if matches!(error, AppError::TurnCancelled) && *cancel.borrow() {
                 send_notification(
                     process,
                     "session/cancel",
@@ -325,7 +326,7 @@ async fn wait_for_response(
             message = process.read() => message?,
             changed = cancel.changed() => {
                 let _ = changed;
-                return Err(AppError::Conflict("turn was cancelled".to_owned()));
+                return Err(AppError::TurnCancelled);
             }
         };
         let Some(message) = message else {
@@ -397,7 +398,7 @@ async fn handle_acp_message(
             .await
         {
             Ok(decision) => decision,
-            Err(error @ AppError::Conflict(_)) => {
+            Err(error @ AppError::TurnCancelled) => {
                 let response = RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
                 process
                     .send(&json!({ "jsonrpc": "2.0", "id": request_id, "result": response }))
@@ -519,7 +520,7 @@ async fn handle_ask_user_question(
             .await
         {
             Ok(decision) => decision,
-            Err(error @ AppError::Conflict(_)) => {
+            Err(error @ AppError::TurnCancelled) => {
                 send_result(process, request_id, json!({ "outcome": "cancelled" })).await?;
                 return Err(error);
             }
@@ -583,7 +584,7 @@ async fn handle_exit_plan_mode(
         .await
     {
         Ok(decision) => decision,
-        Err(error @ AppError::Conflict(_)) => {
+        Err(error @ AppError::TurnCancelled) => {
             send_result(process, request_id, json!({ "outcome": "cancelled" })).await?;
             return Err(error);
         }
@@ -646,7 +647,7 @@ async fn handle_mcp_elicit(
         .await
     {
         Ok(decision) => decision,
-        Err(error @ AppError::Conflict(_)) => {
+        Err(error @ AppError::TurnCancelled) => {
             send_result(process, request_id, json!({ "action": "cancel" })).await?;
             return Err(error);
         }

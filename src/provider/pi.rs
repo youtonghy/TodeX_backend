@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use std::path::Path;
 use serde_json::{json, Value};
+use std::path::Path;
 use tokio::sync::watch;
+use tokio::time::Duration;
 
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
@@ -10,8 +11,7 @@ use crate::error::AppError;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, PermissionOutcome,
-    ProviderCommandDescriptor,
-    ProviderCapabilities, ProviderDescriptor, ProviderDriver,
+    ProviderCapabilities, ProviderCommandDescriptor, ProviderDescriptor, ProviderDriver,
 };
 
 pub struct PiDriver {
@@ -44,30 +44,55 @@ impl ProviderDriver for PiDriver {
                 permissions: false,
                 tool_events: true,
                 native_skills: true,
-                native_mcp: true,
+                native_mcp: false,
+                managed_mcp: true,
                 model_selection: true,
             },
             models: Vec::new(),
         }
     }
 
-    async fn discover_models(&self, workspace: &Path) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
+    async fn discover_models(
+        &self,
+        workspace: &Path,
+    ) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
         let mut spec = CommandSpec::new(&self.binary, workspace);
-        spec.args = vec!["--mode".to_owned(), "rpc".to_owned(), "--no-session".to_owned(), "--approve".to_owned()];
+        spec.args = vec![
+            "--mode".to_owned(),
+            "rpc".to_owned(),
+            "--no-session".to_owned(),
+            "--approve".to_owned(),
+        ];
         let mut process = JsonLineProcess::spawn(&spec).await?;
-        process.send(&json!({"id":"models","type":"get_available_models"})).await?;
+        process
+            .send(&json!({"id":"models","type":"get_available_models"}))
+            .await?;
         let response = loop {
-            let Some(value) = process.read().await? else { return Err(AppError::ProviderUnavailable("Pi RPC process closed stdout".to_owned())); };
-            if value.get("id").and_then(Value::as_str) == Some("models") { break value; }
+            let Some(value) = process.read().await? else {
+                return Err(AppError::ProviderUnavailable(
+                    "Pi RPC process closed stdout".to_owned(),
+                ));
+            };
+            if value.get("id").and_then(Value::as_str) == Some("models") {
+                break value;
+            }
         };
         if response.get("success").and_then(Value::as_bool) != Some(true) {
             process.terminate().await;
             return Err(pi_response_error(&response, "get_available_models"));
         }
-        process.send(&json!({"id":"state","type":"get_state"})).await?;
+        process
+            .send(&json!({"id":"state","type":"get_state"}))
+            .await?;
         let state = loop {
-            let Some(value) = process.read().await? else { return Err(AppError::ProviderUnavailable("Pi RPC process closed stdout".to_owned())); };
-            if value.get("id").and_then(Value::as_str) == Some("state") { break value; }
+            let Some(value) = process.read().await? else {
+                return Err(AppError::ProviderUnavailable(
+                    "Pi RPC process closed stdout".to_owned(),
+                ));
+            };
+            if value.get("id").and_then(Value::as_str) == Some("state") {
+                break value;
+            }
         };
         process.terminate().await;
         if state.get("success").and_then(Value::as_bool) != Some(true) {
@@ -76,27 +101,70 @@ impl ProviderDriver for PiDriver {
         Ok(parse_pi_models(&response, &state))
     }
 
-    async fn discover_commands(&self, workspace: &Path) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
+    async fn discover_commands(
+        &self,
+        workspace: &Path,
+    ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
         let mut spec = CommandSpec::new(&self.binary, workspace);
-        spec.args = vec!["--mode".to_owned(), "rpc".to_owned(), "--no-session".to_owned(), "--approve".to_owned()];
+        spec.args = vec![
+            "--mode".to_owned(),
+            "rpc".to_owned(),
+            "--no-session".to_owned(),
+            "--approve".to_owned(),
+        ];
         let mut process = JsonLineProcess::spawn(&spec).await?;
-        process.send(&json!({"id":"commands","type":"get_commands"})).await?;
+        process
+            .send(&json!({"id":"commands","type":"get_commands"}))
+            .await?;
         let response = loop {
-            let Some(value) = process.read().await? else { return Err(AppError::ProviderUnavailable("Pi RPC process closed stdout".to_owned())); };
-            if value.get("id").and_then(Value::as_str) == Some("commands") { break value; }
+            let Some(value) = process.read().await? else {
+                return Err(AppError::ProviderUnavailable(
+                    "Pi RPC process closed stdout".to_owned(),
+                ));
+            };
+            if value.get("id").and_then(Value::as_str) == Some("commands") {
+                break value;
+            }
         };
         process.terminate().await;
-        Ok(response.pointer("/data/commands").and_then(Value::as_array).map(|items| items.iter().filter_map(|item| {
-            let name = item.get("name").and_then(Value::as_str)?.trim().trim_start_matches('/');
-            if name.is_empty() { return None; }
-            Some(ProviderCommandDescriptor {
-                name: name.to_owned(),
-                description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(),
-                source: item.get("source").and_then(Value::as_str).unwrap_or("extension").to_owned(),
-                invocation: "prompt".to_owned(),
-                argument_hint: None,
+        if response.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(pi_response_error(&response, "get_commands"));
+        }
+        Ok(response
+            .pointer("/data/commands")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)?
+                            .trim()
+                            .trim_start_matches('/');
+                        if name.is_empty() {
+                            return None;
+                        }
+                        Some(ProviderCommandDescriptor {
+                            name: name.to_owned(),
+                            description: item
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            source: item
+                                .get("source")
+                                .and_then(Value::as_str)
+                                .unwrap_or("extension")
+                                .to_owned(),
+                            source_info: item.get("sourceInfo").cloned(),
+                            invocation: "prompt".to_owned(),
+                            argument_hint: None,
+                        })
+                    })
+                    .collect()
             })
-        }).collect()).unwrap_or_default())
+            .unwrap_or_default())
     }
 
     async fn run_turn(
@@ -146,25 +214,58 @@ impl ProviderDriver for PiDriver {
 fn parse_pi_models(response: &Value, state: &Value) -> Vec<super::types::ProviderModelDescriptor> {
     let default_model = state.pointer("/data/model").and_then(pi_model_id);
     let default_effort = state.pointer("/data/thinkingLevel").and_then(Value::as_str);
-    response.pointer("/data/models").or_else(|| response.get("data")).and_then(Value::as_array).into_iter().flatten().filter_map(|item| {
-        let id = pi_model_id(item)?;
-        let is_default = default_model.as_deref() == Some(id.as_str()) || item.get("isDefault").and_then(Value::as_bool).unwrap_or(false);
-        let efforts = pi_supported_thinking_levels(item);
-        Some(super::types::ProviderModelDescriptor {
-            id,
-            display_name: item.get("name").or_else(|| item.get("displayName")).and_then(Value::as_str).unwrap_or("Pi model").to_owned(),
-            description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(),
-            is_default,
-            supported_reasoning_efforts: efforts.clone(),
-            default_reasoning_effort: is_default.then(|| default_effort.filter(|effort| efforts.iter().any(|item| item == effort))).flatten().map(str::to_owned),
-            context_window: item.get("contextWindow").and_then(Value::as_u64),
+    response
+        .pointer("/data/models")
+        .or_else(|| response.get("data"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let id = pi_model_id(item)?;
+            let is_default = default_model.as_deref() == Some(id.as_str())
+                || item
+                    .get("isDefault")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            let efforts = pi_supported_thinking_levels(item);
+            Some(super::types::ProviderModelDescriptor {
+                id,
+                display_name: item
+                    .get("name")
+                    .or_else(|| item.get("displayName"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Pi model")
+                    .to_owned(),
+                description: item
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                is_default,
+                supported_reasoning_efforts: efforts.clone(),
+                default_reasoning_effort: is_default
+                    .then(|| {
+                        default_effort.filter(|effort| efforts.iter().any(|item| item == effort))
+                    })
+                    .flatten()
+                    .map(str::to_owned),
+                context_window: item.get("contextWindow").and_then(Value::as_u64),
+            })
         })
-    }).collect()
+        .collect()
 }
 
 fn pi_model_id(item: &Value) -> Option<String> {
-    let model_id = item.get("id").or_else(|| item.get("modelId")).and_then(Value::as_str)?;
-    Some(item.get("provider").and_then(Value::as_str).map(|provider| format!("{provider}/{model_id}")).unwrap_or_else(|| model_id.to_owned()))
+    let model_id = item
+        .get("id")
+        .or_else(|| item.get("modelId"))
+        .and_then(Value::as_str)?;
+    Some(
+        item.get("provider")
+            .and_then(Value::as_str)
+            .map(|provider| format!("{provider}/{model_id}"))
+            .unwrap_or_else(|| model_id.to_owned()),
+    )
 }
 
 fn pi_supported_thinking_levels(item: &Value) -> Vec<String> {
@@ -172,10 +273,15 @@ fn pi_supported_thinking_levels(item: &Value) -> Vec<String> {
         return vec!["off".to_owned()];
     }
     let map = item.get("thinkingLevelMap").and_then(Value::as_object);
-    ["off", "minimal", "low", "medium", "high", "xhigh", "max"].into_iter().filter(|level| {
-        let mapped = map.and_then(|values| values.get(*level));
-        !mapped.is_some_and(Value::is_null) && (!matches!(*level, "xhigh" | "max") || mapped.is_some())
-    }).map(str::to_owned).collect()
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        .into_iter()
+        .filter(|level| {
+            let mapped = map.and_then(|values| values.get(*level));
+            !mapped.is_some_and(Value::is_null)
+                && (!matches!(*level, "xhigh" | "max") || mapped.is_some())
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 async fn run_pi_turn(
@@ -200,13 +306,29 @@ async fn run_pi_turn(
     provider_state.last_error = None;
     sink.save_provider_state(provider_state).await?;
 
-    process
-        .send(&json!({
-            "id": prompt.turn_id,
-            "type": "prompt",
-            "message": prompt.text,
-        }))
-        .await?;
+    let mut request = json!({
+        "id": prompt.turn_id,
+        "type": "prompt",
+        "message": prompt.text,
+    });
+    let images = prompt
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            super::types::DriverPromptContent::Image {
+                data, mime_type, ..
+            } => Some(json!({
+                "type": "image",
+                "data": data,
+                "mimeType": mime_type,
+            })),
+            super::types::DriverPromptContent::File { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if !images.is_empty() {
+        request["images"] = Value::Array(images);
+    }
+    process.send(&request).await?;
     let accepted = wait_for_response(process, &prompt.turn_id, sink, cancel).await?;
     if accepted.get("success").and_then(Value::as_bool) != Some(true) {
         return Err(pi_response_error(&accepted, "prompt"));
@@ -218,7 +340,7 @@ async fn run_pi_turn(
             message = process.read() => message?,
             changed = cancel.changed() => {
                 let _ = changed;
-                let _ = process.send(&json!({ "id": "abort", "type": "abort" })).await;
+                wait_for_pi_abort(process, sink).await?;
                 return Ok(DriverTurnResult {
                     native_session_id: Some(native_session_id),
                     stop_reason: "cancelled".to_owned(),
@@ -309,7 +431,7 @@ async fn wait_for_response(
             message = process.read() => message?,
             changed = cancel.changed() => {
                 let _ = changed;
-                return Err(AppError::Conflict("turn was cancelled".to_owned()));
+                return Err(AppError::TurnCancelled);
             }
         };
         let Some(message) = message else {
@@ -375,10 +497,43 @@ async fn handle_extension_ui(
         _ => json!({
             "type": "extension_ui_response",
             "id": id,
-            "value": decision.data.as_ref().and_then(|data| data.get("value")).cloned().unwrap_or(Value::Null),
+            "value": decision.data.as_ref().and_then(|data| data.get("value")).and_then(Value::as_str).unwrap_or_default(),
         }),
     };
     process.send(&response).await
+}
+
+async fn wait_for_pi_abort(
+    process: &mut JsonLineProcess,
+    sink: &DriverEventSink,
+) -> Result<(), AppError> {
+    process
+        .send(&json!({ "id": "abort", "type": "abort" }))
+        .await?;
+    let (_cancel_tx, mut no_cancel) = watch::channel(false);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let Some(message) = process.read().await? else {
+                return Err(
+                    provider_exit_error(process, "Pi RPC process closed during abort").await,
+                );
+            };
+            if message.get("id").and_then(Value::as_str) == Some("abort")
+                && message.get("type").and_then(Value::as_str) == Some("response")
+            {
+                return if message.get("success").and_then(Value::as_bool) == Some(true) {
+                    Ok(())
+                } else {
+                    Err(pi_response_error(&message, "abort"))
+                };
+            }
+            if message.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
+                handle_extension_ui(process, message, sink, &mut no_cancel).await?;
+            }
+        }
+    })
+    .await
+    .map_err(|_| AppError::ProviderUnavailable("Pi abort timed out".to_owned()))?
 }
 
 fn pi_tool_payload(message: &Value) -> Value {
@@ -412,9 +567,13 @@ mod tests {
             {"provider":"retoo","id":"deepseek-v4","reasoning":true,"thinkingLevelMap":{"off":null,"minimal":null,"low":null,"medium":null,"high":null,"xhigh":null,"max":"max"}},
             {"provider":"plain","id":"chat","reasoning":false}
         ]}});
-        let state = json!({"data":{"model":{"provider":"zai","id":"glm-5.3"},"thinkingLevel":"high"}});
+        let state =
+            json!({"data":{"model":{"provider":"zai","id":"glm-5.3"},"thinkingLevel":"high"}});
         let models = parse_pi_models(&response, &state);
-        assert_eq!(models[0].supported_reasoning_efforts, ["minimal", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(
+            models[0].supported_reasoning_efforts,
+            ["minimal", "low", "medium", "high", "xhigh", "max"]
+        );
         assert!(models[0].is_default);
         assert_eq!(models[0].default_reasoning_effort.as_deref(), Some("high"));
         assert_eq!(models[1].supported_reasoning_efforts, ["max"]);
@@ -425,6 +584,9 @@ mod tests {
     fn omits_an_invalid_default_thinking_level() {
         let response = json!({"data":{"models":[{"provider":"retoo","id":"deepseek-v4","reasoning":true,"thinkingLevelMap":{"off":null,"minimal":null,"low":null,"medium":null,"high":null,"xhigh":null,"max":"max"}}]}});
         let state = json!({"data":{"model":{"provider":"retoo","id":"deepseek-v4"},"thinkingLevel":"high"}});
-        assert_eq!(parse_pi_models(&response, &state)[0].default_reasoning_effort, None);
+        assert_eq!(
+            parse_pi_models(&response, &state)[0].default_reasoning_effort,
+            None
+        );
     }
 }

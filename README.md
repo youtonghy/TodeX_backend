@@ -1,146 +1,270 @@
-# TodeX Backend / TodeX 后端
+# TodeX Backend (`todex-agentd`)
 
-`todex-agentd` 是 TodeX 2.0 后端。它以 conversation folder 为持久化核心，统一驱动 ACP、Codex、Pi 和 Claude Code。全部对外接口都在 `/v2`（HTTP 资源 + 统一 `/v2/ws` WebSocket）；`/v1/*` 已删除。
+<p align="center">
+  <strong>Unified backend daemon and orchestration engine for TodeX 2.0 AI coding agents.</strong>
+</p>
 
-`todex-agentd` is the TodeX 2.0 backend. Conversation folders are the persistence core for ACP, Codex, Pi, and Claude Code. The whole API surface now lives under `/v2` (HTTP resources plus the unified `/v2/ws` WebSocket); `/v1/*` has been removed.
+<p align="center">
+  <a href="README.md">English</a> •
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
 
-## 功能 / Features
+---
 
-- HTTP 接口：`/health`、`/v2/version`、`/v2/workspaces`、`/v2/workspace/entries`、`/v2/workspace/directories`、`/v2/workspace/file`、`/v2/browser/fetch`
-- v2 对话接口：`/v2/providers`、`/v2/conversations`、`/v2/ws`
-- Provider：ACP 配置 profile、Codex app-server、Pi RPC、Claude Code stream-json
-- 只读 Catalog：读取各 Provider 原生 Skill/MCP 配置，应用 project-over-user 优先级，不安装、不切换、不改写
-- Conversation folder：`$DATA_DIR/conversations/<uuid>/` 下保存 manifest、事件日志、快照与原生 Provider 状态
-- WebSocket 接口：统一 `/v2/ws`（conversation 命令 + 终端/本地 Codex/Cloud Code/MCP 控制命令），可选 X25519 或 ML-KEM-768 传输加密，支持 header 与 `access_token` 查询参数认证
-- 本地 Codex 会话管理：`start`、`status`、`stop`、`turn`、`attach`、`replay`、`interrupt`
-- 工作区权限边界：后端 `workspace_root` 限制移动端只能创建和使用该根目录内的工作区
-- 工作区文件检索：为前端 `@` 引用提供目录和文件建议
-- 认证与配置：支持 Bearer token、环境变量、`config.toml`
-- 后台进程模式：可作为独立 daemon 持续运行，并通过 pidfile 管理状态
-- 交互式 TUI：作为控制器启动、停止 daemon，保存监听地址，并显示 App 配对二维码
+## Overview
 
-- HTTP endpoints: `/health`, `/v2/version`, `/v2/workspaces`, `/v2/workspace/entries`, `/v2/workspace/directories`, `/v2/workspace/file`, `/v2/browser/fetch`
-- v2 conversation endpoints: `/v2/providers`, `/v2/conversations`, and `/v2/ws`
-- ACP profiles, Codex app-server, Pi RPC, and Claude Code stream-json drivers
-- Read-only native Skill/MCP catalogs with project-over-user precedence
-- Per-conversation manifests, journals, snapshots, and native provider state under `$DATA_DIR/conversations/<uuid>/`
-- WebSocket endpoint: the unified `/v2/ws` (conversation commands plus terminal / local Codex / Cloud Code / MCP control), with optional X25519 or ML-KEM-768 transport encryption and header or `access_token` query auth
-- Local Codex session control: `start`, `status`, `stop`, `turn`, `attach`, `replay`, `interrupt`
-- Workspace boundary enforcement: backend `workspace_root` restricts mobile-created and mobile-used workspaces to that root
-- Workspace file lookup for the frontend `@` picker
-- Auth and config via Bearer token, environment variables, and `config.toml`
-- Persistent daemon mode managed through a pidfile
-- Interactive TUI as a controller for starting/stopping the daemon, saving host/port, and showing the app pairing QR
+`todex-agentd` is the core backend service of the TodeX ecosystem. Built with Rust, Tokio, and Axum, it orchestrates multiple AI coding assistants—including **Codex app-server**, **Agent Client Protocol (ACP 2.0)**, **Pi RPC**, and **Claude Code stream-json**—behind a unified, secure, and persistent API.
 
-## 快速开始 / Quick Start
+In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST endpoints and a unified `/v2/ws` WebSocket). Conversation folders serve as the single source of truth for message histories, journals, snapshots, and native provider sessions.
 
-### 1. 安装依赖 / Install
+---
 
-```bash
-cargo build
+## Key Features
+
+- **Multi-Agent Orchestration**:
+  - **Codex**: Native JSON-RPC app-server integration (`start`, `turn`, `status`, `stop`, `attach`, `replay`, `interrupt`).
+  - **ACP (Agent Client Protocol 2.0)**: Supports pre-configured profiles defined in `config.toml` with strict boundary constraints.
+  - **Pi**: Native RPC integration with command discovery (`get_commands`), dynamic models, and interactive tool approval handling.
+  - **Claude Code**: Stream-JSON driver integrating directly with the Claude CLI.
+- **Conversation Folder Persistence**:
+  - Structured storage under `$DATA_DIR/conversations/<uuid>/`:
+    - `manifest.json`: Metadata, active provider profile, workspace path, and timestamps.
+    - `events.jsonl`: Append-only event journal enabling resilient resumption.
+    - `snapshot.json`: Compact conversation state snapshots.
+    - `provider-state.json`: Native agent engine state for turn resumption across restarts.
+  - Optimistic turn concurrency protection (returns `409 Conflict` on concurrent mutations; no arbitrary prompt queueing).
+- **Read-Only Capability Catalogs**:
+  - Real-time introspection of native Skills, MCP servers, Slash Commands, and Model catalogs directly from installed providers.
+  - Applies project-over-user precedence hierarchy without mutating local provider configurations.
+  - Native Skill injection into agent prompts via `resourceId` (no client file uploads required).
+- **Unified Multiplexed WebSocket (`/v2/ws`)**:
+  - Single connection handling conversation streams, turn events, interactive permission requests, local terminal/PTY sessions, and runtime controls.
+  - Heartbeat detection, sequence-based reconnection (`afterSequence`), and UTF-8 frame length enforcement.
+- **Post-Quantum Transport Encryption**:
+  - Configurable end-to-end transport layer encryption:
+    - **Plaintext** (`none`)
+    - **X25519-ChaCha20Poly1305** (`x25519`)
+    - **ML-KEM-768** (`ml-kem-768`, NIST Post-Quantum standard)
+  - Key exchange parameters are seamlessly exchanged via TUI pairing QR codes.
+- **Security & Sandboxing**:
+  - Fail-closed Bearer token authentication (unauthorized requests are rejected with `401 Unauthorized`).
+  - Tenant isolation (`tenant_id`) enforced across all conversation queries, event journals, and subscriptions.
+  - Workspace root boundary enforcement (`workspace_root`) restricting client access to authorized filesystem scopes.
+  - Sanitized subprocess environments preventing leak of administrative environment variables.
+- **Interactive TUI & Daemon Management**:
+  - Interactive Terminal UI (`cargo run -- tui`) built with Ratatui to monitor status, inspect logs, control daemon lifecycle, and generate pairing QR codes with automatic LAN IP resolution.
+  - Background daemon management (`start`, `stop`, `restart`, `status`) backed by a persistent PID file.
+
+---
+
+## Architecture
+
+```
+                      +---------------------------------------+
+                      |   TodeX Desktop / TodeX Mobile App    |
+                      +-------------------+-------------------+
+                                          |
+                        HTTP /v2/*        |   WebSocket /v2/ws
+                       (Auth / REST)      |   (Events, Streams, PTY)
+                                          v
++---------------------------------------------------------------------------------+
+|                                  todex-agentd                                   |
+|                                                                                 |
+|  +---------------------+  +----------------------+  +------------------------+  |
+|  |   Auth & Security   |  |   Transport Crypto   |  |     Workspace Store    |  |
+|  | (Bearer / Tenants)  |  | (X25519 / ML-KEM)    |  | (Sandbox Root Bounds)  |  |
+|  +---------------------+  +----------------------+  +------------------------+  |
+|                                                                                 |
+|  +---------------------------------------------------------------------------+  |
+|  |                          Conversation Engine / Hub                        |  |
+|  |     (Manifests, Events Journal, Snapshots, Turn Concurrency Control)      |  |
+|  +---------------------------------------------------------------------------+  |
+|                                                                                 |
+|  +---------------------------------------------------------------------------+  |
+|  |                             Provider Drivers                              |  |
+|  |  +----------------+  +----------------+  +--------------+  +-----------+  |  |
+|  |  | Codex Gateway  |  |   ACP 2.0      |  |    Pi RPC    |  |Claude Code|  |  |
+|  |  +----------------+  +----------------+  +--------------+  +-----------+  |  |
+|  +---------------------------------------------------------------------------+  |
++---------------------------------------------------------------------------------+
+                                          |
+                      +-------------------+-------------------+
+                      | Native Agent CLI Processes / Subtools |
+                      |    (codex, acp profile, pi, claude)   |
+                      +---------------------------------------+
 ```
 
-### 2. 启动服务 / Run the server
+---
 
-后台 daemon：
+## Quick Start
 
-Persistent daemon:
+### Prerequisites
 
-```bash
-cargo run -- daemon start
-```
+- Rust toolchain (MSRV 1.80+ recommended)
+- At least one AI agent CLI installed and authenticated on the machine (`codex`, `pi`, `claude`, etc.)
 
-前台运行：
-
-Foreground server:
+### 1. Build the Binary
 
 ```bash
-cargo run -- serve
+cargo build --release
 ```
 
-### 3. 或者使用 TUI 控制 daemon / Or control the daemon with the TUI
+### 2. Running the Server
+
+#### Option A: Interactive TUI Controller (Recommended for local dev)
 
 ```bash
 cargo run -- tui
 ```
 
-在 TUI 中启动后，退出 TUI 不会停止 daemon；TUI 只是控制器。停止服务可在 TUI 中执行 Stop，或运行：
+The TUI allows starting and stopping the background daemon, viewing live server logs, and displaying QR codes for mobile client pairing. Quitting the TUI keeps the daemon running in the background.
 
-After the TUI starts the daemon, quitting the TUI leaves it running. Stop it from the TUI or run:
+#### Option B: Foreground Server
 
 ```bash
+cargo run -- serve --host 127.0.0.1 --port 7345
+```
+
+#### Option C: Background Daemon Mode
+
+```bash
+# Start detached daemon
+cargo run -- daemon start
+
+# Check status
+cargo run -- daemon status
+
+# Restart daemon
+cargo run -- daemon restart
+
+# Stop daemon
 cargo run -- daemon stop
 ```
 
-默认监听 `127.0.0.1:7345`，数据目录是 `~/.todex-agent`，默认 workspace 根目录是 `~/projects`。
+---
 
-The default listen address is `127.0.0.1:7345`, the default data directory is `~/.todex-agent`, and the default workspace root is `~/projects`.
+## Configuration
 
-## 配置 / Configuration
+Configuration values are resolved using the following precedence:
+1. **Command-Line Arguments**
+2. **Environment Variables**
+3. **Configuration File** (`$TODEX_AGENTD_DATA_DIR/config.toml`)
+4. **Built-in Defaults**
 
-配置优先级：
+### Configuration Options
 
-1. 命令行参数
-2. 环境变量
-3. `$TODEX_AGENTD_DATA_DIR/config.toml`
-4. 内置默认值
+| Option | CLI Flag | Environment Variable | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **Host** | `--host` | `TODEX_AGENTD_HOST` | `127.0.0.1` | Binding network interface address. |
+| **Port** | `--port` | `TODEX_AGENTD_PORT` | `7345` | TCP port for HTTP and WebSocket. |
+| **Data Dir** | `--data-dir` | `TODEX_AGENTD_DATA_DIR` | `~/.todex-agent` | Storage directory for configs, manifests, and logs. |
+| **Workspace Root** | `--workspace-root` | `TODEX_AGENTD_WORKSPACE_ROOT` | `~/projects` | Root boundary for authorized project directories. |
+| **Default Agent** | — | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` | Default provider (`codex`, `acp`, `pi`, `claude-code`). |
+| **Codex Binary** | — | `TODEX_AGENTD_CODEX_BIN` | `codex` | Path or executable name for Codex CLI. |
+| **Claude Binary** | — | `TODEX_AGENTD_CLAUDE_BIN` | `claude` | Path or executable name for Claude Code CLI. |
+| **Pi Binary** | — | `TODEX_AGENTD_PI_BIN` | `pi` | Path or executable name for Pi CLI. |
+| **Enable Auth** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | Enables fail-closed Bearer authentication. |
+| **Auth Token** | — | `TODEX_AGENTD_AUTH_TOKEN` | *None* | Bearer token secret. |
+| **Pairing Encryption** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | Pairing encryption algorithm (`none`, `x25519`, `ml-kem-768`). |
 
-Priority order:
+### Example `config.toml`
 
-1. CLI arguments
-2. Environment variables
-3. `$TODEX_AGENTD_DATA_DIR/config.toml`
-4. Built-in defaults
+Located at `~/.todex-agent/config.toml`:
 
-常用环境变量 / Common env vars:
+```toml
+host = "127.0.0.1"
+port = 7345
+pairing_encryption = "ml-kem-768"
+data_dir = "~/.todex-agent"
+workspace_root = "~/projects"
 
-- `TODEX_AGENTD_HOST`
-- `TODEX_AGENTD_PORT`
-- `TODEX_AGENTD_DATA_DIR`
-- `TODEX_AGENTD_WORKSPACE_ROOT`
-- `TODEX_AGENTD_CODEX_BIN`
-- `TODEX_AGENTD_CLAUDE_BIN`
-- `TODEX_AGENTD_PI_BIN`
-- `TODEX_AGENTD_DEFAULT_AGENT`
-- `TODEX_AGENTD_ENABLE_AUTH`
-- `TODEX_AGENTD_ENABLE_TLS`
-- `TODEX_AGENTD_AUTH_TOKEN`
+[agent]
+default_agent = "codex"
+codex_bin = "codex"
+claude_bin = "claude"
+pi_bin = "pi"
 
-## 使用方式 / How to Use
+[agent.acp_profiles.default]
+command = "mcp-server"
+args = ["--stdio"]
 
-1. 先启动后端 daemon，或用 `serve` 前台运行。
-2. 让前端客户端连接到 `http://127.0.0.1:7345` 或你自己的地址。
-3. 在设置里填写 `Auth token` 和 `Tenant id`，或从 TUI 扫描配对二维码导入地址和加密公钥。仅 loopback 二维码携带 token；非 loopback 二维码会省略长期 token。
-4. 通过 `/v2/workspace/entries` 为 `@` 引用提供文件建议。
-5. 通过 WebSocket `/v2/ws` 收发协议事件（conversation 命令与终端/本地 Codex 控制命令同一条连接）。
-
-1. Start the backend daemon first, or run `serve` in the foreground.
-2. Point the frontend client to `http://127.0.0.1:7345` or your own host.
-3. Fill in `Auth token` and `Tenant id` in the client settings, or scan the TUI pairing QR. Loopback QR payloads include the token; non-loopback QR payloads intentionally omit the long-lived token.
-4. Use `/v2/workspace/entries` to power `@` file suggestions.
-5. Use `/v2/ws` for everything WebSocket: conversation commands and terminal / local Codex control share one connection.
-
-## 常用检查 / Common Checks
-
-```bash
-cargo check
-cargo fmt --all --check
-cargo clippy --locked --all-targets --all-features
-curl http://127.0.0.1:7345/health
-curl http://127.0.0.1:7345/v2/version
+[security]
+enable_auth = true
+enable_tls = false
+auth_token = "your-secure-secret-token"
 ```
 
-## 真实 E2E / Real E2E
+> [!NOTE]
+> `enable_tls = true` is intentionally blocked on the native listener to prevent false security assumptions. For remote or production access, terminate TLS using a trusted reverse proxy (e.g., Nginx, Caddy, Cloudflare Tunnel).
+
+---
+
+## API & WebSocket Reference
+
+### HTTP Endpoints (`/v2`)
+
+- `GET /health`: Health status probe.
+- `GET /v2/version`: Returns daemon version, workspace root, and capabilities.
+- `GET /v2/workspaces`: List cached workspaces for current tenant.
+- `PUT /v2/workspaces`: Merge workspace caches for the current tenant and return canonical workspace IDs.
+- `GET|PUT /v2/workspaces/{workspaceId}/trust`: Read or explicitly change owner-scoped execution trust. New workspaces are untrusted by default.
+- `DELETE /v2/workspaces/{workspaceId}`: Revoke trust, cancel active turns, and remove one workspace from the current tenant's catalog without deleting its conversations.
+- `GET /v2/workspace/entries?workspace=...&query=...`: Workspace file and folder suggestions for `@` picker.
+- `GET /v2/workspace/directories?path=...`: Directory tree explorer.
+- `GET /v2/workspace/file?path=...`: Read file contents within sandbox root.
+- `GET /v2/browser/fetch?url=...`: Proxy web resource fetching.
+- `GET /v2/providers`: List available agent providers and their active states.
+- `GET /v2/providers/models?provider=...&workspace=...`: Discover supported models for a provider.
+- `GET /v2/providers/commands?provider=...&workspace=...`: Query slash commands and extensions.
+- `GET /v2/conversations`: List persisted conversations for tenant.
+- `POST /v2/conversations`: Create a new conversation folder with selected agent provider.
+- `GET /v2/conversations/{id}`: Fetch conversation manifest and details.
+- `GET /v2/conversations/{id}/events?afterSequence=0&limit=200`: Paginated event journal query.
+- `POST /v2/conversations/{id}/prompt`: Dispatch a prompt turn with text, typed content, model, reasoning effort, and skill resource IDs. Local files remain confined to the trusted workspace.
+- `POST /v2/conversations/{id}/cancel`: Cancel active running turn.
+- `POST /v2/conversations/{id}/permissions/{permissionId}`: Resolve interactive approval request.
+
+### WebSocket Endpoint (`/v2/ws`)
+
+The single endpoint `/v2/ws` handles:
+1. Subscription to real-time conversation event journals (`conversation.subscribe`).
+2. Dispatching prompt turns and cancellations.
+3. Interactive permission decisions.
+4. Interactive PTY terminal sessions (`terminal.open`, `terminal.input`, `terminal.resize`, `terminal.close`).
+5. Local Codex engine process control.
+
+---
+
+## Development & Verification
+
+Run the standard check suite before committing:
 
 ```bash
+# Check compilation
+cargo check
+
+# Check formatting
+cargo fmt --all --check
+
+# Run linter
+cargo clippy --locked --all-targets --all-features
+
+# Run unit tests
+cargo test
+
+# Run real end-to-end test against local Codex (requires authenticated codex CLI)
 TODEX_REAL_E2E=1 cargo test --test e2e_real_codex -- --ignored --test-threads=1
 ```
 
-需要本机可执行 `codex`，并且已经登录可用。
+---
 
-`codex` must be available on the machine and already signed in.
+## Related Repositories
 
-## 相关文档 / Related Docs
+- **[TodeX Desktop](../TodeX_desktop)**: macOS desktop client built with Electron, React 19, and HeroUI Pro.
+- **[TodeX App](../TodeX_app)**: Mobile client built with React Native and Expo SDK 57.
 
-- `docs/API.md`
-- `docs/BUILD_RUN.md`
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

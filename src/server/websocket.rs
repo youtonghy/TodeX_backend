@@ -534,6 +534,29 @@ async fn dispatch(
                     }
                 };
             if let Err(error) = state
+                .workspace_trust
+                .ensure_trusted(&payload.tenant_id, &cwd)
+                .await
+            {
+                publish_local_codex_error_after(
+                    state,
+                    &payload.codex_session_id,
+                    last_cursor,
+                    CodexLocalAdapterProcessError {
+                        payload: CodexLocalErrorPayload {
+                            code: CodexLocalErrorCode::PermissionDenied,
+                            message: error.to_string(),
+                            codex_session_id: payload.codex_session_id.clone(),
+                            request_id: Some(message.id.clone()),
+                            operation: Some("codex.local.start".to_owned()),
+                            upstream_request_id: None,
+                        },
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            if let Err(error) = state
                 .codex_local_adapters
                 .start(CodexLocalAdapterStartOptions::new(
                     payload.codex_session_id.clone(),
@@ -962,6 +985,12 @@ async fn dispatch(
                 state,
             )
             .await?;
+            let cwd =
+                validate_workspace_directory_text(&state.config.workspace_root, &payload.cwd)?;
+            state
+                .workspace_trust
+                .ensure_trusted(&payload.tenant_id, &cwd)
+                .await?;
             state
                 .local_terminals
                 .start(TerminalStartOptions {
@@ -969,12 +998,7 @@ async fn dispatch(
                     terminal_id: payload.terminal_id,
                     tenant_id: payload.tenant_id,
                     workspace_id: payload.workspace_id,
-                    cwd: validate_workspace_directory_text(
-                        &state.config.workspace_root,
-                        &payload.cwd,
-                    )?
-                    .display()
-                    .to_string(),
+                    cwd: cwd.display().to_string(),
                     shell: payload.shell,
                     rows: payload.rows,
                     cols: payload.cols,
@@ -1731,7 +1755,10 @@ async fn audit_codex_decision(
     Ok(())
 }
 
-async fn append_audit_event(state: &AppState, event: &EventRecord) -> Result<(), AppError> {
+pub(crate) async fn append_audit_event(
+    state: &AppState,
+    event: &EventRecord,
+) -> Result<(), AppError> {
     let _guard = state.audit_write_lock.lock().await;
     let dir = state.config.data_dir.join("audit");
     tokio::fs::create_dir_all(&dir).await?;
@@ -1907,6 +1934,21 @@ async fn publish_codex_gateway_record(state: &AppState, record: CodexGatewayEven
         .await;
 }
 
+fn error_event(
+    error: AppError,
+    workspace_id: Option<String>,
+    window_id: Option<String>,
+    pane_id: Option<String>,
+) -> EventRecord {
+    EventRecord::new(
+        "error",
+        workspace_id,
+        window_id,
+        pane_id,
+        json!({ "code": error.code(), "message": error.to_string() }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -2066,6 +2108,7 @@ mod tests {
         let root = unique_tmp_dir("todex-local-ws-lifecycle");
         let cwd = root.join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
+        trust_test_workspace(&state, &cwd).await;
         let binary = write_fake_codex_binary(&root).await;
         Arc::make_mut(&mut state.config).agent.codex_bin = binary.to_string_lossy().to_string();
         let mut events = state.events.subscribe();
@@ -2311,6 +2354,7 @@ mod tests {
         let root = unique_tmp_dir("todex-local-ws-turn");
         let cwd = root.join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
+        trust_test_workspace(&state, &cwd).await;
         let binary = write_fake_codex_binary(&root).await;
         Arc::make_mut(&mut state.config).agent.codex_bin = binary.to_string_lossy().to_string();
         let mut events = state.events.subscribe();
@@ -2433,6 +2477,7 @@ mod tests {
         let root = unique_tmp_dir("todex-local-ws-server-requests");
         let cwd = root.join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
+        trust_test_workspace(&state, &cwd).await;
         let binary = write_requesting_fake_codex_binary(&root).await;
         Arc::make_mut(&mut state.config).agent.codex_bin = binary.to_string_lossy().to_string();
         let mut events = state.events.subscribe();
@@ -2591,6 +2636,7 @@ mod tests {
         let root = unique_tmp_dir("todex-local-ws-turn-busy");
         let cwd = root.join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
+        trust_test_workspace(&state, &cwd).await;
         let binary = write_holding_fake_codex_binary(&root).await;
         Arc::make_mut(&mut state.config).agent.codex_bin = binary.to_string_lossy().to_string();
         let mut events = state.events.subscribe();
@@ -2698,6 +2744,7 @@ mod tests {
         let root = unique_tmp_dir("todex-local-ws-task-10-12");
         let cwd = root.join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
+        trust_test_workspace(&state, &cwd).await;
         let binary = write_fake_codex_binary(&root).await;
         Arc::make_mut(&mut state.config).agent.codex_bin = binary.to_string_lossy().to_string();
         let mut events = state.events.subscribe();
@@ -3702,6 +3749,14 @@ mod tests {
         .expect("create app state")
     }
 
+    async fn trust_test_workspace(state: &AppState, workspace: &std::path::Path) {
+        state
+            .workspace_trust
+            .set_owned("local", workspace, true)
+            .await
+            .expect("trust test workspace");
+    }
+
     fn codex_control_message(id: &str, codex_session_id: &str, tenant_id: &str) -> ClientMessage {
         ClientMessage {
             id: id.to_owned(),
@@ -3823,19 +3878,4 @@ mod tests {
             .unwrap();
         binary
     }
-}
-
-fn error_event(
-    error: AppError,
-    workspace_id: Option<String>,
-    window_id: Option<String>,
-    pane_id: Option<String>,
-) -> EventRecord {
-    EventRecord::new(
-        "error",
-        workspace_id,
-        window_id,
-        pane_id,
-        json!({ "code": error.code(), "message": error.to_string() }),
-    )
 }

@@ -2,12 +2,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use serde_json::{json, Value};
 use tokio::sync::watch;
-use tokio::time::{sleep, timeout, Duration, Instant};
+use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
 use crate::catalog::CatalogService;
@@ -20,6 +22,7 @@ use crate::error::AppError;
 use crate::mcp;
 use crate::workspace_paths::validate_workspace_directory_text;
 use crate::workspace_store::stable_workspace_id;
+use crate::workspace_trust::WorkspaceTrustStore;
 
 use super::acp::AcpDriver;
 use super::claude::ClaudeDriver;
@@ -27,18 +30,49 @@ use super::codex::CodexDriver;
 use super::grok::GrokBuildDriver;
 use super::pi::PiDriver;
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, PermissionBroker, PermissionDecision,
-    PermissionOutcome, ProviderCommandDescriptor, ProviderDescriptor, ProviderDriver,
-    ProviderModelDescriptor,
+    DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill,
+    PermissionBroker, PermissionDecision, PermissionOutcome, ProviderCommandDescriptor,
+    ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
 };
 
 const MAX_PROMPT_BYTES: usize = 512 * 1024;
+const MAX_PROMPT_CONTENT_ITEMS: usize = 16;
+const MAX_PROMPT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct PromptSkillRef {
     pub resource_id: String,
     pub name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConversationPrompt {
+    pub text: String,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub skills: Vec<PromptSkillRef>,
+    pub content: Vec<PromptContentRef>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum PromptContentRef {
+    Text {
+        text: String,
+    },
+    LocalImage {
+        path: PathBuf,
+    },
+    Image {
+        data: String,
+        mime_type: String,
+    },
+    File {
+        path: PathBuf,
+        #[serde(default)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -100,6 +134,7 @@ pub struct ConversationSupervisor {
     registry: DriverRegistry,
     permissions: PermissionBroker,
     active: Arc<DashMap<String, ActiveTurn>>,
+    workspace_trust: WorkspaceTrustStore,
 }
 
 struct ActiveTurn {
@@ -119,9 +154,14 @@ impl Drop for ActiveTurnCleanup {
 }
 
 impl ConversationSupervisor {
-    pub fn new(config: Arc<Config>, store: ConversationStore, hub: ConversationEventHub) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        store: ConversationStore,
+        hub: ConversationEventHub,
+        workspace_trust: WorkspaceTrustStore,
+    ) -> Self {
         let catalog = CatalogService::new(config.clone());
-        Self::new_with_catalog(config, store, hub, catalog)
+        Self::new_with_catalog(config, store, hub, catalog, workspace_trust)
     }
 
     pub fn new_with_catalog(
@@ -129,6 +169,7 @@ impl ConversationSupervisor {
         store: ConversationStore,
         hub: ConversationEventHub,
         catalog: CatalogService,
+        workspace_trust: WorkspaceTrustStore,
     ) -> Self {
         Self {
             registry: DriverRegistry::new(&config),
@@ -138,6 +179,7 @@ impl ConversationSupervisor {
             catalog,
             permissions: PermissionBroker::default(),
             active: Arc::new(DashMap::new()),
+            workspace_trust,
         }
     }
 
@@ -170,26 +212,46 @@ impl ConversationSupervisor {
 
     pub async fn models_live(
         &self,
+        owner_id: &str,
         provider: ProviderKind,
         workspace: &Path,
     ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
+        self.workspace_trust
+            .ensure_trusted(owner_id, workspace)
+            .await?;
         tokio::time::timeout(
             Duration::from_secs(8),
             self.registry.driver(provider)?.discover_models(workspace),
         )
         .await
-        .map_err(|_| AppError::ProviderUnavailable(format!("{} model discovery timed out", provider.as_str())))?
+        .map_err(|_| {
+            AppError::ProviderUnavailable(format!(
+                "{} model discovery timed out",
+                provider.as_str()
+            ))
+        })?
     }
 
     pub async fn commands_live(
         &self,
+        owner_id: &str,
         provider: ProviderKind,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
-        self.registry
-            .driver(provider)?
-            .discover_commands(workspace)
-            .await
+        self.workspace_trust
+            .ensure_trusted(owner_id, workspace)
+            .await?;
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            self.registry.driver(provider)?.discover_commands(workspace),
+        )
+        .await
+        .map_err(|_| {
+            AppError::ProviderUnavailable(format!(
+                "{} command discovery timed out",
+                provider.as_str()
+            ))
+        })?
     }
 
     #[allow(dead_code)]
@@ -348,21 +410,35 @@ impl ConversationSupervisor {
         text: String,
         model: Option<String>,
     ) -> Result<String, AppError> {
-        self.prompt_owned("local", conversation_id, text, model, None, Vec::new())
-            .await
+        self.prompt_owned(
+            "local",
+            conversation_id,
+            ConversationPrompt {
+                text,
+                model,
+                reasoning_effort: None,
+                skills: Vec::new(),
+                content: Vec::new(),
+            },
+        )
+        .await
     }
 
     pub async fn prompt_owned(
         &self,
         owner_id: &str,
         conversation_id: &str,
-        text: String,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-        skills: Vec<PromptSkillRef>,
+        prompt: ConversationPrompt,
     ) -> Result<String, AppError> {
+        let ConversationPrompt {
+            text,
+            model,
+            reasoning_effort,
+            skills,
+            content,
+        } = prompt;
         let text = text.trim().to_owned();
-        if text.is_empty() && skills.is_empty() {
+        if text.is_empty() && skills.is_empty() && content.is_empty() {
             return Err(AppError::InvalidRequest(
                 "prompt cannot be empty".to_owned(),
             ));
@@ -374,13 +450,32 @@ impl ConversationSupervisor {
         }
         let manifest = self.store.get(conversation_id).await?;
         ensure_owner(&manifest, owner_id)?;
-        let injected = self.load_prompt_skills(&manifest, &skills).await?;
-        let user_text = if text.is_empty() {
+        self.workspace_trust
+            .ensure_trusted(owner_id, &manifest.workspace)
+            .await?;
+        let (content_text, driver_content) =
+            prepare_prompt_content(manifest.provider, &manifest.workspace, content).await?;
+        let loaded_skills = self.load_prompt_skills(&manifest, &skills).await?;
+        let mut user_text = if text.is_empty() && !skills.is_empty() {
             "请使用已选择的 Skill。".to_owned()
         } else {
             text
         };
-        let provider_text = compose_prompt_with_skills(&user_text, &injected);
+        if !content_text.is_empty() {
+            if !user_text.is_empty() {
+                user_text.push_str("\n\n");
+            }
+            user_text.push_str(&content_text);
+        }
+        let injected = loaded_skills
+            .iter()
+            .map(|skill| (skill.name.clone(), skill.content.clone()))
+            .collect::<Vec<_>>();
+        let provider_text = if manifest.provider == ProviderKind::Codex {
+            user_text.clone()
+        } else {
+            compose_prompt_with_skills(&user_text, &injected)
+        };
         if provider_text.len() > MAX_PROMPT_BYTES {
             return Err(AppError::InvalidRequest(format!(
                 "prompt exceeds {MAX_PROMPT_BYTES} bytes after skill injection"
@@ -478,9 +573,8 @@ impl ConversationSupervisor {
                 supervisor.permissions.clone(),
                 conversation_id.clone(),
             );
-            let result = timeout(
-                Duration::from_secs(120),
-                driver.run_turn(
+            let result = driver
+                .run_turn(
                     DriverContext {
                         manifest,
                         provider_state: provider_state.clone(),
@@ -488,19 +582,15 @@ impl ConversationSupervisor {
                     DriverPrompt {
                         turn_id: spawned_turn_id.clone(),
                         text: provider_text,
+                        content: driver_content,
+                        skills: loaded_skills,
                         model,
                         reasoning_effort,
                     },
                     sink,
                     cancel_rx,
-                ),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                Err(AppError::ProviderUnavailable(
-                    "provider turn timed out after 120 seconds".to_owned(),
-                ))
-            });
+                )
+                .await;
             match result {
                 Ok(result) if result.cancelled => {
                     if let Err(error) = supervisor
@@ -532,6 +622,22 @@ impl ConversationSupervisor {
                         .await
                     {
                         tracing::error!(conversation_id, error = %error, "failed to persist completed turn");
+                    }
+                }
+                Err(AppError::TurnCancelled) => {
+                    if let Err(error) = supervisor
+                        .emit(
+                            &conversation_id,
+                            "turn.cancelled",
+                            json!({
+                                "turnId": spawned_turn_id,
+                                "stopReason": "cancelled",
+                                "nativeSessionId": Value::Null,
+                            }),
+                        )
+                        .await
+                    {
+                        tracing::error!(conversation_id, error = %error, "failed to persist cancelled turn");
                     }
                 }
                 Err(error) => {
@@ -575,13 +681,33 @@ impl ConversationSupervisor {
         conversation_id: &str,
     ) -> Result<(), AppError> {
         ensure_owner(&self.store.get(conversation_id).await?, owner_id)?;
-        let active = self.active.get(conversation_id).ok_or_else(|| {
-            AppError::Conflict(format!("conversation {conversation_id} has no active turn"))
-        })?;
+        let Some(active) = self.active.get(conversation_id) else {
+            return Ok(());
+        };
         active
             .cancel
             .send(true)
             .map_err(|_| AppError::Conflict("turn has already stopped".to_owned()))
+    }
+
+    pub async fn cancel_workspace_owned(
+        &self,
+        owner_id: &str,
+        workspace: &Path,
+    ) -> Result<usize, AppError> {
+        let mut cancelled = 0;
+        for manifest in self.list_owned(owner_id).await? {
+            if manifest.workspace != workspace {
+                continue;
+            }
+            let Some(active) = self.active.get(&manifest.id) else {
+                continue;
+            };
+            if active.cancel.send(true).is_ok() {
+                cancelled += 1;
+            }
+        }
+        Ok(cancelled)
     }
 
     #[allow(dead_code)]
@@ -636,6 +762,9 @@ impl ConversationSupervisor {
         resource_id: &str,
     ) -> Result<crate::catalog::McpServerDescriptor, AppError> {
         let manifest = self.get_owned(owner_id, conversation_id).await?;
+        self.workspace_trust
+            .ensure_trusted(owner_id, &manifest.workspace)
+            .await?;
         let mut target = self
             .catalog
             .mcp_target(manifest.provider, manifest.workspace.clone(), resource_id)
@@ -663,6 +792,9 @@ impl ConversationSupervisor {
         arguments: Value,
     ) -> Result<Value, AppError> {
         let manifest = self.get_owned(owner_id, conversation_id).await?;
+        self.workspace_trust
+            .ensure_trusted(owner_id, &manifest.workspace)
+            .await?;
         let target = self
             .catalog
             .mcp_target(manifest.provider, manifest.workspace.clone(), resource_id)
@@ -777,7 +909,7 @@ impl ConversationSupervisor {
         &self,
         manifest: &ConversationManifest,
         skills: &[PromptSkillRef],
-    ) -> Result<Vec<(String, String)>, AppError> {
+    ) -> Result<Vec<DriverSkill>, AppError> {
         let mut injected = Vec::new();
         for skill in skills {
             let resource = self
@@ -802,7 +934,11 @@ impl ConversationSupervisor {
                     )));
                 }
             }
-            injected.push((resource.descriptor.name, resource.content));
+            injected.push(DriverSkill {
+                name: resource.descriptor.name,
+                path: resource.descriptor.path,
+                content: resource.content,
+            });
         }
         Ok(injected)
     }
@@ -836,6 +972,158 @@ impl ConversationSupervisor {
             .await?;
         self.hub.publish(event);
         Ok(())
+    }
+}
+
+async fn prepare_prompt_content(
+    provider: ProviderKind,
+    workspace: &Path,
+    content: Vec<PromptContentRef>,
+) -> Result<(String, Vec<DriverPromptContent>), AppError> {
+    if content.len() > MAX_PROMPT_CONTENT_ITEMS {
+        return Err(AppError::InvalidRequest(format!(
+            "prompt content allows at most {MAX_PROMPT_CONTENT_ITEMS} items"
+        )));
+    }
+    let workspace = tokio::fs::canonicalize(workspace).await?;
+    let mut text = Vec::new();
+    let mut driver_content = Vec::new();
+    let mut image_bytes = 0usize;
+    for item in content {
+        match item {
+            PromptContentRef::Text { text: value } => {
+                if !value.trim().is_empty() {
+                    text.push(value);
+                }
+            }
+            PromptContentRef::LocalImage { path } => {
+                ensure_image_provider(provider)?;
+                let path = canonical_workspace_file(&workspace, path).await?;
+                let file_bytes =
+                    usize::try_from(tokio::fs::metadata(&path).await?.len()).unwrap_or(usize::MAX);
+                ensure_image_budget(image_bytes.saturating_add(file_bytes))?;
+                let bytes = tokio::fs::read(&path).await?;
+                image_bytes = image_bytes.saturating_add(bytes.len());
+                driver_content.push(DriverPromptContent::Image {
+                    mime_type: image_mime_type(&path)?.to_owned(),
+                    data: BASE64_STANDARD.encode(bytes),
+                    path: Some(path),
+                });
+            }
+            PromptContentRef::Image { data, mime_type } => {
+                ensure_image_provider(provider)?;
+                let mime_type = mime_type.trim().to_ascii_lowercase();
+                if !matches!(
+                    mime_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ) {
+                    return Err(AppError::InvalidRequest(format!(
+                        "unsupported prompt image MIME type {mime_type:?}"
+                    )));
+                }
+                let data = data.trim();
+                let remaining = MAX_PROMPT_IMAGE_BYTES.saturating_sub(image_bytes);
+                let max_encoded_len = remaining.saturating_add(2) / 3 * 4 + 4;
+                if data.len() > max_encoded_len {
+                    return Err(AppError::InvalidRequest(format!(
+                        "prompt images exceed {MAX_PROMPT_IMAGE_BYTES} decoded bytes"
+                    )));
+                }
+                let bytes = BASE64_STANDARD.decode(data).map_err(|error| {
+                    AppError::InvalidRequest(format!("invalid prompt image base64: {error}"))
+                })?;
+                image_bytes = image_bytes.saturating_add(bytes.len());
+                ensure_image_budget(image_bytes)?;
+                driver_content.push(DriverPromptContent::Image {
+                    path: None,
+                    data: BASE64_STANDARD.encode(bytes),
+                    mime_type,
+                });
+            }
+            PromptContentRef::File { path, name } => {
+                let path = canonical_workspace_file(&workspace, path).await?;
+                let fallback = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("file");
+                let name = name.as_deref().unwrap_or(fallback).trim().to_owned();
+                if name.is_empty() || name.len() > 255 || name.contains(['\r', '\n']) {
+                    return Err(AppError::InvalidRequest(
+                        "prompt file name is invalid".to_owned(),
+                    ));
+                }
+                let relative = path.strip_prefix(&workspace).unwrap_or(&path);
+                if provider != ProviderKind::Codex {
+                    text.push(format!("Attached file: @{}", relative.display()));
+                }
+                driver_content.push(DriverPromptContent::File { path, name });
+            }
+        }
+    }
+    Ok((text.join("\n\n"), driver_content))
+}
+
+async fn canonical_workspace_file(workspace: &Path, path: PathBuf) -> Result<PathBuf, AppError> {
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    };
+    let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
+        AppError::InvalidRequest(format!(
+            "prompt file {} is not readable: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !canonical.starts_with(workspace) {
+        return Err(AppError::InvalidRequest(
+            "prompt files must stay inside the trusted workspace".to_owned(),
+        ));
+    }
+    if !tokio::fs::metadata(&canonical).await?.is_file() {
+        return Err(AppError::InvalidRequest(format!(
+            "prompt path {} is not a regular file",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn ensure_image_provider(provider: ProviderKind) -> Result<(), AppError> {
+    if matches!(provider, ProviderKind::Codex | ProviderKind::Pi) {
+        Ok(())
+    } else {
+        Err(AppError::Unsupported(format!(
+            "provider {provider:?} does not support typed prompt images"
+        )))
+    }
+}
+
+fn ensure_image_budget(bytes: usize) -> Result<(), AppError> {
+    if bytes <= MAX_PROMPT_IMAGE_BYTES {
+        Ok(())
+    } else {
+        Err(AppError::InvalidRequest(format!(
+            "prompt images exceed {MAX_PROMPT_IMAGE_BYTES} decoded bytes"
+        )))
+    }
+}
+
+fn image_mime_type(path: &Path) -> Result<&'static str, AppError> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => Ok("image/png"),
+        Some("jpg" | "jpeg") => Ok("image/jpeg"),
+        Some("gif") => Ok("image/gif"),
+        Some("webp") => Ok("image/webp"),
+        _ => Err(AppError::InvalidRequest(format!(
+            "unsupported prompt image file {}",
+            path.display()
+        ))),
     }
 }
 
@@ -907,11 +1195,24 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use tokio::time::timeout;
-
     use super::*;
     use crate::config::{AcpProfileConfig, AgentConfig, PairingEncryption, SecurityConfig};
     use crate::conversation::{ConversationEventHub, ConversationStore};
+
+    async fn trust_store(
+        config: &Config,
+        owner_id: &str,
+        workspace: Option<&Path>,
+    ) -> WorkspaceTrustStore {
+        let trust =
+            WorkspaceTrustStore::new(config.data_dir.clone(), config.workspace_root.clone())
+                .await
+                .unwrap();
+        if let Some(workspace) = workspace {
+            trust.set_owned(owner_id, workspace, true).await.unwrap();
+        }
+        trust
+    }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -959,8 +1260,13 @@ mod tests {
         let store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
-        let supervisor =
-            ConversationSupervisor::new(config, store.clone(), ConversationEventHub::default());
+        let trust = trust_store(&config, "local", Some(&workspace)).await;
+        let supervisor = ConversationSupervisor::new(
+            config,
+            store.clone(),
+            ConversationEventHub::default(),
+            trust,
+        );
         assert!(supervisor
             .providers()
             .iter()
@@ -985,7 +1291,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let replay = timeout(Duration::from_secs(10), async {
+            let replay = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let replay = supervisor.replay(&manifest.id, 0, 100).await.unwrap();
                     if replay.events.iter().any(|event| {
@@ -1057,8 +1363,9 @@ mod tests {
         let store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
+        let trust = trust_store(&config, "owner-a", None).await;
         let supervisor =
-            ConversationSupervisor::new(config, store, ConversationEventHub::default());
+            ConversationSupervisor::new(config, store, ConversationEventHub::default(), trust);
         let manifest = supervisor
             .create_owned("owner-a", ProviderKind::Codex, workspace, None, None)
             .await
@@ -1107,8 +1414,13 @@ mod tests {
             },
         });
         let store = ConversationStore::new(data_dir.clone()).await.unwrap();
-        let supervisor =
-            ConversationSupervisor::new(config, store.clone(), ConversationEventHub::default());
+        let trust = trust_store(&config, "local", Some(&workspace)).await;
+        let supervisor = ConversationSupervisor::new(
+            config,
+            store.clone(),
+            ConversationEventHub::default(),
+            trust,
+        );
         let manifest = supervisor
             .create(ProviderKind::Codex, workspace, None, None)
             .await
@@ -1256,6 +1568,66 @@ fi
     }
 
     #[tokio::test]
+    async fn prompt_content_is_confined_to_workspace() {
+        let root = temp_dir("todex-prompt-content");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let image = workspace.join("image.png");
+        fs::write(&image, b"png fixture").unwrap();
+        let outside = root.join("outside.txt");
+        fs::write(&outside, b"outside").unwrap();
+
+        let (text, content) = prepare_prompt_content(
+            ProviderKind::Codex,
+            &workspace,
+            vec![
+                PromptContentRef::Text {
+                    text: "look here".to_owned(),
+                },
+                PromptContentRef::LocalImage { path: image },
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "look here");
+        assert!(matches!(
+            content.as_slice(),
+            [DriverPromptContent::Image { path: Some(_), .. }]
+        ));
+
+        let error = prepare_prompt_content(
+            ProviderKind::Codex,
+            &workspace,
+            vec![PromptContentRef::File {
+                path: outside,
+                name: None,
+            }],
+        )
+        .await
+        .expect_err("files outside the trusted workspace must be rejected");
+        assert!(error.to_string().contains("trusted workspace"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn typed_images_are_rejected_for_unsupported_providers() {
+        let root = temp_dir("todex-unsupported-image");
+        fs::create_dir_all(&root).unwrap();
+        let error = prepare_prompt_content(
+            ProviderKind::ClaudeCode,
+            &root,
+            vec![PromptContentRef::Image {
+                data: "cG5n".to_owned(),
+                mime_type: "image/png".to_owned(),
+            }],
+        )
+        .await
+        .expect_err("unsupported image input must fail explicitly");
+        assert!(matches!(error, AppError::Unsupported(_)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn unknown_skill_resource_is_rejected() {
         let root = temp_dir("todex-skill-reject");
         let workspace_root = root.join("workspaces");
@@ -1291,8 +1663,9 @@ fi
         let store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
+        let trust = trust_store(&config, "owner-a", Some(&workspace)).await;
         let supervisor =
-            ConversationSupervisor::new(config, store, ConversationEventHub::default());
+            ConversationSupervisor::new(config, store, ConversationEventHub::default(), trust);
         let manifest = supervisor
             .create_owned("owner-a", ProviderKind::Codex, workspace, None, None)
             .await
@@ -1301,13 +1674,16 @@ fi
             .prompt_owned(
                 "owner-a",
                 &manifest.id,
-                "hello".to_owned(),
-                None,
-                None,
-                vec![PromptSkillRef {
-                    resource_id: "res_missing".to_owned(),
-                    name: Some("missing".to_owned()),
-                }],
+                ConversationPrompt {
+                    text: "hello".to_owned(),
+                    model: None,
+                    reasoning_effort: None,
+                    skills: vec![PromptSkillRef {
+                        resource_id: "res_missing".to_owned(),
+                        name: Some("missing".to_owned()),
+                    }],
+                    content: Vec::new(),
+                },
             )
             .await
             .expect_err("missing skill must be rejected");

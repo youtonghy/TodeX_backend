@@ -14,6 +14,7 @@ use crate::{
     provider::ConversationSupervisor,
     transport_crypto::PairingKeys,
     workspace_store::WorkspaceStore,
+    workspace_trust::WorkspaceTrustStore,
 };
 
 #[derive(Clone)]
@@ -27,6 +28,7 @@ pub struct AppState {
     pub local_terminals: LocalTerminalManager,
     pub pairing_keys: PairingKeys,
     pub workspaces: WorkspaceStore,
+    pub workspace_trust: WorkspaceTrustStore,
     pub(crate) audit_write_lock: Arc<tokio::sync::Mutex<()>>,
     websocket_connections: Arc<AtomicUsize>,
 }
@@ -47,6 +49,9 @@ impl AppState {
         let codex_gateway = CodexGatewayStore::new(config.data_dir.clone());
         let codex_local_adapters =
             CodexLocalAdapterSupervisor::new(codex_gateway.clone(), events.clone());
+        let workspace_trust =
+            WorkspaceTrustStore::new(config.data_dir.clone(), config.workspace_root.clone())
+                .await?;
         let conversation_store = ConversationStore::new(config.data_dir.clone()).await?;
         let migration = migrate_legacy_codex_sessions(
             &config.data_dir,
@@ -63,8 +68,12 @@ impl AppState {
             );
         }
         let conversation_hub = ConversationEventHub::default();
-        let conversations =
-            ConversationSupervisor::new(config.clone(), conversation_store, conversation_hub);
+        let conversations = ConversationSupervisor::new(
+            config.clone(),
+            conversation_store,
+            conversation_hub,
+            workspace_trust.clone(),
+        );
         conversations.recover_all().await?;
         let local_terminals = LocalTerminalManager::new(events.clone());
         let pairing_keys = PairingKeys::load_or_generate(&config.data_dir).await?;
@@ -83,6 +92,7 @@ impl AppState {
             local_terminals,
             pairing_keys,
             workspaces,
+            workspace_trust,
             audit_write_lock,
             websocket_connections,
         })

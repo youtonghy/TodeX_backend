@@ -27,6 +27,8 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 3. `$TODEX_AGENTD_DATA_DIR/config.toml`
 4. 内置默认值
 
+`data_dir` 采用两阶段读取：命令行或环境变量显式指定时直接作为最终目录；否则先读取默认目录的 `config.toml`，允许其中的 `data_dir` 重定向一次，再合并最终目录中的配置。相对路径以声明它的配置文件目录为基准。最终配置再次指向第三个目录会拒绝启动，避免循环或含混的配置来源。
+
 常用配置项：
 
 | 配置 | 命令行参数 | 环境变量 | 默认值 |
@@ -44,6 +46,7 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 | 默认 agent 名称 | 无 | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` |
 | 是否开启认证 | 无 | `TODEX_AGENTD_ENABLE_AUTH` | `true` |
 | Bearer token | 无 | `TODEX_AGENTD_AUTH_TOKEN` | 无 |
+| 历史保留天数 | `--history-retention-days` | `TODEX_AGENTD_HISTORY_RETENTION_DAYS` | 关闭 |
 
 当前 HTTP 层没有实现 TLS 终止，配置 `enable_tls = true` 时服务会拒绝启动，避免产生“已经启用 TLS”的错误安全假设。生产环境应在可信反向代理终止 TLS，且不应直接暴露明文端口。v2 HTTP 和 WebSocket 都使用 `Authorization: Bearer <TODEX_AGENTD_AUTH_TOKEN>`；conversation 持久化 owner tenant，所有读取、订阅与变更入口都会校验 tenant。
 
@@ -61,6 +64,8 @@ GET /v2/providers/models?provider=codex&workspace=/home/user/projects/demo
 GET /v2/conversations
 POST /v2/conversations
 GET /v2/conversations/{conversationId}
+PATCH /v2/conversations/{conversationId}
+DELETE /v2/conversations/{conversationId}
 GET /v2/conversations/{conversationId}/events?afterSequence=0&limit=200
 POST /v2/conversations/{conversationId}/prompt
 POST /v2/conversations/{conversationId}/cancel
@@ -71,7 +76,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 `/v2/providers/models` 会实时向指定 Agent 查询模型目录，返回 `source` 与 `fetchedAt`。每个模型包含 `supportedReasoningEfforts`，并可通过 `defaultReasoningEffort` 声明后端当前默认强度。Codex 使用 app-server `model/list`，Pi 使用 RPC `get_available_models` 与 `get_state`，Claude Code 在配置了 `ANTHROPIC_BASE_URL` 时读取 `/v1/models`，Grok Build 从 ACP initialize 的原生模型状态读取。查询失败时客户端应保留上一次成功目录，并展示可恢复错误。
 
-`GET /v2/providers/commands?provider=pi&workspace=/path` 会实时读取 Agent 命令目录。Pi 使用 RPC `get_commands` 返回扩展、Prompt Template 和 Skill；Codex 返回与本机 CLI 版本同步的 TUI 命令适配目录。命令描述包含 `invocation`，客户端应据此选择原生 RPC、桌面动作或 Provider prompt，不要把所有 `/` 输入都当作普通 prompt。
+`GET /v2/providers/commands?provider=pi&workspace=/path` 会实时读取 Agent 命令目录。Pi 使用 RPC `get_commands` 返回扩展、Prompt Template 和 Skill；响应失败会作为 Provider 错误返回，成功结果中的 `sourceInfo` 会原样保留。Codex 返回与本机 CLI 版本同步的 TUI 命令适配目录。命令描述包含 `invocation`，客户端应据此选择原生 RPC、桌面动作或 Provider prompt，不要把所有 `/` 输入都当作普通 prompt。
 
 创建对话：
 
@@ -93,11 +98,18 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
   "reasoningEffort": null,
   "skills": [
     { "resourceId": "skill_abc", "name": "review" }
+  ],
+  "content": [
+    { "type": "text", "text": "同时检查这个截图" },
+    { "type": "localImage", "path": "screenshots/error.png" },
+    { "type": "file", "path": "src/main.rs", "name": "main.rs" }
   ]
 }
 ```
 
-`skills` 可选。Backend 按 `resourceId` 读取 Skill 正文并注入到 Provider prompt；客户端不要拼接完整 Skill 文件。只带 Skill、不带 `text` 时允许发送。注入成功后会发出 `skill.injected` 事件；用户可见的 `message.created` 仍是原始输入。
+`skills` 可选。Backend 按 `resourceId` 读取 Skill；Codex 使用原生 `skill` input item，其他 Provider 使用受控文本注入，客户端不要拼接完整 Skill 文件。只带 Skill、不带 `text` 时允许发送。注入成功后会发出 `skill.injected` 事件；用户可见的 `message.created` 仍是原始输入。
+
+`content` 可选，最多 16 项，支持 `text`、`localImage`、内联 `image`（`data` + `mimeType`）和 `file`。本地路径可相对 workspace，也可使用 workspace 内绝对路径；规范化后越界、符号链接逃逸和非普通文件都会拒绝。图片仅对 Codex 和 Pi 开放，允许 PNG/JPEG/GIF/WebP，解码后合计最多 10 MiB；不支持图片的 Provider 返回明确的 `UNSUPPORTED`。Codex 把文件映射为原生 mention，其他 Provider 使用 workspace 相对 `@` 引用。
 
 每个 conversation 同时只允许一个 mutating turn；并发 prompt 返回 `409 CONFLICT`，不会排队。daemon 重启会把未完成 turn 标记为 `interrupted`，不会通过重放 prompt 猜测恢复。原生会话 ID 由 `provider-state.json` 保存，Provider 支持时下一 turn 使用原生 resume。
 
@@ -117,9 +129,9 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 }
 ```
 
-支持 `conversation.subscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence。
+支持 `conversation.subscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。
 
-MCP 真实调用只走 Backend：客户端只发送 `resourceId`、`toolName` 和 `arguments`。Catalog JSON 不含 command、URL 或凭据。调用前必须通过权限 broker，默认拒绝；仅 `allow_once` / `allow_always` 会放行。
+MCP 真实调用只走 Backend：客户端只发送 `resourceId`、`toolName` 和对象类型的 `arguments`。Catalog JSON 不含 command、URL 或凭据。调用前必须通过权限 broker，默认拒绝；仅 `allow_once` / `allow_always` 会放行。Backend 使用标准 MCP SDK 连接 stdio JSONL 或 Streamable HTTP transport，并对初始化、调用和关闭分别设置时限。
 
 ### 只读 Skill/MCP Catalog
 
@@ -174,7 +186,7 @@ GET /v2/version
 | `data_dir` | string | 当前数据目录 |
 | `workspace_root` | string | 当前 workspace 根目录 |
 
-## Workspace 缓存同步
+## Workspace 缓存同步与信任
 
 工作区清单由后端持久化到 `$TODEX_AGENTD_DATA_DIR/workspaces.json`。手机和桌面端的本地存储只作为离线缓存；连接成功后会拉取当前身份的后端快照。工作区 ID 由后端根据规范化路径稳定生成，并与对话 manifest 的 `workspaceId` 共用，从而让不同设备恢复同一工作区内的对话。
 
@@ -183,6 +195,8 @@ GET /v2/version
 ```http
 GET /v2/workspaces
 PUT /v2/workspaces
+GET /v2/workspaces/{workspaceId}/trust
+PUT /v2/workspaces/{workspaceId}/trust
 DELETE /v2/workspaces/{workspaceId}
 ```
 
@@ -212,7 +226,9 @@ DELETE /v2/workspaces/{workspaceId}
 }
 ```
 
-`PUT` 请求体使用同样的 `workspaces` 数组。后端会校验 `name`、`path`、路径存在性和根目录边界，按当前认证身份和规范化路径合并记录，并返回后端生成的稳定 ID。它不会接受客户端伪造的租户，也不会持久化设备本地的 `threadId` 和 `localAdapterState`。删除使用显式 `DELETE`，不会删除该工作区已有的对话历史。
+`PUT` 请求体使用同样的 `workspaces` 数组。后端会校验 `name`、`path`、路径存在性和根目录边界，按当前认证身份和规范化路径合并记录，并返回后端生成的稳定 ID。它不会接受客户端伪造的租户，也不会持久化设备本地的 `threadId` 和 `localAdapterState`。
+
+新工作区默认不信任。`GET /v2/workspaces/{workspaceId}/trust` 返回当前状态；`PUT` 请求体为 `{ "trusted": true }` 或 `{ "trusted": false }`。信任记录同时绑定认证 owner 和规范化路径，独立保存在 `$DATA_DIR/workspace-trust.json`。Provider 模型/命令发现、prompt、MCP 调用、Git 写操作、本地终端和本地 Codex 启动前都必须通过信任检查；只读目录、文件预览与 Git 扫描仍受 `workspace_root` 边界约束。撤销信任会取消该 owner 在该工作区的活动 turn。删除工作区会先撤销信任并取消活动 turn，但不会删除已有对话历史。
 
 ### Workspace 目录浏览
 
@@ -256,6 +272,65 @@ GET /v2/workspace/file?path=/home/user/projects/demo/README.md
 
 路径必须是 `workspace_root` 内的绝对路径且指向文件，超过 1 MiB 拒绝预览。响应包含 `name`、`path`、`mimeType`、`sizeBytes`，文本类型附带 `text` 内容。
 
+### Git 扫描与操作
+
+Git HTTP API 只接受 `workspace_root` 内的现有目录。服务端会递归检查该目录及最多两层子目录中的仓库，并返回与桌面端 Git 面板兼容的摘要：
+
+```http
+GET /v2/git/scan?workspacePath=/home/user/projects/demo
+```
+
+响应：
+
+```json
+{
+  "repositories": [
+    {
+      "path": "/home/user/projects/demo",
+      "name": "demo",
+      "branch": "main",
+      "files": [{ "path": "src/main.rs", "status": " M" }],
+      "additions": 3,
+      "deletions": 1,
+      "initialEligible": false,
+      "filesTruncated": false
+    }
+  ]
+}
+```
+
+没有 Git 仓库的 workspace 仍会返回一个 `initialEligible: true`、`branch: "UNINITIALIZED"` 的占位摘要。`files` 和用于未跟踪行数统计的路径各自最多处理 2,000 项；单个命令的 stdout/stderr 各自最多读取 4 MiB。扫描最多并发执行 2 个请求，排队超过 2 秒返回 `409 CONFLICT`，单个扫描请求总计超过 30 秒返回 `GIT_COMMAND_TIMED_OUT`。
+
+仓库变更只能通过固定动作执行，不能传递任意 Git 子命令或参数：
+
+```http
+POST /v2/git/run
+Content-Type: application/json
+
+{
+  "workspacePath": "/home/user/projects/demo",
+  "action": "commit-push",
+  "message": "同步移动端改动",
+  "includeUnstaged": true
+}
+```
+
+`action` 仅支持 `initial`、`commit`、`commit-push` 和 `push`。写操作的 `workspacePath` 必须是仓库根目录本身，不能用仓库内的任意子目录隐式选中祖先仓库；`initial` 只允许用于未初始化目录或尚无首个提交的仓库。`message` 仅用于提交动作，超过 512 bytes 或包含 NUL/不允许的控制字符会被拒绝；缺省时服务端生成安全的提交说明。`includeUnstaged` 缺省为 `true`，为真时先执行固定的 `git add -A`。成功响应：
+
+```json
+{
+  "repositoryPath": "/home/user/projects/demo",
+  "action": "commit-push",
+  "output": "..."
+}
+```
+
+Git 进程不经过 shell，stdin 关闭并设置 `GIT_TERMINAL_PROMPT=0`；子进程只继承必要的基础运行环境，不继承 `TODEX_AGENTD_*` 或 `GIT_DIR`/`GIT_WORK_TREE` 等路径覆盖变量。所有命令显式关闭 fsmonitor 与 untracked cache，差异统计禁用 external diff/textconv。写操作会再次确认 worktree、git-dir 和 git-common-dir 全部位于 `workspace_root` 内，拒绝写入相关 Git 元数据树中的符号链接和 object alternates，并使用 daemon 管理的空 hooks 目录、关闭 commit/push 签名和 `ext`/`file` transport；local 与 worktree 级配置都会展开 `include` 后检查，包含 clean/process filter、askpass、local credential helper、`core.sshCommand`、自定义 GPG program、自定义 remote helper 或仓库级 URL 重写时直接拒绝。仓库远端仅接受 HTTP(S)、SSH、Git URL 与 SCP-like SSH 写法；daemon 账户自己的全局 credential/SSH 配置仍可用于正常的非本地远端推送。同一 daemon 内的 Git 写操作串行执行，排队超过 2 秒返回 `409 CONFLICT`，单次写请求总计超过 120 秒返回 `GIT_PARTIAL_SUCCESS`，提醒客户端状态可能已改变、刷新后再决定后续动作。每条命令 15 秒超时；超时、输出超限或外层请求取消都会终止 Git 进程组并回收直接子进程。完整进程组清理依赖 Unix，因此非 Unix 平台的 Git 写 API 返回 `501 UNSUPPORTED`；Git 扫描仍可使用。
+
+通过认证、schema 与路径校验并进入 Git 执行阶段的请求会尝试写入 `$TODEX_AGENTD_DATA_DIR/audit/audit.jsonl` 的 `git.audit` 事件，审计记录只包含动作、路径、结果码和输出长度，不记录提交说明。无效 token、无效 JSON/action 和路径校验失败发生在审计事件创建之前。Git 副作用完成后的审计 I/O 失败会记录 daemon 警告，但不会把已经成功的操作伪装成失败响应。
+
+Git API 使用以下错误码（均为统一 JSON 错误 envelope 的 `code` 字段）：`GIT_UNAVAILABLE`、`GIT_REPOSITORY_NOT_FOUND`、`GIT_COMMAND_FAILED`、`GIT_PARTIAL_SUCCESS`、`GIT_COMMAND_TIMED_OUT`、`GIT_OUTPUT_LIMIT_EXCEEDED`、`GIT_PROCESS_ERROR`、`GIT_SCAN_LIMIT_EXCEEDED`、`UNSUPPORTED`。`GIT_PARTIAL_SUCCESS` 表示 `commit-push` 已创建本地提交但后续 push 失败，或写请求触及总时限而无法证明仓库/远端完全未变；客户端必须刷新仓库状态且不得自动重试提交。路径越界仍返回通用的 `WORKSPACE_PATH_OUTSIDE_ROOT`。
+
 ### 浏览器代理
 
 ```http
@@ -263,7 +338,7 @@ POST /v2/browser/fetch
 {"url": "https://example.com/page"}
 ```
 
-仅允许 `http`/`https` URL；拒绝云元数据地址和非本后端的 loopback 目标。响应返回 `url`、`status`、`contentType`、`body`（≤2 MiB）。
+仅允许指向本后端 loopback 的 `http`/`https` URL；禁用系统代理，最多跟随 3 次且每一跳仍必须是 loopback。响应返回最终 `url`、实际 `status`、`contentType`、`body`（≤2 MiB）。
 
 ## WebSocket 协议
 

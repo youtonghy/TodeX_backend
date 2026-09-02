@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use std::path::Path;
 use serde_json::{json, Value};
+use std::path::Path;
 use tokio::sync::watch;
+use tokio::time::{timeout, Duration};
 
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
@@ -12,6 +13,8 @@ use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, PermissionOutcome,
     ProviderCapabilities, ProviderCommandDescriptor, ProviderDescriptor, ProviderDriver,
 };
+
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct CodexDriver {
     binary: String,
@@ -43,28 +46,86 @@ impl ProviderDriver for CodexDriver {
                 tool_events: true,
                 native_skills: true,
                 native_mcp: true,
+                managed_mcp: true,
                 model_selection: true,
             },
             models: Vec::new(),
         }
     }
 
-    async fn discover_models(&self, workspace: &Path) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
+    async fn discover_models(
+        &self,
+        workspace: &Path,
+    ) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
         let mut spec = CommandSpec::new(&self.binary, workspace);
-        spec.args = vec!["app-server".to_owned(), "--listen".to_owned(), "stdio://".to_owned()];
+        spec.args = vec![
+            "app-server".to_owned(),
+            "--listen".to_owned(),
+            "stdio://".to_owned(),
+        ];
         let mut process = JsonLineProcess::spawn(&spec).await?;
         process.send(&json!({"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"todex-agentd","version":env!("CARGO_PKG_VERSION")}}})).await?;
         let _ = read_rpc_response(&mut process, "initialize").await?;
-        process.send(&json!({"id":"models","method":"model/list","params":{"includeHidden":false}})).await?;
+        process
+            .send(&json!({"id":"models","method":"model/list","params":{"includeHidden":false}}))
+            .await?;
         let response = read_rpc_response(&mut process, "models").await?;
         process.terminate().await;
-        Ok(response.get("data").and_then(Value::as_array).into_iter().flatten().filter_map(|item| {
-            let id = item.get("model").or_else(|| item.get("id")).and_then(Value::as_str)?.to_owned();
-            Some(super::types::ProviderModelDescriptor { id, display_name: item.get("displayName").and_then(Value::as_str).unwrap_or("Codex model").to_owned(), description: item.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(), is_default: item.get("isDefault").and_then(Value::as_bool).unwrap_or(false), supported_reasoning_efforts: item.get("supportedReasoningEfforts").and_then(Value::as_array).map(|items| items.iter().filter_map(|x| x.get("reasoningEffort").and_then(Value::as_str).map(ToOwned::to_owned)).collect()).unwrap_or_default(), default_reasoning_effort: item.get("defaultReasoningEffort").and_then(Value::as_str).map(ToOwned::to_owned), context_window: None })
-        }).collect())
+        Ok(response
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let id = item
+                    .get("model")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)?
+                    .to_owned();
+                Some(super::types::ProviderModelDescriptor {
+                    id,
+                    display_name: item
+                        .get("displayName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Codex model")
+                        .to_owned(),
+                    description: item
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    is_default: item
+                        .get("isDefault")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    supported_reasoning_efforts: item
+                        .get("supportedReasoningEfforts")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|x| {
+                                    x.get("reasoningEffort")
+                                        .and_then(Value::as_str)
+                                        .map(ToOwned::to_owned)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    default_reasoning_effort: item
+                        .get("defaultReasoningEffort")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    context_window: None,
+                })
+            })
+            .collect())
     }
 
-    async fn discover_commands(&self, _workspace: &Path) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
+    async fn discover_commands(
+        &self,
+        _workspace: &Path,
+    ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
         // Codex exposes these as TUI commands rather than an app-server catalog.
         // Keep this adapter aligned with the installed source version; actions
         // are dispatched by the desktop's native Codex control plane.
@@ -90,9 +151,17 @@ impl ProviderDriver for CodexDriver {
             ("mention", "mention a file"),
             ("logout", "log out of Codex"),
         ];
-        Ok(COMMANDS.iter().map(|(name, description)| ProviderCommandDescriptor {
-            name: (*name).to_owned(), description: (*description).to_owned(), source: "builtin".to_owned(), invocation: "desktop".to_owned(), argument_hint: None,
-        }).collect())
+        Ok(COMMANDS
+            .iter()
+            .map(|(name, description)| ProviderCommandDescriptor {
+                name: (*name).to_owned(),
+                description: (*description).to_owned(),
+                source: "builtin".to_owned(),
+                source_info: None,
+                invocation: "desktop".to_owned(),
+                argument_hint: None,
+            })
+            .collect())
     }
 
     async fn run_turn(
@@ -117,8 +186,14 @@ impl ProviderDriver for CodexDriver {
 
 async fn read_rpc_response(process: &mut JsonLineProcess, id: &str) -> Result<Value, AppError> {
     loop {
-        let Some(value) = process.read().await? else { return Err(AppError::ProviderUnavailable("Codex app-server closed stdout".to_owned())); };
-        if value.get("id").and_then(Value::as_str) == Some(id) { return Ok(value.get("result").cloned().unwrap_or(value)); }
+        let Some(value) = process.read().await? else {
+            return Err(AppError::ProviderUnavailable(
+                "Codex app-server closed stdout".to_owned(),
+            ));
+        };
+        if jsonrpc_id_matches(&value, id) {
+            return Ok(value.get("result").cloned().unwrap_or(value));
+        }
     }
 }
 
@@ -129,6 +204,7 @@ async fn run_codex_turn(
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<DriverTurnResult, AppError> {
+    let input = codex_prompt_input(&prompt);
     process
         .send(&json!({
             "id": "initialize",
@@ -212,7 +288,7 @@ async fn run_codex_turn(
             "method": "turn/start",
             "params": {
                 "threadId": native_session_id,
-                "input": [{ "type": "text", "text": prompt.text }],
+                "input": input,
                 "model": prompt.model.clone(),
                 "effort": prompt.reasoning_effort.clone(),
             }
@@ -230,11 +306,13 @@ async fn run_codex_turn(
             changed = cancel.changed() => {
                 let _ = changed;
                 if let Some(turn_id) = native_turn_id.as_deref() {
-                    let _ = process.send(&json!({
-                        "id": format!("cancel_{}", prompt.turn_id),
-                        "method": "turn/interrupt",
-                        "params": { "threadId": native_session_id, "turnId": turn_id },
-                    })).await;
+                    return interrupt_codex_turn(
+                        process,
+                        &prompt.turn_id,
+                        &native_session_id,
+                        turn_id,
+                        sink,
+                    ).await;
                 }
                 return Ok(DriverTurnResult {
                     native_session_id: Some(native_session_id),
@@ -249,20 +327,53 @@ async fn run_codex_turn(
         if message.is_null() {
             continue;
         }
-        if is_turn_completed(&message, native_turn_id.as_deref()) {
-            let stop_reason = message
-                .pointer("/params/turn/status")
-                .and_then(Value::as_str)
-                .unwrap_or("completed")
-                .to_owned();
+        if let Some(stop_reason) = turn_completion_status(&message, native_turn_id.as_deref()) {
+            if stop_reason == "failed" {
+                return Err(codex_turn_failure(&message));
+            }
             return Ok(DriverTurnResult {
                 native_session_id: Some(native_session_id),
-                stop_reason,
-                cancelled: false,
+                stop_reason: stop_reason.to_owned(),
+                cancelled: stop_reason == "interrupted",
             });
         }
         handle_codex_message(process, message, sink, cancel).await?;
     }
+}
+
+fn codex_prompt_input(prompt: &DriverPrompt) -> Vec<Value> {
+    let mut input = Vec::new();
+    if !prompt.text.is_empty() {
+        input.push(json!({ "type": "text", "text": prompt.text }));
+    }
+    for content in &prompt.content {
+        match content {
+            super::types::DriverPromptContent::Image {
+                path: Some(path), ..
+            } => input.push(json!({ "type": "localImage", "path": path })),
+            super::types::DriverPromptContent::Image {
+                path: None,
+                data,
+                mime_type,
+            } => input.push(json!({
+                "type": "image",
+                "url": format!("data:{mime_type};base64,{data}"),
+            })),
+            super::types::DriverPromptContent::File { path, name } => input.push(json!({
+                "type": "mention",
+                "name": name,
+                "path": path,
+            })),
+        }
+    }
+    for skill in &prompt.skills {
+        input.push(json!({
+            "type": "skill",
+            "name": skill.name,
+            "path": skill.path,
+        }));
+    }
+    input
 }
 
 async fn wait_for_response(
@@ -276,7 +387,7 @@ async fn wait_for_response(
             message = process.read() => message?,
             changed = cancel.changed() => {
                 let _ = changed;
-                return Err(AppError::Conflict("turn was cancelled".to_owned()));
+                return Err(AppError::TurnCancelled);
             }
         };
         let Some(message) = message else {
@@ -285,7 +396,7 @@ async fn wait_for_response(
         if message.is_null() {
             continue;
         }
-        if jsonrpc_id(&message) == Some(request_id) {
+        if jsonrpc_id_matches(&message, request_id) {
             if let Some(error) = message.get("error") {
                 return Err(AppError::ProviderUnavailable(format!(
                     "Codex request {request_id} failed: {}",
@@ -316,7 +427,7 @@ async fn handle_codex_message(
         if is_codex_permission_method(method) {
             let decision = sink
                 .request_permission(
-                    request_id.to_string(),
+                    jsonrpc_id_text(&request_id)?,
                     codex_permission_kind(method),
                     codex_permission_title(method, &params),
                     params.clone(),
@@ -389,16 +500,22 @@ fn codex_item_event(method: &str, params: &Value) -> Option<(&'static str, Value
     let item = params.get("item")?;
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
     if matches!(item_type, "agentMessage" | "agent_message") {
-        return (method == "item/completed").then(|| (
-            "message.completed",
-            json!({ "provider": "codex", "role": "assistant", "message": item }),
-        ));
+        return (method == "item/completed").then(|| {
+            (
+                "message.completed",
+                json!({ "provider": "codex", "role": "assistant", "message": item }),
+            )
+        });
     }
     if matches!(item_type, "reasoning" | "reasoningItem" | "reasoning_item") {
         return None;
     }
     Some((
-        if method == "item/completed" { "tool.completed" } else { "tool.started" },
+        if method == "item/completed" {
+            "tool.completed"
+        } else {
+            "tool.started"
+        },
         json!({ "provider": "codex", "item": item }),
     ))
 }
@@ -473,23 +590,113 @@ fn codex_permission_response(
     json!({ "decision": decision })
 }
 
-fn is_turn_completed(message: &Value, native_turn_id: Option<&str>) -> bool {
-    if message.get("method").and_then(Value::as_str) != Some("turn/completed") {
-        return false;
-    }
-    native_turn_id.is_none_or(|expected| {
-        message.pointer("/params/turn/id").and_then(Value::as_str) == Some(expected)
+async fn interrupt_codex_turn(
+    process: &mut JsonLineProcess,
+    request_turn_id: &str,
+    native_session_id: &str,
+    native_turn_id: &str,
+    sink: &DriverEventSink,
+) -> Result<DriverTurnResult, AppError> {
+    let cancel_request_id = format!("cancel_{request_turn_id}");
+    process
+        .send(&json!({
+            "id": cancel_request_id,
+            "method": "turn/interrupt",
+            "params": { "threadId": native_session_id, "turnId": native_turn_id },
+        }))
+        .await?;
+    let (_cancel_tx, mut no_cancel) = watch::channel(false);
+    let terminal = timeout(CANCEL_TIMEOUT, async {
+        let mut acknowledged = false;
+        let mut terminal = None;
+        loop {
+            let Some(message) = process.read().await? else {
+                return Err(provider_exit_error(
+                    process,
+                    "Codex app-server closed during interrupt",
+                )
+                .await);
+            };
+            if jsonrpc_id_matches(&message, &cancel_request_id) {
+                if let Some(error) = message.get("error") {
+                    return Err(AppError::ProviderUnavailable(format!(
+                        "Codex interrupt failed: {}",
+                        safe_error_text(error)
+                    )));
+                }
+                acknowledged = true;
+            } else if let Some(status) = turn_completion_status(&message, Some(native_turn_id)) {
+                if status == "failed" {
+                    return Err(codex_turn_failure(&message));
+                }
+                terminal = Some(status.to_owned());
+            } else {
+                handle_codex_message(process, message, sink, &mut no_cancel).await?;
+            }
+            if acknowledged {
+                if let Some(terminal) = terminal.take() {
+                    return Ok(terminal);
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| AppError::ProviderUnavailable("Codex interrupt timed out".to_owned()))??;
+    Ok(DriverTurnResult {
+        native_session_id: Some(native_session_id.to_owned()),
+        cancelled: terminal == "interrupted",
+        stop_reason: terminal,
     })
 }
 
-fn jsonrpc_id(message: &Value) -> Option<&str> {
-    message.get("id").and_then(Value::as_str)
+fn turn_completion_status<'a>(message: &'a Value, native_turn_id: Option<&str>) -> Option<&'a str> {
+    if message.get("method").and_then(Value::as_str) != Some("turn/completed") {
+        return None;
+    }
+    if native_turn_id.is_some_and(|expected| {
+        message.pointer("/params/turn/id").and_then(Value::as_str) != Some(expected)
+    }) {
+        return None;
+    }
+    Some(
+        message
+            .pointer("/params/turn/status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed"),
+    )
+}
+
+fn codex_turn_failure(message: &Value) -> AppError {
+    let detail = message
+        .pointer("/params/turn/error/message")
+        .or_else(|| message.pointer("/params/turn/error"))
+        .map(safe_error_text)
+        .unwrap_or_else(|| "Codex turn failed".to_owned());
+    AppError::ProviderUnavailable(detail)
+}
+
+fn jsonrpc_id_matches(message: &Value, expected: &str) -> bool {
+    message.get("id").is_some_and(|id| match id {
+        Value::String(value) => value == expected,
+        Value::Number(value) => value.to_string() == expected,
+        _ => false,
+    })
+}
+
+fn jsonrpc_id_text(id: &Value) -> Result<String, AppError> {
+    match id {
+        Value::String(value) => Ok(value.clone()),
+        Value::Number(value) => Ok(value.to_string()),
+        _ => Err(AppError::InvalidRequest(
+            "Codex request id must be a string or number".to_owned(),
+        )),
+    }
 }
 
 fn safe_error_text(error: &Value) -> String {
     error
-        .get("message")
-        .and_then(Value::as_str)
+        .as_str()
+        .or_else(|| error.get("message").and_then(Value::as_str))
         .unwrap_or("provider returned an error")
         .chars()
         .take(500)
@@ -498,7 +705,10 @@ fn safe_error_text(error: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::provider::types::{DriverPromptContent, DriverSkill};
 
     #[test]
     fn agent_message_completion_is_not_emitted_as_a_tool() {
@@ -512,7 +722,76 @@ mod tests {
     #[test]
     fn command_item_keeps_tool_lifecycle() {
         let params = json!({ "item": { "type": "commandExecution", "command": "pwd" } });
-        assert_eq!(codex_item_event("item/started", &params).unwrap().0, "tool.started");
-        assert_eq!(codex_item_event("item/completed", &params).unwrap().0, "tool.completed");
+        assert_eq!(
+            codex_item_event("item/started", &params).unwrap().0,
+            "tool.started"
+        );
+        assert_eq!(
+            codex_item_event("item/completed", &params).unwrap().0,
+            "tool.completed"
+        );
+    }
+
+    #[test]
+    fn request_ids_accept_strings_and_numbers_without_quoting() {
+        assert!(jsonrpc_id_matches(&json!({ "id": "42" }), "42"));
+        assert!(jsonrpc_id_matches(&json!({ "id": 42 }), "42"));
+        assert_eq!(jsonrpc_id_text(&json!("request-1")).unwrap(), "request-1");
+        assert_eq!(jsonrpc_id_text(&json!(42)).unwrap(), "42");
+        assert!(jsonrpc_id_text(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn turn_terminal_status_is_authoritative_and_turn_scoped() {
+        let failed = json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-1", "status": "failed", "error": "boom" } }
+        });
+        assert_eq!(
+            turn_completion_status(&failed, Some("turn-1")),
+            Some("failed")
+        );
+        assert!(turn_completion_status(&failed, Some("turn-2")).is_none());
+        assert!(codex_turn_failure(&failed).to_string().contains("boom"));
+
+        let interrupted = json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-1", "status": "interrupted" } }
+        });
+        assert_eq!(
+            turn_completion_status(&interrupted, Some("turn-1")),
+            Some("interrupted")
+        );
+    }
+
+    #[test]
+    fn typed_prompt_content_maps_to_codex_input_items() {
+        let prompt = DriverPrompt {
+            turn_id: "turn-1".to_owned(),
+            text: "inspect these".to_owned(),
+            content: vec![
+                DriverPromptContent::Image {
+                    path: Some(PathBuf::from("/workspace/image.png")),
+                    data: String::new(),
+                    mime_type: "image/png".to_owned(),
+                },
+                DriverPromptContent::File {
+                    path: PathBuf::from("/workspace/readme.md"),
+                    name: "readme.md".to_owned(),
+                },
+            ],
+            skills: vec![DriverSkill {
+                name: "review".to_owned(),
+                path: PathBuf::from("/skills/review/SKILL.md"),
+                content: "unused by the native item".to_owned(),
+            }],
+            model: None,
+            reasoning_effort: None,
+        };
+        let input = codex_prompt_input(&prompt);
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[1]["type"], "localImage");
+        assert_eq!(input[2]["type"], "mention");
+        assert_eq!(input[3]["type"], "skill");
     }
 }

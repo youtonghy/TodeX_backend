@@ -127,6 +127,7 @@ impl ProviderDriver for GrokBuildDriver {
                 tool_events: true,
                 native_skills: true,
                 native_mcp: true,
+                managed_mcp: false,
                 model_selection: true,
             },
             models: Vec::new(),
@@ -334,6 +335,7 @@ fn parse_commands(initialize: &Value) -> Vec<ProviderCommandDescriptor> {
                 } else {
                     "builtin".to_owned()
                 },
+                source_info: command.get("sourceInfo").cloned(),
                 description: command
                     .get("description")
                     .and_then(Value::as_str)
@@ -408,6 +410,8 @@ mod tests {
         let prompt = DriverPrompt {
             turn_id: "turn-1".to_owned(),
             text: "hello".to_owned(),
+            content: Vec::new(),
+            skills: Vec::new(),
             model: Some("grok-4.5".to_owned()),
             reasoning_effort: Some("high".to_owned()),
         };

@@ -413,7 +413,7 @@ fn executable_file(path: &Path) -> bool {
     }
 }
 
-fn secure_command(program: impl AsRef<OsStr>) -> Command {
+pub(crate) fn secure_command(program: impl AsRef<OsStr>) -> Command {
     let program = program.as_ref();
     let resolved = program
         .to_str()

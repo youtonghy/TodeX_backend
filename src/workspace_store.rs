@@ -77,6 +77,21 @@ impl WorkspaceStore {
         }
     }
 
+    pub async fn get_owned(
+        &self,
+        owner_id: &str,
+        workspace_id: &str,
+    ) -> Result<WorkspaceRecord, AppError> {
+        self.inner
+            .read()
+            .await
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.tenant_id == owner_id && workspace.id == workspace_id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("workspace {workspace_id}")))
+    }
+
     pub async fn merge_owned(
         &self,
         owner_id: &str,

@@ -4,6 +4,7 @@ use std::fs::FileType;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path as AxumPath, Query, State, WebSocketUpgrade};
@@ -14,17 +15,18 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::warn;
 
 use crate::app_state::AppState;
 use crate::conversation::{ConversationManifest, ProviderKind};
 use crate::error::AppError;
-use crate::provider::{PermissionDecision, PromptSkillRef};
+use crate::provider::{ConversationPrompt, PermissionDecision, PromptContentRef, PromptSkillRef};
 use crate::transport_crypto::TransportCryptoSession;
 use crate::workspace_paths::{canonical_workspace_root, validate_workspace_directory_text};
 use crate::workspace_store::WorkspaceRecord;
 
+use super::git;
 use super::protocol::ServerEvent;
 use super::websocket::{self, AuthContext};
 
@@ -35,11 +37,14 @@ use super::websocket::{self, AuthContext};
 /// Client v2.ts keeps a stricter 4MB guard for `conversation.*` commands.
 const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WS_SUBSCRIPTIONS: usize = 128;
+const MAX_WS_IN_FLIGHT_OPERATIONS: usize = 16;
 /// Keep idle connections alive; mirrors the legacy `/v1/ws` socket so clients
 /// without an application-level heartbeat are not reaped. A Ping draws an
 /// automatic Pong, which counts as receive activity below.
 const WS_PING_INTERVAL_SECS: u64 = 30;
 const WS_CLIENT_TIMEOUT_SECS: u64 = 90;
+const BROWSER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const BROWSER_FETCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Command types handled natively by the v2 dispatcher. Everything else on the
 /// socket is a legacy `ClientMessage` (`terminal.*`, `codex.local.*`,
@@ -62,14 +67,24 @@ fn is_v2_native_command(command_type: &str) -> bool {
     )
 }
 
+fn is_v2_background_command(command_type: &str) -> bool {
+    matches!(command_type, "mcp.refresh" | "mcp.call")
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v2/version", get(version))
         .route("/v2/workspaces", get(workspaces).put(replace_workspaces))
         .route("/v2/workspaces/{workspace_id}", delete(delete_workspace))
+        .route(
+            "/v2/workspaces/{workspace_id}/trust",
+            get(workspace_trust).put(update_workspace_trust),
+        )
         .route("/v2/workspace/entries", get(workspace_entries))
         .route("/v2/workspace/directories", get(workspace_directories))
         .route("/v2/workspace/file", get(workspace_file))
+        .route("/v2/git/scan", get(git_scan))
+        .route("/v2/git/run", post(git_run))
         .route("/v2/browser/fetch", post(browser_fetch))
         .route("/v2/providers", get(providers))
         .route("/v2/providers/models", get(provider_models))
@@ -81,7 +96,12 @@ pub fn routes() -> Router<AppState> {
             "/v2/conversations",
             get(list_conversations).post(create_conversation),
         )
-        .route("/v2/conversations/{conversation_id}", get(get_conversation))
+        .route(
+            "/v2/conversations/{conversation_id}",
+            get(get_conversation)
+                .patch(update_conversation)
+                .delete(delete_conversation),
+        )
         .route(
             "/v2/conversations/{conversation_id}/events",
             get(replay_conversation),
@@ -156,11 +176,93 @@ pub(super) async fn delete_workspace(
     AxumPath(workspace_id): AxumPath<String>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
+    let workspace = state
+        .workspaces
+        .get_owned(&auth.tenant_id, &workspace_id)
+        .await?;
+    let workspace_path = PathBuf::from(&workspace.path);
+    state
+        .workspace_trust
+        .set_owned(&auth.tenant_id, &workspace_path, false)
+        .await?;
+    let cancelled = state
+        .conversations
+        .cancel_workspace_owned(&auth.tenant_id, &workspace_path)
+        .await?;
     let deleted = state
         .workspaces
         .delete_owned(&auth.tenant_id, &workspace_id)
         .await?;
-    Ok(Json(json!({ "workspaceId": workspace_id, "deleted": deleted })))
+    Ok(Json(json!({
+        "workspaceId": workspace_id,
+        "deleted": deleted,
+        "trustRevoked": true,
+        "cancelledTurns": cancelled,
+    })))
+}
+
+pub(super) async fn workspace_trust(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Json<crate::workspace_trust::WorkspaceTrustStatus>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let workspace = state
+        .workspaces
+        .get_owned(&auth.tenant_id, &workspace_id)
+        .await?;
+    Ok(Json(
+        state
+            .workspace_trust
+            .status_owned(&auth.tenant_id, Path::new(&workspace.path))
+            .await?,
+    ))
+}
+
+pub(super) async fn update_workspace_trust(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<UpdateWorkspaceTrustRequest>,
+) -> Result<Json<crate::workspace_trust::WorkspaceTrustStatus>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let workspace = state
+        .workspaces
+        .get_owned(&auth.tenant_id, &workspace_id)
+        .await?;
+    let workspace_path = PathBuf::from(&workspace.path);
+    let status = state
+        .workspace_trust
+        .set_owned(&auth.tenant_id, &workspace_path, request.trusted)
+        .await?;
+    let cancelled_turns = if request.trusted {
+        0
+    } else {
+        state
+            .conversations
+            .cancel_workspace_owned(&auth.tenant_id, &workspace_path)
+            .await?
+    };
+    let audit = crate::event::EventRecord::new(
+        "workspace.trust.changed",
+        None,
+        None,
+        None,
+        json!({
+            "principal_id": auth.principal_id,
+            "tenant_id": auth.tenant_id,
+            "token_id": auth.token_id,
+            "workspace_id": workspace_id,
+            "workspace_path": status.workspace_path,
+            "trusted": status.trusted,
+            "cancelled_turns": cancelled_turns,
+        }),
+    );
+    if let Err(error) = websocket::append_audit_event(&state, &audit).await {
+        warn!(error = %error, "failed to persist workspace trust audit event");
+    }
+    state.events.publish(audit).await;
+    Ok(Json(status))
 }
 
 pub(super) async fn workspace_entries(
@@ -255,6 +357,85 @@ pub(super) async fn workspace_file(
     }))
 }
 
+pub(super) async fn git_scan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<super::protocol::GitScanQuery>,
+) -> Result<Json<super::protocol::GitScanResponse>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace_path)?;
+    let result = git::scan(&state.config.workspace_root, &workspace).await;
+    let audit = append_git_audit(
+        &state,
+        &auth,
+        "scan",
+        &workspace,
+        None,
+        if result.is_ok() { "allow" } else { "deny" },
+        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
+        result.as_ref().ok().map(|value| value.repositories.len()),
+        None,
+    )
+    .await;
+    combine_git_result(result.map(Json), audit)
+}
+
+pub(super) async fn git_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<super::protocol::GitRunResponse>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let request: super::protocol::GitRunRequest =
+        serde_json::from_value(payload).map_err(|error| {
+            AppError::InvalidRequest(format!(
+                "invalid git request: {}",
+                truncate_git_error(error.to_string(), 256)
+            ))
+        })?;
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_root, &request.workspace_path)?;
+    state
+        .workspace_trust
+        .ensure_trusted(&auth.tenant_id, &workspace)
+        .await?;
+    let result = git::run(
+        &state.config.workspace_root,
+        &state.config.data_dir,
+        &workspace,
+        &request,
+    )
+    .await;
+    let decision = if result.is_ok() {
+        "allow"
+    } else if matches!(&result, Err(AppError::GitPartialSuccess { .. })) {
+        "partial"
+    } else {
+        "deny"
+    };
+    let repository = match &result {
+        Ok(value) => Some(Path::new(value.repository_path.as_str())),
+        Err(AppError::GitPartialSuccess {
+            repository_path, ..
+        }) => Some(Path::new(repository_path.as_str())),
+        _ => None,
+    };
+    let audit = append_git_audit(
+        &state,
+        &auth,
+        request.action.as_str(),
+        &workspace,
+        repository,
+        decision,
+        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
+        None,
+        result.as_ref().ok().map(|value| value.output.len()),
+    )
+    .await;
+    combine_git_result(result.map(Json), audit)
+}
+
 fn validate_workspace_file_text(root: &Path, raw: &str) -> Result<PathBuf, AppError> {
     let path = PathBuf::from(raw.trim());
     if !path.is_absolute() {
@@ -290,40 +471,64 @@ pub(super) async fn browser_fetch(
             "browser target is not allowed".to_owned(),
         ));
     }
-    let output = tokio::process::Command::new("curl")
-        .args([
-            "--fail-with-body",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-redirs",
-            "3",
-            "--max-time",
-            "15",
-            "--max-filesize",
-            "2097152",
-            &url,
-        ])
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(AppError::ProviderUnavailable(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(BROWSER_FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 || !is_allowed_browser_target(attempt.url()) {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|error| AppError::ProviderUnavailable(error.to_string()))?;
+    let mut response = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|error| AppError::ProviderUnavailable(error.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AppError::ProviderUnavailable(format!(
+            "browser target returned {status}"
+        )));
     }
-    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    let final_url = response.url().to_string();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| AppError::ProviderUnavailable(error.to_string()))?
+    {
+        if body.len().saturating_add(chunk.len()) > BROWSER_FETCH_BODY_LIMIT {
+            return Err(AppError::InvalidRequest(format!(
+                "browser response exceeds {BROWSER_FETCH_BODY_LIMIT} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
     Ok(Json(BrowserFetchResponse {
-        url,
-        status: 200,
-        content_type: "text/html".to_owned(),
-        body,
+        url: final_url,
+        status: status.as_u16(),
+        content_type,
+        body: String::from_utf8_lossy(&body).to_string(),
     }))
 }
 
 fn is_allowed_browser_target(url: &reqwest::Url) -> bool {
     let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
     let is_loopback = host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().map(|address| address.is_loopback()).unwrap_or(false);
+        || host
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false);
     is_loopback && url.username().is_empty() && url.password().is_none()
 }
 
@@ -334,7 +539,10 @@ fn validate_browser_url(raw: &str) -> Result<String, AppError> {
             "only valid http and https URLs are allowed".to_owned(),
         ));
     };
-    if value.len() > 2048 || !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+    if value.len() > 2048
+        || !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+    {
         return Err(AppError::InvalidRequest(
             "only valid http and https URLs are allowed".to_owned(),
         ));
@@ -662,12 +870,12 @@ async fn provider_models(
     headers: HeaderMap,
     Query(query): Query<ProviderModelsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    require_auth(&state, &headers)?;
+    let auth = require_auth(&state, &headers)?;
     let workspace =
         validate_workspace_directory_text(&state.config.workspace_root, &query.workspace)?;
     let models = state
         .conversations
-        .models_live(query.provider, &workspace)
+        .models_live(&auth.tenant_id, query.provider, &workspace)
         .await?;
     Ok(Json(
         json!({ "provider": query.provider, "models": models, "source": "provider-discovery", "fetchedAt": chrono::Utc::now().to_rfc3339() }),
@@ -679,9 +887,13 @@ async fn provider_commands(
     headers: HeaderMap,
     Query(query): Query<ProviderModelsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    require_auth(&state, &headers)?;
-    let workspace = validate_workspace_directory_text(&state.config.workspace_root, &query.workspace)?;
-    let commands = state.conversations.commands_live(query.provider, &workspace).await?;
+    let auth = require_auth(&state, &headers)?;
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace)?;
+    let commands = state
+        .conversations
+        .commands_live(&auth.tenant_id, query.provider, &workspace)
+        .await?;
     Ok(Json(json!({
         "provider": query.provider,
         "commands": commands,
@@ -742,6 +954,40 @@ async fn get_conversation(
     ))
 }
 
+async fn update_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(conversation_id): AxumPath<String>,
+    Json(request): Json<UpdateConversationRequest>,
+) -> Result<Json<ConversationManifest>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let manifest = state
+        .conversations
+        .update_metadata_owned(
+            &auth.tenant_id,
+            &conversation_id,
+            request.title.map(Some),
+            request.archived,
+        )
+        .await?;
+    Ok(Json(manifest))
+}
+
+async fn delete_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(conversation_id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let manifest = state
+        .conversations
+        .delete_owned(&auth.tenant_id, &conversation_id)
+        .await?;
+    Ok(Json(
+        json!({ "conversationId": manifest.id, "deleted": true }),
+    ))
+}
+
 async fn replay_conversation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -774,10 +1020,13 @@ async fn prompt_conversation(
         .prompt_owned(
             &auth.tenant_id,
             &conversation_id,
-            request.text,
-            request.model,
-            request.reasoning_effort,
-            prompt_skills(request.skills),
+            ConversationPrompt {
+                text: request.text,
+                model: request.model,
+                reasoning_effort: request.reasoning_effort,
+                skills: prompt_skills(request.skills),
+                content: request.content,
+            },
         )
         .await?;
     Ok(Json(
@@ -958,6 +1207,8 @@ async fn handle_socket(
 
     let subscriptions = Arc::new(Mutex::new(HashSet::<String>::new()));
     let mut subscription_tasks = Vec::new();
+    let operation_limit = Arc::new(Semaphore::new(MAX_WS_IN_FLIGHT_OPERATIONS));
+    let mut operation_tasks = Vec::new();
     let client_timeout = tokio::time::Duration::from_secs(WS_CLIENT_TIMEOUT_SECS);
     loop {
         let frame = match tokio::time::timeout(client_timeout, receiver.next()).await {
@@ -1022,6 +1273,35 @@ async fn handle_socket(
                         continue;
                     }
                 };
+                if is_v2_background_command(&command.command_type) {
+                    let permit = match operation_limit.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            let _ = outgoing_tx
+                                .send(error_response(
+                                    Some(command.id),
+                                    AppError::ResourceExhausted(format!(
+                                        "v2 websocket allows at most {MAX_WS_IN_FLIGHT_OPERATIONS} concurrent operations"
+                                    )),
+                                ))
+                                .await;
+                            continue;
+                        }
+                    };
+                    operation_tasks
+                        .retain(|task: &tokio::task::JoinHandle<()>| !task.is_finished());
+                    let operation_state = state.clone();
+                    let operation_outgoing = outgoing_tx.clone();
+                    let owner_id = auth.tenant_id.clone();
+                    operation_tasks.push(tokio::spawn(async move {
+                        let _permit = permit;
+                        let response =
+                            dispatch_mcp_command_response(&operation_state, &owner_id, command)
+                                .await;
+                        let _ = operation_outgoing.send(response).await;
+                    }));
+                    continue;
+                }
                 let response = dispatch_command(
                     &state,
                     &outgoing_tx,
@@ -1057,6 +1337,10 @@ async fn handle_socket(
 
     for task in subscription_tasks {
         task.abort();
+    }
+    for task in operation_tasks {
+        task.abort();
+        let _ = task.await;
     }
     bus_task.abort();
     drop(outgoing_tx);
@@ -1178,13 +1462,17 @@ async fn dispatch_command_inner(
                 .lock()
                 .await
                 .insert(request.conversation_id.clone());
-            let skip_through = high_water;
             let outgoing = outgoing.clone();
             let conversation_id = request.conversation_id.clone();
+            let owner_id = owner_id.to_owned();
+            let conversations = state.conversations.clone();
+            let active_subscriptions = subscriptions.clone();
             subscription_tasks.push(tokio::spawn(async move {
+                let mut delivered_through = high_water;
                 loop {
                     match receiver.recv().await {
-                        Ok(event) if event.sequence > skip_through => {
+                        Ok(event) if event.sequence > delivered_through => {
+                            delivered_through = event.sequence;
                             if outgoing
                                 .send(json!({ "type": "conversation.event", "payload": event }))
                                 .await
@@ -1195,19 +1483,65 @@ async fn dispatch_command_inner(
                         }
                         Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            let _ = outgoing
+                            if outgoing
                                 .send(json!({
                                     "type": "server.error",
                                     "payload": {
                                         "code": "EVENT_STREAM_LAGGED",
-                                        "message": format!("conversation {conversation_id} stream lagged by {skipped} events"),
+                                        "message": format!("conversation {conversation_id} stream lagged by {skipped} events; replaying persisted events"),
                                     }
                                 }))
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            let recovery = async {
+                                let recovery_high_water = conversations
+                                    .get_owned(&owner_id, &conversation_id)
+                                    .await?
+                                    .last_sequence;
+                                while delivered_through < recovery_high_water {
+                                    let replay = conversations
+                                        .replay_owned(
+                                            &owner_id,
+                                            &conversation_id,
+                                            delivered_through,
+                                            page_size,
+                                        )
+                                        .await?;
+                                    let mut advanced = false;
+                                    for event in replay.events.into_iter().take_while(|event| {
+                                        event.sequence <= recovery_high_water
+                                    }) {
+                                        delivered_through = event.sequence;
+                                        advanced = true;
+                                        outgoing
+                                            .send(json!({
+                                                "type": "conversation.event",
+                                                "payload": event,
+                                            }))
+                                            .await
+                                            .map_err(|_| AppError::StreamClosed)?;
+                                    }
+                                    if !advanced {
+                                        return Err(AppError::Conflict(format!(
+                                            "conversation {conversation_id} replay did not reach sequence {recovery_high_water}"
+                                        )));
+                                    }
+                                }
+                                Ok::<(), AppError>(())
+                            }
+                            .await;
+                            if let Err(error) = recovery {
+                                let _ = outgoing.send(error_response(None, error)).await;
+                                break;
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
+                active_subscriptions.lock().await.remove(&conversation_id);
             }));
             Ok(json!({
                 "conversationId": request.conversation_id,
@@ -1244,9 +1578,9 @@ async fn dispatch_command_inner(
         "conversation.prompt" => {
             let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
             let text = request.text.unwrap_or_default();
-            if text.trim().is_empty() && request.skills.is_empty() {
+            if text.trim().is_empty() && request.skills.is_empty() && request.content.is_empty() {
                 return Err(AppError::InvalidRequest(
-                    "conversation.prompt requires text or skills".to_owned(),
+                    "conversation.prompt requires text, content, or skills".to_owned(),
                 ));
             }
             let turn_id = state
@@ -1254,10 +1588,13 @@ async fn dispatch_command_inner(
                 .prompt_owned(
                     owner_id,
                     &request.conversation_id,
-                    text,
-                    request.model,
-                    request.reasoning_effort,
-                    prompt_skills(request.skills),
+                    ConversationPrompt {
+                        text,
+                        model: request.model,
+                        reasoning_effort: request.reasoning_effort,
+                        skills: prompt_skills(request.skills),
+                        content: request.content,
+                    },
                 )
                 .await?;
             Ok(json!({ "conversationId": request.conversation_id, "turnId": turn_id }))
@@ -1287,17 +1624,56 @@ async fn dispatch_command_inner(
                 "accepted": true,
             }))
         }
-        "mcp.list" => {
-            let request: WsMcpRequest = serde_json::from_value(command.payload.clone())?;
-            Ok(serde_json::to_value(
-                state
-                    .conversations
-                    .list_mcp_owned(owner_id, &request.conversation_id)
-                    .await?,
-            )?)
+        "mcp.list" | "mcp.refresh" | "mcp.call" => {
+            dispatch_mcp_command(state, owner_id, command).await
         }
+        "server.ping" => Ok(json!({ "pong": true })),
+        "session.resume" => {
+            // Replaces the transport-hello session cursor replay: grant this
+            // connection visibility for still-existing Codex sessions and
+            // replay gateway events after each client cursor. Replay events
+            // reach the client through the scoped legacy event stream above.
+            let request: SessionResumeRequest = serde_json::from_value(command.payload.clone())?;
+            let resumed =
+                websocket::resume_session_cursors(state, event_scope, &request.session_cursors)
+                    .await?;
+            Ok(json!({ "resumed": resumed }))
+        }
+        other => Err(AppError::Unsupported(format!(
+            "v2 websocket command {other}"
+        ))),
+    }
+}
+
+async fn dispatch_mcp_command_response(
+    state: &AppState,
+    owner_id: &str,
+    command: V2Command,
+) -> Value {
+    match dispatch_mcp_command(state, owner_id, &command).await {
+        Ok(payload) => json!({
+            "id": command.id,
+            "type": "server.result",
+            "payload": payload,
+        }),
+        Err(error) => error_response(Some(command.id), error),
+    }
+}
+
+async fn dispatch_mcp_command(
+    state: &AppState,
+    owner_id: &str,
+    command: &V2Command,
+) -> Result<Value, AppError> {
+    let request: WsMcpRequest = serde_json::from_value(command.payload.clone())?;
+    match command.command_type.as_str() {
+        "mcp.list" => Ok(serde_json::to_value(
+            state
+                .conversations
+                .list_mcp_owned(owner_id, &request.conversation_id)
+                .await?,
+        )?),
         "mcp.refresh" => {
-            let request: WsMcpRequest = serde_json::from_value(command.payload.clone())?;
             let resource_id = request.resource_id.ok_or_else(|| {
                 AppError::InvalidRequest("mcp.refresh requires resourceId".to_owned())
             })?;
@@ -1309,13 +1685,12 @@ async fn dispatch_command_inner(
             )?)
         }
         "mcp.call" => {
-            let request: WsMcpRequest = serde_json::from_value(command.payload.clone())?;
             let resource_id = request.resource_id.ok_or_else(|| {
                 AppError::InvalidRequest("mcp.call requires resourceId".to_owned())
             })?;
-            let tool_name = request.tool_name.ok_or_else(|| {
-                AppError::InvalidRequest("mcp.call requires toolName".to_owned())
-            })?;
+            let tool_name = request
+                .tool_name
+                .ok_or_else(|| AppError::InvalidRequest("mcp.call requires toolName".to_owned()))?;
             let result = state
                 .conversations
                 .call_mcp_owned(
@@ -1333,20 +1708,9 @@ async fn dispatch_command_inner(
                 "result": result,
             }))
         }
-        "server.ping" => Ok(json!({ "pong": true })),
-        "session.resume" => {
-            // Replaces the transport-hello session cursor replay: grant this
-            // connection visibility for still-existing Codex sessions and
-            // replay gateway events after each client cursor. Replay events
-            // reach the client through the scoped legacy event stream above.
-            let request: SessionResumeRequest = serde_json::from_value(command.payload.clone())?;
-            let resumed =
-                websocket::resume_session_cursors(state, event_scope, &request.session_cursors)
-                    .await?;
-            Ok(json!({ "resumed": resumed }))
-        }
-        other => Err(AppError::Unsupported(format!(
-            "v2 websocket command {other}"
+        _ => Err(AppError::Unsupported(format!(
+            "v2 websocket command {}",
+            command.command_type
         ))),
     }
 }
@@ -1370,6 +1734,76 @@ fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<AuthContext, Ap
         });
     }
     websocket::authenticate_headers(state, headers).ok_or(AppError::Unauthenticated)
+}
+
+async fn append_git_audit(
+    state: &AppState,
+    auth: &AuthContext,
+    action: &str,
+    workspace: &Path,
+    repository: Option<&Path>,
+    decision: &str,
+    reason_code: &str,
+    repository_count: Option<usize>,
+    output_bytes: Option<usize>,
+) -> Result<(), AppError> {
+    let event = crate::event::EventRecord::new(
+        "git.audit",
+        None,
+        None,
+        None,
+        json!({
+            "request_id": format!("git_{}", uuid::Uuid::new_v4().simple()),
+            "principal_id": auth.principal_id.as_str(),
+            "tenant_id": auth.tenant_id.as_str(),
+            "token_id": auth.token_id.as_str(),
+            "action": action,
+            "decision": decision,
+            "reason_code": reason_code,
+            "target_kind": "repository",
+            "workspace_path": workspace.display().to_string(),
+            "repository_path": repository.map(|path| path.display().to_string()),
+            "repository_count": repository_count,
+            "output_bytes": output_bytes,
+            "protocol": "git.v2",
+        }),
+    );
+    websocket::append_audit_event(state, &event).await?;
+    state.events.publish(event).await;
+    Ok(())
+}
+
+fn combine_git_result<T>(
+    operation: Result<T, AppError>,
+    audit: Result<(), AppError>,
+) -> Result<T, AppError> {
+    match (operation, audit) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(value), Err(audit_error)) => {
+            warn!(audit_error = %audit_error, "Git operation completed but audit persistence failed");
+            Ok(value)
+        }
+        (Err(operation_error), Ok(())) => Err(operation_error),
+        (Err(operation_error), Err(audit_error)) => {
+            warn!(
+                operation_error = %operation_error,
+                audit_error = %audit_error,
+                "failed to persist Git audit event"
+            );
+            Err(operation_error)
+        }
+    }
+}
+
+fn truncate_git_error(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 fn error_response(id: Option<String>, error: AppError) -> Value {
@@ -1399,6 +1833,12 @@ pub(super) struct ReplaceWorkspacesRequest {
 pub(super) struct WorkspacesResponse {
     workspaces: Vec<WorkspaceRecord>,
     updated_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct UpdateWorkspaceTrustRequest {
+    trusted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1497,6 +1937,15 @@ struct CreateConversationRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateConversationRequest {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    archived: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReplayQuery {
     #[serde(default)]
@@ -1524,6 +1973,8 @@ struct PromptRequest {
     reasoning_effort: Option<String>,
     #[serde(default)]
     skills: Vec<PromptSkillRequest>,
+    #[serde(default)]
+    content: Vec<PromptContentRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1571,6 +2022,8 @@ struct WsConversationRequest {
     reasoning_effort: Option<String>,
     #[serde(default)]
     skills: Vec<PromptSkillRequest>,
+    #[serde(default)]
+    content: Vec<PromptContentRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1597,6 +2050,7 @@ struct WsPermissionRequest {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::process::Command as StdCommand;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use axum::body::{to_bytes, Body};
@@ -1613,13 +2067,27 @@ mod tests {
 
     #[test]
     fn browser_url_allowlist_accepts_only_loopback_hosts() {
-        for url in ["http://localhost", "http://127.0.0.1:5173", "http://[::1]:3000"] {
+        for url in [
+            "http://localhost",
+            "http://127.0.0.1:5173",
+            "http://[::1]:3000",
+        ] {
             let parsed = reqwest::Url::parse(&validate_browser_url(url).unwrap()).unwrap();
-            assert!(is_allowed_browser_target(&parsed), "expected allowed URL: {url}");
+            assert!(
+                is_allowed_browser_target(&parsed),
+                "expected allowed URL: {url}"
+            );
         }
-        for url in ["https://example.com", "http://192.168.1.2", "http://localhost.evil"] {
+        for url in [
+            "https://example.com",
+            "http://192.168.1.2",
+            "http://localhost.evil",
+        ] {
             let parsed = reqwest::Url::parse(&validate_browser_url(url).unwrap()).unwrap();
-            assert!(!is_allowed_browser_target(&parsed), "expected blocked URL: {url}");
+            assert!(
+                !is_allowed_browser_target(&parsed),
+                "expected blocked URL: {url}"
+            );
         }
     }
 
@@ -1752,8 +2220,12 @@ mod tests {
             .await
             .unwrap();
         let hub = ConversationEventHub::default();
-        state.conversations =
-            ConversationSupervisor::new(state.config.clone(), store.clone(), hub.clone());
+        state.conversations = ConversationSupervisor::new(
+            state.config.clone(),
+            store.clone(),
+            hub.clone(),
+            state.workspace_trust.clone(),
+        );
         let manifest = state
             .conversations
             .create_owned(
@@ -2019,12 +2491,75 @@ mod tests {
                     .uri("/v2/workspaces")
                     .header("authorization", auth)
                     .header("content-type", "application/json")
-                    .body(Body::from(json!({ "workspaces": [] }).to_string()))
+                    .body(Body::from(
+                        json!({
+                            "workspaces": [{
+                                "id": "client-generated",
+                                "name": "project",
+                                "path": workspace.display().to_string(),
+                                "sessionId": "session-project",
+                                "tenantId": "local",
+                                "threadId": "",
+                                "model": "gpt-5",
+                                "reasoningEffort": null,
+                                "approvalPolicy": "on-request",
+                                "sandboxMode": "workspace-write",
+                                "serviceTier": null,
+                                "localAdapterState": "idle",
+                                "createdAt": 1,
+                                "updatedAt": 1
+                            }]
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(replaced.status(), StatusCode::OK);
+        let replaced_body = to_bytes(replaced.into_body(), 1024 * 1024).await.unwrap();
+        let replaced_json: Value = serde_json::from_slice(&replaced_body).unwrap();
+        let workspace_id = replaced_json["workspaces"][0]["id"].as_str().unwrap();
+
+        let trust = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v2/workspaces/{workspace_id}/trust"))
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(trust.status(), StatusCode::OK);
+        let trust_body = to_bytes(trust.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            !serde_json::from_slice::<Value>(&trust_body).unwrap()["trusted"]
+                .as_bool()
+                .unwrap()
+        );
+
+        let trusted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v2/workspaces/{workspace_id}/trust"))
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "trusted": true }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(trusted.status(), StatusCode::OK);
+        let trusted_body = to_bytes(trusted.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            serde_json::from_slice::<Value>(&trusted_body).unwrap()["trusted"]
+                .as_bool()
+                .unwrap()
+        );
 
         let entries = app
             .clone()
@@ -2113,6 +2648,80 @@ mod tests {
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
+        let browser_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let browser_address = browser_listener.local_addr().unwrap();
+        let browser_server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut stream, _) = browser_listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = b"<h1>loopback</h1>";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        let fetched_browser = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/browser/fetch")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "url": format!("http://{browser_address}/") }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        browser_server.await.unwrap();
+        assert_eq!(fetched_browser.status(), StatusCode::OK);
+        let browser_body = to_bytes(fetched_browser.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let browser_json: serde_json::Value = serde_json::from_slice(&browser_body).unwrap();
+        assert_eq!(browser_json["status"], 200);
+        assert_eq!(browser_json["contentType"], "text/html; charset=utf-8");
+        assert_eq!(browser_json["body"], "<h1>loopback</h1>");
+
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_address = redirect_listener.local_addr().unwrap();
+        let redirect_server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut stream, _) = redirect_listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://example.com/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let blocked_redirect = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/browser/fetch")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "url": format!("http://{redirect_address}/") }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        redirect_server.await.unwrap();
+        assert_eq!(blocked_redirect.status(), StatusCode::SERVICE_UNAVAILABLE);
+
         let blocked_browser = app
             .clone()
             .oneshot(
@@ -2130,6 +2739,306 @@ mod tests {
             .unwrap();
         assert_eq!(blocked_browser.status(), StatusCode::BAD_REQUEST);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn git_http_api_scans_runs_fixed_actions_and_enforces_root_boundary() {
+        let root = std::env::temp_dir().join(format!("todex-v2-git-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        let outside = root.join("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_root,
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+                auth_token: Some("git-token".to_owned()),
+            },
+        })
+        .await
+        .unwrap();
+        state
+            .workspace_trust
+            .set_owned("local", &workspace, true)
+            .await
+            .unwrap();
+        let app = crate::server::router(state.clone());
+        let auth = "Bearer git-token";
+
+        let scan = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/git/scan?workspacePath={}",
+                        workspace.display()
+                    ))
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scan.status(), StatusCode::OK);
+        let scan_body = to_bytes(scan.into_body(), 2 * 1024 * 1024).await.unwrap();
+        let scan_json: serde_json::Value = serde_json::from_slice(&scan_body).unwrap();
+        assert_eq!(scan_json["repositories"][0]["initialEligible"], true);
+        assert_eq!(scan_json["repositories"][0]["branch"], "UNINITIALIZED");
+
+        let init_status = StdCommand::new("git")
+            .args(["-C", workspace.to_str().unwrap(), "init"])
+            .status()
+            .unwrap();
+        assert!(init_status.success());
+        fs::write(workspace.join("README.md"), "hello\n").unwrap();
+        // Configure identity locally so the test does not depend on a user's
+        // global Git configuration.
+        for (key, value) in [
+            ("user.email", "todex-test@example.invalid"),
+            ("user.name", "TodeX Test"),
+        ] {
+            let status = StdCommand::new("git")
+                .args(["-C", workspace.to_str().unwrap(), "config", key, value])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/git/run")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "workspacePath": workspace,
+                            "action": "initial",
+                            "message": "Initial API commit",
+                            "includeUnstaged": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        let initial_body = to_bytes(initial.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        let initial_json: serde_json::Value = serde_json::from_slice(&initial_body).unwrap();
+        assert_eq!(initial_json["action"], "initial");
+        assert!(initial_json["repositoryPath"]
+            .as_str()
+            .unwrap()
+            .ends_with("/project"));
+
+        fs::write(workspace.join("README.md"), "changed\n").unwrap();
+        let marker = outside.join("injected");
+        #[cfg(unix)]
+        let hook_marker = {
+            use std::os::unix::fs::PermissionsExt;
+            let hook_marker = outside.join("hook-ran");
+            let hook = workspace.join(".git/hooks/pre-commit");
+            fs::write(
+                &hook,
+                format!("#!/bin/sh\ntouch \"{}\"\n", hook_marker.display()),
+            )
+            .unwrap();
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+            hook_marker
+        };
+        let malicious_message = format!("$(touch {})", marker.display());
+        let commit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/git/run")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "workspacePath": workspace,
+                            "action": "commit",
+                            "message": malicious_message,
+                            "includeUnstaged": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(commit.status(), StatusCode::OK);
+        assert!(
+            !marker.exists(),
+            "commit message must never be interpreted by a shell"
+        );
+        #[cfg(unix)]
+        assert!(!hook_marker.exists(), "repository hooks must be disabled");
+
+        let nested = workspace.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        state
+            .workspace_trust
+            .set_owned("local", &nested, true)
+            .await
+            .unwrap();
+        let nested_target = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/git/run")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "workspacePath": nested, "action": "push" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nested_target.status(), StatusCode::BAD_REQUEST);
+
+        let linked_workspace = state.config.workspace_root.join("linked");
+        let external_git_dir = outside.join("linked.git");
+        let linked_status = StdCommand::new("git")
+            .args([
+                "init",
+                "--separate-git-dir",
+                external_git_dir.to_str().unwrap(),
+                linked_workspace.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(linked_status.success());
+        state
+            .workspace_trust
+            .set_owned("local", &linked_workspace, true)
+            .await
+            .unwrap();
+        let external_metadata = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/git/run")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "workspacePath": linked_workspace, "action": "push" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(external_metadata.status(), StatusCode::FORBIDDEN);
+
+        fs::write(workspace.join("README.md"), "partial push\n").unwrap();
+        let partial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/git/run")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "workspacePath": workspace,
+                            "action": "commit-push",
+                            "message": "Commit before expected push failure",
+                            "includeUnstaged": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial.status(), StatusCode::BAD_GATEWAY);
+        let partial_body = to_bytes(partial.into_body(), 1024 * 1024).await.unwrap();
+        let partial_json: serde_json::Value = serde_json::from_slice(&partial_body).unwrap();
+        assert_eq!(partial_json["code"], "GIT_PARTIAL_SUCCESS");
+
+        let escaped = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/git/run")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "workspacePath": outside,
+                            "action": "push"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(escaped.status(), StatusCode::FORBIDDEN);
+
+        let invalid_action = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/git/run")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "workspacePath": workspace,
+                            "action": "reset --hard"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_action.status(), StatusCode::BAD_REQUEST);
+        let invalid_body = to_bytes(invalid_action.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let invalid_json: serde_json::Value = serde_json::from_slice(&invalid_body).unwrap();
+        assert_eq!(invalid_json["code"], "INVALID_REQUEST");
+
+        let audit = fs::read_to_string(state.config.data_dir.join("audit/audit.jsonl")).unwrap();
+        assert!(audit.contains("git.audit"));
+        assert!(audit.contains("commit"));
+        assert!(audit.contains("partial"));
         let _ = fs::remove_dir_all(root);
     }
 

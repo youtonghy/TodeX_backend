@@ -15,6 +15,7 @@ mod transport_crypto;
 mod tui;
 mod workspace_paths;
 mod workspace_store;
+mod workspace_trust;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};

@@ -46,7 +46,7 @@ pub struct SkillDescriptor {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip)]
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     #[serde(skip)]
     priority: u8,
 }
@@ -796,10 +796,8 @@ fn parse_grok_mcp(inspect: &Value, workspace: &Path) -> Vec<McpServerDescriptor>
                 Some("http" | "sse") => McpTransport::Http,
                 _ => McpTransport::Unknown,
             };
-            let enabled = server
-                .get("compatibilityStatus")
-                .and_then(Value::as_str)
-                != Some("disabled");
+            let enabled =
+                server.get("compatibilityStatus").and_then(Value::as_str) != Some("disabled");
             Some(McpServerDescriptor {
                 resource_id: resource_id(&format!("mcp:{name}"), &source_path),
                 name: clean_name(name.to_owned()),
@@ -907,9 +905,7 @@ fn parsed_mcp_from_toml(name: String, table: &toml::Table) -> ParsedMcpServer {
         .and_then(toml::Value::as_table)
         .map(|env| {
             env.iter()
-                .filter_map(|(key, value)| {
-                    Some((key.clone(), value.as_str()?.to_owned()))
-                })
+                .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
                 .collect()
         })
         .unwrap_or_default();
@@ -965,31 +961,26 @@ fn parsed_mcp_from_json(server: &serde_json::Map<String, Value>) -> ParsedMcpSer
     if let Some(bin) = server.get("command").and_then(Value::as_str) {
         command.push(bin.to_owned());
         if let Some(args) = server.get("args").and_then(Value::as_array) {
-            command.extend(
-                args.iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned),
-            );
+            command.extend(args.iter().filter_map(Value::as_str).map(ToOwned::to_owned));
         }
     }
     let url = server
         .get("url")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let transport = if !command.is_empty()
-        || server.get("type").and_then(Value::as_str) == Some("stdio")
-    {
-        McpTransport::Stdio
-    } else if url.is_some()
-        || matches!(
-            server.get("type").and_then(Value::as_str),
-            Some("http" | "sse")
-        )
-    {
-        McpTransport::Http
-    } else {
-        McpTransport::Unknown
-    };
+    let transport =
+        if !command.is_empty() || server.get("type").and_then(Value::as_str) == Some("stdio") {
+            McpTransport::Stdio
+        } else if url.is_some()
+            || matches!(
+                server.get("type").and_then(Value::as_str),
+                Some("http" | "sse")
+            )
+        {
+            McpTransport::Http
+        } else {
+            McpTransport::Unknown
+        };
     let env = server
         .get("env")
         .and_then(Value::as_object)

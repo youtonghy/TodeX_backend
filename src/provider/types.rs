@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,6 +26,7 @@ pub struct ProviderCapabilities {
     pub tool_events: bool,
     pub native_skills: bool,
     pub native_mcp: bool,
+    pub managed_mcp: bool,
     pub model_selection: bool,
 }
 
@@ -49,6 +50,8 @@ pub struct ProviderCommandDescriptor {
     pub name: String,
     pub description: String,
     pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_info: Option<Value>,
     pub invocation: String,
     pub argument_hint: Option<String>,
 }
@@ -76,8 +79,30 @@ pub struct DriverContext {
 pub struct DriverPrompt {
     pub turn_id: String,
     pub text: String,
+    pub content: Vec<DriverPromptContent>,
+    pub skills: Vec<DriverSkill>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DriverSkill {
+    pub name: String,
+    pub path: PathBuf,
+    pub content: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum DriverPromptContent {
+    Image {
+        path: Option<PathBuf>,
+        data: String,
+        mime_type: String,
+    },
+    File {
+        path: PathBuf,
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -91,7 +116,7 @@ pub struct DriverTurnResult {
 #[serde(rename_all = "camelCase")]
 pub struct PermissionDecision {
     pub outcome: PermissionOutcome,
-    #[serde(default)]
+    #[serde(default, alias = "id")]
     pub option_id: Option<String>,
     #[serde(default)]
     pub data: Option<Value>,
@@ -188,11 +213,17 @@ impl DriverEventSink {
 pub trait ProviderDriver: Send + Sync {
     fn descriptor(&self) -> ProviderDescriptor;
 
-    async fn discover_models(&self, _workspace: &Path) -> Result<Vec<ProviderModelDescriptor>, AppError> {
+    async fn discover_models(
+        &self,
+        _workspace: &Path,
+    ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
         Ok(self.descriptor().models)
     }
 
-    async fn discover_commands(&self, _workspace: &Path) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
+    async fn discover_commands(
+        &self,
+        _workspace: &Path,
+    ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
         Ok(Vec::new())
     }
 
@@ -215,6 +246,17 @@ struct PendingPermission {
     sender: oneshot::Sender<PermissionDecision>,
 }
 
+struct PendingPermissionCleanup {
+    pending: Arc<DashMap<String, PendingPermission>>,
+    permission_id: String,
+}
+
+impl Drop for PendingPermissionCleanup {
+    fn drop(&mut self) {
+        self.pending.remove(&self.permission_id);
+    }
+}
+
 impl PermissionBroker {
     async fn request(
         &self,
@@ -235,6 +277,11 @@ impl PermissionBroker {
                 sender,
             },
         );
+        let _cleanup = PendingPermissionCleanup {
+            pending: self.pending.clone(),
+            permission_id: permission_id.clone(),
+        };
+        let options = normalize_permission_options(options)?;
         if let Err(error) = sink
             .emit(
                 "permission.requested",
@@ -249,7 +296,6 @@ impl PermissionBroker {
             )
             .await
         {
-            self.pending.remove(&permission_id);
             return Err(error);
         }
 
@@ -263,10 +309,9 @@ impl PermissionBroker {
             }
             changed = cancel.changed() => {
                 let _ = changed;
-                Err(AppError::Conflict("turn was cancelled while awaiting permission".to_owned()))
+                Err(AppError::TurnCancelled)
             }
         };
-        self.pending.remove(&permission_id);
         let decision = match decision {
             Ok(decision) => decision,
             Err(error) => {
@@ -322,6 +367,65 @@ impl PermissionBroker {
     }
 }
 
+fn normalize_permission_options(options: Value) -> Result<Value, AppError> {
+    let Value::Array(options) = options else {
+        if options.is_null() {
+            return Ok(Value::Array(Vec::new()));
+        }
+        return Err(AppError::InvalidRequest(
+            "permission options must be an array".to_owned(),
+        ));
+    };
+    options
+        .into_iter()
+        .map(|option| {
+            let Value::Object(option) = option else {
+                return Err(AppError::InvalidRequest(
+                    "permission option must be an object".to_owned(),
+                ));
+            };
+            let option_id = option
+                .get("optionId")
+                .or_else(|| option.get("id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::InvalidRequest("permission option id is required".to_owned())
+                })?;
+            let name = option
+                .get("name")
+                .or_else(|| option.get("label"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::InvalidRequest("permission option name is required".to_owned())
+                })?;
+            let kind = option
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or(option_id);
+            if !matches!(
+                kind,
+                "allow_once" | "allow_always" | "reject_once" | "reject_always" | "answer"
+            ) {
+                return Err(AppError::InvalidRequest(format!(
+                    "unsupported permission option kind {kind}"
+                )));
+            }
+            Ok(json!({
+                "optionId": option_id,
+                "id": option_id,
+                "name": name,
+                "label": name,
+                "kind": kind,
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +460,19 @@ mod tests {
             .is_err());
         assert!(broker.pending.is_empty());
         let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[test]
+    fn permission_options_are_canonical_and_keep_legacy_aliases() {
+        let options = normalize_permission_options(json!([
+            { "id": "allow_once", "label": "Allow once" },
+            { "optionId": "answer", "name": "Answer", "kind": "answer" }
+        ]))
+        .unwrap();
+        assert_eq!(options[0]["optionId"], "allow_once");
+        assert_eq!(options[0]["name"], "Allow once");
+        assert_eq!(options[0]["kind"], "allow_once");
+        assert_eq!(options[1]["id"], "answer");
+        assert_eq!(options[1]["label"], "Answer");
     }
 }

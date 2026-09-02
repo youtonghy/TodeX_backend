@@ -8,6 +8,88 @@ use crate::{
 
 pub type CodexSessionId = String;
 
+/// Mutating operations exposed by the HTTP Git API. The enum is deliberately
+/// closed so callers cannot provide arbitrary Git subcommands or arguments.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitAction {
+    Commit,
+    CommitPush,
+    Push,
+    Initial,
+}
+
+impl GitAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::CommitPush => "commit-push",
+            Self::Push => "push",
+            Self::Initial => "initial",
+        }
+    }
+
+    pub fn is_push(&self) -> bool {
+        matches!(self, Self::Push | Self::CommitPush)
+    }
+}
+
+fn default_git_include_unstaged() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitRunRequest {
+    pub workspace_path: String,
+    pub action: GitAction,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default = "default_git_include_unstaged")]
+    pub include_unstaged: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitScanQuery {
+    pub workspace_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileChange {
+    pub path: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRepositorySummary {
+    pub path: String,
+    pub name: String,
+    pub branch: String,
+    pub files: Vec<GitFileChange>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub initial_eligible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub files_truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct GitScanResponse {
+    pub repositories: Vec<GitRepositorySummary>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRunResponse {
+    pub repository_path: String,
+    pub action: GitAction,
+    pub output: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ClientMessage {
     pub id: String,

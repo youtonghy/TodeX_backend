@@ -143,20 +143,14 @@ impl Config {
     pub fn load(args: ServeArgs) -> anyhow::Result<Self> {
         let defaults = Config::default();
         let env_data_dir = env_path("TODEX_AGENTD_DATA_DIR");
-        let config_data_dir = args
-            .data_dir
-            .clone()
-            .or(env_data_dir.clone())
-            .unwrap_or_else(|| defaults.data_dir.clone());
-
-        let file_config = read_config_file(config_data_dir.join("config.toml"))?;
-
-        let data_dir = coalesce_path(
-            args.data_dir,
-            env_data_dir,
-            file_config.data_dir,
-            defaults.data_dir,
+        let bootstrap_data_dir = expand_home(
+            args.data_dir
+                .clone()
+                .or(env_data_dir.clone())
+                .unwrap_or_else(|| defaults.data_dir.clone()),
         );
+        let data_dir_is_explicit = args.data_dir.is_some() || env_data_dir.is_some();
+        let (data_dir, file_config) = load_file_config(&bootstrap_data_dir, !data_dir_is_explicit)?;
         let workspace_root = coalesce_path(
             args.workspace_root,
             env_path("TODEX_AGENTD_WORKSPACE_ROOT"),
@@ -197,7 +191,6 @@ impl Config {
 
         let agent_file = file_config.agent.unwrap_or_default();
         let security_file = file_config.security.unwrap_or_default();
-        let data_dir = expand_home(data_dir);
         let enable_auth = coalesce(
             None,
             env_bool("TODEX_AGENTD_ENABLE_AUTH"),
@@ -379,6 +372,92 @@ fn read_config_file(path: PathBuf) -> anyhow::Result<FileConfig> {
     }
 }
 
+fn load_file_config(
+    bootstrap_data_dir: &Path,
+    allow_redirect: bool,
+) -> anyhow::Result<(PathBuf, FileConfig)> {
+    let bootstrap_config = read_config_file(bootstrap_data_dir.join("config.toml"))?;
+    let data_dir = if allow_redirect {
+        bootstrap_config
+            .data_dir
+            .as_ref()
+            .map(|path| resolve_config_data_dir(bootstrap_data_dir, path))
+            .unwrap_or_else(|| bootstrap_data_dir.to_path_buf())
+    } else {
+        bootstrap_data_dir.to_path_buf()
+    };
+    if data_dir == bootstrap_data_dir {
+        return Ok((data_dir, bootstrap_config));
+    }
+
+    let effective_config = read_config_file(data_dir.join("config.toml"))?;
+    if let Some(next) = effective_config.data_dir.as_ref() {
+        let next = resolve_config_data_dir(&data_dir, next);
+        if next != data_dir {
+            anyhow::bail!(
+                "config data_dir may redirect only once ({} -> {} -> {})",
+                bootstrap_data_dir.display(),
+                data_dir.display(),
+                next.display()
+            );
+        }
+    }
+    Ok((
+        data_dir,
+        merge_file_config(bootstrap_config, effective_config),
+    ))
+}
+
+fn resolve_config_data_dir(base: &Path, configured: &Path) -> PathBuf {
+    let configured = expand_home(configured.to_path_buf());
+    if configured.is_absolute() {
+        configured
+    } else {
+        base.join(configured)
+    }
+}
+
+fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
+    macro_rules! replace_some {
+        ($target:expr, $value:expr) => {
+            if $value.is_some() {
+                $target = $value;
+            }
+        };
+    }
+
+    replace_some!(base.host, overlay.host);
+    replace_some!(base.port, overlay.port);
+    replace_some!(base.pairing_encryption, overlay.pairing_encryption);
+    replace_some!(base.data_dir, overlay.data_dir);
+    replace_some!(base.workspace_root, overlay.workspace_root);
+    replace_some!(base.history_retention_days, overlay.history_retention_days);
+
+    if let Some(overlay_agent) = overlay.agent {
+        let base_agent = base.agent.get_or_insert_with(PartialAgentConfig::default);
+        replace_some!(base_agent.default_agent, overlay_agent.default_agent);
+        replace_some!(base_agent.codex_bin, overlay_agent.codex_bin);
+        replace_some!(base_agent.claude_bin, overlay_agent.claude_bin);
+        replace_some!(base_agent.pi_bin, overlay_agent.pi_bin);
+        replace_some!(base_agent.grok_bin, overlay_agent.grok_bin);
+        replace_some!(base_agent.grok_auth_method, overlay_agent.grok_auth_method);
+        replace_some!(
+            base_agent.grok_env_allowlist,
+            overlay_agent.grok_env_allowlist
+        );
+        replace_some!(base_agent.acp_profiles, overlay_agent.acp_profiles);
+    }
+    if let Some(overlay_security) = overlay.security {
+        let base_security = base
+            .security
+            .get_or_insert_with(PartialSecurityConfig::default);
+        replace_some!(base_security.enable_auth, overlay_security.enable_auth);
+        replace_some!(base_security.enable_tls, overlay_security.enable_tls);
+        replace_some!(base_security.auth_token, overlay_security.auth_token);
+    }
+    base
+}
+
 fn env_path(key: &str) -> Option<PathBuf> {
     env::var_os(key).map(PathBuf::from)
 }
@@ -540,15 +619,25 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use super::{expand_home_with_home, optional_non_empty, Config, PairingEncryption, ServeArgs};
+    use super::{
+        expand_home_with_home, load_file_config, optional_non_empty, Config, PairingEncryption,
+        ServeArgs,
+    };
+    use uuid::Uuid;
 
     #[test]
     fn default_grok_config_is_safe() {
         let config = Config::default();
         assert_eq!(config.agent.grok_bin, "grok");
         assert!(config.agent.grok_auth_method.is_none());
-        assert!(config.agent.grok_env_allowlist.contains(&"GROK_HOME".to_owned()));
-        assert!(config.agent.grok_env_allowlist.contains(&"XAI_API_KEY".to_owned()));
+        assert!(config
+            .agent
+            .grok_env_allowlist
+            .contains(&"GROK_HOME".to_owned()));
+        assert!(config
+            .agent
+            .grok_env_allowlist
+            .contains(&"XAI_API_KEY".to_owned()));
         assert!(config
             .agent
             .grok_env_allowlist
@@ -606,6 +695,54 @@ mod tests {
         let updated = fs::read_to_string(root.join("config.toml")).expect("read config");
         assert!(updated.contains("auth_token"));
         assert!(updated.contains(token));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_data_dir_redirect_loads_effective_config_once() {
+        let root =
+            env::temp_dir().join(format!("todex-config-redirect-{}", Uuid::new_v4().simple()));
+        let bootstrap = root.join("bootstrap");
+        let effective = bootstrap.join("effective");
+        fs::create_dir_all(&effective).unwrap();
+        fs::write(
+            bootstrap.join("config.toml"),
+            "host = \"127.0.0.2\"\ndata_dir = \"effective\"\n",
+        )
+        .unwrap();
+        fs::write(
+            effective.join("config.toml"),
+            "port = 8123\n[security]\nauth_token = \"persisted\"\n",
+        )
+        .unwrap();
+
+        let (resolved, config) = load_file_config(&bootstrap, true).unwrap();
+        assert_eq!(resolved, effective);
+        assert_eq!(config.host.as_deref(), Some("127.0.0.2"));
+        assert_eq!(config.port, Some(8123));
+        assert_eq!(
+            config.security.unwrap().auth_token.as_deref(),
+            Some("persisted")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_data_dir_rejects_a_second_redirect() {
+        let root = env::temp_dir().join(format!(
+            "todex-config-redirect-cycle-{}",
+            Uuid::new_v4().simple()
+        ));
+        let bootstrap = root.join("bootstrap");
+        let effective = bootstrap.join("effective");
+        fs::create_dir_all(&effective).unwrap();
+        fs::write(bootstrap.join("config.toml"), "data_dir = \"effective\"\n").unwrap();
+        fs::write(effective.join("config.toml"), "data_dir = \"next\"\n").unwrap();
+
+        let error = load_file_config(&bootstrap, true).unwrap_err();
+        assert!(error.to_string().contains("redirect only once"));
 
         let _ = fs::remove_dir_all(root);
     }

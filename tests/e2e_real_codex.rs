@@ -759,6 +759,7 @@ async fn spawn_daemon() -> Daemon {
     let workspace_root = real_workspace_root().unwrap_or_else(|| root.join("workspace"));
     fs::create_dir_all(&data_dir).expect("create data dir");
     fs::create_dir_all(&workspace_root).expect("create workspace dir");
+    write_workspace_trust(&data_dir, &workspace_root);
     let port = free_port();
     write_real_acp_profile(&data_dir);
     let bin = env!("CARGO_BIN_EXE_todex-agentd");
@@ -830,6 +831,7 @@ async fn spawn_fake_history_daemon() -> Daemon {
     let workspace_root = root.join("workspace");
     fs::create_dir_all(&data_dir).expect("create data dir");
     fs::create_dir_all(&workspace_root).expect("create workspace dir");
+    write_workspace_trust(&data_dir, &workspace_root);
     let fake_codex = write_fake_history_codex_binary(&root, &workspace_root);
     let port = free_port();
     let bin = env!("CARGO_BIN_EXE_todex-agentd");
@@ -904,6 +906,23 @@ done
         fs::set_permissions(&binary, permissions).expect("chmod fake codex");
     }
     binary
+}
+
+fn write_workspace_trust(data_dir: &Path, workspace: &Path) {
+    let workspace = fs::canonicalize(workspace).expect("canonicalize trusted workspace");
+    let snapshot = json!({
+        "entries": [{
+            "ownerId": "local",
+            "workspacePath": workspace.display().to_string(),
+            "trustedAt": 1
+        }],
+        "updatedAt": 1
+    });
+    fs::write(
+        data_dir.join("workspace-trust.json"),
+        serde_json::to_vec_pretty(&snapshot).expect("serialize workspace trust fixture"),
+    )
+    .expect("write workspace trust fixture");
 }
 
 async fn start_session(ws: &mut Ws, session: &str, cwd: impl AsRef<Path>) {

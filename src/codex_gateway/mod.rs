@@ -17,9 +17,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout},
     sync::{mpsc, oneshot, Mutex as AsyncMutex},
+    task::JoinHandle,
     time::{sleep, Duration, Instant},
 };
 use uuid::Uuid;
@@ -29,6 +30,7 @@ use crate::{
     conversation::redact_secrets,
     error::{AppError, Result},
     event::{EventBus, EventRecord},
+    provider::process::secure_command,
 };
 
 use crate::server::protocol::{CodexLocalErrorCode, CodexLocalErrorPayload};
@@ -1551,7 +1553,7 @@ pub struct LocalCodexAdapter {
     idle_state: Arc<AsyncMutex<LocalCodexAdapterIdleState>>,
     child: Arc<AsyncMutex<Option<Child>>>,
     stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
-    stderr: Arc<AsyncMutex<Option<ChildStderr>>>,
+    stderr_task: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
     store: CodexGatewayStore,
     events: EventBus,
     pending_server_requests: Arc<DashMap<GatewayRequestId, CodexServerRequest>>,
@@ -1597,6 +1599,18 @@ impl LocalCodexAdapterIdleState {
     }
 }
 
+fn spawn_local_stderr_drain(mut stderr: ChildStderr) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+}
+
 impl LocalCodexAdapter {
     async fn start(
         options: CodexLocalAdapterStartOptions,
@@ -1627,7 +1641,8 @@ impl LocalCodexAdapter {
         .await?;
         let runtime = Arc::new(AsyncMutex::new(initial_runtime));
 
-        let spawn_result = Command::new(&options.binary)
+        let mut command = secure_command(&options.binary);
+        let spawn_result = command
             .arg("app-server")
             .arg("--listen")
             .arg("stdio://")
@@ -1635,6 +1650,7 @@ impl LocalCodexAdapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn();
         let mut child = match spawn_result {
             Ok(child) => child,
@@ -1665,7 +1681,7 @@ impl LocalCodexAdapter {
                 "codex.local.start",
             )
         })?;
-        let stderr = child.stderr.take();
+        let stderr_task = child.stderr.take().map(spawn_local_stderr_drain);
         write_json_line_to_child_stdin(
             &mut stdin,
             &codex_initialize_request(&options.request_id),
@@ -1740,7 +1756,7 @@ impl LocalCodexAdapter {
                     idle_state,
                     child: Arc::new(AsyncMutex::new(Some(child))),
                     stdin: Arc::new(AsyncMutex::new(Some(stdin))),
-                    stderr: Arc::new(AsyncMutex::new(stderr)),
+                    stderr_task: Arc::new(AsyncMutex::new(stderr_task)),
                     store,
                     events,
                     pending_server_requests,
@@ -2211,7 +2227,10 @@ impl LocalCodexAdapter {
         .await?;
 
         self.stdin.lock().await.take();
-        self.stderr.lock().await.take();
+        if let Some(task) = self.stderr_task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
         if let Some(mut child) = self.child.lock().await.take() {
             if force {
                 let _ = child.kill().await;

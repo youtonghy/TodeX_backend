@@ -1,3 +1,4 @@
+mod git;
 pub mod protocol;
 mod routes;
 mod v2;
