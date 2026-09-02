@@ -1,39 +1,153 @@
-name: Build backend binaries
+name: Release backend binaries
 
 on:
   workflow_dispatch:
     inputs:
-      timezone:
-        description: Timezone used for YYMMDDHHMM build versions
+      version:
+        description: Release version (for example, 1.2.3 or v1.2.3)
         required: true
-        default: Australia/Victoria
         type: string
-  push:
-    tags:
-      - "backend-v*"
-      - "v*"
 
 permissions:
   contents: read
 
-env:
-  BUILD_TIMEZONE: ${{ github.event.inputs.timezone || 'Australia/Victoria' }}
+concurrency:
+  group: backend-release
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Validate release
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Normalize version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version="${INPUT_VERSION#v}"
+          if [[ ! "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Version must use stable SemVer format X.Y.Z." >&2
+            exit 1
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Reject an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Tag ${RELEASE_TAG} already exists." >&2
+            exit 1
+          fi
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists." >&2
+            exit 1
+          fi
+
+  source:
+    name: Create versioned source tag
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Create release source commit
+        id: source
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          cargo install cargo-edit --version 0.13.13 --locked
+          cargo set-version "${RELEASE_VERSION}"
+
+          if ! git diff --quiet -- Cargo.toml Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore: release ${RELEASE_TAG}"
+          fi
+
+          echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Push release tag
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          git tag "${RELEASE_TAG}"
+          git push origin "refs/tags/${RELEASE_TAG}"
+
+  validate:
+    name: Test backend
+    needs:
+      - prepare
+      - source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Validate backend
+        run: |
+          cargo fmt --all --check
+          cargo check --locked --all-targets --all-features
+          cargo test --locked --all-targets --all-features
+          cargo clippy --locked --all-targets --all-features
+
   build:
-    name: ${{ matrix.os }}
+    name: Build ${{ matrix.label }}
+    needs:
+      - prepare
+      - source
+      - validate
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          - os: ubuntu-24.04
+            label: linux-x64-gnu
+            archive: tar.gz
+          - os: macos-15
+            label: macos-arm64
+            archive: tar.gz
+          - os: windows-2025
+            label: windows-x64
+            archive: zip
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.source.outputs.sha }}
 
       - name: Setup Rust
         shell: bash
@@ -41,49 +155,151 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Generate build version
-        shell: bash
-        run: |
-          build_version="$(TZ="${BUILD_TIMEZONE}" date +'%y%m%d%H%M')"
-          echo "TODEX_BUILD_VERSION=${build_version}" >> "${GITHUB_ENV}"
-
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package binary
+      - name: Verify and package binary
         id: package
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          PLATFORM_LABEL: ${{ matrix.label }}
+          ARCHIVE_FORMAT: ${{ matrix.archive }}
         run: |
-          platform="$(printf '%s-%s' "${RUNNER_OS}" "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
-          package_name="todex-agentd-${TODEX_BUILD_VERSION}-${platform}"
-          package_dir="dist/${package_name}"
           binary_name="todex-agentd"
-
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             binary_name="todex-agentd.exe"
           fi
 
+          binary_path="target/release/${binary_name}"
+          actual_version="$("${binary_path}" --version)"
+          if [[ "${actual_version}" != "todex-agentd ${RELEASE_VERSION}" ]]; then
+            echo "Unexpected binary version: ${actual_version}" >&2
+            exit 1
+          fi
+
+          package_name="todex-agentd-v${RELEASE_VERSION}-${PLATFORM_LABEL}"
+          package_dir="dist/${package_name}"
           mkdir -p "${package_dir}"
-          cp "target/release/${binary_name}" "${package_dir}/"
+          cp "${binary_path}" "${package_dir}/"
           cp README.md LICENSE "${package_dir}/"
           cp docs/BUILD_RUN.md "${package_dir}/"
 
-          pushd dist
-          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+          pushd dist >/dev/null
+          if [[ "${ARCHIVE_FORMAT}" == "zip" ]]; then
             archive_name="${package_name}.zip"
-            7z a "${archive_name}" "${package_name}" > /dev/null
+            7z a "${archive_name}" "${package_name}" >/dev/null
           else
             archive_name="${package_name}.tar.gz"
             tar -czf "${archive_name}" "${package_name}"
           fi
-          popd
+          popd >/dev/null
 
           echo "artifact_name=${package_name}" >> "${GITHUB_OUTPUT}"
           echo "artifact_path=dist/${archive_name}" >> "${GITHUB_OUTPUT}"
 
-      - name: Upload binary
+      - name: Upload binary archive
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.artifact_name }}
           path: ${{ steps.package.outputs.artifact_path }}
           if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - prepare
+      - source
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary archives
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Create and verify release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_SHA: ${{ needs.source.outputs.sha }}
+        run: |
+          tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha')"
+          if [[ "${tag_sha}" != "${SOURCE_SHA}" ]]; then
+            echo "Release tag moved from ${SOURCE_SHA} to ${tag_sha}." >&2
+            exit 1
+          fi
+
+          gh release create "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "${RELEASE_TAG}" \
+            --generate-notes \
+            --draft
+
+          gh release upload "${RELEASE_TAG}" dist/* --repo "${GITHUB_REPOSITORY}"
+          find dist -maxdepth 1 -type f -exec basename {} \; | sort > expected-assets.txt
+          gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets[].name' | sort > uploaded-assets.txt
+          diff -u expected-assets.txt uploaded-assets.txt
+
+          gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false
+
+  cleanup:
+    name: Clean up a failed release
+    if: ${{ always() && needs.source.outputs.sha != '' && needs.release.result != 'success' }}
+    needs:
+      - prepare
+      - source
+      - validate
+      - build
+      - release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Delete draft and release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_SHA: ${{ needs.source.outputs.sha }}
+        run: |
+          tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha' 2>/dev/null || true)"
+          if [[ -z "${tag_sha}" ]]; then
+            exit 0
+          fi
+          if [[ "${tag_sha}" != "${SOURCE_SHA}" ]]; then
+            echo "Tag ${RELEASE_TAG} no longer belongs to this run; leaving it untouched." >&2
+            exit 0
+          fi
+
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          release_state="$(gh api graphql \
+            -f owner="${GITHUB_REPOSITORY_OWNER}" \
+            -f name="${repository_name}" \
+            -f tag="${RELEASE_TAG}" \
+            -f query='query($owner: String!, $name: String!, $tag: String!) { repository(owner: $owner, name: $name) { release(tagName: $tag) { isDraft } } }' \
+            --jq '.data.repository.release | if . == null then "missing" elif .isDraft then "draft" else "public" end')"
+          if [[ "${release_state}" == "public" ]]; then
+            echo "Release ${RELEASE_TAG} is public; leaving it and its tag untouched." >&2
+            exit 0
+          fi
+          if [[ "${release_state}" == "draft" ]]; then
+            gh release delete "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --yes
+          elif [[ "${release_state}" != "missing" ]]; then
+            echo "Unexpected Release state; leaving ${RELEASE_TAG} untouched." >&2
+            exit 1
+          fi
+
+          tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha' 2>/dev/null || true)"
+          if [[ "${tag_sha}" == "${SOURCE_SHA}" ]]; then
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}"
+          fi
