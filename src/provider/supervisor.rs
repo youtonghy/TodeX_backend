@@ -6,7 +6,6 @@ use chrono::{DateTime, Utc};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout, Duration, Instant};
 use uuid::Uuid;
@@ -20,6 +19,7 @@ use crate::conversation::{
 use crate::error::AppError;
 use crate::mcp;
 use crate::workspace_paths::validate_workspace_directory_text;
+use crate::workspace_store::stable_workspace_id;
 
 use super::acp::AcpDriver;
 use super::claude::ClaudeDriver;
@@ -837,17 +837,6 @@ impl ConversationSupervisor {
         self.hub.publish(event);
         Ok(())
     }
-}
-
-fn stable_workspace_id(path: &Path) -> String {
-    let mut digest = Sha256::new();
-    digest.update(path.to_string_lossy().as_bytes());
-    let bytes = digest.finalize();
-    let encoded = bytes[..12]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("ws_{encoded}")
 }
 
 pub(crate) fn compose_prompt_with_skills(user_text: &str, skills: &[(String, String)]) -> String {

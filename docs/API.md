@@ -176,13 +176,14 @@ GET /v2/version
 
 ## Workspace 缓存同步
 
-移动端工作区清单由后端持久化到 `$TODEX_AGENTD_DATA_DIR/workspaces.json`。App 本地 AsyncStorage 只作为离线缓存；连接成功后会拉取后端快照并把本地较新的缓存合并回后端。
+工作区清单由后端持久化到 `$TODEX_AGENTD_DATA_DIR/workspaces.json`。手机和桌面端的本地存储只作为离线缓存；连接成功后会拉取当前身份的后端快照。工作区 ID 由后端根据规范化路径稳定生成，并与对话 manifest 的 `workspaceId` 共用，从而让不同设备恢复同一工作区内的对话。
 
 后端会把 `workspace_root` 作为移动端可用工作区的权限边界。`PUT /v2/workspaces`、`/v2/workspace/entries`、本地 Codex 启动和本地终端启动都会拒绝 `workspace_root` 之外的目录；目录必须存在且是目录。
 
 ```http
 GET /v2/workspaces
 PUT /v2/workspaces
+DELETE /v2/workspaces/{workspaceId}
 ```
 
 `GET` 响应：
@@ -191,7 +192,7 @@ PUT /v2/workspaces
 {
   "workspaces": [
     {
-      "id": "workspace-1",
+      "id": "ws_1f45e78a20d5a33556417b12",
       "name": "demo",
       "path": "/home/user/projects/demo",
       "sessionId": "cdxs_demo",
@@ -211,7 +212,7 @@ PUT /v2/workspaces
 }
 ```
 
-`PUT` 请求体使用同样的 `workspaces` 数组，后端会校验 `id`、`name`、`path`、路径存在性和根目录边界，并整体替换快照。后端保存时会把路径规范化为 canonical path。
+`PUT` 请求体使用同样的 `workspaces` 数组。后端会校验 `name`、`path`、路径存在性和根目录边界，按当前认证身份和规范化路径合并记录，并返回后端生成的稳定 ID。它不会接受客户端伪造的租户，也不会持久化设备本地的 `threadId` 和 `localAdapterState`。删除使用显式 `DELETE`，不会删除该工作区已有的对话历史。
 
 ### Workspace 目录浏览
 

@@ -9,7 +9,7 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, Uri};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v2/version", get(version))
         .route("/v2/workspaces", get(workspaces).put(replace_workspaces))
+        .route("/v2/workspaces/{workspace_id}", delete(delete_workspace))
         .route("/v2/workspace/entries", get(workspace_entries))
         .route("/v2/workspace/directories", get(workspace_directories))
         .route("/v2/workspace/file", get(workspace_file))
@@ -125,8 +126,8 @@ pub(super) async fn workspaces(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<WorkspacesResponse>, AppError> {
-    require_auth(&state, &headers)?;
-    let snapshot = state.workspaces.snapshot().await;
+    let auth = require_auth(&state, &headers)?;
+    let snapshot = state.workspaces.snapshot_owned(&auth.tenant_id).await;
     Ok(Json(WorkspacesResponse {
         workspaces: snapshot.workspaces,
         updated_at: snapshot.updated_at,
@@ -138,12 +139,28 @@ pub(super) async fn replace_workspaces(
     headers: HeaderMap,
     Json(request): Json<ReplaceWorkspacesRequest>,
 ) -> Result<Json<WorkspacesResponse>, AppError> {
-    require_auth(&state, &headers)?;
-    let snapshot = state.workspaces.replace(request.workspaces).await?;
+    let auth = require_auth(&state, &headers)?;
+    let snapshot = state
+        .workspaces
+        .merge_owned(&auth.tenant_id, request.workspaces)
+        .await?;
     Ok(Json(WorkspacesResponse {
         workspaces: snapshot.workspaces,
         updated_at: snapshot.updated_at,
     }))
+}
+
+pub(super) async fn delete_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let deleted = state
+        .workspaces
+        .delete_owned(&auth.tenant_id, &workspace_id)
+        .await?;
+    Ok(Json(json!({ "workspaceId": workspace_id, "deleted": deleted })))
 }
 
 pub(super) async fn workspace_entries(
