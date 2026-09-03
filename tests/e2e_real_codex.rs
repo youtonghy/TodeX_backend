@@ -320,7 +320,7 @@ async fn real_v2_provider_http_ws_roundtrip() {
             &format!("/v2/conversations/{conversation_id}/prompt"),
             Some(TOKEN),
             Some(json!({
-                "text": format!("Reply with exactly {sentinel} and nothing else. Do not use tools or modify files."),
+                "text": format!("First use one read-only tool to determine the current working directory. After the tool result, reply with exactly {sentinel} and nothing else. Do not modify files."),
                 "model": selected_model,
             })),
         )
@@ -1229,6 +1229,7 @@ async fn wait_for_successful_conversation_turn(
     provider: &str,
 ) {
     let mut saw_assistant = false;
+    let mut saw_tool = false;
     let mut seen_types = Vec::new();
     timeout(Duration::from_secs(180), async {
         while let Some(message) = ws.next().await {
@@ -1250,16 +1251,39 @@ async fn wait_for_successful_conversation_turn(
                 seen_types.remove(0);
             }
             let payload = &event["payload"]["payload"];
-            let matching_turn = payload["turnId"].as_str() == Some(turn_id);
+            let matching_turn = payload["turnId"].as_str() == Some(turn_id)
+                || payload.pointer("/block/turnId").and_then(Value::as_str) == Some(turn_id);
             if matching_turn && matches!(event_type, "turn.failed" | "turn.cancelled") {
                 panic!(
                     "provider {provider} ended turn {turn_id} with {event_type}; recent event types: {seen_types:?}"
                 );
             }
+            if matches!(event_type, "tool.started" | "tool.updated" | "tool.completed") {
+                assert_eq!(
+                    payload.pointer("/block/category").and_then(Value::as_str),
+                    Some("tool"),
+                    "provider {provider} emitted an unclassified tool event: {payload}"
+                );
+                assert_eq!(
+                    payload.pointer("/block/turnId").and_then(Value::as_str),
+                    Some(turn_id),
+                    "provider {provider} emitted a tool event for the wrong turn: {payload}"
+                );
+                saw_tool = true;
+            }
             if event_type == "message.completed" && payload.to_string().contains(sentinel) {
+                assert_eq!(
+                    payload.pointer("/block/category").and_then(Value::as_str),
+                    Some("assistant_final"),
+                    "provider {provider} emitted the final answer without final semantics: {payload}"
+                );
                 saw_assistant = true;
             }
             if matching_turn && event_type == "turn.completed" {
+                assert!(
+                    saw_tool,
+                    "provider {provider} completed turn {turn_id} without the requested tool call; recent event types: {seen_types:?}"
+                );
                 assert!(
                     saw_assistant,
                     "provider {provider} completed turn {turn_id} without the sentinel assistant message; recent event types: {seen_types:?}"

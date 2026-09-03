@@ -348,7 +348,7 @@ async fn run_codex_turn(
                 cancelled: stop_reason == "interrupted",
             });
         }
-        handle_codex_message(process, message, sink, cancel).await?;
+        handle_codex_message(process, message, sink, cancel, &prompt.turn_id).await?;
     }
 }
 
@@ -420,7 +420,7 @@ async fn wait_for_response(
                 ))
             });
         }
-        handle_codex_message(process, message, sink, cancel).await?;
+        handle_codex_message(process, message, sink, cancel, request_id).await?;
     }
 }
 
@@ -429,6 +429,7 @@ async fn handle_codex_message(
     message: Value,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
+    turn_id: &str,
 ) -> Result<(), AppError> {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return Ok(());
@@ -463,7 +464,7 @@ async fn handle_codex_message(
     }
 
     if matches!(method, "item/started" | "item/completed") {
-        if let Some((event_type, payload)) = codex_item_event(method, &params) {
+        if let Some((event_type, payload)) = codex_item_event(method, &params, turn_id) {
             sink.emit(event_type, payload).await?;
         }
         return Ok(());
@@ -493,6 +494,7 @@ async fn handle_codex_message(
                 "role": "assistant",
                 "delta": params.get("delta").cloned().unwrap_or(Value::Null),
                 "provider": "codex",
+                "block": codex_block(&params, "assistant_progress", "delta", turn_id),
             }),
         ),
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => (
@@ -500,6 +502,7 @@ async fn handle_codex_message(
             json!({
                 "delta": params.get("delta").cloned().unwrap_or(Value::Null),
                 "provider": "codex",
+                "block": codex_block(&params, "reasoning", "delta", turn_id),
             }),
         ),
         "turn/plan/updated" => (
@@ -551,28 +554,77 @@ fn codex_usage_breakdown(value: &Value) -> Option<Value> {
     }))
 }
 
-fn codex_item_event(method: &str, params: &Value) -> Option<(&'static str, Value)> {
+fn codex_item_event(method: &str, params: &Value, turn_id: &str) -> Option<(&'static str, Value)> {
     let item = params.get("item")?;
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
     if matches!(item_type, "agentMessage" | "agent_message") {
         return (method == "item/completed").then(|| {
             (
                 "message.completed",
-                json!({ "provider": "codex", "role": "assistant", "message": item }),
+                json!({
+                    "provider": "codex",
+                    "role": "assistant",
+                    "message": item,
+                    "block": codex_block(params, "assistant_final", "completed", turn_id),
+                }),
             )
         });
     }
     if matches!(item_type, "reasoning" | "reasoningItem" | "reasoning_item") {
         return None;
     }
+    if !is_codex_tool_item(item_type) {
+        return None;
+    }
+    let (event_type, phase) = if method == "item/completed" {
+        ("tool.completed", "completed")
+    } else {
+        ("tool.started", "started")
+    };
     Some((
-        if method == "item/completed" {
-            "tool.completed"
-        } else {
-            "tool.started"
-        },
-        json!({ "provider": "codex", "item": item }),
+        event_type,
+        json!({
+            "provider": "codex",
+            "item": item,
+            "block": codex_block(params, "tool", phase, turn_id),
+        }),
     ))
+}
+
+fn is_codex_tool_item(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "commandExecution"
+            | "command_execution"
+            | "fileChange"
+            | "file_change"
+            | "mcpToolCall"
+            | "mcp_tool_call"
+            | "dynamicToolCall"
+            | "dynamic_tool_call"
+            | "webSearch"
+            | "web_search"
+            | "imageView"
+            | "image_view"
+            | "collabAgentToolCall"
+            | "collab_agent_tool_call"
+    )
+}
+
+fn codex_block(params: &Value, category: &str, phase: &str, fallback_turn_id: &str) -> Value {
+    let item = params.get("item").unwrap_or(&Value::Null);
+    let id = item
+        .get("id")
+        .or_else(|| params.get("itemId"))
+        .or_else(|| params.get("item_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("current");
+    json!({
+        "category": category,
+        "id": id,
+        "turnId": fallback_turn_id,
+        "phase": phase,
+    })
 }
 
 fn is_codex_permission_method(method: &str) -> bool {
@@ -686,7 +738,8 @@ async fn interrupt_codex_turn(
                 }
                 terminal = Some(status.to_owned());
             } else {
-                handle_codex_message(process, message, sink, &mut no_cancel).await?;
+                handle_codex_message(process, message, sink, &mut no_cancel, request_turn_id)
+                    .await?;
             }
             if acknowledged {
                 if let Some(terminal) = terminal.take() {
@@ -780,8 +833,8 @@ mod tests {
     #[test]
     fn agent_message_completion_is_not_emitted_as_a_tool() {
         let params = json!({ "item": { "type": "agentMessage", "text": "done" } });
-        assert!(codex_item_event("item/started", &params).is_none());
-        let (event_type, payload) = codex_item_event("item/completed", &params).unwrap();
+        assert!(codex_item_event("item/started", &params, "turn-1").is_none());
+        let (event_type, payload) = codex_item_event("item/completed", &params, "turn-1").unwrap();
         assert_eq!(event_type, "message.completed");
         assert_eq!(payload["message"]["text"], "done");
     }
@@ -829,13 +882,38 @@ mod tests {
     fn command_item_keeps_tool_lifecycle() {
         let params = json!({ "item": { "type": "commandExecution", "command": "pwd" } });
         assert_eq!(
-            codex_item_event("item/started", &params).unwrap().0,
+            codex_item_event("item/started", &params, "turn-1")
+                .unwrap()
+                .0,
             "tool.started"
         );
         assert_eq!(
-            codex_item_event("item/completed", &params).unwrap().0,
+            codex_item_event("item/completed", &params, "turn-1")
+                .unwrap()
+                .0,
             "tool.completed"
         );
+    }
+
+    #[test]
+    fn user_message_item_is_not_emitted_as_a_tool() {
+        let params = json!({ "item": { "type": "userMessage", "content": [] } });
+        assert!(codex_item_event("item/started", &params, "turn-1").is_none());
+        assert!(codex_item_event("item/completed", &params, "turn-1").is_none());
+    }
+
+    #[test]
+    fn block_metadata_keeps_provider_item_identity() {
+        let block = codex_block(
+            &json!({ "turnId": "turn-1", "item": { "id": "item-2" } }),
+            "tool",
+            "completed",
+            "fallback-turn",
+        );
+        assert_eq!(block["category"], "tool");
+        assert_eq!(block["id"], "item-2");
+        assert_eq!(block["turnId"], "fallback-turn");
+        assert_eq!(block["phase"], "completed");
     }
 
     #[test]

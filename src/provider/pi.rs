@@ -365,17 +365,34 @@ async fn run_pi_turn(
                 });
             }
             Some("message_end") => {
-                if let Some(reason) = message
+                let reason = message
                     .pointer("/message/stopReason")
                     .and_then(Value::as_str)
-                {
+                    .unwrap_or_default();
+                if !reason.is_empty() {
                     stop_reason = reason.to_owned();
                 }
-                sink.emit(
-                    "message.completed",
-                    json!({ "provider": "pi", "message": message.get("message") }),
-                )
-                .await?;
+                // Pi ends an assistant message before each tool execution. That
+                // message has stopReason=toolUse and is not the turn's final answer.
+                if is_pi_final_message(&message) {
+                    let message_id = pi_message_id(&message)
+                        .unwrap_or_else(|| format!("{}-final", prompt.turn_id));
+                    sink.emit(
+                        "message.completed",
+                        json!({
+                            "provider": "pi",
+                            "role": "assistant",
+                            "message": message.get("message"),
+                            "block": {
+                                "category": "assistant_final",
+                                "id": message_id,
+                                "turnId": prompt.turn_id,
+                                "phase": "completed",
+                            },
+                        }),
+                    )
+                    .await?;
+                }
             }
             Some("message_update") => {
                 let delta = message
@@ -383,28 +400,60 @@ async fn run_pi_turn(
                     .cloned()
                     .unwrap_or(Value::Null);
                 let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
-                let event_type = if delta_type.starts_with("thinking_") {
-                    "thought.delta"
+                let (event_type, category) = if delta_type.starts_with("thinking_") {
+                    ("thought.delta", "reasoning")
                 } else if delta_type.starts_with("toolcall_") {
-                    "tool.updated"
+                    ("tool.updated", "tool")
                 } else {
-                    "message.delta"
+                    ("message.delta", "assistant_progress")
                 };
+                let phase = if delta_type.ends_with("_start") {
+                    "started"
+                } else if delta_type.ends_with("_end") {
+                    "completed"
+                } else {
+                    "delta"
+                };
+                let content_index = delta.get("contentIndex").and_then(Value::as_u64);
+                let block_id = pi_delta_block_id(&delta, &prompt.turn_id, category);
                 sink.emit(
                     event_type,
-                    json!({ "provider": "pi", "role": "assistant", "delta": delta, "usage": message.get("usage") }),
+                    json!({
+                        "provider": "pi",
+                        "role": "assistant",
+                        "delta": delta,
+                        "usage": message.get("usage"),
+                        "block": {
+                            "category": category,
+                            "id": block_id,
+                            "turnId": prompt.turn_id,
+                            "phase": phase,
+                            "contentIndex": content_index,
+                        },
+                    }),
                 )
                 .await?;
             }
             Some("tool_execution_start") => {
-                sink.emit("tool.started", pi_tool_payload(&message)).await?;
+                sink.emit(
+                    "tool.started",
+                    pi_tool_payload(&message, &prompt.turn_id, "started"),
+                )
+                .await?;
             }
             Some("tool_execution_update") => {
-                sink.emit("tool.updated", pi_tool_payload(&message)).await?;
+                sink.emit(
+                    "tool.updated",
+                    pi_tool_payload(&message, &prompt.turn_id, "delta"),
+                )
+                .await?;
             }
             Some("tool_execution_end") => {
-                sink.emit("tool.completed", pi_tool_payload(&message))
-                    .await?;
+                sink.emit(
+                    "tool.completed",
+                    pi_tool_payload(&message, &prompt.turn_id, "completed"),
+                )
+                .await?;
             }
             Some("extension_ui_request") => {
                 handle_extension_ui(process, message, sink, cancel).await?;
@@ -538,7 +587,20 @@ async fn wait_for_pi_abort(
     .map_err(|_| AppError::ProviderUnavailable("Pi abort timed out".to_owned()))?
 }
 
-fn pi_tool_payload(message: &Value) -> Value {
+fn pi_tool_payload(message: &Value, turn_id: &str, phase: &str) -> Value {
+    let tool_call_id = message
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "{turn_id}-tool-{}",
+                message
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            )
+        });
     json!({
         "provider": "pi",
         "toolCallId": message.get("toolCallId"),
@@ -547,7 +609,56 @@ fn pi_tool_payload(message: &Value) -> Value {
         "partialResult": message.get("partialResult"),
         "result": message.get("result"),
         "isError": message.get("isError"),
+        "block": {
+            "category": "tool",
+            "id": tool_call_id,
+            "turnId": turn_id,
+            "phase": phase,
+        },
     })
+}
+
+fn is_pi_final_message(message: &Value) -> bool {
+    message.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
+        && message
+            .pointer("/message/stopReason")
+            .and_then(Value::as_str)
+            != Some("toolUse")
+}
+
+fn pi_delta_block_id(delta: &Value, turn_id: &str, category: &str) -> String {
+    delta
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| delta.pointer("/toolCall/id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            let index = delta
+                .get("contentIndex")
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "current".to_owned());
+            format!("{turn_id}-{category}-{index}")
+        })
+}
+
+fn pi_message_id(message: &Value) -> Option<String> {
+    message
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .and_then(|content| {
+            content.iter().find_map(|part| {
+                part.get("textSignature")
+                    .and_then(Value::as_str)
+                    .and_then(|signature| serde_json::from_str::<Value>(signature).ok())
+                    .and_then(|signature| {
+                        signature
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+            })
+        })
 }
 
 fn pi_response_error(response: &Value, command: &str) -> AppError {
@@ -589,6 +700,38 @@ mod tests {
         assert_eq!(
             parse_pi_models(&response, &state)[0].default_reasoning_effort,
             None
+        );
+    }
+
+    #[test]
+    fn only_terminal_assistant_messages_are_final_answers() {
+        assert!(!is_pi_final_message(&json!({
+            "type": "message_end",
+            "message": { "role": "assistant", "stopReason": "toolUse" }
+        })));
+        assert!(!is_pi_final_message(&json!({
+            "type": "message_end",
+            "message": { "role": "toolResult" }
+        })));
+        assert!(is_pi_final_message(&json!({
+            "type": "message_end",
+            "message": { "role": "assistant", "stopReason": "stop" }
+        })));
+    }
+
+    #[test]
+    fn delta_block_ids_separate_content_indexes_and_keep_tool_ids() {
+        assert_eq!(
+            pi_delta_block_id(&json!({ "contentIndex": 2 }), "turn-1", "reasoning"),
+            "turn-1-reasoning-2"
+        );
+        assert_eq!(
+            pi_delta_block_id(
+                &json!({ "id": "call-1", "contentIndex": 2 }),
+                "turn-1",
+                "tool"
+            ),
+            "call-1"
         );
     }
 }
