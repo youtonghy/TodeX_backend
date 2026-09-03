@@ -105,6 +105,7 @@ pub struct AcpProfileConfig {
 pub struct SecurityConfig {
     pub enable_auth: bool,
     pub enable_tls: bool,
+    pub auto_trust_workspaces: bool,
     pub auth_token: Option<String>,
 }
 
@@ -136,6 +137,7 @@ struct PartialAgentConfig {
 struct PartialSecurityConfig {
     enable_auth: Option<bool>,
     enable_tls: Option<bool>,
+    auto_trust_workspaces: Option<bool>,
     auth_token: Option<String>,
 }
 
@@ -280,6 +282,12 @@ impl Config {
                     security_file.enable_tls,
                     defaults.security.enable_tls,
                 ),
+                auto_trust_workspaces: coalesce(
+                    None,
+                    env_bool("TODEX_AGENTD_AUTO_TRUST_WORKSPACES"),
+                    security_file.auto_trust_workspaces,
+                    defaults.security.auto_trust_workspaces,
+                ),
                 auth_token,
             },
         })
@@ -367,6 +375,7 @@ impl Default for Config {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                auto_trust_workspaces: false,
                 auth_token: None,
             },
         }
@@ -462,6 +471,10 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
             .get_or_insert_with(PartialSecurityConfig::default);
         replace_some!(base_security.enable_auth, overlay_security.enable_auth);
         replace_some!(base_security.enable_tls, overlay_security.enable_tls);
+        replace_some!(
+            base_security.auto_trust_workspaces,
+            overlay_security.auto_trust_workspaces
+        );
         replace_some!(base_security.auth_token, overlay_security.auth_token);
     }
     base
@@ -663,7 +676,34 @@ mod tests {
         let config = Config::default();
 
         assert!(config.security.enable_auth);
+        assert!(!config.security.auto_trust_workspaces);
         assert!(config.security.auth_token.is_none());
+    }
+
+    #[test]
+    fn file_config_can_enable_automatic_workspace_trust() {
+        let root = env::temp_dir().join(format!(
+            "todex-config-auto-trust-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).expect("create temp config dir");
+        fs::write(
+            root.join("config.toml"),
+            "[security]\nauto_trust_workspaces = true\n",
+        )
+        .expect("write config");
+
+        let config = Config::load_read_only(ServeArgs {
+            host: None,
+            port: None,
+            data_dir: Some(root.clone()),
+            workspace_root: None,
+            history_retention_days: None,
+        })
+        .expect("load config");
+
+        assert!(config.security.auto_trust_workspaces);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

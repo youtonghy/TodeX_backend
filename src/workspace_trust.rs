@@ -28,6 +28,8 @@ struct WorkspaceTrustSnapshot {
 struct WorkspaceTrustEntry {
     owner_id: String,
     workspace_path: String,
+    #[serde(default = "default_trusted")]
+    trusted: bool,
     trusted_at: u64,
 }
 
@@ -71,15 +73,17 @@ impl WorkspaceTrustStore {
         let workspace = self.validate(workspace)?;
         let workspace_path = workspace.display().to_string();
         let snapshot = self.inner.read().await;
-        let trusted_at = snapshot
+        let decision = snapshot
             .entries
             .iter()
-            .find(|entry| entry.owner_id == owner_id && entry.workspace_path == workspace_path)
-            .map(|entry| entry.trusted_at);
+            .find(|entry| entry.owner_id == owner_id && entry.workspace_path == workspace_path);
+        let trusted = decision.is_some_and(|entry| entry.trusted);
         Ok(WorkspaceTrustStatus {
             workspace_path,
-            trusted: trusted_at.is_some(),
-            trusted_at,
+            trusted,
+            trusted_at: decision
+                .filter(|entry| entry.trusted)
+                .map(|entry| entry.trusted_at),
         })
     }
 
@@ -96,14 +100,13 @@ impl WorkspaceTrustStore {
         snapshot
             .entries
             .retain(|entry| entry.owner_id != owner_id || entry.workspace_path != workspace_path);
-        let trusted_at = trusted.then(now_millis);
-        if let Some(trusted_at) = trusted_at {
-            snapshot.entries.push(WorkspaceTrustEntry {
-                owner_id: owner_id.to_owned(),
-                workspace_path: workspace_path.clone(),
-                trusted_at,
-            });
-        }
+        let decided_at = now_millis();
+        snapshot.entries.push(WorkspaceTrustEntry {
+            owner_id: owner_id.to_owned(),
+            workspace_path: workspace_path.clone(),
+            trusted,
+            trusted_at: decided_at,
+        });
         snapshot.entries.sort_by(|left, right| {
             left.owner_id
                 .cmp(&right.owner_id)
@@ -115,8 +118,60 @@ impl WorkspaceTrustStore {
         Ok(WorkspaceTrustStatus {
             workspace_path,
             trusted,
-            trusted_at,
+            trusted_at: trusted.then_some(decided_at),
         })
+    }
+
+    pub async fn auto_trust_undecided_owned(
+        &self,
+        owner_id: &str,
+        workspaces: &[PathBuf],
+    ) -> Result<Vec<WorkspaceTrustStatus>, AppError> {
+        let workspace_paths = workspaces
+            .iter()
+            .map(|workspace| {
+                self.validate(workspace)
+                    .map(|path| path.display().to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut current = self.inner.write().await;
+        let mut snapshot = current.clone();
+        let decided_at = now_millis();
+        let mut trusted = Vec::new();
+
+        for workspace_path in workspace_paths {
+            let already_decided = snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.owner_id == owner_id && entry.workspace_path == workspace_path);
+            if already_decided {
+                continue;
+            }
+            snapshot.entries.push(WorkspaceTrustEntry {
+                owner_id: owner_id.to_owned(),
+                workspace_path: workspace_path.clone(),
+                trusted: true,
+                trusted_at: decided_at,
+            });
+            trusted.push(WorkspaceTrustStatus {
+                workspace_path,
+                trusted: true,
+                trusted_at: Some(decided_at),
+            });
+        }
+
+        if trusted.is_empty() {
+            return Ok(trusted);
+        }
+        snapshot.entries.sort_by(|left, right| {
+            left.owner_id
+                .cmp(&right.owner_id)
+                .then_with(|| left.workspace_path.cmp(&right.workspace_path))
+        });
+        snapshot.updated_at = decided_at;
+        write_snapshot(&self.path, &snapshot).await?;
+        *current = snapshot;
+        Ok(trusted)
     }
 
     pub async fn ensure_trusted(&self, owner_id: &str, workspace: &Path) -> Result<(), AppError> {
@@ -136,11 +191,9 @@ impl WorkspaceTrustStore {
         let workspace = self.validate(workspace)?;
         let workspace_path = workspace.display().to_string();
         let snapshot = self.inner.clone().read_owned().await;
-        if snapshot
-            .entries
-            .iter()
-            .any(|entry| entry.owner_id == owner_id && entry.workspace_path == workspace_path)
-        {
+        if snapshot.entries.iter().any(|entry| {
+            entry.owner_id == owner_id && entry.workspace_path == workspace_path && entry.trusted
+        }) {
             Ok(WorkspaceTrustPermit {
                 _snapshot: snapshot,
             })
@@ -233,6 +286,10 @@ fn now_millis() -> u64 {
         .unwrap_or_default()
 }
 
+fn default_trusted() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +345,103 @@ mod tests {
                 .trusted
         );
 
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_trust_only_applies_without_an_explicit_decision() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-workspace-auto-trust-{}",
+            Uuid::new_v4().simple()
+        ));
+        let workspace_root = root.join("workspaces");
+        let first = workspace_root.join("first");
+        let second = workspace_root.join("second");
+        tokio::fs::create_dir_all(&first).await.unwrap();
+        tokio::fs::create_dir_all(&second).await.unwrap();
+        let store = WorkspaceTrustStore::new(root.clone(), workspace_root.clone())
+            .await
+            .unwrap();
+
+        let granted = store
+            .auto_trust_undecided_owned("owner", &[first.clone(), second.clone()])
+            .await
+            .unwrap();
+        assert_eq!(granted.len(), 2);
+        assert!(store.acquire_owned("owner", &first).await.is_ok());
+        assert!(matches!(
+            store.acquire_owned("other-owner", &first).await,
+            Err(AppError::WorkspaceTrustRequired(_))
+        ));
+        store.set_owned("owner", &first, false).await.unwrap();
+
+        let granted = store
+            .auto_trust_undecided_owned("owner", &[first.clone(), second.clone()])
+            .await
+            .unwrap();
+        assert!(granted.is_empty());
+        assert!(!store.status_owned("owner", &first).await.unwrap().trusted);
+        assert!(store.status_owned("owner", &second).await.unwrap().trusted);
+        assert!(matches!(
+            store.acquire_owned("owner", &first).await,
+            Err(AppError::WorkspaceTrustRequired(_))
+        ));
+
+        let reloaded = WorkspaceTrustStore::new(root.clone(), workspace_root)
+            .await
+            .unwrap();
+        assert!(
+            !reloaded
+                .status_owned("owner", &first)
+                .await
+                .unwrap()
+                .trusted
+        );
+        assert!(
+            reloaded
+                .status_owned("owner", &second)
+                .await
+                .unwrap()
+                .trusted
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_trust_entries_default_to_trusted() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-workspace-legacy-trust-{}",
+            Uuid::new_v4().simple()
+        ));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        let workspace = tokio::fs::canonicalize(workspace).await.unwrap();
+        tokio::fs::write(
+            root.join(WORKSPACE_TRUST_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "entries": [{
+                    "ownerId": "owner",
+                    "workspacePath": workspace.display().to_string(),
+                    "trustedAt": 1
+                }],
+                "updatedAt": 1
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let store = WorkspaceTrustStore::new(root.clone(), workspace_root)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .status_owned("owner", &workspace)
+                .await
+                .unwrap()
+                .trusted
+        );
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

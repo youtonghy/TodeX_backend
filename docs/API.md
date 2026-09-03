@@ -46,6 +46,7 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 | 默认 agent 名称 | 无 | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` |
 | 是否开启认证 | 无 | `TODEX_AGENTD_ENABLE_AUTH` | `true` |
 | Bearer token | 无 | `TODEX_AGENTD_AUTH_TOKEN` | 无 |
+| 自动信任工作区 | 无 | `TODEX_AGENTD_AUTO_TRUST_WORKSPACES` | `false` |
 | 历史保留天数 | `--history-retention-days` | `TODEX_AGENTD_HISTORY_RETENTION_DAYS` | 关闭 |
 
 当前 HTTP 层没有实现 TLS 终止，配置 `enable_tls = true` 时服务会拒绝启动，避免产生“已经启用 TLS”的错误安全假设。生产环境应在可信反向代理终止 TLS，且不应直接暴露明文端口。v2 HTTP 和 WebSocket 都使用 `Authorization: Bearer <TODEX_AGENTD_AUTH_TOKEN>`；conversation 持久化 owner tenant，所有读取、订阅与变更入口都会校验 tenant。
@@ -230,7 +231,11 @@ DELETE /v2/workspaces/{workspaceId}
 
 `PUT` 请求体使用同样的 `workspaces` 数组。后端会校验 `name`、`path`、路径存在性和根目录边界，按当前认证身份和规范化路径合并记录，并返回后端生成的稳定 ID。它不会接受客户端伪造的租户，也不会持久化设备本地的 `threadId` 和 `localAdapterState`。
 
-新工作区默认不信任。`GET /v2/workspaces/{workspaceId}/trust` 返回当前状态；`PUT` 请求体为 `{ "trusted": true }` 或 `{ "trusted": false }`。信任记录同时绑定认证 owner 和规范化路径，独立保存在 `$DATA_DIR/workspace-trust.json`。Provider 模型/命令发现、prompt、MCP 调用、Git 写操作、本地终端和本地 Codex 启动前都必须通过信任检查；只读目录、文件预览与 Git 扫描仍受 `workspace_root` 边界约束。Provider 启动许可持有信任读锁直至子进程完成 spawn；撤销先取得写锁，再取消该 owner 在工作区内已登记的活动 turn，因此不会漏过处于检查与启动之间的任务。删除工作区会先撤销信任并取消活动 turn，但不会删除已有对话历史。
+新工作区默认不信任。设置 `[security] auto_trust_workspaces = true` 或 `TODEX_AGENTD_AUTO_TRUST_WORKSPACES=true` 后，`PUT /v2/workspaces` 会自动信任当前 owner 下、已经通过 `workspace_root` 边界校验且尚未做过信任决定的工作区。显式撤销会保留为拒绝决定，后续同步不会重新自动信任；未注册路径也不会因调用模型或执行接口而获得信任。
+
+旧版信任文件没有保存撤销记录。首次升级并启用自动信任时，旧版曾撤销的工作区与从未决定的工作区无法区分，都会在同步时获得信任；需要继续阻止的工作区应在升级后再次显式撤销。
+
+`GET /v2/workspaces/{workspaceId}/trust` 返回当前状态；`PUT` 请求体为 `{ "trusted": true }` 或 `{ "trusted": false }`。信任记录同时绑定认证 owner 和规范化路径，独立保存在 `$DATA_DIR/workspace-trust.json`。Provider 模型/命令发现、prompt、MCP 调用、Git 写操作、本地终端和本地 Codex 启动前都必须通过信任检查；只读目录、文件预览与 Git 扫描仍受 `workspace_root` 边界约束。Provider 启动许可持有信任读锁直至子进程完成 spawn；撤销先取得写锁，再取消该 owner 在工作区内已登记的活动 turn，因此不会漏过处于检查与启动之间的任务。删除工作区会先撤销信任并取消活动 turn，但不会删除已有对话历史。
 
 ### Workspace 目录浏览
 

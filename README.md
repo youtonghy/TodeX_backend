@@ -165,6 +165,7 @@ Configuration values are resolved using the following precedence:
 | **Pi Binary** | — | `TODEX_AGENTD_PI_BIN` | `pi` | Path or executable name for Pi CLI. |
 | **Enable Auth** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | Enables fail-closed Bearer authentication. |
 | **Auth Token** | — | `TODEX_AGENTD_AUTH_TOKEN` | *None* | Bearer token secret. |
+| **Auto-trust Workspaces** | — | `TODEX_AGENTD_AUTO_TRUST_WORKSPACES` | `false` | Automatically trusts first-time synced workspaces without a prior trust decision. |
 | **Pairing Encryption** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | Pairing encryption algorithm (`none`, `x25519`, `ml-kem-768`). |
 
 ### Example `config.toml`
@@ -191,6 +192,7 @@ args = ["--stdio"]
 [security]
 enable_auth = true
 enable_tls = false
+auto_trust_workspaces = false
 auth_token = "your-secure-secret-token"
 ```
 
@@ -206,7 +208,7 @@ auth_token = "your-secure-secret-token"
 - `GET /health`: Health status probe.
 - `GET /v2/version`: Returns daemon version, workspace root, and capabilities.
 - `GET /v2/workspaces`: List cached workspaces for current tenant.
-- `PUT /v2/workspaces`: Merge workspace caches for the current tenant and return canonical workspace IDs.
+- `PUT /v2/workspaces`: Merge workspace caches for the current tenant and return canonical workspace IDs; when auto-trust is enabled, also trust workspaces without a prior trust decision.
 - `GET|PUT /v2/workspaces/{workspaceId}/trust`: Read or explicitly change owner-scoped execution trust. New workspaces are untrusted by default.
 - `DELETE /v2/workspaces/{workspaceId}`: Revoke trust, cancel active turns, and remove one workspace from the current tenant's catalog without deleting its conversations.
 - `GET /v2/workspace/entries?workspace=...&query=...`: Workspace file and folder suggestions for `@` picker.

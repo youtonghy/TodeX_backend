@@ -165,6 +165,7 @@ cargo run -- daemon stop
 | **Pi 可执行文件**    | — | `TODEX_AGENTD_PI_BIN` | `pi` | Pi CLI 路径或命令名称。 |
 | **启用认证** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | 是否启用 Fail-closed Bearer 认证。 |
 | **认证 Token** | — | `TODEX_AGENTD_AUTH_TOKEN` | *无* | Bearer Token 密钥。 |
+| **自动信任工作区** | — | `TODEX_AGENTD_AUTO_TRUST_WORKSPACES` | `false` | 自动信任首次同步且尚未做过信任决定的工作区。 |
 | **配对加密方式** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | 配对加密算法（`none`、`x25519`、`ml-kem-768`）。 |
 
 ### `config.toml` 配置示例
@@ -191,6 +192,7 @@ args = ["--stdio"]
 [security]
 enable_auth = true
 enable_tls = false
+auto_trust_workspaces = false
 auth_token = "your-secure-secret-token"
 ```
 
@@ -206,7 +208,7 @@ auth_token = "your-secure-secret-token"
 - `GET /health`：服务健康检查。
 - `GET /v2/version`：获取服务端版本号、工作区根目录与支持能力。
 - `GET /v2/workspaces`：获取当前租户已缓存的工作区列表。
-- `PUT /v2/workspaces`：合并当前租户的工作区缓存，并返回统一的工作区 ID。
+- `PUT /v2/workspaces`：合并当前租户的工作区缓存，并返回统一的工作区 ID；启用自动信任后，也会信任尚未做过信任决定的工作区。
 - `GET|PUT /v2/workspaces/{workspaceId}/trust`：读取或显式修改按租户隔离的执行信任；新工作区默认不信任。
 - `DELETE /v2/workspaces/{workspaceId}`：撤销信任、取消活动 turn，并从当前租户的目录中移除工作区，但保留其对话历史。
 - `GET /v2/workspace/entries?workspace=...&query=...`：为 `@` 提及提供工作区文件与目录补全。

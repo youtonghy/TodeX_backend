@@ -176,6 +176,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                auto_trust_workspaces: false,
                 auth_token: None,
             },
         };
@@ -225,6 +226,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                auto_trust_workspaces: false,
                 auth_token: Some("token".to_owned()),
             },
         };
@@ -267,6 +269,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: true,
+                auto_trust_workspaces: false,
                 auth_token: Some("token".to_owned()),
             },
         };

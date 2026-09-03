@@ -100,6 +100,7 @@ args = []
 [security]
 enable_auth = true
 enable_tls = false
+auto_trust_workspaces = false
 auth_token = "replace-me"
 
 [tui]
@@ -107,6 +108,10 @@ language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
 ```
 
 `enable_tls = true` 会直接拒绝启动，因为当前 binary 没有证书/私钥配置入口。需要 TLS 时应由可信反向代理终止 TLS；不要把明文监听端口直接暴露到公网。
+
+`auto_trust_workspaces = true` 会在认证客户端同步工作区时，自动信任位于 `workspace_root` 内且尚未做过信任决定的目录。该选项默认关闭；显式撤销的工作区不会因后续同步而重新获得信任。也可以使用 `TODEX_AGENTD_AUTO_TRUST_WORKSPACES=true` 启用。
+
+旧版本只保存可信记录，撤销后不会留下拒绝记录。因此首次升级并启用自动信任时，旧版本中曾被撤销的工作区会被视为“尚未决定”；如需继续阻止执行，应在升级后再次显式撤销。
 
 TUI 默认不捕获鼠标，终端中的文本可以直接拖选复制。按 `c` 打开“凭据与复制”，可完整查看并复制 Auth Token 与当前加密方式的公钥；私钥不会显示或复制。日志使用 `PageUp`、`PageDown`、`Home`、`End` 滚动。daemon 启动会先检查端口占用，并等待最多 30 秒完成核心初始化和监听；旧 Codex 会话随后在后台迁移，不阻塞 daemon 就绪。
 

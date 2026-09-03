@@ -164,6 +164,38 @@ pub(super) async fn replace_workspaces(
         .workspaces
         .merge_owned(&auth.tenant_id, request.workspaces)
         .await?;
+    if state.config.security.auto_trust_workspaces {
+        let workspace_paths = snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| PathBuf::from(&workspace.path))
+            .collect::<Vec<_>>();
+        let trusted = state
+            .workspace_trust
+            .auto_trust_undecided_owned(&auth.tenant_id, &workspace_paths)
+            .await?;
+        if !trusted.is_empty() {
+            let audit = crate::event::EventRecord::new(
+                "workspace.trust.auto_granted",
+                None,
+                None,
+                None,
+                json!({
+                    "principal_id": auth.principal_id,
+                    "tenant_id": auth.tenant_id,
+                    "token_id": auth.token_id,
+                    "workspace_paths": trusted
+                        .iter()
+                        .map(|status| status.workspace_path.as_str())
+                        .collect::<Vec<_>>(),
+                }),
+            );
+            if let Err(error) = websocket::append_audit_event(&state, &audit).await {
+                warn!(error = %error, "failed to persist automatic workspace trust audit event");
+            }
+            state.events.publish(audit).await;
+        }
+    }
     Ok(Json(WorkspacesResponse {
         workspaces: snapshot.workspaces,
         updated_at: snapshot.updated_at,
@@ -2121,6 +2153,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                auto_trust_workspaces: false,
                 auth_token: Some("v2-token".to_owned()),
             },
         })
@@ -2211,6 +2244,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                auto_trust_workspaces: false,
                 auth_token: Some("v2-token".to_owned()),
             },
         })
@@ -2446,6 +2480,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                auto_trust_workspaces: true,
                 auth_token: Some("v2-token".to_owned()),
             },
         })
@@ -2483,6 +2518,25 @@ mod tests {
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
         let auth = "Bearer v2-token";
+        let workspace_payload = json!({
+            "workspaces": [{
+                "id": "client-generated",
+                "name": "project",
+                "path": workspace.display().to_string(),
+                "sessionId": "session-project",
+                "tenantId": "local",
+                "threadId": "",
+                "model": "gpt-5",
+                "reasoningEffort": null,
+                "approvalPolicy": "on-request",
+                "sandboxMode": "workspace-write",
+                "serviceTier": null,
+                "localAdapterState": "idle",
+                "createdAt": 1,
+                "updatedAt": 1
+            }]
+        })
+        .to_string();
         let replaced = app
             .clone()
             .oneshot(
@@ -2491,27 +2545,7 @@ mod tests {
                     .uri("/v2/workspaces")
                     .header("authorization", auth)
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "workspaces": [{
-                                "id": "client-generated",
-                                "name": "project",
-                                "path": workspace.display().to_string(),
-                                "sessionId": "session-project",
-                                "tenantId": "local",
-                                "threadId": "",
-                                "model": "gpt-5",
-                                "reasoningEffort": null,
-                                "approvalPolicy": "on-request",
-                                "sandboxMode": "workspace-write",
-                                "serviceTier": null,
-                                "localAdapterState": "idle",
-                                "createdAt": 1,
-                                "updatedAt": 1
-                            }]
-                        })
-                        .to_string(),
-                    ))
+                    .body(Body::from(workspace_payload.clone()))
                     .unwrap(),
             )
             .await
@@ -2535,7 +2569,56 @@ mod tests {
         assert_eq!(trust.status(), StatusCode::OK);
         let trust_body = to_bytes(trust.into_body(), 1024 * 1024).await.unwrap();
         assert!(
-            !serde_json::from_slice::<Value>(&trust_body).unwrap()["trusted"]
+            serde_json::from_slice::<Value>(&trust_body).unwrap()["trusted"]
+                .as_bool()
+                .unwrap()
+        );
+
+        let revoked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v2/workspaces/{workspace_id}/trust"))
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "trusted": false }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::OK);
+
+        let resynced = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v2/workspaces")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(workspace_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resynced.status(), StatusCode::OK);
+        let trust_after_resync = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v2/workspaces/{workspace_id}/trust"))
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let trust_after_resync_body = to_bytes(trust_after_resync.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            !serde_json::from_slice::<Value>(&trust_after_resync_body).unwrap()["trusted"]
                 .as_bool()
                 .unwrap()
         );
@@ -2774,6 +2857,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                auto_trust_workspaces: false,
                 auth_token: Some("git-token".to_owned()),
             },
         })
@@ -3071,6 +3155,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: false,
                 enable_tls: false,
+                auto_trust_workspaces: false,
                 auth_token: None,
             },
         })
@@ -3143,6 +3228,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
+                auto_trust_workspaces: false,
                 auth_token: Some("v2-ws-token".to_owned()),
             },
         })
@@ -3275,6 +3361,7 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: false,
                 enable_tls: false,
+                auto_trust_workspaces: false,
                 auth_token: None,
             },
         };
