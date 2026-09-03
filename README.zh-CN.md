@@ -25,7 +25,7 @@
   - **Codex**：原生 JSON-RPC app-server 驱动（支持 `start`、`turn`、`status`、`stop`、`attach`、`replay`、`interrupt` 等控制）。
   - **ACP (Agent Client Protocol 2.0)**：支持 `config.toml` 中预配置的受控 profile，防止任意命令注入。
   - **Pi**：原生 RPC 驱动，支持命令目录发现（`get_commands`）、动态模型查询与交互式工具审批。
-  - **Claude Code**：基于 `stream-json` 协议直接对接 Claude CLI。
+  - **Claude Code**：基于 `stream-json` 协议直接对接 Claude CLI；未配置自定义 Anthropic 网关时使用 CLI 内置模型别名。
 - **会话目录持久化体系**：
   - 会话数据独立保存于 `$DATA_DIR/conversations/<uuid>/` 目录下：
     - `manifest.json`：存储元数据、选定 Provider Profile、工作区路径及时间戳。

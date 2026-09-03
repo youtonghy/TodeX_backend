@@ -18,6 +18,24 @@ pub struct ClaudeDriver {
     binary: String,
 }
 
+fn claude_model_aliases() -> Vec<super::types::ProviderModelDescriptor> {
+    ["default", "sonnet", "opus", "haiku"]
+        .into_iter()
+        .map(|id| super::types::ProviderModelDescriptor {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            description: "Claude Code model alias".to_owned(),
+            is_default: id == "default",
+            supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            default_reasoning_effort: None,
+            context_window: None,
+        })
+        .collect()
+}
+
 impl ClaudeDriver {
     pub fn new(config: &AgentConfig) -> Self {
         Self {
@@ -47,21 +65,7 @@ impl ProviderDriver for ClaudeDriver {
                 managed_mcp: true,
                 model_selection: true,
             },
-            models: ["default", "sonnet", "opus", "haiku"]
-                .into_iter()
-                .map(|id| super::types::ProviderModelDescriptor {
-                    id: id.to_owned(),
-                    display_name: id.to_owned(),
-                    description: "Claude Code model alias".to_owned(),
-                    is_default: id == "default",
-                    supported_reasoning_efforts: ["low", "medium", "high"]
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect(),
-                    default_reasoning_effort: None,
-                    context_window: None,
-                })
-                .collect(),
+            models: claude_model_aliases(),
         }
     }
 
@@ -73,7 +77,7 @@ impl ProviderDriver for ClaudeDriver {
             .ok()
             .filter(|value| !value.trim().is_empty())
         else {
-            return Ok(Vec::new());
+            return Ok(claude_model_aliases());
         };
         let url = format!("{}/v1/models", base.trim_end_matches('/'));
         let response = reqwest::Client::new()
@@ -86,7 +90,7 @@ impl ProviderDriver for ClaudeDriver {
         let payload: Value = response.json().await.map_err(|error| {
             AppError::ProviderUnavailable(format!("Claude model catalog invalid: {error}"))
         })?;
-        Ok(payload
+        let models = payload
             .get("data")
             .and_then(Value::as_array)
             .into_iter()
@@ -103,11 +107,10 @@ impl ProviderDriver for ClaudeDriver {
                     id,
                     description: "Claude gateway model".to_owned(),
                     is_default: false,
-                    supported_reasoning_efforts: vec![
-                        "low".to_owned(),
-                        "medium".to_owned(),
-                        "high".to_owned(),
-                    ],
+                    supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
                     default_reasoning_effort: None,
                     context_window: item
                         .get("context_window")
@@ -115,7 +118,12 @@ impl ProviderDriver for ClaudeDriver {
                         .and_then(Value::as_u64),
                 })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        Ok(if models.is_empty() {
+            claude_model_aliases()
+        } else {
+            models
+        })
     }
 
     async fn run_turn(
@@ -171,6 +179,29 @@ impl ProviderDriver for ClaudeDriver {
         .await;
         process.terminate().await;
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claude_model_aliases;
+
+    #[test]
+    fn built_in_model_aliases_are_selectable_without_gateway_discovery() {
+        let models = claude_model_aliases();
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "sonnet", "opus", "haiku"]
+        );
+        assert!(models[0].is_default);
+        assert_eq!(
+            models[0].supported_reasoning_efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
     }
 }
 

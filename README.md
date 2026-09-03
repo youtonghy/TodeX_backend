@@ -25,7 +25,7 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
   - **Codex**: Native JSON-RPC app-server integration (`start`, `turn`, `status`, `stop`, `attach`, `replay`, `interrupt`).
   - **ACP (Agent Client Protocol 2.0)**: Supports pre-configured profiles defined in `config.toml` with strict boundary constraints.
   - **Pi**: Native RPC integration with command discovery (`get_commands`), dynamic models, and interactive tool approval handling.
-  - **Claude Code**: Stream-JSON driver integrating directly with the Claude CLI.
+  - **Claude Code**: Stream-JSON driver integrating directly with the Claude CLI, with built-in model aliases when no custom Anthropic gateway is configured.
 - **Conversation Folder Persistence**:
   - Structured storage under `$DATA_DIR/conversations/<uuid>/`:
     - `manifest.json`: Metadata, active provider profile, workspace path, and timestamps.
