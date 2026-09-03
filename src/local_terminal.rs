@@ -1,13 +1,17 @@
-use std::{path::PathBuf, process::Stdio, sync::Arc};
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
 
 use dashmap::DashMap;
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use serde_json::json;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::Command,
-    sync::{mpsc, RwLock},
-};
+use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
 use crate::{
@@ -34,7 +38,9 @@ struct TerminalHandle {
     pid: Option<u32>,
     started_at: i64,
     input_tx: mpsc::Sender<String>,
-    stop_tx: mpsc::Sender<()>,
+    killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    stop_requested: Arc<AtomicBool>,
     size: Arc<RwLock<TerminalSize>>,
 }
 
@@ -43,6 +49,17 @@ struct TerminalHandle {
 struct TerminalSize {
     rows: u16,
     cols: u16,
+}
+
+impl From<TerminalSize> for PtySize {
+    fn from(size: TerminalSize) -> Self {
+        Self {
+            rows: size.rows,
+            cols: size.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -158,30 +175,35 @@ impl LocalTerminalManager {
             cols: options.cols.unwrap_or(DEFAULT_TERMINAL_COLS).clamp(20, 400),
         };
 
-        let mut command = Command::new(&shell);
-        command
-            .current_dir(&cwd)
-            .env("TERM", "dumb")
-            .env("TODEX_TERMINAL_ID", &terminal_id)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(size.into())
+            .map_err(pty_error("failed to open terminal PTY"))?;
+        let mut command = CommandBuilder::new(&shell);
+        command.cwd(&cwd);
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
+        command.env("TODEX_TERMINAL_ID", &terminal_id);
 
-        let mut child = command.spawn()?;
-        let pid = child.id();
-        let stdin = child.stdin.take().ok_or_else(|| {
-            AppError::InvalidRequest("terminal process did not expose stdin".to_string())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            AppError::InvalidRequest("terminal process did not expose stdout".to_string())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            AppError::InvalidRequest("terminal process did not expose stderr".to_string())
-        })?;
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(pty_error("failed to open terminal PTY reader"))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(pty_error("failed to open terminal PTY writer"))?;
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .map_err(pty_error("failed to spawn terminal process"))?;
+        let pid = child.process_id();
+        let killer = Arc::new(Mutex::new(child.clone_killer()));
+        let master = Arc::new(Mutex::new(pair.master));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        drop(pair.slave);
 
         let (input_tx, input_rx) = mpsc::channel::<String>(64);
-        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let size_state = Arc::new(RwLock::new(size));
         let handle = TerminalHandle {
             tenant_id: options.tenant_id.clone(),
@@ -191,61 +213,63 @@ impl LocalTerminalManager {
             pid,
             started_at: chrono::Utc::now().timestamp_millis(),
             input_tx,
-            stop_tx,
+            killer,
+            master,
+            stop_requested: stop_requested.clone(),
             size: size_state.clone(),
         };
         self.sessions.insert(terminal_id.clone(), handle.clone());
 
         let events = self.events.clone();
+        let input_runtime = tokio::runtime::Handle::current();
         let session_info = TerminalEventInfo::from_handle(&terminal_id, &handle);
-        tokio::spawn(write_terminal_input(
-            stdin,
-            input_rx,
-            events.clone(),
-            session_info.clone(),
-        ));
-        tokio::spawn(read_terminal_output(
-            stdout,
-            events.clone(),
-            session_info.clone(),
-            "stdout",
-        ));
-        tokio::spawn(read_terminal_output(
-            stderr,
-            events.clone(),
-            session_info.clone(),
-            "stderr",
-        ));
+        tokio::task::spawn_blocking(move || {
+            write_terminal_input(
+                writer,
+                input_rx,
+                events.clone(),
+                session_info.clone(),
+                input_runtime,
+            )
+        });
+        let output_events = self.events.clone();
+        let output_runtime = tokio::runtime::Handle::current();
+        let output_info = TerminalEventInfo::from_handle(&terminal_id, &handle);
+        tokio::task::spawn_blocking(move || {
+            read_terminal_output(reader, output_events, output_info, output_runtime)
+        });
 
         let sessions = self.sessions.clone();
         let wait_events = self.events.clone();
-        let wait_info = session_info.clone();
+        let wait_info = TerminalEventInfo::from_handle(&terminal_id, &handle);
         tokio::spawn(async move {
-            let mut stopped_by_request = false;
-            let status_result = tokio::select! {
-                status = child.wait() => status,
-                stop = stop_rx.recv() => {
-                    if stop.is_some() {
-                        stopped_by_request = true;
-                        let _ = child.kill().await;
-                    }
-                    child.wait().await
-                }
-            };
+            let status_result = tokio::task::spawn_blocking(move || child.wait()).await;
+            let stopped_by_request = stop_requested.load(Ordering::Acquire);
 
             sessions.remove(&wait_info.terminal_id);
             let payload = match status_result {
-                Ok(status) => json!({
+                Ok(Ok(status)) => json!({
                     "terminalId": wait_info.terminal_id,
                     "tenantId": wait_info.tenant_id,
                     "workspaceId": wait_info.workspace_id,
                     "cwd": wait_info.cwd,
                     "shell": wait_info.shell,
                     "pid": wait_info.pid,
-                    "exitCode": status.code(),
+                    "exitCode": status.exit_code(),
+                    "signal": status.signal(),
                     "success": status.success(),
                     "stoppedByRequest": stopped_by_request,
                     "lifecycleState": "exited",
+                }),
+                Ok(Err(error)) => json!({
+                    "terminalId": wait_info.terminal_id,
+                    "tenantId": wait_info.tenant_id,
+                    "workspaceId": wait_info.workspace_id,
+                    "cwd": wait_info.cwd,
+                    "shell": wait_info.shell,
+                    "pid": wait_info.pid,
+                    "error": error.to_string(),
+                    "lifecycleState": "error",
                 }),
                 Err(error) => json!({
                     "terminalId": wait_info.terminal_id,
@@ -322,10 +346,30 @@ impl LocalTerminalManager {
 
     pub async fn stop(&self, options: TerminalStopOptions) -> Result<(), AppError> {
         let handle = self.authorized_handle(&options.terminal_id, &options.tenant_id)?;
+        handle.stop_requested.store(true, Ordering::Release);
         if options.force {
-            let _ = handle.stop_tx.send(()).await;
+            let result = handle
+                .killer
+                .lock()
+                .map_err(|_| terminal_lock_error("terminal killer"))?
+                .kill()
+                .map_err(AppError::Io);
+            if result.is_err() {
+                handle.stop_requested.store(false, Ordering::Release);
+            }
+            result?;
         } else {
-            let _ = handle.input_tx.send("exit\n".to_string()).await;
+            let result = handle
+                .input_tx
+                .send("exit\n".to_string())
+                .await
+                .map_err(|_| {
+                    AppError::InvalidRequest("terminal input channel is closed".to_string())
+                });
+            if result.is_err() {
+                handle.stop_requested.store(false, Ordering::Release);
+            }
+            result?;
         }
         self.events
             .publish(EventRecord::new(
@@ -348,13 +392,20 @@ impl LocalTerminalManager {
     pub async fn resize(&self, options: TerminalResizeOptions) -> Result<(), AppError> {
         let handle = self.authorized_handle(&options.terminal_id, &options.tenant_id)?;
         let mut size = handle.size.write().await;
+        let mut next_size = *size;
         if let Some(rows) = options.rows {
-            size.rows = rows.clamp(8, 200);
+            next_size.rows = rows.clamp(8, 200);
         }
         if let Some(cols) = options.cols {
-            size.cols = cols.clamp(20, 400);
+            next_size.cols = cols.clamp(20, 400);
         }
-        let next_size = *size;
+        handle
+            .master
+            .lock()
+            .map_err(|_| terminal_lock_error("terminal PTY"))?
+            .resize(next_size.into())
+            .map_err(pty_error("failed to resize terminal PTY"))?;
+        *size = next_size;
         drop(size);
 
         self.events
@@ -475,92 +526,170 @@ impl TerminalEventInfo {
     }
 }
 
-async fn write_terminal_input(
-    mut stdin: tokio::process::ChildStdin,
+fn write_terminal_input(
+    mut writer: Box<dyn Write + Send>,
     mut input_rx: mpsc::Receiver<String>,
     events: EventBus,
     info: TerminalEventInfo,
+    runtime: tokio::runtime::Handle,
 ) {
-    while let Some(data) = input_rx.recv().await {
-        if let Err(error) = stdin.write_all(data.as_bytes()).await {
-            events
-                .publish(EventRecord::new(
-                    "terminal.error",
-                    info.workspace_id.clone(),
-                    None,
-                    Some(info.terminal_id.clone()),
-                    json!({
-                        "terminalId": info.terminal_id,
-                        "tenantId": info.tenant_id,
-                        "workspaceId": info.workspace_id,
-                        "cwd": info.cwd,
-                        "shell": info.shell,
-                        "pid": info.pid,
-                        "error": error.to_string(),
-                    }),
-                ))
-                .await;
+    while let Some(data) = input_rx.blocking_recv() {
+        if let Err(error) = writer
+            .write_all(data.as_bytes())
+            .and_then(|_| writer.flush())
+        {
+            runtime.block_on(events.publish(terminal_error_event(&info, None, &error)));
             break;
         }
     }
 }
 
-async fn read_terminal_output<R>(
-    mut reader: R,
+fn read_terminal_output(
+    mut reader: Box<dyn Read + Send>,
     events: EventBus,
     info: TerminalEventInfo,
-    stream: &'static str,
-) where
-    R: AsyncRead + Unpin,
-{
+    runtime: tokio::runtime::Handle,
+) {
     let mut buffer = vec![0_u8; TERMINAL_OUTPUT_BUFFER_SIZE];
+    let mut pending_utf8 = Vec::new();
     loop {
-        let read = match reader.read(&mut buffer).await {
+        let read = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
+            Err(error) if is_pty_eof(&error) => break,
             Err(error) => {
-                events
-                    .publish(EventRecord::new(
-                        "terminal.error",
-                        info.workspace_id.clone(),
-                        None,
-                        Some(info.terminal_id.clone()),
-                        json!({
-                            "terminalId": info.terminal_id,
-                            "tenantId": info.tenant_id,
-                            "workspaceId": info.workspace_id,
-                            "cwd": info.cwd,
-                            "shell": info.shell,
-                            "pid": info.pid,
-                            "stream": stream,
-                            "error": error.to_string(),
-                        }),
-                    ))
-                    .await;
+                runtime.block_on(events.publish(terminal_error_event(
+                    &info,
+                    Some("stdout"),
+                    &error,
+                )));
                 break;
             }
         };
-        let data = String::from_utf8_lossy(&buffer[..read]).to_string();
-        events
-            .publish(EventRecord::new(
-                "terminal.output",
-                info.workspace_id.clone(),
-                None,
-                Some(info.terminal_id.clone()),
-                json!({
-                    "terminalId": info.terminal_id,
-                    "tenantId": info.tenant_id,
-                    "workspaceId": info.workspace_id,
-                    "cwd": info.cwd,
-                    "shell": info.shell,
-                    "pid": info.pid,
-                    "stream": stream,
-                    "data": data,
-                    "encoding": "utf8",
-                }),
-            ))
-            .await;
+        let data = decode_terminal_output(&mut pending_utf8, &buffer[..read], false);
+        if !data.is_empty() {
+            publish_terminal_output(&events, &info, &runtime, data);
+        }
     }
+
+    let trailing = decode_terminal_output(&mut pending_utf8, &[], true);
+    if !trailing.is_empty() {
+        publish_terminal_output(&events, &info, &runtime, trailing);
+    }
+}
+
+fn decode_terminal_output(pending: &mut Vec<u8>, chunk: &[u8], flush: bool) -> String {
+    pending.extend_from_slice(chunk);
+    let mut output = String::new();
+
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(text) => {
+                output.push_str(text);
+                pending.clear();
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                let error_len = error.error_len();
+                if valid_up_to > 0 {
+                    output.push_str(
+                        std::str::from_utf8(&pending[..valid_up_to])
+                            .expect("validated UTF-8 prefix"),
+                    );
+                    pending.drain(..valid_up_to);
+                }
+
+                match error_len {
+                    Some(error_len) => {
+                        output.push('\u{fffd}');
+                        pending.drain(..error_len);
+                    }
+                    None if flush => {
+                        output.push_str(&String::from_utf8_lossy(pending));
+                        pending.clear();
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    output
+}
+
+fn publish_terminal_output(
+    events: &EventBus,
+    info: &TerminalEventInfo,
+    runtime: &tokio::runtime::Handle,
+    data: String,
+) {
+    runtime.block_on(events.publish(EventRecord::new(
+        "terminal.output",
+        info.workspace_id.clone(),
+        None,
+        Some(info.terminal_id.clone()),
+        json!({
+            "terminalId": info.terminal_id,
+            "tenantId": info.tenant_id,
+            "workspaceId": info.workspace_id,
+            "cwd": info.cwd,
+            "shell": info.shell,
+            "pid": info.pid,
+            "stream": "stdout",
+            "data": data,
+            "encoding": "utf8",
+            "pty": true,
+        }),
+    )));
+}
+
+fn terminal_error_event(
+    info: &TerminalEventInfo,
+    stream: Option<&str>,
+    error: &std::io::Error,
+) -> EventRecord {
+    EventRecord::new(
+        "terminal.error",
+        info.workspace_id.clone(),
+        None,
+        Some(info.terminal_id.clone()),
+        json!({
+            "terminalId": info.terminal_id,
+            "tenantId": info.tenant_id,
+            "workspaceId": info.workspace_id,
+            "cwd": info.cwd,
+            "shell": info.shell,
+            "pid": info.pid,
+            "stream": stream,
+            "error": error.to_string(),
+        }),
+    )
+}
+
+fn pty_error(context: &'static str) -> impl FnOnce(anyhow::Error) -> AppError {
+    move |error| AppError::Anyhow(anyhow::anyhow!("{context}: {error}"))
+}
+
+fn terminal_lock_error(name: &str) -> AppError {
+    AppError::Anyhow(anyhow::anyhow!("{name} lock is poisoned"))
+}
+
+fn is_pty_eof(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe
+    ) {
+        return true;
+    }
+
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::EIO) {
+        return true;
+    }
+
+    false
 }
 
 fn default_shell() -> String {
@@ -579,8 +708,26 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn terminal_output_preserves_split_utf8_sequences() {
+        let mut pending = Vec::new();
+        assert_eq!(
+            decode_terminal_output(&mut pending, &[0xe4, 0xbd], false),
+            ""
+        );
+        assert_eq!(decode_terminal_output(&mut pending, &[0xa0], false), "你");
+        assert!(pending.is_empty());
+
+        assert_eq!(
+            decode_terminal_output(&mut pending, &[0xff, 0xe5, 0xa5], false),
+            "\u{fffd}"
+        );
+        assert_eq!(decode_terminal_output(&mut pending, &[0xbd], false), "好");
+        assert!(pending.is_empty());
+    }
+
     #[tokio::test]
-    async fn terminal_start_input_and_exit_emit_events() {
+    async fn terminal_process_has_a_real_pty() {
         let events = EventBus::new(64);
         let mut rx = events.subscribe();
         let manager = LocalTerminalManager::new(events);
@@ -595,8 +742,8 @@ mod tests {
                 workspace_id: Some("workspace-test".to_string()),
                 cwd: cwd.display().to_string(),
                 shell: Some("/bin/sh".to_string()),
-                rows: Some(24),
-                cols: Some(80),
+                rows: Some(31),
+                cols: Some(97),
             })
             .await
             .unwrap();
@@ -606,14 +753,14 @@ mod tests {
                 request_id: "terminal-input-test".to_string(),
                 terminal_id: terminal_id.clone(),
                 tenant_id: "local".to_string(),
-                data: "printf todex-terminal-ready\\n\nexit\n".to_string(),
+                data: "if [ -t 0 ] && [ -t 1 ]; then printf '__PTY_%s__ ' OK; else printf '__PTY_%s__ ' BAD; fi; stty size; exit\n".to_string(),
             })
             .await
             .unwrap();
 
         let deadline = tokio::time::sleep(Duration::from_secs(5));
         tokio::pin!(deadline);
-        let mut saw_output = false;
+        let mut output = String::new();
         let mut saw_exit = false;
 
         loop {
@@ -621,20 +768,106 @@ mod tests {
                 _ = &mut deadline => break,
                 event = rx.recv() => {
                     let event = event.unwrap();
-                    if event.event_type == "terminal.output" && payload_text(&event.payload, "data").contains("todex-terminal-ready") {
-                        saw_output = true;
+                    if event.event_type == "terminal.output" {
+                        output.push_str(&payload_text(&event.payload, "data"));
                     }
                     if event.event_type == "terminal.exited" {
                         saw_exit = true;
                     }
-                    if saw_output && saw_exit {
+                    if output.contains("__PTY_OK__") && output.contains("31 97") && saw_exit {
                         break;
                     }
                 }
             }
         }
 
-        assert!(saw_output, "terminal stdout should include command output");
+        assert!(
+            output.contains("__PTY_OK__"),
+            "shell should run inside a PTY: {output:?}"
+        );
+        assert!(
+            output.contains("31 97"),
+            "PTY should receive its initial size: {output:?}"
+        );
+        assert!(saw_exit, "terminal should publish an exit event");
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn terminal_resize_updates_the_pty_window() {
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+        let manager = LocalTerminalManager::new(events);
+        let cwd = make_temp_workspace("terminal-resize");
+        let terminal_id = "term-resize-test".to_string();
+
+        manager
+            .start(TerminalStartOptions {
+                request_id: "terminal-resize-start".to_string(),
+                terminal_id: Some(terminal_id.clone()),
+                tenant_id: "local".to_string(),
+                workspace_id: Some("workspace-test".to_string()),
+                cwd: cwd.display().to_string(),
+                shell: Some("/bin/sh".to_string()),
+                rows: Some(24),
+                cols: Some(80),
+            })
+            .await
+            .unwrap();
+
+        manager
+            .resize(TerminalResizeOptions {
+                request_id: "terminal-resize-test".to_string(),
+                terminal_id: terminal_id.clone(),
+                tenant_id: "local".to_string(),
+                rows: Some(41),
+                cols: Some(132),
+            })
+            .await
+            .unwrap();
+        manager
+            .input(TerminalInputOptions {
+                request_id: "terminal-resize-input".to_string(),
+                terminal_id: terminal_id.clone(),
+                tenant_id: "local".to_string(),
+                data: "printf '__SIZE__ '; stty size; exit\n".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(deadline);
+        let mut output = String::new();
+        let mut saw_resize = false;
+        let mut saw_exit = false;
+
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                event = rx.recv() => {
+                    let event = event.unwrap();
+                    if event.event_type == "terminal.output" {
+                        output.push_str(&payload_text(&event.payload, "data"));
+                    }
+                    if event.event_type == "terminal.resized" {
+                        saw_resize = true;
+                    }
+                    if event.event_type == "terminal.exited" {
+                        saw_exit = true;
+                    }
+                    if output.contains("41 132") && saw_resize && saw_exit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(saw_resize, "terminal should publish a resize event");
+        assert!(
+            output.contains("41 132"),
+            "shell should observe the resized PTY: {output:?}"
+        );
         assert!(saw_exit, "terminal should publish an exit event");
 
         let _ = fs::remove_dir_all(cwd);
