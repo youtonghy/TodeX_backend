@@ -469,6 +469,23 @@ async fn handle_codex_message(
         return Ok(());
     }
 
+    if method == "thread/tokenUsage/updated" {
+        if let Some(payload) = codex_usage_event(&params) {
+            sink.emit("usage.updated", payload).await?;
+        } else {
+            sink.emit(
+                "provider.event",
+                json!({
+                    "provider": "codex",
+                    "providerMethod": method,
+                    "metadata": params,
+                }),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
     let (event_type, payload) = match method {
         "item/agentMessage/delta" => (
             "message.delta",
@@ -505,6 +522,33 @@ async fn handle_codex_message(
     };
     sink.emit(event_type, payload).await?;
     Ok(())
+}
+
+fn codex_usage_event(params: &Value) -> Option<Value> {
+    let usage = params.get("tokenUsage")?.as_object()?;
+    let total = codex_usage_breakdown(usage.get("total")?)?;
+    let last = codex_usage_breakdown(usage.get("last")?)?;
+    Some(json!({
+        "provider": "codex",
+        "turnId": params.get("turnId"),
+        "usage": {
+            "cumulative": total,
+            "last": last,
+        },
+        "contextWindow": usage.get("modelContextWindow"),
+    }))
+}
+
+fn codex_usage_breakdown(value: &Value) -> Option<Value> {
+    let usage = value.as_object()?;
+    Some(json!({
+        "total": usage.get("totalTokens"),
+        "input": usage.get("inputTokens"),
+        "cacheRead": usage.get("cachedInputTokens"),
+        "cacheWrite": usage.get("cacheWriteInputTokens"),
+        "output": usage.get("outputTokens"),
+        "reasoningOutput": usage.get("reasoningOutputTokens"),
+    }))
 }
 
 fn codex_item_event(method: &str, params: &Value) -> Option<(&'static str, Value)> {
@@ -730,6 +774,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::conversation::redact_secrets;
     use crate::provider::types::{DriverPromptContent, DriverSkill};
 
     #[test]
@@ -739,6 +784,45 @@ mod tests {
         let (event_type, payload) = codex_item_event("item/completed", &params).unwrap();
         assert_eq!(event_type, "message.completed");
         assert_eq!(payload["message"]["text"], "done");
+    }
+
+    #[test]
+    fn token_usage_notification_is_normalized_without_secret_like_keys() {
+        let mut payload = codex_usage_event(&json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "total": {
+                    "totalTokens": 210,
+                    "inputTokens": 120,
+                    "cachedInputTokens": 30,
+                    "cacheWriteInputTokens": 10,
+                    "outputTokens": 40,
+                    "reasoningOutputTokens": 8
+                },
+                "last": {
+                    "totalTokens": 70,
+                    "inputTokens": 40,
+                    "cachedInputTokens": 10,
+                    "cacheWriteInputTokens": 0,
+                    "outputTokens": 20,
+                    "reasoningOutputTokens": 5
+                },
+                "modelContextWindow": 200000
+            }
+        }))
+        .unwrap();
+        redact_secrets(&mut payload);
+
+        assert_eq!(payload["provider"], "codex");
+        assert_eq!(payload["turnId"], "turn-1");
+        assert_eq!(payload["usage"]["cumulative"]["total"], 210);
+        assert_eq!(payload["usage"]["last"]["input"], 40);
+        assert_eq!(payload["usage"]["last"]["cacheRead"], 10);
+        assert_eq!(payload["usage"]["last"]["output"], 20);
+        assert_eq!(payload["usage"]["last"]["reasoningOutput"], 5);
+        assert_eq!(payload["contextWindow"], 200000);
+        assert!(!payload.to_string().to_ascii_lowercase().contains("token"));
     }
 
     #[test]
