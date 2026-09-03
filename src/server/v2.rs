@@ -21,7 +21,10 @@ use tracing::warn;
 use crate::app_state::AppState;
 use crate::conversation::{ConversationManifest, ProviderKind};
 use crate::error::AppError;
-use crate::provider::{ConversationPrompt, PermissionDecision, PromptContentRef, PromptSkillRef};
+use crate::provider::{
+    read_current_version, run_upgrade, CliUpgradeOperation, CliVersionsResponse,
+    ConversationPrompt, ManagedCli, PermissionDecision, PromptContentRef, PromptSkillRef,
+};
 use crate::transport_crypto::TransportCryptoSession;
 use crate::workspace_paths::{canonical_workspace_root, validate_workspace_directory_text};
 use crate::workspace_store::WorkspaceRecord;
@@ -87,6 +90,15 @@ pub fn routes() -> Router<AppState> {
         .route("/v2/git/run", post(git_run))
         .route("/v2/browser/fetch", post(browser_fetch))
         .route("/v2/providers", get(providers))
+        .route("/v2/providers/versions", get(provider_versions))
+        .route(
+            "/v2/providers/{provider}/upgrade",
+            post(upgrade_provider_cli),
+        )
+        .route(
+            "/v2/providers/upgrades/{operation_id}",
+            get(provider_upgrade_operation),
+        )
         .route("/v2/providers/models", get(provider_models))
         .route("/v2/providers/commands", get(provider_commands))
         .route("/v2/catalog/skills", get(skills))
@@ -886,6 +898,187 @@ async fn providers(
     Ok(Json(
         json!({ "providers": state.conversations.providers() }),
     ))
+}
+
+async fn provider_versions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CliVersionsResponse>, AppError> {
+    require_auth(&state, &headers)?;
+    match state.cli_execution_gate.clone().try_read_owned() {
+        Ok(_permit) => Ok(Json(state.cli_manager.versions(&state.config).await)),
+        Err(_) => state
+            .cli_manager
+            .cached_versions_while_busy()
+            .await
+            .map(Json)
+            .ok_or_else(|| {
+                AppError::Conflict("CLI versions are unavailable during an upgrade".to_owned())
+            }),
+    }
+}
+
+async fn upgrade_provider_cli(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(provider): AxumPath<ManagedCli>,
+) -> Result<Json<CliUpgradeOperation>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    if state.config.security.auth_token.is_none() {
+        return Err(AppError::Unauthorized(
+            "CLI upgrades require bearer authentication".to_owned(),
+        ));
+    }
+    let execution_guard = match state.cli_execution_gate.clone().try_write_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            append_cli_audit(
+                &state,
+                &auth,
+                provider,
+                None,
+                "deny",
+                Some("CLI_EXECUTION_BUSY"),
+            )
+            .await?;
+            return Err(AppError::Conflict(
+                "an Agent or CLI upgrade is starting".to_owned(),
+            ));
+        }
+    };
+    if state.conversations.has_active_turns() || state.codex_local_adapters.has_active_adapters() {
+        append_cli_audit(&state, &auth, provider, None, "deny", Some("AGENT_ACTIVE")).await?;
+        return Err(AppError::Conflict(
+            "finish active Agent tasks before upgrading a CLI".to_owned(),
+        ));
+    }
+    let previous_version = match read_current_version(&state.config, provider).await {
+        Ok(version) => version,
+        Err(error) => {
+            append_cli_audit(
+                &state,
+                &auth,
+                provider,
+                None,
+                "deny",
+                Some("CLI_UNAVAILABLE"),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    let operation = match state
+        .cli_manager
+        .begin_upgrade(provider, previous_version)
+        .await
+    {
+        Ok(operation) => operation,
+        Err(error) => {
+            append_cli_audit(
+                &state,
+                &auth,
+                provider,
+                None,
+                "deny",
+                Some("UPGRADE_IN_PROGRESS"),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = append_cli_audit(
+        &state,
+        &auth,
+        provider,
+        Some(&operation.id),
+        "attempt",
+        None,
+    )
+    .await
+    {
+        state
+            .cli_manager
+            .complete_upgrade(
+                &operation.id,
+                Err(AppError::ProviderUnavailable(
+                    "CLI upgrade cancelled because the audit record could not be persisted"
+                        .to_owned(),
+                )),
+            )
+            .await;
+        return Err(error);
+    }
+
+    let background_state = state.clone();
+    let background_auth = auth.clone();
+    let operation_id = operation.id.clone();
+    tokio::spawn(async move {
+        let _execution_guard = execution_guard;
+        let result = run_upgrade(&background_state.config, provider).await;
+        let decision = if result.is_ok() { "success" } else { "failure" };
+        let reason = result.as_ref().err().map(ToString::to_string);
+        if let Some(completed) = background_state
+            .cli_manager
+            .complete_upgrade(&operation_id, result)
+            .await
+        {
+            append_cli_audit(
+                &background_state,
+                &background_auth,
+                completed.provider,
+                Some(&completed.id),
+                decision,
+                reason.as_ref().map(|_| "CLI_UPGRADE_FAILED"),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                warn!(error = %error, "failed to persist final CLI upgrade audit event");
+            });
+        }
+    });
+    Ok(Json(operation))
+}
+
+async fn provider_upgrade_operation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(operation_id): AxumPath<String>,
+) -> Result<Json<CliUpgradeOperation>, AppError> {
+    require_auth(&state, &headers)?;
+    state
+        .cli_manager
+        .operation(&operation_id)
+        .await
+        .map(Json)
+        .ok_or_else(|| AppError::NotFound("CLI upgrade operation not found".to_owned()))
+}
+
+async fn append_cli_audit(
+    state: &AppState,
+    auth: &AuthContext,
+    provider: ManagedCli,
+    operation_id: Option<&str>,
+    decision: &str,
+    reason: Option<&str>,
+) -> Result<(), AppError> {
+    let event = crate::event::EventRecord::new(
+        "cli.upgrade.audit",
+        None,
+        None,
+        None,
+        json!({
+            "principal_id": auth.principal_id,
+            "tenant_id": auth.tenant_id,
+            "token_id": auth.token_id,
+            "operation_id": operation_id,
+            "provider": provider,
+            "decision": decision,
+            "reason": reason,
+        }),
+    );
+    websocket::append_audit_event(state, &event).await?;
+    state.events.publish(event).await;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufR
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant};
 
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
@@ -236,9 +236,10 @@ pub async fn run_bounded_command(
     let stderr = child.stderr.take().ok_or_else(|| {
         AppError::ProviderUnavailable("provider process did not expose stderr".to_owned())
     })?;
-    let stdout_task = tokio::spawn(drain_bounded(stdout, max_stdout_bytes));
-    let stderr_task = tokio::spawn(drain_bounded(stderr, MAX_STDERR_BYTES));
+    let mut stdout_task = tokio::spawn(drain_bounded(stdout, max_stdout_bytes));
+    let mut stderr_task = tokio::spawn(drain_bounded(stderr, MAX_STDERR_BYTES));
 
+    let started = Instant::now();
     let status = match timeout(timeout_duration, child.wait()).await {
         Ok(status) => status?,
         Err(_) => {
@@ -255,12 +256,31 @@ pub async fn run_bounded_command(
             ));
         }
     };
-    let (stdout, stdout_exceeded) = stdout_task
-        .await
-        .map_err(|error| AppError::Anyhow(error.into()))??;
-    let (stderr, _) = stderr_task
-        .await
-        .map_err(|error| AppError::Anyhow(error.into()))??;
+    let remaining = timeout_duration.saturating_sub(started.elapsed());
+    let drains = timeout(remaining, async {
+        let stdout = (&mut stdout_task)
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))?;
+        let stderr = (&mut stderr_task)
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))?;
+        Ok::<_, AppError>((stdout?, stderr?))
+    })
+    .await;
+    let ((stdout, stdout_exceeded), (stderr, _)) = match drains {
+        Ok(result) => result?,
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                signal_process_group(pid, libc::SIGKILL);
+            }
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(AppError::ProviderUnavailable(
+                "provider diagnostic command timed out".to_owned(),
+            ));
+        }
+    };
     if stdout_exceeded {
         return Err(AppError::InvalidRequest(
             "provider diagnostic output is too large".to_owned(),

@@ -19,7 +19,7 @@ use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout},
-    sync::{mpsc, oneshot, Mutex as AsyncMutex},
+    sync::{mpsc, oneshot, Mutex as AsyncMutex, RwLock},
     task::JoinHandle,
     time::{sleep, Duration, Instant},
 };
@@ -1280,11 +1280,29 @@ pub struct CodexLocalAdapterSupervisor {
     store: CodexGatewayStore,
     events: EventBus,
     idle_shutdown_after: Duration,
+    cli_execution_gate: Arc<RwLock<()>>,
 }
 
 impl CodexLocalAdapterSupervisor {
     pub fn new(store: CodexGatewayStore, events: EventBus) -> Self {
-        Self::new_with_idle_shutdown_after(store, events, CODEX_LOCAL_ADAPTER_IDLE_SHUTDOWN_AFTER)
+        Self::new_with_execution_gate(store, events, Arc::new(RwLock::new(())))
+    }
+
+    pub fn new_with_execution_gate(
+        store: CodexGatewayStore,
+        events: EventBus,
+        cli_execution_gate: Arc<RwLock<()>>,
+    ) -> Self {
+        Self::new_with_idle_shutdown_after_and_gate(
+            store,
+            events,
+            CODEX_LOCAL_ADAPTER_IDLE_SHUTDOWN_AFTER,
+            cli_execution_gate,
+        )
+    }
+
+    pub fn has_active_adapters(&self) -> bool {
+        !self.adapters.is_empty()
     }
 
     fn new_with_idle_shutdown_after(
@@ -1292,11 +1310,26 @@ impl CodexLocalAdapterSupervisor {
         events: EventBus,
         idle_shutdown_after: Duration,
     ) -> Self {
+        Self::new_with_idle_shutdown_after_and_gate(
+            store,
+            events,
+            idle_shutdown_after,
+            Arc::new(RwLock::new(())),
+        )
+    }
+
+    fn new_with_idle_shutdown_after_and_gate(
+        store: CodexGatewayStore,
+        events: EventBus,
+        idle_shutdown_after: Duration,
+        cli_execution_gate: Arc<RwLock<()>>,
+    ) -> Self {
         Self {
             adapters: Arc::new(DashMap::new()),
             store,
             events,
             idle_shutdown_after,
+            cli_execution_gate,
         }
     }
 
@@ -1304,6 +1337,7 @@ impl CodexLocalAdapterSupervisor {
         &self,
         options: CodexLocalAdapterStartOptions,
     ) -> CodexLocalAdapterProcessResult<Arc<LocalCodexAdapter>> {
+        let cli_start_permit = self.cli_execution_gate.read().await;
         if let Some(adapter) = self
             .adapters
             .get(&options.codex_session_id)
@@ -1324,11 +1358,13 @@ impl CodexLocalAdapterSupervisor {
         {
             let _ = adapter.stop(&options.request_id, true).await;
             existing.acknowledge_start(&options.request_id).await?;
+            drop(cli_start_permit);
             Ok(existing)
         } else {
             self.adapters
                 .insert(options.codex_session_id.clone(), adapter.clone());
             self.spawn_idle_shutdown_task(options.codex_session_id.clone(), adapter.clone());
+            drop(cli_start_permit);
             Ok(adapter)
         }
     }

@@ -16,7 +16,7 @@ use crate::{
     error::Result,
     event::EventBus,
     local_terminal::LocalTerminalManager,
-    provider::ConversationSupervisor,
+    provider::{CliManager, ConversationSupervisor},
     transport_crypto::PairingKeys,
     workspace_store::WorkspaceStore,
     workspace_trust::WorkspaceTrustStore,
@@ -30,6 +30,8 @@ pub struct AppState {
     pub codex_gateway: CodexGatewayStore,
     pub codex_local_adapters: CodexLocalAdapterSupervisor,
     pub conversations: ConversationSupervisor,
+    pub cli_manager: CliManager,
+    pub(crate) cli_execution_gate: Arc<tokio::sync::RwLock<()>>,
     conversation_store: ConversationStore,
     pub local_terminals: LocalTerminalManager,
     pub pairing_keys: PairingKeys,
@@ -53,8 +55,12 @@ impl AppState {
         let catalog = CatalogService::new(config.clone());
         let events = EventBus::new(4096);
         let codex_gateway = CodexGatewayStore::new(config.data_dir.clone());
-        let codex_local_adapters =
-            CodexLocalAdapterSupervisor::new(codex_gateway.clone(), events.clone());
+        let cli_execution_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let codex_local_adapters = CodexLocalAdapterSupervisor::new_with_execution_gate(
+            codex_gateway.clone(),
+            events.clone(),
+            cli_execution_gate.clone(),
+        );
         let workspace_trust =
             WorkspaceTrustStore::new(config.data_dir.clone(), config.workspace_root.clone())
                 .await?;
@@ -74,14 +80,16 @@ impl AppState {
         }
         let conversation_store = ConversationStore::new(config.data_dir.clone()).await?;
         let conversation_hub = ConversationEventHub::default();
-        let conversations = ConversationSupervisor::new(
+        let conversations = ConversationSupervisor::new_with_execution_gate(
             config.clone(),
             conversation_store.clone(),
             conversation_hub,
             workspace_trust.clone(),
+            cli_execution_gate.clone(),
         );
         conversations.recover_all().await?;
         let local_terminals = LocalTerminalManager::new(events.clone());
+        let cli_manager = CliManager::default();
         let pairing_keys = PairingKeys::load_or_generate(&config.data_dir).await?;
         let websocket_connections = Arc::new(AtomicUsize::new(0));
         let audit_write_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -93,6 +101,8 @@ impl AppState {
             codex_gateway,
             codex_local_adapters,
             conversations,
+            cli_manager,
+            cli_execution_gate,
             conversation_store,
             local_terminals,
             pairing_keys,

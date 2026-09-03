@@ -214,6 +214,9 @@ auth_token = "your-secure-secret-token"
 - `GET /v2/workspace/file?path=...`: Read file contents within sandbox root.
 - `GET /v2/browser/fetch?url=...`: Proxy web resource fetching.
 - `GET /v2/providers`: List available agent providers and their active states.
+- `GET /v2/providers/versions`: Inspect the configured backend host's Codex, Pi, Claude Code, Grok Build, and external ACP CLI versions.
+- `POST /v2/providers/{provider}/upgrade`: Start a single-flight self-update for a managed CLI; active Agent work blocks upgrades.
+- `GET /v2/providers/upgrades/{operationId}`: Read asynchronous CLI upgrade progress and the verified post-update version.
 - `GET /v2/providers/models?provider=...&workspace=...`: Discover supported models for a provider.
 - `GET /v2/providers/commands?provider=...&workspace=...`: Query slash commands and extensions.
 - `GET /v2/conversations`: List persisted conversations for tenant.

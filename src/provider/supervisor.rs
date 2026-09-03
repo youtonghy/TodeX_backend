@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use serde_json::{json, Value};
-use tokio::sync::watch;
+use tokio::sync::{watch, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
@@ -134,6 +134,7 @@ pub struct ConversationSupervisor {
     registry: DriverRegistry,
     permissions: PermissionBroker,
     active: Arc<DashMap<String, ActiveTurn>>,
+    cli_execution_gate: Arc<RwLock<()>>,
     workspace_trust: WorkspaceTrustStore,
 }
 
@@ -154,22 +155,47 @@ impl Drop for ActiveTurnCleanup {
 }
 
 impl ConversationSupervisor {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         config: Arc<Config>,
         store: ConversationStore,
         hub: ConversationEventHub,
         workspace_trust: WorkspaceTrustStore,
     ) -> Self {
-        let catalog = CatalogService::new(config.clone());
-        Self::new_with_catalog(config, store, hub, catalog, workspace_trust)
+        Self::new_with_execution_gate(
+            config,
+            store,
+            hub,
+            workspace_trust,
+            Arc::new(RwLock::new(())),
+        )
     }
 
-    pub fn new_with_catalog(
+    pub fn new_with_execution_gate(
+        config: Arc<Config>,
+        store: ConversationStore,
+        hub: ConversationEventHub,
+        workspace_trust: WorkspaceTrustStore,
+        cli_execution_gate: Arc<RwLock<()>>,
+    ) -> Self {
+        let catalog = CatalogService::new(config.clone());
+        Self::new_with_catalog_and_gate(
+            config,
+            store,
+            hub,
+            catalog,
+            workspace_trust,
+            cli_execution_gate,
+        )
+    }
+
+    fn new_with_catalog_and_gate(
         config: Arc<Config>,
         store: ConversationStore,
         hub: ConversationEventHub,
         catalog: CatalogService,
         workspace_trust: WorkspaceTrustStore,
+        cli_execution_gate: Arc<RwLock<()>>,
     ) -> Self {
         Self {
             registry: DriverRegistry::new(&config),
@@ -180,6 +206,7 @@ impl ConversationSupervisor {
             permissions: PermissionBroker::default(),
             active: Arc::new(DashMap::new()),
             workspace_trust,
+            cli_execution_gate,
         }
     }
 
@@ -210,12 +237,19 @@ impl ConversationSupervisor {
         self.registry.descriptors()
     }
 
+    pub fn has_active_turns(&self) -> bool {
+        !self.active.is_empty()
+    }
+
     pub async fn models_live(
         &self,
         owner_id: &str,
         provider: ProviderKind,
         workspace: &Path,
     ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
+        let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
+            AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
+        })?;
         let _launch_permit = self
             .workspace_trust
             .acquire_owned(owner_id, workspace)
@@ -239,6 +273,9 @@ impl ConversationSupervisor {
         provider: ProviderKind,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
+        let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
+            AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
+        })?;
         let _launch_permit = self
             .workspace_trust
             .acquire_owned(owner_id, workspace)
@@ -494,6 +531,7 @@ impl ConversationSupervisor {
         }
         let provider_state = self.store.provider_state(conversation_id).await?;
 
+        let cli_start_permit = self.cli_execution_gate.read().await;
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let (cancel, cancel_rx) = watch::channel(false);
         match self.active.entry(conversation_id.to_owned()) {
@@ -510,6 +548,7 @@ impl ConversationSupervisor {
                 });
             }
         }
+        drop(cli_start_permit);
 
         let launch_permit = match self
             .workspace_trust
