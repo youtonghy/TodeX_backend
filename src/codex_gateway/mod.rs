@@ -1304,29 +1304,27 @@ impl CodexLocalAdapterSupervisor {
         &self,
         options: CodexLocalAdapterStartOptions,
     ) -> CodexLocalAdapterProcessResult<Arc<LocalCodexAdapter>> {
-        if self.adapters.contains_key(&options.codex_session_id) {
-            return Err(CodexLocalAdapterProcessError::new(
-                CodexLocalErrorCode::UnsupportedAction,
-                "local Codex adapter already owns this session",
-                &options.codex_session_id,
-                Some(&options.request_id),
-                "codex.local.start",
-            ));
+        if let Some(adapter) = self
+            .adapters
+            .get(&options.codex_session_id)
+            .map(|entry| entry.value().clone())
+        {
+            adapter.acknowledge_start(&options.request_id).await?;
+            return Ok(adapter);
         }
 
         let adapter =
             LocalCodexAdapter::start(options.clone(), self.store.clone(), self.events.clone())
                 .await?;
         let adapter = Arc::new(adapter);
-        if self.adapters.contains_key(&options.codex_session_id) {
+        if let Some(existing) = self
+            .adapters
+            .get(&options.codex_session_id)
+            .map(|entry| entry.value().clone())
+        {
             let _ = adapter.stop(&options.request_id, true).await;
-            Err(CodexLocalAdapterProcessError::new(
-                CodexLocalErrorCode::UnsupportedAction,
-                "local Codex adapter already owns this session",
-                &options.codex_session_id,
-                Some(&options.request_id),
-                "codex.local.start",
-            ))
+            existing.acknowledge_start(&options.request_id).await?;
+            Ok(existing)
         } else {
             self.adapters
                 .insert(options.codex_session_id.clone(), adapter.clone());
@@ -1858,6 +1856,30 @@ impl LocalCodexAdapter {
 
     pub async fn runtime(&self) -> CodexLocalAdapterRuntime {
         self.runtime.lock().await.clone()
+    }
+
+    async fn acknowledge_start(&self, request_id: &str) -> CodexLocalAdapterProcessResult<()> {
+        let runtime = self.runtime.lock().await;
+        if runtime.state != CodexLocalAdapterLifecycleState::Ready {
+            return Err(CodexLocalAdapterProcessError::new(
+                CodexLocalErrorCode::UnsupportedAction,
+                format!(
+                    "local Codex adapter cannot acknowledge start while in state {:?}",
+                    runtime.state
+                ),
+                &runtime.codex_session_id,
+                Some(request_id),
+                "codex.local.start",
+            ));
+        }
+        append_local_lifecycle_event(
+            &self.store,
+            &runtime,
+            Some(request_id),
+            "codex.control.ready",
+            "codex.local.start",
+        )
+        .await
     }
 
     async fn is_idle_shutdown_due(&self, idle_shutdown_after: Duration) -> bool {
@@ -5519,13 +5541,13 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn local_codex_adapter_supervisor_rejects_duplicate_session_ownership() {
+    async fn local_codex_adapter_supervisor_acknowledges_duplicate_start() {
         let root = unique_tmp_dir("todex-codex-local-adapter-duplicate");
         let cwd = root.join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
         let binary = write_fake_codex_binary(&root, "ready").await;
         let store = CodexGatewayStore::new(root.join("data"));
-        let supervisor = CodexLocalAdapterSupervisor::new(store, EventBus::new(16));
+        let supervisor = CodexLocalAdapterSupervisor::new(store.clone(), EventBus::new(16));
         let options = CodexLocalAdapterStartOptions::new(
             "cdxs_duplicate",
             "local-start-1",
@@ -5533,14 +5555,31 @@ mod tests {
             binary.to_string_lossy(),
         );
 
-        supervisor.start(options.clone()).await.unwrap();
-        let duplicate = supervisor.start(options).await.unwrap_err();
+        let original = supervisor.start(options).await.unwrap();
+        let duplicate = supervisor
+            .start(CodexLocalAdapterStartOptions::new(
+                "cdxs_duplicate",
+                "local-start-2",
+                &cwd,
+                binary.to_string_lossy(),
+            ))
+            .await
+            .unwrap();
 
-        assert_eq!(
-            duplicate.payload.code,
-            CodexLocalErrorCode::UnsupportedAction
-        );
+        assert!(Arc::ptr_eq(&original, &duplicate));
         assert_eq!(supervisor.len(), 1);
+        let replay = store
+            .replay_events("cdxs_duplicate", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.events.last().unwrap().event_type,
+            "codex.control.ready"
+        );
+        assert_eq!(
+            replay.events.last().unwrap().payload["requestId"],
+            json!("local-start-2")
+        );
         supervisor
             .stop("cdxs_duplicate", "local-stop-1", true)
             .await

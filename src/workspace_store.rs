@@ -77,6 +77,10 @@ impl WorkspaceStore {
         }
     }
 
+    pub(crate) async fn snapshot(&self) -> WorkspaceSnapshot {
+        self.inner.read().await.clone()
+    }
+
     pub async fn get_owned(
         &self,
         owner_id: &str,

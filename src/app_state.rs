@@ -1,6 +1,10 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 use tokio::task::JoinHandle;
 
@@ -54,6 +58,20 @@ impl AppState {
         let workspace_trust =
             WorkspaceTrustStore::new(config.data_dir.clone(), config.workspace_root.clone())
                 .await?;
+        let workspaces =
+            WorkspaceStore::new(config.data_dir.clone(), config.workspace_root.clone()).await?;
+        let mut workspace_paths_by_owner = HashMap::<String, Vec<PathBuf>>::new();
+        for workspace in workspaces.snapshot().await.workspaces {
+            workspace_paths_by_owner
+                .entry(workspace.tenant_id)
+                .or_default()
+                .push(PathBuf::from(workspace.path));
+        }
+        for (owner_id, workspace_paths) in workspace_paths_by_owner {
+            workspace_trust
+                .auto_trust_undecided_owned(&owner_id, &workspace_paths)
+                .await?;
+        }
         let conversation_store = ConversationStore::new(config.data_dir.clone()).await?;
         let conversation_hub = ConversationEventHub::default();
         let conversations = ConversationSupervisor::new(
@@ -65,8 +83,6 @@ impl AppState {
         conversations.recover_all().await?;
         let local_terminals = LocalTerminalManager::new(events.clone());
         let pairing_keys = PairingKeys::load_or_generate(&config.data_dir).await?;
-        let workspaces =
-            WorkspaceStore::new(config.data_dir.clone(), config.workspace_root.clone()).await?;
         let websocket_connections = Arc::new(AtomicUsize::new(0));
         let audit_write_lock = Arc::new(tokio::sync::Mutex::new(()));
 
@@ -129,4 +145,89 @@ async fn set_owner_only_directory(path: &std::path::Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace_store::WorkspaceRecord;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn startup_trusts_registered_workspaces_without_overriding_revocation() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-app-state-workspace-trust-{}",
+            Uuid::new_v4().simple()
+        ));
+        let workspace_root = root.join("workspaces");
+        let automatic = workspace_root.join("automatic");
+        let revoked = workspace_root.join("revoked");
+        tokio::fs::create_dir_all(&automatic).await.unwrap();
+        tokio::fs::create_dir_all(&revoked).await.unwrap();
+
+        let workspaces = WorkspaceStore::new(root.clone(), workspace_root.clone())
+            .await
+            .unwrap();
+        workspaces
+            .merge_owned(
+                "local",
+                vec![
+                    workspace_record("automatic", &automatic),
+                    workspace_record("revoked", &revoked),
+                ],
+            )
+            .await
+            .unwrap();
+        WorkspaceTrustStore::new(root.clone(), workspace_root.clone())
+            .await
+            .unwrap()
+            .set_owned("local", &revoked, false)
+            .await
+            .unwrap();
+
+        let config = Config {
+            data_dir: root.clone(),
+            workspace_root,
+            ..Config::default()
+        };
+        let state = AppState::new(config).await.unwrap();
+
+        assert!(
+            state
+                .workspace_trust
+                .status_owned("local", &automatic)
+                .await
+                .unwrap()
+                .trusted
+        );
+        assert!(
+            !state
+                .workspace_trust
+                .status_owned("local", &revoked)
+                .await
+                .unwrap()
+                .trusted
+        );
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    fn workspace_record(name: &str, path: &std::path::Path) -> WorkspaceRecord {
+        WorkspaceRecord {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            path: path.display().to_string(),
+            session_id: String::new(),
+            tenant_id: "local".to_owned(),
+            thread_id: String::new(),
+            model: "gpt-5.5".to_owned(),
+            reasoning_effort: Some("medium".to_owned()),
+            approval_policy: "on-request".to_owned(),
+            sandbox_mode: "workspace-write".to_owned(),
+            service_tier: None,
+            local_adapter_state: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
 }
