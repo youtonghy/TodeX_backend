@@ -164,37 +164,35 @@ pub(super) async fn replace_workspaces(
         .workspaces
         .merge_owned(&auth.tenant_id, request.workspaces)
         .await?;
-    if state.config.security.auto_trust_workspaces {
-        let workspace_paths = snapshot
-            .workspaces
-            .iter()
-            .map(|workspace| PathBuf::from(&workspace.path))
-            .collect::<Vec<_>>();
-        let trusted = state
-            .workspace_trust
-            .auto_trust_undecided_owned(&auth.tenant_id, &workspace_paths)
-            .await?;
-        if !trusted.is_empty() {
-            let audit = crate::event::EventRecord::new(
-                "workspace.trust.auto_granted",
-                None,
-                None,
-                None,
-                json!({
-                    "principal_id": auth.principal_id,
-                    "tenant_id": auth.tenant_id,
-                    "token_id": auth.token_id,
-                    "workspace_paths": trusted
-                        .iter()
-                        .map(|status| status.workspace_path.as_str())
-                        .collect::<Vec<_>>(),
-                }),
-            );
-            if let Err(error) = websocket::append_audit_event(&state, &audit).await {
-                warn!(error = %error, "failed to persist automatic workspace trust audit event");
-            }
-            state.events.publish(audit).await;
+    let workspace_paths = snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| PathBuf::from(&workspace.path))
+        .collect::<Vec<_>>();
+    let trusted = state
+        .workspace_trust
+        .auto_trust_undecided_owned(&auth.tenant_id, &workspace_paths)
+        .await?;
+    if !trusted.is_empty() {
+        let audit = crate::event::EventRecord::new(
+            "workspace.trust.auto_granted",
+            None,
+            None,
+            None,
+            json!({
+                "principal_id": auth.principal_id,
+                "tenant_id": auth.tenant_id,
+                "token_id": auth.token_id,
+                "workspace_paths": trusted
+                    .iter()
+                    .map(|status| status.workspace_path.as_str())
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        if let Err(error) = websocket::append_audit_event(&state, &audit).await {
+            warn!(error = %error, "failed to persist automatic workspace trust audit event");
         }
+        state.events.publish(audit).await;
     }
     Ok(Json(WorkspacesResponse {
         workspaces: snapshot.workspaces,
@@ -2153,7 +2151,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auto_trust_workspaces: false,
                 auth_token: Some("v2-token".to_owned()),
             },
         })
@@ -2244,7 +2241,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auto_trust_workspaces: false,
                 auth_token: Some("v2-token".to_owned()),
             },
         })
@@ -2480,7 +2476,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auto_trust_workspaces: true,
                 auth_token: Some("v2-token".to_owned()),
             },
         })
@@ -2857,7 +2852,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auto_trust_workspaces: false,
                 auth_token: Some("git-token".to_owned()),
             },
         })
@@ -3155,7 +3149,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: false,
                 enable_tls: false,
-                auto_trust_workspaces: false,
                 auth_token: None,
             },
         })
@@ -3228,7 +3221,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auto_trust_workspaces: false,
                 auth_token: Some("v2-ws-token".to_owned()),
             },
         })
@@ -3361,7 +3353,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: false,
                 enable_tls: false,
-                auto_trust_workspaces: false,
                 auth_token: None,
             },
         };
