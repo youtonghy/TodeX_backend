@@ -108,7 +108,7 @@ language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
 
 `enable_tls = true` 会直接拒绝启动，因为当前 binary 没有证书/私钥配置入口。需要 TLS 时应由可信反向代理终止 TLS；不要把明文监听端口直接暴露到公网。
 
-TUI 默认不捕获鼠标，终端中的文本可以直接拖选复制。按 `c` 打开“凭据与复制”，可完整查看并复制 Auth Token 与当前加密方式的公钥；私钥不会显示或复制。日志使用 `PageUp`、`PageDown`、`Home`、`End` 滚动。daemon 启动会先检查端口占用，并等待最多 30 秒完成迁移和初始化后再报告超时。
+TUI 默认不捕获鼠标，终端中的文本可以直接拖选复制。按 `c` 打开“凭据与复制”，可完整查看并复制 Auth Token 与当前加密方式的公钥；私钥不会显示或复制。日志使用 `PageUp`、`PageDown`、`Home`、`End` 滚动。daemon 启动会先检查端口占用，并等待最多 30 秒完成核心初始化和监听；旧 Codex 会话随后在后台迁移，不阻塞 daemon 就绪。
 
 Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径、用户目录、locale、代理和 SSH agent 等运行环境。ACP profile 中的 `env` 会显式传入，但名称以 `TODEX_AGENTD_` 开头的变量会被拒绝。Codex、Pi、Claude Code 和 Grok Build 因此应优先使用各自保存在用户目录中的原生登录配置。Grok Build 通过 `grok --no-auto-update agent --no-leader stdio` 启动；仅 `grok_env_allowlist` 中名称合法的变量会额外传入。首次运行前使用 daemon 用户执行 `grok login`，或在白名单中保留 `XAI_API_KEY`。Pi 始终使用 RPC `--approve`：工作区通过 TodeX 信任门禁后，Pi 的工具和项目资源按 daemon 用户权限全自动运行。Pi 没有通用逐工具审批，也没有 OS sandbox；`permissions` capability 因此保持 `false`。
 
@@ -124,7 +124,7 @@ $TODEX_AGENTD_DATA_DIR/conversations/<conversation-id>/
   provider-state.json
 ```
 
-旧 `$DATA_DIR/codex_gateway/sessions` 会在启动时复制迁移到该结构，源文件保持不变；迁移映射保存在 `$DATA_DIR/migrations/codex-gateway-v1.json`。
+旧 `$DATA_DIR/codex_gateway/sessions` 会在 daemon 就绪后于后台复制迁移到该结构，源文件保持不变；迁移映射保存在 `$DATA_DIR/migrations/codex-gateway-v1.json`。迁移失败会写入 daemon 日志并在下次启动时重试，不会阻止服务监听。
 
 ## 如何编译
 
@@ -244,7 +244,7 @@ macOS 可使用 launchd 的 `ProgramArguments` 指向同一 `serve` 命令，并
 - 监控 `/health`、进程重启次数、数据目录剩余空间和 Provider CLI 退出率。
 - 备份前停止写入或使用文件系统快照，备份后做一次临时目录恢复和事件 replay 校验。
 
-升级前先停止 daemon，复制整个数据目录到带时间戳的备份目录，再升级 binary 并启动。启动迁移是幂等的：旧 `codex_gateway/sessions` 只读复制到 `conversations/`，不会删除或覆盖源文件。升级失败时停止新 binary，恢复备份目录和旧 binary；不要手工编辑 `events.jsonl` 或 `provider-state.json`。
+升级前先停止 daemon，复制整个数据目录到带时间戳的备份目录，再升级 binary 并启动。后台迁移是幂等的：旧 `codex_gateway/sessions` 只读复制到 `conversations/`，不会删除或覆盖源文件。升级失败时停止新 binary，恢复备份目录和旧 binary；不要手工编辑 `events.jsonl` 或 `provider-state.json`。
 
 ### 默认运行
 

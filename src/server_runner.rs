@@ -18,6 +18,7 @@ pub struct ManagedServer {
     shutdown: Option<oneshot::Sender<()>>,
     handle: JoinHandle<Result<()>>,
     retention_task: Option<JoinHandle<()>>,
+    migration_task: Option<JoinHandle<()>>,
 }
 
 impl ManagedServer {
@@ -80,6 +81,7 @@ impl ManagedServer {
                 .await
                 .context("server failed")
         });
+        let migration_task = Some(state.spawn_legacy_conversation_migration());
 
         Ok(Self {
             config,
@@ -88,6 +90,7 @@ impl ManagedServer {
             shutdown: Some(shutdown_tx),
             handle,
             retention_task,
+            migration_task,
         })
     }
 
@@ -104,6 +107,9 @@ impl ManagedServer {
     }
 
     pub async fn stop(mut self) -> Result<()> {
+        if let Some(task) = self.migration_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.retention_task.take() {
             task.abort();
         }
@@ -115,14 +121,17 @@ impl ManagedServer {
         self.handle.await.context("server task join failed")?
     }
 
-    pub async fn wait(self) -> Result<()> {
-        if let Some(task) = self.retention_task {
+    pub async fn wait(mut self) -> Result<()> {
+        if let Some(task) = self.retention_task.take() {
             task.abort();
         }
-        let result = self.handle.await.context("server task join failed")?;
+        let result = self.handle.await.context("server task join failed");
+        if let Some(task) = self.migration_task.take() {
+            task.abort();
+        }
         self.state.conversations.shutdown_all().await;
         self.state.codex_local_adapters.shutdown_all().await;
-        result
+        result?
     }
 }
 
@@ -173,6 +182,61 @@ mod tests {
 
         let server = ManagedServer::start(config).await.expect("start server");
         assert!(server.addr().port() > 0);
+        server.stop().await.expect("stop server");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn managed_server_starts_when_legacy_migration_fails() {
+        let root = env::temp_dir().join(format!(
+            "todex-server-migration-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_dir = root.join("data");
+        let workspace_root = root.join("workspace");
+        fs::create_dir_all(data_dir.join("codex_gateway/sessions"))
+            .expect("create legacy session root");
+        fs::create_dir_all(data_dir.join("migrations")).expect("create migration directory");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
+        fs::write(
+            data_dir.join("migrations/codex-gateway-v1.json"),
+            r#"{"schemaVersion":999,"entries":{}}"#,
+        )
+        .expect("write unsupported migration map");
+
+        let config = Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::default(),
+            data_dir,
+            workspace_root,
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: "codex".to_owned(),
+                claude_bin: "claude".to_owned(),
+                pi_bin: "pi".to_owned(),
+                grok_bin: "grok".to_owned(),
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                acp_profiles: Default::default(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+                auth_token: Some("token".to_owned()),
+            },
+        };
+
+        let mut server = ManagedServer::start(config).await.expect("start server");
+        assert!(server.addr().port() > 0);
+        server
+            .migration_task
+            .take()
+            .expect("migration task")
+            .await
+            .expect("migration task join");
         server.stop().await.expect("stop server");
 
         let _ = fs::remove_dir_all(root);

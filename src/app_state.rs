@@ -2,6 +2,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use tokio::task::JoinHandle;
 
 use crate::{
     catalog::CatalogService,
@@ -25,6 +26,7 @@ pub struct AppState {
     pub codex_gateway: CodexGatewayStore,
     pub codex_local_adapters: CodexLocalAdapterSupervisor,
     pub conversations: ConversationSupervisor,
+    conversation_store: ConversationStore,
     pub local_terminals: LocalTerminalManager,
     pub pairing_keys: PairingKeys,
     pub workspaces: WorkspaceStore,
@@ -53,24 +55,10 @@ impl AppState {
             WorkspaceTrustStore::new(config.data_dir.clone(), config.workspace_root.clone())
                 .await?;
         let conversation_store = ConversationStore::new(config.data_dir.clone()).await?;
-        let migration = migrate_legacy_codex_sessions(
-            &config.data_dir,
-            &config.workspace_root,
-            &conversation_store,
-        )
-        .await?;
-        if migration.imported > 0 || migration.skipped > 0 {
-            tracing::info!(
-                imported = migration.imported,
-                already_imported = migration.already_imported,
-                skipped = migration.skipped,
-                "legacy Codex conversation migration finished"
-            );
-        }
         let conversation_hub = ConversationEventHub::default();
         let conversations = ConversationSupervisor::new(
             config.clone(),
-            conversation_store,
+            conversation_store.clone(),
             conversation_hub,
             workspace_trust.clone(),
         );
@@ -89,12 +77,35 @@ impl AppState {
             codex_gateway,
             codex_local_adapters,
             conversations,
+            conversation_store,
             local_terminals,
             pairing_keys,
             workspaces,
             workspace_trust,
             audit_write_lock,
             websocket_connections,
+        })
+    }
+
+    pub(crate) fn spawn_legacy_conversation_migration(&self) -> JoinHandle<()> {
+        let data_dir = self.config.data_dir.clone();
+        let workspace_root = self.config.workspace_root.clone();
+        let store = self.conversation_store.clone();
+        tokio::spawn(async move {
+            match migrate_legacy_codex_sessions(&data_dir, &workspace_root, &store).await {
+                Ok(migration) if migration.imported > 0 || migration.skipped > 0 => {
+                    tracing::info!(
+                        imported = migration.imported,
+                        already_imported = migration.already_imported,
+                        skipped = migration.skipped,
+                        "legacy Codex conversation migration finished"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "legacy Codex conversation migration failed");
+                }
+            }
         })
     }
 
