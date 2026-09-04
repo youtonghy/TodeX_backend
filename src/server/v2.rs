@@ -3013,6 +3013,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn git_http_api_scans_runs_fixed_actions_and_enforces_root_boundary() {
         let root = std::env::temp_dir().join(format!("todex-v2-git-{}", Uuid::new_v4()));
@@ -3118,12 +3119,6 @@ mod tests {
             )
             .await
             .unwrap();
-        #[cfg(not(unix))]
-        {
-            assert_eq!(initial.status(), StatusCode::NOT_IMPLEMENTED);
-            return;
-        }
-        #[cfg(unix)]
         assert_eq!(initial.status(), StatusCode::OK);
         let initial_body = to_bytes(initial.into_body(), 2 * 1024 * 1024)
             .await
