@@ -3118,6 +3118,12 @@ mod tests {
             )
             .await
             .unwrap();
+        #[cfg(not(unix))]
+        {
+            assert_eq!(initial.status(), StatusCode::NOT_IMPLEMENTED);
+            return;
+        }
+        #[cfg(unix)]
         assert_eq!(initial.status(), StatusCode::OK);
         let initial_body = to_bytes(initial.into_body(), 2 * 1024 * 1024)
             .await
