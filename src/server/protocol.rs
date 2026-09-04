@@ -19,6 +19,7 @@ pub enum GitAction {
     Initial,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 impl GitAction {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -39,6 +40,7 @@ fn default_git_include_unstaged() -> bool {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(not(unix), allow(dead_code))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GitRunRequest {
     pub workspace_path: String,

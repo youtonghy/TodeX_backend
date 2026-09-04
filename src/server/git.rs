@@ -1,3 +1,5 @@
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use std::{
     collections::{HashSet, VecDeque},
     io,
@@ -244,6 +246,8 @@ async fn terminate_child(child: &mut Child, process_group_id: Option<u32>) {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
     }
+    #[cfg(not(unix))]
+    let _ = process_group_id;
     let _ = child.kill().await;
 }
 

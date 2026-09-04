@@ -254,7 +254,6 @@ fn mcp_error(
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use crate::catalog::McpRuntimeTarget;
@@ -299,7 +298,6 @@ while True:
 "#,
         )
         .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
 

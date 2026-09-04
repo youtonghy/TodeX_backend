@@ -230,6 +230,8 @@ pub async fn run_bounded_command(
         }
     })?;
     let pid = child.id();
+    #[cfg(not(unix))]
+    let _ = pid;
     let stdout = child.stdout.take().ok_or_else(|| {
         AppError::ProviderUnavailable("provider process did not expose stdout".to_owned())
     })?;
