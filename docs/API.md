@@ -189,7 +189,7 @@ GET /v2/version
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `name` | string | Cargo 包名 |
-| `version` | string | Cargo 包版本 |
+| `version` | string | 构建时注入的应用版本；开发构建为 `DEV0.0.0` |
 | `data_dir` | string | 当前数据目录 |
 | `workspace_root` | string | 当前 workspace 根目录 |
 

@@ -2450,7 +2450,7 @@ fn codex_initialize_request(_request_id: &str) -> Value {
             "clientInfo": {
                 "name": "todex-agentd",
                 "title": "TodeX Agent Daemon",
-                "version": env!("CARGO_PKG_VERSION")
+                "version": crate::version::APP_VERSION
             },
             "capabilities": {
                 "experimentalApi": true,

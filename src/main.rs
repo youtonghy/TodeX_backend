@@ -13,6 +13,7 @@ mod server;
 mod server_runner;
 mod transport_crypto;
 mod tui;
+mod version;
 mod workspace_paths;
 mod workspace_store;
 mod workspace_trust;
@@ -24,7 +25,11 @@ use crate::config::{Config, ServeArgs};
 use crate::server_runner::ManagedServer;
 
 #[derive(Debug, Parser)]
-#[command(name = "todex-agentd", version, about = "TodeX agent daemon backend")]
+#[command(
+    name = "todex-agentd",
+    version = crate::version::APP_VERSION,
+    about = "TodeX agent daemon backend"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

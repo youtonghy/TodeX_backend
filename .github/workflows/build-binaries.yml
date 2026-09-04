@@ -53,7 +53,7 @@ jobs:
           fi
 
   source:
-    name: Create versioned source tag
+    name: Tag release source
     needs: prepare
     runs-on: ubuntu-24.04
     permissions:
@@ -66,28 +66,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Create release source commit
+      - name: Record release source
         id: source
-        env:
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          cargo install cargo-edit --version 0.13.13 --locked
-          cargo set-version "${RELEASE_VERSION}"
-
-          if ! git diff --quiet -- Cargo.toml Cargo.lock; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Cargo.toml Cargo.lock
-            git commit -m "chore: release ${RELEASE_TAG}"
-          fi
-
-          echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+        run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
       - name: Push release tag
         env:
@@ -103,6 +84,8 @@ jobs:
       - source
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      TODEX_BUILD_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -130,6 +113,8 @@ jobs:
       - validate
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      TODEX_BUILD_VERSION: ${{ needs.prepare.outputs.version }}
     strategy:
       fail-fast: false
       matrix:

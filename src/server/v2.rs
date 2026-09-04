@@ -148,7 +148,7 @@ async fn skills(
 pub(super) async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
     Json(VersionResponse {
         name: env!("CARGO_PKG_NAME"),
-        version: env!("CARGO_PKG_VERSION"),
+        version: crate::version::APP_VERSION,
         data_dir: state.config.data_dir.display().to_string(),
         workspace_root: state.config.workspace_root.display().to_string(),
     })

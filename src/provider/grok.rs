@@ -60,7 +60,7 @@ impl GrokBuildDriver {
                         "clientInfo": {
                             "name": "todex-agentd",
                             "title": "TodeX 2.0",
-                            "version": env!("CARGO_PKG_VERSION")
+                            "version": crate::version::APP_VERSION
                         }
                     }
                 }))

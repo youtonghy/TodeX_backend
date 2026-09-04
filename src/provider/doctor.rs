@@ -86,7 +86,7 @@ pub async fn inspect_providers(
     Ok(ProviderDoctorReport {
         schema_version: 1,
         generated_at: chrono::Utc::now().to_rfc3339(),
-        backend_version: env!("CARGO_PKG_VERSION"),
+        backend_version: crate::version::APP_VERSION,
         billable: false,
         workspace_isolated: true,
         success,

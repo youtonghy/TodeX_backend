@@ -65,7 +65,7 @@ impl ProviderDriver for CodexDriver {
             "stdio://".to_owned(),
         ];
         let mut process = JsonLineProcess::spawn(&spec).await?;
-        process.send(&json!({"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"todex-agentd","version":env!("CARGO_PKG_VERSION")}}})).await?;
+        process.send(&json!({"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"todex-agentd","version":crate::version::APP_VERSION}}})).await?;
         let _ = read_rpc_response(&mut process, "initialize").await?;
         process.send(&json!({ "method": "initialized" })).await?;
         process
@@ -224,7 +224,7 @@ async fn run_codex_turn(
                 "clientInfo": {
                     "name": "todex-agentd",
                     "title": "TodeX 2.0",
-                    "version": env!("CARGO_PKG_VERSION")
+                    "version": crate::version::APP_VERSION
                 },
                 "capabilities": {
                     "experimentalApi": true,

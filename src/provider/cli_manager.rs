@@ -377,7 +377,7 @@ async fn latest_version(config: &Config, provider: ManagedCli) -> Result<Option<
 
     let client = reqwest::Client::builder()
         .timeout(VERSION_TIMEOUT)
-        .user_agent(concat!("todex-agentd/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("todex-agentd/{}", crate::version::APP_VERSION))
         .build()
         .map_err(|error| AppError::Anyhow(error.into()))?;
     let (url, field) = match provider {

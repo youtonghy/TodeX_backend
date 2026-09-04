@@ -148,7 +148,7 @@ pub(super) async fn run_acp_turn(
             ),
         )
         .client_info(
-            Implementation::new("todex-agentd", env!("CARGO_PKG_VERSION")).title("TodeX 2.0"),
+            Implementation::new("todex-agentd", crate::version::APP_VERSION).title("TodeX 2.0"),
         );
     send_request(process, "initialize", "initialize", initialize).await?;
     let initialize_value =
