@@ -100,6 +100,7 @@ pub fn routes() -> Router<AppState> {
             get(provider_upgrade_operation),
         )
         .route("/v2/providers/models", get(provider_models))
+        .route("/v2/providers/image-input", get(provider_image_input))
         .route("/v2/providers/commands", get(provider_commands))
         .route("/v2/catalog/skills", get(skills))
         .route("/v2/catalog/skills/{resource_id}", get(skill_resource))
@@ -1086,6 +1087,37 @@ async fn append_cli_audit(
 struct ProviderModelsQuery {
     provider: ProviderKind,
     workspace: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderImageInputQuery {
+    provider: ProviderKind,
+    workspace: String,
+    profile: Option<String>,
+    model: Option<String>,
+}
+
+async fn provider_image_input(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ProviderImageInputQuery>,
+) -> Result<Json<crate::provider::types::ProviderImageInputCapability>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace)?;
+    Ok(Json(
+        state
+            .conversations
+            .image_input_live(
+                &auth.tenant_id,
+                query.provider,
+                &workspace,
+                query.profile.as_deref(),
+                query.model.as_deref(),
+            )
+            .await?,
+    ))
 }
 
 async fn provider_models(

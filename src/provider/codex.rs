@@ -11,8 +11,9 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, PermissionOutcome,
-    ProviderCapabilities, ProviderCommandDescriptor, ProviderDescriptor, ProviderDriver,
+    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
+    PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor, ProviderDescriptor,
+    ProviderDriver,
 };
 
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -50,6 +51,7 @@ impl ProviderDriver for CodexDriver {
                 managed_mcp: true,
                 model_selection: true,
                 image_input: ProviderKind::Codex.supports_image_input(),
+                image_input_mode: ImageInputMode::Always,
             },
             models: Vec::new(),
         }
@@ -120,6 +122,7 @@ impl ProviderDriver for CodexDriver {
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned),
                     context_window: None,
+                    image_input: Some(true),
                 })
             })
             .collect())

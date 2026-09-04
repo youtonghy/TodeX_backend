@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use agent_client_protocol::schema::{
     v1::{
         CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
-        Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
+        ImageContent, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
         LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOptionKind,
         PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
         RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption,
@@ -25,8 +25,8 @@ use super::process::{
     executable_available, provider_exit_error, redact_sensitive_text, CommandSpec, JsonLineProcess,
 };
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, PermissionOutcome,
-    ProviderCapabilities, ProviderDescriptor, ProviderDriver,
+    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
+    PermissionOutcome, ProviderCapabilities, ProviderDescriptor, ProviderDriver,
 };
 
 pub struct AcpDriver {
@@ -42,6 +42,8 @@ pub(super) struct AcpRuntimeOptions {
     pub request_ask_mode: bool,
     pub legacy_model_state: bool,
     pub nested_config_values: bool,
+    pub allow_unadvertised_images: bool,
+    pub snake_case_image_mime: bool,
 }
 
 impl AcpDriver {
@@ -58,6 +60,18 @@ impl AcpDriver {
             .as_deref()
             .ok_or_else(|| {
                 AppError::InvalidRequest("ACP conversation requires a profile".to_owned())
+            })?;
+        self.profiles.get(profile).ok_or_else(|| {
+            AppError::ProviderUnavailable(format!("ACP profile '{profile}' is not configured"))
+        })
+    }
+
+    fn named_profile(&self, profile: Option<&str>) -> Result<&AcpProfileConfig, AppError> {
+        let profile = profile
+            .map(str::trim)
+            .filter(|profile| !profile.is_empty())
+            .ok_or_else(|| {
+                AppError::InvalidRequest("ACP image capability requires a profile".to_owned())
             })?;
         self.profiles.get(profile).ok_or_else(|| {
             AppError::ProviderUnavailable(format!("ACP profile '{profile}' is not configured"))
@@ -95,9 +109,65 @@ impl ProviderDriver for AcpDriver {
                 managed_mcp: false,
                 model_selection: false,
                 image_input: ProviderKind::Acp.supports_image_input(),
+                image_input_mode: ImageInputMode::Profile,
             },
             models: Vec::new(),
         }
+    }
+
+    async fn discover_image_input(
+        &self,
+        workspace: &std::path::Path,
+        profile: Option<&str>,
+    ) -> Result<bool, AppError> {
+        let profile = self.named_profile(profile)?;
+        let mut spec = CommandSpec::new(&profile.command, workspace);
+        spec.args = profile.args.clone();
+        spec.env = profile
+            .env
+            .iter()
+            .filter(|(key, _)| !key.starts_with("TODEX_AGENTD_"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let mut process = JsonLineProcess::spawn(&spec).await?;
+        let result = async {
+            send_request(
+                &mut process,
+                "initialize",
+                "initialize",
+                initialize_request(),
+            )
+            .await?;
+            loop {
+                let Some(message) = process.read().await? else {
+                    break Err(provider_exit_error(
+                        &mut process,
+                        "ACP agent closed during initialize",
+                    )
+                    .await);
+                };
+                if jsonrpc_id(&message) != Some("initialize") {
+                    continue;
+                }
+                if let Some(error) = message.get("error") {
+                    break Err(AppError::ProviderUnavailable(format!(
+                        "ACP initialize failed: {}",
+                        safe_error_text(error)
+                    )));
+                }
+                let response: InitializeResponse =
+                    serde_json::from_value(message.get("result").cloned().unwrap_or(Value::Null))
+                        .map_err(|error| {
+                        AppError::InvalidRequest(format!(
+                            "invalid ACP initialize response: {error}"
+                        ))
+                    })?;
+                break Ok(response.agent_capabilities.prompt_capabilities.image);
+            }
+        }
+        .await;
+        process.terminate().await;
+        result
     }
 
     async fn run_turn(
@@ -132,6 +202,19 @@ impl ProviderDriver for AcpDriver {
     }
 }
 
+fn initialize_request() -> InitializeRequest {
+    InitializeRequest::new(ProtocolVersion::V1)
+        .client_capabilities(
+            ClientCapabilities::new().session(
+                ClientSessionCapabilities::new()
+                    .config_options(SessionConfigOptionsCapabilities::new()),
+            ),
+        )
+        .client_info(
+            Implementation::new("todex-agentd", crate::version::APP_VERSION).title("TodeX 2.0"),
+        )
+}
+
 pub(super) async fn run_acp_turn(
     process: &mut JsonLineProcess,
     context: DriverContext,
@@ -141,16 +224,7 @@ pub(super) async fn run_acp_turn(
     options: AcpRuntimeOptions,
 ) -> Result<DriverTurnResult, AppError> {
     let provider = context.manifest.provider;
-    let initialize = InitializeRequest::new(ProtocolVersion::V1)
-        .client_capabilities(
-            ClientCapabilities::new().session(
-                ClientSessionCapabilities::new()
-                    .config_options(SessionConfigOptionsCapabilities::new()),
-            ),
-        )
-        .client_info(
-            Implementation::new("todex-agentd", crate::version::APP_VERSION).title("TodeX 2.0"),
-        );
+    let initialize = initialize_request();
     send_request(process, "initialize", "initialize", initialize).await?;
     let initialize_value =
         wait_for_response(process, "initialize", sink, cancel, provider, true).await?;
@@ -164,6 +238,12 @@ pub(super) async fn run_acp_turn(
             initialize.protocol_version
         )));
     }
+    ensure_acp_images_supported(
+        &prompt,
+        initialize.agent_capabilities.prompt_capabilities.image,
+        options.allow_unadvertised_images,
+        context.manifest.provider,
+    )?;
     authenticate_if_requested(process, &initialize_value, sink, cancel, provider, &options).await?;
 
     let (native_session_id, config_options, legacy_models) = match context
@@ -247,10 +327,14 @@ pub(super) async fn run_acp_turn(
     )
     .await?;
 
-    let request = PromptRequest::new(
-        native_session_id.clone(),
-        vec![ContentBlock::Text(TextContent::new(prompt.text))],
-    );
+    let content = acp_prompt_content(&prompt);
+    let mut request = serde_json::to_value(PromptRequest::new(native_session_id.clone(), content))?;
+    // ACP v1 agents in the field (including Claude Code/Grok Build) still
+    // expect the historical snake_case MIME key even though the Rust schema
+    // serializes it as camelCase. Keep the wire compatibility at this edge.
+    if options.snake_case_image_mime {
+        normalize_acp_image_wire(&mut request);
+    }
     send_request(process, &prompt.turn_id, "session/prompt", request).await?;
     loop {
         let message = tokio::select! {
@@ -312,6 +396,54 @@ pub(super) async fn run_acp_turn(
                 });
             }
             return Err(error);
+        }
+    }
+}
+
+fn ensure_acp_images_supported(
+    prompt: &DriverPrompt,
+    advertised: bool,
+    allow_unadvertised: bool,
+    provider: ProviderKind,
+) -> Result<(), AppError> {
+    let has_images = prompt
+        .content
+        .iter()
+        .any(|content| matches!(content, super::types::DriverPromptContent::Image { .. }));
+    if has_images && !advertised && !allow_unadvertised {
+        Err(AppError::ImageInputUnsupported(format!(
+            "{} does not advertise ACP image prompt support",
+            provider.as_str()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn acp_prompt_content(prompt: &DriverPrompt) -> Vec<ContentBlock> {
+    let mut content = Vec::new();
+    if !prompt.text.is_empty() {
+        content.push(ContentBlock::Text(TextContent::new(prompt.text.clone())));
+    }
+    content.extend(prompt.content.iter().filter_map(|item| match item {
+        super::types::DriverPromptContent::Image {
+            data, mime_type, ..
+        } => Some(ContentBlock::Image(ImageContent::new(data, mime_type))),
+        super::types::DriverPromptContent::File { .. } => None,
+    }));
+    content
+}
+
+fn normalize_acp_image_wire(request: &mut Value) {
+    if let Some(items) = request.get_mut("prompt").and_then(Value::as_array_mut) {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("image") {
+                if let Some(mime_type) = item.get("mimeType").cloned() {
+                    let object = item.as_object_mut().expect("image content object");
+                    object.remove("mimeType");
+                    object.insert("mime_type".to_owned(), mime_type);
+                }
+            }
         }
     }
 }
@@ -1085,6 +1217,46 @@ fn safe_error_text(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_prompt() -> DriverPrompt {
+        DriverPrompt {
+            turn_id: "turn-1".to_owned(),
+            text: "inspect this".to_owned(),
+            content: vec![super::super::types::DriverPromptContent::Image {
+                path: None,
+                data: "aGVsbG8=".to_owned(),
+                mime_type: "image/png".to_owned(),
+            }],
+            skills: Vec::new(),
+            model: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn acp_prompt_serializes_images_as_protocol_content_blocks() {
+        let mut value = serde_json::to_value(PromptRequest::new(
+            "session-1".to_owned(),
+            acp_prompt_content(&image_prompt()),
+        ))
+        .unwrap();
+        normalize_acp_image_wire(&mut value);
+        assert_eq!(value["prompt"][0]["type"], "text");
+        assert_eq!(value["prompt"][1]["type"], "image");
+        assert_eq!(value["prompt"][1]["data"], "aGVsbG8=");
+        assert_eq!(value["prompt"][1]["mime_type"], "image/png");
+        assert!(value["prompt"][1].get("mimeType").is_none());
+    }
+
+    #[test]
+    fn acp_rejects_unadvertised_images_except_for_vendor_override() {
+        let prompt = image_prompt();
+        assert!(matches!(
+            ensure_acp_images_supported(&prompt, false, false, ProviderKind::Acp),
+            Err(AppError::ImageInputUnsupported(_))
+        ));
+        assert!(ensure_acp_images_supported(&prompt, false, true, ProviderKind::GrokBuild).is_ok());
+    }
 
     fn request(options: Value) -> RequestPermissionRequest {
         serde_json::from_value(json!({

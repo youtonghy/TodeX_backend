@@ -40,6 +40,8 @@ pub enum AppError {
     GitScanLimitExceeded,
     #[error("unsupported capability: {0}")]
     Unsupported(String),
+    #[error("image input unsupported: {0}")]
+    ImageInputUnsupported(String),
     #[error("resource not found: {0}")]
     NotFound(String),
     #[error("resource is busy: {0}")]
@@ -81,6 +83,7 @@ impl AppError {
             Self::GitProcess(_) => "GIT_PROCESS_ERROR",
             Self::GitScanLimitExceeded => "GIT_SCAN_LIMIT_EXCEEDED",
             Self::Unsupported(_) => "UNSUPPORTED",
+            Self::ImageInputUnsupported(_) => "IMAGE_INPUT_UNSUPPORTED",
             Self::NotFound(_) => "NOT_FOUND",
             Self::Conflict(_) => "CONFLICT",
             Self::TurnCancelled => "TURN_CANCELLED",
@@ -113,6 +116,7 @@ impl IntoResponse for AppError {
             Self::GitProcess(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::GitScanLimitExceeded => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
+            Self::ImageInputUnsupported(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::TurnCancelled => StatusCode::CONFLICT,

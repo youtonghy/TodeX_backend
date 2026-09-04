@@ -16,8 +16,9 @@ use super::process::{
     executable_available, redact_sensitive_text, run_bounded_command, CommandSpec, JsonLineProcess,
 };
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ProviderCapabilities,
-    ProviderCommandDescriptor, ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
+    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
+    ProviderCapabilities, ProviderCommandDescriptor, ProviderDescriptor, ProviderDriver,
+    ProviderModelDescriptor,
 };
 
 const INSPECT_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -131,6 +132,7 @@ impl ProviderDriver for GrokBuildDriver {
                 managed_mcp: false,
                 model_selection: true,
                 image_input: ProviderKind::GrokBuild.supports_image_input(),
+                image_input_mode: ImageInputMode::Always,
             },
             models: Vec::new(),
         }
@@ -177,6 +179,8 @@ impl ProviderDriver for GrokBuildDriver {
                 request_ask_mode: true,
                 legacy_model_state: true,
                 nested_config_values: true,
+                allow_unadvertised_images: true,
+                snake_case_image_mime: false,
             },
         )
         .await;
@@ -299,6 +303,7 @@ fn parse_models(initialize: &Value) -> Vec<ProviderModelDescriptor> {
                     .and_then(Value::as_u64),
                 id,
                 supported_reasoning_efforts: efforts,
+                image_input: Some(true),
             })
         })
         .collect()

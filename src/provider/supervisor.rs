@@ -30,9 +30,9 @@ use super::codex::CodexDriver;
 use super::grok::GrokBuildDriver;
 use super::pi::PiDriver;
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill,
+    DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill, ImageInputMode,
     PermissionBroker, PermissionDecision, PermissionOutcome, ProviderCommandDescriptor,
-    ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
+    ProviderDescriptor, ProviderDriver, ProviderImageInputCapability, ProviderModelDescriptor,
 };
 
 const MAX_PROMPT_BYTES: usize = 512 * 1024;
@@ -266,6 +266,82 @@ impl ConversationSupervisor {
                 provider.as_str()
             ))
         })?
+    }
+
+    pub async fn image_input_live(
+        &self,
+        owner_id: &str,
+        provider: ProviderKind,
+        workspace: &Path,
+        profile: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<ProviderImageInputCapability, AppError> {
+        let descriptor = self.registry.driver(provider)?.descriptor();
+        let (image_input, source, reason) = match descriptor.capabilities.image_input_mode {
+            ImageInputMode::Always => (true, "provider".to_owned(), None),
+            ImageInputMode::None => (
+                false,
+                "provider".to_owned(),
+                Some("this provider does not support image input".to_owned()),
+            ),
+            ImageInputMode::Model => {
+                let models = self.models_live(owner_id, provider, workspace).await?;
+                let selected = model
+                    .and_then(|id| models.iter().find(|candidate| candidate.id == id))
+                    .or_else(|| models.iter().find(|candidate| candidate.is_default));
+                match selected {
+                    Some(selected) => (
+                        selected.image_input.unwrap_or(false),
+                        "model".to_owned(),
+                        (!selected.image_input.unwrap_or(false)).then(|| {
+                            format!("model '{}' does not support image input", selected.id)
+                        }),
+                    ),
+                    None => (
+                        false,
+                        "model".to_owned(),
+                        Some("the selected model's image capability is unknown".to_owned()),
+                    ),
+                }
+            }
+            ImageInputMode::Profile => {
+                let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
+                    AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
+                })?;
+                let _launch_permit = self
+                    .workspace_trust
+                    .acquire_owned(owner_id, workspace)
+                    .await?;
+                let image_input = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    self.registry
+                        .driver(provider)?
+                        .discover_image_input(workspace, profile),
+                )
+                .await
+                .map_err(|_| {
+                    AppError::ProviderUnavailable(format!(
+                        "{} image capability discovery timed out",
+                        provider.as_str()
+                    ))
+                })??;
+                (
+                    image_input,
+                    "profile".to_owned(),
+                    (!image_input).then(|| {
+                        "the selected ACP profile does not advertise image input".to_owned()
+                    }),
+                )
+            }
+        };
+        Ok(ProviderImageInputCapability {
+            provider,
+            profile: profile.map(ToOwned::to_owned),
+            model: model.map(ToOwned::to_owned),
+            image_input,
+            source,
+            reason,
+        })
     }
 
     pub async fn commands_live(
@@ -1145,7 +1221,7 @@ async fn canonical_workspace_file(workspace: &Path, path: PathBuf) -> Result<Pat
 }
 
 fn ensure_image_provider(provider: ProviderKind) -> Result<(), AppError> {
-    if provider.supports_image_input() {
+    if provider == ProviderKind::Acp || provider.supports_image_input() {
         Ok(())
     } else {
         Err(AppError::Unsupported(format!(
@@ -1860,6 +1936,8 @@ done
             ProviderKind::Codex,
             ProviderKind::Pi,
             ProviderKind::ClaudeCode,
+            ProviderKind::Acp,
+            ProviderKind::GrokBuild,
         ] {
             let (_, content) = prepare_prompt_content(
                 provider,
@@ -1875,19 +1953,6 @@ done
                 content.as_slice(),
                 [DriverPromptContent::Image { path: None, .. }]
             ));
-        }
-        for provider in [ProviderKind::Acp, ProviderKind::GrokBuild] {
-            let error = prepare_prompt_content(
-                provider,
-                &root,
-                vec![PromptContentRef::Image {
-                    data: "cG5n".to_owned(),
-                    mime_type: "image/png".to_owned(),
-                }],
-            )
-            .await
-            .expect_err("unsupported image input must fail explicitly");
-            assert!(matches!(error, AppError::Unsupported(_)));
         }
         let _ = fs::remove_dir_all(root);
     }

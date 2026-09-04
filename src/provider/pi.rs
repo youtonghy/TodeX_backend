@@ -11,8 +11,9 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, PermissionOutcome,
-    ProviderCapabilities, ProviderCommandDescriptor, ProviderDescriptor, ProviderDriver,
+    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
+    PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor, ProviderDescriptor,
+    ProviderDriver,
 };
 
 pub struct PiDriver {
@@ -49,6 +50,7 @@ impl ProviderDriver for PiDriver {
                 managed_mcp: true,
                 model_selection: true,
                 image_input: ProviderKind::Pi.supports_image_input(),
+                image_input_mode: ImageInputMode::Model,
             },
             models: Vec::new(),
         }
@@ -253,6 +255,9 @@ fn parse_pi_models(response: &Value, state: &Value) -> Vec<super::types::Provide
                     .flatten()
                     .map(str::to_owned),
                 context_window: item.get("contextWindow").and_then(Value::as_u64),
+                image_input: Some(item.get("input").and_then(Value::as_array).is_some_and(
+                    |inputs| inputs.iter().any(|input| input.as_str() == Some("image")),
+                )),
             })
         })
         .collect()
@@ -287,6 +292,12 @@ fn pi_supported_thinking_levels(item: &Value) -> Vec<String> {
         .collect()
 }
 
+fn pi_model_supports_images(item: &Value) -> bool {
+    item.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|inputs| inputs.iter().any(|input| input.as_str() == Some("image")))
+}
+
 async fn run_pi_turn(
     process: &mut JsonLineProcess,
     context: DriverContext,
@@ -301,6 +312,19 @@ async fn run_pi_turn(
     let state = wait_for_response(process, "state", sink, cancel).await?;
     if state.get("success").and_then(Value::as_bool) != Some(true) {
         return Err(pi_response_error(&state, "get_state"));
+    }
+    let has_images = prompt
+        .content
+        .iter()
+        .any(|content| matches!(content, super::types::DriverPromptContent::Image { .. }));
+    if has_images
+        && !state
+            .pointer("/data/model")
+            .is_some_and(pi_model_supports_images)
+    {
+        return Err(AppError::ImageInputUnsupported(
+            "the selected Pi model does not support image input".to_owned(),
+        ));
     }
 
     let mut provider_state = context.provider_state;
@@ -677,7 +701,7 @@ mod tests {
     #[test]
     fn parses_model_specific_thinking_levels_and_default() {
         let response = json!({"data":{"models":[
-            {"provider":"zai","id":"glm-5.3","reasoning":true,"thinkingLevelMap":{"off":null,"xhigh":"xhigh","max":"max"}},
+            {"provider":"zai","id":"glm-5.3","input":["text","image"],"reasoning":true,"thinkingLevelMap":{"off":null,"xhigh":"xhigh","max":"max"}},
             {"provider":"retoo","id":"deepseek-v4","reasoning":true,"thinkingLevelMap":{"off":null,"minimal":null,"low":null,"medium":null,"high":null,"xhigh":null,"max":"max"}},
             {"provider":"plain","id":"chat","reasoning":false}
         ]}});
@@ -690,6 +714,8 @@ mod tests {
         );
         assert!(models[0].is_default);
         assert_eq!(models[0].default_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(models[0].image_input, Some(true));
+        assert_eq!(models[1].image_input, Some(false));
         assert_eq!(models[1].supported_reasoning_efforts, ["max"]);
         assert_eq!(models[2].supported_reasoning_efforts, ["off"]);
     }

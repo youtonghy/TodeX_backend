@@ -9,7 +9,7 @@ mod grok;
 mod pi;
 pub(crate) mod process;
 mod supervisor;
-mod types;
+pub(crate) mod types;
 
 pub(crate) use cli_manager::{
     read_current_version, run_upgrade, CliManager, CliUpgradeOperation, CliVersionsResponse,

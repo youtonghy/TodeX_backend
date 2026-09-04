@@ -38,7 +38,10 @@ impl ProviderKind {
     }
 
     pub const fn supports_image_input(self) -> bool {
-        matches!(self, Self::Codex | Self::Pi | Self::ClaudeCode)
+        matches!(
+            self,
+            Self::Codex | Self::Pi | Self::ClaudeCode | Self::GrokBuild
+        )
     }
 }
 

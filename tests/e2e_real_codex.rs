@@ -14,7 +14,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 use tungstenite::client::IntoClientRequest;
 
 const TOKEN: &str = "todex_real_e2e_token";
-const CLAUDE_IMAGE_BASE64: &str = include_str!("fixtures/claude_image.png.b64");
+const IMAGE_BASE64: &str = include_str!("fixtures/claude_image.png.b64");
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -245,16 +245,14 @@ async fn real_v2_provider_http_ws_roundtrip() {
                     .any(|item| item["id"] == provider && item["available"] == true)),
             "provider {provider} is not available: {provider_catalog}"
         );
-        if provider == "claude-code" {
-            assert!(
-                provider_catalog["providers"]
-                    .as_array()
-                    .is_some_and(|items| items.iter().any(|item| {
-                        item["id"] == provider && item["capabilities"]["imageInput"] == true
-                    })),
-                "Claude Code must advertise image input: {provider_catalog}"
-            );
-        }
+        assert!(
+            provider_catalog["providers"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| {
+                    item["id"] == provider && item["capabilities"]["imageInput"] == true
+                })),
+            "provider {provider} must advertise image input: {provider_catalog}"
+        );
         let create = http_request(
             daemon.port,
             "POST",
@@ -308,7 +306,8 @@ async fn real_v2_provider_http_ws_roundtrip() {
                     .expect("model discovery must return an array");
                 selected_model = models
                     .iter()
-                    .find(|model| model["isDefault"] == true)
+                    .find(|model| model["imageInput"] == true && model["isDefault"] == true)
+                    .or_else(|| models.iter().find(|model| model["imageInput"] == true))
                     .or_else(|| models.first())
                     .and_then(|model| model["id"].as_str())
                     .map(ToOwned::to_owned);
@@ -325,22 +324,16 @@ async fn real_v2_provider_http_ws_roundtrip() {
                 .unwrap()
                 .as_nanos()
         );
-        let prompt_text = if provider == "claude-code" {
-            format!("Identify the dominant color in the attached image. Reply with the color name, then a newline, then exactly {sentinel}. Do not use tools or modify files.")
-        } else {
-            format!("First use one read-only tool to determine the current working directory. After the tool result, reply with exactly {sentinel} and nothing else. Do not modify files.")
-        };
+        let prompt_text = format!("Identify the dominant color in the attached image. Reply with the color name, then a newline, then exactly {sentinel}. Do not use tools or modify files.");
         let mut prompt_payload = json!({
             "text": prompt_text,
             "model": selected_model,
         });
-        if provider == "claude-code" {
-            prompt_payload["content"] = json!([{
-                "type": "image",
-                "data": CLAUDE_IMAGE_BASE64.trim(),
-                "mimeType": "image/png",
-            }]);
-        }
+        prompt_payload["content"] = json!([{
+            "type": "image",
+            "data": IMAGE_BASE64.trim(),
+            "mimeType": "image/png",
+        }]);
         let prompt = http_request(
             daemon.port,
             "POST",
@@ -382,8 +375,8 @@ fn require_real_v2_e2e() {
         .filter(|value| !value.is_empty())
     {
         assert!(
-            matches!(provider, "codex" | "pi" | "claude-code"),
-            "real v2 smoke supports only codex, pi, and claude-code, got {provider}"
+            matches!(provider, "codex" | "pi" | "claude-code" | "grok-build"),
+            "real v2 smoke supports codex, pi, claude-code, and grok-build, got {provider}"
         );
         let binary = match provider {
             "codex" => codex_binary(),
@@ -393,6 +386,9 @@ fn require_real_v2_e2e() {
             "claude-code" => env::var_os("TODEX_REAL_CLAUDE_BIN")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("claude")),
+            "grok-build" => env::var_os("TODEX_REAL_GROK_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("grok")),
             other => panic!("unsupported provider {other}"),
         };
         let output = Command::new(&binary)
@@ -861,6 +857,10 @@ async fn spawn_daemon() -> Daemon {
             "TODEX_AGENTD_CLAUDE_BIN",
             env::var_os("TODEX_REAL_CLAUDE_BIN").unwrap_or_else(|| "claude".into()),
         )
+        .env(
+            "TODEX_AGENTD_GROK_BIN",
+            env::var_os("TODEX_REAL_GROK_BIN").unwrap_or_else(|| "grok".into()),
+        )
         .env("CODEX_HOME", &codex_home)
         .env("PI_CODING_AGENT_DIR", &pi_home)
         .stdin(Stdio::null())
@@ -1256,7 +1256,6 @@ async fn wait_for_successful_conversation_turn(
     provider: &str,
 ) {
     let mut saw_assistant = false;
-    let mut saw_tool = false;
     let mut seen_types = Vec::new();
     timeout(Duration::from_secs(180), async {
         while let Some(message) = ws.next().await {
@@ -1282,7 +1281,7 @@ async fn wait_for_successful_conversation_turn(
                 || payload.pointer("/block/turnId").and_then(Value::as_str) == Some(turn_id);
             if matching_turn && matches!(event_type, "turn.failed" | "turn.cancelled") {
                 panic!(
-                    "provider {provider} ended turn {turn_id} with {event_type}; recent event types: {seen_types:?}"
+                    "provider {provider} ended turn {turn_id} with {event_type}; payload: {payload}; recent event types: {seen_types:?}"
                 );
             }
             if matches!(event_type, "tool.started" | "tool.updated" | "tool.completed") {
@@ -1296,30 +1295,15 @@ async fn wait_for_successful_conversation_turn(
                     Some(turn_id),
                     "provider {provider} emitted a tool event for the wrong turn: {payload}"
                 );
-                saw_tool = true;
             }
             if event_type == "message.completed" && payload.to_string().contains(sentinel) {
-                if provider == "claude-code" {
-                    assert!(
-                        payload.to_string().to_ascii_lowercase().contains("red"),
-                        "Claude Code completed without reading the attached image: {payload}"
-                    );
-                } else {
-                    assert_eq!(
-                        payload.pointer("/block/category").and_then(Value::as_str),
-                        Some("assistant_final"),
-                        "provider {provider} emitted the final answer without final semantics: {payload}"
-                    );
-                }
+                assert!(
+                    payload.to_string().to_ascii_lowercase().contains("red"),
+                    "provider {provider} completed without reading the attached image: {payload}"
+                );
                 saw_assistant = true;
             }
             if matching_turn && event_type == "turn.completed" {
-                if provider != "claude-code" {
-                    assert!(
-                        saw_tool,
-                        "provider {provider} completed turn {turn_id} without the requested tool call; recent event types: {seen_types:?}"
-                    );
-                }
                 assert!(
                     saw_assistant,
                     "provider {provider} completed turn {turn_id} without the sentinel assistant message; recent event types: {seen_types:?}"

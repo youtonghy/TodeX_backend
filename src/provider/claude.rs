@@ -10,8 +10,8 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, PermissionOutcome,
-    ProviderCapabilities, ProviderDescriptor, ProviderDriver,
+    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
+    PermissionOutcome, ProviderCapabilities, ProviderDescriptor, ProviderDriver,
 };
 
 pub struct ClaudeDriver {
@@ -32,6 +32,7 @@ fn claude_model_aliases() -> Vec<super::types::ProviderModelDescriptor> {
                 .collect(),
             default_reasoning_effort: None,
             context_window: None,
+            image_input: Some(true),
         })
         .collect()
 }
@@ -65,6 +66,7 @@ impl ProviderDriver for ClaudeDriver {
                 managed_mcp: true,
                 model_selection: true,
                 image_input: ProviderKind::ClaudeCode.supports_image_input(),
+                image_input_mode: ImageInputMode::Always,
             },
             models: claude_model_aliases(),
         }
@@ -117,6 +119,7 @@ impl ProviderDriver for ClaudeDriver {
                         .get("context_window")
                         .or_else(|| item.get("contextWindow"))
                         .and_then(Value::as_u64),
+                    image_input: Some(true),
                 })
             })
             .collect::<Vec<_>>();

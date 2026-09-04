@@ -30,6 +30,16 @@ pub struct ProviderCapabilities {
     pub managed_mcp: bool,
     pub model_selection: bool,
     pub image_input: bool,
+    pub image_input_mode: ImageInputMode,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImageInputMode {
+    Always,
+    Model,
+    Profile,
+    None,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -44,6 +54,22 @@ pub struct ProviderModelDescriptor {
     pub default_reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImageInputCapability {
+    pub provider: ProviderKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub image_input: bool,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -227,6 +253,14 @@ pub trait ProviderDriver: Send + Sync {
         _workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
         Ok(Vec::new())
+    }
+
+    async fn discover_image_input(
+        &self,
+        _workspace: &Path,
+        _profile: Option<&str>,
+    ) -> Result<bool, AppError> {
+        Ok(self.descriptor().capabilities.image_input)
     }
 
     async fn run_turn(
@@ -445,10 +479,12 @@ mod tests {
             managed_mcp: true,
             model_selection: true,
             image_input: true,
+            image_input_mode: ImageInputMode::Always,
         })
         .unwrap();
 
         assert_eq!(value["imageInput"], true);
+        assert_eq!(value["imageInputMode"], "always");
         assert!(value.get("image_input").is_none());
     }
 
