@@ -49,6 +49,7 @@ impl ProviderDriver for CodexDriver {
                 native_mcp: true,
                 managed_mcp: true,
                 model_selection: true,
+                image_input: ProviderKind::Codex.supports_image_input(),
             },
             models: Vec::new(),
         }

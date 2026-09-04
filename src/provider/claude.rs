@@ -64,6 +64,7 @@ impl ProviderDriver for ClaudeDriver {
                 native_mcp: true,
                 managed_mcp: true,
                 model_selection: true,
+                image_input: ProviderKind::ClaudeCode.supports_image_input(),
             },
             models: claude_model_aliases(),
         }
@@ -182,9 +183,42 @@ impl ProviderDriver for ClaudeDriver {
     }
 }
 
+fn claude_user_content(prompt: &DriverPrompt) -> Value {
+    let images = prompt
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            super::types::DriverPromptContent::Image {
+                data, mime_type, ..
+            } => Some(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type,
+                    "data": data,
+                },
+            })),
+            super::types::DriverPromptContent::File { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return Value::String(prompt.text.clone());
+    }
+
+    let mut content = Vec::with_capacity(images.len() + usize::from(!prompt.text.is_empty()));
+    if !prompt.text.is_empty() {
+        content.push(json!({ "type": "text", "text": prompt.text }));
+    }
+    content.extend(images);
+    Value::Array(content)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::claude_model_aliases;
+    use serde_json::json;
+
+    use super::{claude_model_aliases, claude_user_content};
+    use crate::provider::types::{DriverPrompt, DriverPromptContent};
 
     #[test]
     fn built_in_model_aliases_are_selectable_without_gateway_discovery() {
@@ -203,6 +237,51 @@ mod tests {
             ["low", "medium", "high", "xhigh", "max"]
         );
     }
+
+    #[test]
+    fn text_only_prompt_keeps_the_existing_string_shape() {
+        let prompt = DriverPrompt {
+            turn_id: "turn-1".to_owned(),
+            text: "hello".to_owned(),
+            content: Vec::new(),
+            skills: Vec::new(),
+            model: None,
+            reasoning_effort: None,
+        };
+
+        assert_eq!(claude_user_content(&prompt), json!("hello"));
+    }
+
+    #[test]
+    fn image_prompt_uses_claude_streaming_content_blocks() {
+        let prompt = DriverPrompt {
+            turn_id: "turn-2".to_owned(),
+            text: "describe this".to_owned(),
+            content: vec![DriverPromptContent::Image {
+                path: None,
+                data: "cG5n".to_owned(),
+                mime_type: "image/png".to_owned(),
+            }],
+            skills: Vec::new(),
+            model: None,
+            reasoning_effort: None,
+        };
+
+        assert_eq!(
+            claude_user_content(&prompt),
+            json!([
+                { "type": "text", "text": "describe this" },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "cG5n",
+                    },
+                },
+            ])
+        );
+    }
 }
 
 async fn run_claude_turn(
@@ -213,6 +292,7 @@ async fn run_claude_turn(
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<DriverTurnResult, AppError> {
+    let message_content = claude_user_content(&prompt);
     process
         .send(&json!({
             "type": "user",
@@ -220,7 +300,7 @@ async fn run_claude_turn(
             "parent_tool_use_id": null,
             "message": {
                 "role": "user",
-                "content": prompt.text,
+                "content": message_content,
             }
         }))
         .await?;

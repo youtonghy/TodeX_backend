@@ -48,6 +48,7 @@ impl ProviderDriver for PiDriver {
                 native_mcp: false,
                 managed_mcp: true,
                 model_selection: true,
+                image_input: ProviderKind::Pi.supports_image_input(),
             },
             models: Vec::new(),
         }

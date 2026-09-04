@@ -29,6 +29,7 @@ pub struct ProviderCapabilities {
     pub native_mcp: bool,
     pub managed_mcp: bool,
     pub model_selection: bool,
+    pub image_input: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -431,6 +432,25 @@ fn normalize_permission_options(options: Value) -> Result<Value, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_capabilities_publish_image_input_in_camel_case() {
+        let value = serde_json::to_value(ProviderCapabilities {
+            native_resume: true,
+            cancel: true,
+            permissions: true,
+            tool_events: true,
+            native_skills: true,
+            native_mcp: true,
+            managed_mcp: true,
+            model_selection: true,
+            image_input: true,
+        })
+        .unwrap();
+
+        assert_eq!(value["imageInput"], true);
+        assert!(value.get("image_input").is_none());
+    }
 
     #[tokio::test]
     async fn permission_persistence_failure_cleans_pending_request() {

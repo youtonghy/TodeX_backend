@@ -130,6 +130,7 @@ impl ProviderDriver for GrokBuildDriver {
                 native_mcp: true,
                 managed_mcp: false,
                 model_selection: true,
+                image_input: ProviderKind::GrokBuild.supports_image_input(),
             },
             models: Vec::new(),
         }

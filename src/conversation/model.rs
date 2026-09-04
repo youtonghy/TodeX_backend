@@ -36,6 +36,10 @@ impl ProviderKind {
             Self::GrokBuild => "grok-build",
         }
     }
+
+    pub const fn supports_image_input(self) -> bool {
+        matches!(self, Self::Codex | Self::Pi | Self::ClaudeCode)
+    }
 }
 
 impl std::str::FromStr for ProviderKind {

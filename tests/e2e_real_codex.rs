@@ -14,6 +14,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 use tungstenite::client::IntoClientRequest;
 
 const TOKEN: &str = "todex_real_e2e_token";
+const CLAUDE_IMAGE_BASE64: &str = include_str!("fixtures/claude_image.png.b64");
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -244,6 +245,16 @@ async fn real_v2_provider_http_ws_roundtrip() {
                     .any(|item| item["id"] == provider && item["available"] == true)),
             "provider {provider} is not available: {provider_catalog}"
         );
+        if provider == "claude-code" {
+            assert!(
+                provider_catalog["providers"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| {
+                        item["id"] == provider && item["capabilities"]["imageInput"] == true
+                    })),
+                "Claude Code must advertise image input: {provider_catalog}"
+            );
+        }
         let create = http_request(
             daemon.port,
             "POST",
@@ -314,15 +325,28 @@ async fn real_v2_provider_http_ws_roundtrip() {
                 .unwrap()
                 .as_nanos()
         );
+        let prompt_text = if provider == "claude-code" {
+            format!("Identify the dominant color in the attached image. Reply with the color name, then a newline, then exactly {sentinel}. Do not use tools or modify files.")
+        } else {
+            format!("First use one read-only tool to determine the current working directory. After the tool result, reply with exactly {sentinel} and nothing else. Do not modify files.")
+        };
+        let mut prompt_payload = json!({
+            "text": prompt_text,
+            "model": selected_model,
+        });
+        if provider == "claude-code" {
+            prompt_payload["content"] = json!([{
+                "type": "image",
+                "data": CLAUDE_IMAGE_BASE64.trim(),
+                "mimeType": "image/png",
+            }]);
+        }
         let prompt = http_request(
             daemon.port,
             "POST",
             &format!("/v2/conversations/{conversation_id}/prompt"),
             Some(TOKEN),
-            Some(json!({
-                "text": format!("First use one read-only tool to determine the current working directory. After the tool result, reply with exactly {sentinel} and nothing else. Do not modify files."),
-                "model": selected_model,
-            })),
+            Some(prompt_payload),
         )
         .await;
         assert_eq!(prompt.0, 200, "prompt {provider}: {}", prompt.1);
@@ -358,14 +382,17 @@ fn require_real_v2_e2e() {
         .filter(|value| !value.is_empty())
     {
         assert!(
-            matches!(provider, "codex" | "pi"),
-            "real v2 smoke supports only codex and pi, got {provider}"
+            matches!(provider, "codex" | "pi" | "claude-code"),
+            "real v2 smoke supports only codex, pi, and claude-code, got {provider}"
         );
         let binary = match provider {
             "codex" => codex_binary(),
             "pi" => env::var_os("TODEX_REAL_PI_BIN")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("pi")),
+            "claude-code" => env::var_os("TODEX_REAL_CLAUDE_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("claude")),
             other => panic!("unsupported provider {other}"),
         };
         let output = Command::new(&binary)
@@ -1272,18 +1299,27 @@ async fn wait_for_successful_conversation_turn(
                 saw_tool = true;
             }
             if event_type == "message.completed" && payload.to_string().contains(sentinel) {
-                assert_eq!(
-                    payload.pointer("/block/category").and_then(Value::as_str),
-                    Some("assistant_final"),
-                    "provider {provider} emitted the final answer without final semantics: {payload}"
-                );
+                if provider == "claude-code" {
+                    assert!(
+                        payload.to_string().to_ascii_lowercase().contains("red"),
+                        "Claude Code completed without reading the attached image: {payload}"
+                    );
+                } else {
+                    assert_eq!(
+                        payload.pointer("/block/category").and_then(Value::as_str),
+                        Some("assistant_final"),
+                        "provider {provider} emitted the final answer without final semantics: {payload}"
+                    );
+                }
                 saw_assistant = true;
             }
             if matching_turn && event_type == "turn.completed" {
-                assert!(
-                    saw_tool,
-                    "provider {provider} completed turn {turn_id} without the requested tool call; recent event types: {seen_types:?}"
-                );
+                if provider != "claude-code" {
+                    assert!(
+                        saw_tool,
+                        "provider {provider} completed turn {turn_id} without the requested tool call; recent event types: {seen_types:?}"
+                    );
+                }
                 assert!(
                     saw_assistant,
                     "provider {provider} completed turn {turn_id} without the sentinel assistant message; recent event types: {seen_types:?}"

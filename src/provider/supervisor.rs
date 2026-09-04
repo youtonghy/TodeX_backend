@@ -66,6 +66,7 @@ pub enum PromptContentRef {
     },
     Image {
         data: String,
+        #[serde(rename = "mimeType", alias = "mime_type")]
         mime_type: String,
     },
     File {
@@ -1144,7 +1145,7 @@ async fn canonical_workspace_file(workspace: &Path, path: PathBuf) -> Result<Pat
 }
 
 fn ensure_image_provider(provider: ProviderKind) -> Result<(), AppError> {
-    if matches!(provider, ProviderKind::Codex | ProviderKind::Pi) {
+    if provider.supports_image_input() {
         Ok(())
     } else {
         Err(AppError::Unsupported(format!(
@@ -1785,6 +1786,30 @@ done
         assert!(composed.contains("<skill name=\"build\">"));
     }
 
+    #[test]
+    fn prompt_images_accept_camel_case_and_legacy_mime_fields() {
+        for value in [
+            serde_json::json!({ "type": "image", "data": "cG5n", "mimeType": "image/png" }),
+            serde_json::json!({ "type": "image", "data": "cG5n", "mime_type": "image/png" }),
+        ] {
+            let content: PromptContentRef = serde_json::from_value(value).unwrap();
+            assert!(matches!(
+                content,
+                PromptContentRef::Image { data, mime_type }
+                    if data == "cG5n" && mime_type == "image/png"
+            ));
+        }
+
+        let error = serde_json::from_value::<PromptContentRef>(serde_json::json!({
+            "type": "image",
+            "data": "cG5n",
+            "mimeType": "image/png",
+            "unexpected": true,
+        }))
+        .expect_err("unknown prompt image fields must remain rejected");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
     #[tokio::test]
     async fn prompt_content_is_confined_to_workspace() {
         let root = temp_dir("todex-prompt-content");
@@ -1828,20 +1853,42 @@ done
     }
 
     #[tokio::test]
-    async fn typed_images_are_rejected_for_unsupported_providers() {
-        let root = temp_dir("todex-unsupported-image");
+    async fn typed_image_support_matches_provider_capabilities() {
+        let root = temp_dir("todex-provider-image-capabilities");
         fs::create_dir_all(&root).unwrap();
-        let error = prepare_prompt_content(
+        for provider in [
+            ProviderKind::Codex,
+            ProviderKind::Pi,
             ProviderKind::ClaudeCode,
-            &root,
-            vec![PromptContentRef::Image {
-                data: "cG5n".to_owned(),
-                mime_type: "image/png".to_owned(),
-            }],
-        )
-        .await
-        .expect_err("unsupported image input must fail explicitly");
-        assert!(matches!(error, AppError::Unsupported(_)));
+        ] {
+            let (_, content) = prepare_prompt_content(
+                provider,
+                &root,
+                vec![PromptContentRef::Image {
+                    data: "cG5n".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                }],
+            )
+            .await
+            .expect("declared image provider must accept typed image input");
+            assert!(matches!(
+                content.as_slice(),
+                [DriverPromptContent::Image { path: None, .. }]
+            ));
+        }
+        for provider in [ProviderKind::Acp, ProviderKind::GrokBuild] {
+            let error = prepare_prompt_content(
+                provider,
+                &root,
+                vec![PromptContentRef::Image {
+                    data: "cG5n".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                }],
+            )
+            .await
+            .expect_err("unsupported image input must fail explicitly");
+            assert!(matches!(error, AppError::Unsupported(_)));
+        }
         let _ = fs::remove_dir_all(root);
     }
 

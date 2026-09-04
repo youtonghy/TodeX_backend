@@ -94,6 +94,7 @@ impl ProviderDriver for AcpDriver {
                 native_mcp: true,
                 managed_mcp: false,
                 model_selection: false,
+                image_input: ProviderKind::Acp.supports_image_input(),
             },
             models: Vec::new(),
         }
