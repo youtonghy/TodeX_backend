@@ -3749,6 +3749,7 @@ mod tests {
         .expect("create app state")
     }
 
+    #[cfg(unix)]
     async fn trust_test_workspace(state: &AppState, workspace: &std::path::Path) {
         state
             .workspace_trust
