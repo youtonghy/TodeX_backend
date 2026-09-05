@@ -32,3 +32,10 @@
 - Review prompt caching after model changes: keep stable instructions and reusable context first, avoid dynamic prefixes, and confirm cache settings are supported.
 - Pin and log the effective model and reasoning settings for reproducibility, without logging API keys or sensitive prompt/content data.
 - Run representative integration checks for tool calls when practical and update configuration examples when defaults or model behavior change.
+
+## GPT-6 Astra 运行细节
+
+- Astra 支持异步工具调用。对耗时或可并行的函数工具，在协议支持时设置 `async: true`，保存原始 `call_id`，并在工具完成后回传结果；应用负责执行工具、超时、重试和待处理状态。
+- 需要在单次请求执行期间接收用户修正时，使用 Responses API 的中途引导能力，并保留已完成工作、工具结果和对话状态。
+- 若同一对话需要改变推理强度，使用 `configuration_update` 输入项；保持请求级 `reasoning.effort` 不变以维护提示缓存，确认所选配置与模型兼容。
+- Astra 不支持 `reasoning.effort: "none"`；不得将其作为默认或回退值。欧盟数据驻留场景不得使用 Astra 的 `fast` 或 `priority` 服务层级。
