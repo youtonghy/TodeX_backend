@@ -901,9 +901,21 @@ async fn providers(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     require_auth(&state, &headers)?;
-    Ok(Json(
-        json!({ "providers": state.conversations.providers() }),
-    ))
+    let mut providers = serde_json::to_value(state.conversations.providers())?;
+    if let Some(items) = providers.as_array_mut() {
+        for provider in items {
+            let capabilities = provider.get("capabilities").cloned().unwrap_or_else(|| json!({}));
+            let mut actions = Vec::new();
+            if capabilities.get("cancel").and_then(Value::as_bool).unwrap_or(false) {
+                actions.push("cancel");
+                actions.push("interrupt");
+            }
+            if let Some(object) = provider.as_object_mut() {
+                object.insert("controlActions".to_owned(), json!(actions));
+            }
+        }
+    }
+    Ok(Json(json!({ "providers": providers })))
 }
 
 async fn provider_versions(
