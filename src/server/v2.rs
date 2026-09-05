@@ -911,7 +911,9 @@ async fn providers(
                 actions.push("interrupt");
             }
             if let Some(object) = provider.as_object_mut() {
-                object.insert("controlActions".to_owned(), json!(actions));
+                if let Some(capabilities) = object.get_mut("capabilities").and_then(Value::as_object_mut) {
+                    capabilities.insert("controlActions".to_owned(), json!(actions));
+                }
             }
         }
     }
