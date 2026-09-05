@@ -559,6 +559,30 @@ impl ConversationSupervisor {
         .await
     }
 
+    pub async fn fork_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        title: Option<String>,
+    ) -> Result<ConversationManifest, AppError> {
+        let source = self.get_owned(owner_id, conversation_id).await?;
+        let replay = self.store.replay(conversation_id, 0, usize::MAX).await?;
+        let mut fork = ConversationManifest::new(
+            source.provider,
+            source.workspace.clone(),
+            title.or_else(|| source.title.clone().map(|value| format!("{value} (fork)"))),
+            source.provider_profile.clone(),
+        );
+        fork.owner_id = owner_id.to_owned();
+        let fork = self.store.create(fork).await?;
+        for event in replay.events {
+            self.store
+                .append(&fork.id, event.event_type, event.payload)
+                .await?;
+        }
+        self.store.get(&fork.id).await
+    }
+
     #[allow(dead_code)]
     pub async fn prompt(
         &self,

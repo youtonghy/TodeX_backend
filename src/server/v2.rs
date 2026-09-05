@@ -62,6 +62,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.followUp"
             | "conversation.retry"
             | "conversation.resume"
+            | "conversation.fork"
             | "conversation.cancel"
             | "conversation.interrupt"
             | "conversation.stop"
@@ -1912,6 +1913,14 @@ async fn dispatch_command_inner(
                 json!({ "conversationId": request.conversation_id, "turnId": turn_id, "resumed": true }),
             )
         }
+        "conversation.fork" => {
+            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let fork = state
+                .conversations
+                .fork_owned(owner_id, &request.conversation_id, request.title)
+                .await?;
+            Ok(json!({ "conversationId": fork.id, "forkedFrom": request.conversation_id }))
+        }
         "conversation.cancel" | "conversation.interrupt" | "conversation.stop" => {
             let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
             state
@@ -2333,6 +2342,8 @@ struct SessionResumeRequest {
 #[serde(rename_all = "camelCase")]
 struct WsConversationRequest {
     conversation_id: String,
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
