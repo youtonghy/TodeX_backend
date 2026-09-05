@@ -983,6 +983,9 @@ mod tests {
             }],
             model: None,
             reasoning_effort: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
         };
         let input = codex_prompt_input(&prompt);
         assert_eq!(input[0]["type"], "text");

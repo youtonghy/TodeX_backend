@@ -153,8 +153,15 @@ impl ProviderDriver for ClaudeDriver {
             "--verbose".to_owned(),
             "--include-partial-messages".to_owned(),
             "--replay-user-messages".to_owned(),
+            "--permission-prompts".to_owned(),
+            "host".to_owned(),
             "--permission-mode".to_owned(),
-            "manual".to_owned(),
+            claude_permission_mode(
+                prompt.permission_profile.as_deref(),
+                prompt.sandbox_mode.as_deref(),
+                prompt.approval_policy.as_deref(),
+            )
+            .to_owned(),
         ];
         if context.provider_state.native_session_id.is_some() {
             spec.args.push("--resume".to_owned());
@@ -183,6 +190,26 @@ impl ProviderDriver for ClaudeDriver {
         .await;
         process.terminate().await;
         result
+    }
+}
+
+fn claude_permission_mode(
+    profile: Option<&str>,
+    sandbox_mode: Option<&str>,
+    approval_policy: Option<&str>,
+) -> &'static str {
+    match (profile, sandbox_mode, approval_policy) {
+        (Some("read-only" | ":read-only"), _, _) | (Some(_), Some("read-only"), _) => "plan",
+        (Some("full-access" | ":danger-full-access"), _, _)
+        | (_, Some("danger-full-access"), Some("never")) => "bypassPermissions",
+        // Verified against Claude Code 2.1.259 in `-p` stream-json mode: the
+        // host never receives `can_use_tool` control requests (the SDK answers
+        // prompts through an injected MCP tool instead), so anything gated is
+        // auto-denied ("you haven't granted it yet"). `manual` is silently
+        // downgraded to `default` there, which denies every Write/Edit. Map
+        // workspace profiles to `acceptEdits` instead: edits inside the working
+        // directory are granted, outside edits and risky Bash stay denied.
+        _ => "acceptEdits",
     }
 }
 
@@ -220,7 +247,7 @@ fn claude_user_content(prompt: &DriverPrompt) -> Value {
 mod tests {
     use serde_json::json;
 
-    use super::{claude_model_aliases, claude_user_content};
+    use super::{claude_model_aliases, claude_permission_mode, claude_user_content};
     use crate::provider::types::{DriverPrompt, DriverPromptContent};
 
     #[test]
@@ -242,6 +269,31 @@ mod tests {
     }
 
     #[test]
+    fn permission_profiles_map_to_safe_claude_modes() {
+        assert_eq!(
+            claude_permission_mode(Some(":read-only"), None, None),
+            "plan"
+        );
+        assert_eq!(
+            claude_permission_mode(
+                Some(":workspace"),
+                Some("workspace-write"),
+                Some("on-request")
+            ),
+            "acceptEdits"
+        );
+        assert_eq!(claude_permission_mode(None, None, None), "acceptEdits");
+        assert_eq!(
+            claude_permission_mode(
+                Some(":danger-full-access"),
+                Some("danger-full-access"),
+                Some("never")
+            ),
+            "bypassPermissions"
+        );
+    }
+
+    #[test]
     fn text_only_prompt_keeps_the_existing_string_shape() {
         let prompt = DriverPrompt {
             turn_id: "turn-1".to_owned(),
@@ -250,6 +302,9 @@ mod tests {
             skills: Vec::new(),
             model: None,
             reasoning_effort: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
         };
 
         assert_eq!(claude_user_content(&prompt), json!("hello"));
@@ -268,6 +323,9 @@ mod tests {
             skills: Vec::new(),
             model: None,
             reasoning_effort: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
         };
 
         assert_eq!(
@@ -308,6 +366,7 @@ async fn run_claude_turn(
         }))
         .await?;
 
+    let mut saw_output = false;
     loop {
         let message = tokio::select! {
             message = process.read() => message?,
@@ -348,6 +407,11 @@ async fn run_claude_turn(
                             .collect(),
                     ));
                 }
+                if !saw_output {
+                    return Err(AppError::ProviderUnavailable(
+                        "Claude Code completed without producing output; please retry".to_owned(),
+                    ));
+                }
                 let mut provider_state = context.provider_state;
                 provider_state.native_session_id = Some(native_session_id.clone());
                 provider_state.recoverable = true;
@@ -363,8 +427,12 @@ async fn run_claude_turn(
                     cancelled: false,
                 });
             }
-            Some("stream_event") => handle_stream_event(&message, sink).await?,
+            Some("stream_event") => {
+                saw_output = true;
+                handle_stream_event(&message, sink).await?;
+            }
             Some("assistant") => {
+                saw_output = true;
                 sink.emit(
                     "message.completed",
                     json!({ "provider": "claude-code", "message": message.get("message") }),
@@ -372,6 +440,7 @@ async fn run_claude_turn(
                 .await?;
             }
             Some("tool_progress") => {
+                saw_output = true;
                 sink.emit(
                     "tool.updated",
                     json!({

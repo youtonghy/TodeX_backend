@@ -37,6 +37,10 @@ pub struct WorkspaceRecord {
     pub reasoning_effort: Option<String>,
     pub approval_policy: String,
     pub sandbox_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<String>,
     #[serde(default)]
     pub service_tier: Option<String>,
     #[serde(default)]
@@ -288,6 +292,8 @@ mod tests {
                     reasoning_effort: Some("medium".to_owned()),
                     approval_policy: "on-request".to_owned(),
                     sandbox_mode: "workspace-write".to_owned(),
+                    permission_profile: Some(":workspace".to_owned()),
+                    approvals_reviewer: Some("user".to_owned()),
                     service_tier: None,
                     local_adapter_state: Some("idle".to_owned()),
                     created_at: 10,
@@ -340,6 +346,8 @@ mod tests {
             reasoning_effort: None,
             approval_policy: "on-request".to_owned(),
             sandbox_mode: "workspace-write".to_owned(),
+            permission_profile: Some(":workspace".to_owned()),
+            approvals_reviewer: Some("user".to_owned()),
             service_tier: None,
             local_adapter_state: None,
             created_at: 10,

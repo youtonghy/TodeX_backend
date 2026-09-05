@@ -53,6 +53,9 @@ pub struct ConversationPrompt {
     pub reasoning_effort: Option<String>,
     pub skills: Vec<PromptSkillRef>,
     pub content: Vec<PromptContentRef>,
+    pub permission_profile: Option<String>,
+    pub sandbox_mode: Option<String>,
+    pub approval_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -535,6 +538,9 @@ impl ConversationSupervisor {
                 reasoning_effort: None,
                 skills: Vec::new(),
                 content: Vec::new(),
+                permission_profile: None,
+                sandbox_mode: None,
+                approval_policy: None,
             },
         )
         .await
@@ -552,6 +558,9 @@ impl ConversationSupervisor {
             reasoning_effort,
             skills,
             content,
+            permission_profile,
+            sandbox_mode,
+            approval_policy,
         } = prompt;
         let text = text.trim().to_owned();
         if text.is_empty() && skills.is_empty() && content.is_empty() {
@@ -716,6 +725,9 @@ impl ConversationSupervisor {
                         skills: loaded_skills,
                         model,
                         reasoning_effort,
+                        permission_profile,
+                        sandbox_mode,
+                        approval_policy,
                     },
                     sink,
                     cancel_rx,
@@ -2008,6 +2020,9 @@ done
                     text: "hello".to_owned(),
                     model: None,
                     reasoning_effort: None,
+                    permission_profile: None,
+                    sandbox_mode: None,
+                    approval_policy: None,
                     skills: vec![PromptSkillRef {
                         resource_id: "res_missing".to_owned(),
                         name: Some("missing".to_owned()),

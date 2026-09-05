@@ -1230,6 +1230,9 @@ mod tests {
             skills: Vec::new(),
             model: None,
             reasoning_effort: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
         }
     }
 

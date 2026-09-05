@@ -234,6 +234,8 @@ mod tests {
             reasoning_effort: Some("medium".to_owned()),
             approval_policy: "on-request".to_owned(),
             sandbox_mode: "workspace-write".to_owned(),
+            permission_profile: Some(":workspace".to_owned()),
+            approvals_reviewer: Some("user".to_owned()),
             service_tier: None,
             local_adapter_state: None,
             created_at: 1,

@@ -111,6 +111,9 @@ pub struct DriverPrompt {
     pub skills: Vec<DriverSkill>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub permission_profile: Option<String>,
+    pub sandbox_mode: Option<String>,
+    pub approval_policy: Option<String>,
 }
 
 #[derive(Clone, Debug)]

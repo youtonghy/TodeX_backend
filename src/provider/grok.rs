@@ -424,6 +424,9 @@ mod tests {
             skills: Vec::new(),
             model: Some("grok-4.5".to_owned()),
             reasoning_effort: Some("high".to_owned()),
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
         };
         let spec = grok_command_spec("grok", &[], Path::new("/tmp"), Some(&prompt));
         assert_eq!(
