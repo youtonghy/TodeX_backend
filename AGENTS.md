@@ -39,3 +39,13 @@
 - 需要在单次请求执行期间接收用户修正时，使用 Responses API 的中途引导能力，并保留已完成工作、工具结果和对话状态。
 - 若同一对话需要改变推理强度，使用 `configuration_update` 输入项；保持请求级 `reasoning.effort` 不变以维护提示缓存，确认所选配置与模型兼容。
 - Astra 不支持 `reasoning.effort: "none"`；不得将其作为默认或回退值。欧盟数据驻留场景不得使用 Astra 的 `fast` 或 `priority` 服务层级。
+
+## OpenAI API 模型规范（依据官方 Model guidance）
+
+- 新的一般用途集成默认使用 `gpt-6-astra`；因兼容性、供应商可用性、延迟或成本改用其他模型时记录原因。模型 ID 必须可配置，并校验供应商支持列表，不得臆造或静默替换。
+- 新集成和工具调用优先使用 Responses API；使用 Responses 原语保留会话状态和工具结果。
+- 显式设置 reasoning；Astra 不支持 `none`，使用 `low` 或更高等级。迁移时保留现有有效 effort，除非记录调整理由。
+- Astra 不支持 `temperature`、`top_p`、`top_logprobs`、`logprobs` 或 `message.output_text.logprobs`，迁移旧 Chat Completions 集成时移除这些字段。
+- 将提示缓存配置从 `prompt_cache_retention` 迁移为 `prompt_cache_options.ttl: "30m"`，并复查缓存边界与成本。
+- 使用 Responses 工具调用时，在应用边界校验工具输入和输出，并设置与 SDK、模型兼容的超时、重试和流式策略；重试不得重复提交不可幂等操作。
+- 参考：https://developers.openai.com/api/docs/guides/latest-model
