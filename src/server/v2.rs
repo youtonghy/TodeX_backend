@@ -129,6 +129,10 @@ pub fn routes() -> Router<AppState> {
             post(cancel_conversation),
         )
         .route(
+            "/v2/conversations/{conversation_id}/interrupt",
+            post(cancel_conversation),
+        )
+        .route(
             "/v2/conversations/{conversation_id}/permissions/{permission_id}",
             post(resolve_permission),
         )
