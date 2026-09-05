@@ -2481,6 +2481,35 @@ mod tests {
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
+        let providers = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/providers")
+                    .header("authorization", "Bearer v2-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(providers.status(), StatusCode::OK);
+        let providers_body = to_bytes(providers.into_body(), 1024 * 1024).await.unwrap();
+        let providers_json: Value = serde_json::from_slice(&providers_body).unwrap();
+        let codex_actions = providers_json["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "codex")
+            .unwrap()["capabilities"]["controlActions"]
+            .as_array()
+            .unwrap();
+        for action in ["cancel", "interrupt", "followUp", "retry", "resume", "fork"] {
+            assert!(
+                codex_actions.iter().any(|value| value == action),
+                "missing {action}"
+            );
+        }
+
         let create = app
             .clone()
             .oneshot(
