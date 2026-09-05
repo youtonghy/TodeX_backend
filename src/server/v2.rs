@@ -60,6 +60,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.create"
             | "conversation.prompt"
             | "conversation.cancel"
+            | "conversation.interrupt"
             | "conversation.stop"
             | "conversation.permission.respond"
             | "mcp.list"
@@ -1279,6 +1280,9 @@ async fn prompt_conversation(
                 text: request.text,
                 model: request.model,
                 reasoning_effort: request.reasoning_effort,
+                permission_profile: request.permission_profile,
+                sandbox_mode: request.sandbox_mode,
+                approval_policy: request.approval_policy,
                 skills: prompt_skills(request.skills),
                 content: request.content,
             },
@@ -1847,6 +1851,9 @@ async fn dispatch_command_inner(
                         text,
                         model: request.model,
                         reasoning_effort: request.reasoning_effort,
+                        permission_profile: request.permission_profile,
+                        sandbox_mode: request.sandbox_mode,
+                        approval_policy: request.approval_policy,
                         skills: prompt_skills(request.skills),
                         content: request.content,
                     },
@@ -1854,7 +1861,7 @@ async fn dispatch_command_inner(
                 .await?;
             Ok(json!({ "conversationId": request.conversation_id, "turnId": turn_id }))
         }
-        "conversation.cancel" | "conversation.stop" => {
+        "conversation.cancel" | "conversation.interrupt" | "conversation.stop" => {
             let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
             state
                 .conversations
@@ -2230,6 +2237,12 @@ struct PromptRequest {
     skills: Vec<PromptSkillRequest>,
     #[serde(default)]
     content: Vec<PromptContentRef>,
+    #[serde(default)]
+    permission_profile: Option<String>,
+    #[serde(default)]
+    sandbox_mode: Option<String>,
+    #[serde(default)]
+    approval_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2279,6 +2292,12 @@ struct WsConversationRequest {
     skills: Vec<PromptSkillRequest>,
     #[serde(default)]
     content: Vec<PromptContentRef>,
+    #[serde(default)]
+    permission_profile: Option<String>,
+    #[serde(default)]
+    sandbox_mode: Option<String>,
+    #[serde(default)]
+    approval_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
