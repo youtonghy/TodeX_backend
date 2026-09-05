@@ -920,6 +920,10 @@ async fn providers(
             {
                 actions.push("cancel");
                 actions.push("interrupt");
+                actions.push("followUp");
+                actions.push("retry");
+                actions.push("resume");
+                actions.push("fork");
             }
             if let Some(object) = provider.as_object_mut() {
                 if let Some(capabilities) = object
