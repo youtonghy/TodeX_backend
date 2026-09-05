@@ -59,7 +59,9 @@ fn is_v2_native_command(command_type: &str) -> bool {
         "conversation.subscribe"
             | "conversation.create"
             | "conversation.prompt"
+            | "conversation.followUp"
             | "conversation.retry"
+            | "conversation.resume"
             | "conversation.cancel"
             | "conversation.interrupt"
             | "conversation.stop"
@@ -1863,7 +1865,7 @@ async fn dispatch_command_inner(
                     .await?,
             )?)
         }
-        "conversation.prompt" => {
+        "conversation.prompt" | "conversation.followUp" => {
             let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
             let text = request.text.unwrap_or_default();
             if text.trim().is_empty() && request.skills.is_empty() && request.content.is_empty() {
@@ -1898,6 +1900,16 @@ async fn dispatch_command_inner(
                 .await?;
             Ok(
                 json!({ "conversationId": request.conversation_id, "turnId": turn_id, "retried": true }),
+            )
+        }
+        "conversation.resume" => {
+            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let turn_id = state
+                .conversations
+                .retry_owned(owner_id, &request.conversation_id)
+                .await?;
+            Ok(
+                json!({ "conversationId": request.conversation_id, "turnId": turn_id, "resumed": true }),
             )
         }
         "conversation.cancel" | "conversation.interrupt" | "conversation.stop" => {
