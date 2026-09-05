@@ -266,6 +266,10 @@ pub fn status_after_event(current: ConversationStatus, event_type: &str) -> Conv
         "turn.completed" | "turn.cancelled" => ConversationStatus::Idle,
         "conversation.interrupted" => ConversationStatus::Interrupted,
         "turn.failed" | "conversation.failed" => ConversationStatus::Failed,
+        "workflow.started" | "workflow.resumed" => ConversationStatus::Running,
+        "workflow.paused" => ConversationStatus::Interrupted,
+        "workflow.completed" | "workflow.cancelled" => ConversationStatus::Idle,
+        "workflow.failed" => ConversationStatus::Failed,
         _ => current,
     }
 }
