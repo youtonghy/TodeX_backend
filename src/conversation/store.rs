@@ -240,12 +240,13 @@ impl ConversationStore {
             manifest.status = status_after_event(manifest.status, &last_event.event_type);
             manifest.updated_at = last_event.time;
         }
-        let event = ConversationEvent::new(
+        let mut event = ConversationEvent::new(
             conversation_id,
             manifest.last_sequence.saturating_add(1),
             event_type,
             payload,
         );
+        event.provider = Some(manifest.provider);
         let mut line = serde_json::to_vec(&event)?;
         line.push(b'\n');
         let event_path = directory.join(EVENTS_FILE);
@@ -709,6 +710,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((first.sequence, second.sequence), (1, 2));
+        let replay = store.replay(&manifest.id, 0, 10).await.unwrap();
+        assert!(replay
+            .events
+            .iter()
+            .all(|event| event.provider == Some(ProviderKind::Codex)));
 
         let directory = root.join("conversations").join(&manifest.id);
         for name in [

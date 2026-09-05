@@ -134,6 +134,10 @@ pub struct ConversationEvent {
     pub time: DateTime<Utc>,
     #[serde(rename = "type")]
     pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderKind>,
     pub payload: Value,
 }
 
@@ -144,13 +148,19 @@ impl ConversationEvent {
         event_type: impl Into<String>,
         payload: Value,
     ) -> Self {
+        let event_type = event_type.into();
         Self {
             schema_version: CONVERSATION_SCHEMA_VERSION,
             sequence,
             event_id: format!("evt_{}", Uuid::new_v4().simple()),
             conversation_id: conversation_id.into(),
             time: Utc::now(),
-            event_type: event_type.into(),
+            raw_type: payload
+                .get("providerMethod")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            provider: None,
+            event_type,
             payload,
         }
     }
@@ -256,6 +266,31 @@ mod provider_kind_tests {
     use std::str::FromStr;
 
     use super::ProviderKind;
+
+    #[test]
+    fn event_origin_is_optional_for_old_journals_and_preserves_native_method() {
+        let old = serde_json::json!({
+            "schemaVersion": 2, "sequence": 1, "eventId": "evt_old",
+            "conversationId": "conv_old", "time": "2026-09-05T00:00:00Z",
+            "type": "provider.event", "payload": {"unknown": true}
+        });
+        let restored: super::ConversationEvent = serde_json::from_value(old.clone()).unwrap();
+        assert!(restored.provider.is_none());
+        assert!(restored.raw_type.is_none());
+        assert_eq!(serde_json::to_value(restored).unwrap(), old);
+
+        let mut event = super::ConversationEvent::new(
+            "conv_new",
+            1,
+            "provider.event",
+            serde_json::json!({"providerMethod": "item/started"}),
+        );
+        event.provider = Some(ProviderKind::Codex);
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["rawType"], "item/started");
+        assert_eq!(wire["provider"], "codex");
+        assert_eq!(wire["type"], "provider.event");
+    }
 
     #[test]
     fn grok_build_provider_kind_has_stable_wire_name_and_aliases() {
