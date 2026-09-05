@@ -135,6 +135,8 @@ pub struct ConversationEvent {
     #[serde(rename = "type")]
     pub event_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderKind>,
@@ -149,6 +151,7 @@ impl ConversationEvent {
         payload: Value,
     ) -> Self {
         let event_type = event_type.into();
+        let normalized_type = normalized_event_type(&event_type);
         Self {
             schema_version: CONVERSATION_SCHEMA_VERSION,
             sequence,
@@ -161,9 +164,30 @@ impl ConversationEvent {
                 .map(str::to_owned),
             provider: None,
             event_type,
+            normalized_type: Some(normalized_type),
             payload,
         }
     }
+}
+
+pub fn normalized_event_type(event_type: &str) -> String {
+    match event_type {
+        "turn.started" | "codex.turn.started" => "turn.started",
+        "turn.completed" | "codex.turn.completed" | "message.completed" => "turn.completed",
+        "turn.cancelled" | "conversation.interrupted" => "turn.cancelled",
+        "turn.failed" | "conversation.failed" => "turn.failed",
+        "message.delta" | "assistant.delta" | "text_delta" => "assistant.delta",
+        "thought.delta" | "reasoning.delta" | "thinking_delta" => "reasoning.delta",
+        "tool.started" | "tool.created" | "item.started" => "tool.started",
+        "tool.completed" | "tool.result" | "item.completed" => "tool.completed",
+        "tool.failed" | "tool.error" => "tool.failed",
+        "permission.requested" | "tool.awaitingApproval" => "tool.awaitingApproval",
+        "compaction.started" => "compaction.started",
+        "compaction.completed" => "compaction.completed",
+        "subagent.started" => "subagent.started",
+        "subagent.completed" => "subagent.completed",
+        _ => event_type,
+    }.to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -290,6 +314,8 @@ mod provider_kind_tests {
         assert_eq!(wire["rawType"], "item/started");
         assert_eq!(wire["provider"], "codex");
         assert_eq!(wire["type"], "provider.event");
+        assert_eq!(wire["normalizedType"], "provider.event");
+        assert_eq!(super::normalized_event_type("codex.turn.completed"), "turn.completed");
     }
 
     #[test]
