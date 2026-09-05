@@ -59,6 +59,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
         "conversation.subscribe"
             | "conversation.create"
             | "conversation.prompt"
+            | "conversation.retry"
             | "conversation.cancel"
             | "conversation.interrupt"
             | "conversation.stop"
@@ -904,14 +905,24 @@ async fn providers(
     let mut providers = serde_json::to_value(state.conversations.providers())?;
     if let Some(items) = providers.as_array_mut() {
         for provider in items {
-            let capabilities = provider.get("capabilities").cloned().unwrap_or_else(|| json!({}));
+            let capabilities = provider
+                .get("capabilities")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let mut actions = Vec::new();
-            if capabilities.get("cancel").and_then(Value::as_bool).unwrap_or(false) {
+            if capabilities
+                .get("cancel")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 actions.push("cancel");
                 actions.push("interrupt");
             }
             if let Some(object) = provider.as_object_mut() {
-                if let Some(capabilities) = object.get_mut("capabilities").and_then(Value::as_object_mut) {
+                if let Some(capabilities) = object
+                    .get_mut("capabilities")
+                    .and_then(Value::as_object_mut)
+                {
                     capabilities.insert("controlActions".to_owned(), json!(actions));
                 }
             }
@@ -1878,6 +1889,16 @@ async fn dispatch_command_inner(
                 )
                 .await?;
             Ok(json!({ "conversationId": request.conversation_id, "turnId": turn_id }))
+        }
+        "conversation.retry" => {
+            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let turn_id = state
+                .conversations
+                .retry_owned(owner_id, &request.conversation_id)
+                .await?;
+            Ok(
+                json!({ "conversationId": request.conversation_id, "turnId": turn_id, "retried": true }),
+            )
         }
         "conversation.cancel" | "conversation.interrupt" | "conversation.stop" => {
             let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;

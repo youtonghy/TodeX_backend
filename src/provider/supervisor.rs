@@ -522,6 +522,43 @@ impl ConversationSupervisor {
         self.replay(conversation_id, after_sequence, limit).await
     }
 
+    pub async fn retry_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+    ) -> Result<String, AppError> {
+        self.get_owned(owner_id, conversation_id).await?;
+        let replay = self.store.replay(conversation_id, 0, usize::MAX).await?;
+        let text = replay
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "message.created")
+            .and_then(|event| {
+                (event.payload.get("role")?.as_str() == Some("user"))
+                    .then(|| event.payload.get("content")?.as_str().map(str::to_owned))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                AppError::Conflict("conversation has no user message to retry".to_owned())
+            })?;
+        self.prompt_owned(
+            owner_id,
+            conversation_id,
+            ConversationPrompt {
+                text,
+                model: None,
+                reasoning_effort: None,
+                skills: Vec::new(),
+                content: Vec::new(),
+                permission_profile: None,
+                sandbox_mode: None,
+                approval_policy: None,
+            },
+        )
+        .await
+    }
+
     #[allow(dead_code)]
     pub async fn prompt(
         &self,
