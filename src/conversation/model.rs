@@ -186,6 +186,14 @@ pub fn normalized_event_type(event_type: &str) -> String {
         "compaction.completed" => "compaction.completed",
         "subagent.started" => "subagent.started",
         "subagent.completed" => "subagent.completed",
+        "workflow.started" | "workflow.resumed" => "workflow.started",
+        "workflow.paused" => "workflow.paused",
+        "workflow.completed" => "workflow.completed",
+        "workflow.failed" => "workflow.failed",
+        "workflow.cancelled" => "workflow.cancelled",
+        "tool.checkpoint.created" => "tool.checkpoint.created",
+        "tool.checkpoint.committed" => "tool.checkpoint.committed",
+        "tool.checkpoint.rolledBack" | "tool.checkpoint.rolled_back" => "tool.checkpoint.rolledBack",
         _ => event_type,
     }.to_owned()
 }
