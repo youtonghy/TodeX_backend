@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
 use tokio::sync::watch;
-use tokio::time::Duration;
 
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
@@ -40,6 +39,9 @@ impl ProviderDriver for PiDriver {
                 .then(|| format!("executable '{}' was not found", self.binary)),
             profiles: Vec::new(),
             capabilities: ProviderCapabilities {
+                permission_config: super::types::permission_config_capabilities(ProviderKind::Pi),
+                native_fork: false,
+                native_compact: false,
                 native_resume: true,
                 cancel: true,
                 // Pi RPC exposes extension dialogs, but not a universal pre-tool approval API.
@@ -179,6 +181,12 @@ impl ProviderDriver for PiDriver {
         mut cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
+        super::types::resolve_permission_config(
+            context.manifest.provider,
+            prompt.permission_profile.as_deref(),
+            prompt.sandbox_mode.as_deref(),
+            prompt.approval_policy.as_deref(),
+        )?;
         let native_session_id = context
             .provider_state
             .native_session_id
@@ -362,6 +370,7 @@ async fn run_pi_turn(
     }
 
     let mut stop_reason = "completed".to_owned();
+    let mut message_sequence = 0u64;
     loop {
         let message = tokio::select! {
             message = process.read() => message?,
@@ -389,34 +398,35 @@ async fn run_pi_turn(
                     cancelled: false,
                 });
             }
+            Some("compaction_start" | "compaction_end") => {
+                let event_type = if message["type"] == "compaction_start" {
+                    "compaction.started"
+                } else if message["aborted"] == true {
+                    "compaction.cancelled"
+                } else if message
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .is_some()
+                {
+                    "compaction.failed"
+                } else {
+                    "compaction.completed"
+                };
+                sink.emit(event_type, json!({ "provider": "pi", "turnId": prompt.turn_id, "source": "provider", "reason": message.get("reason"), "result": message.get("result"), "error": message.get("errorMessage") })).await?;
+            }
             Some("message_end") => {
+                message_sequence = message_sequence.saturating_add(1);
+                for (event_type, payload) in
+                    pi_completed_message_events(&message, &prompt.turn_id, message_sequence)
+                {
+                    sink.emit(event_type, payload).await?;
+                }
                 let reason = message
                     .pointer("/message/stopReason")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if !reason.is_empty() {
                     stop_reason = reason.to_owned();
-                }
-                // Pi ends an assistant message before each tool execution. That
-                // message has stopReason=toolUse and is not the turn's final answer.
-                if is_pi_final_message(&message) {
-                    let message_id = pi_message_id(&message)
-                        .unwrap_or_else(|| format!("{}-final", prompt.turn_id));
-                    sink.emit(
-                        "message.completed",
-                        json!({
-                            "provider": "pi",
-                            "role": "assistant",
-                            "message": message.get("message"),
-                            "block": {
-                                "category": "assistant_final",
-                                "id": message_id,
-                                "turnId": prompt.turn_id,
-                                "phase": "completed",
-                            },
-                        }),
-                    )
-                    .await?;
                 }
             }
             Some("message_update") => {
@@ -481,7 +491,12 @@ async fn run_pi_turn(
                 .await?;
             }
             Some("extension_ui_request") => {
-                handle_extension_ui(process, message, sink, cancel).await?;
+                if let Err(error) = handle_extension_ui(process, message, sink, cancel).await {
+                    if matches!(error, AppError::TurnCancelled) && *cancel.borrow() {
+                        wait_for_pi_abort(process, sink).await?;
+                    }
+                    return Err(error);
+                }
             }
             Some("response" | "agent_start" | "agent_end" | "turn_start" | "turn_end") => {}
             Some(event_type) => {
@@ -502,9 +517,10 @@ async fn wait_for_response(
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<Value, AppError> {
+    let mut deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
     loop {
         let message = tokio::select! {
-            message = process.read() => message?,
+            message = process.read_control_until(deadline) => message?,
             changed = cancel.changed() => {
                 let _ = changed;
                 return Err(AppError::TurnCancelled);
@@ -519,7 +535,15 @@ async fn wait_for_response(
             return Ok(message);
         }
         if message.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
+            let waits_for_user = matches!(
+                message.get("method").and_then(Value::as_str),
+                Some("select" | "confirm" | "input" | "editor")
+            );
+            let handler_started = tokio::time::Instant::now();
             handle_extension_ui(process, message, sink, cancel).await?;
+            if waits_for_user {
+                deadline += handler_started.elapsed();
+            }
         }
     }
 }
@@ -587,7 +611,7 @@ async fn wait_for_pi_abort(
         .send(&json!({ "id": "abort", "type": "abort" }))
         .await?;
     let (_cancel_tx, mut no_cancel) = watch::channel(false);
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(super::process::cancel_timeout()?, async {
         loop {
             let Some(message) = process.read().await? else {
                 return Err(
@@ -667,7 +691,47 @@ fn pi_delta_block_id(delta: &Value, turn_id: &str, category: &str) -> String {
         })
 }
 
+/// The usage and final-message events represent one native message and must
+/// share identity even when Pi omitted its optional text signature.
+fn pi_completed_message_events(
+    message: &Value,
+    turn_id: &str,
+    sequence: u64,
+) -> Vec<(&'static str, Value)> {
+    let message_id =
+        pi_message_id(message).unwrap_or_else(|| format!("{turn_id}-message-{sequence}"));
+    let mut events = Vec::new();
+    if let Some(usage) = message
+        .pointer("/message/usage")
+        .filter(|usage| usage.is_object())
+    {
+        events.push((
+            "usage.updated",
+            json!({
+                "provider": "pi", "turnId": turn_id, "messageId": message_id,
+                "source": "provider", "scope": "message", "usage": usage,
+            }),
+        ));
+    }
+    // Tool-use messages carry usage but are not the turn's final answer.
+    if is_pi_final_message(message) {
+        events.push(("message.completed", json!({
+            "provider": "pi", "turnId": turn_id, "messageId": message_id,
+            "role": "assistant", "message": message.get("message"),
+            "block": { "category": "assistant_final", "id": message_id, "turnId": turn_id, "phase": "completed" },
+        })));
+    }
+    events
+}
+
 fn pi_message_id(message: &Value) -> Option<String> {
+    if let Some(id) = message
+        .pointer("/message/id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return Some(id.to_owned());
+    }
     message
         .pointer("/message/content")
         .and_then(Value::as_array)
@@ -680,6 +744,7 @@ fn pi_message_id(message: &Value) -> Option<String> {
                         signature
                             .get("id")
                             .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
                             .map(ToOwned::to_owned)
                     })
             })
@@ -697,6 +762,28 @@ fn pi_response_error(response: &Value, command: &str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsigned_messages_share_usage_identity_with_final_output() {
+        let message = json!({ "type": "message_end", "message": { "role": "assistant", "stopReason": "stop", "content": [{ "type": "text", "text": "answer" }], "usage": { "input": 10, "output": 4 } } });
+        let events = pi_completed_message_events(&message, "turn-local", 1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "usage.updated");
+        assert_eq!(events[1].0, "message.completed");
+        assert_eq!(events[0].1["messageId"], "turn-local-message-1");
+        assert_eq!(events[0].1["messageId"], events[1].1["messageId"]);
+        assert_eq!(events[0].1["messageId"], events[1].1["block"]["id"]);
+        assert_ne!(
+            events[0].1["messageId"],
+            pi_completed_message_events(&message, "turn-local", 2)[0].1["messageId"]
+        );
+        let mut tool_message = message;
+        tool_message["message"]["stopReason"] = json!("toolUse");
+        tool_message["message"]["id"] = json!("native-message");
+        let events = pi_completed_message_events(&tool_message, "turn-local", 3);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1["messageId"], "native-message");
+    }
 
     #[test]
     fn parses_model_specific_thinking_levels_and_default() {

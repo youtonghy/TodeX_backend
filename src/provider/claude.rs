@@ -57,6 +57,11 @@ impl ProviderDriver for ClaudeDriver {
                 .then(|| format!("executable '{}' was not found", self.binary)),
             profiles: Vec::new(),
             capabilities: ProviderCapabilities {
+                permission_config: super::types::permission_config_capabilities(
+                    ProviderKind::ClaudeCode,
+                ),
+                native_fork: false,
+                native_compact: false,
                 native_resume: true,
                 cancel: true,
                 permissions: true,
@@ -138,6 +143,12 @@ impl ProviderDriver for ClaudeDriver {
         mut cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
+        let controls = super::types::resolve_permission_config(
+            context.manifest.provider,
+            prompt.permission_profile.as_deref(),
+            prompt.sandbox_mode.as_deref(),
+            prompt.approval_policy.as_deref(),
+        )?;
         let requested_session_id = context
             .provider_state
             .native_session_id
@@ -156,12 +167,9 @@ impl ProviderDriver for ClaudeDriver {
             "--permission-prompts".to_owned(),
             "host".to_owned(),
             "--permission-mode".to_owned(),
-            claude_permission_mode(
-                prompt.permission_profile.as_deref(),
-                prompt.sandbox_mode.as_deref(),
-                prompt.approval_policy.as_deref(),
-            )
-            .to_owned(),
+            controls
+                .provider_mode
+                .expect("Claude permission mode validated"),
         ];
         if context.provider_state.native_session_id.is_some() {
             spec.args.push("--resume".to_owned());
@@ -193,13 +201,14 @@ impl ProviderDriver for ClaudeDriver {
     }
 }
 
+#[cfg(test)]
 fn claude_permission_mode(
     profile: Option<&str>,
     sandbox_mode: Option<&str>,
     approval_policy: Option<&str>,
 ) -> &'static str {
     match (profile, sandbox_mode, approval_policy) {
-        (Some("read-only" | ":read-only"), _, _) | (Some(_), Some("read-only"), _) => "plan",
+        (Some("read-only" | ":read-only"), _, _) | (_, Some("read-only"), _) => "plan",
         (Some("full-access" | ":danger-full-access"), _, _)
         | (_, Some("danger-full-access"), Some("never")) => "bypassPermissions",
         // Verified against Claude Code 2.1.259 in `-p` stream-json mode: the
@@ -387,6 +396,9 @@ async fn run_claude_turn(
         }
         match message.get("type").and_then(Value::as_str) {
             Some("result") => {
+                if let Some(usage) = message.get("usage").filter(|usage| usage.is_object()) {
+                    sink.emit("usage.updated", json!({ "provider": "claude-code", "turnId": prompt.turn_id, "source": "provider", "scope": "turn", "usage": usage, "costUsd": message.get("total_cost_usd") })).await?;
+                }
                 let native_session_id = message
                     .get("session_id")
                     .and_then(Value::as_str)
@@ -575,15 +587,16 @@ async fn handle_control_request(
         )
         .await?;
     let response = match decision.outcome {
-        PermissionOutcome::AllowOnce
-        | PermissionOutcome::AllowAlways
-        | PermissionOutcome::Answer => {
+        PermissionOutcome::AllowOnce | PermissionOutcome::AllowAlways => {
             json!({
                 "behavior": "allow",
                 "updatedInput": request.get("input").cloned().unwrap_or_else(|| json!({})),
             })
         }
-        PermissionOutcome::RejectOnce | PermissionOutcome::RejectAlways => json!({
+        PermissionOutcome::RejectOnce
+        | PermissionOutcome::RejectAlways
+        | PermissionOutcome::Answer
+        | PermissionOutcome::AbortTurn => json!({
             "behavior": "deny",
             "message": "User rejected this tool request",
         }),

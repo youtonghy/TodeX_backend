@@ -21,6 +21,9 @@ const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderCapabilities {
+    pub permission_config: PermissionConfigCapabilities,
+    pub native_fork: bool,
+    pub native_compact: bool,
     pub native_resume: bool,
     pub cancel: bool,
     pub permissions: bool,
@@ -31,6 +34,37 @@ pub struct ProviderCapabilities {
     pub model_selection: bool,
     pub image_input: bool,
     pub image_input_mode: ImageInputMode,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionConfigCapabilities {
+    pub sandbox_modes: Vec<&'static str>,
+    pub approval_policies: Vec<&'static str>,
+    pub permission_profiles: Vec<&'static str>,
+    pub enforcement: &'static str,
+    pub description: &'static str,
+}
+
+pub fn permission_config_capabilities(provider: ProviderKind) -> PermissionConfigCapabilities {
+    match provider {
+        ProviderKind::Codex => PermissionConfigCapabilities {
+            sandbox_modes: vec!["read-only", "workspace-write", "danger-full-access"],
+            approval_policies: vec!["untrusted", "on-request", "never"],
+            permission_profiles: vec!["read-only", "workspace-write", "danger-full-access"],
+            enforcement: "sandbox", description: "Codex native sandbox and approval controls",
+        },
+        ProviderKind::ClaudeCode => PermissionConfigCapabilities {
+            sandbox_modes: vec!["read-only", "workspace-write", "danger-full-access"],
+            approval_policies: vec!["on-request", "never"],
+            permission_profiles: vec!["read-only", "workspace-write", "danger-full-access"],
+            enforcement: "agent-policy", description: "Claude plan / acceptEdits / bypassPermissions modes; not an operating-system sandbox. Unsupported combinations are rejected.",
+        },
+        _ => PermissionConfigCapabilities {
+            sandbox_modes: vec![], approval_policies: vec![], permission_profiles: vec![],
+            enforcement: "unsupported", description: "This provider does not expose sandbox or approval overrides through its active protocol.",
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -116,6 +150,103 @@ pub struct DriverPrompt {
     pub approval_policy: Option<String>,
 }
 
+/// Validated controls actually supported by the selected provider.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectivePermissionConfig {
+    pub sandbox_mode: Option<String>,
+    pub approval_policy: Option<String>,
+    pub provider_mode: Option<String>,
+    pub source: String,
+}
+
+pub fn resolve_permission_config(
+    provider: ProviderKind,
+    profile: Option<&str>,
+    sandbox: Option<&str>,
+    approval: Option<&str>,
+) -> Result<EffectivePermissionConfig, AppError> {
+    let profile_sandbox = match profile {
+        None => None,
+        Some("read-only" | ":read-only") => Some("read-only"),
+        Some("workspace-write" | ":workspace-write" | ":workspace" | "default") => {
+            Some("workspace-write")
+        }
+        Some("full-access" | ":danger-full-access" | "danger-full-access") => {
+            Some("danger-full-access")
+        }
+        Some(value) => {
+            return Err(AppError::Unsupported(format!(
+                "unsupported permission profile {value}"
+            )))
+        }
+    };
+    if sandbox.is_some_and(|value| {
+        !matches!(
+            value,
+            "read-only" | "workspace-write" | "danger-full-access"
+        )
+    }) {
+        return Err(AppError::InvalidRequest(
+            "unsupported sandbox mode".to_owned(),
+        ));
+    }
+    if approval.is_some_and(|value| !matches!(value, "untrusted" | "on-request" | "never")) {
+        return Err(AppError::InvalidRequest(
+            "unsupported approval policy".to_owned(),
+        ));
+    }
+    if profile_sandbox.zip(sandbox).is_some_and(|(a, b)| a != b) {
+        return Err(AppError::InvalidRequest(
+            "permission profile conflicts with sandbox mode".to_owned(),
+        ));
+    }
+    if !matches!(provider, ProviderKind::Codex | ProviderKind::ClaudeCode) {
+        if profile.is_some() || sandbox.is_some() || approval.is_some() {
+            return Err(AppError::Unsupported(format!(
+                "{} does not expose sandbox or approval overrides",
+                provider.as_str()
+            )));
+        }
+        return Ok(EffectivePermissionConfig {
+            sandbox_mode: None,
+            approval_policy: None,
+            provider_mode: None,
+            source: "provider-default".to_owned(),
+        });
+    }
+    let sandbox = profile_sandbox.or(sandbox).unwrap_or("workspace-write");
+    let approval = approval.unwrap_or(if profile_sandbox == Some("danger-full-access") {
+        "never"
+    } else {
+        "on-request"
+    });
+    let provider_mode = if provider == ProviderKind::ClaudeCode {
+        Some(
+            match (sandbox, approval) {
+                ("read-only", "on-request" | "never") => "plan",
+                ("workspace-write", "on-request") => "acceptEdits",
+                ("danger-full-access", "never") => "bypassPermissions",
+                _ => {
+                    return Err(AppError::Unsupported(
+                        "Claude stream-json does not support this permission combination"
+                            .to_owned(),
+                    ))
+                }
+            }
+            .to_owned(),
+        )
+    } else {
+        None
+    };
+    Ok(EffectivePermissionConfig {
+        sandbox_mode: Some(sandbox.to_owned()),
+        approval_policy: Some(approval.to_owned()),
+        provider_mode,
+        source: "validated-provider-controls".to_owned(),
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct DriverSkill {
     pub name: String,
@@ -160,6 +291,7 @@ pub enum PermissionOutcome {
     AllowAlways,
     RejectOnce,
     RejectAlways,
+    AbortTurn,
     Answer,
 }
 
@@ -170,6 +302,7 @@ impl PermissionOutcome {
             Self::AllowAlways => "allow_always",
             Self::RejectOnce => "reject_once",
             Self::RejectAlways => "reject_always",
+            Self::AbortTurn => "abort_turn",
             Self::Answer => "answer",
         }
     }
@@ -181,6 +314,7 @@ pub struct DriverEventSink {
     hub: ConversationEventHub,
     permissions: PermissionBroker,
     conversation_id: String,
+    current_turn_id: Option<String>,
 }
 
 impl DriverEventSink {
@@ -195,20 +329,36 @@ impl DriverEventSink {
             hub,
             permissions,
             conversation_id: conversation_id.into(),
+            current_turn_id: None,
         }
+    }
+
+    pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
+        self.current_turn_id = Some(turn_id.into());
+        self
     }
 
     pub async fn emit(
         &self,
         event_type: impl Into<String>,
-        payload: Value,
+        mut payload: Value,
     ) -> Result<ConversationEvent, AppError> {
-        let event = self
-            .store
-            .append(&self.conversation_id, event_type, payload)
-            .await?;
-        self.hub.publish(event.clone());
-        Ok(event)
+        if let (Some(turn_id), Some(object)) = (&self.current_turn_id, payload.as_object_mut()) {
+            if let Some(native_turn_id) = object
+                .get("turnId")
+                .and_then(Value::as_str)
+                .filter(|value| *value != turn_id)
+                .map(ToOwned::to_owned)
+            {
+                object
+                    .entry("nativeTurnId")
+                    .or_insert(Value::String(native_turn_id));
+            }
+            object.insert("turnId".to_owned(), Value::String(turn_id.clone()));
+        }
+        self.store
+            .append_and_publish(&self.conversation_id, event_type, payload, &self.hub)
+            .await
     }
 
     pub async fn save_provider_state(&self, state: ProviderState) -> Result<(), AppError> {
@@ -242,6 +392,35 @@ impl DriverEventSink {
 
 #[async_trait]
 pub trait ProviderDriver: Send + Sync {
+    fn supports_native_compact(&self) -> bool {
+        false
+    }
+
+    async fn compact_session(
+        &self,
+        _context: DriverContext,
+        _cancel: watch::Receiver<bool>,
+        _launch_permit: WorkspaceTrustPermit,
+    ) -> Result<(), AppError> {
+        Err(AppError::Unsupported(
+            "provider does not support native session compaction".to_owned(),
+        ))
+    }
+
+    fn supports_native_fork(&self) -> bool {
+        false
+    }
+
+    async fn fork_session(
+        &self,
+        _context: DriverContext,
+        _launch_permit: WorkspaceTrustPermit,
+    ) -> Result<ProviderState, AppError> {
+        Err(AppError::Unsupported(
+            "provider does not support native session fork".to_owned(),
+        ))
+    }
+
     fn descriptor(&self) -> ProviderDescriptor;
 
     async fn discover_models(
@@ -284,6 +463,9 @@ pub struct PermissionBroker {
 struct PendingPermission {
     conversation_id: String,
     sender: oneshot::Sender<PermissionDecision>,
+    kind: String,
+    details: Value,
+    options: Value,
 }
 
 struct PendingPermissionCleanup {
@@ -308,6 +490,7 @@ impl PermissionBroker {
         options: Value,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<PermissionDecision, AppError> {
+        let options = normalize_permission_options(options)?;
         let permission_id = format!("perm_{}", Uuid::new_v4().simple());
         let (sender, receiver) = oneshot::channel();
         self.pending.insert(
@@ -315,13 +498,15 @@ impl PermissionBroker {
             PendingPermission {
                 conversation_id: sink.conversation_id.clone(),
                 sender,
+                kind: kind.clone(),
+                details: details.clone(),
+                options: options.clone(),
             },
         );
         let _cleanup = PendingPermissionCleanup {
             pending: self.pending.clone(),
             permission_id: permission_id.clone(),
         };
-        let options = normalize_permission_options(options)?;
         if let Err(error) = sink
             .emit(
                 "permission.requested",
@@ -385,17 +570,22 @@ impl PermissionBroker {
         permission_id: &str,
         decision: PermissionDecision,
     ) -> Result<(), AppError> {
-        let Some((_, pending)) = self.pending.remove(permission_id) else {
-            return Err(AppError::NotFound(format!(
-                "pending permission {permission_id}"
-            )));
+        let entry = match self.pending.entry(permission_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => entry,
+            dashmap::mapref::entry::Entry::Vacant(_) => {
+                return Err(AppError::NotFound(format!(
+                    "pending permission {permission_id}"
+                )))
+            }
         };
+        let pending = entry.get();
         if pending.conversation_id != conversation_id {
-            self.pending.insert(permission_id.to_owned(), pending);
             return Err(AppError::Unauthorized(
                 "permission belongs to another conversation".to_owned(),
             ));
         }
+        validate_permission_decision(&pending.kind, &pending.details, &pending.options, &decision)?;
+        let pending = entry.remove();
         pending
             .sender
             .send(decision)
@@ -405,6 +595,97 @@ impl PermissionBroker {
     pub fn expire_all(&self) {
         self.pending.clear();
     }
+}
+
+fn validate_permission_decision(
+    kind: &str,
+    details: &Value,
+    options: &Value,
+    decision: &PermissionDecision,
+) -> Result<(), AppError> {
+    let invalid = || {
+        AppError::InvalidRequest(
+            "permission response does not match the pending request".to_owned(),
+        )
+    };
+    let options = options.as_array().ok_or_else(invalid)?;
+    if !options.iter().any(|option| {
+        option.get("kind").and_then(Value::as_str) == Some(decision.outcome.as_str())
+            && decision
+                .option_id
+                .as_deref()
+                .is_none_or(|id| option.get("optionId").and_then(Value::as_str) == Some(id))
+    }) {
+        return Err(invalid());
+    }
+    if matches!(decision.outcome, PermissionOutcome::Answer) {
+        // Grok choice answers are encoded by the advertised option id, without a data object.
+        if kind == "question" && decision.data.is_none() && decision.option_id.is_some() {
+            return Ok(());
+        }
+        let data = decision.data.as_ref().ok_or_else(invalid)?;
+        if kind == "user_input" {
+            let answers = data
+                .get("answers")
+                .and_then(Value::as_object)
+                .ok_or_else(invalid)?;
+            let questions = details
+                .get("questions")
+                .and_then(Value::as_array)
+                .ok_or_else(invalid)?;
+            if questions.is_empty()
+                || answers.len() != questions.len()
+                || !questions.iter().all(|question| {
+                    question
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| answers.get(id))
+                        .and_then(|answer| answer.get("answers"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|values| {
+                            !values.is_empty() && values.iter().all(Value::is_string)
+                        })
+                })
+            {
+                return Err(invalid());
+            }
+        } else if kind == "extension_ui" {
+            match details.get("method").and_then(Value::as_str) {
+                Some("confirm") if data.get("confirmed").is_some_and(Value::is_boolean) => {}
+                Some("input" | "editor") if data.get("value").is_some_and(Value::is_string) => {}
+                Some("select")
+                    if data
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| {
+                            details
+                                .get("options")
+                                .and_then(Value::as_array)
+                                .is_some_and(|options| {
+                                    options.iter().any(|option| option.as_str() == Some(value))
+                                })
+                        }) => {}
+                _ => return Err(invalid()),
+            }
+        } else if kind == "elicitation" {
+            if !data.is_object() {
+                return Err(invalid());
+            }
+        } else if !matches!(kind, "question" | "questions") {
+            return Err(invalid());
+        }
+    } else if decision.data.is_some()
+        && !(kind == "plan"
+            && matches!(decision.outcome, PermissionOutcome::RejectOnce)
+            && decision
+                .data
+                .as_ref()
+                .and_then(|data| data.get("feedback"))
+                .is_some_and(Value::is_string))
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn normalize_permission_options(options: Value) -> Result<Value, AppError> {
@@ -448,7 +729,12 @@ fn normalize_permission_options(options: Value) -> Result<Value, AppError> {
                 .unwrap_or(option_id);
             if !matches!(
                 kind,
-                "allow_once" | "allow_always" | "reject_once" | "reject_always" | "answer"
+                "allow_once"
+                    | "allow_always"
+                    | "reject_once"
+                    | "reject_always"
+                    | "abort_turn"
+                    | "answer"
             ) {
                 return Err(AppError::InvalidRequest(format!(
                     "unsupported permission option kind {kind}"
@@ -473,6 +759,9 @@ mod tests {
     #[test]
     fn provider_capabilities_publish_image_input_in_camel_case() {
         let value = serde_json::to_value(ProviderCapabilities {
+            permission_config: permission_config_capabilities(ProviderKind::Codex),
+            native_fork: true,
+            native_compact: true,
             native_resume: true,
             cancel: true,
             permissions: true,
@@ -535,5 +824,138 @@ mod tests {
         assert_eq!(options[0]["kind"], "allow_once");
         assert_eq!(options[1]["id"], "answer");
         assert_eq!(options[1]["label"], "Answer");
+    }
+    #[test]
+    fn permission_controls_reject_unsupported_and_conflicting_inputs() {
+        assert!(resolve_permission_config(ProviderKind::Codex, None, Some("root"), None).is_err());
+        assert!(resolve_permission_config(
+            ProviderKind::Codex,
+            Some("read-only"),
+            Some("danger-full-access"),
+            None
+        )
+        .is_err());
+        assert!(
+            resolve_permission_config(ProviderKind::Pi, None, Some("read-only"), None).is_err()
+        );
+        assert_eq!(
+            resolve_permission_config(ProviderKind::ClaudeCode, None, Some("read-only"), None)
+                .unwrap()
+                .provider_mode
+                .as_deref(),
+            Some("plan")
+        );
+        assert_eq!(
+            resolve_permission_config(ProviderKind::Codex, None, None, None)
+                .unwrap()
+                .approval_policy
+                .as_deref(),
+            Some("on-request")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_permission_answers_preserve_pending_request() {
+        let broker = PermissionBroker::default();
+        let (sender, receiver) = oneshot::channel();
+        broker.pending.insert(
+            "p".to_owned(),
+            PendingPermission {
+                conversation_id: "c".to_owned(),
+                sender,
+                kind: "command".to_owned(),
+                details: Value::Null,
+                options: normalize_permission_options(
+                    json!([{ "id": "allow", "kind": "allow_once", "name": "Allow" }]),
+                )
+                .unwrap(),
+            },
+        );
+        let answer = PermissionDecision {
+            outcome: PermissionOutcome::Answer,
+            option_id: None,
+            data: Some(json!({"answers": {}})),
+        };
+        assert!(broker.resolve("c", "p", answer).await.is_err());
+        assert!(broker.pending.contains_key("p"));
+        let valid = PermissionDecision {
+            outcome: PermissionOutcome::AllowOnce,
+            option_id: Some("allow".to_owned()),
+            data: None,
+        };
+        assert!(broker.resolve("other", "p", valid.clone()).await.is_err());
+        assert!(broker
+            .resolve(
+                "c",
+                "p",
+                PermissionDecision {
+                    option_id: Some("forged".to_owned()),
+                    ..valid.clone()
+                }
+            )
+            .await
+            .is_err());
+        broker.resolve("c", "p", valid.clone()).await.unwrap();
+        assert!(matches!(
+            receiver.await.unwrap().outcome,
+            PermissionOutcome::AllowOnce
+        ));
+        assert!(broker.resolve("c", "p", valid).await.is_err());
+    }
+
+    #[test]
+    fn user_input_and_extension_answers_require_the_expected_shape() {
+        let options = normalize_permission_options(
+            json!([{ "id": "answer", "kind": "answer", "name": "Answer" }]),
+        )
+        .unwrap();
+        let mut decision = PermissionDecision {
+            outcome: PermissionOutcome::Answer,
+            option_id: None,
+            data: Some(json!({"answers": {}})),
+        };
+        let details = json!({"questions": [{"id": "q"}]});
+        assert!(validate_permission_decision("user_input", &details, &options, &decision).is_err());
+        decision.data = Some(json!({"answers": {"q": {"answers": ["yes"]}}}));
+        assert!(validate_permission_decision("user_input", &details, &options, &decision).is_ok());
+        assert!(validate_permission_decision(
+            "extension_ui",
+            &json!({"method":"confirm"}),
+            &options,
+            &decision
+        )
+        .is_err());
+        decision.data = Some(json!({"confirmed": false}));
+        assert!(validate_permission_decision(
+            "extension_ui",
+            &json!({"method":"confirm"}),
+            &options,
+            &decision
+        )
+        .is_ok());
+    }
+    #[test]
+    fn grok_advertised_choice_does_not_require_answer_data() {
+        let options = normalize_permission_options(
+            json!([{ "id":"answer:0:1", "kind":"answer", "name":"Choice" }]),
+        )
+        .unwrap();
+        let decision = PermissionDecision {
+            outcome: PermissionOutcome::Answer,
+            option_id: Some("answer:0:1".to_owned()),
+            data: None,
+        };
+        assert!(validate_permission_decision("question", &json!({}), &options, &decision).is_ok());
+    }
+    #[test]
+    fn removing_sandbox_does_not_implicitly_disable_approvals() {
+        let effective =
+            resolve_permission_config(ProviderKind::Codex, None, Some("danger-full-access"), None)
+                .unwrap();
+        assert_eq!(effective.approval_policy.as_deref(), Some("on-request"));
+        let preset =
+            resolve_permission_config(ProviderKind::Codex, Some(":danger-full-access"), None, None)
+                .unwrap();
+        assert_eq!(preset.approval_policy.as_deref(), Some("never"));
     }
 }

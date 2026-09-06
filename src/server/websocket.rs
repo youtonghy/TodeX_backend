@@ -52,6 +52,7 @@ pub struct AuthContext {
 pub(super) struct LegacyEventScope {
     codex_sessions: HashSet<String>,
     terminals: HashSet<String>,
+    delivered_cursors: std::collections::BTreeMap<String, u64>,
 }
 
 pub fn authenticate_headers(state: &AppState, headers: &HeaderMap) -> Option<AuthContext> {
@@ -397,33 +398,156 @@ pub(super) async fn resume_session_cursors(
     state: &AppState,
     event_scope: &tokio::sync::RwLock<LegacyEventScope>,
     cursors: &std::collections::BTreeMap<String, u64>,
+    outgoing: &tokio::sync::mpsc::Sender<Value>,
 ) -> Result<Vec<String>, AppError> {
-    let mut valid_sessions = Vec::new();
-    for session_id in cursors.keys().take(TRANSPORT_HELLO_MAX_SESSIONS) {
-        if state.codex_gateway.session_exists(session_id).await? {
-            valid_sessions.push(session_id.clone());
-        }
-    }
+    // Holding this connection's scope lock also buffers its live bus forwarding.
+    // Replay goes only to this sender, never back into the shared event bus.
     let mut scope = event_scope.write().await;
-    for session_id in &valid_sessions {
-        if scope.codex_sessions.len() >= MAX_CONNECTION_SCOPES {
+    let mut valid_sessions = Vec::new();
+    for (session_id, cursor) in cursors.iter().take(TRANSPORT_HELLO_MAX_SESSIONS) {
+        if !scope.codex_sessions.contains(session_id)
+            && scope.codex_sessions.len() >= MAX_CONNECTION_SCOPES
+        {
             break;
         }
+        if !state.codex_gateway.session_exists(session_id).await? {
+            continue;
+        }
+        let high_water = state
+            .codex_gateway
+            .recover_session(session_id)
+            .await?
+            .last_cursor;
+        let delivered = replay_gateway_to_connection(
+            state,
+            outgoing,
+            session_id,
+            (*cursor).min(high_water),
+            high_water,
+        )
+        .await?;
         scope.codex_sessions.insert(session_id.clone());
+        scope
+            .delivered_cursors
+            .insert(session_id.clone(), delivered);
+        valid_sessions.push(session_id.clone());
     }
-    drop(scope);
+    Ok(valid_sessions)
+}
 
-    for session_id in &valid_sessions {
-        let cursor = cursors[session_id];
+async fn replay_gateway_to_connection(
+    state: &AppState,
+    outgoing: &tokio::sync::mpsc::Sender<Value>,
+    session_id: &str,
+    mut cursor: u64,
+    high_water: u64,
+) -> Result<u64, AppError> {
+    while cursor < high_water {
         let replay = state
             .codex_gateway
             .replay_events(session_id, Some(cursor), TRANSPORT_HELLO_REPLAY_LIMIT)
             .await?;
-        for record in replay.events {
-            publish_codex_gateway_record(state, record).await;
+        let previous = cursor;
+        for record in replay
+            .events
+            .into_iter()
+            .take_while(|record| record.cursor <= high_water)
+        {
+            if record.cursor != cursor + 1 {
+                return Err(AppError::Conflict(
+                    "Gateway history contains a cursor gap".to_owned(),
+                ));
+            }
+            cursor = record.cursor;
+            outgoing
+                .send(serde_json::to_value(ServerEvent::from(
+                    gateway_event_record(record),
+                ))?)
+                .await
+                .map_err(|_| AppError::StreamClosed)?;
+        }
+        if cursor == previous {
+            return Err(AppError::Conflict(
+                "Gateway replay did not reach its high water mark".to_owned(),
+            ));
         }
     }
-    Ok(valid_sessions)
+    Ok(cursor)
+}
+
+pub(super) async fn forward_legacy_event(
+    state: &AppState,
+    event_scope: &tokio::sync::RwLock<LegacyEventScope>,
+    outgoing: &tokio::sync::mpsc::Sender<Value>,
+    event: EventRecord,
+) -> Result<(), AppError> {
+    let mut scope = event_scope.write().await;
+    if !legacy_event_is_visible(&event, &scope) {
+        return Ok(());
+    }
+    if event.event_type.starts_with("codex.") {
+        if let (Some(session_id), Some(cursor)) = (
+            event
+                .payload
+                .get("codex_session_id")
+                .and_then(Value::as_str),
+            event.payload.get("cursor").and_then(Value::as_u64),
+        ) {
+            if let Some(delivered) = scope.delivered_cursors.get(session_id).copied() {
+                if cursor <= delivered {
+                    return Ok(());
+                }
+                // Recover both lag and out-of-order publication from the journal.
+                if cursor > delivered + 1 {
+                    replay_gateway_to_connection(
+                        state,
+                        outgoing,
+                        session_id,
+                        delivered,
+                        cursor - 1,
+                    )
+                    .await?;
+                }
+            }
+            outgoing
+                .send(serde_json::to_value(ServerEvent::from(event.clone()))?)
+                .await
+                .map_err(|_| AppError::StreamClosed)?;
+            scope
+                .delivered_cursors
+                .insert(session_id.to_owned(), cursor);
+            return Ok(());
+        }
+    }
+    outgoing
+        .send(serde_json::to_value(ServerEvent::from(event))?)
+        .await
+        .map_err(|_| AppError::StreamClosed)
+}
+
+pub(super) async fn recover_legacy_lag(
+    state: &AppState,
+    event_scope: &tokio::sync::RwLock<LegacyEventScope>,
+    outgoing: &tokio::sync::mpsc::Sender<Value>,
+) -> Result<(), AppError> {
+    let mut scope = event_scope.write().await;
+    for session_id in scope.codex_sessions.clone() {
+        let delivered = scope
+            .delivered_cursors
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        let high_water = state
+            .codex_gateway
+            .recover_session(&session_id)
+            .await?
+            .last_cursor;
+        let cursor =
+            replay_gateway_to_connection(state, outgoing, &session_id, delivered, high_water)
+                .await?;
+        scope.delivered_cursors.insert(session_id, cursor);
+    }
+    Ok(())
 }
 
 pub(super) fn legacy_event_is_visible(event: &EventRecord, scope: &LegacyEventScope) -> bool {
@@ -1914,24 +2038,25 @@ fn local_codex_status_from_runtime(
 }
 
 async fn publish_codex_gateway_record(state: &AppState, record: CodexGatewayEventRecord) {
-    state
-        .events
-        .publish(EventRecord {
-            time: record.time,
-            event_id: record.event_id,
-            event_type: record.event_type,
-            workspace_id: None,
-            window_id: None,
-            pane_id: None,
-            payload: json!({
-                "cursor": record.cursor,
-                "codex_session_id": record.session_id,
-                "codex_thread_id": record.codex_thread_id,
-                "codex_turn_id": record.codex_turn_id,
-                "data": record.payload,
-            }),
-        })
-        .await;
+    state.events.publish(gateway_event_record(record)).await;
+}
+
+fn gateway_event_record(record: CodexGatewayEventRecord) -> EventRecord {
+    EventRecord {
+        time: record.time,
+        event_id: record.event_id,
+        event_type: record.event_type,
+        workspace_id: None,
+        window_id: None,
+        pane_id: None,
+        payload: json!({
+            "cursor": record.cursor,
+            "codex_session_id": record.session_id,
+            "codex_thread_id": record.codex_thread_id,
+            "codex_turn_id": record.codex_turn_id,
+            "data": record.payload,
+        }),
+    }
 }
 
 fn error_event(
@@ -3719,6 +3844,104 @@ mod tests {
     #[cfg(unix)]
     fn payload_u64(payload: &Value, key: &str) -> Option<u64> {
         payload.get(key).and_then(Value::as_u64)
+    }
+
+    #[tokio::test]
+    async fn session_resume_pages_to_one_connection_and_recovers_cursor_gaps() {
+        let state = test_state().await;
+        let session = "cdxs_paged";
+        let mut records = Vec::new();
+        for index in 1..=165 {
+            records.push(
+                state
+                    .codex_gateway
+                    .append_event(
+                        session,
+                        CodexGatewayEvent::new("codex.thread.started", json!({ "index": index })),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut global = state.events.subscribe();
+        let scope = tokio::sync::RwLock::new(super::LegacyEventScope::default());
+        let (outgoing, mut incoming) = tokio::sync::mpsc::channel(256);
+        let sessions = super::resume_session_cursors(
+            &state,
+            &scope,
+            &[(session.to_owned(), 0)].into(),
+            &outgoing,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sessions, vec![session]);
+        for expected in 1..=165 {
+            assert_eq!(
+                incoming.recv().await.unwrap()["payload"]["cursor"],
+                expected
+            );
+        }
+        assert!(
+            global.try_recv().is_err(),
+            "replay must never republish into another client's bus"
+        );
+        // Already-replayed events still buffered by the shared bus are ignored.
+        super::forward_legacy_event(
+            &state,
+            &scope,
+            &outgoing,
+            super::gateway_event_record(records.pop().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(incoming.try_recv().is_err());
+        let missed = state
+            .codex_gateway
+            .append_event(
+                session,
+                CodexGatewayEvent::new("codex.thread.started", json!({})),
+            )
+            .await
+            .unwrap();
+        let newest = state
+            .codex_gateway
+            .append_event(
+                session,
+                CodexGatewayEvent::new("codex.thread.started", json!({})),
+            )
+            .await
+            .unwrap();
+        super::forward_legacy_event(
+            &state,
+            &scope,
+            &outgoing,
+            super::gateway_event_record(newest),
+        )
+        .await
+        .unwrap();
+        assert_eq!(incoming.recv().await.unwrap()["payload"]["cursor"], 166);
+        assert_eq!(incoming.recv().await.unwrap()["payload"]["cursor"], 167);
+        super::forward_legacy_event(
+            &state,
+            &scope,
+            &outgoing,
+            super::gateway_event_record(missed),
+        )
+        .await
+        .unwrap();
+        assert!(incoming.try_recv().is_err());
+        state
+            .codex_gateway
+            .append_event(
+                session,
+                CodexGatewayEvent::new("codex.thread.started", json!({})),
+            )
+            .await
+            .unwrap();
+        super::recover_legacy_lag(&state, &scope, &outgoing)
+            .await
+            .unwrap();
+        assert_eq!(incoming.recv().await.unwrap()["payload"]["cursor"], 168);
     }
 
     async fn test_state() -> AppState {

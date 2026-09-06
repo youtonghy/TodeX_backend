@@ -9,13 +9,46 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufR
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
 const MAX_PROTOCOL_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
+pub(super) fn control_timeout() -> Result<Duration, AppError> {
+    configured_timeout("TODEX_AGENTD_PROVIDER_CONTROL_TIMEOUT_SECONDS", 30, 3600)
+}
+pub(super) fn cancel_timeout() -> Result<Duration, AppError> {
+    configured_timeout("TODEX_AGENTD_PROVIDER_CANCEL_TIMEOUT_SECONDS", 10, 3600)
+}
+pub(super) fn compact_timeout() -> Result<Duration, AppError> {
+    configured_timeout("TODEX_AGENTD_PROVIDER_COMPACT_TIMEOUT_SECONDS", 300, 86400)
+}
+fn write_timeout() -> Result<Duration, AppError> {
+    configured_timeout("TODEX_AGENTD_PROVIDER_WRITE_TIMEOUT_SECONDS", 10, 3600)
+}
+fn configured_timeout(name: &str, default: u64, maximum: u64) -> Result<Duration, AppError> {
+    match std::env::var(name) {
+        Ok(value) => parse_timeout_value(name, &value, maximum),
+        Err(std::env::VarError::NotPresent) => Ok(Duration::from_secs(default)),
+        Err(_) => Err(AppError::InvalidRequest(format!(
+            "{name} must contain a positive integer number of seconds"
+        ))),
+    }
+}
+fn parse_timeout_value(name: &str, value: &str, maximum: u64) -> Result<Duration, AppError> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| (1..=maximum).contains(seconds))
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            AppError::InvalidRequest(format!(
+                "{name} must be an integer between 1 and {maximum} seconds"
+            ))
+        })
+}
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 // How much stderr travels with a failure message. The buffer holds up to
 // MAX_STDERR_BYTES, which is more than a user can read and more than an error
@@ -51,6 +84,7 @@ pub struct JsonLineProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stdout_pending: Vec<u8>,
     stderr: Arc<Mutex<Vec<u8>>>,
     stderr_task: JoinHandle<()>,
     pid: Option<u32>,
@@ -107,6 +141,7 @@ impl JsonLineProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            stdout_pending: Vec::new(),
             stderr,
             stderr_task,
             pid,
@@ -123,6 +158,14 @@ impl JsonLineProcess {
     }
 
     pub async fn send(&mut self, value: &Value) -> Result<(), AppError> {
+        self.send_with_timeout(value, write_timeout()?).await
+    }
+
+    async fn send_with_timeout(
+        &mut self,
+        value: &Value,
+        deadline: Duration,
+    ) -> Result<(), AppError> {
         let mut bytes = serde_json::to_vec(value)?;
         if bytes.len() > MAX_PROTOCOL_LINE_BYTES {
             return Err(AppError::InvalidRequest(
@@ -130,13 +173,39 @@ impl JsonLineProcess {
             ));
         }
         bytes.push(b'\n');
-        self.stdin.write_all(&bytes).await?;
-        self.stdin.flush().await?;
+        timeout(deadline, async {
+            self.stdin.write_all(&bytes).await?;
+            self.stdin.flush().await
+        })
+        .await
+        .map_err(|_| {
+            AppError::ProviderUnavailable("provider protocol write timed out".to_owned())
+        })??;
         Ok(())
     }
 
+    /// A single control exchange keeps the same deadline across unrelated notifications.
+    pub async fn read_control_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Option<Value>, AppError> {
+        if Instant::now() >= deadline {
+            return Err(AppError::ProviderUnavailable(
+                "provider control response timed out".to_owned(),
+            ));
+        }
+        timeout_at(deadline, self.read()).await.map_err(|_| {
+            AppError::ProviderUnavailable("provider control response timed out".to_owned())
+        })?
+    }
+
     pub async fn read(&mut self) -> Result<Option<Value>, AppError> {
-        let Some(mut bytes) = read_bounded_line(&mut self.stdout, MAX_PROTOCOL_LINE_BYTES).await?
+        let Some(mut bytes) = read_bounded_line(
+            &mut self.stdout,
+            &mut self.stdout_pending,
+            MAX_PROTOCOL_LINE_BYTES,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -539,11 +608,15 @@ where
     Ok((output, exceeded))
 }
 
-async fn read_bounded_line<R>(reader: &mut R, max_bytes: usize) -> Result<Option<Vec<u8>>, AppError>
+async fn read_bounded_line<R>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, AppError>
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut output = Vec::new();
+    // Keep partial frames with the process: cancelling a read to send interrupt must not lose bytes.
     loop {
         let (consumed, found_newline) = {
             let available = reader.fill_buf().await?;
@@ -551,7 +624,7 @@ where
                 return if output.is_empty() {
                     Ok(None)
                 } else {
-                    Ok(Some(output))
+                    Ok(Some(std::mem::take(output)))
                 };
             }
             let consumed = available
@@ -571,7 +644,7 @@ where
         };
         reader.consume(consumed);
         if found_newline {
-            return Ok(Some(output));
+            return Ok(Some(std::mem::take(output)));
         }
     }
 }
@@ -595,7 +668,7 @@ mod tests {
         let input = b"123456789\n".as_slice();
         let mut reader = BufReader::new(input);
         assert!(matches!(
-            read_bounded_line(&mut reader, 4).await,
+            read_bounded_line(&mut reader, &mut Vec::new(), 4).await,
             Err(AppError::InvalidRequest(message)) if message.contains("too large")
         ));
     }
@@ -653,5 +726,101 @@ mod tests {
             Some(path.clone())
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn silent_provider_control_times_out_and_can_be_reaped() {
+        let mut spec = CommandSpec::new("/bin/sh", std::env::temp_dir());
+        spec.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
+        let mut process = JsonLineProcess::spawn(&spec).await.unwrap();
+        let result = process
+            .read_control_until(Instant::now() + Duration::from_millis(20))
+            .await;
+        assert!(
+            matches!(result, Err(AppError::ProviderUnavailable(message)) if message.contains("timed out"))
+        );
+        process.terminate().await;
+        assert!(process.child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrelated_frames_do_not_reset_control_deadline() {
+        let mut spec = CommandSpec::new("/bin/sh", std::env::temp_dir());
+        spec.args = vec![
+            "-c".to_owned(),
+            "while :; do printf '{}\n'; done".to_owned(),
+        ];
+        let mut process = JsonLineProcess::spawn(&spec).await.unwrap();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let mut received = 0;
+        loop {
+            // timeout_at permits one immediate poll even when expired; enforce the exchange deadline too.
+            if Instant::now() >= deadline {
+                break;
+            }
+            match process.read_control_until(deadline).await {
+                Ok(Some(_)) => received += 1,
+                Err(AppError::ProviderUnavailable(_)) => break,
+                other => panic!("unexpected provider result: {other:?}"),
+            }
+        }
+        assert!(received > 0);
+        process.terminate().await;
+    }
+    #[test]
+    fn timeout_configuration_is_bounded_and_does_not_echo_invalid_values() {
+        for value in ["0", "-1", "3601", "secret-value"] {
+            let error =
+                parse_timeout_value("TODEX_AGENTD_PROVIDER_WRITE_TIMEOUT_SECONDS", value, 3600)
+                    .unwrap_err();
+            assert!(!error.to_string().contains("secret-value"));
+        }
+        assert_eq!(
+            parse_timeout_value("timeout", "15", 3600).unwrap(),
+            Duration::from_secs(15)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_that_does_not_consume_stdin_has_bounded_writes() {
+        let mut spec = CommandSpec::new("/bin/sh", std::env::temp_dir());
+        spec.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
+        let mut process = JsonLineProcess::spawn(&spec).await.unwrap();
+        let result = process
+            .send_with_timeout(
+                &serde_json::json!({"data": "x".repeat(1024 * 1024)}),
+                Duration::from_millis(20),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AppError::ProviderUnavailable(message)) if message.contains("write timed out"))
+        );
+        process.terminate().await;
+        assert!(process.child.try_wait().unwrap().is_some());
+    }
+    #[tokio::test]
+    async fn interrupted_read_preserves_the_partial_protocol_frame() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+        let mut reader = BufReader::new(reader);
+        let mut pending = Vec::new();
+        writer.write_all(b"{\"part\":").await.unwrap();
+        assert!(timeout(
+            Duration::from_millis(10),
+            read_bounded_line(&mut reader, &mut pending, 128)
+        )
+        .await
+        .is_err());
+        writer.write_all(b"true}\n").await.unwrap();
+        let frame = read_bounded_line(&mut reader, &mut pending, 128)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&frame).unwrap(),
+            serde_json::json!({"part": true})
+        );
+        assert!(pending.is_empty());
     }
 }

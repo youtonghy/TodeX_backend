@@ -123,6 +123,11 @@ impl ProviderDriver for GrokBuildDriver {
             }),
             profiles: Vec::new(),
             capabilities: ProviderCapabilities {
+                permission_config: super::types::permission_config_capabilities(
+                    ProviderKind::GrokBuild,
+                ),
+                native_fork: false,
+                native_compact: false,
                 native_resume: true,
                 cancel: true,
                 permissions: true,

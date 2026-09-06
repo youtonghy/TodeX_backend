@@ -13,9 +13,9 @@ use uuid::Uuid;
 use crate::error::AppError;
 
 use super::{
-    redact_secrets, status_after_event, ConversationEvent, ConversationManifest,
-    ConversationReplay, ConversationSnapshot, ProviderState, CONVERSATION_SCHEMA_VERSION,
-    MAX_EVENT_PAYLOAD_BYTES,
+    redact_secrets, status_after_conversation_event, ConversationEvent, ConversationEventHub,
+    ConversationManifest, ConversationReplay, ConversationSnapshot, ProviderState,
+    CONVERSATION_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES,
 };
 
 const MANIFEST_FILE: &str = "manifest.json";
@@ -29,6 +29,22 @@ const MAX_EVENTS_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 pub struct ConversationStore {
     root: PathBuf,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    indexes: Arc<DashMap<String, JournalIndex>>,
+    tails: Arc<DashMap<String, JournalTail>>,
+}
+
+#[derive(Clone)]
+struct JournalIndex {
+    bytes: u64,
+    modified: Option<std::time::SystemTime>,
+    offsets: Vec<(u64, u64)>,
+}
+
+#[derive(Clone)]
+struct JournalTail {
+    bytes: u64,
+    modified: Option<std::time::SystemTime>,
+    event: ConversationEvent,
 }
 
 impl ConversationStore {
@@ -39,6 +55,8 @@ impl ConversationStore {
         Ok(Self {
             root,
             locks: Arc::new(DashMap::new()),
+            indexes: Arc::new(DashMap::new()),
+            tails: Arc::new(DashMap::new()),
         })
     }
 
@@ -46,7 +64,32 @@ impl ConversationStore {
         &self,
         manifest: ConversationManifest,
     ) -> Result<ConversationManifest, AppError> {
+        self.create_with_history(manifest, Vec::new(), None, None)
+            .await
+    }
+
+    /// Publish a fork directory only after history, provider state and snapshot are complete.
+    pub async fn create_with_history(
+        &self,
+        mut manifest: ConversationManifest,
+        events: Vec<ConversationEvent>,
+        provider_state: Option<ProviderState>,
+        request: Option<Value>,
+    ) -> Result<ConversationManifest, AppError> {
         validate_id(&manifest.id)?;
+        let mut journal = Vec::new();
+        for (index, event) in events.iter().enumerate() {
+            validate_event(event, &manifest.id, index as u64 + 1)?;
+            serde_json::to_writer(&mut journal, event)?;
+            journal.push(b'\n');
+            if journal.len() as u64 > MAX_EVENTS_JOURNAL_BYTES {
+                return Err(AppError::Conflict(
+                    "Fork history exceeds the journal storage limit".to_owned(),
+                ));
+            }
+            manifest.status = status_after_conversation_event(manifest.status, event);
+            manifest.last_sequence = event.sequence;
+        }
         let _guard = self.lock(&manifest.id).await;
         let directory = self.directory(&manifest.id)?;
         if tokio::fs::try_exists(&directory).await? {
@@ -69,6 +112,7 @@ impl ConversationStore {
                 .write(true)
                 .open(&event_file)
                 .await?;
+            file.write_all(&journal).await?;
             file.flush().await?;
             file.sync_all().await?;
             drop(file);
@@ -82,9 +126,12 @@ impl ConversationStore {
             .await?;
             write_atomic_json(
                 &temporary.join(PROVIDER_STATE_FILE),
-                &ProviderState::new(manifest.provider),
+                &provider_state.unwrap_or_else(|| ProviderState::new(manifest.provider)),
             )
             .await?;
+            if let Some(request) = request {
+                write_atomic_json(&temporary.join("last-request.json"), &request).await?;
+            }
             sync_directory(&temporary).await?;
             tokio::fs::rename(&temporary, &directory).await?;
             sync_directory(&self.root).await
@@ -163,17 +210,21 @@ impl ConversationStore {
             )));
         }
         tokio::fs::remove_dir_all(directory).await?;
+        self.indexes.remove(conversation_id);
+        self.tails.remove(conversation_id);
         Ok(())
     }
 
     pub async fn cleanup_before(
         &self,
         cutoff: DateTime<Utc>,
+        protected: &std::collections::HashSet<String>,
     ) -> Result<Vec<ConversationManifest>, AppError> {
         let manifests = self.list().await?;
         let mut removed = Vec::new();
         for manifest in manifests {
-            if manifest.updated_at >= cutoff
+            if protected.contains(&manifest.id)
+                || manifest.updated_at >= cutoff
                 || matches!(
                     manifest.status,
                     super::ConversationStatus::Running
@@ -197,6 +248,8 @@ impl ConversationStore {
                 )
             {
                 tokio::fs::remove_dir_all(self.directory(&id)?).await?;
+                self.indexes.remove(&id);
+                self.tails.remove(&id);
                 removed.push(current);
             }
         }
@@ -207,9 +260,31 @@ impl ConversationStore {
         &self,
         conversation_id: &str,
         event_type: impl Into<String>,
-        mut payload: Value,
+        payload: Value,
     ) -> Result<ConversationEvent, AppError> {
-        let event_type = event_type.into();
+        self.append_inner(conversation_id, event_type.into(), payload, None)
+            .await
+    }
+
+    /// Serialize durable writes and publication with the same conversation lock.
+    pub async fn append_and_publish(
+        &self,
+        conversation_id: &str,
+        event_type: impl Into<String>,
+        payload: Value,
+        hub: &ConversationEventHub,
+    ) -> Result<ConversationEvent, AppError> {
+        self.append_inner(conversation_id, event_type.into(), payload, Some(hub))
+            .await
+    }
+
+    async fn append_inner(
+        &self,
+        conversation_id: &str,
+        event_type: String,
+        mut payload: Value,
+        hub: Option<&ConversationEventHub>,
+    ) -> Result<ConversationEvent, AppError> {
         validate_event_type(&event_type)?;
         redact_secrets(&mut payload);
         if serde_json::to_vec(&payload)?.len() > MAX_EVENT_PAYLOAD_BYTES {
@@ -237,7 +312,7 @@ impl ConversationStore {
                 ))
             })?;
             manifest.last_sequence = last_event.sequence;
-            manifest.status = status_after_event(manifest.status, &last_event.event_type);
+            manifest.status = status_after_conversation_event(manifest.status, &last_event);
             manifest.updated_at = last_event.time;
         }
         let mut event = ConversationEvent::new(
@@ -250,9 +325,9 @@ impl ConversationStore {
         let mut line = serde_json::to_vec(&event)?;
         line.push(b'\n');
         let event_path = directory.join(EVENTS_FILE);
-        let journal_bytes = match tokio::fs::metadata(&event_path).await {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        let (journal_bytes, journal_modified) = match tokio::fs::metadata(&event_path).await {
+            Ok(metadata) => (metadata.len(), metadata.modified().ok()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (0, None),
             Err(error) => return Err(error.into()),
         };
         if journal_bytes.saturating_add(line.len() as u64) > MAX_EVENTS_JOURNAL_BYTES {
@@ -269,9 +344,27 @@ impl ConversationStore {
         file.write_all(&line).await?;
         file.flush().await?;
         file.sync_data().await?;
+        let metadata = file.metadata().await?;
+        if let Some(mut index) = self.indexes.get_mut(conversation_id) {
+            if index.bytes == journal_bytes && index.modified == journal_modified {
+                index
+                    .offsets
+                    .push((journal_bytes, journal_bytes + line.len() as u64 - 1));
+                index.bytes = metadata.len();
+                index.modified = metadata.modified().ok();
+            }
+        }
+        self.tails.insert(
+            conversation_id.to_owned(),
+            JournalTail {
+                bytes: metadata.len(),
+                modified: metadata.modified().ok(),
+                event: event.clone(),
+            },
+        );
 
         manifest.last_sequence = event.sequence;
-        manifest.status = status_after_event(manifest.status, &event.event_type);
+        manifest.status = status_after_conversation_event(manifest.status, &event);
         manifest.updated_at = event.time;
         write_atomic_json(&directory.join(MANIFEST_FILE), &manifest).await?;
         write_atomic_json(
@@ -279,7 +372,54 @@ impl ConversationStore {
             &ConversationSnapshot::from_manifest(&manifest),
         )
         .await?;
+        if let Some(hub) = hub {
+            hub.publish(event.clone());
+        }
         Ok(event)
+    }
+
+    pub async fn save_request(
+        &self,
+        conversation_id: &str,
+        request: &Value,
+    ) -> Result<(), AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let directory = self.directory(conversation_id)?;
+        read_json::<ConversationManifest>(&directory.join(MANIFEST_FILE), "conversation manifest")
+            .await?;
+        write_atomic_json(&directory.join("last-request.json"), request).await
+    }
+
+    pub async fn last_request(&self, conversation_id: &str) -> Result<Option<Value>, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let path = self.directory(conversation_id)?.join("last-request.json");
+        if !tokio::fs::try_exists(&path).await? {
+            return Ok(None);
+        }
+        Ok(Some(
+            read_json(&path, "conversation request snapshot").await?,
+        ))
+    }
+
+    pub async fn complete_history(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationEvent>, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        self.read_and_recover_events(conversation_id).await
+    }
+
+    /// Internal complete scan: unlike the public paginated API this never truncates.
+    pub async fn last_user_message(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationEvent>, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let events = self.read_and_recover_events(conversation_id).await?;
+        Ok(events.into_iter().rev().find(|event| {
+            event.event_type == "message.created"
+                && event.payload.get("role").and_then(Value::as_str) == Some("user")
+        }))
     }
 
     pub async fn replay(
@@ -295,13 +435,44 @@ impl ConversationStore {
                 "conversation {conversation_id}"
             )));
         }
-        let events = self.read_and_recover_events(conversation_id).await?;
         let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
-        let mut matching = events
-            .into_iter()
-            .filter(|event| event.sequence > after_sequence);
-        let events = matching.by_ref().take(limit).collect::<Vec<_>>();
-        let has_more = matching.next().is_some();
+        let event_path = directory.join(EVENTS_FILE);
+        let metadata = tokio::fs::metadata(&event_path).await?;
+        let valid_index = self.indexes.get(conversation_id).is_some_and(|index| {
+            index.bytes == metadata.len() && index.modified == metadata.modified().ok()
+        });
+        if !valid_index {
+            // Validate and repair once; the byte index is only a rebuildable cache.
+            self.read_and_recover_events(conversation_id).await?;
+        }
+        let (from, has_more, offsets) = {
+            let index = self.indexes.get(conversation_id);
+            let offsets = index
+                .as_ref()
+                .map(|entry| entry.offsets.as_slice())
+                .unwrap_or_default();
+            let from = usize::try_from(after_sequence)
+                .unwrap_or(usize::MAX)
+                .min(offsets.len());
+            let to = from.saturating_add(limit).min(offsets.len());
+            (from, to < offsets.len(), offsets[from..to].to_vec())
+        };
+        let mut events = Vec::with_capacity(offsets.len());
+        if let (Some(first), Some(last)) = (offsets.first(), offsets.last()) {
+            let start = first.0;
+            let end = last.1;
+            let mut file = tokio::fs::File::open(&event_path).await?;
+            file.seek(std::io::SeekFrom::Start(start)).await?;
+            let mut page = vec![0u8; (end - start) as usize];
+            file.read_exact(&mut page).await?;
+            for (index, (start_offset, end_offset)) in offsets.iter().enumerate() {
+                let event: ConversationEvent = serde_json::from_slice(
+                    &page[(start_offset - start) as usize..(end_offset - start) as usize],
+                )?;
+                validate_event(&event, conversation_id, (from + index + 1) as u64)?;
+                events.push(event);
+            }
+        }
         let next_sequence = events.last().map_or(after_sequence, |event| event.sequence);
         Ok(ConversationReplay {
             conversation_id: conversation_id.to_owned(),
@@ -322,7 +493,7 @@ impl ConversationStore {
         let last_sequence = events.last().map_or(0, |event| event.sequence);
         let mut status = super::ConversationStatus::Idle;
         for event in &events {
-            status = status_after_event(status, &event.event_type);
+            status = status_after_conversation_event(status, event);
         }
         if status == super::ConversationStatus::Running
             || status == super::ConversationStatus::WaitingPermission
@@ -397,6 +568,7 @@ impl ConversationStore {
             .iter()
             .rposition(|(start, end)| !trim_ascii(&raw[*start..*end]).is_empty());
         let mut events = Vec::new();
+        let mut offsets = Vec::new();
         for (index, (start, end)) in ranges.iter().copied().enumerate() {
             let line = trim_ascii(&raw[start..end]);
             if line.is_empty() {
@@ -423,7 +595,29 @@ impl ConversationStore {
                 }
             };
             validate_event(&event, conversation_id, events.len() as u64 + 1)?;
+            offsets.push((start as u64, end as u64));
             events.push(event);
+        }
+        let metadata = tokio::fs::metadata(&path).await?;
+        self.indexes.insert(
+            conversation_id.to_owned(),
+            JournalIndex {
+                bytes: metadata.len(),
+                modified: metadata.modified().ok(),
+                offsets,
+            },
+        );
+        if let Some(event) = events.last() {
+            self.tails.insert(
+                conversation_id.to_owned(),
+                JournalTail {
+                    bytes: metadata.len(),
+                    modified: metadata.modified().ok(),
+                    event: event.clone(),
+                },
+            );
+        } else {
+            self.tails.remove(conversation_id);
         }
         Ok(events)
     }
@@ -438,6 +632,11 @@ impl ConversationStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        if let Some(tail) = self.tails.get(conversation_id) {
+            if tail.bytes == metadata.len() && tail.modified == metadata.modified().ok() {
+                return Ok(Some(tail.event.clone()));
+            }
+        }
         if metadata.len() > MAX_EVENTS_JOURNAL_BYTES {
             return Err(AppError::InvalidRequest(format!(
                 "conversation {conversation_id} journal exceeds {MAX_EVENTS_JOURNAL_BYTES} bytes"
@@ -489,12 +688,14 @@ impl ConversationStore {
     }
 
     async fn lock(&self, conversation_id: &str) -> OwnedMutexGuard<()> {
-        self.locks
+        // Drop the DashMap shard guard before awaiting the async mutex. Holding
+        // it across await can block every executor thread under concurrent writes.
+        let lock = self
+            .locks
             .entry(conversation_id.to_owned())
             .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-            .lock_owned()
-            .await
+            .clone();
+        lock.lock_owned().await
     }
 }
 
@@ -676,6 +877,351 @@ mod tests {
 
     use super::*;
     use crate::conversation::{ConversationStatus, ProviderKind};
+
+    #[tokio::test]
+    #[ignore = "opt-in 1k/10k journal replay performance measurement"]
+    async fn measure_journal_replay_1k_and_10k() {
+        for count in [1_000u64, 10_000] {
+            let root = temp_dir("todex-replay-measurement");
+            let store = ConversationStore::new(root.clone()).await.unwrap();
+            let manifest = ConversationManifest::new(ProviderKind::Codex, root.clone(), None, None);
+            let history = (1..=count)
+                .map(|sequence| {
+                    ConversationEvent::new(
+                        &manifest.id,
+                        sequence,
+                        "message.delta",
+                        json!({ "turnId": "t", "content": "representative delta ".repeat(24) }),
+                    )
+                })
+                .collect();
+            store
+                .create_with_history(manifest.clone(), history, None, None)
+                .await
+                .unwrap();
+            // The previous replay algorithm reparsed the complete journal for every page.
+            let baseline_start = std::time::Instant::now();
+            let mut baseline_first_page = std::time::Duration::ZERO;
+            let mut restored = 0;
+            for cursor in (0..count as usize).step_by(200) {
+                restored += store
+                    .complete_history(&manifest.id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .skip(cursor)
+                    .take(200)
+                    .count();
+                if cursor == 0 {
+                    baseline_first_page = baseline_start.elapsed();
+                }
+            }
+            assert_eq!(restored, count as usize);
+            let baseline = baseline_start.elapsed();
+            store.indexes.clear();
+            let cold_start = std::time::Instant::now();
+            let mut cold_first_page = std::time::Duration::ZERO;
+            let mut cursor = 0;
+            loop {
+                let page = store.replay(&manifest.id, cursor, 200).await.unwrap();
+                if cursor == 0 {
+                    cold_first_page = cold_start.elapsed();
+                }
+                cursor = page.next_sequence;
+                if !page.has_more {
+                    break;
+                }
+            }
+            assert_eq!(cursor, count);
+            let cold = cold_start.elapsed();
+            let warm_start = std::time::Instant::now();
+            let mut cursor = 0;
+            loop {
+                let page = store.replay(&manifest.id, cursor, 200).await.unwrap();
+                cursor = page.next_sequence;
+                if !page.has_more {
+                    break;
+                }
+            }
+            assert_eq!(cursor, count);
+            let warm = warm_start.elapsed();
+            let offset_capacity_bytes = {
+                let index = store.indexes.get(&manifest.id).unwrap();
+                index.offsets.capacity() * std::mem::size_of::<(u64, u64)>()
+            };
+            // Measure durable append queueing while the same journal is repeatedly replayed.
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader_done = done.clone();
+            let reader_store = store.clone();
+            let reader_id = manifest.id.clone();
+            let reader = tokio::spawn(async move {
+                let mut cursor = 0;
+                loop {
+                    let page = reader_store.replay(&reader_id, cursor, 200).await.unwrap();
+                    cursor = page.next_sequence;
+                    if cursor >= count {
+                        if reader_done.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        cursor = 0;
+                    }
+                }
+            });
+            let mut append_ms = Vec::new();
+            for index in 0..20 {
+                let start = std::time::Instant::now();
+                store
+                    .append(&manifest.id, "fixture.append", json!({ "index": index }))
+                    .await
+                    .unwrap();
+                append_ms.push(start.elapsed().as_secs_f64() * 1000.);
+            }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            reader.await.unwrap();
+            append_ms.sort_by(f64::total_cmp);
+            eprintln!("replay_measurement events={count} page=200 baseline_full_scan_ms={:.2} indexed_cold_ms={:.2} indexed_warm_ms={:.2} baseline_first_page_ms={:.2} indexed_first_page_ms={:.2} concurrent_append_samples=20 append_p50_ms={:.2} append_p95_ms={:.2} append_max_ms={:.2} index_offset_capacity_bytes={offset_capacity_bytes}", baseline.as_secs_f64()*1000., cold.as_secs_f64()*1000., warm.as_secs_f64()*1000., baseline_first_page.as_secs_f64()*1000., cold_first_page.as_secs_f64()*1000., append_ms[9], append_ms[18], append_ms[19]);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_and_recovered_status_preserve_approval_and_interruption_semantics() {
+        let root = temp_dir("todex-status-contract");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(
+                &conversation.id,
+                "codex.turn.started",
+                json!({ "turnId": "t" }),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                &conversation.id,
+                "permission.requested",
+                json!({ "permissionId": "p" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&conversation.id).await.unwrap().status,
+            ConversationStatus::WaitingPermission
+        );
+        store
+            .append(
+                &conversation.id,
+                "permission.resolved",
+                json!({ "permissionId": "p" }),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                &conversation.id,
+                "message.completed",
+                json!({ "role": "assistant" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&conversation.id).await.unwrap().status,
+            ConversationStatus::Running
+        );
+        for activity in [
+            "compaction.started",
+            "compaction.completed",
+            "compaction.failed",
+        ] {
+            store
+                .append(
+                    &conversation.id,
+                    activity,
+                    json!({ "turnId": "t", "source": "provider" }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get(&conversation.id).await.unwrap().status,
+                ConversationStatus::Running
+            );
+        }
+        store
+            .append(
+                &conversation.id,
+                "conversation.interrupted",
+                json!({ "reason": "daemon_restarted" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&conversation.id).await.unwrap().status,
+            ConversationStatus::Interrupted
+        );
+        assert_eq!(
+            store.recover(&conversation.id).await.unwrap().status,
+            ConversationStatus::Interrupted
+        );
+        // Repair a journal record created by the older lossy canonical mapping.
+        let path = root
+            .join("conversations")
+            .join(&conversation.id)
+            .join(EVENTS_FILE);
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            original.replace(
+                "\"normalizedType\":\"conversation.interrupted\"",
+                "\"normalizedType\":\"turn.cancelled\"",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            store.recover(&conversation.id).await.unwrap().status,
+            ConversationStatus::Interrupted
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_durable_publish_is_contiguous() {
+        let root = temp_dir("todex-publish-order");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let hub = ConversationEventHub::default();
+        let mut receiver = hub.subscribe(&conversation.id);
+        let barrier = Arc::new(tokio::sync::Barrier::new(24));
+        let mut tasks = Vec::new();
+        for _ in 0..24 {
+            let (store, hub, id, barrier) = (
+                store.clone(),
+                hub.clone(),
+                conversation.id.clone(),
+                barrier.clone(),
+            );
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .append_and_publish(&id, "fixture.delta", json!({}), &hub)
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        for expected in 1..=24 {
+            let received = receiver.recv().await.unwrap();
+            assert_eq!(received.sequence, expected);
+            assert!(store.get(&conversation.id).await.unwrap().last_sequence >= received.sequence);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn seeded_history_and_indexed_pages_are_complete_and_rebuildable() {
+        let root = temp_dir("todex-indexed-history");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = ConversationManifest::new(ProviderKind::Codex, root.clone(), None, None);
+        let events = (1..=1201).map(|sequence| ConversationEvent::new(&conversation.id, sequence,
+            "message.created", json!({ "role": "user", "content": format!("message-{sequence}"), "turnId": format!("t-{sequence}") }))).collect();
+        let mut native = ProviderState::new(ProviderKind::Codex);
+        native.native_session_id = Some("native-fork".to_owned());
+        let snapshot = json!({ "turnId": "t-1201", "request": { "text": "last" } });
+        store
+            .create_with_history(
+                conversation.clone(),
+                events,
+                Some(native),
+                Some(snapshot.clone()),
+            )
+            .await
+            .unwrap();
+        let first = store.replay(&conversation.id, 0, usize::MAX).await.unwrap();
+        assert_eq!(first.events.len(), 1000);
+        assert!(first.has_more);
+        let last = store
+            .replay(&conversation.id, first.next_sequence, 1000)
+            .await
+            .unwrap();
+        assert_eq!(last.events.len(), 201);
+        assert!(!last.has_more);
+        assert_eq!(
+            store
+                .last_user_message(&conversation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .sequence,
+            1201
+        );
+        assert_eq!(
+            store
+                .complete_history(&conversation.id)
+                .await
+                .unwrap()
+                .len(),
+            1201
+        );
+        assert_eq!(
+            store.last_request(&conversation.id).await.unwrap(),
+            Some(snapshot)
+        );
+        assert_eq!(
+            store
+                .provider_state(&conversation.id)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("native-fork")
+        );
+        store
+            .append(&conversation.id, "turn.completed", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .replay(&conversation.id, 1201, 1000)
+                .await
+                .unwrap()
+                .events[0]
+                .sequence,
+            1202
+        );
+        assert_eq!(
+            store.indexes.get(&conversation.id).unwrap().offsets.len(),
+            1202
+        );
+        store.indexes.clear();
+        assert_eq!(
+            store
+                .replay(&conversation.id, 1199, 1000)
+                .await
+                .unwrap()
+                .events
+                .len(),
+            3
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn conversation_folder_is_sequenced_private_and_redacted() {

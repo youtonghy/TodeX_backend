@@ -173,8 +173,9 @@ impl ConversationEvent {
 pub fn normalized_event_type(event_type: &str) -> String {
     match event_type {
         "turn.started" | "codex.turn.started" => "turn.started",
-        "turn.completed" | "codex.turn.completed" | "message.completed" => "turn.completed",
-        "turn.cancelled" | "conversation.interrupted" => "turn.cancelled",
+        "turn.completed" | "codex.turn.completed" => "turn.completed",
+        "turn.cancelled" => "turn.cancelled",
+        "conversation.interrupted" => "conversation.interrupted",
         "turn.failed" | "conversation.failed" => "turn.failed",
         "message.delta" | "assistant.delta" | "text_delta" => "assistant.delta",
         "thought.delta" | "reasoning.delta" | "thinking_delta" => "reasoning.delta",
@@ -193,9 +194,12 @@ pub fn normalized_event_type(event_type: &str) -> String {
         "workflow.cancelled" => "workflow.cancelled",
         "tool.checkpoint.created" => "tool.checkpoint.created",
         "tool.checkpoint.committed" => "tool.checkpoint.committed",
-        "tool.checkpoint.rolledBack" | "tool.checkpoint.rolled_back" => "tool.checkpoint.rolledBack",
+        "tool.checkpoint.rolledBack" | "tool.checkpoint.rolled_back" => {
+            "tool.checkpoint.rolledBack"
+        }
         _ => event_type,
-    }.to_owned()
+    }
+    .to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -259,11 +263,13 @@ pub struct ConversationReplay {
 }
 
 pub fn status_after_event(current: ConversationStatus, event_type: &str) -> ConversationStatus {
-    match event_type {
+    match normalized_event_type(event_type).as_str() {
         "turn.started" => ConversationStatus::Running,
-        "permission.requested" => ConversationStatus::WaitingPermission,
-        "permission.resolved" => ConversationStatus::Running,
-        "turn.completed" | "turn.cancelled" => ConversationStatus::Idle,
+        "tool.awaitingApproval" => ConversationStatus::WaitingPermission,
+        "permission.resolved" if current == ConversationStatus::WaitingPermission => {
+            ConversationStatus::Running
+        }
+        "turn.completed" | "turn.cancelled" | "conversation.forked" => ConversationStatus::Idle,
         "conversation.interrupted" => ConversationStatus::Interrupted,
         "turn.failed" | "conversation.failed" => ConversationStatus::Failed,
         "workflow.started" | "workflow.resumed" => ConversationStatus::Running,
@@ -274,11 +280,65 @@ pub fn status_after_event(current: ConversationStatus, event_type: &str) -> Conv
     }
 }
 
+/// Automatic compaction is a child activity; only explicit standalone operations
+/// own the conversation lifecycle. Recompute canonical names from raw history so
+/// journals written with older lossy normalizedType values remain correct.
+pub fn status_after_conversation_event(
+    current: ConversationStatus,
+    event: &ConversationEvent,
+) -> ConversationStatus {
+    if event
+        .payload
+        .get("operationId")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        match event.event_type.as_str() {
+            "compaction.started" => return ConversationStatus::Running,
+            "compaction.completed" | "compaction.cancelled" => return ConversationStatus::Idle,
+            "compaction.failed" => return ConversationStatus::Failed,
+            _ => {}
+        }
+    }
+    status_after_event(current, &event.event_type)
+}
+
 pub fn redact_secrets(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (key, value) in map {
                 let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+                let usage_count = value.is_number()
+                    && matches!(
+                        normalized.as_str(),
+                        "inputtokens"
+                            | "outputtokens"
+                            | "totaltokens"
+                            | "cachedinputtokens"
+                            | "cachewritetokens"
+                            | "cachecreationinputtokens"
+                            | "cachereadinputtokens"
+                            | "reasoningoutputtokens"
+                            | "reasoningtokens"
+                            | "cachedtokens"
+                            | "tokencount"
+                            | "contextwindowtokens"
+                            | "contexttokens"
+                            | "prompttokens"
+                            | "completiontokens"
+                    );
+                let usage_container = (value.is_object() || value.is_array())
+                    && matches!(
+                        normalized.as_str(),
+                        "tokenusage" | "tokenusages" | "inputtokensdetails" | "outputtokensdetails"
+                    );
+                if usage_count {
+                    continue;
+                }
+                if usage_container {
+                    redact_secrets(value);
+                    continue;
+                }
                 if normalized.contains("token")
                     || normalized.contains("secret")
                     || normalized.contains("password")
@@ -304,6 +364,22 @@ mod provider_kind_tests {
     use super::ProviderKind;
 
     #[test]
+    fn redaction_preserves_numeric_usage_without_preserving_credentials() {
+        let mut value = serde_json::json!({
+            "inputTokens": 42, "output_tokens": 9, "tokenUsage": { "cachedInputTokens": 12, "authToken": "secret" },
+            "access_token": "secret", "input_tokens_details": { "cached_tokens": 4 },
+            "promptTokens": "credential-shaped-string",
+        });
+        super::redact_secrets(&mut value);
+        assert_eq!(value["inputTokens"], 42);
+        assert_eq!(value["output_tokens"], 9);
+        assert_eq!(value["tokenUsage"]["cachedInputTokens"], 12);
+        assert_eq!(value["tokenUsage"]["authToken"], "[REDACTED]");
+        assert_eq!(value["access_token"], "[REDACTED]");
+        assert_eq!(value["promptTokens"], "[REDACTED]");
+    }
+
+    #[test]
     fn event_origin_is_optional_for_old_journals_and_preserves_native_method() {
         let old = serde_json::json!({
             "schemaVersion": 2, "sequence": 1, "eventId": "evt_old",
@@ -327,7 +403,10 @@ mod provider_kind_tests {
         assert_eq!(wire["provider"], "codex");
         assert_eq!(wire["type"], "provider.event");
         assert_eq!(wire["normalizedType"], "provider.event");
-        assert_eq!(super::normalized_event_type("codex.turn.completed"), "turn.completed");
+        assert_eq!(
+            super::normalized_event_type("codex.turn.completed"),
+            "turn.completed"
+        );
     }
 
     #[test]
@@ -352,6 +431,24 @@ mod provider_kind_tests {
                 .filter(|provider| **provider == ProviderKind::GrokBuild)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn status_transitions_use_canonical_event_names() {
+        assert_eq!(
+            super::status_after_event(
+                super::ConversationStatus::Idle,
+                &super::normalized_event_type("codex.turn.started")
+            ),
+            super::ConversationStatus::Running
+        );
+        assert_eq!(
+            super::status_after_event(
+                super::ConversationStatus::Running,
+                &super::normalized_event_type("codex.turn.completed")
+            ),
+            super::ConversationStatus::Idle
         );
     }
 }

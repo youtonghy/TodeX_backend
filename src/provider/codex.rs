@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
 use tokio::sync::watch;
-use tokio::time::{timeout, Duration};
+use tokio::time::timeout;
 
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
@@ -11,12 +11,10 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor, ProviderDescriptor,
-    ProviderDriver,
+    resolve_permission_config, DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult,
+    ImageInputMode, PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor,
+    ProviderDescriptor, ProviderDriver,
 };
-
-const CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct CodexDriver {
     binary: String,
@@ -32,6 +30,120 @@ impl CodexDriver {
 
 #[async_trait]
 impl ProviderDriver for CodexDriver {
+    fn supports_native_compact(&self) -> bool {
+        true
+    }
+
+    async fn compact_session(
+        &self,
+        context: DriverContext,
+        mut cancel: watch::Receiver<bool>,
+        launch_permit: WorkspaceTrustPermit,
+    ) -> Result<(), AppError> {
+        let native = context
+            .provider_state
+            .native_session_id
+            .as_deref()
+            .ok_or_else(|| {
+                AppError::Unsupported(
+                    "conversation has no native Codex session to compact".to_owned(),
+                )
+            })?;
+        let mut spec = CommandSpec::new(&self.binary, &context.manifest.workspace);
+        spec.args = vec![
+            "app-server".to_owned(),
+            "--listen".to_owned(),
+            "stdio://".to_owned(),
+        ];
+        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
+        let result = async {
+            if *cancel.borrow() { return Err(AppError::TurnCancelled); }
+            process.send(&json!({ "id": "initialize", "method": "initialize", "params": { "clientInfo": { "name": "todex-agentd", "version": crate::version::APP_VERSION }, "capabilities": { "experimentalApi": true } } })).await?;
+            read_rpc_response_cancellable(&mut process, "initialize", &mut cancel).await?;
+            process.send(&json!({ "method": "initialized" })).await?;
+            process.send(&json!({ "id": "resume", "method": "thread/resume", "params": { "threadId": native, "cwd": context.manifest.workspace } })).await?;
+            read_rpc_response_cancellable(&mut process, "resume", &mut cancel).await?;
+            if *cancel.borrow() { return Err(AppError::TurnCancelled); }
+            process.send(&json!({ "id": "compact", "method": "thread/compact/start", "params": { "threadId": native } })).await?;
+            let deadline = tokio::time::Instant::now() + super::process::compact_timeout()?;
+            let acknowledgement_deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
+            let mut acknowledged = false;
+            let mut completed = false;
+            let mut native_turn = None;
+            loop {
+                let message = tokio::select! {
+                    message = process.read_control_until(if acknowledged { deadline } else { acknowledgement_deadline.min(deadline) }) => message?,
+                    _ = cancel.changed() => {
+                        if let Some(turn) = native_turn.as_deref() {
+                            process.send(&json!({ "id": "interrupt-compact", "method": "turn/interrupt", "params": {"threadId":native,"turnId":turn} })).await?;
+                        }
+                        return Err(AppError::TurnCancelled);
+                    }
+                }.ok_or_else(|| AppError::ProviderUnavailable("Codex closed during compaction".to_owned()))?;
+                if jsonrpc_id_matches(&message, "compact") {
+                    if let Some(error) = message.get("error") { return Err(AppError::ProviderUnavailable(format!("Codex compaction failed: {}", safe_error_text(error)))); }
+                    acknowledged = message.get("result").is_some();
+                }
+                if message.pointer("/params/threadId").and_then(Value::as_str) == Some(native) {
+                    if message.get("method").and_then(Value::as_str) == Some("turn/started") {
+                        native_turn = message.pointer("/params/turn/id").and_then(Value::as_str).map(ToOwned::to_owned);
+                    }
+                    if message.get("method").and_then(Value::as_str) == Some("item/completed") && message.pointer("/params/item/type").and_then(Value::as_str) == Some("contextCompaction") { completed = true; }
+                    if let Some(status) = turn_completion_status(&message, native_turn.as_deref())? {
+                        match status {
+                            "failed" => return Err(codex_turn_failure(&message)),
+                            "interrupted" => return Err(AppError::TurnCancelled),
+                            _ => {},
+                        }
+                    }
+                }
+                if acknowledged && completed { return Ok(()); }
+            }
+        }.await;
+        process.terminate().await;
+        result
+    }
+
+    fn supports_native_fork(&self) -> bool {
+        true
+    }
+
+    async fn fork_session(
+        &self,
+        context: DriverContext,
+        launch_permit: WorkspaceTrustPermit,
+    ) -> Result<crate::conversation::ProviderState, AppError> {
+        let original = context
+            .provider_state
+            .native_session_id
+            .as_deref()
+            .ok_or_else(|| {
+                AppError::Unsupported("conversation has no native Codex session to fork".to_owned())
+            })?;
+        let mut spec = CommandSpec::new(&self.binary, &context.manifest.workspace);
+        spec.args = vec![
+            "app-server".to_owned(),
+            "--listen".to_owned(),
+            "stdio://".to_owned(),
+        ];
+        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
+        let result = async {
+            process.send(&json!({ "id": "initialize", "method": "initialize", "params": { "clientInfo": { "name": "todex-agentd", "version": crate::version::APP_VERSION }, "capabilities": { "experimentalApi": true } } })).await?;
+            read_rpc_response(&mut process, "initialize").await?;
+            process.send(&json!({ "method": "initialized" })).await?;
+            process.send(&json!({ "id": "fork", "method": "thread/fork", "params": { "threadId": original, "cwd": context.manifest.workspace, "excludeTurns": true, "ephemeral": false } })).await?;
+            let response = read_rpc_response(&mut process, "fork").await?;
+            let native = response.pointer("/thread/id").and_then(Value::as_str).filter(|id| !id.is_empty() && *id != original)
+                .ok_or_else(|| AppError::ProviderUnavailable("Codex fork did not return a new thread id".to_owned()))?;
+            let mut state = crate::conversation::ProviderState::new(ProviderKind::Codex);
+            state.native_session_id = Some(native.to_owned());
+            state.recoverable = true;
+            Ok(state)
+        }.await;
+        process.terminate().await;
+        result
+    }
+
     fn descriptor(&self) -> ProviderDescriptor {
         let available = executable_available(&self.binary);
         ProviderDescriptor {
@@ -42,6 +154,11 @@ impl ProviderDriver for CodexDriver {
                 .then(|| format!("executable '{}' was not found", self.binary)),
             profiles: Vec::new(),
             capabilities: ProviderCapabilities {
+                permission_config: super::types::permission_config_capabilities(
+                    ProviderKind::Codex,
+                ),
+                native_fork: true,
+                native_compact: true,
                 native_resume: true,
                 cancel: true,
                 permissions: true,
@@ -191,9 +308,24 @@ impl ProviderDriver for CodexDriver {
     }
 }
 
+async fn read_rpc_response_cancellable(
+    process: &mut JsonLineProcess,
+    id: &str,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Value, AppError> {
+    if *cancel.borrow() {
+        return Err(AppError::TurnCancelled);
+    }
+    tokio::select! {
+        response = read_rpc_response(process, id) => response,
+        _ = cancel.changed() => Err(AppError::TurnCancelled),
+    }
+}
+
 async fn read_rpc_response(process: &mut JsonLineProcess, id: &str) -> Result<Value, AppError> {
+    let deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
     loop {
-        let Some(value) = process.read().await? else {
+        let Some(value) = process.read_control_until(deadline).await? else {
             return Err(provider_exit_error(process, "Codex app-server closed stdout").await);
         };
         if jsonrpc_id_matches(&value, id) {
@@ -240,11 +372,19 @@ async fn run_codex_turn(
     wait_for_response(process, "initialize", sink, cancel).await?;
     process.send(&json!({ "method": "initialized" })).await?;
 
+    let controls = resolve_permission_config(
+        context.manifest.provider,
+        prompt.permission_profile.as_deref(),
+        prompt.sandbox_mode.as_deref(),
+        prompt.approval_policy.as_deref(),
+    )?;
     let native_session_id = match context.provider_state.native_session_id.as_deref() {
         Some(thread_id) => {
             let mut resume_params = json!({
                 "threadId": thread_id,
                 "cwd": context.manifest.workspace,
+                "approvalPolicy": controls.approval_policy,
+                "sandbox": controls.sandbox_mode,
             });
             if let Some(model) = &prompt.model {
                 resume_params["model"] = Value::String(model.clone());
@@ -259,17 +399,23 @@ async fn run_codex_turn(
                     "params": resume_params,
                 }))
                 .await?;
-            wait_for_response(process, "thread", sink, cancel).await?;
+            let response = wait_for_response(process, "thread", sink, cancel).await?;
+            if let Some(configuration) = codex_configuration_event(&response, &prompt) {
+                sink.emit("turn.configuration", configuration).await?;
+            }
             thread_id.to_owned()
         }
         None => {
             let mut params = json!({
                 "cwd": context.manifest.workspace,
-                "approvalPolicy": "on-request",
-                "sandbox": "workspace-write",
+                "approvalPolicy": controls.approval_policy,
+                "sandbox": controls.sandbox_mode,
             });
             if let Some(model) = &prompt.model {
                 params["model"] = Value::String(model.clone());
+            }
+            if let Some(effort) = &prompt.reasoning_effort {
+                params["config"] = json!({ "model_reasoning_effort": effort });
             }
             process
                 .send(&json!({
@@ -279,6 +425,9 @@ async fn run_codex_turn(
                 }))
                 .await?;
             let response = wait_for_response(process, "thread", sink, cancel).await?;
+            if let Some(configuration) = codex_configuration_event(&response, &prompt) {
+                sink.emit("turn.configuration", configuration).await?;
+            }
             response
                 .pointer("/thread/id")
                 .and_then(Value::as_str)
@@ -306,6 +455,8 @@ async fn run_codex_turn(
                 "input": input,
                 "model": prompt.model.clone(),
                 "effort": prompt.reasoning_effort.clone(),
+                "approvalPolicy": controls.approval_policy,
+                "sandboxPolicy": codex_sandbox_policy(controls.sandbox_mode.as_deref()),
             }
         }))
         .await?;
@@ -352,7 +503,59 @@ async fn run_codex_turn(
                 cancelled: stop_reason == "interrupted",
             });
         }
-        handle_codex_message(process, message, sink, cancel, &prompt.turn_id).await?;
+        if let Err(error) =
+            handle_codex_message(process, message, sink, cancel, &prompt.turn_id).await
+        {
+            if matches!(error, AppError::TurnCancelled) && *cancel.borrow() {
+                if let Some(turn_id) = native_turn_id.as_deref() {
+                    return interrupt_codex_turn(
+                        process,
+                        &prompt.turn_id,
+                        &native_session_id,
+                        turn_id,
+                        sink,
+                    )
+                    .await;
+                }
+            }
+            return Err(error);
+        }
+    }
+}
+
+fn codex_configuration_event(response: &Value, prompt: &DriverPrompt) -> Option<Value> {
+    let mut effective = serde_json::Map::new();
+    for key in ["model", "reasoningEffort", "approvalPolicy"] {
+        if let Some(value) = response.get(key).filter(|value| !value.is_null()) {
+            effective.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(kind) = response.pointer("/sandbox/type").and_then(Value::as_str) {
+        let mode = match kind {
+            "readOnly" => "read-only",
+            "workspaceWrite" => "workspace-write",
+            "dangerFullAccess" => "danger-full-access",
+            "externalSandbox" => "external-sandbox",
+            _ => kind,
+        };
+        effective.insert("sandboxMode".to_owned(), json!(mode));
+    }
+    if effective.is_empty() {
+        return None;
+    }
+    effective.insert("source".to_owned(), json!("provider-confirmed"));
+    Some(json!({
+        "provider": "codex", "turnId": prompt.turn_id,
+        "requested": { "model": prompt.model, "reasoningEffort": prompt.reasoning_effort, "permissionProfile": prompt.permission_profile, "sandboxMode": prompt.sandbox_mode, "approvalPolicy": prompt.approval_policy },
+        "effective": effective,
+    }))
+}
+
+fn codex_sandbox_policy(mode: Option<&str>) -> Value {
+    match mode {
+        Some("read-only") => json!({ "type": "readOnly", "networkAccess": false }),
+        Some("danger-full-access") => json!({ "type": "dangerFullAccess" }),
+        _ => json!({ "type": "workspaceWrite", "networkAccess": false }),
     }
 }
 
@@ -397,9 +600,10 @@ async fn wait_for_response(
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<Value, AppError> {
+    let mut deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
     loop {
         let message = tokio::select! {
-            message = process.read() => message?,
+            message = process.read_control_until(deadline) => message?,
             changed = cancel.changed() => {
                 let _ = changed;
                 return Err(AppError::TurnCancelled);
@@ -424,7 +628,16 @@ async fn wait_for_response(
                 ))
             });
         }
+        let waits_for_user = message.get("id").is_some()
+            && message
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(is_codex_permission_method);
+        let handler_started = tokio::time::Instant::now();
         handle_codex_message(process, message, sink, cancel, request_id).await?;
+        if waits_for_user {
+            deadline += handler_started.elapsed();
+        }
     }
 }
 
@@ -468,6 +681,9 @@ async fn handle_codex_message(
     }
 
     if matches!(method, "item/started" | "item/completed") {
+        for (event_type, payload) in codex_activity_events(method, &params, turn_id) {
+            sink.emit(event_type, payload).await?;
+        }
         if let Some((event_type, payload)) = codex_item_event(method, &params, turn_id) {
             sink.emit(event_type, payload).await?;
         }
@@ -475,7 +691,9 @@ async fn handle_codex_message(
     }
 
     if method == "thread/tokenUsage/updated" {
-        if let Some(payload) = codex_usage_event(&params) {
+        if let Some(mut payload) = codex_usage_event(&params) {
+            payload["turnId"] = json!(turn_id);
+            payload["source"] = json!("provider");
             sink.emit("usage.updated", payload).await?;
         } else {
             sink.emit(
@@ -556,6 +774,34 @@ fn codex_usage_breakdown(value: &Value) -> Option<Value> {
         "output": usage.get("outputTokens"),
         "reasoningOutput": usage.get("reasoningOutputTokens"),
     }))
+}
+
+fn codex_activity_events(
+    method: &str,
+    params: &Value,
+    turn_id: &str,
+) -> Vec<(&'static str, Value)> {
+    let Some(item) = params.get("item") else {
+        return Vec::new();
+    };
+    match item.get("type").and_then(Value::as_str) {
+        Some("contextCompaction") => vec![(if method == "item/started" { "compaction.started" } else { "compaction.completed" },
+            json!({ "provider": "codex", "turnId": turn_id, "compactionId": item.get("id"), "source": "provider" }))],
+        Some("collabAgentToolCall") => item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(|id| {
+            let id = id.as_str()?;
+            let state = item.get("agentsStates").and_then(|states| states.get(id));
+            let status = state.and_then(|state| state.get("status")).and_then(Value::as_str);
+            let event = match status {
+                Some("completed") => "subagent.completed",
+                Some("errored" | "notFound") => "subagent.failed",
+                Some("interrupted" | "shutdown") => "subagent.cancelled",
+                Some("pendingInit") => "subagent.started",
+                _ => "subagent.updated",
+            };
+            Some((event, json!({ "provider": "codex", "turnId": turn_id, "subagentId": id, "parentId": item.get("senderThreadId"), "title": item.get("tool"), "task": item.get("prompt"), "status": status, "result": state.and_then(|state| state.get("message")), "source": "provider", "providerItemId": item.get("id") })))
+        }).collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn codex_item_event(method: &str, params: &Value, turn_id: &str) -> Option<(&'static str, Value)> {
@@ -669,11 +915,23 @@ fn codex_permission_options(method: &str) -> Value {
     if method == "item/tool/requestUserInput" {
         return json!([{ "id": "answer", "kind": "answer", "name": "Answer" }]);
     }
-    json!([
+    let mut options = json!([
         { "id": "allow_once", "kind": "allow_once", "name": "Allow once" },
         { "id": "allow_always", "kind": "allow_always", "name": "Allow for session" },
         { "id": "reject_once", "kind": "reject_once", "name": "Reject" }
-    ])
+    ]);
+    if matches!(
+        method,
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+    ) {
+        options
+            .as_array_mut()
+            .expect("permission options array")
+            .push(
+                json!({ "id": "abort_turn", "kind": "abort_turn", "name": "Reject and stop turn" }),
+            );
+    }
+    options
 }
 
 fn codex_permission_response(
@@ -695,7 +953,9 @@ fn codex_permission_response(
     }
     let decision = match decision.outcome {
         PermissionOutcome::AllowAlways => "acceptForSession",
-        PermissionOutcome::AllowOnce | PermissionOutcome::Answer => "accept",
+        PermissionOutcome::AllowOnce => "accept",
+        PermissionOutcome::Answer => "decline",
+        PermissionOutcome::AbortTurn => "cancel",
         PermissionOutcome::RejectOnce | PermissionOutcome::RejectAlways => "decline",
     };
     json!({ "decision": decision })
@@ -717,7 +977,7 @@ async fn interrupt_codex_turn(
         }))
         .await?;
     let (_cancel_tx, mut no_cancel) = watch::channel(false);
-    let terminal = timeout(CANCEL_TIMEOUT, async {
+    let terminal = timeout(super::process::cancel_timeout()?, async {
         let mut acknowledged = false;
         let mut terminal = None;
         loop {
@@ -992,5 +1252,221 @@ mod tests {
         assert_eq!(input[1]["type"], "localImage");
         assert_eq!(input[2]["type"], "mention");
         assert_eq!(input[3]["type"], "skill");
+    }
+    #[test]
+    fn sandbox_wire_and_answer_rejection_match_protocol() {
+        assert_eq!(
+            super::codex_sandbox_policy(Some("read-only"))["type"],
+            "readOnly"
+        );
+        assert_eq!(
+            super::codex_sandbox_policy(Some("danger-full-access"))["type"],
+            "dangerFullAccess"
+        );
+        let response = super::codex_permission_response(
+            "item/commandExecution/requestApproval",
+            &json!({}),
+            super::super::types::PermissionDecision {
+                outcome: super::PermissionOutcome::Answer,
+                option_id: None,
+                data: None,
+            },
+        );
+        assert_eq!(response["decision"], "decline");
+    }
+
+    #[test]
+    fn native_activity_keeps_child_identity_and_independent_status() {
+        let events = super::codex_activity_events(
+            "item/completed",
+            &json!({"item": {"type":"collabAgentToolCall", "id":"tool", "senderThreadId":"parent", "receiverThreadIds":["child"], "status":"completed", "agentsStates":{"child":{"status":"running"}}}}),
+            "turn",
+        );
+        assert_eq!(events[0].0, "subagent.updated");
+        assert_eq!(events[0].1["subagentId"], "child");
+        assert_eq!(events[0].1["parentId"], "parent");
+        assert_eq!(
+            super::codex_activity_events(
+                "item/completed",
+                &json!({"item":{"type":"contextCompaction","id":"compact"}}),
+                "turn"
+            )[0]
+            .0,
+            "compaction.completed"
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_wire_preserves_controls_resume_fork_and_compact() {
+        use crate::conversation::{
+            ConversationEventHub, ConversationManifest, ConversationStore, ProviderState,
+        };
+        use crate::provider::types::PermissionBroker;
+        use crate::workspace_trust::WorkspaceTrustStore;
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("todex-codex-wire-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let root = tokio::fs::canonicalize(root).await.unwrap();
+        let script = root.join("fake-codex");
+        tokio::fs::write(&script, r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> wire.jsonl
+  id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":"%s","result":{}}\n' "$id" ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '{"id":"%s","result":{"thread":{"id":"native"}}}\n' "$id" ;;
+    *'"method":"turn/start"'*)
+      printf '{"id":"%s","result":{"turn":{"id":"native-turn"}}}\n' "$id"
+      printf '{"method":"turn/completed","params":{"threadId":"native","turn":{"id":"native-turn","status":"completed"}}}\n' ;;
+    *'"method":"thread/fork"'*) printf '{"id":"%s","result":{"thread":{"id":"forked"}}}\n' "$id" ;;
+    *'"method":"thread/compact/start"'*)
+      printf '{"method":"item/completed","params":{"threadId":"native","item":{"type":"contextCompaction","id":"compact-item"}}}\n'
+      printf '{"id":"%s","result":{}}\n' "$id" ;;
+  esac
+done
+"#).await.unwrap();
+        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let store = ConversationStore::new(root.join("data")).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let sink = DriverEventSink::new(
+            store,
+            ConversationEventHub::default(),
+            PermissionBroker::default(),
+            manifest.id.clone(),
+        );
+        let trust = WorkspaceTrustStore::new(root.join("trust"), root.clone())
+            .await
+            .unwrap();
+        trust.set_owned("local", &root, true).await.unwrap();
+        let driver = CodexDriver {
+            binary: script.display().to_string(),
+        };
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut provider_state = ProviderState::new(ProviderKind::Codex);
+        for sandbox in ["read-only", "danger-full-access"] {
+            driver
+                .run_turn(
+                    DriverContext {
+                        manifest: manifest.clone(),
+                        provider_state: provider_state.clone(),
+                    },
+                    DriverPrompt {
+                        turn_id: "turn".to_owned(),
+                        text: "hello".to_owned(),
+                        content: vec![],
+                        skills: vec![],
+                        model: None,
+                        reasoning_effort: None,
+                        permission_profile: None,
+                        sandbox_mode: Some(sandbox.to_owned()),
+                        approval_policy: Some("never".to_owned()),
+                    },
+                    sink.clone(),
+                    cancel_rx.clone(),
+                    trust.acquire_owned("local", &root).await.unwrap(),
+                )
+                .await
+                .unwrap();
+            provider_state.native_session_id = Some("native".to_owned());
+        }
+        let context = DriverContext {
+            manifest,
+            provider_state,
+        };
+        let fork = driver
+            .fork_session(
+                context.clone(),
+                trust.acquire_owned("local", &root).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fork.native_session_id.as_deref(), Some("forked"));
+        driver
+            .compact_session(
+                context,
+                cancel_rx,
+                trust.acquire_owned("local", &root).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        let wire = tokio::fs::read_to_string(root.join("wire.jsonl"))
+            .await
+            .unwrap();
+        let messages: Vec<Value> = wire
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let requests = |method: &str| {
+            messages
+                .iter()
+                .filter(|message| message["method"] == method)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            requests("thread/start")[0]["params"]["sandbox"],
+            "read-only"
+        );
+        assert_eq!(
+            requests("thread/start")[0]["params"]["approvalPolicy"],
+            "never"
+        );
+        assert_eq!(
+            requests("thread/resume")[0]["params"]["sandbox"],
+            "danger-full-access"
+        );
+        assert_eq!(
+            requests("turn/start")[0]["params"]["sandboxPolicy"]["type"],
+            "readOnly"
+        );
+        assert_eq!(
+            requests("turn/start")[1]["params"]["sandboxPolicy"]["type"],
+            "dangerFullAccess"
+        );
+        assert_eq!(requests("thread/fork")[0]["params"]["threadId"], "native");
+        assert_eq!(requests("thread/compact/start").len(), 1);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+    #[test]
+    fn abort_turn_is_only_advertised_for_supported_codex_requests() {
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        ] {
+            assert!(codex_permission_options(method)
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option["kind"] == "abort_turn"));
+            assert_eq!(
+                codex_permission_response(
+                    method,
+                    &json!({}),
+                    crate::provider::types::PermissionDecision {
+                        outcome: PermissionOutcome::AbortTurn,
+                        option_id: Some("abort_turn".to_owned()),
+                        data: None
+                    }
+                )["decision"],
+                "cancel"
+            );
+        }
+        assert!(
+            !codex_permission_options("item/permissions/requestApproval")
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option["kind"] == "abort_turn")
+        );
     }
 }

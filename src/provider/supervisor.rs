@@ -8,6 +8,8 @@ use chrono::{DateTime, Utc};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{watch, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
@@ -40,14 +42,18 @@ const MAX_PROMPT_CONTENT_ITEMS: usize = 16;
 const MAX_PROMPT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptSkillRef {
     pub resource_id: String,
     pub name: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConversationPrompt {
+    #[serde(default)]
+    pub client_request_id: Option<String>,
     pub text: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -58,7 +64,7 @@ pub struct ConversationPrompt {
     pub approval_policy: Option<String>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum PromptContentRef {
     Text {
@@ -138,6 +144,7 @@ pub struct ConversationSupervisor {
     registry: DriverRegistry,
     permissions: PermissionBroker,
     active: Arc<DashMap<String, ActiveTurn>>,
+    request_gates: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     cli_execution_gate: Arc<RwLock<()>>,
     workspace_trust: WorkspaceTrustStore,
 }
@@ -209,6 +216,7 @@ impl ConversationSupervisor {
             catalog,
             permissions: PermissionBroker::default(),
             active: Arc::new(DashMap::new()),
+            request_gates: Arc::new(DashMap::new()),
             workspace_trust,
             cli_execution_gate,
         }
@@ -221,6 +229,27 @@ impl ConversationSupervisor {
                 ConversationStatus::Running | ConversationStatus::WaitingPermission
             );
             let recovered = self.store.recover(&manifest.id).await?;
+            let mut expired = std::collections::BTreeSet::new();
+            for event in self.store.complete_history(&manifest.id).await? {
+                if let Some(id) = event.payload.get("permissionId").and_then(Value::as_str) {
+                    match event.event_type.as_str() {
+                        "permission.requested" | "tool.awaitingApproval" => {
+                            expired.insert(id.to_owned());
+                        }
+                        "permission.resolved" => {
+                            expired.remove(id);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for permission_id in expired {
+                self.emit(&manifest.id, "permission.resolved", json!({
+                    "permissionId": permission_id, "outcome": "cancelled", "optionId": Value::Null,
+                    "reason": "daemon_restarted",
+                })).await?;
+            }
+
             if was_active {
                 self.emit(
                     &recovered.id,
@@ -480,11 +509,14 @@ impl ConversationSupervisor {
         owner_id: &str,
         conversation_id: &str,
     ) -> Result<ConversationManifest, AppError> {
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         let manifest = self.get_owned(owner_id, conversation_id).await?;
-        if matches!(
-            manifest.status,
-            ConversationStatus::Running | ConversationStatus::WaitingPermission
-        ) {
+        if self.active.contains_key(conversation_id)
+            || matches!(
+                manifest.status,
+                ConversationStatus::Running | ConversationStatus::WaitingPermission
+            )
+        {
             return Err(AppError::Conflict(
                 "active conversation cannot be deleted".to_owned(),
             ));
@@ -497,7 +529,14 @@ impl ConversationSupervisor {
         &self,
         cutoff: DateTime<Utc>,
     ) -> Result<Vec<ConversationManifest>, AppError> {
-        self.store.cleanup_before(cutoff).await
+        // Prevent a new turn/fork reservation between capturing active IDs and cleanup.
+        let _cli_gate = self.cli_execution_gate.write().await;
+        let protected = self
+            .active
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        self.store.cleanup_before(cutoff, &protected).await
     }
 
     pub async fn replay(
@@ -526,37 +565,34 @@ impl ConversationSupervisor {
         &self,
         owner_id: &str,
         conversation_id: &str,
+        client_request_id: Option<String>,
     ) -> Result<String, AppError> {
         self.get_owned(owner_id, conversation_id).await?;
-        let replay = self.store.replay(conversation_id, 0, usize::MAX).await?;
-        let text = replay
-            .events
-            .iter()
-            .rev()
-            .find(|event| event.event_type == "message.created")
-            .and_then(|event| {
-                (event.payload.get("role")?.as_str() == Some("user"))
-                    .then(|| event.payload.get("content")?.as_str().map(str::to_owned))
-                    .flatten()
-            })
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        let latest = self
+            .store
+            .last_user_message(conversation_id)
+            .await?
             .ok_or_else(|| {
                 AppError::Conflict("conversation has no user message to retry".to_owned())
             })?;
-        self.prompt_owned(
-            owner_id,
-            conversation_id,
-            ConversationPrompt {
-                text,
-                model: None,
-                reasoning_effort: None,
-                skills: Vec::new(),
-                content: Vec::new(),
-                permission_profile: None,
-                sandbox_mode: None,
-                approval_policy: None,
-            },
-        )
-        .await
+        let snapshot = self.store.last_request(conversation_id).await?
+            .ok_or_else(|| AppError::Unsupported("This older request has no complete retry snapshot; submit it explicitly with its attachments and settings.".to_owned()))?;
+        if snapshot.get("turnId") != latest.payload.get("turnId") {
+            return Err(AppError::Conflict(
+                "The latest request snapshot is incomplete; retry was not submitted.".to_owned(),
+            ));
+        }
+        let files: Vec<RequestFileFingerprint> = serde_json::from_value(snapshot["files"].clone())?;
+        for file in files {
+            if fingerprint_file(&file.path).await? != file.sha256 {
+                return Err(AppError::Conflict("An attached file or skill changed since this request. Submit a new request to use its current contents.".to_owned()));
+            }
+        }
+        let mut prompt: ConversationPrompt = serde_json::from_value(snapshot["request"].clone())?;
+        prompt.client_request_id =
+            client_request_id.or_else(|| Some(format!("retry_{}", Uuid::new_v4().simple())));
+        self.prompt_inner(owner_id, conversation_id, prompt).await
     }
 
     pub async fn fork_owned(
@@ -565,22 +601,183 @@ impl ConversationSupervisor {
         conversation_id: &str,
         title: Option<String>,
     ) -> Result<ConversationManifest, AppError> {
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         let source = self.get_owned(owner_id, conversation_id).await?;
-        let replay = self.store.replay(conversation_id, 0, usize::MAX).await?;
+        let driver = self.registry.driver(source.provider)?;
+        if !driver.supports_native_fork() {
+            return Err(AppError::Unsupported(
+                "Native conversation fork is not supported by this provider.".to_owned(),
+            ));
+        }
+        let _cli_permit = self.cli_execution_gate.read().await;
+        let (cancel, _) = watch::channel(false);
+        match self.active.entry(conversation_id.to_owned()) {
+            Entry::Occupied(_) => {
+                return Err(AppError::Conflict(
+                    "Wait for the active turn to finish before forking.".to_owned(),
+                ))
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(ActiveTurn {
+                    turn_id: "fork".to_owned(),
+                    cancel,
+                });
+            }
+        }
+        let _cleanup = ActiveTurnCleanup {
+            active: self.active.clone(),
+            conversation_id: conversation_id.to_owned(),
+        };
+        let launch_permit = self
+            .workspace_trust
+            .acquire_owned(owner_id, &source.workspace)
+            .await?;
+        let provider_state = self.store.provider_state(conversation_id).await?;
+        let history = self.store.complete_history(conversation_id).await?;
+        let request = self.store.last_request(conversation_id).await?;
+        let native_fork = driver
+            .fork_session(
+                DriverContext {
+                    manifest: source.clone(),
+                    provider_state,
+                },
+                launch_permit,
+            )
+            .await?;
         let mut fork = ConversationManifest::new(
             source.provider,
             source.workspace.clone(),
-            title.or_else(|| source.title.clone().map(|value| format!("{value} (fork)"))),
+            title.or_else(|| source.title.as_ref().map(|value| format!("{value} (fork)"))),
             source.provider_profile.clone(),
         );
         fork.owner_id = owner_id.to_owned();
-        let fork = self.store.create(fork).await?;
-        for event in replay.events {
-            self.store
-                .append(&fork.id, event.event_type, event.payload)
-                .await?;
+        fork.workspace_id = source.workspace_id.clone();
+        let mut copied = Vec::with_capacity(history.len() + 1);
+        for event in history {
+            let mut next = crate::conversation::ConversationEvent::new(
+                &fork.id,
+                copied.len() as u64 + 1,
+                event.event_type,
+                event.payload,
+            );
+            next.provider = Some(source.provider);
+            next.time = event.time;
+            copied.push(next);
         }
-        self.store.get(&fork.id).await
+        let mut completed = crate::conversation::ConversationEvent::new(
+            &fork.id,
+            copied.len() as u64 + 1,
+            "conversation.forked",
+            json!({ "sourceConversationId": source.id, "sourceSequence": copied.len() }),
+        );
+        completed.provider = Some(source.provider);
+        copied.push(completed);
+        self.store
+            .create_with_history(fork, copied, Some(native_fork), request)
+            .await
+    }
+
+    pub async fn compact_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        client_request_id: &str,
+    ) -> Result<String, AppError> {
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        let driver = self.registry.driver(manifest.provider)?;
+        if !driver.supports_native_compact() {
+            return Err(AppError::Unsupported(
+                "Native compaction is not supported by this provider.".to_owned(),
+            ));
+        }
+        let _cli_permit = self.cli_execution_gate.read().await;
+        let (cancel, cancel_rx) = watch::channel(false);
+        let operation_id = format!("compact_{}", Uuid::new_v4().simple());
+        match self.active.entry(conversation_id.to_owned()) {
+            Entry::Occupied(_) => {
+                return Err(AppError::Conflict(
+                    "Wait for the active turn to finish before compacting.".to_owned(),
+                ))
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(ActiveTurn {
+                    turn_id: operation_id.clone(),
+                    cancel,
+                });
+            }
+        }
+        let cleanup = ActiveTurnCleanup {
+            active: self.active.clone(),
+            conversation_id: conversation_id.to_owned(),
+        };
+        let launch_permit = self
+            .workspace_trust
+            .acquire_owned(owner_id, &manifest.workspace)
+            .await?;
+        let provider_state = self.store.provider_state(conversation_id).await?;
+        if provider_state.native_session_id.is_none() {
+            return Err(AppError::Unsupported(
+                "Conversation has no native session to compact.".to_owned(),
+            ));
+        }
+        self.emit(
+            conversation_id,
+            "compaction.started",
+            json!({ "operationId": operation_id, "clientRequestId": client_request_id }),
+        )
+        .await?;
+        let supervisor = self.clone();
+        let conversation_id = conversation_id.to_owned();
+        let request_id = client_request_id.to_owned();
+        let spawned_id = operation_id.clone();
+        tokio::spawn(async move {
+            let _cleanup = cleanup;
+            let result = driver
+                .compact_session(
+                    DriverContext {
+                        manifest,
+                        provider_state,
+                    },
+                    cancel_rx,
+                    launch_permit,
+                )
+                .await;
+            let (event_type, payload) = match result {
+                Ok(()) => (
+                    "compaction.completed",
+                    json!({ "operationId": spawned_id, "clientRequestId": request_id }),
+                ),
+                Err(AppError::TurnCancelled) => (
+                    "compaction.cancelled",
+                    json!({ "operationId": spawned_id, "clientRequestId": request_id }),
+                ),
+                Err(error) => (
+                    "compaction.failed",
+                    json!({ "operationId": spawned_id, "clientRequestId": request_id, "code": error.code(), "message": error.to_string() }),
+                ),
+            };
+            if let Err(error) = supervisor.emit(&conversation_id, event_type, payload).await {
+                tracing::error!(conversation_id, error = %error, "failed to persist native compaction outcome");
+            }
+        });
+        Ok(operation_id)
+    }
+
+    pub fn supports_native_compact(&self, provider: &str) -> bool {
+        provider
+            .parse::<ProviderKind>()
+            .ok()
+            .and_then(|kind| self.registry.driver(kind).ok())
+            .is_some_and(|driver| driver.supports_native_compact())
+    }
+
+    pub fn supports_native_fork(&self, provider: &str) -> bool {
+        provider
+            .parse::<ProviderKind>()
+            .ok()
+            .and_then(|kind| self.registry.driver(kind).ok())
+            .is_some_and(|driver| driver.supports_native_fork())
     }
 
     #[allow(dead_code)]
@@ -594,6 +791,7 @@ impl ConversationSupervisor {
             "local",
             conversation_id,
             ConversationPrompt {
+                client_request_id: None,
                 text,
                 model,
                 reasoning_effort: None,
@@ -613,7 +811,26 @@ impl ConversationSupervisor {
         conversation_id: &str,
         prompt: ConversationPrompt,
     ) -> Result<String, AppError> {
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        self.prompt_inner(owner_id, conversation_id, prompt).await
+    }
+
+    fn request_gate(&self, conversation_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.request_gates
+            .entry(conversation_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    async fn prompt_inner(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        prompt: ConversationPrompt,
+    ) -> Result<String, AppError> {
+        let request_snapshot = prompt.clone();
         let ConversationPrompt {
+            client_request_id,
             text,
             model,
             reasoning_effort,
@@ -623,6 +840,14 @@ impl ConversationSupervisor {
             sandbox_mode,
             approval_policy,
         } = prompt;
+        if client_request_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.len() > 200)
+        {
+            return Err(AppError::InvalidRequest(
+                "clientRequestId must contain 1 to 200 bytes".to_owned(),
+            ));
+        }
         let text = text.trim().to_owned();
         if text.is_empty() && skills.is_empty() && content.is_empty() {
             return Err(AppError::InvalidRequest(
@@ -667,6 +892,12 @@ impl ConversationSupervisor {
                 "prompt exceeds {MAX_PROMPT_BYTES} bytes after skill injection"
             )));
         }
+        let effective_permissions = super::types::resolve_permission_config(
+            manifest.provider,
+            permission_profile.as_deref(),
+            sandbox_mode.as_deref(),
+            approval_policy.as_deref(),
+        )?;
         let driver = self.registry.driver(manifest.provider)?;
         let descriptor = driver.descriptor();
         if !descriptor.available {
@@ -678,6 +909,25 @@ impl ConversationSupervisor {
         }
         let provider_state = self.store.provider_state(conversation_id).await?;
 
+        let mut snapshot_files = Vec::new();
+        for item in &driver_content {
+            let path = match item {
+                DriverPromptContent::File { path, .. } => Some(path),
+                DriverPromptContent::Image { path, .. } => path.as_ref(),
+            };
+            if let Some(path) = path {
+                snapshot_files.push(RequestFileFingerprint {
+                    path: path.clone(),
+                    sha256: fingerprint_file(path).await?,
+                });
+            }
+        }
+        for skill in &loaded_skills {
+            snapshot_files.push(RequestFileFingerprint {
+                path: skill.path.clone(),
+                sha256: fingerprint_file(&skill.path).await?,
+            });
+        }
         let cli_start_permit = self.cli_execution_gate.read().await;
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let (cancel, cancel_rx) = watch::channel(false);
@@ -709,11 +959,17 @@ impl ConversationSupervisor {
             }
         };
 
+        if let Err(error) = self.store.save_request(conversation_id, &json!({
+            "schemaVersion": 1, "turnId": turn_id, "request": request_snapshot, "files": snapshot_files,
+        })).await {
+            self.active.remove(conversation_id);
+            return Err(error);
+        }
         if let Err(error) = self
             .emit(
                 conversation_id,
                 "message.created",
-                json!({ "turnId": turn_id, "role": "user", "content": user_text }),
+                json!({ "turnId": turn_id, "clientRequestId": client_request_id, "role": "user", "content": user_text }),
             )
             .await
         {
@@ -743,7 +999,9 @@ impl ConversationSupervisor {
             .emit(
                 conversation_id,
                 "turn.started",
-                json!({ "turnId": turn_id, "provider": manifest.provider }),
+                json!({ "turnId": turn_id, "clientRequestId": client_request_id, "provider": manifest.provider,
+                    "requestedPermissions": { "profile": permission_profile, "sandboxMode": sandbox_mode, "approvalPolicy": approval_policy },
+                    "effectivePermissions": effective_permissions, "configurationStatus": "validated" }),
             )
             .await
         {
@@ -772,7 +1030,8 @@ impl ConversationSupervisor {
                 supervisor.hub.clone(),
                 supervisor.permissions.clone(),
                 conversation_id.clone(),
-            );
+            )
+            .with_turn_id(spawned_turn_id.clone());
             let result = driver
                 .run_turn(
                     DriverContext {
@@ -803,6 +1062,7 @@ impl ConversationSupervisor {
                             "turn.cancelled",
                             json!({
                                 "turnId": spawned_turn_id,
+                                "clientRequestId": client_request_id,
                                 "stopReason": result.stop_reason,
                                 "nativeSessionId": result.native_session_id,
                             }),
@@ -819,6 +1079,7 @@ impl ConversationSupervisor {
                             "turn.completed",
                             json!({
                                 "turnId": spawned_turn_id,
+                                "clientRequestId": client_request_id,
                                 "stopReason": result.stop_reason,
                                 "nativeSessionId": result.native_session_id,
                             }),
@@ -835,6 +1096,7 @@ impl ConversationSupervisor {
                             "turn.cancelled",
                             json!({
                                 "turnId": spawned_turn_id,
+                                "clientRequestId": client_request_id,
                                 "stopReason": "cancelled",
                                 "nativeSessionId": Value::Null,
                             }),
@@ -860,6 +1122,7 @@ impl ConversationSupervisor {
                             "turn.failed",
                             json!({
                                 "turnId": spawned_turn_id,
+                                "clientRequestId": client_request_id,
                                 "code": error.code(),
                                 "message": error.to_string(),
                             }),
@@ -1170,13 +1433,31 @@ impl ConversationSupervisor {
         event_type: &str,
         payload: Value,
     ) -> Result<(), AppError> {
-        let event = self
-            .store
-            .append(conversation_id, event_type, payload)
+        self.store
+            .append_and_publish(conversation_id, event_type, payload, &self.hub)
             .await?;
-        self.hub.publish(event);
         Ok(())
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RequestFileFingerprint {
+    path: PathBuf,
+    sha256: String,
+}
+
+async fn fingerprint_file(path: &Path) -> Result<String, AppError> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let length = file.read(&mut buffer).await?;
+        if length == 0 {
+            break;
+        }
+        hasher.update(&buffer[..length]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 async fn prepare_prompt_content(
@@ -1416,6 +1697,297 @@ mod tests {
             trust.set_owned(owner_id, workspace, true).await.unwrap();
         }
         trust
+    }
+
+    async fn control_fixture(
+        label: &str,
+    ) -> (PathBuf, ConversationStore, ConversationSupervisor, PathBuf) {
+        let root = temp_dir(label);
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace_root = fs::canonicalize(workspace_root).unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let executable = write_provider_fixture(&root).to_string_lossy().to_string();
+        let config = Arc::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_root,
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+                auth_token: Some("test-token".to_owned()),
+            },
+        });
+        let store = ConversationStore::new(config.data_dir.clone())
+            .await
+            .unwrap();
+        let trust = trust_store(&config, "local", Some(&workspace)).await;
+        let supervisor = ConversationSupervisor::new(
+            config,
+            store.clone(),
+            ConversationEventHub::default(),
+            trust,
+        );
+        (root, store, supervisor, workspace)
+    }
+
+    async fn wait_until_idle(supervisor: &ConversationSupervisor) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while supervisor.has_active_turns() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture operation should complete");
+    }
+
+    #[tokio::test]
+    async fn retry_preserves_complete_request_after_first_page_and_rejects_changed_files() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-retry-snapshot").await;
+        let manifest =
+            ConversationManifest::new(ProviderKind::Codex, workspace.clone(), None, None);
+        let history = (1..=1201)
+            .map(|seq| {
+                crate::conversation::ConversationEvent::new(
+                    &manifest.id,
+                    seq,
+                    "message.created",
+                    json!({ "role": "user", "content": "old", "turnId": format!("old-{seq}") }),
+                )
+            })
+            .collect();
+        store
+            .create_with_history(manifest.clone(), history, None, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            supervisor.retry_owned("local", &manifest.id, None).await,
+            Err(AppError::Unsupported(_))
+        ));
+        let file = workspace.join("attachment.txt");
+        fs::write(&file, "original attachment").unwrap();
+        let request = ConversationPrompt {
+            client_request_id: Some("submit-1".to_owned()),
+            text: "latest question".to_owned(),
+            model: Some("fixture-model".to_owned()),
+            reasoning_effort: Some("high".to_owned()),
+            skills: Vec::new(),
+            content: vec![
+                PromptContentRef::File {
+                    path: file.clone(),
+                    name: Some("attachment.txt".to_owned()),
+                },
+                PromptContentRef::Image {
+                    data: "eA==".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                },
+            ],
+            permission_profile: None,
+            sandbox_mode: Some("read-only".to_owned()),
+            approval_policy: Some("on-request".to_owned()),
+        };
+        supervisor
+            .prompt_owned("local", &manifest.id, request.clone())
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let first_snapshot = store.last_request(&manifest.id).await.unwrap().unwrap();
+        assert_eq!(
+            first_snapshot["request"],
+            serde_json::to_value(&request).unwrap()
+        );
+        supervisor
+            .retry_owned("local", &manifest.id, Some("retry-2".to_owned()))
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let mut retried =
+            store.last_request(&manifest.id).await.unwrap().unwrap()["request"].clone();
+        assert_eq!(retried["clientRequestId"], "retry-2");
+        retried["clientRequestId"] = json!("submit-1");
+        assert_eq!(retried, first_snapshot["request"]);
+        let last = store
+            .last_user_message(&manifest.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(last.sequence > 1201);
+        assert_eq!(last.payload["content"], "latest question");
+        let events = store.complete_history(&manifest.id).await.unwrap();
+        assert!(events.iter().any(|event| event.event_type == "turn.started"
+            && event.payload["clientRequestId"] == "retry-2"));
+        let before = store.get(&manifest.id).await.unwrap().last_sequence;
+        fs::write(file, "changed attachment").unwrap();
+        assert!(matches!(
+            supervisor.retry_owned("local", &manifest.id, None).await,
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(store.get(&manifest.id).await.unwrap().last_sequence, before);
+        assert!(!supervisor.has_active_turns());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_fork_keeps_full_history_and_uses_distinct_provider_session() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-native-fork").await;
+        let manifest = ConversationManifest::new(
+            ProviderKind::Codex,
+            workspace,
+            Some("source".to_owned()),
+            None,
+        );
+        let history = (1..=1201)
+            .map(|seq| {
+                crate::conversation::ConversationEvent::new(
+                    &manifest.id,
+                    seq,
+                    "message.created",
+                    json!({ "role": "user", "content": format!("message-{seq}") }),
+                )
+            })
+            .collect();
+        let mut native = crate::conversation::ProviderState::new(ProviderKind::Codex);
+        native.native_session_id = Some("codex-native".to_owned());
+        store
+            .create_with_history(manifest.clone(), history, Some(native), None)
+            .await
+            .unwrap();
+        let fork = supervisor
+            .fork_owned("local", &manifest.id, None)
+            .await
+            .unwrap();
+        assert_eq!(fork.last_sequence, 1202);
+        assert_eq!(fork.status, ConversationStatus::Idle);
+        let forked = store.complete_history(&fork.id).await.unwrap();
+        assert_eq!(forked[1200].payload["content"], "message-1201");
+        assert_eq!(forked[1201].event_type, "conversation.forked");
+        assert!(forked.iter().all(|event| event.conversation_id == fork.id));
+        assert_eq!(
+            store
+                .provider_state(&fork.id)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("codex-fork-native")
+        );
+        assert_eq!(
+            store
+                .provider_state(&manifest.id)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("codex-native")
+        );
+        supervisor
+            .compact_owned("local", &manifest.id, "compact-1")
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert_eq!(history.last().unwrap().event_type, "compaction.completed");
+        assert_eq!(
+            history.last().unwrap().payload["clientRequestId"],
+            "compact-1"
+        );
+        assert_eq!(
+            store.get(&manifest.id).await.unwrap().status,
+            ConversationStatus::Idle
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserved_operations_are_protected_from_delete_and_retention() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-retention-reservation").await;
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                workspace,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let (cancel, _) = watch::channel(false);
+        supervisor.active.insert(
+            manifest.id.clone(),
+            ActiveTurn {
+                turn_id: "preparing".to_owned(),
+                cancel,
+            },
+        );
+        assert!(matches!(
+            supervisor.delete_owned("local", &manifest.id).await,
+            Err(AppError::Conflict(_))
+        ));
+        let cutoff = Utc::now() + chrono::Duration::hours(1);
+        assert!(supervisor.cleanup_expired(cutoff).await.unwrap().is_empty());
+        assert!(store.get(&manifest.id).await.is_ok());
+        supervisor.active.remove(&manifest.id);
+        assert_eq!(supervisor.cleanup_expired(cutoff).await.unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_resolves_stale_permissions_and_keeps_interrupted_status() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-recover-approval").await;
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                workspace,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(&manifest.id, "turn.started", json!({ "turnId": "t" }))
+            .await
+            .unwrap();
+        store
+            .append(
+                &manifest.id,
+                "permission.requested",
+                json!({ "permissionId": "p", "turnId": "t" }),
+            )
+            .await
+            .unwrap();
+        supervisor.recover_all().await.unwrap();
+        assert_eq!(
+            store.get(&manifest.id).await.unwrap().status,
+            ConversationStatus::Interrupted
+        );
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let terminal = history
+            .iter()
+            .find(|event| event.event_type == "permission.resolved")
+            .unwrap();
+        assert_eq!(terminal.payload["outcome"], "cancelled");
+        assert_eq!(terminal.payload["reason"], "daemon_restarted");
+        let count = history.len();
+        supervisor.recover_all().await.unwrap();
+        assert_eq!(
+            store.complete_history(&manifest.id).await.unwrap().len(),
+            count
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -1846,7 +2418,15 @@ elif [ "$mode" = "app-server" ]; then
         printf '{"id":"thread","result":{"thread":{"id":"codex-native"}}}\n'
         ;;
       *'"method":"thread/resume"'*)
-        printf '{"id":"thread","result":{}}\n'
+        id=$(extract_id "$line")
+        printf '{"id":"%s","result":{}}\n' "$id"
+        ;;
+      *'"method":"thread/fork"'*)
+        printf '{"id":"fork","result":{"thread":{"id":"codex-fork-native"}}}\n'
+        ;;
+      *'"method":"thread/compact/start"'*)
+        printf '{"id":"compact","result":{}}\n'
+        printf '{"method":"item/completed","params":{"threadId":"codex-native","item":{"type":"contextCompaction","id":"compact-item"}}}\n'
         ;;
       *'"method":"turn/start"'*)
         id=$(extract_id "$line")
@@ -2078,6 +2658,7 @@ done
                 "owner-a",
                 &manifest.id,
                 ConversationPrompt {
+                    client_request_id: None,
                     text: "hello".to_owned(),
                     model: None,
                     reasoning_effort: None,

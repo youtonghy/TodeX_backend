@@ -100,6 +100,9 @@ impl ProviderDriver for AcpDriver {
             }),
             profiles,
             capabilities: ProviderCapabilities {
+                permission_config: super::types::permission_config_capabilities(ProviderKind::Acp),
+                native_fork: false,
+                native_compact: false,
                 native_resume: true,
                 cancel: true,
                 permissions: true,
@@ -224,6 +227,12 @@ pub(super) async fn run_acp_turn(
     options: AcpRuntimeOptions,
 ) -> Result<DriverTurnResult, AppError> {
     let provider = context.manifest.provider;
+    super::types::resolve_permission_config(
+        provider,
+        prompt.permission_profile.as_deref(),
+        prompt.sandbox_mode.as_deref(),
+        prompt.approval_policy.as_deref(),
+    )?;
     let initialize = initialize_request();
     send_request(process, "initialize", "initialize", initialize).await?;
     let initialize_value =
@@ -456,9 +465,10 @@ async fn wait_for_response(
     provider: ProviderKind,
     emit_stream_updates: bool,
 ) -> Result<Value, AppError> {
+    let mut deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
     loop {
         let message = tokio::select! {
-            message = process.read() => message?,
+            message = process.read_control_until(deadline) => message?,
             changed = cancel.changed() => {
                 let _ = changed;
                 return Err(AppError::TurnCancelled);
@@ -479,6 +489,20 @@ async fn wait_for_response(
             }
             return Ok(message.get("result").cloned().unwrap_or(Value::Null));
         }
+        let waits_for_user = message.get("id").is_some()
+            && message
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| {
+                    matches!(
+                        extension_method(method),
+                        "session/request_permission"
+                            | "x.ai/ask_user_question"
+                            | "x.ai/exit_plan_mode"
+                            | "x.ai/mcp/elicit"
+                    )
+                });
+        let handler_started = tokio::time::Instant::now();
         handle_acp_message(
             process,
             message,
@@ -488,6 +512,9 @@ async fn wait_for_response(
             emit_stream_updates,
         )
         .await?;
+        if waits_for_user {
+            deadline += handler_started.elapsed();
+        }
     }
 }
 
@@ -552,6 +579,12 @@ async fn handle_acp_message(
         return Ok(());
     }
     if method == "session/update" {
+        if emit_stream_updates && provider == ProviderKind::GrokBuild {
+            if let Some((event, payload)) = grok_activity_event(&params) {
+                sink.emit(event, payload).await?;
+                return Ok(());
+            }
+        }
         let notification: SessionNotification =
             serde_json::from_value(params).map_err(|error| {
                 AppError::InvalidRequest(format!("invalid ACP session update: {error}"))
@@ -622,6 +655,43 @@ async fn handle_acp_message(
         .await?;
     }
     Ok(())
+}
+
+fn grok_activity_event(params: &Value) -> Option<(&'static str, Value)> {
+    let update = params.get("update")?;
+    let kind = update.get("sessionUpdate")?.as_str()?;
+    let event = match kind {
+        "subagent_spawned" => "subagent.started",
+        "subagent_progress" => "subagent.updated",
+        "subagent_finished" => match update.get("status")?.as_str()? {
+            "completed" => "subagent.completed",
+            "failed" => "subagent.failed",
+            "cancelled" => "subagent.cancelled",
+            _ => return None,
+        },
+        "auto_compact_started" => "compaction.started",
+        "auto_compact_completed" => "compaction.completed",
+        "auto_compact_failed" => "compaction.failed",
+        "auto_compact_cancelled" => "compaction.cancelled",
+        "response_completed" if update.get("usage").is_some_and(Value::is_object) => {
+            "usage.updated"
+        }
+        _ => return None,
+    };
+    if event.starts_with("subagent.") && !update.get("subagent_id").is_some_and(Value::is_string) {
+        return None;
+    }
+    Some((
+        event,
+        json!({
+            "provider": "grok-build", "source": "provider", "scope": "message",
+            "nativeSessionId": params.get("sessionId"), "turnId": update.get("parent_prompt_id"),
+            "subagentId": update.get("subagent_id"), "parentId": update.get("parent_session_id"),
+            "title": update.get("subagent_type"), "task": update.get("description"),
+            "result": update.get("output"), "status": update.get("status"), "error": update.get("error"),
+            "messageId": update.get("message_id"), "usage": update.get("usage"), "metadata": update,
+        }),
+    ))
 }
 
 async fn handle_ask_user_question(
@@ -731,7 +801,8 @@ async fn handle_exit_plan_mode(
         }
         PermissionOutcome::RejectOnce
         | PermissionOutcome::RejectAlways
-        | PermissionOutcome::Answer => {
+        | PermissionOutcome::Answer
+        | PermissionOutcome::AbortTurn => {
             let feedback = decision
                 .data
                 .as_ref()
@@ -1120,7 +1191,7 @@ fn select_acp_option(
         PermissionOutcome::AllowAlways => PermissionOptionKind::AllowAlways,
         PermissionOutcome::RejectOnce => PermissionOptionKind::RejectOnce,
         PermissionOutcome::RejectAlways => PermissionOptionKind::RejectAlways,
-        PermissionOutcome::Answer => {
+        PermissionOutcome::Answer | PermissionOutcome::AbortTurn => {
             return Err(AppError::InvalidRequest(
                 "answer outcome cannot authorize an ACP tool permission".to_owned(),
             ));
@@ -1358,5 +1429,15 @@ mod tests {
             selected_question_answer(questions, Some("answer:1:0")).unwrap(),
             json!({ "Second?": ["C"] })
         );
+    }
+    #[test]
+    fn grok_extension_activity_preserves_actual_failure_status() {
+        let event = super::grok_activity_event(&json!({"sessionId":"parent", "update":{"sessionUpdate":"subagent_finished", "subagent_id":"child", "status":"failed", "error":"failure"}})).unwrap();
+        assert_eq!(event.0, "subagent.failed");
+        assert_eq!(event.1["subagentId"], "child");
+        assert!(super::grok_activity_event(
+            &json!({"update":{"sessionUpdate":"subagent_finished", "status":"unknown"}})
+        )
+        .is_none());
     }
 }

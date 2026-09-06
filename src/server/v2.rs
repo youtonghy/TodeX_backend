@@ -30,7 +30,6 @@ use crate::workspace_paths::{canonical_workspace_root, validate_workspace_direct
 use crate::workspace_store::WorkspaceRecord;
 
 use super::git;
-use super::protocol::ServerEvent;
 use super::websocket::{self, AuthContext};
 
 /// Maximum WebSocket message size for the unified `/v2/ws` socket (8MB).
@@ -63,6 +62,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.retry"
             | "conversation.resume"
             | "conversation.fork"
+            | "conversation.compact"
             | "conversation.cancel"
             | "conversation.interrupt"
             | "conversation.stop"
@@ -922,8 +922,21 @@ async fn providers(
                 actions.push("interrupt");
                 actions.push("followUp");
                 actions.push("retry");
-                actions.push("resume");
-                actions.push("fork");
+                // Resume requires native continuation semantics, not prompt replay.
+                if provider
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| state.conversations.supports_native_fork(id))
+                {
+                    actions.push("fork");
+                }
+                if provider
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| state.conversations.supports_native_compact(id))
+                {
+                    actions.push("compact");
+                }
             }
             if let Some(object) = provider.as_object_mut() {
                 if let Some(capabilities) = object
@@ -1313,6 +1326,7 @@ async fn prompt_conversation(
             &auth.tenant_id,
             &conversation_id,
             ConversationPrompt {
+                client_request_id: request.client_request_id,
                 text: request.text,
                 model: request.model,
                 reasoning_effort: request.reasoning_effort,
@@ -1462,24 +1476,35 @@ async fn handle_socket(
     ));
     let bus_event_scope = event_scope.clone();
     let bus_outgoing_tx = outgoing_tx.clone();
+    let bus_state = state.clone();
     let bus_task = tokio::spawn(async move {
         loop {
             match event_rx.recv().await {
                 Ok(event) => {
-                    let visible = {
-                        let scope = bus_event_scope.read().await;
-                        websocket::legacy_event_is_visible(&event, &scope)
-                    };
-                    if !visible {
-                        continue;
-                    }
-                    if let Ok(value) = serde_json::to_value(ServerEvent::from(event)) {
-                        if bus_outgoing_tx.send(value).await.is_err() {
-                            break;
-                        }
+                    if let Err(error) = websocket::forward_legacy_event(
+                        &bus_state,
+                        &bus_event_scope,
+                        &bus_outgoing_tx,
+                        event,
+                    )
+                    .await
+                    {
+                        let _ = bus_outgoing_tx.send(error_response(None, error)).await;
+                        break;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    if let Err(error) = websocket::recover_legacy_lag(
+                        &bus_state,
+                        &bus_event_scope,
+                        &bus_outgoing_tx,
+                    )
+                    .await
+                    {
+                        let _ = bus_outgoing_tx.send(error_response(None, error)).await;
+                        break;
+                    }
+                    // Non-journal legacy surfaces (e.g. terminal output) still need an explicit signal.
                     if let Ok(value) = serde_json::to_value(websocket::direct_error_event(
                         AppError::StreamLagged(skipped),
                     )) {
@@ -1767,6 +1792,27 @@ async fn dispatch_command_inner(
                 loop {
                     match receiver.recv().await {
                         Ok(event) if event.sequence > delivered_through => {
+                            if event.sequence > delivered_through + 1 {
+                                let recovery = async {
+                                    while delivered_through + 1 < event.sequence {
+                                        let replay = conversations.replay_owned(&owner_id, &conversation_id, delivered_through, page_size).await?;
+                                        let previous = delivered_through;
+                                        for missing in replay.events.into_iter().take_while(|missing| missing.sequence < event.sequence) {
+                                            if missing.sequence != delivered_through + 1 {
+                                                return Err(AppError::Conflict("Conversation replay contains a sequence gap".to_owned()));
+                                            }
+                                            outgoing.send(json!({ "type": "conversation.event", "payload": missing })).await.map_err(|_| AppError::StreamClosed)?;
+                                            delivered_through = missing.sequence;
+                                        }
+                                        if previous == delivered_through { return Err(AppError::Conflict("Conversation sequence gap could not be recovered".to_owned())); }
+                                    }
+                                    Ok::<(), AppError>(())
+                                }.await;
+                                if let Err(error) = recovery {
+                                    let _ = outgoing.send(error_response(None, error)).await;
+                                    break;
+                                }
+                            }
                             delivered_through = event.sequence;
                             if outgoing
                                 .send(json!({ "type": "conversation.event", "payload": event }))
@@ -1884,6 +1930,7 @@ async fn dispatch_command_inner(
                     owner_id,
                     &request.conversation_id,
                     ConversationPrompt {
+                        client_request_id: Some(command.id.clone()),
                         text,
                         model: request.model,
                         reasoning_effort: request.reasoning_effort,
@@ -1901,7 +1948,7 @@ async fn dispatch_command_inner(
             let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
             let turn_id = state
                 .conversations
-                .retry_owned(owner_id, &request.conversation_id)
+                .retry_owned(owner_id, &request.conversation_id, Some(command.id.clone()))
                 .await?;
             Ok(
                 json!({ "conversationId": request.conversation_id, "turnId": turn_id, "retried": true }),
@@ -1909,12 +1956,20 @@ async fn dispatch_command_inner(
         }
         "conversation.resume" => {
             let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
-            let turn_id = state
+            state
                 .conversations
-                .retry_owned(owner_id, &request.conversation_id)
+                .get_owned(owner_id, &request.conversation_id)
+                .await?;
+            Err(AppError::Unsupported("Native resume is not implemented; submit an explicit follow-up to continue this conversation.".to_owned()))
+        }
+        "conversation.compact" => {
+            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let operation_id = state
+                .conversations
+                .compact_owned(owner_id, &request.conversation_id, &command.id)
                 .await?;
             Ok(
-                json!({ "conversationId": request.conversation_id, "turnId": turn_id, "resumed": true }),
+                json!({ "conversationId": request.conversation_id, "operationId": operation_id, "started": true }),
             )
         }
         "conversation.fork" => {
@@ -1957,12 +2012,16 @@ async fn dispatch_command_inner(
         "session.resume" => {
             // Replaces the transport-hello session cursor replay: grant this
             // connection visibility for still-existing Codex sessions and
-            // replay gateway events after each client cursor. Replay events
-            // reach the client through the scoped legacy event stream above.
+            // replay gateway events after each cursor directly to this connection,
+            // serialized with its live forwarding (never republished globally).
             let request: SessionResumeRequest = serde_json::from_value(command.payload.clone())?;
-            let resumed =
-                websocket::resume_session_cursors(state, event_scope, &request.session_cursors)
-                    .await?;
+            let resumed = websocket::resume_session_cursors(
+                state,
+                event_scope,
+                &request.session_cursors,
+                outgoing,
+            )
+            .await?;
             Ok(json!({ "resumed": resumed }))
         }
         other => Err(AppError::Unsupported(format!(
@@ -2292,6 +2351,8 @@ struct PromptSkillRequest {
 #[serde(rename_all = "camelCase")]
 struct PromptRequest {
     #[serde(default)]
+    client_request_id: Option<String>,
+    #[serde(default)]
     text: String,
     #[serde(default)]
     model: Option<String>,
@@ -2503,11 +2564,28 @@ mod tests {
             .unwrap()["capabilities"]["controlActions"]
             .as_array()
             .unwrap();
-        for action in ["cancel", "interrupt", "followUp", "retry", "resume", "fork"] {
+        for action in ["cancel", "interrupt", "followUp", "retry"] {
             assert!(
                 codex_actions.iter().any(|value| value == action),
                 "missing {action}"
             );
+        }
+
+        assert!(codex_actions.iter().any(|value| value == "fork"));
+        assert!(codex_actions.iter().any(|value| value == "compact"));
+        assert!(!codex_actions.iter().any(|value| value == "resume"));
+        for provider in providers_json["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|provider| provider["id"] != "codex")
+        {
+            let actions = provider["capabilities"]["controlActions"]
+                .as_array()
+                .unwrap();
+            assert!(!actions
+                .iter()
+                .any(|value| value == "fork" || value == "compact" || value == "resume"));
         }
 
         let create = app
@@ -2692,6 +2770,24 @@ mod tests {
             .expect("future-cursor subscription should receive a live event")
             .expect("future-cursor subscription channel should remain open");
         assert_eq!(received["payload"]["sequence"], 5);
+        // A late publisher must not make a persisted predecessor disappear.
+        let sixth = store
+            .append(&manifest.id, "fixture.live", json!({}))
+            .await
+            .unwrap();
+        let seventh = store
+            .append(&manifest.id, "fixture.live", json!({}))
+            .await
+            .unwrap();
+        hub.publish(seventh);
+        hub.publish(sixth);
+        for expected in [6, 7] {
+            let received = tokio::time::timeout(Duration::from_secs(1), future_events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received["payload"]["sequence"], expected);
+        }
         for task in future_tasks {
             task.abort();
         }
@@ -3650,16 +3746,16 @@ mod tests {
         ))
         .await
         .unwrap();
-        let result = wait_for_ws_message(&mut ws, |message| {
-            message["id"] == "resume-1" && message["type"] == "server.result"
-        })
-        .await;
-        assert_eq!(result["payload"]["resumed"], json!(["cdxs_resume"]));
         let replayed = wait_for_ws_message(&mut ws, |message| {
             message["type"] == "codex.thread.started" && message["payload"]["cursor"] == 2
         })
         .await;
         assert_eq!(replayed["payload"]["codex_session_id"], "cdxs_resume");
+        let result = wait_for_ws_message(&mut ws, |message| {
+            message["id"] == "resume-1" && message["type"] == "server.result"
+        })
+        .await;
+        assert_eq!(result["payload"]["resumed"], json!(["cdxs_resume"]));
 
         let _ = ws.close(None).await;
         let _ = fs::remove_dir_all(root);
