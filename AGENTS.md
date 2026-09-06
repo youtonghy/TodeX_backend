@@ -1,20 +1,34 @@
 # Agent Instructions
 
+## Execution and communication
+
 - Treat requests that imply action (for example, “can you…”, “I want to…”, or “help me…”) as authorization to do the work. Infer routine details from the repository and conversation, persist until the requested outcome is complete, and do not stop at a plan or a capability acknowledgement.
 - Before asking a question or requesting approval, complete all reversible, read-only, review, and implementation work already authorized by context so the user can review a concrete result. Ask only when the answer would materially change the outcome or when the next step is destructive or external.
-- User instructions take precedence over general guidance in this file. If another instruction file or skill causes a pause or changes direction, identify that file and quote the relevant rule in the final response.
+- User instructions take precedence over general guidance in this file. If an instruction file or skill blocks progress, link the exact file, quote the rule, and explain why it applies; distinguish an explicit requirement from your interpretation.
 - Keep responses direct and technically precise. Lead with the result, use plain language and active voice, and use lists only for genuinely parallel or sequential information. Avoid filler, canned conclusions, unnecessary warnings, and unexplained jargon.
 - For work that can be split independently, use collaboration tools to delegate parallel subtasks when doing so saves time or improves quality. Keep messages to other agents and user-facing text readable.
 - Calibrate verification to risk: do not add tests that merely mirror a small reversible change; run the checks appropriate to the change and broaden them only when failures or unresolved risk justify it.
-- When changing OpenAI API integrations, follow the current official model guidance (https://developers.openai.com/api/docs/guides/latest-model):
-  - Use GPT-6 Astra (`gpt-6-astra`) for new general-purpose work unless compatibility, provider availability, latency, or cost requires another model. Keep model IDs configurable and verify the provider's supported-model list; do not silently fall back to an invented model name.
-  - Prefer the Responses API for new integrations and for tool calling. Preserve conversation state and tool results using the Responses primitives rather than recreating Chat Completions message formats.
-  - Set reasoning explicitly for the workload. Astra does not support `none`; use `low` or higher. Preserve an existing effective effort during migrations unless there is a documented reason to change it.
-  - Do not send unsupported sampling or log-probability fields to Astra (`temperature`, `top_p`, `top_logprobs`, `logprobs`, or `message.output_text.logprobs`). Remove them when migrating from older Chat Completions integrations.
-  - When migrating prompt caching, replace `prompt_cache_retention` with `prompt_cache_options.ttl: "30m"`, and review cache boundaries and cost implications.
-  - Use Responses tool calling and validate structured tool inputs/outputs at the application boundary. Keep retries, timeouts, and streaming behavior compatible with the selected SDK and model.
-  - Pin model versions for production paths when reproducibility matters, and record the selected model, reasoning effort, and fallback rationale in configuration or documentation. Re-run representative evaluations after model changes.
-  - Prefer server-side state primitives, streaming, and background execution that match the workload; do not assume Chat Completions-only fields or response shapes when switching APIs.
+- Incorporate follow-up corrections into the active task and retain completed work. Answer side questions, then continue unless the user cancels or replaces the task.
+
+## OpenAI API compatibility (GPT-6 Astra)
+
+Reference: [Official model guidance](https://developers.openai.com/api/docs/guides/latest-model), checked 2026-09-06. Recheck before implementation; these rules apply to OpenAI integrations, not other providers or the coding agent's own runtime.
+
+- Keep model IDs configurable; respect explicit selections and verify provider support. Consider `gpt-6-astra` for new work; preserve existing routing unless migration is requested.
+- Astra tool calling requires Responses; text-only Chat Completions remains supported.
+- Astra does not support `none`. On migration, map `none`/`minimal` effort to `low`; otherwise preserve effective effort and evaluate.
+- Remove `temperature`, `top_p`, `top_logprobs`; also remove Chat Completions `logprobs` or Responses `include` entry `message.output_text.logprobs`.
+- From GPT-5.5 or earlier, replace `prompt_cache_retention` with `prompt_cache_options.ttl: "30m"`; review billing.
+- Async tools use `async: true` and original `call_id`; the application manages execution and pending work. Steering uses WebSockets.
+- For compatible standard single-agent requests, change effort via `configuration_update`; retain request-level effort for caching.
+- EU residency requires Standard processing, excluding `fast`/`priority`.
+
+## Integration verification
+
+- Validate tool inputs and outputs at application boundaries. Check timeouts, retries, streaming, errors, and state preservation; avoid repeating non-idempotent actions during retries.
+- Re-run representative evaluations after model or prompt changes. Record effective model and reasoning settings without logging secrets or sensitive content; update affected configuration examples.
+
+## Git delivery
 
 - After completing each task, create one or more Git commits for the changes made in that task.
 - Group commits by change category or repository responsibility when the task includes unrelated changes.
@@ -22,30 +36,3 @@
 - Push the created commits to the current branch's upstream remote after committing.
 - If committing or pushing is blocked, report the blocker explicitly and leave the working tree status clear in the final response.
 - Do not include unrelated local changes in a task commit. Preserve user changes unless the user explicitly asks to modify or discard them.
-
-## OpenAI API and model guidance
-
-- Prefer the Responses API for new integrations and tool-calling workflows; keep state, tools, structured outputs, streaming, and errors aligned with its current contract.
-- Use GPT-6 Astra for complex or multi-step work when available. Select a smaller supported model only for clear cost or latency reasons, and keep the model configurable rather than hard-coded.
-- Set `reasoning.effort` deliberately and verify that the selected provider/model supports the requested level. Use lower effort for simple, latency-sensitive requests and higher effort for complex planning, coding, research, or orchestration.
-- During model migrations, verify provider model discovery and defaults, remove unsupported sampling or log-probability parameters, and recheck tool calls, schemas, token limits, streaming, and error handling.
-- Review prompt caching after model changes: keep stable instructions and reusable context first, avoid dynamic prefixes, and confirm cache settings are supported.
-- Pin and log the effective model and reasoning settings for reproducibility, without logging API keys or sensitive prompt/content data.
-- Run representative integration checks for tool calls when practical and update configuration examples when defaults or model behavior change.
-
-## GPT-6 Astra 运行细节
-
-- Astra 支持异步工具调用。对耗时或可并行的函数工具，在协议支持时设置 `async: true`，保存原始 `call_id`，并在工具完成后回传结果；应用负责执行工具、超时、重试和待处理状态。
-- 需要在单次请求执行期间接收用户修正时，使用 Responses API 的中途引导能力，并保留已完成工作、工具结果和对话状态。
-- 若同一对话需要改变推理强度，使用 `configuration_update` 输入项；保持请求级 `reasoning.effort` 不变以维护提示缓存，确认所选配置与模型兼容。
-- Astra 不支持 `reasoning.effort: "none"`；不得将其作为默认或回退值。欧盟数据驻留场景不得使用 Astra 的 `fast` 或 `priority` 服务层级。
-
-## OpenAI API 模型规范（依据官方 Model guidance）
-
-- 新的一般用途集成默认使用 `gpt-6-astra`；因兼容性、供应商可用性、延迟或成本改用其他模型时记录原因。模型 ID 必须可配置，并校验供应商支持列表，不得臆造或静默替换。
-- 新集成和工具调用优先使用 Responses API；使用 Responses 原语保留会话状态和工具结果。
-- 显式设置 reasoning；Astra 不支持 `none`，使用 `low` 或更高等级。迁移时保留现有有效 effort，除非记录调整理由。
-- Astra 不支持 `temperature`、`top_p`、`top_logprobs`、`logprobs` 或 `message.output_text.logprobs`，迁移旧 Chat Completions 集成时移除这些字段。
-- 将提示缓存配置从 `prompt_cache_retention` 迁移为 `prompt_cache_options.ttl: "30m"`，并复查缓存边界与成本。
-- 使用 Responses 工具调用时，在应用边界校验工具输入和输出，并设置与 SDK、模型兼容的超时、重试和流式策略；重试不得重复提交不可幂等操作。
-- 参考：https://developers.openai.com/api/docs/guides/latest-model
