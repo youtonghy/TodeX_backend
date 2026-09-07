@@ -77,6 +77,10 @@ pub struct PromptSkillRef {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationPrompt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_mode: Option<String>,
     #[serde(default)]
     pub client_request_id: Option<String>,
     pub text: String,
@@ -989,6 +993,8 @@ impl ConversationSupervisor {
                 reasoning_effort: None,
                 skills: Vec::new(),
                 content: Vec::new(),
+                permission_mode: None,
+                work_mode: None,
                 permission_profile: None,
                 sandbox_mode: None,
                 approval_policy: None,
@@ -1030,6 +1036,8 @@ impl ConversationSupervisor {
             reasoning_effort,
             skills,
             content,
+            permission_mode,
+            work_mode,
             permission_profile,
             sandbox_mode,
             approval_policy,
@@ -1100,6 +1108,8 @@ impl ConversationSupervisor {
                             && request_snapshot.skills.is_empty()
                             && request_snapshot.model.is_none()
                             && request_snapshot.reasoning_effort.is_none()
+                            && request_snapshot.permission_mode.is_none()
+                            && request_snapshot.work_mode.is_none()
                             && request_snapshot.permission_profile.is_none()
                             && request_snapshot.sandbox_mode.is_none()
                             && request_snapshot.approval_policy.is_none()
@@ -1156,8 +1166,10 @@ impl ConversationSupervisor {
                 "prompt exceeds {MAX_PROMPT_BYTES} bytes after skill injection"
             )));
         }
-        let effective_permissions = super::types::resolve_permission_config(
+        let effective_permissions = super::types::resolve_execution_config(
             manifest.provider,
+            permission_mode.as_deref(),
+            work_mode.as_deref(),
             permission_profile.as_deref(),
             sandbox_mode.as_deref(),
             approval_policy.as_deref(),
@@ -1264,7 +1276,7 @@ impl ConversationSupervisor {
                 conversation_id,
                 "turn.started",
                 json!({ "turnId": turn_id, "clientRequestId": client_request_id, "provider": manifest.provider,
-                    "requestedPermissions": { "profile": permission_profile, "sandboxMode": sandbox_mode, "approvalPolicy": approval_policy },
+                    "requestedPermissions": { "permissionMode": permission_mode, "workMode": work_mode, "profile": permission_profile, "sandboxMode": sandbox_mode, "approvalPolicy": approval_policy },
                     "effectivePermissions": effective_permissions, "configurationStatus": "validated" }),
             )
             .await
@@ -1309,6 +1321,8 @@ impl ConversationSupervisor {
                         skills: loaded_skills,
                         model,
                         reasoning_effort,
+                        permission_mode,
+                        work_mode,
                         permission_profile,
                         sandbox_mode,
                         approval_policy,
@@ -2121,6 +2135,8 @@ mod tests {
                     mime_type: "image/png".to_owned(),
                 },
             ],
+            permission_mode: None,
+            work_mode: None,
             permission_profile: None,
             sandbox_mode: Some("read-only".to_owned()),
             approval_policy: Some("on-request".to_owned()),
@@ -2778,6 +2794,12 @@ elif [ "$mode" = "--mode" ]; then
   done
 else
   while IFS= read -r line; do
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{}}}\n'
+        continue
+        ;;
+    esac
     printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"claude fixture"}}}\n'
     printf '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-native","result":"ok"}\n'
   done
@@ -2989,6 +3011,8 @@ done
                     text: "hello".to_owned(),
                     model: None,
                     reasoning_effort: None,
+                    permission_mode: None,
+                    work_mode: None,
                     permission_profile: None,
                     sandbox_mode: None,
                     approval_policy: None,

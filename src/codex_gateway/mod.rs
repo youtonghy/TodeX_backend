@@ -1433,6 +1433,7 @@ impl CodexLocalAdapterSupervisor {
         request_id: &str,
         thread_id: &str,
         input: Value,
+        approvals_reviewer: Option<String>,
         approval_policy: Option<Value>,
         sandbox_policy: Option<Value>,
         service_tier: Option<Value>,
@@ -1452,6 +1453,7 @@ impl CodexLocalAdapterSupervisor {
                 request_id,
                 thread_id,
                 input,
+                approvals_reviewer,
                 approval_policy,
                 sandbox_policy,
                 service_tier,
@@ -1937,12 +1939,25 @@ impl LocalCodexAdapter {
         request_id: &str,
         thread_id: &str,
         input: Value,
+        approvals_reviewer: Option<String>,
         approval_policy: Option<Value>,
         sandbox_policy: Option<Value>,
         service_tier: Option<Value>,
         collaboration_mode: Option<Value>,
     ) -> CodexLocalAdapterProcessResult<()> {
         let codex_session_id = self.runtime.lock().await.codex_session_id.clone();
+        if approvals_reviewer
+            .as_deref()
+            .is_some_and(|reviewer| !matches!(reviewer, "user" | "auto_review"))
+        {
+            return Err(CodexLocalAdapterProcessError::new(
+                CodexLocalErrorCode::MalformedEvent,
+                "unsupported approvals reviewer",
+                &codex_session_id,
+                Some(request_id),
+                "codex.local.turn",
+            ));
+        }
         let collaboration_mode = collaboration_mode
             .map(serde_json::from_value)
             .transpose()
@@ -1959,6 +1974,7 @@ impl LocalCodexAdapter {
             CodexGatewayRequest::turn_start(request_id, thread_id, input, collaboration_mode);
         apply_turn_start_overrides(
             &mut request.payload,
+            approvals_reviewer,
             approval_policy,
             sandbox_policy,
             service_tier,
@@ -2910,6 +2926,7 @@ fn codex_request_to_app_server_method_and_params(request: CodexGatewayRequest) -
 
 fn apply_turn_start_overrides(
     params: &mut Value,
+    approvals_reviewer: Option<String>,
     approval_policy: Option<Value>,
     sandbox_policy: Option<Value>,
     service_tier: Option<Value>,
@@ -2917,6 +2934,9 @@ fn apply_turn_start_overrides(
     let Some(object) = params.as_object_mut() else {
         return;
     };
+    if let Some(reviewer) = approvals_reviewer {
+        object.insert("approvalsReviewer".to_string(), json!(reviewer));
+    }
     if let Some(approval_policy) = approval_policy {
         object.insert("approvalPolicy".to_string(), approval_policy);
     }
@@ -4611,6 +4631,7 @@ mod tests {
         );
         apply_turn_start_overrides(
             &mut request.payload,
+            Some("auto_review".to_owned()),
             Some(json!("on-request")),
             Some(json!({
                 "type": "workspaceWrite",
@@ -4632,6 +4653,7 @@ mod tests {
             "high"
         );
         assert_eq!(params["approvalPolicy"], "on-request");
+        assert_eq!(params["approvalsReviewer"], "auto_review");
         assert_eq!(params["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(params["serviceTier"], "priority");
         assert_eq!(params["collaborationMode"]["mode"], "plan");
@@ -5453,6 +5475,7 @@ mod tests {
                 "local-turn-1",
                 "thread-idle-1",
                 json!([{ "type": "text", "text": "complete and idle" }]),
+                None,
                 None,
                 None,
                 None,

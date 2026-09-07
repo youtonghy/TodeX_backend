@@ -127,6 +127,7 @@ fn spawn_worker(binary: String) -> mpsc::Sender<Command> {
 async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
     let mut process: Option<JsonLineProcess> = None;
     let mut native_thread = None;
+    let mut native_model: Option<String> = None;
     let mut last_sink: Option<DriverEventSink> = None;
     let mut known_queue = VecDeque::<Value>::new();
     loop {
@@ -181,21 +182,22 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                 let child = process.as_mut().expect("spawned process");
                 let result = async {
                     if native_thread.is_none() {
-                        native_thread = Some(
-                            super::prepare_codex_thread(
-                                child,
-                                context,
-                                &prompt,
-                                &sink,
-                                &mut cancel,
-                            )
-                            .await?,
-                        );
+                        let (thread, model) = super::prepare_codex_thread(
+                            child,
+                            context,
+                            &prompt,
+                            &sink,
+                            &mut cancel,
+                        )
+                        .await?;
+                        native_thread = Some(thread);
+                        native_model = model;
                     }
                     active_turn(
                         child,
                         native_thread.as_deref().unwrap(),
                         &prompt,
+                        &mut native_model,
                         &sink,
                         &mut cancel,
                         &mut commands,
@@ -258,21 +260,44 @@ async fn active_turn(
     process: &mut JsonLineProcess,
     thread: &str,
     prompt: &DriverPrompt,
+    native_model: &mut Option<String>,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
     commands: &mut mpsc::Receiver<Command>,
     known_queue: &mut VecDeque<Value>,
 ) -> Result<DriverTurnResult, AppError> {
-    let controls = resolve_permission_config(
+    let controls = resolve_execution_config(
         ProviderKind::Codex,
+        prompt.permission_mode.as_deref(),
+        prompt.work_mode.as_deref(),
         prompt.permission_profile.as_deref(),
         prompt.sandbox_mode.as_deref(),
         prompt.approval_policy.as_deref(),
     )?;
     let start_id = format!("todex-start-{}", uuid::Uuid::new_v4());
-    process.send(&json!({"id":start_id,"method":"turn/start", "params":{
-        "threadId":thread,"input":codex_prompt_input(prompt),"model":prompt.model,"effort":prompt.reasoning_effort,
-        "approvalPolicy":controls.approval_policy,"sandboxPolicy":codex_sandbox_policy(controls.sandbox_mode.as_deref())}})).await?;
+    let mut params = json!({
+        "threadId": thread, "input": codex_prompt_input(prompt), "model": prompt.model,
+        "effort": prompt.reasoning_effort, "approvalPolicy": controls.approval_policy,
+        "approvalsReviewer": controls.approvals_reviewer,
+        "sandboxPolicy": codex_sandbox_policy(controls.sandbox_mode.as_deref())
+    });
+    let selected_model = prompt.model.as_ref().or(native_model.as_ref());
+    if let Some(model) = selected_model.filter(|_| prompt.work_mode.is_some()) {
+        params["collaborationMode"] = json!({
+            "mode": if controls.work_mode == "plan" { "plan" } else { "default" },
+            "settings": { "model": model, "reasoning_effort": prompt.reasoning_effort, "developer_instructions": null }
+        });
+    } else if controls.work_mode == "plan" {
+        return Err(AppError::Unsupported(
+            "Codex Plan mode requires a provider-confirmed or selected model".to_owned(),
+        ));
+    }
+    if let Some(model) = &prompt.model {
+        *native_model = Some(model.clone());
+    }
+    process
+        .send(&json!({"id": start_id, "method": "turn/start", "params": params}))
+        .await?;
     let mut start_request = Some(start_id);
     let mut queued_start: Option<Value> = None;
     let mut start_deadline =
@@ -457,7 +482,7 @@ async fn active_turn(
                             if let ProviderControl::Configure {model, reasoning_effort} = &p.control.control {
                                 if result.get("status").and_then(Value::as_str) == Some("applied") {
                                     let mut effective = json!({"source":"provider-confirmed","scope":"active-turn","effectiveFrom":"subsequent-captures"});
-                                    if let Some(model) = model { effective["model"] = json!(model); }
+                                    if let Some(model) = model { effective["model"] = json!(model); *native_model = Some(model.clone()); }
                                     if let Some(effort) = reasoning_effort { effective["reasoningEffort"] = json!(effort); }
                                     sink.emit("turn.configuration", json!({"provider":"codex", "requestId":p.control.request_id, "requested":{"model":model,"reasoningEffort":reasoning_effort}, "effective":effective})).await?;
                                 }
@@ -759,6 +784,8 @@ done
             skills: vec![],
             model: Some("fixture-model".into()),
             reasoning_effort: Some("high".into()),
+            permission_mode: None,
+            work_mode: None,
             permission_profile: None,
             sandbox_mode: Some("read-only".into()),
             approval_policy: Some("never".into()),

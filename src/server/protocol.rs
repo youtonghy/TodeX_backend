@@ -231,6 +231,8 @@ pub struct CodexLocalTurnRequest {
     pub thread_id: String,
     pub input: Value,
     #[serde(default)]
+    pub approvals_reviewer: Option<String>,
+    #[serde(default)]
     pub approval_policy: Option<Value>,
     #[serde(default)]
     pub sandbox_policy: Option<Value>,

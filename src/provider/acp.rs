@@ -257,8 +257,10 @@ pub(super) async fn run_acp_turn_controlled(
     mut controls: Option<&mut mpsc::Receiver<PendingProviderControl>>,
 ) -> Result<DriverTurnResult, AppError> {
     let provider = context.manifest.provider;
-    super::types::resolve_permission_config(
+    super::types::resolve_execution_config(
         provider,
+        prompt.permission_mode.as_deref(),
+        prompt.work_mode.as_deref(),
         prompt.permission_profile.as_deref(),
         prompt.sandbox_mode.as_deref(),
         prompt.approval_policy.as_deref(),
@@ -1927,6 +1929,8 @@ mod tests {
             skills: Vec::new(),
             model: None,
             reasoning_effort: None,
+            permission_mode: None,
+            work_mode: None,
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,

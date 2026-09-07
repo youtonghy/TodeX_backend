@@ -39,6 +39,9 @@ pub struct ProviderCapabilities {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionConfigCapabilities {
+    pub modes: Vec<&'static str>,
+    pub default_mode: &'static str,
+    pub supports_plan: bool,
     pub sandbox_modes: Vec<&'static str>,
     pub approval_policies: Vec<&'static str>,
     pub permission_profiles: Vec<&'static str>,
@@ -49,18 +52,22 @@ pub struct PermissionConfigCapabilities {
 pub fn permission_config_capabilities(provider: ProviderKind) -> PermissionConfigCapabilities {
     match provider {
         ProviderKind::Codex => PermissionConfigCapabilities {
+            modes: vec!["ask", "auto", "full-access"], default_mode: "ask", supports_plan: true,
             sandbox_modes: vec!["read-only", "workspace-write", "danger-full-access"],
             approval_policies: vec!["untrusted", "on-request", "never"],
             permission_profiles: vec!["read-only", "workspace-write", "danger-full-access"],
             enforcement: "sandbox", description: "Codex native sandbox and approval controls",
         },
         ProviderKind::ClaudeCode => PermissionConfigCapabilities {
+            modes: vec!["ask", "auto", "full-access"], default_mode: "ask", supports_plan: true,
             sandbox_modes: vec!["read-only", "workspace-write", "danger-full-access"],
             approval_policies: vec!["on-request", "never"],
             permission_profiles: vec!["read-only", "workspace-write", "danger-full-access"],
-            enforcement: "agent-policy", description: "Claude plan / acceptEdits / bypassPermissions modes; not an operating-system sandbox. Unsupported combinations are rejected.",
+            enforcement: "agent-policy", description: "Claude default / auto / bypassPermissions and independent plan mode; not an operating-system sandbox. Legacy combinations remain validated.",
         },
         _ => PermissionConfigCapabilities {
+            modes: vec![if provider == ProviderKind::Pi { "full-access" } else { "ask" }],
+            default_mode: if provider == ProviderKind::Pi { "full-access" } else { "ask" }, supports_plan: false,
             sandbox_modes: vec![], approval_policies: vec![], permission_profiles: vec![],
             enforcement: "unsupported", description: "This provider does not expose sandbox or approval overrides through its active protocol.",
         },
@@ -139,6 +146,8 @@ pub struct DriverContext {
 
 #[derive(Clone, Debug)]
 pub struct DriverPrompt {
+    pub permission_mode: Option<String>,
+    pub work_mode: Option<String>,
     pub turn_id: String,
     pub text: String,
     pub content: Vec<DriverPromptContent>,
@@ -154,6 +163,9 @@ pub struct DriverPrompt {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectivePermissionConfig {
+    pub permission_mode: String,
+    pub work_mode: String,
+    pub approvals_reviewer: Option<String>,
     pub sandbox_mode: Option<String>,
     pub approval_policy: Option<String>,
     pub provider_mode: Option<String>,
@@ -209,6 +221,14 @@ pub fn resolve_permission_config(
             )));
         }
         return Ok(EffectivePermissionConfig {
+            permission_mode: if provider == ProviderKind::Pi {
+                "full-access"
+            } else {
+                "ask"
+            }
+            .to_owned(),
+            work_mode: "implement".to_owned(),
+            approvals_reviewer: None,
             sandbox_mode: None,
             approval_policy: None,
             provider_mode: None,
@@ -225,7 +245,7 @@ pub fn resolve_permission_config(
         Some(
             match (sandbox, approval) {
                 ("read-only", "on-request" | "never") => "plan",
-                ("workspace-write", "on-request") => "acceptEdits",
+                ("workspace-write", "on-request") => "default",
                 ("danger-full-access", "never") => "bypassPermissions",
                 _ => {
                     return Err(AppError::Unsupported(
@@ -240,11 +260,142 @@ pub fn resolve_permission_config(
         None
     };
     Ok(EffectivePermissionConfig {
+        permission_mode: if sandbox == "danger-full-access" && approval == "never" {
+            "full-access"
+        } else {
+            "ask"
+        }
+        .to_owned(),
+        work_mode: if provider_mode.as_deref() == Some("plan") {
+            "plan"
+        } else {
+            "implement"
+        }
+        .to_owned(),
+        approvals_reviewer: None,
         sandbox_mode: Some(sandbox.to_owned()),
         approval_policy: Some(approval.to_owned()),
         provider_mode,
         source: "validated-provider-controls".to_owned(),
     })
+}
+
+/// Product-level modes are independent of the provider's native permission policy.
+/// Legacy controls retain their original restrictions; mixed requests must agree.
+pub fn resolve_execution_config(
+    provider: ProviderKind,
+    permission_mode: Option<&str>,
+    work_mode: Option<&str>,
+    profile: Option<&str>,
+    sandbox: Option<&str>,
+    approval: Option<&str>,
+) -> Result<EffectivePermissionConfig, AppError> {
+    let capabilities = permission_config_capabilities(provider);
+    let work = work_mode.unwrap_or("implement");
+    if !matches!(work, "plan" | "implement") {
+        return Err(AppError::InvalidRequest("unsupported work mode".to_owned()));
+    }
+    if work == "plan" && !capabilities.supports_plan {
+        return Err(AppError::Unsupported(format!(
+            "{} does not support Plan mode",
+            provider.as_str()
+        )));
+    }
+    let has_legacy = profile.is_some() || sandbox.is_some() || approval.is_some();
+    if permission_mode.is_none() && has_legacy {
+        let mut legacy = resolve_permission_config(provider, profile, sandbox, approval)?;
+        if work_mode == Some("implement") && legacy.work_mode == "plan" {
+            return Err(AppError::InvalidRequest(
+                "legacy read-only permissions conflict with implement mode".to_owned(),
+            ));
+        }
+        if work == "plan" {
+            legacy.work_mode = "plan".to_owned();
+            if provider == ProviderKind::ClaudeCode {
+                legacy.provider_mode = Some("plan".to_owned());
+            }
+        }
+        return Ok(legacy);
+    }
+    let mode = permission_mode.unwrap_or(capabilities.default_mode);
+    if !capabilities.modes.contains(&mode) {
+        return Err(AppError::Unsupported(format!(
+            "{} does not support permission mode {mode}",
+            provider.as_str()
+        )));
+    }
+    let mut config = match provider {
+        ProviderKind::Codex => EffectivePermissionConfig {
+            permission_mode: mode.to_owned(),
+            work_mode: work.to_owned(),
+            sandbox_mode: Some(
+                if mode == "full-access" {
+                    "danger-full-access"
+                } else {
+                    "workspace-write"
+                }
+                .to_owned(),
+            ),
+            approval_policy: Some(
+                if mode == "full-access" {
+                    "never"
+                } else {
+                    "on-request"
+                }
+                .to_owned(),
+            ),
+            approvals_reviewer: Some(
+                if mode == "auto" {
+                    "auto_review"
+                } else {
+                    "user"
+                }
+                .to_owned(),
+            ),
+            provider_mode: None,
+            source: "validated-provider-controls".to_owned(),
+        },
+        ProviderKind::ClaudeCode => EffectivePermissionConfig {
+            permission_mode: mode.to_owned(),
+            work_mode: work.to_owned(),
+            sandbox_mode: None,
+            approval_policy: None,
+            approvals_reviewer: None,
+            provider_mode: Some(
+                if work == "plan" {
+                    "plan"
+                } else {
+                    match mode {
+                        "auto" => "auto",
+                        "full-access" => "bypassPermissions",
+                        _ => "default",
+                    }
+                }
+                .to_owned(),
+            ),
+            source: "validated-provider-controls".to_owned(),
+        },
+        _ => EffectivePermissionConfig {
+            permission_mode: mode.to_owned(),
+            work_mode: work.to_owned(),
+            sandbox_mode: None,
+            approval_policy: None,
+            approvals_reviewer: None,
+            provider_mode: None,
+            source: "provider-default".to_owned(),
+        },
+    };
+    if has_legacy {
+        let legacy = resolve_permission_config(provider, profile, sandbox, approval)?;
+        // Never silently turn a saved read-only or no-approval policy into a broader preset.
+        if legacy.sandbox_mode != config.sandbox_mode
+            || legacy.approval_policy != config.approval_policy
+        {
+            return Err(AppError::InvalidRequest("permissionMode conflicts with legacy permission controls; send one configuration format".to_owned()));
+        }
+        config.source = "validated-provider-controls".to_owned();
+    }
+    Ok(config)
 }
 
 #[derive(Clone, Debug)]
@@ -1044,6 +1195,83 @@ mod tests {
         assert_eq!(options[1]["id"], "answer");
         assert_eq!(options[1]["label"], "Answer");
     }
+    #[test]
+    fn product_permission_modes_preserve_native_boundaries() {
+        let config = |provider, mode, work| {
+            resolve_execution_config(provider, Some(mode), Some(work), None, None, None)
+        };
+        let ask = config(ProviderKind::Codex, "ask", "implement").unwrap();
+        assert_eq!(ask.approval_policy.as_deref(), Some("on-request"));
+        assert_eq!(ask.approvals_reviewer.as_deref(), Some("user"));
+        let auto = config(ProviderKind::Codex, "auto", "plan").unwrap();
+        assert_eq!(auto.approvals_reviewer.as_deref(), Some("auto_review"));
+        assert_eq!(auto.sandbox_mode.as_deref(), Some("workspace-write"));
+        assert_eq!(auto.work_mode, "plan");
+        let full = config(ProviderKind::Codex, "full-access", "implement").unwrap();
+        assert_eq!(full.approval_policy.as_deref(), Some("never"));
+        assert_eq!(full.sandbox_mode.as_deref(), Some("danger-full-access"));
+        for (mode, native) in [
+            ("ask", "default"),
+            ("auto", "auto"),
+            ("full-access", "bypassPermissions"),
+        ] {
+            assert_eq!(
+                config(ProviderKind::ClaudeCode, mode, "implement")
+                    .unwrap()
+                    .provider_mode
+                    .as_deref(),
+                Some(native)
+            );
+            assert_eq!(
+                config(ProviderKind::ClaudeCode, mode, "plan")
+                    .unwrap()
+                    .provider_mode
+                    .as_deref(),
+                Some("plan")
+            );
+        }
+        assert!(config(ProviderKind::Pi, "full-access", "implement").is_ok());
+        assert!(config(ProviderKind::Pi, "auto", "implement").is_err());
+        assert!(config(ProviderKind::Pi, "ask", "implement").is_err());
+        assert!(config(ProviderKind::Pi, "full-access", "plan").is_err());
+        for provider in [ProviderKind::Acp, ProviderKind::GrokBuild] {
+            assert!(config(provider, "ask", "implement").is_ok());
+            assert!(config(provider, "auto", "implement").is_err());
+            assert!(config(provider, "full-access", "implement").is_err());
+            assert!(config(provider, "ask", "plan").is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_read_only_cannot_be_silently_replaced_by_new_modes() {
+        for provider in [ProviderKind::Codex, ProviderKind::ClaudeCode] {
+            for mode in ["ask", "auto", "full-access"] {
+                assert!(resolve_execution_config(
+                    provider,
+                    Some(mode),
+                    None,
+                    None,
+                    Some("read-only"),
+                    None
+                )
+                .is_err());
+            }
+            let legacy =
+                resolve_execution_config(provider, None, None, None, Some("read-only"), None)
+                    .unwrap();
+            assert_eq!(legacy.sandbox_mode.as_deref(), Some("read-only"));
+        }
+        assert!(resolve_execution_config(
+            ProviderKind::Codex,
+            Some("ask"),
+            Some("unknown"),
+            None,
+            None,
+            None
+        )
+        .is_err());
+    }
+
     #[test]
     fn permission_controls_reject_unsupported_and_conflicting_inputs() {
         assert!(resolve_permission_config(ProviderKind::Codex, None, Some("root"), None).is_err());

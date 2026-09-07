@@ -40,11 +40,20 @@ partial replay approvals, legacy gaps, usage snapshots and status rendering.
 
 ## Provider capability boundaries
 
-| Provider | Permission overrides | Native fork / manual compact |
+| Provider | Product permission modes | Plan mode |
 | --- | --- | --- |
-| Codex | Validated sandbox and approval controls, passed separately to thread and turn RPCs | Supported |
-| Claude Code | Supported combinations map to plan, acceptEdits, or bypassPermissions; plan is not an OS sandbox | Unsupported |
-| Pi, Grok, generic ACP | Provider defaults; explicit sandbox/approval overrides are rejected | Unsupported |
+| Codex | ask: workspace sandbox + user review; auto: workspace sandbox + native auto_review; full-access: no sandbox + never approve | Native collaborationMode, independent of permission mode |
+| Claude Code | default / auto / bypassPermissions; runtime eligibility may restrict auto | Native plan permission mode; not an OS sandbox |
+| Pi | Fixed full-access; RPC has no built-in tool approval or sandbox | Unsupported |
+| Grok | Fixed ask through ACP metadata and permission callbacks | Unsupported |
+| Generic ACP | Fixed ask; native permission requests are forwarded | Unsupported until a profile advertises an integrated mode |
+
+Prompt requests accept optional `permissionMode` (`ask`, `auto`, `full-access`) and
+`workMode` (`implement`, `plan`). The advertised permissionConfig includes `modes`,
+`defaultMode`, and `supportsPlan`. Legacy sandbox/profile/approval inputs retain
+their restrictions; incompatible mixed formats are rejected, including replacing
+saved read-only settings with a broader preset. Old native Codex adapter turns
+also forward `approvalsReviewer` separately from approvalPolicy.
 
 Live discovery remains authoritative. The presence of cancel alone does not
 imply resume/fork/compact. Only advertised approval options can be submitted;

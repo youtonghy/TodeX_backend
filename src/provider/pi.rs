@@ -362,8 +362,10 @@ impl ProviderDriver for PiDriver {
         cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
-        super::types::resolve_permission_config(
+        super::types::resolve_execution_config(
             context.manifest.provider,
+            prompt.permission_mode.as_deref(),
+            prompt.work_mode.as_deref(),
             prompt.permission_profile.as_deref(),
             prompt.sandbox_mode.as_deref(),
             prompt.approval_policy.as_deref(),
@@ -1792,6 +1794,8 @@ mod tests {
                 skills: vec![],
                 model: None,
                 reasoning_effort: None,
+                permission_mode: None,
+                work_mode: None,
                 permission_profile: None,
                 sandbox_mode: None,
                 approval_policy: None,

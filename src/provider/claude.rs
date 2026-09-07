@@ -143,8 +143,10 @@ impl ProviderDriver for ClaudeDriver {
         mut cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
-        let controls = super::types::resolve_permission_config(
+        let controls = super::types::resolve_execution_config(
             context.manifest.provider,
+            prompt.permission_mode.as_deref(),
+            prompt.work_mode.as_deref(),
             prompt.permission_profile.as_deref(),
             prompt.sandbox_mode.as_deref(),
             prompt.approval_policy.as_deref(),
@@ -166,6 +168,10 @@ impl ProviderDriver for ClaudeDriver {
             "--replay-user-messages".to_owned(),
             "--permission-prompts".to_owned(),
             "host".to_owned(),
+            // Match the official Agent SDK transport: host alone does not
+            // connect can_use_tool requests to the stream-json control channel.
+            "--permission-prompt-tool".to_owned(),
+            "stdio".to_owned(),
             "--permission-mode".to_owned(),
             controls
                 .provider_mode
@@ -198,27 +204,6 @@ impl ProviderDriver for ClaudeDriver {
         .await;
         process.terminate().await;
         result
-    }
-}
-
-#[cfg(test)]
-fn claude_permission_mode(
-    profile: Option<&str>,
-    sandbox_mode: Option<&str>,
-    approval_policy: Option<&str>,
-) -> &'static str {
-    match (profile, sandbox_mode, approval_policy) {
-        (Some("read-only" | ":read-only"), _, _) | (_, Some("read-only"), _) => "plan",
-        (Some("full-access" | ":danger-full-access"), _, _)
-        | (_, Some("danger-full-access"), Some("never")) => "bypassPermissions",
-        // Verified against Claude Code 2.1.259 in `-p` stream-json mode: the
-        // host never receives `can_use_tool` control requests (the SDK answers
-        // prompts through an injected MCP tool instead), so anything gated is
-        // auto-denied ("you haven't granted it yet"). `manual` is silently
-        // downgraded to `default` there, which denies every Write/Edit. Map
-        // workspace profiles to `acceptEdits` instead: edits inside the working
-        // directory are granted, outside edits and risky Bash stay denied.
-        _ => "acceptEdits",
     }
 }
 
@@ -256,7 +241,7 @@ fn claude_user_content(prompt: &DriverPrompt) -> Value {
 mod tests {
     use serde_json::json;
 
-    use super::{claude_model_aliases, claude_permission_mode, claude_user_content};
+    use super::{claude_model_aliases, claude_user_content};
     use crate::provider::types::{DriverPrompt, DriverPromptContent};
 
     #[test]
@@ -278,31 +263,6 @@ mod tests {
     }
 
     #[test]
-    fn permission_profiles_map_to_safe_claude_modes() {
-        assert_eq!(
-            claude_permission_mode(Some(":read-only"), None, None),
-            "plan"
-        );
-        assert_eq!(
-            claude_permission_mode(
-                Some(":workspace"),
-                Some("workspace-write"),
-                Some("on-request")
-            ),
-            "acceptEdits"
-        );
-        assert_eq!(claude_permission_mode(None, None, None), "acceptEdits");
-        assert_eq!(
-            claude_permission_mode(
-                Some(":danger-full-access"),
-                Some("danger-full-access"),
-                Some("never")
-            ),
-            "bypassPermissions"
-        );
-    }
-
-    #[test]
     fn text_only_prompt_keeps_the_existing_string_shape() {
         let prompt = DriverPrompt {
             turn_id: "turn-1".to_owned(),
@@ -311,6 +271,8 @@ mod tests {
             skills: Vec::new(),
             model: None,
             reasoning_effort: None,
+            permission_mode: None,
+            work_mode: None,
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
@@ -332,6 +294,8 @@ mod tests {
             skills: Vec::new(),
             model: None,
             reasoning_effort: None,
+            permission_mode: None,
+            work_mode: None,
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
@@ -354,6 +318,70 @@ mod tests {
     }
 }
 
+// Protocol reference: anthropics/claude-agent-sdk-python, _internal/query.py.
+// Use the same initialize exchange as the official Agent SDK before sending
+// a user turn. A rejected/unsupported control channel must fail before tools run.
+async fn initialize_claude(
+    process: &mut JsonLineProcess,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    process
+        .send(&json!({
+            "type": "control_request",
+            "request_id": "todex-initialize",
+            "request": { "subtype": "initialize", "hooks": null }
+        }))
+        .await?;
+    let initialize = async {
+        loop {
+            let Some(message) = process.read().await? else {
+                return Err(provider_exit_error(
+                    process,
+                    "Claude Code closed during initialization",
+                )
+                .await);
+            };
+            if message.get("type").and_then(Value::as_str) == Some("result")
+                && message.get("is_error").and_then(Value::as_bool) == Some(true)
+            {
+                return Err(AppError::ProviderUnavailable(format!(
+                    "Claude Code initialization failed: {}",
+                    message
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .unwrap_or("provider rejected startup")
+                )));
+            }
+            if message.get("type").and_then(Value::as_str) == Some("control_response")
+                && message
+                    .pointer("/response/request_id")
+                    .and_then(Value::as_str)
+                    == Some("todex-initialize")
+            {
+                return if message.pointer("/response/subtype").and_then(Value::as_str)
+                    == Some("success")
+                {
+                    Ok(())
+                } else {
+                    Err(AppError::ProviderUnavailable(format!(
+                        "Claude Code initialization rejected: {}",
+                        message
+                            .pointer("/response/error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unsupported control protocol")
+                    )))
+                };
+            }
+        }
+    };
+    tokio::select! {
+        result = tokio::time::timeout(super::process::control_timeout()?, initialize) => {
+            result.map_err(|_| AppError::ProviderUnavailable("Claude Code initialization timed out".to_owned()))?
+        }
+        _ = cancel.changed() => Err(AppError::InvalidRequest("Claude Code initialization cancelled".to_owned())),
+    }
+}
+
 async fn run_claude_turn(
     process: &mut JsonLineProcess,
     context: DriverContext,
@@ -362,6 +390,16 @@ async fn run_claude_turn(
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<DriverTurnResult, AppError> {
+    initialize_claude(process, cancel).await?;
+    let expected_mode = super::types::resolve_execution_config(
+        context.manifest.provider,
+        prompt.permission_mode.as_deref(),
+        prompt.work_mode.as_deref(),
+        prompt.permission_profile.as_deref(),
+        prompt.sandbox_mode.as_deref(),
+        prompt.approval_policy.as_deref(),
+    )?
+    .provider_mode;
     let message_content = claude_user_content(&prompt);
     process
         .send(&json!({
@@ -468,6 +506,16 @@ async fn run_claude_turn(
                 handle_control_request(process, message, sink, cancel).await?;
             }
             Some("system") => {
+                if message.get("subtype").and_then(Value::as_str) == Some("init") {
+                    if let Some(actual) = message.get("permissionMode").and_then(Value::as_str) {
+                        if expected_mode.as_deref() != Some(actual) {
+                            return Err(AppError::ProviderUnavailable(format!(
+                                "Claude Code did not activate requested permission mode '{}'; reported '{}'. Check model, account and organization permissions.",
+                                expected_mode.as_deref().unwrap_or("default"), actual
+                            )));
+                        }
+                    }
+                }
                 sink.emit(
                     "provider.event",
                     json!({

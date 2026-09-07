@@ -110,6 +110,8 @@ impl Harness {
             reasoning_effort: None,
             skills: vec![],
             content: vec![],
+            permission_mode: None,
+            work_mode: None,
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,

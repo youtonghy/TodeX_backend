@@ -10,7 +10,7 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
-    resolve_permission_config, DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult,
+    resolve_execution_config, DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult,
     ImageInputMode, PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor,
     ProviderDescriptor, ProviderDriver,
 };
@@ -430,7 +430,7 @@ async fn prepare_codex_thread(
     prompt: &DriverPrompt,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
-) -> Result<String, AppError> {
+) -> Result<(String, Option<String>), AppError> {
     process
         .send(&json!({
             "id": "initialize",
@@ -451,18 +451,22 @@ async fn prepare_codex_thread(
     wait_for_response(process, "initialize", sink, cancel).await?;
     process.send(&json!({ "method": "initialized" })).await?;
 
-    let controls = resolve_permission_config(
+    let controls = resolve_execution_config(
         context.manifest.provider,
+        prompt.permission_mode.as_deref(),
+        prompt.work_mode.as_deref(),
         prompt.permission_profile.as_deref(),
         prompt.sandbox_mode.as_deref(),
         prompt.approval_policy.as_deref(),
     )?;
+    let mut effective_model = prompt.model.clone();
     let native_session_id = match context.provider_state.native_session_id.as_deref() {
         Some(thread_id) => {
             let mut resume_params = json!({
                 "threadId": thread_id,
                 "cwd": context.manifest.workspace,
                 "approvalPolicy": controls.approval_policy,
+                "approvalsReviewer": controls.approvals_reviewer,
                 "sandbox": controls.sandbox_mode,
             });
             if let Some(model) = &prompt.model {
@@ -479,6 +483,11 @@ async fn prepare_codex_thread(
                 }))
                 .await?;
             let response = wait_for_response(process, "thread", sink, cancel).await?;
+            effective_model = response
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(effective_model);
             if let Some(configuration) = codex_configuration_event(&response, &prompt) {
                 sink.emit("turn.configuration", configuration).await?;
             }
@@ -488,6 +497,7 @@ async fn prepare_codex_thread(
             let mut params = json!({
                 "cwd": context.manifest.workspace,
                 "approvalPolicy": controls.approval_policy,
+                "approvalsReviewer": controls.approvals_reviewer,
                 "sandbox": controls.sandbox_mode,
             });
             if let Some(model) = &prompt.model {
@@ -504,6 +514,11 @@ async fn prepare_codex_thread(
                 }))
                 .await?;
             let response = wait_for_response(process, "thread", sink, cancel).await?;
+            effective_model = response
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(effective_model);
             if let Some(configuration) = codex_configuration_event(&response, &prompt) {
                 sink.emit("turn.configuration", configuration).await?;
             }
@@ -525,12 +540,17 @@ async fn prepare_codex_thread(
     provider_state.last_error = None;
     sink.save_provider_state(provider_state).await?;
 
-    Ok(native_session_id)
+    Ok((native_session_id, effective_model))
 }
 
 fn codex_configuration_event(response: &Value, prompt: &DriverPrompt) -> Option<Value> {
     let mut effective = serde_json::Map::new();
-    for key in ["model", "reasoningEffort", "approvalPolicy"] {
+    for key in [
+        "model",
+        "reasoningEffort",
+        "approvalPolicy",
+        "approvalsReviewer",
+    ] {
         if let Some(value) = response.get(key).filter(|value| !value.is_null()) {
             effective.insert(key.to_owned(), value.clone());
         }
@@ -551,7 +571,7 @@ fn codex_configuration_event(response: &Value, prompt: &DriverPrompt) -> Option<
     effective.insert("source".to_owned(), json!("provider-confirmed"));
     Some(json!({
         "provider": "codex", "turnId": prompt.turn_id,
-        "requested": { "model": prompt.model, "reasoningEffort": prompt.reasoning_effort, "permissionProfile": prompt.permission_profile, "sandboxMode": prompt.sandbox_mode, "approvalPolicy": prompt.approval_policy },
+        "requested": { "permissionMode": prompt.permission_mode, "workMode": prompt.work_mode, "model": prompt.model, "reasoningEffort": prompt.reasoning_effort, "permissionProfile": prompt.permission_profile, "sandboxMode": prompt.sandbox_mode, "approvalPolicy": prompt.approval_policy },
         "effective": effective,
     }))
 }
@@ -1394,6 +1414,8 @@ mod tests {
             }],
             model: None,
             reasoning_effort: None,
+            permission_mode: None,
+            work_mode: None,
             permission_profile: None,
             sandbox_mode: None,
             approval_policy: None,
@@ -1502,7 +1524,7 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   case "$line" in
     *'"method":"initialize"'*) printf '{"id":"%s","result":{}}\n' "$id" ;;
-    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '{"id":"%s","result":{"thread":{"id":"native"}}}\n' "$id" ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '{"id":"%s","result":{"thread":{"id":"native"},"model":"fixture-model"}}\n' "$id" ;;
     *'"method":"turn/start"'*)
       printf '{"id":"%s","result":{"turn":{"id":"native-turn"}}}\n' "$id"
       printf '{"method":"turn/completed","params":{"threadId":"native","turn":{"id":"native-turn","status":"completed"}}}\n' ;;
@@ -1543,7 +1565,12 @@ done
         };
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut provider_state = ProviderState::new(ProviderKind::Codex);
-        for sandbox in ["read-only", "danger-full-access"] {
+        for (sandbox, permission_mode, work_mode) in [
+            (Some("read-only"), None, None),
+            (Some("danger-full-access"), None, None),
+            (None, Some("auto"), Some("plan")),
+            (None, Some("ask"), Some("implement")),
+        ] {
             driver
                 .run_turn(
                     DriverContext {
@@ -1557,9 +1584,11 @@ done
                         skills: vec![],
                         model: None,
                         reasoning_effort: None,
+                        permission_mode: permission_mode.map(str::to_owned),
+                        work_mode: work_mode.map(str::to_owned),
                         permission_profile: None,
-                        sandbox_mode: Some(sandbox.to_owned()),
-                        approval_policy: Some("never".to_owned()),
+                        sandbox_mode: sandbox.map(str::to_owned),
+                        approval_policy: sandbox.map(|_| "never".to_owned()),
                     },
                     sink.clone(),
                     cancel_rx.clone(),
@@ -1622,6 +1651,18 @@ done
             requests("turn/start")[1]["params"]["sandboxPolicy"]["type"],
             "dangerFullAccess"
         );
+        let plan_params = &requests("turn/start")[2]["params"];
+        assert_eq!(plan_params["approvalsReviewer"], "auto_review");
+        assert_eq!(plan_params["approvalPolicy"], "on-request");
+        assert_eq!(plan_params["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(plan_params["collaborationMode"]["mode"], "plan");
+        assert_eq!(
+            plan_params["collaborationMode"]["settings"]["model"],
+            "fixture-model"
+        );
+        let implement_params = &requests("turn/start")[3]["params"];
+        assert_eq!(implement_params["approvalsReviewer"], "user");
+        assert_eq!(implement_params["collaborationMode"]["mode"], "default");
         assert_eq!(requests("thread/fork")[0]["params"]["threadId"], "native");
         assert_eq!(requests("thread/compact/start").len(), 1);
         tokio::fs::remove_dir_all(root).await.unwrap();

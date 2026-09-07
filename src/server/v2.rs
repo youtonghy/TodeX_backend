@@ -1358,6 +1358,8 @@ async fn prompt_conversation(
                 text: request.text,
                 model: request.model,
                 reasoning_effort: request.reasoning_effort,
+                permission_mode: request.permission_mode,
+                work_mode: request.work_mode,
                 permission_profile: request.permission_profile,
                 sandbox_mode: request.sandbox_mode,
                 approval_policy: request.approval_policy,
@@ -1962,6 +1964,8 @@ async fn dispatch_command_inner(
                         text,
                         model: request.model,
                         reasoning_effort: request.reasoning_effort,
+                        permission_mode: request.permission_mode,
+                        work_mode: request.work_mode,
                         permission_profile: request.permission_profile,
                         sandbox_mode: request.sandbox_mode,
                         approval_policy: request.approval_policy,
@@ -2422,6 +2426,10 @@ struct PromptRequest {
     #[serde(default)]
     content: Vec<PromptContentRef>,
     #[serde(default)]
+    permission_mode: Option<String>,
+    #[serde(default)]
+    work_mode: Option<String>,
+    #[serde(default)]
     permission_profile: Option<String>,
     #[serde(default)]
     sandbox_mode: Option<String>,
@@ -2478,6 +2486,10 @@ struct WsConversationRequest {
     skills: Vec<PromptSkillRequest>,
     #[serde(default)]
     content: Vec<PromptContentRef>,
+    #[serde(default)]
+    permission_mode: Option<String>,
+    #[serde(default)]
+    work_mode: Option<String>,
     #[serde(default)]
     permission_profile: Option<String>,
     #[serde(default)]
