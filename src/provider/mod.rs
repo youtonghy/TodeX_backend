@@ -21,3 +21,6 @@ pub use supervisor::{
     ConversationPrompt, ConversationSupervisor, PromptContentRef, PromptSkillRef,
 };
 pub use types::PermissionDecision;
+
+#[cfg(test)]
+mod control_tests;

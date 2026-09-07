@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
 use tokio::sync::watch;
-use tokio::time::timeout;
 
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
@@ -16,20 +15,66 @@ use super::types::{
     ProviderDescriptor, ProviderDriver,
 };
 
+mod capabilities;
+mod runtime;
+
 pub struct CodexDriver {
     binary: String,
+    sessions: runtime::Sessions,
+    control_probe: tokio::sync::OnceCell<capabilities::ControlProbe>,
 }
 
 impl CodexDriver {
     pub fn new(config: &AgentConfig) -> Self {
         Self {
             binary: config.codex_bin.clone(),
+            sessions: runtime::Sessions::new(),
+            control_probe: tokio::sync::OnceCell::new(),
         }
     }
 }
 
 #[async_trait]
 impl ProviderDriver for CodexDriver {
+    async fn refresh_control_capabilities(&self) {
+        self.control_probe
+            .get_or_init(|| capabilities::probe(&self.binary))
+            .await;
+    }
+    fn control_probe(&self) -> Option<Value> {
+        Some(
+            self.control_probe
+                .get()
+                .map(|probe| probe.diagnostic.clone())
+                .unwrap_or_else(|| json!({"status":"notChecked","source":"installed-schema"})),
+        )
+    }
+    fn supports_live_controls(&self) -> bool {
+        self.control_probe.get().is_some_and(|probe| probe.live)
+    }
+    fn supports_native_queue(&self) -> bool {
+        self.control_probe.get().is_some_and(|probe| probe.queue)
+    }
+
+    async fn control(
+        &self,
+        conversation_id: &str,
+        expected_turn_id: &str,
+        request_id: &str,
+        control: super::types::ProviderControl,
+    ) -> Result<Value, AppError> {
+        self.sessions
+            .control(conversation_id, expected_turn_id, request_id, control)
+            .await
+    }
+
+    async fn shutdown_session(&self, conversation_id: &str) {
+        self.sessions.stop(conversation_id).await;
+    }
+    async fn shutdown(&self) {
+        self.sessions.stop_all().await;
+    }
+
     fn supports_native_compact(&self) -> bool {
         true
     }
@@ -40,6 +85,7 @@ impl ProviderDriver for CodexDriver {
         mut cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<(), AppError> {
+        self.sessions.stop(&context.manifest.id).await;
         let native = context
             .provider_state
             .native_session_id
@@ -168,7 +214,7 @@ impl ProviderDriver for CodexDriver {
                 managed_mcp: true,
                 model_selection: true,
                 image_input: ProviderKind::Codex.supports_image_input(),
-                image_input_mode: ImageInputMode::Always,
+                image_input_mode: ImageInputMode::Model,
             },
             models: Vec::new(),
         }
@@ -188,16 +234,45 @@ impl ProviderDriver for CodexDriver {
         process.send(&json!({"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"todex-agentd","version":crate::version::APP_VERSION}}})).await?;
         let _ = read_rpc_response(&mut process, "initialize").await?;
         process.send(&json!({ "method": "initialized" })).await?;
-        process
-            .send(&json!({"id":"models","method":"model/list","params":{"includeHidden":false}}))
-            .await?;
-        let response = read_rpc_response(&mut process, "models").await?;
+        let result = async {
+            let mut items = Vec::new();
+            let mut cursor = Value::Null;
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                process
+                    .send(&json!({"id":"models","method":"model/list",
+                    "params":{"includeHidden":false,"cursor":cursor}}))
+                    .await?;
+                let response = read_rpc_response(&mut process, "models").await?;
+                let page = response
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        AppError::ProviderUnavailable(
+                            "Codex model catalog has no data array".to_owned(),
+                        )
+                    })?;
+                items.extend(page.iter().cloned());
+                match response
+                    .get("nextCursor")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    None => break,
+                    Some(next) if seen.insert(next.to_owned()) => cursor = json!(next),
+                    Some(_) => {
+                        return Err(AppError::ProviderUnavailable(
+                            "Codex model catalog repeated a cursor".to_owned(),
+                        ))
+                    }
+                }
+            }
+            Ok::<_, AppError>(items)
+        }
+        .await;
         process.terminate().await;
-        Ok(response
-            .get("data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+        Ok(result?
+            .iter()
             .filter_map(|item| {
                 let id = item
                     .get("model")
@@ -239,7 +314,10 @@ impl ProviderDriver for CodexDriver {
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned),
                     context_window: None,
-                    image_input: Some(true),
+                    image_input: item
+                        .get("inputModalities")
+                        .and_then(Value::as_array)
+                        .map(|items| items.iter().any(|value| value.as_str() == Some("image"))),
                 })
             })
             .collect())
@@ -292,19 +370,21 @@ impl ProviderDriver for CodexDriver {
         context: DriverContext,
         prompt: DriverPrompt,
         sink: DriverEventSink,
-        mut cancel: watch::Receiver<bool>,
+        cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
-        let mut spec = CommandSpec::new(&self.binary, &context.manifest.workspace);
-        spec.args = vec![
-            "app-server".to_owned(),
-            "--listen".to_owned(),
-            "stdio://".to_owned(),
-        ];
-        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
-        let result = run_codex_turn(&mut process, context, prompt, &sink, &mut cancel).await;
-        process.terminate().await;
-        result
+        self.sessions
+            .run(
+                &self.binary,
+                runtime::Run {
+                    context,
+                    prompt,
+                    sink,
+                    cancel,
+                    permit: launch_permit,
+                },
+            )
+            .await
     }
 }
 
@@ -344,14 +424,13 @@ async fn read_rpc_response(process: &mut JsonLineProcess, id: &str) -> Result<Va
     }
 }
 
-async fn run_codex_turn(
+async fn prepare_codex_thread(
     process: &mut JsonLineProcess,
     context: DriverContext,
-    prompt: DriverPrompt,
+    prompt: &DriverPrompt,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
-) -> Result<DriverTurnResult, AppError> {
-    let input = codex_prompt_input(&prompt);
+) -> Result<String, AppError> {
     process
         .send(&json!({
             "id": "initialize",
@@ -446,81 +525,7 @@ async fn run_codex_turn(
     provider_state.last_error = None;
     sink.save_provider_state(provider_state).await?;
 
-    process
-        .send(&json!({
-            "id": prompt.turn_id,
-            "method": "turn/start",
-            "params": {
-                "threadId": native_session_id,
-                "input": input,
-                "model": prompt.model.clone(),
-                "effort": prompt.reasoning_effort.clone(),
-                "approvalPolicy": controls.approval_policy,
-                "sandboxPolicy": codex_sandbox_policy(controls.sandbox_mode.as_deref()),
-            }
-        }))
-        .await?;
-    let response = wait_for_response(process, &prompt.turn_id, sink, cancel).await?;
-    let native_turn_id = response
-        .pointer("/turn/id")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-
-    loop {
-        let message = tokio::select! {
-            message = process.read() => message?,
-            changed = cancel.changed() => {
-                let _ = changed;
-                if let Some(turn_id) = native_turn_id.as_deref() {
-                    return interrupt_codex_turn(
-                        process,
-                        &prompt.turn_id,
-                        &native_session_id,
-                        turn_id,
-                        sink,
-                    ).await;
-                }
-                return Ok(DriverTurnResult {
-                    native_session_id: Some(native_session_id),
-                    stop_reason: "cancelled".to_owned(),
-                    cancelled: true,
-                });
-            }
-        };
-        let Some(message) = message else {
-            return Err(provider_exit_error(process, "Codex app-server closed stdout").await);
-        };
-        if message.is_null() {
-            continue;
-        }
-        if let Some(stop_reason) = turn_completion_status(&message, native_turn_id.as_deref())? {
-            if stop_reason == "failed" {
-                return Err(codex_turn_failure(&message));
-            }
-            return Ok(DriverTurnResult {
-                native_session_id: Some(native_session_id),
-                stop_reason: stop_reason.to_owned(),
-                cancelled: stop_reason == "interrupted",
-            });
-        }
-        if let Err(error) =
-            handle_codex_message(process, message, sink, cancel, &prompt.turn_id).await
-        {
-            if matches!(error, AppError::TurnCancelled) && *cancel.borrow() {
-                if let Some(turn_id) = native_turn_id.as_deref() {
-                    return interrupt_codex_turn(
-                        process,
-                        &prompt.turn_id,
-                        &native_session_id,
-                        turn_id,
-                        sink,
-                    )
-                    .await;
-                }
-            }
-            return Err(error);
-        }
-    }
+    Ok(native_session_id)
 }
 
 fn codex_configuration_event(response: &Value, prompt: &DriverPrompt) -> Option<Value> {
@@ -601,42 +606,53 @@ async fn wait_for_response(
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<Value, AppError> {
     let mut deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
+    let mut response = None;
+    let mut permissions = tokio::task::JoinSet::<(
+        Value,
+        String,
+        Value,
+        Result<super::types::PermissionDecision, AppError>,
+    )>::new();
     loop {
-        let message = tokio::select! {
-            message = process.read_control_until(deadline) => message?,
-            changed = cancel.changed() => {
-                let _ = changed;
-                return Err(AppError::TurnCancelled);
+        if permissions.is_empty() {
+            if let Some(response) = response.take() {
+                return Ok(response);
             }
-        };
-        let Some(message) = message else {
-            return Err(provider_exit_error(process, "Codex app-server closed stdout").await);
-        };
-        if message.is_null() {
-            continue;
         }
-        if jsonrpc_id_matches(&message, request_id) {
-            if let Some(error) = message.get("error") {
-                return Err(AppError::ProviderUnavailable(format!(
-                    "Codex request {request_id} failed: {}",
-                    safe_error_text(error)
-                )));
+        tokio::select! {
+            _ = cancel.changed() => return Err(AppError::TurnCancelled),
+            _ = tokio::time::sleep_until(deadline), if permissions.is_empty() => {
+                return Err(AppError::ProviderUnavailable(format!("Codex request {request_id} timed out")));
             }
-            return message.get("result").cloned().ok_or_else(|| {
-                AppError::InvalidRequest(format!(
-                    "Codex response {request_id} did not contain a result"
-                ))
-            });
-        }
-        let waits_for_user = message.get("id").is_some()
-            && message
-                .get("method")
-                .and_then(Value::as_str)
-                .is_some_and(is_codex_permission_method);
-        let handler_started = tokio::time::Instant::now();
-        handle_codex_message(process, message, sink, cancel, request_id).await?;
-        if waits_for_user {
-            deadline += handler_started.elapsed();
+            answer = permissions.join_next(), if !permissions.is_empty() => {
+                if let Some(Ok((id, method, params, decision))) = answer {
+                    let result = codex_permission_response(&method, &params, decision?);
+                    process.send(&json!({"id":id,"result":result})).await?;
+                    deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
+                }
+            }
+            message = process.read() => {
+                let Some(message) = message? else { return Err(provider_exit_error(process, "Codex app-server closed stdout").await); };
+                if message.is_null() { continue; }
+                if jsonrpc_id_matches(&message, request_id) {
+                    if let Some(error) = message.get("error") { return Err(AppError::ProviderUnavailable(format!("Codex request {request_id} failed: {}",safe_error_text(error)))); }
+                    response = Some(message.get("result").cloned().ok_or_else(||AppError::InvalidRequest(format!("Codex response {request_id} did not contain a result")))?);
+                    continue;
+                }
+                if let (Some(id),Some(method)) = (message.get("id"),message.get("method").and_then(Value::as_str)) {
+                    if is_codex_permission_method(method) {
+                        let id = id.clone(); let method = method.to_owned(); let params = message.get("params").cloned().unwrap_or(Value::Null);
+                        let sink = sink.clone(); let mut cancel = cancel.clone();
+                        permissions.spawn(async move {
+                            let decision = sink.request_permission(jsonrpc_id_text(&id).unwrap_or_default(), codex_permission_kind(&method),
+                                codex_permission_title(&method,&params),params.clone(),codex_permission_options(&method),&mut cancel).await;
+                            (id,method,params,decision)
+                        });
+                        continue;
+                    }
+                }
+                handle_codex_message(process, message, sink, cancel, request_id).await?;
+            }
         }
     }
 }
@@ -684,8 +700,21 @@ async fn handle_codex_message(
         for (event_type, payload) in codex_activity_events(method, &params, turn_id) {
             sink.emit(event_type, payload).await?;
         }
-        if let Some((event_type, payload)) = codex_item_event(method, &params, turn_id) {
+        for payload in codex_completed_reasoning(method, &params, turn_id) {
+            sink.emit("thought.completed", payload).await?;
+        }
+        if let Some((event_type, mut payload)) = codex_item_event(method, &params, turn_id) {
+            payload["nativeTurnId"] = params.get("turnId").cloned().unwrap_or(Value::Null);
+            payload["nativeSessionId"] = params.get("threadId").cloned().unwrap_or(Value::Null);
             sink.emit(event_type, payload).await?;
+        } else {
+            // New upstream item variants must survive even before a typed UI exists.
+            sink.emit(
+                "provider.event",
+                json!({"provider":"codex", "providerMethod":method,
+                "metadata":params, "turnId":turn_id}),
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -709,14 +738,14 @@ async fn handle_codex_message(
         return Ok(());
     }
 
-    let (event_type, payload) = match method {
+    let (event_type, mut payload) = match method {
         "item/agentMessage/delta" => (
             "message.delta",
             json!({
                 "role": "assistant",
                 "delta": params.get("delta").cloned().unwrap_or(Value::Null),
                 "provider": "codex",
-                "block": codex_block(&params, "assistant_progress", "delta", turn_id),
+                "block": codex_block(&params, "assistant_final", "delta", turn_id),
             }),
         ),
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => (
@@ -724,8 +753,24 @@ async fn handle_codex_message(
             json!({
                 "delta": params.get("delta").cloned().unwrap_or(Value::Null),
                 "provider": "codex",
-                "block": codex_block(&params, "reasoning", "delta", turn_id),
+                "thought": params.get("delta"),
+                "block": codex_reasoning_block(&params, method, "delta", turn_id),
             }),
+        ),
+        "thread/settings/updated" => (
+            "turn.configuration",
+            json!({"provider":"codex", "effective":{
+                "model":params.pointer("/threadSettings/model"),
+                "reasoningEffort":params.pointer("/threadSettings/effort"),
+                "approvalPolicy":params.pointer("/threadSettings/approvalPolicy"),
+                "source":"provider-confirmed","scope":"subsequent-turns"
+            }}),
+        ),
+        "model/rerouted" => (
+            "turn.configuration",
+            json!({"provider":"codex","effective":{
+                "model":params.get("toModel"),"source":"provider-confirmed","scope":"active-turn"
+            }}),
         ),
         "turn/plan/updated" => (
             "plan.updated",
@@ -745,6 +790,8 @@ async fn handle_codex_message(
             }),
         ),
     };
+    payload["nativeTurnId"] = params.get("turnId").cloned().unwrap_or(Value::Null);
+    payload["nativeSessionId"] = params.get("threadId").cloned().unwrap_or(Value::Null);
     sink.emit(event_type, payload).await?;
     Ok(())
 }
@@ -785,6 +832,17 @@ fn codex_activity_events(
         return Vec::new();
     };
     match item.get("type").and_then(Value::as_str) {
+        Some("subAgentActivity") => {
+            let event = match item.get("kind").and_then(Value::as_str) {
+                Some("started") => "subagent.started",
+                Some("completed") => "subagent.completed",
+                Some("interrupted") => "subagent.cancelled",
+                _ => "subagent.updated",
+            };
+            vec![(event, json!({"provider":"codex","turnId":turn_id,
+                "subagentId":item.get("agentThreadId"), "title":item.get("agentPath"),
+                "source":"provider", "providerItemId":item.get("id")}))]
+        }
         Some("contextCompaction") => vec![(if method == "item/started" { "compaction.started" } else { "compaction.completed" },
             json!({ "provider": "codex", "turnId": turn_id, "compactionId": item.get("id"), "source": "provider" }))],
         Some("collabAgentToolCall") => item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(|id| {
@@ -808,20 +866,28 @@ fn codex_item_event(method: &str, params: &Value, turn_id: &str) -> Option<(&'st
     let item = params.get("item")?;
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
     if matches!(item_type, "agentMessage" | "agent_message") {
-        return (method == "item/completed").then(|| {
-            (
-                "message.completed",
-                json!({
-                    "provider": "codex",
-                    "role": "assistant",
-                    "message": item,
-                    "block": codex_block(params, "assistant_final", "completed", turn_id),
-                }),
-            )
-        });
+        let completed = method == "item/completed";
+        return Some((
+            if completed {
+                "message.completed"
+            } else {
+                "message.created"
+            },
+            json!({
+                "provider":"codex", "role":"assistant", "message":item,
+                "block": codex_block(params, if item.get("phase").and_then(Value::as_str) == Some("commentary") {
+                    "assistant_progress"
+                } else { "assistant_final" }, if completed { "completed" } else { "started" }, turn_id),
+            }),
+        ));
     }
     if matches!(item_type, "reasoning" | "reasoningItem" | "reasoning_item") {
-        return None;
+        // Preserve authoritative summary/content without merging the two streams.
+        return Some((
+            "provider.event",
+            json!({"provider":"codex", "providerMethod":method,
+            "metadata":params, "turnId":turn_id}),
+        ));
     }
     if !is_codex_tool_item(item_type) {
         return None;
@@ -858,6 +924,12 @@ fn is_codex_tool_item(item_type: &str) -> bool {
             | "image_view"
             | "collabAgentToolCall"
             | "collab_agent_tool_call"
+            | "imageGeneration"
+            | "functionCallOutput"
+            | "sleep"
+            | "subAgentActivity"
+            | "enteredReviewMode"
+            | "exitedReviewMode"
     )
 }
 
@@ -877,6 +949,53 @@ fn codex_block(params: &Value, category: &str, phase: &str, fallback_turn_id: &s
     })
 }
 
+fn codex_completed_reasoning(method: &str, params: &Value, turn_id: &str) -> Vec<Value> {
+    if method != "item/completed"
+        || params.pointer("/item/type").and_then(Value::as_str) != Some("reasoning")
+    {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    for (field, index_key, native_method) in [
+        ("summary", "summaryIndex", "item/reasoning/summaryTextDelta"),
+        ("content", "contentIndex", "item/reasoning/textDelta"),
+    ] {
+        for (index, text) in params
+            .get("item")
+            .and_then(|item| item.get(field))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if let Some(text) = text.as_str() {
+                let mut params = params.clone();
+                params[index_key] = json!(index);
+                events.push(json!({"provider":"codex", "thought":text,
+                    "block":codex_reasoning_block(&params,native_method,"completed",turn_id)}));
+            }
+        }
+    }
+    events
+}
+
+fn codex_reasoning_block(params: &Value, method: &str, phase: &str, turn_id: &str) -> Value {
+    let mut block = codex_block(params, "reasoning", phase, turn_id);
+    let (source, index) = if method == "item/reasoning/summaryTextDelta" {
+        ("summary", params.get("summaryIndex"))
+    } else {
+        ("content", params.get("contentIndex"))
+    };
+    block["id"] = json!(format!(
+        "{}:{source}:{}",
+        block["id"].as_str().unwrap_or("current"),
+        index.and_then(Value::as_i64).unwrap_or(0)
+    ));
+    block["contentIndex"] = index.cloned().unwrap_or(json!(0));
+    block["source"] = json!(source);
+    block
+}
+
 fn is_codex_permission_method(method: &str) -> bool {
     matches!(
         method,
@@ -884,6 +1003,7 @@ fn is_codex_permission_method(method: &str) -> bool {
             | "item/fileChange/requestApproval"
             | "item/permissions/requestApproval"
             | "item/tool/requestUserInput"
+            | "mcpServer/elicitation/request"
     )
 }
 
@@ -893,6 +1013,7 @@ fn codex_permission_kind(method: &str) -> &'static str {
         "item/fileChange/requestApproval" => "file_change",
         "item/permissions/requestApproval" => "permissions",
         "item/tool/requestUserInput" => "user_input",
+        "mcpServer/elicitation/request" => "elicitation",
         _ => "unknown",
     }
 }
@@ -900,6 +1021,7 @@ fn codex_permission_kind(method: &str) -> &'static str {
 fn codex_permission_title(method: &str, params: &Value) -> String {
     params
         .get("reason")
+        .or_else(|| params.get("message"))
         .and_then(Value::as_str)
         .unwrap_or(match method {
             "item/commandExecution/requestApproval" => "Allow command execution?",
@@ -912,6 +1034,12 @@ fn codex_permission_title(method: &str, params: &Value) -> String {
 }
 
 fn codex_permission_options(method: &str) -> Value {
+    if method == "mcpServer/elicitation/request" {
+        return json!([
+            {"id":"answer", "kind":"answer", "name":"Submit"},
+            {"id":"reject_once", "kind":"reject_once", "name":"Decline"}
+        ]);
+    }
     if method == "item/tool/requestUserInput" {
         return json!([{ "id": "answer", "kind": "answer", "name": "Answer" }]);
     }
@@ -939,6 +1067,22 @@ fn codex_permission_response(
     params: &Value,
     decision: super::types::PermissionDecision,
 ) -> Value {
+    if method == "mcpServer/elicitation/request" {
+        return match decision.outcome {
+            PermissionOutcome::Answer => {
+                let content = if params.get("mode").and_then(Value::as_str) == Some("url") {
+                    Value::Null
+                } else {
+                    decision.data.unwrap_or(Value::Null)
+                };
+                json!({"action":"accept", "content":content, "_meta":null})
+            }
+            PermissionOutcome::AbortTurn => {
+                json!({"action":"cancel", "content":null, "_meta":null})
+            }
+            _ => json!({"action":"decline", "content":null, "_meta":null}),
+        };
+    }
     if method == "item/tool/requestUserInput" {
         return decision.data.unwrap_or_else(|| json!({ "answers": {} }));
     }
@@ -959,66 +1103,6 @@ fn codex_permission_response(
         PermissionOutcome::RejectOnce | PermissionOutcome::RejectAlways => "decline",
     };
     json!({ "decision": decision })
-}
-
-async fn interrupt_codex_turn(
-    process: &mut JsonLineProcess,
-    request_turn_id: &str,
-    native_session_id: &str,
-    native_turn_id: &str,
-    sink: &DriverEventSink,
-) -> Result<DriverTurnResult, AppError> {
-    let cancel_request_id = format!("cancel_{request_turn_id}");
-    process
-        .send(&json!({
-            "id": cancel_request_id,
-            "method": "turn/interrupt",
-            "params": { "threadId": native_session_id, "turnId": native_turn_id },
-        }))
-        .await?;
-    let (_cancel_tx, mut no_cancel) = watch::channel(false);
-    let terminal = timeout(super::process::cancel_timeout()?, async {
-        let mut acknowledged = false;
-        let mut terminal = None;
-        loop {
-            let Some(message) = process.read().await? else {
-                return Err(provider_exit_error(
-                    process,
-                    "Codex app-server closed during interrupt",
-                )
-                .await);
-            };
-            if jsonrpc_id_matches(&message, &cancel_request_id) {
-                if let Some(error) = message.get("error") {
-                    return Err(AppError::ProviderUnavailable(format!(
-                        "Codex interrupt failed: {}",
-                        safe_error_text(error)
-                    )));
-                }
-                acknowledged = true;
-            } else if let Some(status) = turn_completion_status(&message, Some(native_turn_id))? {
-                if status == "failed" {
-                    return Err(codex_turn_failure(&message));
-                }
-                terminal = Some(status.to_owned());
-            } else {
-                handle_codex_message(process, message, sink, &mut no_cancel, request_turn_id)
-                    .await?;
-            }
-            if acknowledged {
-                if let Some(terminal) = terminal.take() {
-                    return Ok(terminal);
-                }
-            }
-        }
-    })
-    .await
-    .map_err(|_| AppError::ProviderUnavailable("Codex interrupt timed out".to_owned()))??;
-    Ok(DriverTurnResult {
-        native_session_id: Some(native_session_id.to_owned()),
-        cancelled: terminal == "interrupted",
-        stop_reason: terminal,
-    })
 }
 
 fn turn_completion_status<'a>(
@@ -1095,9 +1179,76 @@ mod tests {
     use crate::provider::types::{DriverPromptContent, DriverSkill};
 
     #[test]
+    fn codex_items_keep_phase_metadata_and_unknown_payloads() {
+        let commentary = json!({"item":{"id":"m1","type":"agentMessage","phase":"commentary","text":"working","questions":[{"id":"q"}]}});
+        let (_, event) = codex_item_event("item/completed", &commentary, "turn").unwrap();
+        assert_eq!(event["block"]["category"], "assistant_progress");
+        assert_eq!(event["message"]["questions"][0]["id"], "q");
+        let image = json!({"item":{"id":"img","type":"imageGeneration","status":"completed","result":"/tmp/image.png"}});
+        assert_eq!(
+            codex_item_event("item/completed", &image, "turn")
+                .unwrap()
+                .1["item"],
+            image["item"]
+        );
+        let summary = codex_reasoning_block(
+            &json!({"itemId":"r","summaryIndex":1}),
+            "item/reasoning/summaryTextDelta",
+            "delta",
+            "turn",
+        );
+        let raw = codex_reasoning_block(
+            &json!({"itemId":"r","contentIndex":1}),
+            "item/reasoning/textDelta",
+            "delta",
+            "turn",
+        );
+        assert_ne!(summary["id"], raw["id"]);
+        assert_eq!(summary["contentIndex"], 1);
+    }
+
+    #[test]
+    fn elicitation_maps_form_answers_and_rejection_to_upstream_shape() {
+        assert!(is_codex_permission_method("mcpServer/elicitation/request"));
+        assert_eq!(
+            codex_permission_kind("mcpServer/elicitation/request"),
+            "elicitation"
+        );
+        let response = codex_permission_response(
+            "mcpServer/elicitation/request",
+            &json!({"mode":"form","requestedSchema":{"type":"object"}}),
+            super::super::types::PermissionDecision {
+                outcome: PermissionOutcome::Answer,
+                option_id: Some("answer".into()),
+                data: Some(json!({"name":"Ada"})),
+            },
+        );
+        assert_eq!(
+            response,
+            json!({"action":"accept","content":{"name":"Ada"},"_meta":null})
+        );
+        let rejected = codex_permission_response(
+            "mcpServer/elicitation/request",
+            &Value::Null,
+            super::super::types::PermissionDecision {
+                outcome: PermissionOutcome::RejectOnce,
+                option_id: Some("reject_once".into()),
+                data: None,
+            },
+        );
+        assert_eq!(rejected["action"], "decline");
+        assert!(rejected["content"].is_null());
+    }
+
+    #[test]
     fn agent_message_completion_is_not_emitted_as_a_tool() {
         let params = json!({ "item": { "type": "agentMessage", "text": "done" } });
-        assert!(codex_item_event("item/started", &params, "turn-1").is_none());
+        assert_eq!(
+            codex_item_event("item/started", &params, "turn-1")
+                .unwrap()
+                .0,
+            "message.created"
+        );
         let (event_type, payload) = codex_item_event("item/completed", &params, "turn-1").unwrap();
         assert_eq!(event_type, "message.completed");
         assert_eq!(payload["message"]["text"], "done");
@@ -1297,6 +1448,43 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
+    async fn model_catalog_follows_pages_and_respects_input_modalities() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("todex-codex-models-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let script = root.join("fake-codex");
+        tokio::fs::write(&script, r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":"initialize","result":{}}\n' ;;
+    *'"cursor":null'*) printf '{"id":"models","result":{"data":[{"model":"text-model","displayName":"Text","inputModalities":["text"],"supportedReasoningEfforts":[{"reasoningEffort":"low"}],"defaultReasoningEffort":"low"}],"nextCursor":"next-page"}}\n' ;;
+    *'"cursor":"next-page"'*) printf '{"id":"models","result":{"data":[{"model":"image-model","displayName":"Vision","inputModalities":["text","image"],"supportedReasoningEfforts":[{"reasoningEffort":"high"}],"defaultReasoningEffort":"high"}],"nextCursor":null}}\n' ;;
+  esac
+done
+"#).await.unwrap();
+        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let driver = CodexDriver {
+            binary: script.display().to_string(),
+            sessions: runtime::Sessions::new(),
+            control_probe: tokio::sync::OnceCell::new(),
+        };
+        let catalog = driver.discover_models(&root).await.unwrap();
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0].image_input, Some(false));
+        assert_eq!(catalog[1].image_input, Some(true));
+        assert_eq!(catalog[1].default_reasoning_effort.as_deref(), Some("high"));
+        assert!(matches!(
+            driver.descriptor().capabilities.image_input_mode,
+            ImageInputMode::Model
+        ));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn native_wire_preserves_controls_resume_fork_and_compact() {
         use crate::conversation::{
             ConversationEventHub, ConversationManifest, ConversationStore, ProviderState,
@@ -1350,6 +1538,8 @@ done
         trust.set_owned("local", &root, true).await.unwrap();
         let driver = CodexDriver {
             binary: script.display().to_string(),
+            sessions: runtime::Sessions::new(),
+            control_probe: tokio::sync::OnceCell::new(),
         };
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut provider_state = ProviderState::new(ProviderKind::Codex);
@@ -1421,10 +1611,9 @@ done
             requests("thread/start")[0]["params"]["approvalPolicy"],
             "never"
         );
-        assert_eq!(
-            requests("thread/resume")[0]["params"]["sandbox"],
-            "danger-full-access"
-        );
+        assert!(requests("thread/resume")
+            .iter()
+            .all(|request| request["params"]["threadId"] == "native"));
         assert_eq!(
             requests("turn/start")[0]["params"]["sandboxPolicy"]["type"],
             "readOnly"

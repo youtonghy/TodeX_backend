@@ -2932,22 +2932,29 @@ fn normalize_turn_start_params(params: &mut Value) {
     let Some(object) = params.as_object_mut() else {
         return;
     };
-    let collaboration_mode = object.remove("collaborationMode");
-    let Some(settings) = collaboration_mode
-        .as_ref()
-        .and_then(|value| value.get("settings"))
-        .and_then(Value::as_object)
+    // The outer API is camelCase, but upstream CollaborationMode::Settings
+    // uses snake_case. Preserve the mode and its instructions on the wire.
+    let Some(settings) = object
+        .get_mut("collaborationMode")
+        .and_then(|mode| mode.get_mut("settings"))
+        .and_then(Value::as_object_mut)
     else {
         return;
     };
-    if let Some(model) = settings.get("model").cloned() {
-        object.entry("model".to_string()).or_insert(model);
+    for (client, wire) in [
+        ("reasoningEffort", "reasoning_effort"),
+        ("developerInstructions", "developer_instructions"),
+    ] {
+        if let Some(value) = settings.remove(client) {
+            settings.insert(wire.to_owned(), value);
+        }
     }
-    if let Some(reasoning_effort) = settings.get("reasoningEffort").cloned() {
-        object
-            .entry("effort".to_string())
-            .or_insert(reasoning_effort);
-    }
+    settings
+        .entry("developer_instructions".to_owned())
+        .or_insert(Value::Null);
+    settings
+        .entry("reasoning_effort".to_owned())
+        .or_insert(Value::Null);
 }
 
 fn normalize_turn_input_as_steer(params: &mut Value) {
@@ -2963,7 +2970,9 @@ fn normalize_turn_steer_params(params: &mut Value) {
     let Some(object) = params.as_object_mut() else {
         return;
     };
-    object.remove("turnId");
+    if let Some(turn_id) = object.remove("turnId") {
+        object.entry("expectedTurnId".to_owned()).or_insert(turn_id);
+    }
 }
 
 async fn append_local_lifecycle_event(
@@ -4592,7 +4601,7 @@ mod tests {
             "thread-1",
             json!([{ "type": "text", "text": "Plan this" }]),
             Some(CodexCollaborationMode {
-                mode: CodexModeKind::Default,
+                mode: CodexModeKind::Plan,
                 settings: CodexCollaborationSettings {
                     model: "gpt-5.4".to_string(),
                     reasoning_effort: Some("high".to_string()),
@@ -4617,12 +4626,34 @@ mod tests {
 
         assert_eq!(method, "turn/start");
         assert_eq!(params["threadId"], "thread-1");
-        assert_eq!(params["model"], "gpt-5.4");
-        assert_eq!(params["effort"], "high");
+        assert_eq!(params["collaborationMode"]["settings"]["model"], "gpt-5.4");
+        assert_eq!(
+            params["collaborationMode"]["settings"]["reasoning_effort"],
+            "high"
+        );
         assert_eq!(params["approvalPolicy"], "on-request");
         assert_eq!(params["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(params["serviceTier"], "priority");
-        assert!(params.get("collaborationMode").is_none());
+        assert_eq!(params["collaborationMode"]["mode"], "plan");
+        assert_eq!(
+            params["collaborationMode"]["settings"]["developer_instructions"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn steer_uses_native_turn_as_precondition_when_no_override_is_supplied() {
+        let request = CodexGatewayRequest::turn_steer(
+            "steer",
+            "thread",
+            "active-turn",
+            None,
+            json!([{"type":"text","text":"continue"}]),
+        );
+        let (method, params) = codex_request_to_app_server_method_and_params(request);
+        assert_eq!(method, "turn/steer");
+        assert_eq!(params["expectedTurnId"], "active-turn");
+        assert!(params.get("turnId").is_none());
     }
 
     #[test]

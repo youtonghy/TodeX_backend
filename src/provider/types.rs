@@ -392,6 +392,37 @@ impl DriverEventSink {
 
 #[async_trait]
 pub trait ProviderDriver: Send + Sync {
+    async fn refresh_control_capabilities(&self) {}
+    fn control_probe(&self) -> Option<Value> {
+        None
+    }
+
+    /// Controls must target the currently running TodeX turn. A driver must
+    /// reject a stale target before writing to the native transport.
+    fn supports_live_controls(&self) -> bool {
+        false
+    }
+
+    fn supports_native_queue(&self) -> bool {
+        false
+    }
+
+    async fn control(
+        &self,
+        _conversation_id: &str,
+        _expected_turn_id: &str,
+        _request_id: &str,
+        _control: ProviderControl,
+    ) -> Result<Value, AppError> {
+        Err(AppError::Unsupported(
+            "This provider has no live control channel.".to_owned(),
+        ))
+    }
+
+    async fn shutdown_session(&self, _conversation_id: &str) {}
+
+    async fn shutdown(&self) {}
+
     fn supports_native_compact(&self) -> bool {
         false
     }
@@ -453,6 +484,40 @@ pub trait ProviderDriver: Send + Sync {
         cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError>;
+}
+
+/// Deliberately bounded public controls. Native method names and arbitrary
+/// provider configuration never cross this boundary unchecked.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ProviderControl {
+    Steer {
+        text: String,
+    },
+    Configure {
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default, rename = "reasoningEffort")]
+        reasoning_effort: Option<String>,
+    },
+    QueueAdd {
+        #[serde(rename = "itemId")]
+        item_id: String,
+        text: String,
+    },
+    QueueRemove {
+        #[serde(rename = "itemId")]
+        item_id: String,
+    },
+    QueueList,
+    QueueClear,
+}
+
+pub struct PendingProviderControl {
+    pub expected_turn_id: String,
+    pub request_id: String,
+    pub control: ProviderControl,
+    pub respond_to: oneshot::Sender<Result<Value, AppError>>,
 }
 
 #[derive(Clone, Default)]
@@ -671,6 +736,16 @@ fn validate_permission_decision(
             if !data.is_object() {
                 return Err(invalid());
             }
+            if details.get("mode").and_then(Value::as_str) == Some("url") {
+                if data != &json!({ "completed": true }) {
+                    return Err(invalid());
+                }
+            } else if let Some(schema) = details
+                .get("requestedSchema")
+                .or_else(|| details.get("schema"))
+            {
+                validate_elicitation_value(schema, data, 0)?;
+            }
         } else if !matches!(kind, "question" | "questions") {
             return Err(invalid());
         }
@@ -684,6 +759,101 @@ fn validate_permission_decision(
                 .is_some_and(Value::is_string))
     {
         return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_elicitation_value(schema: &Value, value: &Value, depth: usize) -> Result<(), AppError> {
+    let invalid =
+        || AppError::InvalidRequest("Answer does not match the requested form schema.".to_owned());
+    if depth > 16 {
+        return Err(invalid());
+    }
+    if let Some(options) = schema.get("enum").and_then(Value::as_array) {
+        if !options.contains(value) {
+            return Err(invalid());
+        }
+    }
+    if schema
+        .get("const")
+        .is_some_and(|expected| expected != value)
+    {
+        return Err(invalid());
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("object") => {
+            let object = value.as_object().ok_or_else(invalid)?;
+            let properties = schema.get("properties").and_then(Value::as_object);
+            if schema
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| {
+                    required
+                        .iter()
+                        .any(|key| key.as_str().is_none_or(|key| !object.contains_key(key)))
+                })
+            {
+                return Err(invalid());
+            }
+            for (key, value) in object {
+                if let Some(property) = properties.and_then(|properties| properties.get(key)) {
+                    validate_elicitation_value(property, value, depth + 1)?;
+                } else if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                    return Err(invalid());
+                }
+            }
+        }
+        Some("array") => {
+            let items = value.as_array().ok_or_else(invalid)?;
+            if let Some(item_schema) = schema.get("items") {
+                for item in items {
+                    validate_elicitation_value(item_schema, item, depth + 1)?;
+                }
+            }
+            if schema
+                .get("minItems")
+                .and_then(Value::as_u64)
+                .is_some_and(|min| items.len() < min as usize)
+                || schema
+                    .get("maxItems")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|max| items.len() > max as usize)
+            {
+                return Err(invalid());
+            }
+        }
+        Some("string") => {
+            let text = value.as_str().ok_or_else(invalid)?;
+            if schema
+                .get("minLength")
+                .and_then(Value::as_u64)
+                .is_some_and(|min| text.chars().count() < min as usize)
+                || schema
+                    .get("maxLength")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|max| text.chars().count() > max as usize)
+            {
+                return Err(invalid());
+            }
+        }
+        Some("boolean") if !value.is_boolean() => return Err(invalid()),
+        Some("integer") if !value.is_i64() && !value.is_u64() => return Err(invalid()),
+        Some("number") if !value.is_number() => return Err(invalid()),
+        Some("null") if !value.is_null() => return Err(invalid()),
+        _ => {}
+    }
+    if let Some(number) = value.as_f64() {
+        if schema
+            .get("minimum")
+            .and_then(Value::as_f64)
+            .is_some_and(|min| number < min)
+            || schema
+                .get("maximum")
+                .and_then(Value::as_f64)
+                .is_some_and(|max| number > max)
+        {
+            return Err(invalid());
+        }
     }
     Ok(())
 }
@@ -755,6 +925,55 @@ fn normalize_permission_options(options: Value) -> Result<Value, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elicitation_form_validates_required_values_and_url_confirmation() {
+        let options = json!([{ "kind": "answer", "optionId": "submit" }]);
+        let schema = json!({"requestedSchema": {"type":"object", "required":["count","color"],
+            "additionalProperties":false, "properties": {"count":{"type":"integer","minimum":1},
+            "color":{"type":"string","enum":["red","blue"]}}}});
+        let decision = |data| PermissionDecision {
+            outcome: PermissionOutcome::Answer,
+            option_id: Some("submit".to_owned()),
+            data: Some(data),
+        };
+        assert!(validate_permission_decision(
+            "elicitation",
+            &schema,
+            &options,
+            &decision(json!({"count":2,"color":"red"}))
+        )
+        .is_ok());
+        for data in [
+            json!({"count":0,"color":"red"}),
+            json!({"count":1.5,"color":"red"}),
+            json!({"count":2,"color":"green"}),
+            json!({"count":2}),
+            json!({"count":2,"color":"red","extra":true}),
+        ] {
+            assert!(validate_permission_decision(
+                "elicitation",
+                &schema,
+                &options,
+                &decision(data)
+            )
+            .is_err());
+        }
+        assert!(validate_permission_decision(
+            "elicitation",
+            &json!({"mode":"url"}),
+            &options,
+            &decision(json!({"completed":true}))
+        )
+        .is_ok());
+        assert!(validate_permission_decision(
+            "elicitation",
+            &json!({"mode":"url"}),
+            &options,
+            &decision(json!({}))
+        )
+        .is_err());
+    }
 
     #[test]
     fn provider_capabilities_publish_image_input_in_camel_case() {

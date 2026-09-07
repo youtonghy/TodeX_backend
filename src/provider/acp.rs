@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use agent_client_protocol::schema::{
     v1::{
@@ -14,7 +15,7 @@ use agent_client_protocol::schema::{
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::{AcpProfileConfig, AgentConfig};
 use crate::conversation::ProviderKind;
@@ -26,7 +27,8 @@ use super::process::{
 };
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PermissionOutcome, ProviderCapabilities, ProviderDescriptor, ProviderDriver,
+    PendingProviderControl, PermissionOutcome, ProviderCapabilities, ProviderControl,
+    ProviderDescriptor, ProviderDriver,
 };
 
 pub struct AcpDriver {
@@ -143,11 +145,9 @@ impl ProviderDriver for AcpDriver {
             .await?;
             loop {
                 let Some(message) = process.read().await? else {
-                    break Err(provider_exit_error(
-                        &mut process,
-                        "ACP agent closed during initialize",
-                    )
-                    .await);
+                    break Err(
+                        provider_exit_error(&process, "ACP agent closed during initialize").await,
+                    );
                 };
                 if jsonrpc_id(&message) != Some("initialize") {
                     continue;
@@ -218,6 +218,12 @@ fn initialize_request() -> InitializeRequest {
         )
 }
 
+#[derive(Default)]
+pub(super) struct AcpConnectionState {
+    initialize: Option<Value>,
+    session: Option<(String, Value)>,
+}
+
 pub(super) async fn run_acp_turn(
     process: &mut JsonLineProcess,
     context: DriverContext,
@@ -226,6 +232,30 @@ pub(super) async fn run_acp_turn(
     cancel: &mut watch::Receiver<bool>,
     options: AcpRuntimeOptions,
 ) -> Result<DriverTurnResult, AppError> {
+    run_acp_turn_controlled(
+        process,
+        context,
+        prompt,
+        sink,
+        cancel,
+        options,
+        &mut AcpConnectionState::default(),
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_acp_turn_controlled(
+    process: &mut JsonLineProcess,
+    context: DriverContext,
+    prompt: DriverPrompt,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+    options: AcpRuntimeOptions,
+    connection: &mut AcpConnectionState,
+    mut controls: Option<&mut mpsc::Receiver<PendingProviderControl>>,
+) -> Result<DriverTurnResult, AppError> {
     let provider = context.manifest.provider;
     super::types::resolve_permission_config(
         provider,
@@ -233,10 +263,14 @@ pub(super) async fn run_acp_turn(
         prompt.sandbox_mode.as_deref(),
         prompt.approval_policy.as_deref(),
     )?;
-    let initialize = initialize_request();
-    send_request(process, "initialize", "initialize", initialize).await?;
-    let initialize_value =
-        wait_for_response(process, "initialize", sink, cancel, provider, true).await?;
+    let initialize_value = if let Some(initialize) = &connection.initialize {
+        initialize.clone()
+    } else {
+        send_request(process, "initialize", "initialize", initialize_request()).await?;
+        let initialize =
+            wait_for_response(process, "initialize", sink, cancel, provider, true).await?;
+        initialize
+    };
     let initialize: InitializeResponse =
         serde_json::from_value(initialize_value.clone()).map_err(|error| {
             AppError::InvalidRequest(format!("invalid ACP initialize response: {error}"))
@@ -253,63 +287,76 @@ pub(super) async fn run_acp_turn(
         options.allow_unadvertised_images,
         context.manifest.provider,
     )?;
-    authenticate_if_requested(process, &initialize_value, sink, cancel, provider, &options).await?;
 
-    let (native_session_id, config_options, legacy_models) = match context
-        .provider_state
-        .native_session_id
-        .clone()
+    if connection.initialize.is_none() {
+        authenticate_if_requested(process, &initialize_value, sink, cancel, provider, &options)
+            .await?;
+        connection.initialize = Some(initialize_value.clone());
+    }
+
+    let (native_session_id, config_options, legacy_models) = if let Some((id, response)) =
+        &connection.session
     {
-        Some(session_id) => {
-            if !initialize.agent_capabilities.load_session {
-                return Err(AppError::Unsupported(
+        let options = response
+            .get("configOptions")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
+        (id.clone(), options, response.get("models").cloned())
+    } else {
+        match context.provider_state.native_session_id.clone() {
+            Some(session_id) => {
+                if !initialize.agent_capabilities.load_session {
+                    return Err(AppError::Unsupported(
                     "ACP agent does not support session/load; historical prompts will not be replayed"
                         .to_owned(),
                 ));
+                }
+                let mut request = serde_json::to_value(LoadSessionRequest::new(
+                    session_id.clone(),
+                    context.manifest.workspace.clone(),
+                ))?;
+                apply_session_metadata(&mut request, &options, true);
+                send_request(process, "session", "session/load", request).await?;
+                let response_value = wait_for_response(
+                    process,
+                    "session",
+                    sink,
+                    cancel,
+                    provider,
+                    !options.suppress_load_replay,
+                )
+                .await?;
+                connection.session = Some((session_id.clone(), response_value.clone()));
+                let legacy_models = response_value.get("models").cloned();
+                let response: LoadSessionResponse = serde_json::from_value(response_value)
+                    .map_err(|error| {
+                        AppError::InvalidRequest(format!(
+                            "invalid ACP session/load response: {error}"
+                        ))
+                    })?;
+                (session_id, response.config_options, legacy_models)
             }
-            let mut request = serde_json::to_value(LoadSessionRequest::new(
-                session_id.clone(),
-                context.manifest.workspace.clone(),
-            ))?;
-            if options.suppress_load_replay {
-                request["_meta"] = json!({ "noReplay": true });
-            }
-            send_request(process, "session", "session/load", request).await?;
-            let response_value = wait_for_response(
-                process,
-                "session",
-                sink,
-                cancel,
-                provider,
-                !options.suppress_load_replay,
-            )
-            .await?;
-            let legacy_models = response_value.get("models").cloned();
-            let response: LoadSessionResponse =
-                serde_json::from_value(response_value).map_err(|error| {
-                    AppError::InvalidRequest(format!("invalid ACP session/load response: {error}"))
-                })?;
-            (session_id, response.config_options, legacy_models)
-        }
-        None => {
-            let mut request =
-                serde_json::to_value(NewSessionRequest::new(context.manifest.workspace.clone()))?;
-            if options.request_ask_mode {
-                request["_meta"] = json!({ "yoloMode": false, "autoMode": false });
-            }
-            send_request(process, "session", "session/new", request).await?;
-            let response_value =
-                wait_for_response(process, "session", sink, cancel, provider, true).await?;
-            let legacy_models = response_value.get("models").cloned();
-            let response: NewSessionResponse =
-                serde_json::from_value(response_value).map_err(|error| {
+            None => {
+                let mut request = serde_json::to_value(NewSessionRequest::new(
+                    context.manifest.workspace.clone(),
+                ))?;
+                apply_session_metadata(&mut request, &options, false);
+                send_request(process, "session", "session/new", request).await?;
+                let response_value =
+                    wait_for_response(process, "session", sink, cancel, provider, true).await?;
+                let legacy_models = response_value.get("models").cloned();
+                let response: NewSessionResponse = serde_json::from_value(response_value.clone())
+                    .map_err(|error| {
                     AppError::InvalidRequest(format!("invalid ACP session/new response: {error}"))
                 })?;
-            (
-                response.session_id.0.to_string(),
-                response.config_options,
-                legacy_models,
-            )
+                connection.session = Some((response.session_id.0.to_string(), response_value));
+                (
+                    response.session_id.0.to_string(),
+                    response.config_options,
+                    legacy_models,
+                )
+            }
         }
     };
 
@@ -321,7 +368,7 @@ pub(super) async fn run_acp_turn(
 
     let legacy_models =
         legacy_models.or_else(|| initialize_value.pointer("/_meta/modelState").cloned());
-    apply_requested_config(
+    let applied_options = apply_requested_config(
         process,
         config_options.as_deref(),
         legacy_models.as_ref(),
@@ -335,6 +382,9 @@ pub(super) async fn run_acp_turn(
         },
     )
     .await?;
+    if let (Some((_, response)), Some(options)) = (&mut connection.session, applied_options) {
+        response["configOptions"] = serde_json::to_value(options)?;
+    }
 
     let content = acp_prompt_content(&prompt);
     let mut request = serde_json::to_value(PromptRequest::new(native_session_id.clone(), content))?;
@@ -345,9 +395,47 @@ pub(super) async fn run_acp_turn(
         normalize_acp_image_wire(&mut request);
     }
     send_request(process, &prompt.turn_id, "session/prompt", request).await?;
+    let mut pending: BTreeMap<String, LiveAcpControl> = BTreeMap::new();
+    let mut client_requests: tokio::task::JoinSet<(Vec<Value>, Result<(), AppError>)> =
+        tokio::task::JoinSet::new();
+    let mut terminal_response = None;
     loop {
+        if terminal_response.is_some() && pending.is_empty() {
+            return finish_prompt(terminal_response.take().unwrap(), native_session_id);
+        }
+        let control_deadline = pending.values().map(|entry| entry.deadline).min();
         let message = tokio::select! {
             message = process.read() => message?,
+            response = client_requests.join_next(), if !client_requests.is_empty() => {
+                if let Some(Ok((responses, outcome))) = response {
+                    for response in responses { process.send(&response).await?; }
+                    if let Err(error) = outcome {
+                        if !matches!(error, AppError::TurnCancelled) { return Err(error); }
+                    }
+                }
+                continue;
+            }
+            request = receive_control(&mut controls), if terminal_response.is_none() => {
+                if let Some(request) = request {
+                    if request.expected_turn_id != prompt.turn_id {
+                        let _ = request.respond_to.send(Err(AppError::InvalidRequest("control targets a stale turn".to_owned())));
+                    } else {
+                        start_live_control(process, request, &native_session_id, &mut pending).await?;
+                    }
+                } else { controls = None; }
+                continue;
+            }
+            _ = async { if let Some(deadline) = control_deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending::<()>().await } } => {
+                let now = tokio::time::Instant::now();
+                let expired: Vec<_> = pending.iter().filter(|(_,value)| value.deadline <= now).map(|(id,_)| id.clone()).collect();
+                for id in expired {
+                    if let Some(request) = pending.remove(&id) {
+                        let _ = request.request.respond_to.send(Err(AppError::ProviderUnavailable("Grok control timed out; effective configuration is unknown".to_owned())));
+                    }
+                }
+                // A timed-out mutation must never remain in a reusable process.
+                return Err(AppError::ProviderUnavailable("Grok control acknowledgement timed out".to_owned()));
+            }
             changed = cancel.changed() => {
                 let _ = changed;
                 send_notification(
@@ -355,11 +443,7 @@ pub(super) async fn run_acp_turn(
                     "session/cancel",
                     CancelNotification::new(native_session_id.clone()),
                 ).await?;
-                return Ok(DriverTurnResult {
-                    native_session_id: Some(native_session_id),
-                    stop_reason: "cancelled".to_owned(),
-                    cancelled: true,
-                });
+                return drain_cancelled_turn(process, &native_session_id, &prompt.turn_id, sink, provider, &mut client_requests, terminal_response.is_some()).await;
             }
         };
         let Some(message) = message else {
@@ -368,26 +452,32 @@ pub(super) async fn run_acp_turn(
         if message.is_null() {
             continue;
         }
-        if jsonrpc_id(&message) == Some(prompt.turn_id.as_str()) {
-            if let Some(error) = message.get("error") {
-                return Err(AppError::ProviderUnavailable(format!(
-                    "ACP prompt failed: {}",
-                    safe_error_text(error)
-                )));
+        if let Some(id) = jsonrpc_id(&message) {
+            if let Some(request) = pending.remove(id) {
+                complete_live_control(process, message, request, sink, &mut pending, connection)
+                    .await?;
+                continue;
             }
-            let response: PromptResponse =
-                serde_json::from_value(message.get("result").cloned().unwrap_or(Value::Null))
-                    .map_err(|error| {
-                        AppError::InvalidRequest(format!("invalid ACP prompt response: {error}"))
-                    })?;
-            return Ok(DriverTurnResult {
-                native_session_id: Some(native_session_id),
-                stop_reason: serde_json::to_value(response.stop_reason)?
-                    .as_str()
-                    .unwrap_or("completed")
-                    .to_owned(),
-                cancelled: false,
+        }
+        if jsonrpc_id(&message) == Some(prompt.turn_id.as_str()) {
+            emit_prompt_metadata(&message, sink, provider).await?;
+            terminal_response = Some(message);
+            continue;
+        }
+        observe_config_options(connection, &message);
+        if is_client_request(&message) {
+            if client_requests.len() >= 32 {
+                process.send(&json!({"jsonrpc":"2.0","id":message.get("id"),"error":{"code":-32000,"message":"too many pending client requests"}})).await?;
+                continue;
+            }
+            let sink = sink.clone();
+            let mut cancel = cancel.clone();
+            client_requests.spawn(async move {
+                let mut writer = BufferedAcpWriter::default();
+                let result = handle_client_request(&mut writer, &message, &sink, &mut cancel).await;
+                (writer.responses, result)
             });
+            continue;
         }
         if let Err(error) = handle_acp_message(process, message, sink, cancel, provider, true).await
         {
@@ -398,15 +488,383 @@ pub(super) async fn run_acp_turn(
                     CancelNotification::new(native_session_id.clone()),
                 )
                 .await?;
-                return Ok(DriverTurnResult {
-                    native_session_id: Some(native_session_id),
-                    stop_reason: "cancelled".to_owned(),
-                    cancelled: true,
-                });
+                return drain_cancelled_turn(
+                    process,
+                    &native_session_id,
+                    &prompt.turn_id,
+                    sink,
+                    provider,
+                    &mut client_requests,
+                    terminal_response.is_some(),
+                )
+                .await;
             }
             return Err(error);
         }
     }
+}
+
+fn finish_prompt(message: Value, session_id: String) -> Result<DriverTurnResult, AppError> {
+    if let Some(error) = message.get("error") {
+        return Err(AppError::ProviderUnavailable(format!(
+            "ACP prompt failed: {}",
+            safe_error_text(error)
+        )));
+    }
+    let response: PromptResponse = serde_json::from_value(
+        message.get("result").cloned().unwrap_or(Value::Null),
+    )
+    .map_err(|error| AppError::InvalidRequest(format!("invalid ACP prompt response: {error}")))?;
+    Ok(DriverTurnResult {
+        native_session_id: Some(session_id),
+        stop_reason: serde_json::to_value(response.stop_reason)?
+            .as_str()
+            .unwrap_or("completed")
+            .to_owned(),
+        cancelled: response.stop_reason == agent_client_protocol::schema::v1::StopReason::Cancelled,
+    })
+}
+
+struct LiveAcpControl {
+    request: PendingProviderControl,
+    remaining: Vec<(String, Value)>,
+    deadline: tokio::time::Instant,
+}
+
+async fn receive_control(
+    controls: &mut Option<&mut mpsc::Receiver<PendingProviderControl>>,
+) -> Option<PendingProviderControl> {
+    match controls {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn start_live_control(
+    process: &mut JsonLineProcess,
+    request: PendingProviderControl,
+    session_id: &str,
+    pending: &mut BTreeMap<String, LiveAcpControl>,
+) -> Result<(), AppError> {
+    if request.respond_to.is_closed() {
+        return Ok(());
+    }
+    if pending.len() >= 16 {
+        let _ = request.respond_to.send(Err(AppError::Conflict(
+            "too many pending Grok controls".to_owned(),
+        )));
+        return Ok(());
+    }
+    if matches!(request.control, ProviderControl::Configure { .. })
+        && pending
+            .values()
+            .any(|control| matches!(control.request.control, ProviderControl::Configure { .. }))
+    {
+        let _ = request.respond_to.send(Err(AppError::Conflict(
+            "a Grok configuration change is already pending".to_owned(),
+        )));
+        return Ok(());
+    }
+    let mut commands = match &request.control {
+        ProviderControl::Steer { text } => vec![(
+            "_x.ai/interject".to_owned(),
+            json!({"sessionId":session_id,"text":text,"interjectionId":request.request_id}),
+        )],
+        ProviderControl::Configure {
+            model,
+            reasoning_effort,
+        } => [("model", model), ("reasoning_effort", reasoning_effort)]
+            .into_iter()
+            .filter_map(|(id, value)| {
+                value.as_ref().map(|value| {
+                    (
+                        "session/set_config_option".to_owned(),
+                        json!({"sessionId":session_id,"configId":id,"value":{"value":value}}),
+                    )
+                })
+            })
+            .collect(),
+        _ => {
+            let _ = request.respond_to.send(Err(AppError::Unsupported(
+                "Grok does not expose native prompt queue controls".to_owned(),
+            )));
+            return Ok(());
+        }
+    };
+    if commands.is_empty() {
+        let _ = request.respond_to.send(Err(AppError::InvalidRequest(
+            "configuration change is empty".to_owned(),
+        )));
+        return Ok(());
+    }
+    let id = format!("live:{}", request.request_id);
+    if pending.contains_key(&id) {
+        let _ = request.respond_to.send(Err(AppError::InvalidRequest(
+            "duplicate live control request".to_owned(),
+        )));
+        return Ok(());
+    }
+    let (method, params) = commands.remove(0);
+    send_request(process, &id, &method, params).await?;
+    pending.insert(
+        id,
+        LiveAcpControl {
+            request,
+            remaining: commands,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(8),
+        },
+    );
+    Ok(())
+}
+
+async fn complete_live_control(
+    process: &mut JsonLineProcess,
+    message: Value,
+    mut control: LiveAcpControl,
+    sink: &DriverEventSink,
+    pending: &mut BTreeMap<String, LiveAcpControl>,
+    connection: &mut AcpConnectionState,
+) -> Result<(), AppError> {
+    if let Some(error) = message.get("error") {
+        let _ = control
+            .request
+            .respond_to
+            .send(Err(AppError::InvalidRequest(format!(
+                "Grok control rejected: {}",
+                safe_error_text(error)
+            ))));
+        return Ok(());
+    }
+    let Some(result) = message.get("result") else {
+        let _ = control
+            .request
+            .respond_to
+            .send(Err(AppError::ProviderUnavailable(
+                "Grok control response has no result; outcome is unknown".to_owned(),
+            )));
+        return Err(AppError::ProviderUnavailable(
+            "Grok control response has no result".to_owned(),
+        ));
+    };
+    if let Some(config) = result.get("configOptions") {
+        if let Some((_, response)) = &mut connection.session {
+            response["configOptions"] = config.clone();
+        }
+    }
+    if let Some(effective) = result.get("configOptions").and_then(config_effective) {
+        sink.emit("turn.configuration", json!({"provider":"grok-build","source":"provider-confirmed","effectiveConfig":effective,"effectiveFrom":"next-safe-point"})).await?;
+    }
+    if !control.remaining.is_empty() {
+        let (method, params) = control.remaining.remove(0);
+        let id = format!("live:{}", control.request.request_id);
+        send_request(process, &id, &method, params).await?;
+        control.deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        pending.insert(id, control);
+        return Ok(());
+    }
+    let effective = result.get("configOptions").and_then(config_effective);
+    let missing_effective = match &control.request.control {
+        ProviderControl::Configure {
+            model,
+            reasoning_effort,
+        } => {
+            let has_value = |key: &str| {
+                effective
+                    .as_ref()
+                    .and_then(|config| config.get(key))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            };
+            (model.is_some() && !has_value("model"))
+                || (reasoning_effort.is_some() && !has_value("reasoningEffort"))
+        }
+        _ => false,
+    };
+    let unknown_steer = matches!(control.request.control, ProviderControl::Steer { .. })
+        && result.get("status").and_then(Value::as_str) != Some("queued");
+    if missing_effective || unknown_steer {
+        let message = "Grok control acknowledgement does not confirm its effective result";
+        let _ = control
+            .request
+            .respond_to
+            .send(Err(AppError::ProviderUnavailable(message.to_owned())));
+        return Err(AppError::ProviderUnavailable(message.to_owned()));
+    }
+    let _ = control.request.respond_to.send(Ok(json!({"source":"provider-confirmed","effectiveConfig":effective,"effectiveFrom":"next-safe-point","result":result})));
+    Ok(())
+}
+
+pub(super) fn observe_config_options(connection: &mut AcpConnectionState, message: &Value) {
+    if message.get("method").and_then(Value::as_str) != Some("session/update")
+        || message
+            .pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            != Some("config_option_update")
+    {
+        return;
+    }
+    if let Some((id, response)) = &mut connection.session {
+        if message.pointer("/params/sessionId").and_then(Value::as_str) == Some(id.as_str()) {
+            if let Some(options) = message
+                .pointer("/params/update/configOptions")
+                .filter(|value| value.is_array())
+            {
+                response["configOptions"] = options.clone();
+            }
+        }
+    }
+}
+
+fn config_effective(options: &Value) -> Option<Value> {
+    let mut config = serde_json::Map::new();
+    for option in options.as_array()? {
+        let key = match option.get("id").and_then(Value::as_str) {
+            Some("model") => "model",
+            Some("reasoning_effort") => "reasoningEffort",
+            _ => continue,
+        };
+        if let Some(value) = option
+            .get("currentValue")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            config.insert(key.to_owned(), json!(value));
+        }
+    }
+    if config.is_empty() {
+        return None;
+    }
+    config.insert("source".to_owned(), json!("provider-confirmed"));
+    Some(Value::Object(config))
+}
+
+fn apply_session_metadata(request: &mut Value, options: &AcpRuntimeOptions, loading: bool) {
+    if options.request_ask_mode {
+        request["_meta"]["yoloMode"] = json!(false);
+        request["_meta"]["autoMode"] = json!(false);
+    }
+    if loading && options.suppress_load_replay {
+        request["_meta"]["noReplay"] = json!(true);
+    }
+}
+
+fn is_grok_update_method(method: &str) -> bool {
+    matches!(
+        extension_method(method),
+        "session/update" | "x.ai/session_notification" | "x.ai/session/update"
+    )
+}
+
+fn prompt_metadata(message: &Value) -> Option<Value> {
+    message
+        .pointer("/result/_meta")
+        .filter(|value| value.is_object())
+        .cloned()
+        .or_else(|| {
+            message
+                .pointer("/error/data")
+                .filter(|value| value.is_object())
+                .cloned()
+        })
+}
+
+async fn emit_prompt_metadata(
+    message: &Value,
+    sink: &DriverEventSink,
+    provider: ProviderKind,
+) -> Result<(), AppError> {
+    let Some(metadata) = prompt_metadata(message) else {
+        return Ok(());
+    };
+    sink.emit("provider.event", json!({
+        "provider": provider.as_str(), "providerMethod": "session/prompt/result", "metadata": metadata,
+    })).await?;
+    if provider == ProviderKind::GrokBuild {
+        if let Some(usage) = metadata
+            .get("usage")
+            .or_else(|| metadata.get("promptUsage"))
+            .filter(|value| value.is_object())
+        {
+            sink.emit(
+                "usage.updated",
+                json!({
+                    "provider": provider.as_str(), "source": "provider", "scope": "turn",
+                    "aggregation": "snapshot", "final": true,
+                    "nativeTurnId": metadata.get("promptId").or_else(|| metadata.get("prompt_id")),
+                    "model": metadata.get("modelId").or_else(|| metadata.get("model_id")),
+                    "usage": normalize_grok_usage(usage, false), "metadata": metadata,
+                }),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Give cancellation a bounded protocol drain before the caller terminates the process.
+/// Reverse requests during this window are rejected without waiting for another user action.
+async fn drain_cancelled_turn(
+    process: &mut JsonLineProcess,
+    session_id: &str,
+    turn_id: &str,
+    sink: &DriverEventSink,
+    provider: ProviderKind,
+    client_requests: &mut tokio::task::JoinSet<(Vec<Value>, Result<(), AppError>)>,
+    terminal_seen: bool,
+) -> Result<DriverTurnResult, AppError> {
+    let drain = async {
+        if terminal_seen {
+            return Ok(true);
+        }
+        let (_cancel_tx, mut cancelled) = watch::channel(true);
+        loop {
+            let message = tokio::select! {
+                message = process.read() => message?,
+                response = client_requests.join_next(), if !client_requests.is_empty() => {
+                    if let Some(Ok((responses, _))) = response { for response in responses { process.send(&response).await?; } }
+                    continue;
+                }
+            };
+            let Some(message) = message else {
+                return Ok::<bool, AppError>(false);
+            };
+            if jsonrpc_id(&message) == Some(turn_id) {
+                emit_prompt_metadata(&message, sink, provider).await?;
+                return Ok(true);
+            }
+            if let Some(id) = message
+                .get("id")
+                .filter(|_| message.get("method").is_some())
+            {
+                if message.get("method").and_then(Value::as_str)
+                    == Some("session/request_permission")
+                {
+                    send_result(
+                        process,
+                        id,
+                        serde_json::to_value(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ))?,
+                    )
+                    .await?;
+                } else {
+                    process.send(&json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32800,"message":"turn cancelled"}})).await?;
+                }
+            } else {
+                handle_acp_message(process, message, sink, &mut cancelled, provider, true).await?;
+            }
+        }
+    };
+    let graceful = matches!(
+        tokio::time::timeout(Duration::from_secs(3), drain).await,
+        Ok(Ok(true))
+    );
+    sink.emit("provider.event", json!({"provider":provider.as_str(), "providerMethod":"session/cancel/result", "metadata":{"graceful":graceful}})).await?;
+    Ok(DriverTurnResult {
+        native_session_id: Some(session_id.to_owned()),
+        stop_reason: "cancelled".to_owned(),
+        cancelled: true,
+    })
 }
 
 fn ensure_acp_images_supported(
@@ -518,7 +976,47 @@ async fn wait_for_response(
     }
 }
 
-async fn handle_acp_message(
+#[async_trait]
+trait AcpWriter: Send {
+    async fn write_response(&mut self, value: Value) -> Result<(), AppError>;
+}
+
+#[async_trait]
+impl AcpWriter for JsonLineProcess {
+    async fn write_response(&mut self, value: Value) -> Result<(), AppError> {
+        self.send(&value).await
+    }
+}
+
+#[derive(Default)]
+struct BufferedAcpWriter {
+    responses: Vec<Value>,
+}
+#[async_trait]
+impl AcpWriter for BufferedAcpWriter {
+    async fn write_response(&mut self, value: Value) -> Result<(), AppError> {
+        self.responses.push(value);
+        Ok(())
+    }
+}
+
+fn is_client_request(message: &Value) -> bool {
+    message.get("id").is_some()
+        && message
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|method| {
+                matches!(
+                    extension_method(method),
+                    "session/request_permission"
+                        | "x.ai/ask_user_question"
+                        | "x.ai/exit_plan_mode"
+                        | "x.ai/mcp/elicit"
+                )
+            })
+}
+
+pub(super) async fn handle_acp_message(
     process: &mut JsonLineProcess,
     message: Value,
     sink: &DriverEventSink,
@@ -530,66 +1028,44 @@ async fn handle_acp_message(
         return Ok(());
     };
     let params = message.get("params").cloned().unwrap_or(Value::Null);
-    if extension_method(method) == "x.ai/ask_user_question" {
-        return handle_ask_user_question(process, &message, params, sink, cancel).await;
+    if is_client_request(&message) {
+        return handle_client_request(process, &message, sink, cancel).await;
     }
-    if extension_method(method) == "x.ai/exit_plan_mode" {
-        return handle_exit_plan_mode(process, &message, params, sink, cancel).await;
-    }
-    if extension_method(method) == "x.ai/mcp/elicit" {
-        return handle_mcp_elicit(process, &message, params, sink, cancel).await;
-    }
-    if method == "session/request_permission" {
-        let request_id = message.get("id").cloned().ok_or_else(|| {
-            AppError::InvalidRequest("ACP permission request is missing an id".to_owned())
-        })?;
-        let request: RequestPermissionRequest =
-            serde_json::from_value(params.clone()).map_err(|error| {
-                AppError::InvalidRequest(format!("invalid ACP permission request: {error}"))
-            })?;
-        let options = serde_json::to_value(&request.options)?;
-        let decision = match sink
-            .request_permission(
-                request_id_text(&request_id),
-                "tool",
-                "Allow ACP tool call?",
-                serde_json::to_value(&request.tool_call)?,
-                options,
-                cancel,
+    if provider == ProviderKind::GrokBuild && is_grok_update_method(method) {
+        if !emit_stream_updates {
+            return Ok(());
+        }
+        if let Some((event, payload)) = grok_activity_event(&params) {
+            sink.emit(event, payload).await?;
+            return Ok(());
+        }
+        if method != "session/update" {
+            sink.emit(
+                "provider.event",
+                json!({
+                    "provider": provider.as_str(), "providerMethod": method, "metadata": params,
+                }),
             )
-            .await
-        {
-            Ok(decision) => decision,
-            Err(error @ AppError::TurnCancelled) => {
-                let response = RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
-                process
-                    .send(&json!({ "jsonrpc": "2.0", "id": request_id, "result": response }))
-                    .await?;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
-        let selected = select_acp_option(&request, &decision)?;
-        let response = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
-            SelectedPermissionOutcome::new(selected),
-        ));
-        process
-            .send(&json!({ "jsonrpc": "2.0", "id": request_id, "result": response }))
             .await?;
-        return Ok(());
+            return Ok(());
+        }
     }
     if method == "session/update" {
-        if emit_stream_updates && provider == ProviderKind::GrokBuild {
-            if let Some((event, payload)) = grok_activity_event(&params) {
-                sink.emit(event, payload).await?;
+        let notification = serde_json::from_value::<SessionNotification>(params.clone());
+        if let Err(error) = notification {
+            if provider == ProviderKind::GrokBuild {
+                sink.emit(
+                    "provider.event",
+                    json!({"provider":provider.as_str(),"providerMethod":method,"metadata":params}),
+                )
+                .await?;
                 return Ok(());
             }
+            return Err(AppError::InvalidRequest(format!(
+                "invalid ACP session update: {error}"
+            )));
         }
-        let notification: SessionNotification =
-            serde_json::from_value(params).map_err(|error| {
-                AppError::InvalidRequest(format!("invalid ACP session update: {error}"))
-            })?;
-        let update = serde_json::to_value(notification.update)?;
+        let update = params.get("update").cloned().unwrap_or(Value::Null);
         let update_type = update
             .get("sessionUpdate")
             .and_then(Value::as_str)
@@ -629,6 +1105,14 @@ async fn handle_acp_message(
                 "plan.updated",
                 json!({ "provider": provider_id, "plan": update }),
             ),
+            "config_option_update" => (
+                "turn.configuration",
+                json!({"provider":provider_id,"source":"provider-confirmed","effectiveConfig":update.get("configOptions").and_then(config_effective),"metadata":update}),
+            ),
+            "available_commands_update" if provider == ProviderKind::GrokBuild => (
+                "provider.commands.updated",
+                json!({ "provider": provider_id, "commands": super::grok::parse_commands(&json!({"_meta":{"availableCommands":update.get("availableCommands")}})), "metadata":update }),
+            ),
             "user_message_chunk" => return Ok(()),
             _ => (
                 "provider.event",
@@ -655,6 +1139,138 @@ async fn handle_acp_message(
         .await?;
     }
     Ok(())
+}
+
+async fn handle_client_request(
+    process: &mut (impl AcpWriter + ?Sized),
+    message: &Value,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    if *cancel.borrow() {
+        let id = required_request_id(message, "ACP client request")?;
+        let response = match extension_method(method) {
+            "session/request_permission" => serde_json::to_value(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Cancelled,
+            ))?,
+            "x.ai/mcp/elicit" => json!({"action":"cancel"}),
+            _ => json!({"outcome":"cancelled"}),
+        };
+        send_result(process, id, response).await?;
+        return Err(AppError::TurnCancelled);
+    }
+    if extension_method(method) == "x.ai/ask_user_question" {
+        return handle_ask_user_question(process, message, params, sink, cancel).await;
+    }
+    if extension_method(method) == "x.ai/exit_plan_mode" {
+        return handle_exit_plan_mode(process, message, params, sink, cancel).await;
+    }
+    if extension_method(method) == "x.ai/mcp/elicit" {
+        return handle_mcp_elicit(process, message, params, sink, cancel).await;
+    }
+    if method == "session/request_permission" {
+        let request_id = message.get("id").cloned().ok_or_else(|| {
+            AppError::InvalidRequest("ACP permission request is missing an id".to_owned())
+        })?;
+        let request: RequestPermissionRequest =
+            serde_json::from_value(params.clone()).map_err(|error| {
+                AppError::InvalidRequest(format!("invalid ACP permission request: {error}"))
+            })?;
+        let options = serde_json::to_value(&request.options)?;
+        let decision = match sink
+            .request_permission(
+                request_id_text(&request_id),
+                "tool",
+                "Allow ACP tool call?",
+                serde_json::to_value(&request.tool_call)?,
+                options,
+                cancel,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error @ AppError::TurnCancelled) => {
+                let response = RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
+                process
+                    .write_response(
+                        json!({ "jsonrpc": "2.0", "id": request_id, "result": response }),
+                    )
+                    .await?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let selected = select_acp_option(&request, &decision)?;
+        let response = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+            SelectedPermissionOutcome::new(selected),
+        ));
+        process
+            .write_response(json!({ "jsonrpc": "2.0", "id": request_id, "result": response }))
+            .await?;
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// Grok's prompt ledger includes cached input, while individual response usage excludes it.
+/// Normalize both to included-cache counts; missing counts remain missing rather than zero.
+fn normalize_grok_usage(raw: &Value, response: bool) -> Value {
+    let mut last = serde_json::Map::new();
+    let names = if response {
+        [
+            ("input", "input_tokens"),
+            ("output", "output_tokens"),
+            ("cacheRead", "cache_read_input_tokens"),
+            ("cacheWrite", "cache_creation_input_tokens"),
+            ("total", "total_tokens"),
+        ]
+    } else {
+        [
+            ("input", "inputTokens"),
+            ("output", "outputTokens"),
+            ("cacheRead", "cachedReadTokens"),
+            ("cacheWrite", "cacheCreationTokens"),
+            ("total", "totalTokens"),
+        ]
+    };
+    for (target, source) in names {
+        if let Some(count) = raw.get(source).and_then(Value::as_u64) {
+            last.insert(target.to_owned(), json!(count));
+        }
+    }
+    if response {
+        let included_input = last
+            .get("input")
+            .and_then(Value::as_u64)
+            .zip(last.get("cacheRead").and_then(Value::as_u64))
+            .and_then(|(input, cache)| input.checked_add(cache))
+            .zip(last.get("cacheWrite").and_then(Value::as_u64))
+            .and_then(|(input, cache)| input.checked_add(cache));
+        match included_input {
+            Some(input) => {
+                last.insert("input".to_owned(), json!(input));
+            }
+            None => {
+                last.remove("input");
+            }
+        }
+    }
+    if !last.contains_key("total") {
+        if let Some(total) = last
+            .get("input")
+            .and_then(Value::as_u64)
+            .zip(last.get("output").and_then(Value::as_u64))
+            .and_then(|(input, output)| input.checked_add(output))
+        {
+            last.insert("total".to_owned(), json!(total));
+        }
+    }
+    json!({"last":last, "cacheSemantics":"included", "raw":raw})
 }
 
 fn grok_activity_event(params: &Value) -> Option<(&'static str, Value)> {
@@ -689,13 +1305,13 @@ fn grok_activity_event(params: &Value) -> Option<(&'static str, Value)> {
             "subagentId": update.get("subagent_id"), "parentId": update.get("parent_session_id"),
             "title": update.get("subagent_type"), "task": update.get("description"),
             "result": update.get("output"), "status": update.get("status"), "error": update.get("error"),
-            "messageId": update.get("message_id"), "usage": update.get("usage"), "metadata": update,
+            "messageId": update.get("message_id"), "usage": update.get("usage").map(|usage| normalize_grok_usage(usage, true)), "metadata": update,
         }),
     ))
 }
 
 async fn handle_ask_user_question(
-    process: &mut JsonLineProcess,
+    process: &mut (impl AcpWriter + ?Sized),
     message: &Value,
     params: Value,
     sink: &DriverEventSink,
@@ -764,7 +1380,7 @@ async fn handle_ask_user_question(
 }
 
 async fn handle_exit_plan_mode(
-    process: &mut JsonLineProcess,
+    process: &mut (impl AcpWriter + ?Sized),
     message: &Value,
     params: Value,
     sink: &DriverEventSink,
@@ -818,7 +1434,7 @@ async fn handle_exit_plan_mode(
 }
 
 async fn handle_mcp_elicit(
-    process: &mut JsonLineProcess,
+    process: &mut (impl AcpWriter + ?Sized),
     message: &Value,
     params: Value,
     sink: &DriverEventSink,
@@ -887,22 +1503,22 @@ fn request_id_text(id: &Value) -> String {
 }
 
 async fn send_result(
-    process: &mut JsonLineProcess,
+    process: &mut (impl AcpWriter + ?Sized),
     id: &Value,
     result: Value,
 ) -> Result<(), AppError> {
     process
-        .send(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+        .write_response(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
         .await
 }
 
 async fn send_invalid_params(
-    process: &mut JsonLineProcess,
+    process: &mut (impl AcpWriter + ?Sized),
     id: &Value,
     message: &str,
 ) -> Result<(), AppError> {
     process
-        .send(&json!({
+        .write_response(json!({
             "jsonrpc": "2.0",
             "id": id,
             "error": { "code": -32602, "message": message }
@@ -985,43 +1601,10 @@ async fn authenticate_if_requested(
     if !options.authenticate {
         return Ok(());
     }
-    let advertised = initialize
-        .get("authMethods")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|method| method.get("id").and_then(Value::as_str))
-        .collect::<Vec<_>>();
-    if advertised.is_empty() {
+    let Some(selected) = select_headless_auth_method(initialize, options.auth_method.as_deref())?
+    else {
         return Ok(());
-    }
-    let selected = options
-        .auth_method
-        .as_deref()
-        .or_else(|| {
-            initialize
-                .pointer("/_meta/defaultAuthMethodId")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| advertised.contains(&"cached_token").then_some("cached_token"))
-        .or_else(|| (advertised.len() == 1).then_some(advertised[0]))
-        .ok_or_else(|| {
-            AppError::ProviderUnavailable(format!(
-                "{} advertised multiple authentication methods but no default; configure agent.grok_auth_method",
-                provider.as_str()
-            ))
-        })?;
-    if !advertised.contains(&selected) {
-        return Err(AppError::ProviderUnavailable(format!(
-            "authentication method '{selected}' is not advertised by {}",
-            provider.as_str()
-        )));
-    }
-    if provider == ProviderKind::GrokBuild && !is_grok_headless_auth_method(selected) {
-        return Err(AppError::ProviderUnavailable(format!(
-            "authentication method '{selected}' requires interaction; run `grok login` first or configure XAI_API_KEY"
-        )));
-    }
+    };
     send_request(
         process,
         "authenticate",
@@ -1031,6 +1614,44 @@ async fn authenticate_if_requested(
     .await?;
     wait_for_response(process, "authenticate", sink, cancel, provider, true).await?;
     Ok(())
+}
+
+pub(super) fn select_headless_auth_method(
+    initialize: &Value,
+    configured: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    let advertised = initialize
+        .get("authMethods")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|method| method.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    if advertised.is_empty() {
+        return Ok(None);
+    }
+    let selected = configured
+        .or_else(|| {
+            initialize
+                .pointer("/_meta/defaultAuthMethodId")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| advertised.contains(&"cached_token").then_some("cached_token"))
+        .or_else(|| (advertised.len() == 1).then_some(advertised[0]))
+        .ok_or_else(|| {
+            AppError::ProviderUnavailable("grok-build advertised multiple authentication methods but no default; configure agent.grok_auth_method".to_owned())
+        })?;
+    if !advertised.contains(&selected) {
+        return Err(AppError::ProviderUnavailable(format!(
+            "authentication method '{selected}' is not advertised by grok-build"
+        )));
+    }
+    if !is_grok_headless_auth_method(selected) {
+        return Err(AppError::ProviderUnavailable(format!(
+            "authentication method '{selected}' requires interaction; run `grok login` first or configure XAI_API_KEY"
+        )));
+    }
+    Ok(Some(selected.to_owned()))
 }
 
 fn is_grok_headless_auth_method(method: &str) -> bool {
@@ -1052,10 +1673,10 @@ async fn apply_requested_config(
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
     context: SessionConfigContext<'_>,
-) -> Result<(), AppError> {
+) -> Result<Option<Vec<SessionConfigOption>>, AppError> {
     if options.is_none() && context.runtime.legacy_model_state {
-        return apply_legacy_model_config(process, legacy_models, prompt, sink, cancel, context)
-            .await;
+        apply_legacy_model_config(process, legacy_models, prompt, sink, cancel, context).await?;
+        return Ok(None);
     }
     let mut current_options = options.map(<[SessionConfigOption]>::to_vec);
     for (config_id, requested) in [
@@ -1102,7 +1723,12 @@ async fn apply_requested_config(
             })?;
         current_options = Some(response.config_options);
     }
-    Ok(())
+    if let Some(options) = &current_options {
+        if let Some(effective) = config_effective(&serde_json::to_value(options)?) {
+            sink.emit("turn.configuration", json!({"provider":context.provider.as_str(), "source":"provider-confirmed", "effectiveConfig":effective, "effectiveFrom":"current-turn"})).await?;
+        }
+    }
+    Ok(current_options)
 }
 
 fn config_option_wire_value(requested: &str, nested: bool) -> Value {
@@ -1439,5 +2065,35 @@ mod tests {
             &json!({"update":{"sessionUpdate":"subagent_finished", "status":"unknown"}})
         )
         .is_none());
+    }
+    #[test]
+    fn grok_usage_unifies_response_and_prompt_cache_semantics_without_inventing_missing_counts() {
+        let response = normalize_grok_usage(
+            &json!({"input_tokens":20,"output_tokens":10,"cache_read_input_tokens":50,"cache_creation_input_tokens":30}),
+            true,
+        );
+        let prompt = normalize_grok_usage(
+            &json!({"inputTokens":100,"outputTokens":10,"cachedReadTokens":50,"cacheCreationTokens":30,"totalTokens":110}),
+            false,
+        );
+        assert_eq!(response["last"], prompt["last"]);
+        assert_eq!(response["last"]["total"], 110);
+        assert_eq!(prompt["cacheSemantics"], "included");
+        let absent = normalize_grok_usage(&json!({"usageIsIncomplete":true}), false);
+        assert_eq!(absent["last"], json!({}));
+        assert_eq!(absent["raw"]["usageIsIncomplete"], true);
+        let missing_cache =
+            normalize_grok_usage(&json!({"input_tokens":20,"output_tokens":10}), true);
+        assert!(missing_cache["last"].get("input").is_none());
+        assert!(missing_cache["last"].get("total").is_none());
+    }
+
+    #[test]
+    fn grok_error_metadata_keeps_partial_prompt_usage() {
+        let message = json!({"error":{"message":"failed","data":{"promptUsage":{"inputTokens":8,"usageIsIncomplete":true}}}});
+        assert_eq!(
+            prompt_metadata(&message).unwrap()["promptUsage"]["inputTokens"],
+            8
+        );
     }
 }

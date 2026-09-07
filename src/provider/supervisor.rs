@@ -34,8 +34,33 @@ use super::pi::PiDriver;
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill, ImageInputMode,
     PermissionBroker, PermissionDecision, PermissionOutcome, ProviderCommandDescriptor,
-    ProviderDescriptor, ProviderDriver, ProviderImageInputCapability, ProviderModelDescriptor,
+    ProviderControl, ProviderDescriptor, ProviderDriver, ProviderImageInputCapability,
+    ProviderModelDescriptor,
 };
+
+fn prompt_fingerprint(prompt: &ConversationPrompt) -> Result<String, AppError> {
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(prompt)?)))
+}
+
+fn control_failure_event(error: &AppError) -> &'static str {
+    match error {
+        AppError::InvalidRequest(_) | AppError::Unsupported(_) => "control.rejected",
+        AppError::Conflict(message)
+            if ![
+                "timeout",
+                "timed out",
+                "unknown",
+                "not confirmed",
+                "could not be confirmed",
+            ]
+            .iter()
+            .any(|fragment| message.to_ascii_lowercase().contains(fragment)) =>
+        {
+            "control.rejected"
+        }
+        _ => "control.unknown",
+    }
+}
 
 const MAX_PROMPT_BYTES: usize = 512 * 1024;
 const MAX_PROMPT_CONTENT_ITEMS: usize = 16;
@@ -521,6 +546,10 @@ impl ConversationSupervisor {
                 "active conversation cannot be deleted".to_owned(),
             ));
         }
+        self.registry
+            .driver(manifest.provider)?
+            .shutdown_session(&manifest.id)
+            .await;
         self.store.delete(&manifest.id).await?;
         Ok(manifest)
     }
@@ -536,7 +565,14 @@ impl ConversationSupervisor {
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
-        self.store.cleanup_before(cutoff, &protected).await
+        let removed = self.store.cleanup_before(cutoff, &protected).await?;
+        for manifest in &removed {
+            self.registry
+                .driver(manifest.provider)?
+                .shutdown_session(&manifest.id)
+                .await;
+        }
+        Ok(removed)
     }
 
     pub async fn replay(
@@ -780,6 +816,162 @@ impl ConversationSupervisor {
             .is_some_and(|driver| driver.supports_native_fork())
     }
 
+    pub async fn refresh_control_capabilities(&self, provider: &str) {
+        if let Some(driver) = provider
+            .parse::<ProviderKind>()
+            .ok()
+            .and_then(|kind| self.registry.driver(kind).ok())
+        {
+            driver.refresh_control_capabilities().await;
+        }
+    }
+
+    pub fn control_probe(&self, provider: &str) -> Option<Value> {
+        provider
+            .parse::<ProviderKind>()
+            .ok()
+            .and_then(|kind| self.registry.driver(kind).ok())
+            .and_then(|driver| driver.control_probe())
+    }
+
+    pub fn supports_live_controls(&self, provider: &str) -> bool {
+        provider
+            .parse::<ProviderKind>()
+            .ok()
+            .and_then(|kind| self.registry.driver(kind).ok())
+            .is_some_and(|driver| driver.supports_live_controls())
+    }
+
+    pub fn supports_native_queue(&self, provider: &str) -> bool {
+        provider
+            .parse::<ProviderKind>()
+            .ok()
+            .and_then(|kind| self.registry.driver(kind).ok())
+            .is_some_and(|driver| driver.supports_native_queue())
+    }
+
+    /// Persist an intent before sending any non-idempotent control. A lost
+    /// acknowledgement is never grounds for submitting an interjection twice.
+    pub async fn control_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        expected_turn_id: &str,
+        request_id: &str,
+        control: ProviderControl,
+    ) -> Result<Value, AppError> {
+        self.get_owned(owner_id, conversation_id).await?;
+        let guard = self.request_gate(conversation_id).lock_owned().await;
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        self.workspace_trust
+            .ensure_trusted(owner_id, &manifest.workspace)
+            .await?;
+        validate_provider_control(request_id, expected_turn_id, &control)?;
+        let serialized = serde_json::to_value(&control)?;
+        let history = self.store.complete_history(conversation_id).await?;
+        let prior = history.iter().find(|event| {
+            event.event_type == "control.requested"
+                && event.payload.get("requestId").and_then(Value::as_str) == Some(request_id)
+        });
+        if let Some(prior) = prior {
+            if prior.payload.get("control") != Some(&serialized)
+                || prior.payload.get("turnId").and_then(Value::as_str) != Some(expected_turn_id)
+            {
+                return Err(AppError::Conflict(
+                    "Control request ID was already used with different input.".to_owned(),
+                ));
+            }
+            if let Some(done) = history.iter().rev().find(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "control.completed" | "control.rejected" | "control.unknown"
+                ) && event.payload.get("requestId").and_then(Value::as_str) == Some(request_id)
+            }) {
+                if done.event_type == "control.completed" {
+                    return Ok(done.payload.get("result").cloned().unwrap_or(Value::Null));
+                }
+                if done.event_type == "control.unknown" {
+                    return Err(AppError::ProviderUnavailable("Control delivery outcome is unknown; it was not sent again. Inspect the effective state before issuing a new request.".to_owned()));
+                }
+                return Err(AppError::Conflict(
+                    done.payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Control was rejected.")
+                        .to_owned(),
+                ));
+            }
+            return Err(AppError::ProviderUnavailable("Control was already submitted; its outcome is unknown. Inspect the conversation record before trying a new request.".to_owned()));
+        }
+        let driver = self.registry.driver(manifest.provider)?;
+        if !driver.supports_live_controls() {
+            return Err(AppError::Unsupported(
+                "This provider does not support live controls.".to_owned(),
+            ));
+        }
+        if matches!(
+            control,
+            ProviderControl::QueueAdd { .. }
+                | ProviderControl::QueueRemove { .. }
+                | ProviderControl::QueueList
+                | ProviderControl::QueueClear
+        ) && !driver.supports_native_queue()
+        {
+            return Err(AppError::Unsupported(
+                "This provider does not expose a native follow-up queue.".to_owned(),
+            ));
+        }
+        let matches_active = self
+            .active
+            .get(conversation_id)
+            .is_some_and(|active| active.turn_id == expected_turn_id && !*active.cancel.borrow());
+        if !matches_active {
+            return Err(AppError::Conflict(
+                "The target turn is no longer running; settings were not changed.".to_owned(),
+            ));
+        }
+        self.emit(
+            conversation_id,
+            "control.requested",
+            json!({
+                "turnId": expected_turn_id, "requestId": request_id, "control": serialized,
+                "status": "pending",
+            }),
+        )
+        .await?;
+        let supervisor = self.clone();
+        let conversation_id = conversation_id.to_owned();
+        let turn_id = expected_turn_id.to_owned();
+        let request_id = request_id.to_owned();
+        // Continue to record the outcome even if the socket waiting for the ACK
+        // disconnects. The detached task never retries the native command.
+        tokio::spawn(async move {
+            let _guard = guard;
+            let result = driver
+                .control(&conversation_id, &turn_id, &request_id, control)
+                .await;
+            let (event_type, payload) = match &result {
+                Ok(value) => (
+                    "control.completed",
+                    json!({ "turnId": turn_id, "requestId": request_id, "result": value }),
+                ),
+                Err(error) => (
+                    control_failure_event(error),
+                    json!({ "turnId": turn_id, "requestId": request_id,
+                    "message": error.to_string(), "code": error.code() }),
+                ),
+            };
+            supervisor
+                .emit(&conversation_id, event_type, payload)
+                .await?;
+            result
+        })
+        .await
+        .map_err(|error| {
+            AppError::Conflict(format!("Control outcome could not be confirmed: {error}"))
+        })?
+    }
+
     #[allow(dead_code)]
     pub async fn prompt(
         &self,
@@ -811,6 +1003,7 @@ impl ConversationSupervisor {
         conversation_id: &str,
         prompt: ConversationPrompt,
     ) -> Result<String, AppError> {
+        self.get_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         self.prompt_inner(owner_id, conversation_id, prompt).await
     }
@@ -828,6 +1021,7 @@ impl ConversationSupervisor {
         conversation_id: &str,
         prompt: ConversationPrompt,
     ) -> Result<String, AppError> {
+        let request_fingerprint = prompt_fingerprint(&prompt)?;
         let request_snapshot = prompt.clone();
         let ConversationPrompt {
             client_request_id,
@@ -864,6 +1058,76 @@ impl ConversationSupervisor {
         self.workspace_trust
             .ensure_trusted(owner_id, &manifest.workspace)
             .await?;
+        if let Some(request_id) = client_request_id.as_deref() {
+            let history = self.store.complete_history(conversation_id).await?;
+            if let Some(previous) = history.iter().find(|event| {
+                event.event_type == "message.created"
+                    && event.payload.get("clientRequestId").and_then(Value::as_str)
+                        == Some(request_id)
+            }) {
+                let matches = if let Some(recorded) = previous
+                    .payload
+                    .get("requestFingerprint")
+                    .and_then(Value::as_str)
+                {
+                    recorded == request_fingerprint
+                } else {
+                    // Native queue/steering deliveries have an original durable control,
+                    // rather than a prompt snapshot. Recognize exactly that text-only
+                    // submission so reconnect cannot execute its tools a second time.
+                    let control_text = history.iter().find_map(|event| {
+                        if event.event_type != "control.requested" {
+                            return None;
+                        }
+                        let control = event.payload.get("control")?;
+                        let matches_id = match control.get("action").and_then(Value::as_str) {
+                            Some("queueAdd") => {
+                                control.get("itemId").and_then(Value::as_str) == Some(request_id)
+                            }
+                            Some("steer") => {
+                                event.payload.get("requestId").and_then(Value::as_str)
+                                    == Some(request_id)
+                            }
+                            _ => false,
+                        };
+                        matches_id
+                            .then(|| control.get("text").and_then(Value::as_str))
+                            .flatten()
+                    });
+                    if let Some(control_text) = control_text {
+                        request_snapshot.text == control_text
+                            && request_snapshot.content.is_empty()
+                            && request_snapshot.skills.is_empty()
+                            && request_snapshot.model.is_none()
+                            && request_snapshot.reasoning_effort.is_none()
+                            && request_snapshot.permission_profile.is_none()
+                            && request_snapshot.sandbox_mode.is_none()
+                            && request_snapshot.approval_policy.is_none()
+                    } else if let Some(saved) = self.store.last_request(conversation_id).await? {
+                        saved.get("turnId") == previous.payload.get("turnId")
+                            && saved.get("request").is_some_and(|request| {
+                                request
+                                    == &serde_json::to_value(&request_snapshot)
+                                        .unwrap_or(Value::Null)
+                            })
+                    } else {
+                        false
+                    }
+                };
+                if !matches {
+                    return Err(AppError::Conflict(
+                        "clientRequestId was already used with different or unverifiable input."
+                            .to_owned(),
+                    ));
+                }
+                if let Some(turn_id) = previous.payload.get("turnId").and_then(Value::as_str) {
+                    return Ok(turn_id.to_owned());
+                }
+                return Err(AppError::Conflict(
+                    "Request was recorded but its execution state is unknown.".to_owned(),
+                ));
+            }
+        }
         let (content_text, driver_content) =
             prepare_prompt_content(manifest.provider, &manifest.workspace, content).await?;
         let loaded_skills = self.load_prompt_skills(&manifest, &skills).await?;
@@ -969,7 +1233,7 @@ impl ConversationSupervisor {
             .emit(
                 conversation_id,
                 "message.created",
-                json!({ "turnId": turn_id, "clientRequestId": client_request_id, "role": "user", "content": user_text }),
+                json!({ "turnId": turn_id, "clientRequestId": client_request_id, "requestFingerprint": request_fingerprint, "role": "user", "content": user_text }),
             )
             .await
         {
@@ -1107,7 +1371,13 @@ impl ConversationSupervisor {
                     }
                 }
                 Err(error) => {
-                    let mut state = provider_state;
+                    // A driver may have persisted a new native session or an
+                    // extension switch during this turn. Do not roll it back.
+                    let mut state = supervisor
+                        .store
+                        .provider_state(&conversation_id)
+                        .await
+                        .unwrap_or(provider_state);
                     state.last_error = Some(error.to_string().chars().take(1000).collect());
                     if let Err(save_error) = supervisor
                         .store
@@ -1425,6 +1695,9 @@ impl ConversationSupervisor {
                 "provider turns did not stop before shutdown deadline"
             );
         }
+        for driver in self.registry.drivers.values() {
+            driver.shutdown().await;
+        }
     }
 
     async fn emit(
@@ -1637,6 +1910,58 @@ fn validate_owner_id(owner_id: &str) -> Result<(), AppError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_provider_control(
+    request_id: &str,
+    turn_id: &str,
+    control: &ProviderControl,
+) -> Result<(), AppError> {
+    let valid_id = |value: &str| !value.trim().is_empty() && value.len() <= 200;
+    if !valid_id(request_id) || !valid_id(turn_id) {
+        return Err(AppError::InvalidRequest(
+            "Control requires a request ID and expectedTurnId (1–200 bytes).".to_owned(),
+        ));
+    }
+    match control {
+        ProviderControl::Steer { text } | ProviderControl::QueueAdd { text, .. }
+            if text.trim().is_empty() || text.len() > MAX_PROMPT_BYTES =>
+        {
+            return Err(AppError::InvalidRequest(
+                "Control text must be nonempty and at most 512 KiB.".to_owned(),
+            ));
+        }
+        ProviderControl::Configure {
+            model,
+            reasoning_effort,
+        } => {
+            if model.is_none() && reasoning_effort.is_none() {
+                return Err(AppError::InvalidRequest(
+                    "Configure requires model or reasoningEffort.".to_owned(),
+                ));
+            }
+            if model
+                .iter()
+                .chain(reasoning_effort.iter())
+                .any(|value| value.trim().is_empty() || value.len() > 200)
+            {
+                return Err(AppError::InvalidRequest(
+                    "Configuration values must contain 1–200 bytes.".to_owned(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    if let ProviderControl::QueueAdd { item_id, .. } | ProviderControl::QueueRemove { item_id } =
+        control
+    {
+        if !valid_id(item_id) {
+            return Err(AppError::InvalidRequest(
+                "Queue itemId must contain 1–200 bytes.".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_owner(manifest: &ConversationManifest, owner_id: &str) -> Result<(), AppError> {
@@ -2440,7 +2765,8 @@ elif [ "$mode" = "--mode" ]; then
   while IFS= read -r line; do
     case "$line" in
       *'"type":"get_state"'*)
-        printf '{"id":"state","type":"response","success":true}\n'
+        id=$(extract_id "$line")
+        printf '{"id":"%s","type":"response","success":true,"data":{"sessionId":"pi-native","isStreaming":false,"isCompacting":false,"pendingMessageCount":0}}\n' "$id"
         ;;
       *'"type":"prompt"'*)
         id=$(extract_id "$line")
@@ -2482,7 +2808,8 @@ while IFS= read -r line; do
       printf '{{"id":"commands","type":"response","success":true,"data":{{"commands":[]}}}}\n'
       ;;
     *'"type":"get_state"'*)
-      printf '{{"id":"state","type":"response","success":true,"data":{{}}}}\n'
+      id=$(extract_id "$line")
+      printf '{{"id":"%s","type":"response","success":true,"data":{{"sessionId":"pi-native","isStreaming":false,"isCompacting":false,"pendingMessageCount":0}}}}\n' "$id"
       ;;
     *'"type":"prompt"'*)
       id=$(extract_id "$line")

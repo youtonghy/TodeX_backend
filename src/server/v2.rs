@@ -63,6 +63,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.resume"
             | "conversation.fork"
             | "conversation.compact"
+            | "conversation.control"
             | "conversation.cancel"
             | "conversation.interrupt"
             | "conversation.stop"
@@ -76,7 +77,10 @@ fn is_v2_native_command(command_type: &str) -> bool {
 }
 
 fn is_v2_background_command(command_type: &str) -> bool {
-    matches!(command_type, "mcp.refresh" | "mcp.call")
+    matches!(
+        command_type,
+        "mcp.refresh" | "mcp.call" | "conversation.control"
+    )
 }
 
 pub fn routes() -> Router<AppState> {
@@ -908,11 +912,29 @@ async fn providers(
     let mut providers = serde_json::to_value(state.conversations.providers())?;
     if let Some(items) = providers.as_array_mut() {
         for provider in items {
+            let provider_id = provider
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            state
+                .conversations
+                .refresh_control_capabilities(&provider_id)
+                .await;
+            let control_probe = state.conversations.control_probe(&provider_id);
+            let live_controls = state.conversations.supports_live_controls(&provider_id);
+            let native_queue = state.conversations.supports_native_queue(&provider_id);
             let capabilities = provider
                 .get("capabilities")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let mut actions = Vec::new();
+            if live_controls {
+                actions.push("steer");
+            }
+            if native_queue {
+                actions.push("queue");
+            }
             if capabilities
                 .get("cancel")
                 .and_then(Value::as_bool)
@@ -944,6 +966,12 @@ async fn providers(
                     .and_then(Value::as_object_mut)
                 {
                     capabilities.insert("controlActions".to_owned(), json!(actions));
+                    if let Some(probe) = control_probe {
+                        capabilities.insert("controlProbe".to_owned(), probe);
+                    }
+                    capabilities.insert("steering".to_owned(), json!(live_controls));
+                    capabilities.insert("liveConfiguration".to_owned(), json!(live_controls));
+                    capabilities.insert("followUpQueue".to_owned(), json!(native_queue));
                 }
             }
         }
@@ -2005,6 +2033,7 @@ async fn dispatch_command_inner(
                 "accepted": true,
             }))
         }
+        "conversation.control" => dispatch_provider_control(state, owner_id, command).await,
         "mcp.list" | "mcp.refresh" | "mcp.call" => {
             dispatch_mcp_command(state, owner_id, command).await
         }
@@ -2035,7 +2064,12 @@ async fn dispatch_mcp_command_response(
     owner_id: &str,
     command: V2Command,
 ) -> Value {
-    match dispatch_mcp_command(state, owner_id, &command).await {
+    let result = if command.command_type == "conversation.control" {
+        dispatch_provider_control(state, owner_id, &command).await
+    } else {
+        dispatch_mcp_command(state, owner_id, &command).await
+    };
+    match result {
         Ok(payload) => json!({
             "id": command.id,
             "type": "server.result",
@@ -2043,6 +2077,31 @@ async fn dispatch_mcp_command_response(
         }),
         Err(error) => error_response(Some(command.id), error),
     }
+}
+
+async fn dispatch_provider_control(
+    state: &AppState,
+    owner_id: &str,
+    command: &V2Command,
+) -> Result<Value, AppError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Request {
+        conversation_id: String,
+        expected_turn_id: String,
+        control: crate::provider::types::ProviderControl,
+    }
+    let request: Request = serde_json::from_value(command.payload.clone())?;
+    state
+        .conversations
+        .control_owned(
+            owner_id,
+            &request.conversation_id,
+            &request.expected_turn_id,
+            &command.id,
+            request.control,
+        )
+        .await
 }
 
 async fn dispatch_mcp_command(
@@ -2583,9 +2642,13 @@ mod tests {
             let actions = provider["capabilities"]["controlActions"]
                 .as_array()
                 .unwrap();
-            assert!(!actions
-                .iter()
-                .any(|value| value == "fork" || value == "compact" || value == "resume"));
+            assert!(!actions.iter().any(|value| value == "resume"));
+            let id = provider["id"].as_str().unwrap();
+            assert_eq!(
+                actions.iter().any(|value| value == "fork"),
+                matches!(id, "grok-build" | "pi")
+            );
+            assert_eq!(actions.iter().any(|value| value == "compact"), id == "pi");
         }
 
         let create = app
