@@ -18,7 +18,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::{Frame, Terminal};
 use serde_json::Value;
 
@@ -33,6 +35,11 @@ const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
 const EDIT_POPUP_WIDTH: u16 = 64;
+
+// A single border treatment keeps nested views and overlays visually consistent.
+fn panel_block<'a>() -> Block<'a> {
+    Block::default().border_type(BorderType::Rounded)
+}
 
 pub async fn run(args: ServeArgs) -> Result<()> {
     let config = Config::load(args).context("failed to load configuration")?;
@@ -690,7 +697,7 @@ impl TuiApp {
         self.device_pairing.displayed_request.replace(None);
         let area = centered_area(frame.area(), 88, 24);
         frame.render_widget(Clear, area);
-        let block = Block::default()
+        let block = panel_block()
             .borders(Borders::ALL)
             .title(self.text("Device verification", "设备验证"));
         let inner = block.inner(area);
@@ -1595,6 +1602,7 @@ impl TuiApp {
         frame.render_widget(Clear, frame.area());
         if self.view == TuiView::Observer {
             self.render_observer(frame);
+            self.dim_popup_background(frame);
             if self.pairing_qr.is_some() {
                 let popup = self.pairing_qr_popup(frame.area());
                 frame.render_widget(Clear, popup.area);
@@ -1614,36 +1622,63 @@ impl TuiApp {
             return;
         }
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Length(14),
-                Constraint::Min(10),
-                Constraint::Length(6),
-                Constraint::Length(4),
-            ])
-            .split(frame.area());
-        let main_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(40), Constraint::Length(32)])
-            .split(chunks[1]);
-
-        for area in [
-            chunks[0],
-            main_chunks[0],
-            main_chunks[1],
-            chunks[2],
-            chunks[3],
-        ] {
-            frame.render_widget(Clear, area);
+        let chunks = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(if self.last_error.is_some() { 4 } else { 3 }),
+            Constraint::Length(2),
+        ])
+        .margin(1)
+        .spacing(1)
+        .split(frame.area());
+        let wide = chunks[0].width >= 68;
+        let main = Layout::horizontal([
+            Constraint::Min(0),
+            Constraint::Length(if wide { 33 } else { chunks[0].width }),
+        ])
+        .spacing(u16::from(wide))
+        .split(chunks[0]);
+        if wide {
+            let status_height = if main[0].height >= 25 { 14 } else { 7 };
+            let left = Layout::vertical([Constraint::Length(status_height), Constraint::Min(3)])
+                .spacing(1)
+                .split(main[0]);
+            frame.render_widget(self.status_panel(left[0]), left[0]);
+            frame.render_widget(self.log_panel(left[1]), left[1]);
         }
-
-        frame.render_widget(self.status_panel(), chunks[0]);
-        frame.render_widget(self.log_panel(main_chunks[0]), main_chunks[0]);
-        frame.render_widget(self.action_panel(), main_chunks[1]);
+        let action_area = if wide {
+            main[1]
+        } else {
+            let stacked = Layout::vertical([Constraint::Length(3), Constraint::Min(3)])
+                .spacing(1)
+                .split(main[1]);
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{} · {}:{}",
+                    self.text(
+                        if self.daemon.is_some() {
+                            "Running"
+                        } else {
+                            "Stopped"
+                        },
+                        if self.daemon.is_some() {
+                            "运行中"
+                        } else {
+                            "已停止"
+                        },
+                    ),
+                    self.config.host,
+                    self.config.port
+                ))
+                .block(panel_block().title("TodeX Backend").borders(Borders::ALL)),
+                stacked[0],
+            );
+            stacked[1]
+        };
+        let mut actions = ListState::default().with_selected(Some(self.selected_action));
+        frame.render_stateful_widget(self.action_panel(), action_area, &mut actions);
+        frame.render_widget(self.message_panel(), chunks[1]);
         frame.render_widget(self.help_panel(), chunks[2]);
-        frame.render_widget(self.message_panel(), chunks[3]);
+        self.dim_popup_background(frame);
         if self.pairing_qr.is_some() {
             let popup = self.pairing_qr_popup(frame.area());
             frame.render_widget(Clear, popup.area);
@@ -1660,7 +1695,7 @@ impl TuiApp {
         if let Some(picker) = &self.folder_picker {
             let area = self.folder_picker_area(frame.area());
             frame.render_widget(Clear, area);
-            frame.render_widget(self.folder_picker_widget(picker), area);
+            self.render_folder_picker(frame, area, picker);
         }
         if let Some(credentials) = &self.credentials {
             let area = self.credentials_area(frame.area());
@@ -1672,28 +1707,47 @@ impl TuiApp {
         }
     }
 
-    fn render_observer(&self, frame: &mut Frame<'_>) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Length(7),
-                Constraint::Min(12),
-                Constraint::Length(4),
-            ])
-            .split(frame.area());
-        let main_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(42), Constraint::Min(48)])
-            .split(chunks[1]);
-
-        for area in [chunks[0], main_chunks[0], main_chunks[1], chunks[2]] {
-            frame.render_widget(Clear, area);
+    fn dim_popup_background(&self, frame: &mut Frame<'_>) {
+        if self.pairing_qr.is_some()
+            || self.credentials.is_some()
+            || self.device_pairing.open
+            || (self.view == TuiView::Control
+                && (self.edit.is_some() || self.folder_picker.is_some()))
+        {
+            for cell in &mut frame.buffer_mut().content {
+                cell.set_style(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                );
+            }
         }
+    }
 
+    fn render_observer(&self, frame: &mut Frame<'_>) {
+        let chunks = Layout::vertical([
+            Constraint::Length(6),
+            Constraint::Min(5),
+            Constraint::Length(2),
+        ])
+        .margin(1)
+        .spacing(1)
+        .split(frame.area());
+        let wide = chunks[1].width >= 90;
+        let main_chunks = if wide {
+            Layout::horizontal([Constraint::Length(34), Constraint::Min(0)])
+                .spacing(1)
+                .split(chunks[1])
+        } else {
+            Layout::vertical([Constraint::Length(5), Constraint::Min(3)])
+                .spacing(1)
+                .split(chunks[1])
+        };
         let state = self.observer_state();
         frame.render_widget(self.observer_summary_panel(&state), chunks[0]);
-        frame.render_widget(self.session_panel(&state), main_chunks[0]);
+        let mut sessions = ListState::default()
+            .with_selected((!state.sessions.is_empty()).then_some(self.selected_session));
+        frame.render_stateful_widget(self.session_panel(&state), main_chunks[0], &mut sessions);
         frame.render_widget(
             self.session_detail_panel(&state, main_chunks[1]),
             main_chunks[1],
@@ -1701,7 +1755,7 @@ impl TuiApp {
         frame.render_widget(self.observer_help_panel(), chunks[2]);
     }
 
-    fn status_panel(&self) -> Paragraph<'_> {
+    fn status_panel(&self, area: Rect) -> Paragraph<'_> {
         let process = self.daemon.as_ref();
         let status = if process.is_some() {
             Span::styled(
@@ -1780,6 +1834,29 @@ impl TuiApp {
             )
         };
 
+        if area.height < 14 {
+            return Paragraph::new(vec![
+                Line::from(vec![Span::raw(self.text("Status: ", "状态：")), status]),
+                Line::from(format!("{listen_host}:{listen_port}")),
+                Line::from(format!(
+                    "{}{}",
+                    self.text("Encryption: ", "加密："),
+                    pairing_encryption_label(self.config.pairing_encryption)
+                )),
+                Line::from(format!(
+                    "{}{}",
+                    self.text("Auth: ", "认证："),
+                    auth_state.content
+                )),
+                Line::from(format!(
+                    "{}{}  [d]",
+                    self.text("Pending devices: ", "待验证设备："),
+                    self.device_pairing.requests.len()
+                )),
+            ])
+            .block(panel_block().title("TodeX Backend").borders(Borders::ALL));
+        }
+
         Paragraph::new(vec![
             Line::from(vec![Span::raw(self.text("Status: ", "状态：")), status]),
             Line::styled(
@@ -1819,8 +1896,8 @@ impl TuiApp {
                 ),
             }),
             Line::from(self.text(
-                "Pairing QR: one-click link + auth token; app fetches protocol key",
-                "配对二维码：包含一键链接和认证令牌；应用会获取协议公钥",
+                "g pairing QR · c credentials · d device verification",
+                "g 配对二维码 · c 凭据 · d 设备验证",
             )),
             Line::from(vec![Span::raw(self.text("Auth: ", "认证：")), auth_state]),
             token_line,
@@ -1845,12 +1922,7 @@ impl TuiApp {
                 connection_state,
             ]),
         ])
-        .block(
-            Block::default()
-                .title("TodeX Backend")
-                .borders(Borders::ALL),
-        )
-        .wrap(Wrap { trim: true })
+        .block(panel_block().title("TodeX Backend").borders(Borders::ALL))
     }
 
     fn log_panel(&self, area: ratatui::layout::Rect) -> Paragraph<'_> {
@@ -1886,7 +1958,7 @@ impl TuiApp {
         Paragraph::new(lines)
             .scroll((scroll as u16, 0))
             .wrap(Wrap { trim: true })
-            .block(Block::default().title(title).borders(Borders::ALL))
+            .block(panel_block().title(title).borders(Borders::ALL))
     }
 
     fn action_panel(&self) -> List<'_> {
@@ -1906,9 +1978,10 @@ impl TuiApp {
             self.text("Show pairing QR", "显示配对二维码"),
             self.text("Credentials & copy", "凭据与复制"),
             self.text("Language: English", "语言：中文"),
-            self.text("Device verification (d)", "设备验证 (d)"),
+            self.text("Device verification", "设备验证"),
             self.text("Quit", "退出"),
         ];
+        let shortcuts = ["s", "r", "h", "p", "w", "e", "x", "g", "c", "l", "d", "q"];
         let items = actions
             .iter()
             .enumerate()
@@ -1925,46 +1998,33 @@ impl TuiApp {
                 } else {
                     Style::default()
                 };
-                ListItem::new(Line::from(format!("{marker}{label}"))).style(style)
+                ListItem::new(Line::from(format!("{marker}[{}] {label}", shortcuts[idx])))
+                    .style(style)
             })
             .collect::<Vec<_>>();
 
         List::new(items).block(
-            Block::default()
+            panel_block()
                 .title(self.text("Actions", "操作"))
                 .borders(Borders::ALL),
         )
     }
 
     fn help_panel(&self) -> Paragraph<'_> {
-        let lines = vec![
+        Paragraph::new(vec![
             Line::from(self.text(
-                "Use Up/Down or j/k to choose an action, Enter to run it.",
-                "使用上下方向键或 j/k 选择操作，按 Enter 执行。",
+                "↑↓/j k select · Enter run · o observer · q quit",
+                "↑↓/j k 选择 · Enter 执行 · o 观察器 · q 退出",
             )),
             Line::from(self.text(
-                "Shortcuts: s start/stop, r restart, h host, p port, w workspace, e encryption, x reset, g QR, c credentials, d devices, l language, o observer, q quit.",
-                "快捷键：s 启停、r 重启、h 主机、p 端口、w 工作区、e 加密、x 重置、g 二维码、c 凭据、d 设备验证、l 语言、o 观察器、q 退出。",
+                "PgUp/PgDn/Home/End logs · Settings saved · Quit keeps daemon online",
+                "PgUp/PgDn/Home/End 日志 · 设置自动保存 · 退出保留后台服务",
             )),
-            Line::from(self.text(
-                "Mouse drag selects terminal text. PageUp/PageDown/Home/End scroll logs.",
-                "鼠标拖动可选择终端文本；PageUp/PageDown/Home/End 滚动日志。",
-            )),
-            Line::from(self.text(
-                "Settings auto-save. Quitting leaves a running daemon online and exports logs.",
-                "设置会自动保存；退出时导出日志，已运行的 daemon 会保持在线。",
-            )),
-        ];
-
-        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .title(self.text("Controls", "控制"))
-                .borders(Borders::ALL),
-        )
+        ])
     }
 
     fn message_panel(&self) -> Paragraph<'_> {
-        let mut lines = vec![Line::from(self.notice.clone())];
+        let mut lines = Vec::new();
         if let Some(error) = &self.last_error {
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1975,8 +2035,10 @@ impl TuiApp {
             ]));
         }
 
+        lines.push(Line::from(self.notice.clone()));
+
         Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-            Block::default()
+            panel_block()
                 .title(self.text("Messages", "消息"))
                 .borders(Borders::ALL),
         )
@@ -2048,7 +2110,7 @@ impl TuiApp {
             .scroll((credentials.scroll, 0))
             .wrap(Wrap { trim: false })
             .block(
-                Block::default()
+                panel_block()
                     .title(self.text("Credentials & Copy", "凭据与复制"))
                     .borders(Borders::ALL),
             )
@@ -2219,42 +2281,63 @@ impl TuiApp {
 
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
-            .block(Block::default().title(title).borders(Borders::ALL))
+            .block(panel_block().title(title).borders(Borders::ALL))
     }
 
     fn folder_picker_area(&self, area: Rect) -> Rect {
         centered_area(area, 82, 24)
     }
 
-    fn folder_picker_widget(&self, picker: &FolderPicker) -> List<'static> {
-        let mut items = Vec::new();
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled(
-                self.text("Current: ", "当前目录："),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                picker.current.display().to_string(),
-                Style::default().fg(Color::Cyan),
-            ),
-        ])));
-        items.push(ListItem::new(Line::from(
-            self.text(
-                "Space selects current. Enter/Right opens selected. Left/Backspace goes parent. Home jumps home.",
-                "Space 选择当前目录；Enter/右键打开所选目录；左键/Backspace 返回上级；Home 返回主目录。",
-            ),
-        )));
-        if let Some(error) = &picker.error {
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled(
-                    self.text("Error: ", "错误："),
+    fn render_folder_picker(&self, frame: &mut Frame<'_>, area: Rect, picker: &FolderPicker) {
+        let block = panel_block()
+            .title(self.text("Choose Workspace Root", "选择工作区根目录"))
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let sections = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!(
+                    "{}{}",
+                    self.text("Current: ", "当前目录："),
+                    picker.current.display()
+                )),
+                Line::styled(
+                    picker.error.clone().unwrap_or_default(),
                     Style::default().fg(Color::Red),
                 ),
-                Span::raw(error.clone()),
-            ])));
-        }
-        items.push(ListItem::new(Line::from("")));
+            ]),
+            sections[0],
+        );
+        let mut selection = ListState::default()
+            .with_selected((!picker.entries.is_empty()).then_some(picker.selected));
+        frame.render_stateful_widget(
+            self.folder_picker_widget(picker),
+            sections[1],
+            &mut selection,
+        );
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(self.text(
+                    "Space selects current · Enter/→ opens · ←/Backspace parent",
+                    "Space 选择当前目录 · Enter/→ 打开 · ←/Backspace 上级",
+                )),
+                Line::from(self.text(
+                    "↑↓ navigate · Home home directory · Esc cancels",
+                    "↑↓ 选择 · Home 主目录 · Esc 取消",
+                )),
+            ]),
+            sections[2],
+        );
+    }
 
+    fn folder_picker_widget(&self, picker: &FolderPicker) -> List<'static> {
+        let mut items = Vec::new();
         if picker.entries.is_empty() {
             items.push(ListItem::new(Line::from(
                 self.text("No readable subdirectories.", "没有可读取的子目录。"),
@@ -2276,11 +2359,7 @@ impl TuiApp {
             }
         }
 
-        List::new(items).block(
-            Block::default()
-                .title(self.text("Choose Workspace Root", "选择工作区根目录"))
-                .borders(Borders::ALL),
-        )
+        List::new(items)
     }
 
     fn pairing_qr_area(&self, area: Rect, content_width: u16, content_height: u16) -> Rect {
@@ -2421,7 +2500,7 @@ impl TuiApp {
             .fg(Color::Rgb(0, 0, 0))
             .bg(Color::Rgb(255, 255, 255));
         Paragraph::new(lines).style(qr_style).block(
-            Block::default()
+            panel_block()
                 .title(title)
                 .borders(Borders::ALL)
                 .style(qr_style),
@@ -2448,7 +2527,9 @@ impl TuiApp {
             Line::from(vec![
                 Span::styled(
                     self.text("Observer ", "观察器 "),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(self.text(
                     "read-only view for this TUI session",
@@ -2457,12 +2538,18 @@ impl TuiApp {
             ]),
             Line::from(match self.language {
                 TuiLanguage::English => format!(
-                    "Service: {runtime_state} | Sessions: {} | Active tasks: {} | Pending requests: {} | Events: {}",
-                    state.sessions.len(), state.active_task_count, state.pending_request_count, self.live_events.len()
+                    "{runtime_state} · Sessions {} · Tasks {} · Requests {} · Events {}",
+                    state.sessions.len(),
+                    state.active_task_count,
+                    state.pending_request_count,
+                    self.live_events.len()
                 ),
                 TuiLanguage::Chinese => format!(
                     "服务：{runtime_state} | 会话：{} | 活跃任务：{} | 待处理请求：{} | 事件：{}",
-                    state.sessions.len(), state.active_task_count, state.pending_request_count, self.live_events.len()
+                    state.sessions.len(),
+                    state.active_task_count,
+                    state.pending_request_count,
+                    self.live_events.len()
                 ),
             }),
             Line::from(match self.language {
@@ -2476,7 +2563,7 @@ impl TuiApp {
         ])
         .wrap(Wrap { trim: true })
         .block(
-            Block::default()
+            panel_block()
                 .title(self.text("Session Observer", "会话观察器"))
                 .borders(Borders::ALL),
         )
@@ -2506,31 +2593,33 @@ impl TuiApp {
                     } else {
                         Style::default()
                     };
-                    ListItem::new(Line::from(vec![
-                        Span::raw(marker),
-                        Span::raw(truncate_text(&session.session_id, 22)),
-                        Span::raw(match self.language {
+                    ListItem::new(vec![
+                        Line::from(format!(
+                            "{marker}{}",
+                            truncate_text(&session.session_id, 22)
+                        )),
+                        Line::from(match self.language {
                             TuiLanguage::English => format!(
-                                " {} ev {} turn {} req",
+                                "  {} ev · {} turns · {} req",
                                 session.event_count,
                                 session.turns.len(),
                                 session.pending_request_count()
                             ),
                             TuiLanguage::Chinese => format!(
-                                " {} 事件 {} 轮次 {} 请求",
+                                "  {} 事件 · {} 轮次 · {} 请求",
                                 session.event_count,
                                 session.turns.len(),
                                 session.pending_request_count()
                             ),
                         }),
-                    ]))
+                    ])
                     .style(style)
                 })
                 .collect()
         };
 
         List::new(items).block(
-            Block::default()
+            panel_block()
                 .title(self.text("Sessions", "会话"))
                 .borders(Borders::ALL),
         )
@@ -2553,7 +2642,7 @@ impl TuiApp {
             .scroll((scroll as u16, 0))
             .wrap(Wrap { trim: true })
             .block(
-                Block::default()
+                panel_block()
                     .title(match self.language {
                         TuiLanguage::English => {
                             format!("History / Conversation / Current Tasks [{line_count}]")
@@ -2569,20 +2658,14 @@ impl TuiApp {
     fn observer_help_panel(&self) -> Paragraph<'_> {
         Paragraph::new(vec![
             Line::from(self.text(
-                "Read-only navigation: Up/Down selects session, PageUp/PageDown scrolls details, Home/End jumps.",
-                "只读导航：上下方向键选择会话，PageUp/PageDown 滚动详情，Home/End 跳转。",
+                "↑↓ select session · PgUp/PgDn scroll · Home/End jump",
+                "↑↓ 选择会话 · PgUp/PgDn 滚动 · Home/End 跳转",
             )),
             Line::from(self.text(
-                "q, Esc, o, or Tab returns to the control view. This page does not start, stop, approve, or send anything.",
-                "按 q、Esc、o 或 Tab 返回控制视图；本页不会启停、审批或发送任何内容。",
+                "q / Esc / o / Tab return · Read-only view",
+                "q / Esc / o / Tab 返回 · 只读视图",
             )),
         ])
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .title(self.text("Observer Controls", "观察器控制"))
-                .borders(Borders::ALL),
-        )
     }
 }
 
@@ -3525,6 +3608,214 @@ mod tests {
         ACTION_COUNT,
     };
     use crate::event::EventRecord;
+
+    fn render_preview(app: &super::TuiApp, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn write_preview(buffer: &ratatui::buffer::Buffer, name: &str) {
+        if std::env::var_os("TODEX_TUI_PREVIEW").is_none() {
+            return;
+        }
+        let width = buffer.area.width;
+        let height = buffer.area.height;
+        let mut cells = Vec::new();
+        let mut rows = Vec::new();
+        for y in 0..height {
+            let mut row = String::new();
+            for x in 0..width {
+                let cell = &buffer[(x, y)];
+                row.push_str(cell.symbol());
+                cells.push(json!({
+                    "x": x, "y": y, "symbol": cell.symbol(),
+                    "fg": format!("{:?}", cell.fg), "bg": format!("{:?}", cell.bg),
+                }));
+            }
+            rows.push(row);
+        }
+        let path = format!("/tmp/todex-tui-preview-{name}-{width}x{height}");
+        std::fs::write(format!("{path}.txt"), rows.join("\n")).unwrap();
+        std::fs::write(
+            format!("{path}.json"),
+            serde_json::to_string(&json!({ "width": width, "height": height, "cells": cells }))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn responsive_views_keep_selected_actions_and_borders_visible() {
+        for language in [TuiLanguage::English, TuiLanguage::Chinese] {
+            let mut app = super::TuiApp::new(crate::config::Config::default());
+            app.language = language;
+            app.config.security.auth_token = Some("preview-token".into());
+            app.config.data_dir = "/data/todex".into();
+            app.config.workspace_root = "/workspace".into();
+            app.notice = app
+                .text(
+                    "Ready. Settings are saved automatically.",
+                    "就绪。设置会自动保存。",
+                )
+                .into();
+            for (width, height) in [(40, 16), (80, 24), (100, 30), (120, 40)] {
+                for selected in 0..ACTION_COUNT {
+                    app.selected_action = selected;
+                    let buffer = render_preview(&app, width, height);
+                    let contents = buffer
+                        .content
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
+                    let shortcut =
+                        ["s", "r", "h", "p", "w", "e", "x", "g", "c", "l", "d", "q"][selected];
+                    assert!(
+                        contents.contains(&format!("> [{shortcut}]")),
+                        "selected {selected} missing at {width}x{height}"
+                    );
+                    // Every pane retains a complete rounded perimeter, even at compact sizes.
+                    for (left, right) in [("╭", "╮"), ("╰", "╯")] {
+                        assert_eq!(
+                            contents.matches(left).count(),
+                            contents.matches(right).count()
+                        );
+                    }
+                    assert!(!contents.contains("┌"));
+                    if width >= 80 {
+                        assert!(contents.contains("[s]"));
+                        assert!(contents.contains("[q]"));
+                    }
+                }
+                if std::env::var_os("TODEX_TUI_PREVIEW").is_some() {
+                    for view in [super::TuiView::Control, super::TuiView::Observer] {
+                        app.view = view;
+                        let buffer = render_preview(&app, width, height);
+                        write_preview(&buffer, &format!("{language:?}-{view:?}"));
+                    }
+                    app.view = super::TuiView::Control;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn popup_previews_preserve_selection_and_error_feedback() {
+        for language in [TuiLanguage::English, TuiLanguage::Chinese] {
+            let mut app = super::TuiApp::new(crate::config::Config::default());
+            app.language = language;
+            app.config.security.auth_token = Some("preview-token".into());
+            app.notice = "A very long preview notice that should not hide an error. ".repeat(6);
+            app.last_error = Some("Preview error".into());
+            let buffer = render_preview(&app, 80, 24);
+            assert!(buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .contains("Preview error"));
+            app.last_error = None;
+            for popup in ["Encryption", "Reset", "Folder", "Credentials", "Device"] {
+                app.edit = None;
+                app.folder_picker = None;
+                app.credentials = None;
+                app.device_pairing.open = false;
+                match popup {
+                    "Encryption" => {
+                        app.edit = Some(super::EditMode::Encryption {
+                            value: app.config.pairing_encryption,
+                        })
+                    }
+                    "Reset" => {
+                        app.edit = Some(super::EditMode::Reset {
+                            target: super::ResetTarget::Auth,
+                        })
+                    }
+                    "Folder" => {
+                        app.folder_picker = Some(super::FolderPicker {
+                            current: "/workspace".into(),
+                            entries: (0..30)
+                                .map(|i| super::FolderEntry {
+                                    path: format!("/workspace/folder-{i:02}").into(),
+                                    name: format!("folder-{i:02}"),
+                                })
+                                .collect(),
+                            selected: 29,
+                            error: None,
+                        })
+                    }
+                    "Credentials" => {
+                        app.credentials = Some(super::CredentialsPopup {
+                            auth_token: Some("preview-token".into()),
+                            public_key: Some("preview-public-key".into()),
+                            selected: 1,
+                            scroll: 0,
+                        })
+                    }
+                    "Device" => {
+                        app.device_pairing.open = true;
+                        app.device_pairing.replace(vec![device_request("preview")]);
+                        app.device_pairing.navigate(true);
+                    }
+                    _ => unreachable!(),
+                }
+                let buffer = render_preview(&app, 80, 24);
+                if popup == "Folder" {
+                    let contents = buffer
+                        .content
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
+                    assert!(contents.contains("/workspace"));
+                    assert!(contents.contains("Space"));
+                    assert!(buffer
+                        .content
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                        .contains("> folder-29/"));
+                }
+                write_preview(&buffer, &format!("{language:?}-{popup}"));
+            }
+        }
+    }
+
+    #[test]
+    fn observer_scrolls_to_the_selected_session() {
+        for language in [TuiLanguage::English, TuiLanguage::Chinese] {
+            let mut app = super::TuiApp::new(crate::config::Config::default());
+            app.language = language;
+            let state = super::ObserverState {
+                sessions: (0..20)
+                    .map(|index| super::ObservedSession::new(format!("session-{index:02}")))
+                    .collect(),
+                ..Default::default()
+            };
+            app.selected_session = 19;
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 5)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let mut selection = ratatui::widgets::ListState::default()
+                        .with_selected(Some(app.selected_session));
+                    frame.render_stateful_widget(
+                        app.session_panel(&state),
+                        frame.area(),
+                        &mut selection,
+                    );
+                })
+                .unwrap();
+            let contents = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(contents.contains("> session-19"));
+        }
+    }
 
     fn device_request(id: &str) -> super::DevicePairingRequest {
         super::DevicePairingRequest {
