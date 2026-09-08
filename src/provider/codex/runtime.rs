@@ -650,11 +650,15 @@ fn apply_control_result(control: &ProviderControl, result: &Value, queue: &mut V
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::conversation::{
         ConversationEventHub, ConversationManifest, ConversationStore, ProviderState,
     };
+    #[cfg(unix)]
     use crate::provider::types::PermissionBroker;
+    #[cfg(unix)]
     use crate::workspace_trust::WorkspaceTrustStore;
+    #[cfg(unix)]
     use std::sync::Arc;
 
     #[test]

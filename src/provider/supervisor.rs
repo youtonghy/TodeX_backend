@@ -340,11 +340,6 @@ impl ConversationSupervisor {
         let descriptor = self.registry.driver(provider)?.descriptor();
         let (image_input, source, reason) = match descriptor.capabilities.image_input_mode {
             ImageInputMode::Always => (true, "provider".to_owned(), None),
-            ImageInputMode::None => (
-                false,
-                "provider".to_owned(),
-                Some("this provider does not support image input".to_owned()),
-            ),
             ImageInputMode::Model => {
                 let models = self.models_live(owner_id, provider, workspace).await?;
                 let selected = model

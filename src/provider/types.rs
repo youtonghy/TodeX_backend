@@ -80,7 +80,6 @@ pub enum ImageInputMode {
     Always,
     Model,
     Profile,
-    None,
 }
 
 #[derive(Clone, Debug, Serialize)]
