@@ -674,11 +674,9 @@ pub(crate) fn render_qr_text_for_bounds(
 ) -> Result<RenderedQrText, AppError> {
     let qr = QrCode::encode_text(payload, QrCodeEcc::Low)
         .map_err(|_| AppError::InvalidRequest("pairing payload is too large for QR".to_owned()))?;
-    let candidates = [
-        (QrRenderMode::HalfBlock, 2),
-        (QrRenderMode::HalfBlock, 1),
-        (QrRenderMode::HalfBlock, 0),
-    ];
+    // A QR symbol needs a four-module quiet zone on every side. If it does
+    // not fit, report its real size so the TUI can ask for a larger terminal.
+    let candidates = [(QrRenderMode::HalfBlock, 4)];
     let mut best = None;
     for (mode, border) in candidates {
         let rendered = render_qr_with_mode(&qr, mode, border);
@@ -698,7 +696,7 @@ pub(crate) fn render_qr_text_for_bounds(
 fn render_qr_text(payload: &str) -> Result<String, AppError> {
     let qr = QrCode::encode_text(payload, QrCodeEcc::Low)
         .map_err(|_| AppError::InvalidRequest("pairing payload is too large for QR".to_owned()))?;
-    Ok(render_qr_with_mode(&qr, QrRenderMode::HalfBlock, 2).text)
+    Ok(render_qr_with_mode(&qr, QrRenderMode::HalfBlock, 4).text)
 }
 
 fn render_qr_with_mode(qr: &QrCode, mode: QrRenderMode, border: i32) -> RenderedQrText {

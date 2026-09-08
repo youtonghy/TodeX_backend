@@ -1967,15 +1967,17 @@ impl TuiApp {
     }
 
     fn pairing_qr_paragraph(&self, lines: Vec<Line<'static>>, title: String) -> Paragraph<'static> {
-        Paragraph::new(lines)
-            .style(Style::default().fg(Color::Black).bg(Color::White))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Black).bg(Color::White)),
-            )
+        // ANSI Black/White are user-remappable palette entries. Force actual
+        // black ink on white paper, and clear inherited inverse/dim modifiers.
+        let qr_style = Style::reset()
+            .fg(Color::Rgb(0, 0, 0))
+            .bg(Color::Rgb(255, 255, 255));
+        Paragraph::new(lines).style(qr_style).block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .style(qr_style),
+        )
     }
 
     fn observer_state(&self) -> ObserverState {
@@ -3075,6 +3077,93 @@ mod tests {
         ACTION_COUNT,
     };
     use crate::event::EventRecord;
+
+    #[test]
+    fn pairing_qr_preserves_modules_and_true_colors_in_terminal_buffer() {
+        use qrcodegen::{QrCode, QrCodeEcc};
+        use ratatui::{
+            backend::TestBackend,
+            style::{Color, Modifier, Style},
+            widgets::Paragraph,
+            Terminal,
+        };
+        let payload = "todex-pairing-test:no-real-credentials";
+        let qr = QrCode::encode_text(payload, QrCodeEcc::Low).unwrap();
+        let mut config = crate::config::Config::default();
+        config.data_dir =
+            std::env::temp_dir().join(format!("todex-qr-test-{}", uuid::Uuid::new_v4()));
+        let mut app = super::TuiApp::new(config);
+        app.pairing_qr = Some(super::PairingQr {
+            payloads: vec![payload.to_owned()],
+            active_index: 0,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 60)).unwrap();
+        let popup = app.pairing_qr_popup(ratatui::layout::Rect::new(0, 0, 100, 60));
+        let qr_area = popup.area;
+        terminal
+            .draw(|frame| {
+                // Simulate hostile inherited terminal styles, including inverse text.
+                frame.render_widget(
+                    Paragraph::new("background").style(
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(Color::Black)
+                            .add_modifier(Modifier::REVERSED | Modifier::DIM),
+                    ),
+                    frame.area(),
+                );
+                frame.render_widget(
+                    app.pairing_qr_paragraph(popup.lines.clone(), popup.title.clone()),
+                    qr_area,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in qr_area.top()..qr_area.bottom() {
+            for x in qr_area.left()..qr_area.right() {
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.fg, Color::Rgb(0, 0, 0));
+                assert_eq!(cell.bg, Color::Rgb(255, 255, 255));
+                assert!(!cell.modifier.intersects(Modifier::REVERSED | Modifier::DIM));
+            }
+        }
+        // Reconstruct each QR pixel from the actual rendered half-block cells.
+        // Check the data and the complete white quiet zone, not only text output.
+        for y in 0..qr.size() + 8 {
+            for x in 0..qr.size() + 8 {
+                let cell = &buffer[(qr_area.x + 1 + x as u16, qr_area.y + 1 + (y / 2) as u16)];
+                let dark = match (cell.symbol(), y % 2) {
+                    ("█", _) | ("▀", 0) | ("▄", 1) => true,
+                    (" ", _) | ("▄", 0) | ("▀", 1) => false,
+                    value => panic!("unexpected QR cell {value:?}"),
+                };
+                assert_eq!(dark, qr.get_module(x - 4, y - 4), "QR module at {x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn pairing_qr_does_not_shrink_quiet_zone_to_fit_a_small_terminal() {
+        use crate::transport_crypto::render_qr_text_for_bounds;
+        let payload = "synthetic-qr-payload";
+        let full = render_qr_text_for_bounds(payload, 100, 60).unwrap();
+        let small = render_qr_text_for_bounds(payload, full.width - 1, full.height - 1).unwrap();
+        assert_eq!(full, small);
+        let mut config = crate::config::Config::default();
+        config.data_dir =
+            std::env::temp_dir().join(format!("todex-qr-test-{}", uuid::Uuid::new_v4()));
+        let mut app = super::TuiApp::new(config);
+        app.language = super::TuiLanguage::English;
+        app.pairing_qr = Some(super::PairingQr {
+            payloads: vec![payload.to_owned()],
+            active_index: 0,
+        });
+        let lines = app.pairing_qr_lines(full.width - 1, full.height - 1);
+        assert!(lines[0].to_string().contains("too small"));
+        assert!(!lines
+            .iter()
+            .any(|line| line.to_string().contains(['█', '▀', '▄'])));
+    }
 
     #[test]
     fn validate_host_accepts_ip_addresses() {
