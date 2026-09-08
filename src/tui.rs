@@ -1282,8 +1282,8 @@ impl TuiApp {
         });
         self.notice = self
             .text(
-                "Pairing encryption edit window is open. Use Left/Right to switch.",
-                "配对加密编辑窗口已打开。使用左右方向键切换。",
+                "Required encryption edit window is open. Use Left/Right to switch.",
+                "强制加密编辑窗口已打开。使用左右方向键切换。",
             )
             .to_owned();
     }
@@ -1371,9 +1371,14 @@ impl TuiApp {
             EditMode::Encryption { value } => {
                 self.config.pairing_encryption = value;
                 let subject = self
-                    .text("Pairing encryption updated", "配对加密已更新")
+                    .text(
+                        "Required transport encryption updated",
+                        "强制传输加密已更新",
+                    )
                     .to_owned();
-                self.auto_save_settings(&subject);
+                if self.auto_save_settings(&subject) {
+                    self.finish_reset(&subject).await;
+                }
             }
             EditMode::Reset { target } => self.reset_target(target).await?,
         }
@@ -1805,11 +1810,11 @@ impl TuiApp {
             )),
             Line::from(match self.language {
                 TuiLanguage::English => format!(
-                    "Pairing encryption: {} (action e)",
+                    "Required encryption: {} (action e)",
                     pairing_encryption_label(self.config.pairing_encryption)
                 ),
                 TuiLanguage::Chinese => format!(
-                    "配对加密：{}（操作 e）",
+                    "强制加密：{}（操作 e）",
                     pairing_encryption_label(self.config.pairing_encryption)
                 ),
             }),
@@ -1896,7 +1901,7 @@ impl TuiApp {
             self.text("Edit listen IP", "编辑监听 IP"),
             self.text("Edit listen port", "编辑监听端口"),
             self.text("Choose workspace root", "选择工作区根目录"),
-            self.text("Edit pairing encryption", "编辑配对加密"),
+            self.text("Edit required encryption", "编辑强制加密"),
             self.text("Reset", "重置"),
             self.text("Show pairing QR", "显示配对二维码"),
             self.text("Credentials & copy", "凭据与复制"),
@@ -2123,7 +2128,7 @@ impl TuiApp {
                 ],
             ),
             EditMode::Encryption { value } => (
-                self.text("Edit Pairing Encryption", "编辑配对加密")
+                self.text("Required Transport Encryption", "强制传输加密")
                     .to_owned(),
                 vec![
                     Line::from(""),
@@ -2151,12 +2156,12 @@ impl TuiApp {
                     ]),
                     Line::from(""),
                     Line::from(self.text(
-                        "Left/Right switches the encryption method.",
-                        "使用左右方向键切换加密方式。",
+                        "Required for sessions. None allows optional encryption.",
+                        "会话必须使用所选加密；None 允许可选加密。",
                     )),
                     Line::from(self.text(
-                        "Enter applies and auto-saves. Esc cancels.",
-                        "Enter 应用并自动保存，Esc 取消。",
+                        "Enter saves and restarts a running daemon. Esc cancels.",
+                        "Enter 保存并重启正在运行的 daemon，Esc 取消。",
                     )),
                 ],
             ),

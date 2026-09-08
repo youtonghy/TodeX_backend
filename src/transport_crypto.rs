@@ -337,19 +337,40 @@ pub struct TransportCryptoSession {
 impl TransportCryptoSession {
     pub fn from_headers_and_query(
         keys: &PairingKeys,
+        required: PairingEncryption,
         headers: &HeaderMap,
         query: Option<&str>,
     ) -> Result<Option<Self>, AppError> {
-        let enc = query_value(query, "enc")
-            .or_else(|| header_value(headers, "x-todex-encryption"))
-            .filter(|value| !value.trim().is_empty());
-        let Some(enc) = enc else {
+        // A present query parameter is authoritative, including invalid/empty
+        // values. Never fall back to a header or plaintext on malformed input.
+        let enc = match query_value(query, "enc") {
+            Some(value) => Some(value),
+            None => headers
+                .get("x-todex-encryption")
+                .map(|value| {
+                    value.to_str().map(str::to_owned).map_err(|_| {
+                        AppError::InvalidRequest("invalid encryption protocol header".to_owned())
+                    })
+                })
+                .transpose()?,
+        };
+        let protocol = match enc.as_deref() {
+            None | Some("none") => None,
+            Some(value) => Some(EncryptionProtocol::parse(value).ok_or_else(|| {
+                AppError::InvalidRequest(format!("unsupported encryption protocol: {value}"))
+            })?),
+        };
+        if required != PairingEncryption::None
+            && protocol.map(EncryptionProtocol::as_str) != Some(required.as_str())
+        {
+            return Err(AppError::Unauthorized(format!(
+                "Encryption public-key transfer verification is incomplete; server requires {} transport encryption",
+                required.as_str()
+            )));
+        }
+        let Some(protocol) = protocol else {
             return Ok(None);
         };
-
-        let protocol = EncryptionProtocol::parse(enc.as_str()).ok_or_else(|| {
-            AppError::InvalidRequest(format!("unsupported encryption protocol: {enc}"))
-        })?;
 
         let (shared, salt) = match protocol {
             EncryptionProtocol::X25519 => {
@@ -563,7 +584,7 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 fn query_value(query: Option<&str>, key: &str) -> Option<String> {
     let query = query?;
     query.split('&').find_map(|pair| {
-        let (raw_key, raw_value) = pair.split_once('=')?;
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
         if raw_key == key {
             Some(percent_decode(raw_value))
         } else {
@@ -1030,13 +1051,18 @@ mod tests {
         let client = X25519Secret::random_from_rng(OsRng);
         let client_public = X25519PublicKey::from(&client).to_bytes();
         let query = format!("enc=x25519&client_key={}", encode_b64(&client_public));
-        let session =
-            TransportCryptoSession::from_headers_and_query(&keys, &HeaderMap::new(), Some(&query))
-                .unwrap()
-                .unwrap();
+        let session = TransportCryptoSession::from_headers_and_query(
+            &keys,
+            PairingEncryption::None,
+            &HeaderMap::new(),
+            Some(&query),
+        )
+        .unwrap()
+        .unwrap();
         assert!(matches!(
             TransportCryptoSession::from_headers_and_query(
                 &keys,
+                PairingEncryption::None,
                 &HeaderMap::new(),
                 Some(&query)
             ),
@@ -1099,6 +1125,7 @@ mod tests {
         assert!(matches!(
             TransportCryptoSession::from_headers_and_query(
                 &keys,
+                PairingEncryption::None,
                 &HeaderMap::new(),
                 Some(&query)
             ),
@@ -1144,6 +1171,7 @@ mod tests {
         let query = format!("enc=x25519&client_key={}", encode_b64(&client_public));
         let session = TransportCryptoSession::from_headers_and_query(
             &second,
+            PairingEncryption::None,
             &HeaderMap::new(),
             Some(&query),
         )
@@ -1222,10 +1250,14 @@ mod tests {
             "enc=ml-kem-768&ciphertext={}",
             encode_b64(ciphertext.as_bytes())
         );
-        let session =
-            TransportCryptoSession::from_headers_and_query(&keys, &HeaderMap::new(), Some(&query))
-                .unwrap()
-                .unwrap();
+        let session = TransportCryptoSession::from_headers_and_query(
+            &keys,
+            PairingEncryption::None,
+            &HeaderMap::new(),
+            Some(&query),
+        )
+        .unwrap()
+        .unwrap();
 
         let salt = [keys.ml_kem_public.as_slice(), ciphertext.as_bytes()].concat();
         let mut key = [0_u8; 32];
@@ -1246,6 +1278,205 @@ mod tests {
             session.decrypt_client_text(&wrapped).unwrap(),
             r#"{"type":"ping"}"#
         );
+    }
+
+    #[test]
+    fn transport_policy_never_downgrades_malformed_or_overridden_protocols() {
+        let keys = PairingKeys::generate();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-todex-encryption", "x25519".parse().unwrap());
+        for query in ["enc=", "enc", "enc=invalid", "enc=none", "enc=ml-kem-768"] {
+            assert!(
+                TransportCryptoSession::from_headers_and_query(
+                    &keys,
+                    PairingEncryption::X25519,
+                    &headers,
+                    Some(query)
+                )
+                .is_err(),
+                "{query}"
+            );
+        }
+        for query in ["enc=", "enc", "enc=invalid"] {
+            assert!(TransportCryptoSession::from_headers_and_query(
+                &keys,
+                PairingEncryption::None,
+                &headers,
+                Some(query)
+            )
+            .is_err());
+        }
+        headers.insert(
+            "x-todex-encryption",
+            axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        assert!(TransportCryptoSession::from_headers_and_query(
+            &keys,
+            PairingEncryption::None,
+            &headers,
+            None
+        )
+        .is_err());
+        assert!(TransportCryptoSession::from_headers_and_query(
+            &keys,
+            PairingEncryption::None,
+            &HeaderMap::new(),
+            Some("enc=none")
+        )
+        .unwrap()
+        .is_none());
+        // Explicit query choice wins over a conflicting header.
+        assert!(TransportCryptoSession::from_headers_and_query(
+            &keys,
+            PairingEncryption::None,
+            &headers,
+            Some("enc=none")
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn transport_policy_real_websocket_enforces_both_protocols_and_preserves_bootstrap() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+        for required in [
+            PairingEncryption::None,
+            PairingEncryption::X25519,
+            PairingEncryption::MlKem768,
+        ] {
+            let root = unique_tmp_dir("todex-transport-policy");
+            let mut config = test_config();
+            config.data_dir = root.join("data");
+            config.workspace_root = root.join("workspace");
+            config.pairing_encryption = required;
+            let state = crate::app_state::AppState::new(config).await.unwrap();
+            let keys = state.pairing_keys.clone();
+            let app = crate::server::router(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            });
+            let http = reqwest::Client::new();
+            let policy = http
+                .get(format!("http://{address}/v2/transport-policy"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(policy.status(), 200);
+            assert_eq!(policy.headers()["cache-control"], "no-store");
+            assert_eq!(
+                policy.json::<serde_json::Value>().await.unwrap(),
+                json!({"requiredProtocol": required.as_str()})
+            );
+            let client = X25519Secret::random_from_rng(OsRng);
+            let bootstrap = http.post(format!("http://{address}/v2/device-pairing/create")).json(&json!({
+                "deviceName": "policy test", "clientPublicKey": encode_b64(X25519PublicKey::from(&client).as_bytes())
+            })).send().await.unwrap();
+            assert_eq!(bootstrap.status(), 200);
+            let base = format!("ws://{address}/v2/ws?access_token=token");
+            let plaintext = tokio_tungstenite::connect_async(&base).await;
+            if required == PairingEncryption::None {
+                plaintext.unwrap().0.close(None).await.unwrap();
+            } else {
+                assert!(
+                    matches!(plaintext, Err(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status() == 403)
+                );
+                let wrong = if required == PairingEncryption::X25519 {
+                    "ml-kem-768"
+                } else {
+                    "x25519"
+                };
+                for enc in ["none", "", "invalid", wrong] {
+                    assert!(
+                        tokio_tungstenite::connect_async(format!("{base}&enc={enc}"))
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+            // Query protocol is authoritative over a conflicting header.
+            let protocol = if required == PairingEncryption::MlKem768 {
+                EncryptionProtocol::MlKem768
+            } else {
+                EncryptionProtocol::X25519
+            };
+            let (query, shared, salt) = match protocol {
+                EncryptionProtocol::X25519 => {
+                    let public = X25519PublicKey::from(&client).to_bytes();
+                    let shared = client.diffie_hellman(&X25519PublicKey::from(keys.x25519_public));
+                    (
+                        format!("enc=x25519&client_key={}", encode_b64(&public)),
+                        shared.as_bytes().to_vec(),
+                        [keys.x25519_public.as_slice(), public.as_slice()].concat(),
+                    )
+                }
+                EncryptionProtocol::MlKem768 => {
+                    let public = mlkem768::PublicKey::from_bytes(&keys.ml_kem_public).unwrap();
+                    let (shared, ciphertext) = mlkem768::encapsulate(&public);
+                    (
+                        format!(
+                            "enc=ml-kem-768&ciphertext={}",
+                            encode_b64(ciphertext.as_bytes())
+                        ),
+                        shared.as_bytes().to_vec(),
+                        [keys.ml_kem_public.as_slice(), ciphertext.as_bytes()].concat(),
+                    )
+                }
+            };
+            let mut key = [0; 32];
+            Hkdf::<Sha256>::new(Some(&salt), &shared)
+                .expand(protocol.as_str().as_bytes(), &mut key)
+                .unwrap();
+            let client_crypto = TransportCryptoSession {
+                protocol,
+                cipher: Arc::new(XChaCha20Poly1305::new(Key::from_slice(&key))),
+                send_counter: Arc::new(AtomicU64::new(0)),
+                receive_counter: Arc::new(AtomicU64::new(0)),
+            };
+            let mut request = format!("{base}&{query}").into_client_request().unwrap();
+            request
+                .headers_mut()
+                .insert("x-todex-encryption", "none".parse().unwrap());
+            let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            socket
+                .send(Message::Text(
+                    client_crypto
+                        .encrypt_client_text_for_tests(
+                            &json!({"id":"policy-ping", "type":"server.ping", "payload":{}})
+                                .to_string(),
+                        )
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                        continue;
+                    };
+                    let plain = client_crypto.decrypt_server_text_for_tests(&text).unwrap();
+                    let message: serde_json::Value = serde_json::from_str(&plain).unwrap();
+                    if message["id"] == "policy-ping" {
+                        assert_eq!(message["payload"]["pong"], true);
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            socket.close(None).await.unwrap();
+            server.abort();
+            let _ = server.await;
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     fn test_config() -> Config {

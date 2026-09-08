@@ -134,7 +134,12 @@ pub fn transport_crypto_from_handshake(
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> Result<Option<TransportCryptoSession>, AppError> {
-    TransportCryptoSession::from_headers_and_query(&state.pairing_keys, headers, query)
+    TransportCryptoSession::from_headers_and_query(
+        &state.pairing_keys,
+        state.config.pairing_encryption,
+        headers,
+        query,
+    )
 }
 
 #[derive(Default)]

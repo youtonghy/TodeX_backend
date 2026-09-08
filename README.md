@@ -167,7 +167,7 @@ Configuration values are resolved using the following precedence:
 | **Pi Binary** | — | `TODEX_AGENTD_PI_BIN` | `pi` | Path or executable name for Pi CLI. |
 | **Enable Auth** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | Enables fail-closed Bearer authentication. |
 | **Auth Token** | — | `TODEX_AGENTD_AUTH_TOKEN` | *None* | Bearer token secret. |
-| **Pairing Encryption** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | Pairing encryption algorithm (`none`, `x25519`, `ml-kem-768`). |
+| **Pairing Encryption** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | Required WebSocket encryption (`x25519` or `ml-kem-768`); `none` permits plaintext or optional encryption. Clients must import the matching public key separately from device approval. |
 
 ### Example `config.toml`
 
