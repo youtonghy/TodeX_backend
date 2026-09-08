@@ -14,13 +14,10 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use serde_json::Value;
 
@@ -36,9 +33,22 @@ const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
 const EDIT_POPUP_WIDTH: u16 = 64;
 
-// A single border treatment keeps nested views and overlays visually consistent.
+mod positioned_backend;
+use positioned_backend::PositionedBackend;
+
+// Box-drawing glyphs have ambiguous terminal widths. ASCII frame characters
+// stay one cell wide even when the host uses a different Unicode width table.
 fn panel_block<'a>() -> Block<'a> {
-    Block::default().border_type(BorderType::Rounded)
+    Block::default().border_set(ratatui::symbols::border::Set {
+        top_left: "+",
+        top_right: "+",
+        bottom_left: "+",
+        bottom_right: "+",
+        vertical_left: "|",
+        vertical_right: "|",
+        horizontal_top: "-",
+        horizontal_bottom: "-",
+    })
 }
 
 pub async fn run(args: ServeArgs) -> Result<()> {
@@ -76,11 +86,13 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
-fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+fn init_terminal() -> Result<Terminal<PositionedBackend<io::BufWriter<io::Stdout>>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    match Terminal::new(CrosstermBackend::new(stdout)) {
+    // Absolute cell positioning emits more ANSI bytes. Buffer them so cursor
+    // corrections are delivered together instead of making per-cell writes.
+    match Terminal::new(PositionedBackend::new(io::BufWriter::new(stdout))) {
         Ok(mut terminal) => {
             terminal.clear()?;
             Ok(terminal)
@@ -3675,14 +3687,12 @@ mod tests {
                         contents.contains(&format!("> [{shortcut}]")),
                         "selected {selected} missing at {width}x{height}"
                     );
-                    // Every pane retains a complete rounded perimeter, even at compact sizes.
-                    for (left, right) in [("╭", "╮"), ("╰", "╯")] {
-                        assert_eq!(
-                            contents.matches(left).count(),
-                            contents.matches(right).count()
-                        );
-                    }
-                    assert!(!contents.contains("┌"));
+                    // Each framed row starts and ends at fixed columns. Frame
+                    // glyphs themselves must not depend on ambiguous widths.
+                    assert!(!contents
+                        .chars()
+                        .any(|ch| ('\u{2500}'..='\u{257f}').contains(&ch)));
+                    assert!(contents.matches('+').count() >= 12);
                     if width >= 80 {
                         assert!(contents.contains("[s]"));
                         assert!(contents.contains("[q]"));
