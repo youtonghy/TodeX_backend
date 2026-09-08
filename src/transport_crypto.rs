@@ -1,3 +1,5 @@
+pub(crate) mod pairing_browser;
+
 use std::collections::HashSet;
 use std::net::{IpAddr, UdpSocket};
 use std::path::Path;
@@ -655,6 +657,98 @@ async fn set_owner_only_permissions(_path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Render locally generated QR geometry only. Payload text never becomes HTML,
+/// a script literal, a URL, or an attribute value.
+pub(crate) fn render_pairing_qr_browser_html(payloads: &[String]) -> Result<String, AppError> {
+    if payloads.is_empty() || payloads.len() > 128 {
+        return Err(AppError::InvalidRequest(
+            "invalid pairing QR frame count".to_owned(),
+        ));
+    }
+    let mut frames = String::new();
+    for (index, payload) in payloads.iter().enumerate() {
+        let qr = QrCode::encode_text(payload, QrCodeEcc::Low).map_err(|_| {
+            AppError::InvalidRequest("pairing payload is too large for QR".to_owned())
+        })?;
+        let modules = qr.size() + 8;
+        let pixels = modules * 8;
+        let mut path = String::new();
+        for y in 0..qr.size() {
+            for x in 0..qr.size() {
+                if qr.get_module(x, y) {
+                    use std::fmt::Write;
+                    write!(&mut path, "M{} {}h1v1h-1z", x + 4, y + 4).expect("writing to String");
+                }
+            }
+        }
+        use std::fmt::Write;
+        write!(&mut frames,
+            r##"<div class="qr-frame"{}><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="配对二维码 {} / {}" width="{}" height="{}" viewBox="0 0 {} {}" shape-rendering="crispEdges"><rect width="{}" height="{}" fill="#ffffff"/><path fill="#000000" d="{}"/></svg></div>"##,
+            if index == 0 { "" } else { " hidden" }, index + 1, payloads.len(), pixels, pixels,
+            modules, modules, modules, modules, path,
+        ).expect("writing to String");
+    }
+    let script_hash = base64::engine::general_purpose::STANDARD
+        .encode(Sha256::digest(PAIRING_BROWSER_SCRIPT.as_bytes()));
+    let controls_disabled = if payloads.len() == 1 { " disabled" } else { "" };
+    Ok(format!(
+        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{script_hash}'; base-uri 'none'; form-action 'none'; object-src 'none'; connect-src 'none'"><title>TodeX 配对</title><style>{style}</style></head><body><main><h1>TodeX 配对</h1><p>在客户端导入同一组的全部二维码。</p><div class="qr-window">{frames}</div><nav aria-label="二维码分片"><button id="previous" type="button"{controls_disabled}>← 上一张</button><output id="counter" aria-live="polite">1 / {total}</output><button id="next" type="button"{controls_disabled}>下一张 →</button></nav><p class="hint">也可使用方向键切换；二维码已完整保留白色边缘。</p></main><script>{script}</script></body></html>"#,
+        style = PAIRING_BROWSER_STYLE,
+        total = payloads.len(),
+        script = PAIRING_BROWSER_SCRIPT,
+    ))
+}
+
+const PAIRING_BROWSER_STYLE: &str = r#"
+* { box-sizing: border-box; }
+html { background: #f4f6f8; color: #172129; font-family: system-ui, sans-serif; color-scheme: light; }
+body { margin: 0; padding: 24px; min-height: 100vh; display: grid; place-items: center; }
+main { text-align: center; max-width: 100%; }
+h1 { margin: 0 0 8px; font-size: 24px; }
+p { margin: 8px 0 18px; }
+.qr-window { max-width: 100%; overflow: auto; }
+.qr-frame { width: fit-content; margin: auto; background: #fff; }
+.qr-frame[hidden] { display: none; }
+svg { display: block; }
+nav { display: flex; align-items: center; justify-content: center; gap: 20px; margin-top: 20px; }
+button { border: 1px solid #bac5ce; border-radius: 8px; background: #fff; color: #172129; padding: 10px 16px; font: inherit; cursor: pointer; }
+button:focus-visible { outline: 3px solid #168a70; outline-offset: 3px; }
+button:disabled { opacity: .45; cursor: default; }
+output { min-width: 64px; font-variant-numeric: tabular-nums; }
+.hint { font-size: 13px; color: #52606b; margin-bottom: 0; }
+"#;
+
+const PAIRING_BROWSER_SCRIPT: &str = r#"
+'use strict';
+const frames = Array.from(document.querySelectorAll('.qr-frame'));
+const counter = document.getElementById('counter');
+let active = 0;
+function fit() {
+  const svg = frames[active].querySelector('svg');
+  const modules = svg.viewBox.baseVal.width;
+  const availableWidth = Math.max(1, document.documentElement.clientWidth - 48);
+  const availableHeight = Math.max(1, window.innerHeight - 210);
+  const scale = Math.max(1, Math.min(8, Math.floor(availableWidth / modules), Math.floor(availableHeight / modules)));
+  svg.setAttribute('width', String(modules * scale));
+  svg.setAttribute('height', String(modules * scale));
+}
+function show(index) {
+  frames[active].hidden = true;
+  active = (index + frames.length) % frames.length;
+  frames[active].hidden = false;
+  counter.textContent = (active + 1) + ' / ' + frames.length;
+  fit();
+}
+document.getElementById('previous').addEventListener('click', () => show(active - 1));
+document.getElementById('next').addEventListener('click', () => show(active + 1));
+document.addEventListener('keydown', event => {
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') { event.preventDefault(); show(active - 1); }
+  if (event.key === 'ArrowRight' || event.key === 'ArrowDown') { event.preventDefault(); show(active + 1); }
+});
+window.addEventListener('resize', fit);
+fit();
+"#;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QrRenderMode {
     HalfBlock,
@@ -750,6 +844,50 @@ mod tests {
     use super::*;
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use std::path::PathBuf;
+
+    #[test]
+    fn browser_pairing_page_is_self_contained_and_escapes_payload_by_geometry() {
+        let payload = "synthetic-</script><img src=malicious onerror=alert(1)>".to_owned();
+        let html = render_pairing_qr_browser_html(&[payload.clone()]).unwrap();
+        let size = QrCode::encode_text(&payload, QrCodeEcc::Low)
+            .unwrap()
+            .size()
+            + 8;
+        assert!(!html.contains(&payload));
+        assert!(!html.contains("onerror="));
+        assert!(html.contains(&format!("viewBox=\"0 0 {size} {size}\"")));
+        assert!(html.contains(&format!("width=\"{}\" height=\"{}\"", size * 8, size * 8)));
+        assert!(html.contains("shape-rendering=\"crispEdges\""));
+        assert!(html.contains("connect-src 'none'"));
+        assert!(html.contains("default-src 'none'"));
+        assert!(html.contains("type=\"button\" disabled"));
+        let hash = base64::engine::general_purpose::STANDARD
+            .encode(Sha256::digest(PAIRING_BROWSER_SCRIPT.as_bytes()));
+        assert!(html.contains(&format!("script-src 'sha256-{hash}'")));
+        assert!(html.contains("ArrowLeft") && html.contains("ArrowRight"));
+        assert!(html.contains("ArrowUp") && html.contains("ArrowDown"));
+    }
+
+    #[test]
+    fn browser_pairing_page_keeps_all_segments_with_one_visible_frame() {
+        let keys = PairingKeys::generate();
+        let mut config = test_config();
+        config.security.auth_token = None;
+        let payloads = keys
+            .pairing_qr_payloads(&config, 7345, PairingEncryption::MlKem768)
+            .unwrap();
+        let html = render_pairing_qr_browser_html(&payloads).unwrap();
+        assert!(payloads.len() > 1);
+        assert_eq!(html.matches("<svg ").count(), payloads.len());
+        assert_eq!(
+            html.matches("class=\"qr-frame\" hidden").count(),
+            payloads.len() - 1
+        );
+        assert!(!html.contains("todex-pairing-chunk"));
+        assert!(!html.contains("publicKey"));
+        assert!(render_pairing_qr_browser_html(&[]).is_err());
+        assert!(render_pairing_qr_browser_html(&vec!["synthetic".to_owned(); 129]).is_err());
+    }
 
     #[test]
     fn pairing_qr_embeds_selected_public_key() {

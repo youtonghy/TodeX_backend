@@ -119,6 +119,8 @@ cargo run -- tui
 
 The TUI allows starting and stopping the background daemon, viewing live server logs, and displaying QR codes for mobile client pairing. Quitting the TUI keeps the daemon running in the background.
 
+Pairing QR codes use solid terminal cell backgrounds to avoid gaps caused by terminal fonts. If the code does not fit, press `b` in the QR popup to view it in your default browser. The browser page renders a square SVG code and supports Left/Right keys or buttons to switch ML-KEM segments. It loads no external resources; its private temporary file is removed when the TUI exits.
+
 #### Option B: Foreground Server
 
 ```bash

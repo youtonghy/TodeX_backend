@@ -169,6 +169,7 @@ struct TuiApp {
     observer_scroll: usize,
     log_follow_tail: bool,
     pairing_qr: Option<PairingQr>,
+    pairing_browser_pages: Vec<crate::transport_crypto::pairing_browser::PairingQrBrowserPage>,
     credentials: Option<CredentialsPopup>,
     folder_picker: Option<FolderPicker>,
     language: TuiLanguage,
@@ -207,6 +208,7 @@ impl TuiApp {
             observer_scroll: 0,
             log_follow_tail: true,
             pairing_qr: None,
+            pairing_browser_pages: Vec::new(),
             credentials: None,
             folder_picker: None,
             language,
@@ -296,10 +298,10 @@ impl TuiApp {
                     active_index: 0,
                 });
                 self.notice = match (self.language, total > 1) {
-                    (TuiLanguage::English, true) => format!("Pairing QR is open in the center window. Use Left/Right to switch {total} segments."),
-                    (TuiLanguage::Chinese, true) => format!("配对二维码已打开。使用左右方向键切换 {total} 个分段。"),
-                    (TuiLanguage::English, false) => "Pairing QR is open in the center window.".to_owned(),
-                    (TuiLanguage::Chinese, false) => "配对二维码已在中央窗口打开。".to_owned(),
+                    (TuiLanguage::English, true) => format!("Pairing QR is open in the center window. Use Left/Right to switch {total} segments; b opens a browser."),
+                    (TuiLanguage::Chinese, true) => format!("配对二维码已打开。使用左右方向键切换 {total} 个分段，按 b 在浏览器查看。"),
+                    (TuiLanguage::English, false) => "Pairing QR is open in the center window; b opens a browser.".to_owned(),
+                    (TuiLanguage::Chinese, false) => "配对二维码已在中央窗口打开，按 b 在浏览器查看。".to_owned(),
                 };
             }
             Err(error) => {
@@ -412,6 +414,34 @@ impl TuiApp {
         }
     }
 
+    async fn open_pairing_qr_browser(&mut self) {
+        let Some(qr) = self.pairing_qr.as_ref() else {
+            return;
+        };
+        match crate::transport_crypto::pairing_browser::open_pairing_qr_browser(&qr.payloads).await
+        {
+            Ok(page) => {
+                self.pairing_browser_pages.push(page);
+                self.notice = self
+                    .text(
+                        "Pairing QR opened in your browser.",
+                        "已在浏览器中打开配对二维码。",
+                    )
+                    .to_owned();
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.notice = self
+                    .text(
+                        "Could not open the pairing QR in a browser.",
+                        "无法在浏览器中打开配对二维码。",
+                    )
+                    .to_owned();
+                self.last_error = Some(error.to_string());
+            }
+        }
+    }
+
     fn close_pairing_qr(&mut self) {
         if self.pairing_qr.is_some() {
             self.pairing_qr = None;
@@ -480,6 +510,7 @@ impl TuiApp {
 
         if self.pairing_qr.is_some() {
             match key.code {
+                KeyCode::Char('b') => self.open_pairing_qr_browser().await,
                 KeyCode::Left | KeyCode::PageUp => self.previous_pairing_qr(),
                 KeyCode::Right | KeyCode::PageDown => self.next_pairing_qr(),
                 KeyCode::Esc | KeyCode::Char('q') => self.close_pairing_qr(),
@@ -1888,18 +1919,21 @@ impl TuiApp {
         let title = match self.pairing_qr.as_ref() {
             Some(qr) if qr.payloads.len() > 1 => match self.language {
                 TuiLanguage::English => format!(
-                    "Pairing QR {}/{} - Left/Right switch, Esc closes",
+                    "Pairing QR {}/{} - Left/Right switch, b browser, Esc closes",
                     qr.active_index + 1,
                     qr.payloads.len()
                 ),
                 TuiLanguage::Chinese => format!(
-                    "配对二维码 {}/{} - 左右键切换，Esc 关闭",
+                    "配对二维码 {}/{} - 左右切换，b 浏览器，Esc 关闭",
                     qr.active_index + 1,
                     qr.payloads.len()
                 ),
             },
             Some(_) | None => self
-                .text("Pairing QR - any key closes", "配对二维码 - 按任意键关闭")
+                .text(
+                    "Pairing QR - b browser, Esc closes",
+                    "配对二维码 - b 浏览器，Esc 关闭",
+                )
                 .to_owned(),
         };
         let max_popup_width = area
@@ -1931,12 +1965,37 @@ impl TuiApp {
                 self.text("Failed to render pairing QR.", "无法生成配对二维码。"),
             )];
         };
-        match render_qr_text_for_bounds(payload, max_width, max_height) {
-            Ok(rendered) if rendered.width <= max_width && rendered.height <= max_height => {
+        match render_qr_text_for_bounds(payload, max_width / 2, max_height / 2) {
+            Ok(rendered)
+                if rendered.width.saturating_mul(2) <= max_width
+                    && rendered.height.saturating_mul(2) <= max_height =>
+            {
+                // Decode the compact representation into complete background cells.
+                // Glyphs such as ▀/▄/█ can leave gaps with terminal font leading;
+                // backgrounds cover the entire cell regardless of font metrics.
                 rendered
                     .text
                     .lines()
-                    .map(|line| Line::from(line.to_owned()))
+                    .flat_map(|line| {
+                        (0..2).map(move |half| {
+                            Line::from(
+                                line.chars()
+                                    .map(|cell| {
+                                        let dark =
+                                            matches!((cell, half), ('█', _) | ('▀', 0) | ('▄', 1));
+                                        Span::styled(
+                                            "  ",
+                                            Style::reset().fg(Color::Rgb(0, 0, 0)).bg(if dark {
+                                                Color::Rgb(0, 0, 0)
+                                            } else {
+                                                Color::Rgb(255, 255, 255)
+                                            }),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                    })
                     .collect()
             }
             Ok(rendered) => vec![
@@ -1946,17 +2005,19 @@ impl TuiApp {
                 )),
                 Line::from(match self.language {
                     TuiLanguage::English => format!(
-                        "Need at least {}x{} cells for the compact code.",
-                        rendered.width, rendered.height
+                        "Need at least {}x{} cells for the code.",
+                        rendered.width.saturating_mul(2),
+                        rendered.height.saturating_mul(2)
                     ),
                     TuiLanguage::Chinese => format!(
-                        "紧凑二维码至少需要 {}x{} 个字符单元。",
-                        rendered.width, rendered.height
+                        "二维码至少需要 {}x{} 个字符单元。",
+                        rendered.width.saturating_mul(2),
+                        rendered.height.saturating_mul(2)
                     ),
                 }),
                 Line::from(self.text(
-                    "Resize the window and it will redraw automatically.",
-                    "调整窗口大小后会自动重绘。",
+                    "Press b to view in a browser, or enlarge the terminal.",
+                    "按 b 在浏览器查看，或放大终端窗口。",
                 )),
             ],
             Err(error) => vec![
@@ -3123,21 +3184,29 @@ mod tests {
             for x in qr_area.left()..qr_area.right() {
                 let cell = &buffer[(x, y)];
                 assert_eq!(cell.fg, Color::Rgb(0, 0, 0));
-                assert_eq!(cell.bg, Color::Rgb(255, 255, 255));
+                assert!(matches!(
+                    cell.bg,
+                    Color::Rgb(0, 0, 0) | Color::Rgb(255, 255, 255)
+                ));
                 assert!(!cell.modifier.intersects(Modifier::REVERSED | Modifier::DIM));
             }
         }
-        // Reconstruct each QR pixel from the actual rendered half-block cells.
-        // Check the data and the complete white quiet zone, not only text output.
+        // Every module consists of two ordinary spaces with a solid background.
+        // This remains contiguous even if the terminal adds font leading.
         for y in 0..qr.size() + 8 {
             for x in 0..qr.size() + 8 {
-                let cell = &buffer[(qr_area.x + 1 + x as u16, qr_area.y + 1 + (y / 2) as u16)];
-                let dark = match (cell.symbol(), y % 2) {
-                    ("█", _) | ("▀", 0) | ("▄", 1) => true,
-                    (" ", _) | ("▄", 0) | ("▀", 1) => false,
-                    value => panic!("unexpected QR cell {value:?}"),
-                };
-                assert_eq!(dark, qr.get_module(x - 4, y - 4), "QR module at {x},{y}");
+                for column in 0..2 {
+                    let cell = &buffer[(
+                        qr_area.x + 1 + (x * 2 + column) as u16,
+                        qr_area.y + 1 + y as u16,
+                    )];
+                    assert_eq!(cell.symbol(), " ");
+                    assert_eq!(
+                        cell.bg == Color::Rgb(0, 0, 0),
+                        qr.get_module(x - 4, y - 4),
+                        "QR module at {x},{y}"
+                    );
+                }
             }
         }
     }
@@ -3158,7 +3227,12 @@ mod tests {
             payloads: vec![payload.to_owned()],
             active_index: 0,
         });
-        let lines = app.pairing_qr_lines(full.width - 1, full.height - 1);
+        let fits = app.pairing_qr_lines(full.width * 2, full.height * 2);
+        assert_eq!(fits.len(), usize::from(full.height * 2));
+        assert!(fits
+            .iter()
+            .all(|line| line.width() == usize::from(full.width * 2)));
+        let lines = app.pairing_qr_lines(full.width * 2 - 1, full.height * 2 - 1);
         assert!(lines[0].to_string().contains("too small"));
         assert!(!lines
             .iter()
