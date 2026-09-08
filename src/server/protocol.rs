@@ -141,6 +141,26 @@ impl GitOperation {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GitStatusResponse {
+    pub repository_path: String,
+    pub initialized: bool,
+    pub branch: Option<String>,
+    pub worktree_kind: Option<GitWorktreeKind>,
+    pub changed_files: u64,
+    pub additions: u64,
+    pub deletions: u64,
+    pub stats_truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GitWorktreeKind {
+    Main,
+    Linked,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GitWorkspaceResponse {
     pub repository_path: String,
     pub initialized: bool,

@@ -98,6 +98,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v2/git/scan", get(git_scan))
         .route("/v2/git/run", post(git_run))
         .route("/v2/git/workspace", get(git_workspace))
+        .route("/v2/git/status", get(git_status))
         .route("/v2/git/operation", post(git_operation))
         .route("/v2/browser/fetch", post(browser_fetch))
         .route("/v2/providers", get(providers))
@@ -489,6 +490,30 @@ pub(super) async fn git_run(
         result.as_ref().err().map(AppError::code).unwrap_or("OK"),
         None,
         result.as_ref().ok().map(|value| value.output.len()),
+    )
+    .await;
+    combine_git_result(result.map(Json), audit)
+}
+
+pub(super) async fn git_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<super::protocol::GitScanQuery>,
+) -> Result<Json<super::protocol::GitStatusResponse>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace_path)?;
+    let result = git::status::read(&state.config.workspace_root, &workspace).await;
+    let audit = append_git_audit(
+        &state,
+        &auth,
+        "status",
+        &workspace,
+        None,
+        if result.is_ok() { "allow" } else { "deny" },
+        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
+        None,
+        None,
     )
     .await;
     combine_git_result(result.map(Json), audit)
@@ -2757,6 +2782,42 @@ mod tests {
                 .unwrap();
         assert_eq!(payload["initialized"], true);
         assert_eq!(payload["branches"], json!([]));
+        let status_uri = format!("/v2/git/status?workspacePath={}", workspace.display());
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&status_uri)
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(status_uri)
+                    .header("authorization", auth.unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status: Value =
+            serde_json::from_slice(&to_bytes(status.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(status["initialized"], true);
+        assert_eq!(status["worktreeKind"], "main");
+        assert_eq!(status["changedFiles"], 0);
+        assert_eq!(status["additions"], 0);
+        assert_eq!(status["deletions"], 0);
+        assert_eq!(status["statsTruncated"], false);
+
         let mut manifest = crate::conversation::ConversationManifest::new(
             ProviderKind::Pi,
             fs::canonicalize(&workspace).unwrap(),

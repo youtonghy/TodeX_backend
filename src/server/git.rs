@@ -1,5 +1,6 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
+pub(crate) mod status;
 pub(crate) mod workspace;
 
 use std::{
