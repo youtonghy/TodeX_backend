@@ -93,6 +93,94 @@ pub struct GitRunResponse {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitOperationRequest {
+    pub workspace_path: String,
+    pub operation: GitOperation,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(
+    tag = "action",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum GitOperation {
+    Init {},
+    Push {},
+    CreateBranch {
+        branch_name: String,
+        start_point: Option<String>,
+    },
+    SwitchBranch {
+        branch_name: String,
+    },
+    CreateWorktree {
+        path: String,
+        branch_name: String,
+        start_point: Option<String>,
+    },
+    RemoveWorktree {
+        path: String,
+    },
+}
+
+impl GitOperation {
+    pub fn action(&self) -> &'static str {
+        match self {
+            Self::Init {} => "init",
+            Self::Push {} => "push",
+            Self::CreateBranch { .. } => "create-branch",
+            Self::SwitchBranch { .. } => "switch-branch",
+            Self::CreateWorktree { .. } => "create-worktree",
+            Self::RemoveWorktree { .. } => "remove-worktree",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorkspaceResponse {
+    pub repository_path: String,
+    pub initialized: bool,
+    pub current_branch: String,
+    pub branches: Vec<GitBranch>,
+    pub worktrees: Vec<GitWorktree>,
+    pub dirty: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranch {
+    pub name: String,
+    pub current: bool,
+    pub remote: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktree {
+    pub path: String,
+    pub branch: String,
+    pub current: bool,
+    pub main: bool,
+    pub locked: bool,
+    pub dirty: bool,
+    pub accessible: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitOperationResponse {
+    pub repository_path: String,
+    pub action: String,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct ClientMessage {
     pub id: String,
     #[serde(flatten)]

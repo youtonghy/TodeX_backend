@@ -97,6 +97,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v2/workspace/file", get(workspace_file))
         .route("/v2/git/scan", get(git_scan))
         .route("/v2/git/run", post(git_run))
+        .route("/v2/git/workspace", get(git_workspace))
+        .route("/v2/git/operation", post(git_operation))
         .route("/v2/browser/fetch", post(browser_fetch))
         .route("/v2/providers", get(providers))
         .route("/v2/providers/versions", get(provider_versions))
@@ -484,6 +486,98 @@ pub(super) async fn git_run(
         &workspace,
         repository,
         decision,
+        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
+        None,
+        result.as_ref().ok().map(|value| value.output.len()),
+    )
+    .await;
+    combine_git_result(result.map(Json), audit)
+}
+
+pub(super) async fn git_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<super::protocol::GitScanQuery>,
+) -> Result<Json<super::protocol::GitWorkspaceResponse>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace_path)?;
+    let result = git::workspace::snapshot(&state.config.workspace_root, &workspace).await;
+    let audit = append_git_audit(
+        &state,
+        &auth,
+        "workspace",
+        &workspace,
+        None,
+        if result.is_ok() { "allow" } else { "deny" },
+        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
+        None,
+        None,
+    )
+    .await;
+    combine_git_result(result.map(Json), audit)
+}
+
+pub(super) async fn git_operation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<super::protocol::GitOperationResponse>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let request: super::protocol::GitOperationRequest =
+        serde_json::from_value(payload).map_err(|error| {
+            AppError::InvalidRequest(format!(
+                "invalid Git operation: {}",
+                truncate_git_error(error.to_string(), 256)
+            ))
+        })?;
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_root, &request.workspace_path)?;
+    let _trust = state
+        .workspace_trust
+        .acquire_owned(&auth.tenant_id, &workspace)
+        .await?;
+    // An active Agent may be writing files. Reject instead of changing its checkout
+    // beneath it. This is a preflight guard, not a lock against external Git tools.
+    let target = match &request.operation {
+        super::protocol::GitOperation::RemoveWorktree { path } => Some(
+            validate_workspace_directory_text(&state.config.workspace_root, path)?,
+        ),
+        _ => None,
+    };
+    for manifest in state.conversations.list_owned(&auth.tenant_id).await? {
+        if matches!(
+            manifest.status,
+            crate::conversation::ConversationStatus::Running
+                | crate::conversation::ConversationStatus::WaitingPermission
+        ) {
+            let active_path =
+                std::fs::canonicalize(&manifest.workspace).unwrap_or(manifest.workspace);
+            if active_path.starts_with(&workspace)
+                || target
+                    .as_ref()
+                    .is_some_and(|path| active_path.starts_with(path))
+            {
+                return Err(AppError::Conflict(
+                    "Wait for the active Agent turn to finish before changing Git state".to_owned(),
+                ));
+            }
+        }
+    }
+    let result = git::workspace::operate(
+        &state.config.workspace_root,
+        &state.config.data_dir,
+        &workspace,
+        &request.operation,
+    )
+    .await;
+    let audit = append_git_audit(
+        &state,
+        &auth,
+        request.operation.action(),
+        &workspace,
+        Some(&workspace),
+        if result.is_ok() { "allow" } else { "deny" },
         result.as_ref().err().map(AppError::code).unwrap_or("OK"),
         None,
         result.as_ref().ok().map(|value| value.output.len()),
@@ -2537,6 +2631,169 @@ mod tests {
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use crate::conversation::{ConversationEventHub, ConversationStore};
     use crate::provider::ConversationSupervisor;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_workspace_operations_require_auth_owner_trust_and_idle_agent() {
+        let root = std::env::temp_dir().join(format!("todex-v2-git-workspace-{}", Uuid::new_v4()));
+        let workspace = root.join("workspaces/project");
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new(Config {
+            host: "127.0.0.1".into(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_root: root.join("workspaces"),
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".into(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: vec![],
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+                auth_token: Some("git-token".into()),
+            },
+        })
+        .await
+        .unwrap();
+        let app = crate::server::router(state.clone());
+        let request = |token: Option<&str>, operation: Value| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/v2/git/operation")
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                builder = builder.header("authorization", token);
+            }
+            builder
+                .body(Body::from(
+                    json!({"workspacePath":workspace, "operation":operation}).to_string(),
+                ))
+                .unwrap()
+        };
+        let auth = Some("Bearer git-token");
+        let init = json!({"action":"init"});
+        assert_eq!(
+            app.clone()
+                .oneshot(request(None, init.clone()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        state
+            .workspace_trust
+            .set_owned("another-owner", &workspace, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(auth, init.clone()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        state
+            .workspace_trust
+            .set_owned("local", &workspace, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(auth, json!({"action":"init", "command":"unsafe"})))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(auth, init))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let read_uri = format!("/v2/git/workspace?workspacePath={}", workspace.display());
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&read_uri)
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(read_uri)
+                    .header("authorization", auth.unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let payload: Value =
+            serde_json::from_slice(&to_bytes(snapshot.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(payload["initialized"], true);
+        assert_eq!(payload["branches"], json!([]));
+        let mut manifest = crate::conversation::ConversationManifest::new(
+            ProviderKind::Pi,
+            fs::canonicalize(&workspace).unwrap(),
+            None,
+            None,
+        );
+        manifest.status = crate::conversation::ConversationStatus::Running;
+        ConversationStore::new(state.config.data_dir.clone())
+            .await
+            .unwrap()
+            .create(manifest)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(auth, json!({"action":"push"})))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let outside = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/git/workspace?workspacePath={}",
+                        root.display()
+                    ))
+                    .header("authorization", auth.unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outside.status(), StatusCode::FORBIDDEN);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn browser_url_allowlist_accepts_only_loopback_hosts() {

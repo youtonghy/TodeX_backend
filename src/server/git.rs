@@ -1,5 +1,7 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
+pub(crate) mod workspace;
+
 use std::{
     collections::{HashSet, VecDeque},
     io,
@@ -594,17 +596,39 @@ async fn prepare_disabled_hooks_directory(data_dir: &Path) -> Result<PathBuf> {
 }
 
 async fn validate_mutation_execution_config(repository: &Path) -> Result<()> {
-    for (scope, operation) in [
-        ("--local", "git config --local --includes --list"),
-        ("--worktree", "git config --worktree --includes --list"),
-    ] {
-        let output = run_checked(
+    let local = run_checked(
+        repository,
+        &git_args(&["config", "--local", "--includes", "--null", "--list"]),
+        "git config --local --includes --list",
+    )
+    .await?;
+    validate_executable_config_entries(&local.stdout)?;
+    // Git refuses --worktree once linked worktrees exist unless the extension
+    // is enabled. Without it, local config is already the effective repo scope.
+    let extension = run_git_command(
+        repository,
+        &git_args(&[
+            "config",
+            "--local",
+            "--bool",
+            "--get",
+            "extensions.worktreeConfig",
+        ]),
+        "git config extensions.worktreeConfig",
+    )
+    .await?;
+    if extension.status.success() && extension.stdout.starts_with(b"true") {
+        let worktree = run_checked(
             repository,
-            &git_args(&["config", scope, "--includes", "--null", "--list"]),
-            operation,
+            &git_args(&["config", "--worktree", "--includes", "--null", "--list"]),
+            "git config --worktree --includes --list",
         )
         .await?;
-        validate_executable_config_entries(&output.stdout)?;
+        validate_executable_config_entries(&worktree.stdout)?;
+    } else if !extension.status.success() && extension.status.code() != Some(1) {
+        return Err(AppError::GitProcess(
+            "Cannot inspect worktree configuration".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -623,8 +647,8 @@ fn validate_executable_config_entries(output: &[u8]) -> Result<()> {
             .get(key_end.saturating_add(1)..)
             .map(String::from_utf8_lossy)
             .unwrap_or_default();
-        let executable_filter =
-            key.starts_with("filter.") && (key.ends_with(".clean") || key.ends_with(".process"));
+        let executable_filter = key.starts_with("filter.")
+            && (key.ends_with(".clean") || key.ends_with(".process") || key.ends_with(".smudge"));
         let remote_url =
             key.starts_with("remote.") && (key.ends_with(".url") || key.ends_with(".pushurl"));
         let remote_url_rewrite = key.starts_with("url.")
