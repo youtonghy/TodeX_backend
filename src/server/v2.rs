@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path as AxumPath, Query, State, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -47,6 +47,9 @@ const WS_PING_INTERVAL_SECS: u64 = 30;
 const WS_CLIENT_TIMEOUT_SECS: u64 = 90;
 const BROWSER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const BROWSER_FETCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const MAX_WORKSPACE_TEXT_BYTES: usize = 1024 * 1024;
+// Serialize compare-and-save across requests, including cancelled HTTP handlers.
+static WORKSPACE_FILE_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Command types handled natively by the v2 dispatcher. Everything else on the
 /// socket is a legacy `ClientMessage` (`terminal.*`, `codex.local.*`,
@@ -94,7 +97,15 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v2/workspace/entries", get(workspace_entries))
         .route("/v2/workspace/directories", get(workspace_directories))
-        .route("/v2/workspace/file", get(workspace_file))
+        .route(
+            "/v2/workspace/file",
+            get(workspace_file)
+                .put(save_workspace_file)
+                // Two 1 MiB strings may each expand sixfold when JSON escaped.
+                .layer(DefaultBodyLimit::max(
+                    12 * MAX_WORKSPACE_TEXT_BYTES + 64 * 1024,
+                )),
+        )
         .route("/v2/git/scan", get(git_scan))
         .route("/v2/git/run", post(git_run))
         .route("/v2/git/workspace", get(git_workspace))
@@ -414,6 +425,89 @@ pub(super) async fn workspace_file(
         size_bytes: bytes.len() as u64,
         text,
     }))
+}
+
+pub(super) async fn save_workspace_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SaveWorkspaceFileRequest>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    if request.text.len() > MAX_WORKSPACE_TEXT_BYTES
+        || request.expected_text.len() > MAX_WORKSPACE_TEXT_BYTES
+    {
+        return Err(AppError::InvalidRequest(
+            "file is too large to edit".to_owned(),
+        ));
+    }
+    let root = state.config.workspace_root.clone();
+    tokio::task::spawn_blocking(move || save_workspace_text(&root, request))
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))??;
+    Ok(Json(json!({ "saved": true })))
+}
+
+fn save_workspace_text(root: &Path, request: SaveWorkspaceFileRequest) -> Result<(), AppError> {
+    use std::io::{Read, Write};
+
+    let _guard = WORKSPACE_FILE_SAVE_LOCK
+        .lock()
+        .map_err(|_| AppError::Conflict("file save lock unavailable".to_owned()))?;
+    let path = validate_workspace_file_text(root, &request.path)?;
+    let mime = mime_for_name(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(""),
+    );
+    if !mime.starts_with("text/") && mime != "application/json" {
+        return Err(AppError::InvalidRequest(
+            "file is not editable text".to_owned(),
+        ));
+    }
+    let file = std::fs::File::open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_WORKSPACE_TEXT_BYTES as u64 {
+        return Err(AppError::InvalidRequest(
+            "file is not editable text or is too large".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_WORKSPACE_TEXT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_WORKSPACE_TEXT_BYTES || std::str::from_utf8(&bytes).is_err() {
+        return Err(AppError::InvalidRequest(
+            "file is not UTF-8 text or is too large".to_owned(),
+        ));
+    }
+    if bytes != request.expected_text.as_bytes() {
+        return Err(AppError::Conflict(
+            "file changed since it was opened; reload before saving".to_owned(),
+        ));
+    }
+    // Write a sibling first so interrupted writes cannot leave a truncated file.
+    let temporary = path.with_file_name(format!(".todex-save-{}", uuid::Uuid::new_v4()));
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| -> Result<(), AppError> {
+        output.set_permissions(metadata.permissions())?;
+        output.write_all(request.text.as_bytes())?;
+        output.sync_all()?;
+        // Catch changes by other programs during preparation as well.
+        let current_path = validate_workspace_file_text(root, &request.path)?;
+        if current_path != path || std::fs::read(&path)? != bytes {
+            return Err(AppError::Conflict(
+                "file changed since it was opened; reload before saving".to_owned(),
+            ));
+        }
+        std::fs::rename(&temporary, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub(super) async fn git_scan(
@@ -2432,6 +2526,14 @@ pub(super) struct WorkspaceFileQuery {
     path: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SaveWorkspaceFileRequest {
+    path: String,
+    text: String,
+    expected_text: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct WorkspaceFileResponse {
@@ -3522,6 +3624,132 @@ mod tests {
         let file_json: serde_json::Value = serde_json::from_slice(&file_body).unwrap();
         assert_eq!(file_json["mimeType"], "text/markdown");
         assert_eq!(file_json["text"], "# readme");
+
+        let save_request = |path: &Path, text: &str, expected: &str, authenticated: bool| {
+            let mut builder = Request::builder()
+                .method("PUT")
+                .uri("/v2/workspace/file")
+                .header("content-type", "application/json");
+            if authenticated {
+                builder = builder.header("authorization", auth);
+            }
+            builder
+                .body(Body::from(
+                    json!({
+                        "path": path, "text": text, "expectedText": expected,
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let readme = workspace.join("README.md");
+        let unauthorized = app
+            .clone()
+            .oneshot(save_request(&readme, "new", "# readme", false))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(fs::read_to_string(&readme).unwrap(), "# readme");
+
+        let outside_file = outside.join("secret.txt");
+        let escaped_save = app
+            .clone()
+            .oneshot(save_request(&outside_file, "changed", "nope", true))
+            .await
+            .unwrap();
+        assert_eq!(escaped_save.status(), StatusCode::FORBIDDEN);
+        assert_eq!(fs::read_to_string(&outside_file).unwrap(), "nope");
+        #[cfg(unix)]
+        {
+            let link = workspace.join("escape.md");
+            std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+            let escaped_link = app
+                .clone()
+                .oneshot(save_request(&link, "changed", "nope", true))
+                .await
+                .unwrap();
+            assert_eq!(escaped_link.status(), StatusCode::FORBIDDEN);
+        }
+        let missing_save = app
+            .clone()
+            .oneshot(save_request(&workspace.join("new.md"), "new", "", true))
+            .await
+            .unwrap();
+        assert_eq!(missing_save.status(), StatusCode::NOT_FOUND);
+        assert!(!workspace.join("new.md").exists());
+
+        let saved = app
+            .clone()
+            .oneshot(save_request(&readme, "# edited 中文", "# readme", true))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let saved_body = to_bytes(saved.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&saved_body).unwrap(),
+            json!({ "saved": true })
+        );
+        assert_eq!(fs::read_to_string(&readme).unwrap(), "# edited 中文");
+        let stale = app
+            .clone()
+            .oneshot(save_request(&readme, "stale", "# readme", true))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert_eq!(fs::read_to_string(&readme).unwrap(), "# edited 中文");
+
+        let (first, second) = tokio::join!(
+            app.clone()
+                .oneshot(save_request(&readme, "first", "# edited 中文", true)),
+            app.clone()
+                .oneshot(save_request(&readme, "second", "# edited 中文", true)),
+        );
+        let statuses = [first.unwrap().status(), second.unwrap().status()];
+        assert!(statuses.contains(&StatusCode::OK));
+        assert!(statuses.contains(&StatusCode::CONFLICT));
+        assert!(["first", "second"].contains(&fs::read_to_string(&readme).unwrap().as_str()));
+
+        let invalid = workspace.join("invalid.md");
+        fs::write(&invalid, [0xff]).unwrap();
+        let invalid_save = app
+            .clone()
+            .oneshot(save_request(&invalid, "valid", "�", true))
+            .await
+            .unwrap();
+        assert_eq!(invalid_save.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(fs::read(&invalid).unwrap(), [0xff]);
+        let binary = workspace.join("image.png");
+        fs::write(&binary, "binary").unwrap();
+        let binary_save = app
+            .clone()
+            .oneshot(save_request(&binary, "text", "binary", true))
+            .await
+            .unwrap();
+        assert_eq!(binary_save.status(), StatusCode::BAD_REQUEST);
+
+        let large = "x".repeat(MAX_WORKSPACE_TEXT_BYTES + 1);
+        let too_large = app
+            .clone()
+            .oneshot(save_request(&readme, &large, "first", true))
+            .await
+            .unwrap();
+        assert_eq!(too_large.status(), StatusCode::BAD_REQUEST);
+        fs::write(&invalid, &large).unwrap();
+        let large_existing = app
+            .clone()
+            .oneshot(save_request(&invalid, "small", "", true))
+            .await
+            .unwrap();
+        assert_eq!(large_existing.status(), StatusCode::BAD_REQUEST);
+        // Escaped JSON with two full-size strings must survive the body limit.
+        let boundary = "\n".repeat(MAX_WORKSPACE_TEXT_BYTES);
+        fs::write(&invalid, &boundary).unwrap();
+        let boundary_save = app
+            .clone()
+            .oneshot(save_request(&invalid, &boundary, &boundary, true))
+            .await
+            .unwrap();
+        assert_eq!(boundary_save.status(), StatusCode::OK);
 
         let escaped = app
             .clone()
