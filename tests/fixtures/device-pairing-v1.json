@@ -1,0 +1,16 @@
+{
+  "requestId": "11111111-2222-4333-8444-555555555555",
+  "expiresAt": 2000000300000,
+  "clientSecret": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+  "serverSecret": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk",
+  "clientPublicKey": "E75P6uryBMf9M1j8nAByGIHRdCeBKCJ-xnTzf3_pe20",
+  "serverPublicKey": "V9tLNZ8jrl4Ubk4lEgVnBHIlBjSMFQwUdT0Mkz0E1CE",
+  "transcript": "dG9kZXguZGV2aWNlLXBhaXJpbmcudjEvdHJhbnNjcmlwdAAxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUAE75P6uryBMf9M1j8nAByGIHRdCeBKCJ-xnTzf3_pe21X20s1nyOuXhRuTiUSBWcEciUGNIwVDBR1PQyTPQTUIQ",
+  "verificationCode": "254BE-020DC",
+  "wrapKey": "uP92FjLJ_vfM8zw--x4j6kXG7OvXEls_aOhFSQfEOiI",
+  "pollProof": "fY8bZQ51Yf0x0CQS6uvZiZy5oxBOMFiwHKom7sMsDwk",
+  "cancelProof": "S4C76skr7KGcP8rIPyEoPX47HQnFx0jGHbBYg4yRNbk",
+  "nonce": "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsL",
+  "authToken": "synthetic-device-pairing-token",
+  "ciphertext": "-Rlk4G9hSYSwJsNUrWbyPyAjeYgSoK6K38UULgs3P14WbNjQJ8-0Vo2LOzNYoqpWfz7PhiQkBhOvDhkJSrU"
+}

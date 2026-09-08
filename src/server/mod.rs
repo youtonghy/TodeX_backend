@@ -1,3 +1,4 @@
+mod device_pairing;
 mod git;
 pub mod protocol;
 mod routes;
@@ -15,6 +16,7 @@ use crate::app_state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::routes())
+        .merge(device_pairing::routes())
         .layer(cors_layer(&state.config.host))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

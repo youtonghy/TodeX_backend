@@ -29,6 +29,12 @@ impl ManagedServer {
             );
         }
         let addr = bind_addr(&config)?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("failed to bind {addr}"))?;
+        let addr = listener
+            .local_addr()
+            .context("failed to read bound address")?;
         let state = AppState::new(config.clone()).await?;
         let retention_task = config.history_retention_days.map(|days| {
             let state = state.clone();
@@ -51,12 +57,6 @@ impl ManagedServer {
             })
         });
         let app = server::router(state.clone());
-        let listener = TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("failed to bind {addr}"))?;
-        let addr = listener
-            .local_addr()
-            .context("failed to read bound address")?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         info!(
@@ -74,12 +74,15 @@ impl ManagedServer {
         }
 
         let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .context("server failed")
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .context("server failed")
         });
         let migration_task = Some(state.spawn_legacy_conversation_migration());
 

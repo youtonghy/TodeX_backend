@@ -4,6 +4,7 @@ mod codex_gateway;
 mod config;
 mod conversation;
 mod daemon;
+mod device_pairing;
 mod error;
 mod event;
 mod local_terminal;

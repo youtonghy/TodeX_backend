@@ -1,9 +1,10 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use arboard::Clipboard;
@@ -27,7 +28,7 @@ use crate::event::EventRecord;
 use crate::transport_crypto::{render_qr_text_for_bounds, PairingKeys};
 use crate::workspace_paths::canonical_workspace_root;
 
-const ACTION_COUNT: usize = 11;
+const ACTION_COUNT: usize = 12;
 const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
@@ -41,6 +42,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
 
     loop {
         app.refresh_daemon_status();
+        app.refresh_device_pairing(false);
         terminal.draw(|frame| app.render(frame))?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -111,6 +113,74 @@ struct CredentialsPopup {
     scroll: u16,
 }
 
+#[derive(Clone)]
+struct DevicePairingRequest {
+    request_id: String,
+    verification_code: String,
+    device_name: String,
+    expires_at: i64,
+}
+
+#[derive(Default)]
+struct DevicePairingState {
+    open: bool,
+    requests: Vec<DevicePairingRequest>,
+    selected_id: Option<String>,
+    displayed_request: RefCell<Option<(String, String)>>,
+    refreshed_at: Option<Instant>,
+    error: Option<String>,
+}
+
+impl DevicePairingState {
+    fn replace(&mut self, requests: Vec<DevicePairingRequest>) {
+        // Never approve a different request merely because a list index moved.
+        if self
+            .selected_id
+            .as_ref()
+            .is_some_and(|id| !requests.iter().any(|request| &request.request_id == id))
+        {
+            self.selected_id = None;
+        }
+        self.requests = requests;
+    }
+
+    fn navigate(&mut self, down: bool) {
+        let current = self.selected_id.as_ref().and_then(|id| {
+            self.requests
+                .iter()
+                .position(|request| &request.request_id == id)
+        });
+        let index = match current {
+            Some(index) if down => (index + 1).min(self.requests.len().saturating_sub(1)),
+            Some(index) => index.saturating_sub(1),
+            None => 0,
+        };
+        self.selected_id = self
+            .requests
+            .get(index)
+            .map(|request| request.request_id.clone());
+    }
+
+    fn selected(&self) -> Option<&DevicePairingRequest> {
+        self.selected_id.as_ref().and_then(|id| {
+            self.requests
+                .iter()
+                .find(|request| &request.request_id == id)
+        })
+    }
+}
+
+fn device_display_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(*character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(100)
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TuiLanguage {
     English,
@@ -171,6 +241,7 @@ struct TuiApp {
     pairing_qr: Option<PairingQr>,
     pairing_browser_pages: Vec<crate::transport_crypto::pairing_browser::PairingQrBrowserPage>,
     credentials: Option<CredentialsPopup>,
+    device_pairing: DevicePairingState,
     folder_picker: Option<FolderPicker>,
     language: TuiLanguage,
 }
@@ -210,6 +281,7 @@ impl TuiApp {
             pairing_qr: None,
             pairing_browser_pages: Vec::new(),
             credentials: None,
+            device_pairing: DevicePairingState::default(),
             folder_picker: None,
             language,
         }
@@ -471,7 +543,289 @@ impl TuiApp {
         }
     }
 
+    fn refresh_device_pairing(&mut self, force: bool) {
+        if !force
+            && self
+                .device_pairing
+                .refreshed_at
+                .is_some_and(|time| time.elapsed() < Duration::from_millis(500))
+        {
+            return;
+        }
+        self.device_pairing.refreshed_at = Some(Instant::now());
+        let data_dir = self
+            .daemon
+            .as_ref()
+            .map(|process| process.data_dir.as_path())
+            .unwrap_or(self.config.data_dir.as_path());
+        match crate::device_pairing::list_device_pairing_requests(data_dir) {
+            Ok(requests) => {
+                self.device_pairing.replace(
+                    requests
+                        .into_iter()
+                        .map(|request| DevicePairingRequest {
+                            request_id: request.request_id,
+                            verification_code: request.verification_code,
+                            device_name: request.device_name,
+                            expires_at: i64::try_from(request.expires_at).unwrap_or(i64::MAX),
+                        })
+                        .collect(),
+                );
+                self.device_pairing.error = None;
+            }
+            Err(_) => {
+                self.device_pairing.replace(Vec::new());
+                self.device_pairing.error = Some(
+                    self.text(
+                        "Cannot read local device requests.",
+                        "无法读取本机设备验证请求。",
+                    )
+                    .to_owned(),
+                );
+            }
+        }
+    }
+
+    fn decide_device_pairing(&mut self, approved: bool) {
+        // Approval is only valid for the exact request/code actually rendered.
+        // A tiny terminal or a changed selection must not hide what is approved.
+        let displayed = self.device_pairing.displayed_request.borrow().clone();
+        if approved
+            && !self.device_pairing.selected().is_some_and(|request| {
+                displayed.as_ref()
+                    == Some(&(
+                        request.request_id.clone(),
+                        request.verification_code.clone(),
+                    ))
+            })
+        {
+            self.device_pairing.error = Some(
+                self.text(
+                    "Enlarge the terminal to view and verify the full code before approving.",
+                    "请放大终端，查看并核对完整验证码后再批准。",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+        // Recheck TTL and pending state, preserving request identity through refresh.
+        self.refresh_device_pairing(true);
+        let Some(request) = self.device_pairing.selected() else {
+            return;
+        };
+        if request.expires_at <= Utc::now().timestamp_millis() {
+            return;
+        }
+        if approved
+            && displayed.as_ref()
+                != Some(&(
+                    request.request_id.clone(),
+                    request.verification_code.clone(),
+                ))
+        {
+            return;
+        }
+        let request_id = request.request_id.clone();
+        let data_dir = self
+            .daemon
+            .as_ref()
+            .map(|process| process.data_dir.as_path())
+            .unwrap_or(self.config.data_dir.as_path());
+        match crate::device_pairing::decide_device_pairing(data_dir, &request_id, approved) {
+            Ok(()) => {
+                self.device_pairing.selected_id = None;
+                self.refresh_device_pairing(true);
+                self.notice = if approved {
+                    self.text(
+                        "Device approval recorded locally.",
+                        "已在本机记录设备批准。",
+                    )
+                    .to_owned()
+                } else {
+                    self.text(
+                        "Device rejection recorded locally.",
+                        "已在本机记录设备拒绝。",
+                    )
+                    .to_owned()
+                };
+            }
+            Err(_) => {
+                self.device_pairing.error = Some(
+                    self.text(
+                        "Could not record the decision; check whether the request expired.",
+                        "无法记录决定，请检查请求是否已过期。",
+                    )
+                    .to_owned(),
+                )
+            }
+        }
+    }
+
+    fn open_device_pairing(&mut self) {
+        self.refresh_device_pairing(true);
+        self.device_pairing.open = true;
+        self.device_pairing.selected_id = self
+            .device_pairing
+            .requests
+            .first()
+            .map(|request| request.request_id.clone());
+    }
+
+    fn handle_device_pairing_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.device_pairing.open = false,
+            KeyCode::Up | KeyCode::Char('k') => self.device_pairing.navigate(false),
+            KeyCode::Down | KeyCode::Char('j') => self.device_pairing.navigate(true),
+            KeyCode::Char('a') | KeyCode::Char('r')
+                if key.kind == crossterm::event::KeyEventKind::Press =>
+            {
+                self.decide_device_pairing(key.code == KeyCode::Char('a'));
+            }
+            // Enter is intentionally inert: approval requires the explicit a key.
+            _ => {}
+        }
+    }
+
+    fn render_device_pairing(&self, frame: &mut Frame<'_>) {
+        self.device_pairing.displayed_request.replace(None);
+        let area = centered_area(frame.area(), 88, 24);
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(self.text("Device verification", "设备验证"));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width < 36 || inner.height < 18 {
+            frame.render_widget(
+                Paragraph::new(self.text(
+                    "Enlarge the terminal to verify the code. Approval is disabled. Esc closes.",
+                    "请放大终端查看验证码。当前禁止批准，Esc 关闭。",
+                ))
+                .wrap(Wrap { trim: true }),
+                inner,
+            );
+            return;
+        }
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(3),
+                Constraint::Length(10),
+                Constraint::Length(2),
+            ])
+            .split(inner);
+        frame.render_widget(Paragraph::new(self.text(
+            "Compare the full code with your client before approving. Device names are self-reported.",
+            "批准前请核对客户端的完整验证码。设备名称由请求方自行填写。",
+        )).wrap(Wrap { trim: true }), sections[0]);
+        let selected_index = self
+            .device_pairing
+            .selected_id
+            .as_ref()
+            .and_then(|id| {
+                self.device_pairing
+                    .requests
+                    .iter()
+                    .position(|request| &request.request_id == id)
+            })
+            .unwrap_or(0);
+        let offset = selected_index.saturating_sub(sections[1].height.saturating_sub(1) as usize);
+        let lines: Vec<Line<'static>> = if self.device_pairing.requests.is_empty() {
+            vec![Line::from(
+                self.text("No pending devices.", "暂无待验证设备。")
+                    .to_owned(),
+            )]
+        } else {
+            self.device_pairing
+                .requests
+                .iter()
+                .skip(offset)
+                .map(|request| {
+                    let selected = self.device_pairing.selected_id.as_deref()
+                        == Some(request.request_id.as_str());
+                    Line::styled(
+                        format!(
+                            "{}{}",
+                            if selected { "> " } else { "  " },
+                            device_display_name(&request.device_name)
+                        ),
+                        if selected {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        },
+                    )
+                })
+                .collect()
+        };
+        frame.render_widget(Paragraph::new(lines), sections[1]);
+        let details = if let Some(request) = self.device_pairing.selected() {
+            self.device_pairing.displayed_request.replace(Some((
+                request.request_id.clone(),
+                request.verification_code.clone(),
+            )));
+            let remaining = request
+                .expires_at
+                .saturating_sub(Utc::now().timestamp_millis())
+                .max(0)
+                / 1000;
+            vec![
+                Line::from(self.text("Verification code:", "验证码：").to_owned()),
+                Line::styled(
+                    request.verification_code.clone(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Line::from(format!(
+                    "{}{}",
+                    self.text("Device (self-reported): ", "设备（自报）："),
+                    device_display_name(&request.device_name)
+                )),
+                Line::from(format!(
+                    "{}{}",
+                    self.text("Request: ", "请求："),
+                    device_display_name(&request.request_id)
+                )),
+                Line::from(match self.language {
+                    TuiLanguage::English => format!("Expires in {remaining}s"),
+                    TuiLanguage::Chinese => format!("{remaining} 秒后过期"),
+                }),
+            ]
+        } else {
+            vec![Line::from(
+                self.text(
+                    "Use Up/Down to select a pending request.",
+                    "请使用上下键选择待验证请求。",
+                )
+                .to_owned(),
+            )]
+        };
+        frame.render_widget(
+            Paragraph::new(details).wrap(Wrap { trim: true }),
+            sections[2],
+        );
+        let footer = self.device_pairing.error.clone().unwrap_or_else(|| {
+            self.text(
+                "a approve · r reject · Up/Down select · Esc close (Enter does not approve)",
+                "a 批准 · r 拒绝 · 上下选择 · Esc 关闭（Enter 不会批准）",
+            )
+            .to_owned()
+        });
+        frame.render_widget(
+            Paragraph::new(footer).wrap(Wrap { trim: true }),
+            sections[3],
+        );
+    }
+
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.device_pairing.open {
+            self.handle_device_pairing_key(key);
+            return Ok(false);
+        }
         if self.credentials.is_some() {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.close_credentials(),
@@ -588,6 +942,7 @@ impl TuiApp {
             KeyCode::Char('x') => self.start_reset_edit(),
             KeyCode::Char('g') => self.show_pairing_qr().await,
             KeyCode::Char('c') => self.show_credentials().await,
+            KeyCode::Char('d') => self.open_device_pairing(),
             KeyCode::Char('l') => self.toggle_language(),
             KeyCode::PageUp => self.scroll_logs_up(LOG_SCROLL_STEP),
             KeyCode::PageDown => self.scroll_logs_down(LOG_SCROLL_STEP),
@@ -718,7 +1073,8 @@ impl TuiApp {
             7 => self.show_pairing_qr().await,
             8 => self.show_credentials().await,
             9 => self.toggle_language(),
-            10 => return Ok(true),
+            10 => self.open_device_pairing(),
+            11 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -1247,6 +1603,9 @@ impl TuiApp {
                 frame.render_widget(Clear, area);
                 frame.render_widget(self.credentials_widget(credentials), area);
             }
+            if self.device_pairing.open {
+                self.render_device_pairing(frame);
+            }
             return;
         }
 
@@ -1254,7 +1613,7 @@ impl TuiApp {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(13),
+                Constraint::Length(14),
                 Constraint::Min(10),
                 Constraint::Length(6),
                 Constraint::Length(4),
@@ -1302,6 +1661,9 @@ impl TuiApp {
             let area = self.credentials_area(frame.area());
             frame.render_widget(Clear, area);
             frame.render_widget(self.credentials_widget(credentials), area);
+        }
+        if self.device_pairing.open {
+            self.render_device_pairing(frame);
         }
     }
 
@@ -1415,6 +1777,25 @@ impl TuiApp {
 
         Paragraph::new(vec![
             Line::from(vec![Span::raw(self.text("Status: ", "状态：")), status]),
+            Line::styled(
+                match self.language {
+                    TuiLanguage::English => format!(
+                        "Device verification: {} pending — press d",
+                        self.device_pairing.requests.len()
+                    ),
+                    TuiLanguage::Chinese => format!(
+                        "设备验证：{} 个待确认 — 按 d 核对验证码",
+                        self.device_pairing.requests.len()
+                    ),
+                },
+                Style::default()
+                    .fg(if self.device_pairing.requests.is_empty() {
+                        Color::Cyan
+                    } else {
+                        Color::Yellow
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
             Line::from(match self.language {
                 TuiLanguage::English => format!("Listen: {listen_host}:{listen_port}"),
                 TuiLanguage::Chinese => format!("监听：{listen_host}:{listen_port}"),
@@ -1520,6 +1901,7 @@ impl TuiApp {
             self.text("Show pairing QR", "显示配对二维码"),
             self.text("Credentials & copy", "凭据与复制"),
             self.text("Language: English", "语言：中文"),
+            self.text("Device verification (d)", "设备验证 (d)"),
             self.text("Quit", "退出"),
         ];
         let items = actions
@@ -1556,8 +1938,8 @@ impl TuiApp {
                 "使用上下方向键或 j/k 选择操作，按 Enter 执行。",
             )),
             Line::from(self.text(
-                "Shortcuts: s start/stop, r restart, h host, p port, w workspace, e encryption, x reset, g QR, c credentials, l language, o observer, q quit.",
-                "快捷键：s 启停、r 重启、h 主机、p 端口、w 工作区、e 加密、x 重置、g 二维码、c 凭据、l 语言、o 观察器、q 退出。",
+                "Shortcuts: s start/stop, r restart, h host, p port, w workspace, e encryption, x reset, g QR, c credentials, d devices, l language, o observer, q quit.",
+                "快捷键：s 启停、r 重启、h 主机、p 端口、w 工作区、e 加密、x 重置、g 二维码、c 凭据、d 设备验证、l 语言、o 观察器、q 退出。",
             )),
             Line::from(self.text(
                 "Mouse drag selects terminal text. PageUp/PageDown/Home/End scroll logs.",
@@ -3139,6 +3521,120 @@ mod tests {
     };
     use crate::event::EventRecord;
 
+    fn device_request(id: &str) -> super::DevicePairingRequest {
+        super::DevicePairingRequest {
+            request_id: id.to_owned(),
+            verification_code: "ABCDE-FGHJK".to_owned(),
+            device_name: "My laptop".to_owned(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 60_000,
+        }
+    }
+
+    #[test]
+    fn device_selection_preserves_identity_and_never_moves_to_a_new_request_implicitly() {
+        let mut state = super::DevicePairingState::default();
+        state.replace(vec![device_request("first"), device_request("second")]);
+        state.navigate(true);
+        assert_eq!(state.selected().unwrap().request_id, "first");
+        state.replace(vec![
+            device_request("new"),
+            device_request("first"),
+            device_request("second"),
+        ]);
+        assert_eq!(state.selected().unwrap().request_id, "first");
+        state.replace(vec![device_request("new"), device_request("second")]);
+        assert!(state.selected().is_none());
+        state.navigate(true);
+        assert_eq!(state.selected().unwrap().request_id, "new");
+    }
+
+    #[test]
+    fn device_names_cannot_inject_terminal_control_or_bidi_sequences() {
+        assert_eq!(
+            super::device_display_name("Laptop\n\r\t\u{1b}\u{202e}test\u{2069}"),
+            "Laptoptest"
+        );
+        assert_eq!(super::device_display_name(&"a".repeat(200)).len(), 100);
+    }
+
+    #[test]
+    fn device_verification_enter_does_not_approve_and_escape_only_closes_popup() {
+        let mut app = super::TuiApp::new(crate::config::Config::default());
+        app.device_pairing.open = true;
+        app.device_pairing.replace(vec![device_request("pending")]);
+        app.device_pairing.navigate(true);
+        app.handle_device_pairing_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.device_pairing.open);
+        assert_eq!(app.device_pairing.selected().unwrap().request_id, "pending");
+        assert!(app.device_pairing.refreshed_at.is_none());
+        app.handle_device_pairing_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(!app.device_pairing.open);
+    }
+
+    #[test]
+    fn device_approval_requires_code_visible_in_the_current_terminal() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = super::TuiApp::new(crate::config::Config::default());
+        app.language = super::TuiLanguage::English;
+        app.device_pairing.open = true;
+        app.device_pairing.replace(vec![device_request("pending")]);
+        app.device_pairing.navigate(true);
+        let mut full = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        full.draw(|frame| app.render_device_pairing(frame)).unwrap();
+        assert!(app.device_pairing.displayed_request.borrow().is_some());
+        for (width, height) in [(30, 28), (100, 12)] {
+            let mut small = Terminal::new(TestBackend::new(width, height)).unwrap();
+            small
+                .draw(|frame| app.render_device_pairing(frame))
+                .unwrap();
+            assert!(app.device_pairing.displayed_request.borrow().is_none());
+            app.handle_device_pairing_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            // No filesystem refresh/write occurred, and approval was not recorded.
+            assert!(app.device_pairing.refreshed_at.is_none());
+            assert_eq!(app.device_pairing.selected().unwrap().request_id, "pending");
+            assert!(app
+                .device_pairing
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("full code"));
+        }
+    }
+
+    #[test]
+    fn device_verification_renders_complete_code_name_and_expiry() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = super::TuiApp::new(crate::config::Config::default());
+        app.language = super::TuiLanguage::English;
+        app.device_pairing.open = true;
+        app.device_pairing.replace(vec![device_request("pending")]);
+        app.device_pairing.navigate(true);
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal
+            .draw(|frame| app.render_device_pairing(frame))
+            .unwrap();
+        let contents = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(contents.contains("ABCDE-FGHJK"));
+        assert!(contents.contains("My laptop"));
+        assert!(contents.contains("Expires in"));
+        assert!(contents.contains("a approve"));
+    }
+
     #[test]
     fn pairing_qr_preserves_modules_and_true_colors_in_terminal_buffer() {
         use qrcodegen::{QrCode, QrCodeEcc};
@@ -3272,7 +3768,7 @@ mod tests {
         assert_eq!(TuiLanguage::parse("invalid"), None);
         assert_eq!(TuiLanguage::Chinese.as_str(), "zh-CN");
         assert_eq!(TuiLanguage::English.as_str(), "en");
-        assert_eq!(ACTION_COUNT, 11);
+        assert_eq!(ACTION_COUNT, 12);
     }
 
     #[test]

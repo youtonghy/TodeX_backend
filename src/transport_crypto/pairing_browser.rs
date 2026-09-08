@@ -127,7 +127,7 @@ fn browser_command(path: &std::path::Path) -> Result<tokio::process::Command, Ap
 }
 
 #[cfg(windows)]
-fn current_windows_sid() -> Result<String, AppError> {
+pub(crate) fn current_windows_sid() -> Result<String, AppError> {
     let output = std::process::Command::new("whoami.exe")
         .args(["/user", "/fo", "csv", "/nh"])
         .stdin(Stdio::null())
@@ -157,7 +157,7 @@ fn current_windows_sid() -> Result<String, AppError> {
 }
 
 #[cfg(windows)]
-fn secure_windows_path(
+pub(crate) fn secure_windows_path(
     path: &std::path::Path,
     owner: &str,
     directory: bool,
