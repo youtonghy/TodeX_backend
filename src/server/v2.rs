@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -400,19 +401,38 @@ pub(super) async fn workspace_file(
     if !metadata.is_file() {
         return Err(AppError::InvalidRequest("path must be a file".to_owned()));
     }
-    const MAX_PREVIEW_BYTES: u64 = 1024 * 1024;
-    if metadata.len() > MAX_PREVIEW_BYTES {
-        return Err(AppError::InvalidRequest(
-            "file is too large to preview".to_owned(),
-        ));
-    }
-    let bytes = tokio::fs::read(&path).await?;
     let name = path
         .file_name()
         .and_then(|v| v.to_str())
         .unwrap_or("file")
         .to_owned();
     let mime_type = mime_for_name(&name);
+    let is_image = mime_type.starts_with("image/");
+    let max_preview_bytes: u64 = if is_image {
+        8 * 1024 * 1024
+    } else {
+        1024 * 1024
+    };
+    if metadata.len() > max_preview_bytes {
+        return Err(AppError::InvalidRequest(
+            "file is too large to preview".to_owned(),
+        ));
+    }
+    // Bound the read as well: a file can grow between metadata and reading.
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(&path)
+        .await?
+        .take(max_preview_bytes + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > max_preview_bytes {
+        return Err(AppError::InvalidRequest(
+            "file is too large to preview".to_owned(),
+        ));
+    }
+    let data_url =
+        is_image.then(|| format!("data:{mime_type};base64,{}", BASE64_STANDARD.encode(&bytes)));
     let text = if mime_type.starts_with("text/") || mime_type == "application/json" {
         Some(String::from_utf8_lossy(&bytes).to_string())
     } else {
@@ -424,6 +444,7 @@ pub(super) async fn workspace_file(
         mime_type,
         size_bytes: bytes.len() as u64,
         text,
+        data_url,
     }))
 }
 
@@ -824,7 +845,21 @@ fn validate_browser_url(raw: &str) -> Result<String, AppError> {
 
 fn mime_for_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".md") {
+    if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".avif") {
+        "image/avif"
+    } else if lower.ends_with(".bmp") {
+        "image/bmp"
+    } else if lower.ends_with(".svg") {
+        "image/svg+xml"
+    } else if lower.ends_with(".md") {
         "text/markdown"
     } else if lower.ends_with(".json") {
         "application/json"
@@ -2542,6 +2577,8 @@ pub(super) struct WorkspaceFileResponse {
     mime_type: String,
     size_bytes: u64,
     text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2749,6 +2786,7 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
     use tower::ServiceExt;
@@ -3624,6 +3662,77 @@ mod tests {
         let file_json: serde_json::Value = serde_json::from_slice(&file_body).unwrap();
         assert_eq!(file_json["mimeType"], "text/markdown");
         assert_eq!(file_json["text"], "# readme");
+        assert!(file_json.get("dataUrl").is_none());
+
+        let preview_request = |path: &Path, authenticated: bool| {
+            let mut builder =
+                Request::builder().uri(format!("/v2/workspace/file?path={}", path.display()));
+            if authenticated {
+                builder = builder.header("authorization", auth);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        for (name, mime, bytes) in [
+            ("preview.png", "image/png", b"\x89PNG\r\n\x1a\n".as_slice()),
+            (
+                "preview.svg",
+                "image/svg+xml",
+                b"<svg xmlns='http://www.w3.org/2000/svg'/>".as_slice(),
+            ),
+        ] {
+            let path = workspace.join(name);
+            fs::write(&path, bytes).unwrap();
+            let response = app
+                .clone()
+                .oneshot(preview_request(&path, true))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["mimeType"], mime);
+            assert_eq!(
+                value["dataUrl"],
+                format!("data:{mime};base64,{}", BASE64_STANDARD.encode(bytes))
+            );
+            assert!(value["text"].is_null());
+            let unauthorized = app
+                .clone()
+                .oneshot(preview_request(&path, false))
+                .await
+                .unwrap();
+            assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        }
+        let outside_image = outside.join("preview.png");
+        fs::write(&outside_image, b"image").unwrap();
+        let escaped_image = app
+            .clone()
+            .oneshot(preview_request(&outside_image, true))
+            .await
+            .unwrap();
+        assert_eq!(escaped_image.status(), StatusCode::FORBIDDEN);
+        let large_image = workspace.join("large-preview.png");
+        fs::File::create(&large_image)
+            .unwrap()
+            .set_len(8 * 1024 * 1024 + 1)
+            .unwrap();
+        let oversized_image = app
+            .clone()
+            .oneshot(preview_request(&large_image, true))
+            .await
+            .unwrap();
+        assert_eq!(oversized_image.status(), StatusCode::BAD_REQUEST);
+        let large_text = workspace.join("large-preview.md");
+        fs::File::create(&large_text)
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        let oversized_text = app
+            .clone()
+            .oneshot(preview_request(&large_text, true))
+            .await
+            .unwrap();
+        assert_eq!(oversized_text.status(), StatusCode::BAD_REQUEST);
 
         let save_request = |path: &Path, text: &str, expected: &str, authenticated: bool| {
             let mut builder = Request::builder()
