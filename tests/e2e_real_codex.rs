@@ -848,6 +848,8 @@ async fn spawn_daemon() -> Daemon {
         .arg("--workspace-root")
         .arg(&workspace_root)
         .env("TODEX_AGENTD_AUTH_TOKEN", TOKEN)
+        // This fixture uses token-authenticated plaintext WebSockets.
+        .env("TODEX_AGENTD_PAIRING_ENCRYPTION", "none")
         .env("TODEX_AGENTD_CODEX_BIN", codex_binary())
         .env(
             "TODEX_AGENTD_PI_BIN",
@@ -970,6 +972,8 @@ async fn spawn_fake_history_daemon() -> Daemon {
         .arg("--workspace-root")
         .arg(&workspace_root)
         .env("TODEX_AGENTD_AUTH_TOKEN", TOKEN)
+        // This fixture uses token-authenticated plaintext WebSockets.
+        .env("TODEX_AGENTD_PAIRING_ENCRYPTION", "none")
         .env("TODEX_AGENTD_CODEX_BIN", &fake_codex)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

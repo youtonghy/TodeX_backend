@@ -2786,7 +2786,6 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
-    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
     use tower::ServiceExt;
