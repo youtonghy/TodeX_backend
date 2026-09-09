@@ -86,6 +86,7 @@ jobs:
     timeout-minutes: 30
     env:
       TODEX_BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+      TODEX_RELEASE_BUILD: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -115,6 +116,7 @@ jobs:
     timeout-minutes: 60
     env:
       TODEX_BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+      TODEX_RELEASE_BUILD: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -167,6 +169,12 @@ jobs:
           package_dir="dist/${package_name}"
           mkdir -p "${package_dir}"
           cp "${binary_path}" "${package_dir}/"
+          update_name="${package_name}.bin"
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            update_name="${package_name}.exe"
+          fi
+          cp "${binary_path}" "dist/${update_name}"
+          echo "update_path=dist/${update_name}" >> "${GITHUB_OUTPUT}"
           cp README.md LICENSE "${package_dir}/"
           cp docs/BUILD_RUN.md "${package_dir}/"
 
@@ -187,7 +195,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.artifact_name }}
-          path: ${{ steps.package.outputs.artifact_path }}
+          path: |
+            ${{ steps.package.outputs.artifact_path }}
+            ${{ steps.package.outputs.update_path }}
           if-no-files-found: error
           retention-days: 7
 

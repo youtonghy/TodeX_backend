@@ -14,6 +14,7 @@ mod server;
 mod server_runner;
 mod transport_crypto;
 mod tui;
+mod update;
 mod version;
 mod workspace_paths;
 mod workspace_store;
@@ -51,6 +52,13 @@ enum Command {
     Doctor {
         #[command(subcommand)]
         command: DoctorCommand,
+    },
+    #[command(about = "Check or install the latest packaged backend release")]
+    Update {
+        #[arg(long)]
+        check: bool,
+        #[command(flatten)]
+        args: ServeArgs,
     },
     #[command(name = "daemon-run", hide = true)]
     DaemonRun(ServeArgs),
@@ -90,6 +98,16 @@ struct ProviderDoctorArgs {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    match &cli.command {
+        Command::Serve(args) | Command::Tui(args) => {
+            let config = Config::load_read_only(args.clone())?;
+            if daemon::status(&config)?.is_none() {
+                update::before_start().await?;
+            }
+        }
+        _ => {}
+    }
+
     match cli.command {
         Command::Serve(args) => {
             init_serve_logging();
@@ -104,6 +122,21 @@ async fn main() -> anyhow::Result<()> {
             daemon_command(command).await
         }
         Command::Doctor { command } => doctor_command(command).await,
+        Command::Update { check, args } => {
+            if !check && update::enabled() {
+                let config = Config::load_read_only(args)?;
+                if daemon::status(&config)?.is_some() {
+                    anyhow::bail!(
+                        "stop the daemon before installing an update (or use daemon restart)"
+                    );
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&update::run(check).await?)?
+            );
+            Ok(())
+        }
         Command::DaemonRun(args) => {
             init_serve_logging();
             daemon_run(args).await
@@ -167,6 +200,9 @@ async fn daemon_command(command: DaemonCommand) -> anyhow::Result<()> {
     match command {
         DaemonCommand::Start(args) => {
             let config = Config::load(args).context("failed to load configuration")?;
+            if daemon::status(&config)?.is_none() {
+                update::before_start().await?;
+            }
             let process = daemon::start(config).await?;
             println!(
                 "Daemon running: pid={} listen={}",
@@ -183,7 +219,11 @@ async fn daemon_command(command: DaemonCommand) -> anyhow::Result<()> {
         }
         DaemonCommand::Restart(args) => {
             let config = Config::load(args).context("failed to load configuration")?;
-            let process = daemon::restart(config).await?;
+            // The user explicitly requested a restart; update only after the old
+            // daemon is stopped so its executable identity remains verifiable.
+            daemon::stop(&config).await?;
+            update::before_start().await?;
+            let process = daemon::start(config).await?;
             println!(
                 "Daemon restarted: pid={} listen={}",
                 process.pid,

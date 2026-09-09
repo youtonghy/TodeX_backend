@@ -409,3 +409,57 @@ cargo run -- serve
 ```bash
 curl http://127.0.0.1:7345/health
 ```
+
+## GitHub Release updates
+
+Official release packages automatically check `youtonghy/TodeX_backend` on GitHub
+before `serve`, `tui`, or a new `daemon start`. `daemon restart` stops the old daemon
+first, then updates before starting the replacement. An already-running daemon
+returned by `daemon start` is left alone. Updates are installed at these launch
+boundaries; running servers are never periodically restarted and active agent
+turns are never stopped by an update timer.
+
+Eligibility requires **both** the release workflow's `TODEX_RELEASE_BUILD=1`
+compile-time marker and a strict stable `TODEX_BUILD_VERSION=X.Y.Z` other than
+`0.0.0`. Ordinary
+`cargo run`, debug builds, and unversioned builds perform no update network calls.
+Only newer stable releases are considered; no downgrades or prereleases.
+Supported update platforms match the release matrix: Linux x64 GNU, macOS arm64,
+and Windows x64.
+
+```sh
+# Read-only JSON status (also reports enabled=false for development builds)
+todex-agentd update --check
+# Install now, without starting or stopping a service
+todex-agentd update
+# Disable automatic startup updates; manual update remains available
+TODEX_AUTO_UPDATE=0 todex-agentd serve
+```
+
+The `update` command accepts the normal `--data-dir` and other server configuration
+flags to find your daemon. Stop running backend instances before manual installation;
+installation refuses when the configured managed daemon is running. Use `daemon
+restart` to deliberately stop and update that daemon. Installations must reside in
+a directory writable by the current user; the updater never elevates privileges.
+In PowerShell, disable automatic startup updates with `$env:TODEX_AUTO_UPDATE="0"`.
+
+The updater checks the exact release tag, platform asset name, HTTPS GitHub URL,
+size limits, and `SHA256SUMS`, then runs the downloaded executable's `--version`
+with a timeout before replacing the installed file. The workflow publishes both
+human-downloadable archives and raw executables for this mechanism. A release
+without the raw asset or checksum is skipped without changing the old binary.
+Network, checksum, permission, or validation failures are reported to stderr and
+automatic startup continues on the current version. GitHub metadata checks have
+a 10-second deadline; each asset download has a 120-second timeout. Offline startup
+may therefore wait up to the metadata timeout. Set the opt-out above when network
+checks must not delay service startup.
+
+The old executable is retained beside the installation as `*.previous-<uuid>`;
+its path is printed when an update installs. Replacement failures restore the old
+file, and immediate process-launch failures restore it as well. If a newer backend
+starts but later fails, stop it, restore that printed backup to the original
+executable filename, and launch with automatic updates disabled. This is a binary
+rollback, not a data migration rollback. Old backups can be removed after verifying
+the new version. A concurrent update is refused using a sibling `*.update-lock`
+directory. If the updater is forcibly killed, inspect the installation and backup
+first, then remove the abandoned lock directory before retrying.
