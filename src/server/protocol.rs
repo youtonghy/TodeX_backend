@@ -107,6 +107,13 @@ pub struct GitOperationRequest {
     deny_unknown_fields
 )]
 pub enum GitOperation {
+    CreatePr {
+        title: String,
+        body: String,
+        base_branch: String,
+        draft: bool,
+        repository: String,
+    },
     Init {},
     Push {},
     CreateBranch {
@@ -129,6 +136,7 @@ pub enum GitOperation {
 impl GitOperation {
     pub fn action(&self) -> &'static str {
         match self {
+            Self::CreatePr { .. } => "create-pr",
             Self::Init {} => "init",
             Self::Push {} => "push",
             Self::CreateBranch { .. } => "create-branch",

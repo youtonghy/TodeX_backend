@@ -1,5 +1,6 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
+mod pull_request;
 pub(crate) mod status;
 pub(crate) mod workspace;
 
@@ -115,6 +116,10 @@ async fn run_git_command(cwd: &Path, args: &[String], operation: &str) -> Result
         command.as_std_mut().process_group(0);
     }
 
+    run_external_command(command, operation).await
+}
+
+async fn run_external_command(mut command: Command, operation: &str) -> Result<GitCommandOutput> {
     let mut child = command.spawn().map_err(map_spawn_error)?;
     let process_group_id = child.id();
     let mut process_group_guard = ProcessGroupGuard::new(process_group_id);
