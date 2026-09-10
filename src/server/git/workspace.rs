@@ -309,7 +309,12 @@ async fn operate_locked(
             repository,
         } => {
             let output = super::pull_request::create(
-                workspace, title, body, base_branch, *draft, repository,
+                workspace,
+                title,
+                body,
+                base_branch,
+                *draft,
+                repository,
             )
             .await?;
             return Ok(GitOperationResponse {
@@ -466,13 +471,25 @@ mod tests {
     async fn create_pr_requires_pushed_upstream_without_mutating_checkout() {
         let fixture = Fixture::new();
         fixture.seed().await;
-        let head = text_command(&fixture.repo, &["rev-parse", "HEAD"]).await.unwrap();
-        let result = fixture.action(GitOperation::CreatePr {
-            title: "Example".to_owned(), body: "First line\nSecond line".to_owned(),
-            base_branch: "main".to_owned(), draft: true, repository: "owner/repo".to_owned(),
-        }).await;
+        let head = text_command(&fixture.repo, &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        let result = fixture
+            .action(GitOperation::CreatePr {
+                title: "Example".to_owned(),
+                body: "First line\nSecond line".to_owned(),
+                base_branch: "main".to_owned(),
+                draft: true,
+                repository: "owner/repo".to_owned(),
+            })
+            .await;
         assert!(result.unwrap_err().to_string().contains("upstream"));
-        assert_eq!(head, text_command(&fixture.repo, &["rev-parse", "HEAD"]).await.unwrap());
+        assert_eq!(
+            head,
+            text_command(&fixture.repo, &["rev-parse", "HEAD"])
+                .await
+                .unwrap()
+        );
         assert!(!is_dirty(&fixture.repo).await.unwrap());
     }
 
