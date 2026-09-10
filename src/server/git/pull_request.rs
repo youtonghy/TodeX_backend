@@ -127,6 +127,31 @@ pub(super) async fn create(
     draft: bool,
     repository: &str,
 ) -> Result<String> {
+    create_with_gh(
+        cwd,
+        title,
+        body,
+        base,
+        draft,
+        repository,
+        |args| async move { gh(cwd, &args).await },
+    )
+    .await
+}
+
+async fn create_with_gh<F, Fut>(
+    cwd: &Path,
+    title: &str,
+    body: &str,
+    base: &str,
+    draft: bool,
+    repository: &str,
+    mut execute: F,
+) -> Result<String>
+where
+    F: FnMut(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
     if title.trim().is_empty()
         || title.len() > 256
         || body.len() > 60_000
@@ -181,14 +206,11 @@ pub(super) async fn create(
             }
         })
         .collect();
-    let remote_head = gh(
-        cwd,
-        &api_args(
-            &host,
-            &format!("repos/{repository}/git/ref/heads/{encoded}"),
-            "GET",
-        ),
-    )
+    let remote_head = execute(api_args(
+        &host,
+        &format!("repos/{repository}/git/ref/heads/{encoded}"),
+        "GET",
+    ))
     .await?;
     if remote_head.pointer("/object/sha").and_then(Value::as_str) != Some(oid.as_str()) {
         return Err(invalid(
@@ -205,7 +227,7 @@ pub(super) async fn create(
         "--raw-field",
         &format!("base={base}"),
     ]));
-    let existing = gh(cwd, &lookup).await?;
+    let existing = execute(lookup).await?;
     let existing = existing
         .as_array()
         .ok_or_else(|| invalid("GitHub returned invalid PR list"))?;
@@ -226,7 +248,7 @@ pub(super) async fn create(
         if draft { "draft=true" } else { "draft=false" },
     ]));
     // Never retry a write: the server may have accepted it before a timeout.
-    let result = gh(cwd, &args)
+    let result = execute(args)
         .await
         .and_then(|pr| pr_url(&pr, &host, &repository));
     result.map_err(|error| AppError::GitPartialSuccess {
@@ -242,6 +264,168 @@ pub(super) async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    async fn fixture() -> (Fixture, String) {
+        let path = std::env::temp_dir().join(format!("todex-pr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        git_text(&path, &["init", "--initial-branch=feature", "--template="])
+            .await
+            .unwrap();
+        git_text(
+            &path,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initial",
+            ],
+        )
+        .await
+        .unwrap();
+        let oid = git_text(&path, &["rev-parse", "HEAD"]).await.unwrap();
+        git_text(
+            &path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/repo.git",
+            ],
+        )
+        .await
+        .unwrap();
+        git_text(&path, &["update-ref", "refs/remotes/origin/feature", &oid])
+            .await
+            .unwrap();
+        git_text(
+            &path,
+            &["branch", "--set-upstream-to=origin/feature", "feature"],
+        )
+        .await
+        .unwrap();
+        (Fixture(path), oid)
+    }
+
+    async fn mock_create(
+        path: &Path,
+        replies: Vec<Result<Value>>,
+    ) -> (Result<String>, Vec<Vec<String>>) {
+        let mut replies = VecDeque::from(replies);
+        let mut calls = Vec::new();
+        let result = create_with_gh(
+            path,
+            "Title $(literal)",
+            "First line\nSecond `literal` line",
+            "main",
+            true,
+            "owner/repo",
+            |args| {
+                calls.push(args);
+                std::future::ready(replies.pop_front().expect("Unexpected GitHub request"))
+            },
+        )
+        .await;
+        assert!(
+            replies.is_empty(),
+            "Not all expected GitHub requests occurred"
+        );
+        (result, calls)
+    }
+
+    #[tokio::test]
+    async fn creates_pr_with_literal_multiline_body_and_draft() {
+        let (fixture, oid) = fixture().await;
+        let (result, calls) = mock_create(
+            &fixture.0,
+            vec![
+                Ok(serde_json::json!({"object":{"sha":oid}})),
+                Ok(serde_json::json!([])),
+                Ok(serde_json::json!({"html_url":"https://github.com/owner/repo/pull/42"})),
+            ],
+        )
+        .await;
+        assert_eq!(result.unwrap(), "https://github.com/owner/repo/pull/42");
+        assert_eq!(calls.len(), 3);
+        assert!(calls[2].windows(2).any(|pair| pair == ["--method", "POST"]));
+        assert!(calls[2]
+            .windows(2)
+            .any(|pair| pair == ["--raw-field", "body=First line\nSecond `literal` line"]));
+        assert!(calls[2]
+            .windows(2)
+            .any(|pair| pair == ["--raw-field", "title=Title $(literal)"]));
+        assert!(calls[2]
+            .windows(2)
+            .any(|pair| pair == ["--field", "draft=true"]));
+        assert!(calls[2].contains(&"head=feature".to_owned()));
+        assert!(calls[2].contains(&"base=main".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn existing_pr_returns_url_without_post() {
+        let (fixture, oid) = fixture().await;
+        let (result, calls) = mock_create(
+            &fixture.0,
+            vec![
+                Ok(serde_json::json!({"object":{"sha":oid}})),
+                Ok(serde_json::json!([{"html_url":"https://github.com/owner/repo/pull/42"}])),
+            ],
+        )
+        .await;
+        assert_eq!(result.unwrap(), "https://github.com/owner/repo/pull/42");
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|args| !args.contains(&"POST".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn remote_sha_mismatch_prevents_post() {
+        let (fixture, _) = fixture().await;
+        let (result, calls) = mock_create(
+            &fixture.0,
+            vec![Ok(serde_json::json!({"object":{"sha":"different"}}))],
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("does not match HEAD"));
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].contains(&"POST".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn write_timeout_is_unknown_and_never_retried() {
+        let (fixture, oid) = fixture().await;
+        let (result, calls) = mock_create(
+            &fixture.0,
+            vec![
+                Ok(serde_json::json!({"object":{"sha":oid}})),
+                Ok(serde_json::json!([])),
+                Err(AppError::GitCommandTimedOut("GitHub PR request".to_owned())),
+            ],
+        )
+        .await;
+        match result.unwrap_err() {
+            AppError::GitPartialSuccess { detail, .. } => {
+                assert!(detail.contains("outcome is unknown"))
+            }
+            other => panic!("Expected unknown write outcome, got {other}"),
+        }
+        assert_eq!(calls.len(), 3);
+    }
+
     #[test]
     fn validates_repository_and_remote_identity() {
         assert_eq!(
