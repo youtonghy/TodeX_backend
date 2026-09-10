@@ -258,12 +258,26 @@ impl ConversationSupervisor {
                 ConversationStatus::Running | ConversationStatus::WaitingPermission
             );
             let recovered = self.store.recover(&manifest.id).await?;
-            let mut expired = std::collections::BTreeSet::new();
+            let mut expired = std::collections::BTreeMap::new();
+            let mut resident_runtimes = std::collections::BTreeSet::new();
             for event in self.store.complete_history(&manifest.id).await? {
+                if event.event_type == "provider.runtime" {
+                    if let Some(id) = event.payload.get("runtimeId").and_then(Value::as_str) {
+                        match event.payload.get("status").and_then(Value::as_str) {
+                            Some("ready") => {
+                                resident_runtimes.insert(id.to_owned());
+                            }
+                            Some("stopped") => {
+                                resident_runtimes.remove(id);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if let Some(id) = event.payload.get("permissionId").and_then(Value::as_str) {
                     match event.event_type.as_str() {
                         "permission.requested" | "tool.awaitingApproval" => {
-                            expired.insert(id.to_owned());
+                            expired.insert(id.to_owned(), json!({"scope":event.payload.get("scope"),"runtimeId":event.payload.get("runtimeId")}));
                         }
                         "permission.resolved" => {
                             expired.remove(id);
@@ -272,11 +286,22 @@ impl ConversationSupervisor {
                     }
                 }
             }
-            for permission_id in expired {
+            for (permission_id, context) in expired {
                 self.emit(&manifest.id, "permission.resolved", json!({
                     "permissionId": permission_id, "outcome": "cancelled", "optionId": Value::Null,
-                    "reason": "daemon_restarted",
+                    "reason": "daemon_restarted", "scope":context.get("scope"),"runtimeId":context.get("runtimeId"),
                 })).await?;
+            }
+            for runtime_id in resident_runtimes {
+                self.emit(
+                    &manifest.id,
+                    "provider.runtime",
+                    json!({
+                        "provider":manifest.provider,"runtimeId":runtime_id,"scope":"session",
+                        "status":"stopped","reason":"daemon_restarted",
+                    }),
+                )
+                .await?;
             }
 
             if was_active {
@@ -426,6 +451,47 @@ impl ConversationSupervisor {
         })?
     }
 
+    /// A conversation query must use its authorized manifest, never a client's
+    /// independently supplied provider or workspace. Only the owning worker may
+    /// read the resident provider's stdout.
+    pub async fn conversation_commands_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+    ) -> Result<Value, AppError> {
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
+            AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
+        })?;
+        let _launch_permit = self
+            .workspace_trust
+            .acquire_owned(owner_id, &manifest.workspace)
+            .await?;
+        let driver = self.registry.driver(manifest.provider)?;
+        let catalog = tokio::time::timeout(Duration::from_secs(8), async {
+            if let Some(catalog) = driver.session_commands(&manifest.id).await? {
+                Ok(json!({
+                    "provider": manifest.provider, "conversationId": manifest.id,
+                    "runtimeId": catalog.runtime_id, "commands": catalog.commands,
+                    "catalogSource": "session", "source": "provider-session",
+                    "fetchedAt": chrono::Utc::now().to_rfc3339(),
+                }))
+            } else {
+                let commands = driver.discover_commands(&manifest.workspace).await?;
+                Ok(json!({
+                    "provider": manifest.provider, "conversationId": manifest.id,
+                    "commands": commands, "catalogSource": "discovery",
+                    "source": "provider-discovery", "fetchedAt": chrono::Utc::now().to_rfc3339(),
+                }))
+            }
+        })
+        .await
+        .map_err(|_| {
+            AppError::ProviderUnavailable("Conversation command discovery timed out".to_owned())
+        })?;
+        catalog
+    }
+
     #[allow(dead_code)]
     pub async fn create(
         &self,
@@ -547,7 +613,7 @@ impl ConversationSupervisor {
         }
         self.registry
             .driver(manifest.provider)?
-            .shutdown_session(&manifest.id)
+            .shutdown_session_with_reason(&manifest.id, "conversation_deleted")
             .await;
         self.store.delete(&manifest.id).await?;
         Ok(manifest)
@@ -568,7 +634,7 @@ impl ConversationSupervisor {
         for manifest in &removed {
             self.registry
                 .driver(manifest.provider)?
-                .shutdown_session(&manifest.id)
+                .shutdown_session_with_reason(&manifest.id, "conversation_expired")
                 .await;
         }
         Ok(removed)
@@ -847,6 +913,29 @@ impl ConversationSupervisor {
             .ok()
             .and_then(|kind| self.registry.driver(kind).ok())
             .is_some_and(|driver| driver.supports_native_queue())
+    }
+
+    pub fn supports_runtime_stop(&self, provider: &str) -> bool {
+        provider
+            .parse::<ProviderKind>()
+            .ok()
+            .and_then(|kind| self.registry.driver(kind).ok())
+            .is_some_and(|driver| driver.supports_runtime_stop())
+    }
+
+    pub async fn stop_runtime_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+    ) -> Result<Value, AppError> {
+        let _guard = self.request_gate(conversation_id).lock_owned().await;
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        // Closing a runtime is distinct from aborting its current model turn.
+        // The worker closes pending dialogs and reports any interrupted turn.
+        self.registry
+            .driver(manifest.provider)?
+            .stop_runtime(&manifest.id)
+            .await
     }
 
     /// Persist an intent before sending any non-idempotent control. A lost
@@ -1446,12 +1535,17 @@ impl ConversationSupervisor {
             if manifest.workspace != workspace {
                 continue;
             }
-            let Some(active) = self.active.get(&manifest.id) else {
-                continue;
-            };
-            if active.cancel.send(true).is_ok() {
-                cancelled += 1;
+            if let Some(active) = self.active.get(&manifest.id) {
+                if active.cancel.send(true).is_ok() {
+                    cancelled += 1;
+                }
             }
+            // Trust revocation and workspace deletion also stop resident
+            // extensions that are running between model turns.
+            self.registry
+                .driver(manifest.provider)?
+                .shutdown_session_with_reason(&manifest.id, "workspace_access_revoked")
+                .await;
         }
         Ok(cancelled)
     }
@@ -2305,7 +2399,44 @@ mod tests {
             )
             .await
             .unwrap();
+        let idle = store
+            .create(ConversationManifest::new(
+                ProviderKind::Pi,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        store.append(&idle.id, "provider.runtime", json!({"provider":"pi","scope":"session","runtimeId":"runtime-idle","status":"ready"})).await.unwrap();
+        store
+            .append(
+                &idle.id,
+                "permission.requested",
+                json!({"permissionId":"idle-dialog","scope":"session","runtimeId":"runtime-idle"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&idle.id).await.unwrap().status,
+            ConversationStatus::Idle
+        );
         supervisor.recover_all().await.unwrap();
+        assert_eq!(
+            store.get(&idle.id).await.unwrap().status,
+            ConversationStatus::Idle
+        );
+        let idle_history = store.complete_history(&idle.id).await.unwrap();
+        assert!(idle_history
+            .iter()
+            .any(|event| event.event_type == "permission.resolved"
+                && event.payload["scope"] == "session"
+                && event.payload["runtimeId"] == "runtime-idle"));
+        assert!(idle_history
+            .iter()
+            .any(|event| event.event_type == "provider.runtime"
+                && event.payload["status"] == "stopped"
+                && event.payload["reason"] == "daemon_restarted"));
         assert_eq!(
             store.get(&manifest.id).await.unwrap().status,
             ConversationStatus::Interrupted
@@ -2319,6 +2450,10 @@ mod tests {
         assert_eq!(terminal.payload["reason"], "daemon_restarted");
         let count = history.len();
         supervisor.recover_all().await.unwrap();
+        assert_eq!(
+            store.complete_history(&idle.id).await.unwrap().len(),
+            idle_history.len()
+        );
         assert_eq!(
             store.complete_history(&manifest.id).await.unwrap().len(),
             count
@@ -2560,6 +2695,98 @@ mod tests {
                 .count()
                 == 1
         }));
+        wait_until_idle(&supervisor).await;
+        let catalog = supervisor
+            .conversation_commands_owned("local", &manifest.id)
+            .await
+            .unwrap();
+        assert_eq!(catalog["catalogSource"], "session");
+        assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 3);
+        assert!(matches!(
+            supervisor
+                .conversation_commands_owned("other", &manifest.id)
+                .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            supervisor.stop_runtime_owned("other", &manifest.id).await,
+            Err(AppError::NotFound(_))
+        ));
+        supervisor
+            .cancel_owned("local", &manifest.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            supervisor
+                .conversation_commands_owned("local", &manifest.id)
+                .await
+                .unwrap()["runtimeId"],
+            catalog["runtimeId"]
+        );
+        trust.set_owned("local", &workspace, false).await.unwrap();
+        assert_eq!(
+            supervisor
+                .cancel_workspace_owned("local", &workspace)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(store
+            .complete_history(&manifest.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "provider.runtime"
+                && event.payload["reason"] == "workspace_access_revoked"));
+        assert!(matches!(
+            supervisor
+                .conversation_commands_owned("local", &manifest.id)
+                .await,
+            Err(AppError::WorkspaceTrustRequired(_))
+        ));
+        trust.set_owned("local", &workspace, true).await.unwrap();
+        supervisor
+            .prompt(&manifest.id, "reopen".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let reopened = supervisor
+            .conversation_commands_owned("local", &manifest.id)
+            .await
+            .unwrap();
+        assert_ne!(catalog["runtimeId"], reopened["runtimeId"]);
+        let stopped = supervisor
+            .stop_runtime_owned("local", &manifest.id)
+            .await
+            .unwrap();
+        assert_eq!(stopped["status"], "stopped");
+        assert_eq!(
+            store.get(&manifest.id).await.unwrap().status,
+            ConversationStatus::Idle
+        );
+        assert!(store
+            .provider_state(&manifest.id)
+            .await
+            .unwrap()
+            .native_session_id
+            .is_some());
+        supervisor
+            .prompt(&manifest.id, "reopen before delete".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        supervisor
+            .delete_owned("local", &manifest.id)
+            .await
+            .unwrap();
+        assert!(supervisor
+            .registry
+            .driver(ProviderKind::Pi)
+            .unwrap()
+            .session_commands(&manifest.id)
+            .await
+            .unwrap()
+            .is_none());
         supervisor.shutdown_all().await;
         let _ = fs::remove_dir_all(root);
     }
@@ -2822,7 +3049,8 @@ while IFS= read -r line; do
       printf '{{"id":"models","type":"response","success":true,"data":{{"models":[]}}}}\n'
       ;;
     *'"type":"get_commands"'*)
-      printf '{{"id":"commands","type":"response","success":true,"data":{{"commands":[]}}}}\n'
+      id=$(extract_id "$line")
+      printf '{{"id":"%s","type":"response","success":true,"data":{{"commands":[]}}}}\n' "$id"
       ;;
     *'"type":"get_state"'*)
       id=$(extract_id "$line")

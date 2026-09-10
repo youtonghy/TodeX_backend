@@ -287,6 +287,16 @@ pub fn status_after_conversation_event(
     current: ConversationStatus,
     event: &ConversationEvent,
 ) -> ConversationStatus {
+    // Extension dialogs can outlive a turn or arrive while the provider is
+    // otherwise idle. They are actionable UI, not a new model execution.
+    if event.payload.get("scope").and_then(Value::as_str) == Some("session")
+        && matches!(
+            event.event_type.as_str(),
+            "permission.requested" | "tool.awaitingApproval" | "permission.resolved"
+        )
+    {
+        return current;
+    }
     if event
         .payload
         .get("operationId")

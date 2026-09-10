@@ -671,6 +671,8 @@ pub(super) fn parse_commands(initialize: &Value) -> Vec<ProviderCommandDescripto
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 invocation: "provider-prompt".to_owned(),
+                package_name: None,
+                package_version: None,
                 name,
             })
         })

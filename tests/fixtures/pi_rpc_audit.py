@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import threading
 
 args = sys.argv[1:]
 session = args[args.index('--session') + 1] if '--session' in args else args[args.index('--session-id') + 1] if '--session-id' in args else 'discovery'
@@ -19,9 +20,25 @@ scenario = ''
 queue = []
 steering = []
 waiting_dialog = False
+output_lock = threading.Lock()
 
 def out(value):
-    print(json.dumps(value), flush=True)
+    with output_lock:
+        print(json.dumps(value), flush=True)
+
+def custom(text, display=True):
+    message = {'role': 'custom', 'customType': 'fixture-report', 'content': [{'type': 'text', 'text': text}], 'display': display, 'details': {'fixture': True}, 'timestamp': 123456}
+    out({'type': 'message_start', 'message': message})
+    out({'type': 'message_end', 'message': message})
+
+def ui(method, **fields):
+    out({'type': 'extension_ui_request', 'id': fields.pop('id', 'ui-' + method), 'method': method, **fields})
+
+def idle_events():
+    time.sleep(0.08)
+    ui('notify', message='idle notification', notifyType='info')
+    custom('idle custom message')
+    ui('confirm', id='idle-confirm', title='Background confirmation')
 
 def ack(cmd, data=None):
     value = {'type': 'response', 'id': cmd.get('id'), 'command': cmd['type'], 'success': True}
@@ -48,7 +65,15 @@ for line in sys.stdin:
     kind = cmd['type']
     with open('pi-commands', 'a') as marker:
         marker.write(json.dumps(cmd) + '\n')
-    if kind == 'get_state':
+    if kind == 'get_commands':
+        if scenario == 'stall-catalog':
+            ui('confirm', id='catalog-confirm', title='Catalog is stalled')
+            continue
+        ack(cmd, {'commands': [{'name': 'fixture-report', 'description': 'fixture command', 'source': 'extension', 'sourceInfo': {'path': os.path.join(os.getcwd(), 'pi.py'), 'origin': 'top-level', 'scope': 'user', 'source': 'npm:fixture-plugin'}}]})
+    elif kind == 'get_state':
+        if cmd.get('id') == 'state' and scenario == 'buffer-idle':
+            out({'type': 'message_start', 'message': {'role': 'assistant'}})
+            out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop', 'content': [{'type': 'text', 'text': 'background before next prompt'}], 'usage': {'input': 1, 'output': 2}}})
         ack(cmd, state())
         if cmd.get('id') == 'accepted-state':
             if scenario == 'normal':
@@ -77,7 +102,7 @@ for line in sys.stdin:
         ack(cmd)
     elif kind == 'prompt':
         scenario = cmd['message']
-        streaming = scenario not in ['pure', 'preack', 'preack-dialog', 'extension-error']
+        streaming = scenario not in ['pure', 'preack', 'preack-dialog', 'extension-error', 'ui', 'schedule-idle', 'stall-catalog', 'buffer-idle', 'rejected']
         if scenario == 'extension-error':
             out({'type': 'extension_error', 'error': 'fixture extension failed'})
             ack(cmd)
@@ -88,6 +113,30 @@ for line in sys.stdin:
         elif scenario == 'preack':
             finish(text='before ack')
             ack(cmd)
+        elif scenario == 'ui':
+            ui('notify', message='plugin notification', notifyType='warning')
+            ui('setStatus', id='status-one', statusKey='fixture', statusText='working')
+            ui('setStatus', id='status-two', statusKey='fixture', statusText='working')
+            ui('setWidget', widgetKey='fixture', widgetLines=['row one', 'row two'], widgetPlacement='belowEditor')
+            ui('setTitle', title='Extension title')
+            ui('set_editor_text', text='suggested prompt')
+            custom('visible extension report')
+            custom('hidden extension context', False)
+            for index in range(50):
+                ui('setWidget', widgetKey='fixture', widgetLines=['progress ' + str(index)])
+            ui('setStatus', statusKey='fixture')
+            ui('setWidget', widgetKey='fixture')
+            ack(cmd)
+        elif scenario in ['stall-catalog', 'buffer-idle']:
+            ack(cmd)
+        elif scenario == 'schedule-idle':
+            ack(cmd)
+            threading.Thread(target=idle_events, daemon=True).start()
+        elif scenario == 'rejected':
+            out({'type': 'response', 'id': cmd.get('id'), 'command': kind, 'success': False, 'error': 'fixture command rejected'})
+        elif scenario == 'malformed':
+            ack(cmd)
+            print('not-json', flush=True)
         else:
             ack(cmd)
             if streaming:
@@ -143,6 +192,7 @@ for line in sys.stdin:
         out({'type': 'compaction_end', 'result': {'summary': 'compact summary'}})
         ack(cmd, {'summary': 'compact summary'})
     elif kind == 'extension_ui_response':
-        pass
+        if cmd.get('id') == 'idle-confirm':
+            ui('notify', message='idle answer: ' + str(cmd.get('confirmed', 'cancelled')), notifyType='info')
     else:
         out({'type': 'response', 'id': cmd.get('id'), 'success': False, 'error': 'unexpected command ' + kind})
