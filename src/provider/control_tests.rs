@@ -128,7 +128,10 @@ impl Harness {
             )
             .await
             .unwrap();
-        self.wait_event("tool.started", None).await;
+        // Starting the fixture includes a cold Python launch and durable session setup.
+        // Give CI runners room to initialize without relaxing live control deadlines.
+        self.wait_event_with_timeout("tool.started", None, Duration::from_secs(30))
+            .await;
         turn
     }
 
@@ -140,7 +143,12 @@ impl Harness {
     }
 
     async fn wait_event(&self, kind: &str, request: Option<&str>) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        self.wait_event_with_timeout(kind, request, Duration::from_secs(5))
+            .await;
+    }
+
+    async fn wait_event_with_timeout(&self, kind: &str, request: Option<&str>, timeout: Duration) {
+        let result = tokio::time::timeout(timeout, async {
             loop {
                 if self.events().await.iter().any(|event| {
                     event.event_type == kind
@@ -153,8 +161,14 @@ impl Harness {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .unwrap_or_else(|_| panic!("missing {kind} {request:?}"));
+        .await;
+        if result.is_err() {
+            panic!(
+                "missing {kind} {request:?} within {timeout:?}; events: {:#?}; native commands: {:#?}",
+                self.events().await,
+                self.native_commands().await,
+            );
+        }
     }
 
     async fn native_commands(&self) -> Vec<Value> {
