@@ -111,6 +111,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v2/git/scan", get(git_scan))
         .route("/v2/git/run", post(git_run))
         .route("/v2/git/workspace", get(git_workspace))
+        .route("/v2/git/pull-request", get(git_pull_request))
         .route("/v2/git/status", get(git_status))
         .route("/v2/git/operation", post(git_operation))
         .route("/v2/browser/fetch", post(browser_fetch))
@@ -652,6 +653,30 @@ pub(super) async fn git_workspace(
         &state,
         &auth,
         "workspace",
+        &workspace,
+        None,
+        if result.is_ok() { "allow" } else { "deny" },
+        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
+        None,
+        None,
+    )
+    .await;
+    combine_git_result(result.map(Json), audit)
+}
+
+pub(super) async fn git_pull_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<super::protocol::GitScanQuery>,
+) -> Result<Json<super::protocol::GitPullRequestResponse>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace_path)?;
+    let result = git::pull_request::summary(&state.config.workspace_root, &workspace).await;
+    let audit = append_git_audit(
+        &state,
+        &auth,
+        "pull-request",
         &workspace,
         None,
         if result.is_ok() { "allow" } else { "deny" },

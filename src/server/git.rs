@@ -1,6 +1,6 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
-mod pull_request;
+pub(crate) mod pull_request;
 pub(crate) mod status;
 pub(crate) mod workspace;
 
