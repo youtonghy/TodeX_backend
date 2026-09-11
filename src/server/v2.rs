@@ -439,16 +439,19 @@ pub(super) async fn workspace_file(
     }
     let data_url =
         is_image.then(|| format!("data:{mime_type};base64,{}", BASE64_STANDARD.encode(&bytes)));
-    let text = if mime_type.starts_with("text/") || mime_type == "application/json" {
-        Some(String::from_utf8_lossy(&bytes).to_string())
-    } else {
+    let size_bytes = bytes.len() as u64;
+    // Preview any UTF-8 decodable file as text so source files outside the
+    // MIME whitelist (Swift, Kotlin, extension-less scripts, ...) still render.
+    let text = if is_image {
         None
+    } else {
+        String::from_utf8(bytes).ok()
     };
     Ok(Json(WorkspaceFileResponse {
         name,
         path: path.display().to_string(),
         mime_type,
-        size_bytes: bytes.len() as u64,
+        size_bytes,
         text,
         data_url,
     }))
@@ -3923,6 +3926,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(oversized_text.status(), StatusCode::BAD_REQUEST);
+
+        // Source files whose extension is not in the MIME whitelist still
+        // preview as text, while non-UTF-8 payloads stay unpreviewable.
+        let swift = workspace.join("Package.swift");
+        fs::write(&swift, "// swift-tools-version: 6.0\n").unwrap();
+        let swift_response = app
+            .clone()
+            .oneshot(preview_request(&swift, true))
+            .await
+            .unwrap();
+        assert_eq!(swift_response.status(), StatusCode::OK);
+        let swift_body = to_bytes(swift_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let swift_json: serde_json::Value = serde_json::from_slice(&swift_body).unwrap();
+        assert_eq!(swift_json["text"], "// swift-tools-version: 6.0\n");
+        let binary = workspace.join("preview.bin");
+        fs::write(&binary, [0x00u8, 0x9f, 0x92, 0x96, 0xff]).unwrap();
+        let binary_response = app
+            .clone()
+            .oneshot(preview_request(&binary, true))
+            .await
+            .unwrap();
+        assert_eq!(binary_response.status(), StatusCode::OK);
+        let binary_body = to_bytes(binary_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let binary_json: serde_json::Value = serde_json::from_slice(&binary_body).unwrap();
+        assert!(binary_json["text"].is_null());
 
         let save_request = |path: &Path, text: &str, expected: &str, authenticated: bool| {
             let mut builder = Request::builder()
