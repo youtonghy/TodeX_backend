@@ -385,7 +385,7 @@ pub(super) async fn run_acp_turn_controlled(
         let options = response
             .get("configOptions")
             .cloned()
-            .map(serde_json::from_value)
+            .map(serde_json::from_value::<Vec<SessionConfigOption>>)
             .transpose()?;
         (id.clone(), options, response.get("models").cloned())
     } else {
@@ -403,7 +403,7 @@ pub(super) async fn run_acp_turn_controlled(
                         .to_owned(),
                 ));
                 }
-                let response_value = if can_resume {
+                let loaded = if can_resume {
                     send_request(
                         process,
                         "session",
@@ -424,7 +424,7 @@ pub(super) async fn run_acp_turn_controlled(
                         auto_approve,
                         connection,
                     )
-                    .await?
+                    .await
                 } else {
                     let mut request = serde_json::to_value(LoadSessionRequest::new(
                         session_id.clone(),
@@ -442,7 +442,32 @@ pub(super) async fn run_acp_turn_controlled(
                         auto_approve,
                         connection,
                     )
-                    .await?
+                    .await
+                };
+                let (session_id, response_value) = match loaded {
+                    Ok(response_value) => (session_id, response_value),
+                    // Devin sessions are locked process-wide and can be held by
+                    // a stale or externally hosted instance; start a fresh
+                    // session rather than failing the turn.
+                    Err(AppError::Conflict(_)) if provider == ProviderKind::Devin => {
+                        sink.emit(
+                            "provider.event",
+                            json!({"provider":provider.as_str(),"providerMethod":"session/recreated","metadata":{"reason":"session_locked","previousSessionId":session_id}}),
+                        )
+                        .await?;
+                        new_acp_session(
+                            process,
+                            &context,
+                            &options,
+                            sink,
+                            cancel,
+                            provider,
+                            auto_approve,
+                            connection,
+                        )
+                        .await?
+                    }
+                    Err(error) => return Err(error),
                 };
                 connection.session = Some((session_id.clone(), response_value.clone()));
                 let legacy_models = response_value.get("models").cloned();
@@ -459,33 +484,30 @@ pub(super) async fn run_acp_turn_controlled(
                 (session_id, config_options, legacy_models)
             }
             None => {
-                let mut request = serde_json::to_value(NewSessionRequest::new(
-                    context.manifest.workspace.clone(),
-                ))?;
-                apply_session_metadata(&mut request, &options, false);
-                send_request(process, "session", "session/new", request).await?;
-                let response_value = wait_for_response(
+                let (session_id, response_value) = new_acp_session(
                     process,
-                    "session",
+                    &context,
+                    &options,
                     sink,
                     cancel,
                     provider,
-                    true,
                     auto_approve,
                     connection,
                 )
                 .await?;
+                connection.session = Some((session_id.clone(), response_value.clone()));
                 let legacy_models = response_value.get("models").cloned();
-                let response: NewSessionResponse = serde_json::from_value(response_value.clone())
+                let config_options = response_value
+                    .get("configOptions")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
                     .map_err(|error| {
-                    AppError::InvalidRequest(format!("invalid ACP session/new response: {error}"))
-                })?;
-                connection.session = Some((response.session_id.0.to_string(), response_value));
-                (
-                    response.session_id.0.to_string(),
-                    response.config_options,
-                    legacy_models,
-                )
+                        AppError::InvalidRequest(format!(
+                            "invalid ACP session/new response: {error}"
+                        ))
+                    })?;
+                (session_id, config_options, legacy_models)
             }
         }
     };
@@ -996,6 +1018,41 @@ fn apply_session_metadata(request: &mut Value, options: &AcpRuntimeOptions, load
     }
 }
 
+/// Open a new native ACP session. Shared by the cold-start path and the
+/// session-lock fallback, where the previous session id is abandoned.
+#[allow(clippy::too_many_arguments)]
+async fn new_acp_session(
+    process: &mut JsonLineProcess,
+    context: &DriverContext,
+    options: &AcpRuntimeOptions,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+    provider: ProviderKind,
+    auto_approve: AutoApprove,
+    connection: &mut AcpConnectionState,
+) -> Result<(String, Value), AppError> {
+    let mut request =
+        serde_json::to_value(NewSessionRequest::new(context.manifest.workspace.clone()))?;
+    apply_session_metadata(&mut request, options, false);
+    send_request(process, "session", "session/new", request).await?;
+    let response_value = wait_for_response(
+        process,
+        "session",
+        sink,
+        cancel,
+        provider,
+        true,
+        auto_approve,
+        connection,
+    )
+    .await?;
+    let response: NewSessionResponse =
+        serde_json::from_value(response_value.clone()).map_err(|error| {
+            AppError::InvalidRequest(format!("invalid ACP session/new response: {error}"))
+        })?;
+    Ok((response.session_id.0.to_string(), response_value))
+}
+
 fn is_grok_update_method(method: &str) -> bool {
     matches!(
         extension_method(method),
@@ -1249,6 +1306,18 @@ async fn wait_for_response_with_timeout(
         }
         if jsonrpc_id(&message) == Some(request_id) {
             if let Some(error) = message.get("error") {
+                // Devin marks a session opened by another process (a stale lock
+                // or the Devin app's resident ACP host) with a structured kind;
+                // surface it distinctly so the caller can recover.
+                let locked = error
+                    .pointer("/data/cognition.ai~1errorKind")
+                    .and_then(Value::as_str)
+                    == Some("session_locked");
+                if locked {
+                    return Err(AppError::Conflict(
+                        "ACP session is open in another process".to_owned(),
+                    ));
+                }
                 return Err(AppError::ProviderUnavailable(format!(
                     "ACP request {request_id} failed: {}",
                     safe_error_text(error)
@@ -2220,9 +2289,12 @@ fn devin_session_mode(prompt: &DriverPrompt) -> Option<&'static str> {
     if prompt.work_mode.as_deref() == Some("plan") {
         return Some("plan");
     }
+    // Devin has no auto-approval tier: `accept-edits` still prompts for shell
+    // commands and is the only mode that surfaces approval requests, so both
+    // `ask` and a stale `auto` selection resolve to it. Devin's own `ask` mode
+    // is read-only Q&A, which is not what manual approval means here.
     match prompt.permission_mode.as_deref() {
-        Some("ask") => Some("ask"),
-        Some("auto") => Some("accept-edits"),
+        Some("ask") | Some("auto") => Some("accept-edits"),
         Some("full-access") => Some("bypass"),
         _ => None,
     }
@@ -2496,7 +2568,7 @@ mod tests {
     fn devin_session_mode_maps_permission_and_work_modes() {
         let mut prompt = image_prompt();
         prompt.permission_mode = Some("ask".to_owned());
-        assert_eq!(devin_session_mode(&prompt), Some("ask"));
+        assert_eq!(devin_session_mode(&prompt), Some("accept-edits"));
         prompt.permission_mode = Some("auto".to_owned());
         assert_eq!(devin_session_mode(&prompt), Some("accept-edits"));
         prompt.permission_mode = Some("full-access".to_owned());

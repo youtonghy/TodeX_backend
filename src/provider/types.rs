@@ -66,9 +66,9 @@ pub fn permission_config_capabilities(provider: ProviderKind) -> PermissionConfi
             enforcement: "agent-policy", description: "Claude default / auto / bypassPermissions and independent plan mode; not an operating-system sandbox. Legacy combinations remain validated.",
         },
         ProviderKind::Devin => PermissionConfigCapabilities {
-            modes: vec!["ask", "auto", "full-access"], default_mode: "auto", supports_plan: true,
+            modes: vec!["ask", "full-access"], default_mode: "ask", supports_plan: true,
             sandbox_modes: vec![], approval_policies: vec![], permission_profiles: vec![],
-            enforcement: "agent-policy", description: "Devin session modes over ACP: ask / accept-edits / plan / bypass; enforced by the agent, not an operating-system sandbox",
+            enforcement: "agent-policy", description: "Devin session modes over ACP: manual approval (accept-edits) / bypass, plus plan work mode; enforced by the agent, not an operating-system sandbox",
         },
         ProviderKind::Opencode => PermissionConfigCapabilities {
             modes: vec!["ask", "auto", "full-access"], default_mode: "ask", supports_plan: true,
@@ -337,6 +337,13 @@ pub fn resolve_execution_config(
         return Ok(legacy);
     }
     let mode = permission_mode.unwrap_or(capabilities.default_mode);
+    // Devin exposes no auto-approval tier; a stale `auto` selection degrades to
+    // manual approval rather than failing the prompt.
+    let mode = if provider == ProviderKind::Devin && mode == "auto" {
+        "ask"
+    } else {
+        mode
+    };
     if !capabilities.modes.contains(&mode) {
         return Err(AppError::Unsupported(format!(
             "{} does not support permission mode {mode}",
@@ -1310,6 +1317,12 @@ mod tests {
         assert!(config(ProviderKind::Pi, "auto", "implement").is_err());
         assert!(config(ProviderKind::Pi, "ask", "implement").is_err());
         assert!(config(ProviderKind::Pi, "full-access", "plan").is_err());
+        // Devin offers only manual approval and full access; a stale `auto`
+        // selection degrades to `ask` instead of erroring.
+        let stale_auto = config(ProviderKind::Devin, "auto", "implement").unwrap();
+        assert_eq!(stale_auto.permission_mode, "ask");
+        assert!(config(ProviderKind::Devin, "ask", "plan").is_ok());
+        assert!(config(ProviderKind::Devin, "full-access", "implement").is_ok());
         for provider in [ProviderKind::Acp, ProviderKind::GrokBuild] {
             assert!(config(provider, "ask", "implement").is_ok());
             assert!(config(provider, "auto", "implement").is_err());
