@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::config::AgentConfig;
-use crate::conversation::ProviderKind;
+use crate::conversation::{ProviderKind, ProviderState};
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
@@ -75,8 +75,9 @@ impl OpencodeDriver {
         }
     }
 
-    /// Models and slash commands live behind `session/new`; the probe session is
-    /// closed best-effort before returning.
+    /// Models and slash commands live behind `session/new`. The session is left
+    /// open so callers can issue follow-up probes (per-model effort options);
+    /// callers must close it best-effort via `close_probe_session`.
     async fn session_probe(
         &self,
         workspace: &Path,
@@ -94,14 +95,13 @@ impl OpencodeDriver {
                 DIAGNOSTIC_TIMEOUT,
             )
             .await?;
-            let session_id = response
+            response
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| {
                     AppError::InvalidRequest("invalid OpenCode session/new response".to_owned())
-                })?
-                .to_owned();
+                })?;
             // Command announcements trail the session/new response.
             let deadline = tokio::time::Instant::now() + COMMAND_DRAIN;
             loop {
@@ -127,14 +127,6 @@ impl OpencodeDriver {
                         .await?;
                 }
             }
-            let _ = control_request(
-                &mut process,
-                "session:close",
-                "session/close",
-                json!({ "sessionId": session_id }),
-                DIAGNOSTIC_TIMEOUT,
-            )
-            .await;
             Ok((response, updates))
         }
         .await;
@@ -146,6 +138,22 @@ impl OpencodeDriver {
             }
         }
     }
+}
+
+/// Best-effort close for a probe session; failures are ignored because the
+/// process is terminated immediately afterwards either way.
+async fn close_probe_session(process: &mut JsonLineProcess, session: &Value) {
+    let Some(session_id) = session.get("sessionId").and_then(Value::as_str) else {
+        return;
+    };
+    let _ = control_request(
+        process,
+        "session:close",
+        "session/close",
+        json!({ "sessionId": session_id }),
+        DIAGNOSTIC_TIMEOUT,
+    )
+    .await;
 }
 
 #[async_trait]
@@ -251,7 +259,7 @@ impl ProviderDriver for OpencodeDriver {
                 permission_config: super::types::permission_config_capabilities(
                     ProviderKind::Opencode,
                 ),
-                native_fork: false,
+                native_fork: true,
                 native_compact: false,
                 native_resume: true,
                 cancel: true,
@@ -268,20 +276,125 @@ impl ProviderDriver for OpencodeDriver {
         }
     }
 
+    fn supports_native_fork(&self) -> bool {
+        true
+    }
+
+    async fn fork_session(
+        &self,
+        context: DriverContext,
+        launch_permit: WorkspaceTrustPermit,
+    ) -> Result<ProviderState, AppError> {
+        let source = context
+            .provider_state
+            .native_session_id
+            .as_deref()
+            .ok_or_else(|| {
+                AppError::InvalidRequest("OpenCode session has not started".to_owned())
+            })?;
+        let mut process = JsonLineProcess::spawn_trusted(
+            &self.command_spec(&context.manifest.workspace),
+            launch_permit,
+        )
+        .await?;
+        let result = async {
+            let _initialize = initialize_process(&mut process).await?;
+            let response = control_request(
+                &mut process,
+                "fork",
+                "session/fork",
+                json!({"sessionId": source, "cwd": context.manifest.workspace}),
+                DIAGNOSTIC_TIMEOUT,
+            )
+            .await?;
+            let id = response
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty() && *id != source)
+                .ok_or_else(|| {
+                    AppError::InvalidRequest(
+                        "invalid OpenCode fork response: missing distinct sessionId".to_owned(),
+                    )
+                })?;
+            let mut state = context.provider_state.clone();
+            state.native_session_id = Some(id.to_owned());
+            state.recoverable = true;
+            state.last_error = None;
+            Ok(state)
+        }
+        .await;
+        process.terminate().await;
+        result
+    }
+
     async fn discover_models(
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
         let (mut process, session, _updates) = self.session_probe(workspace).await?;
+        let result = async {
+            let mut models = super::devin::parse_devin_models(&session);
+            let session_id = session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // OpenCode only exposes an `effort` config option for the currently
+            // selected model, so probe each model to learn its effort levels.
+            for model in &mut models {
+                let response = control_request(
+                    &mut process,
+                    "probe:model",
+                    "session/set_config_option",
+                    json!({"sessionId": session_id, "configId": "model", "value": model.id}),
+                    CONTROL_TIMEOUT,
+                )
+                .await;
+                let Ok(response) = response else {
+                    continue;
+                };
+                let Some(effort) = response
+                    .get("configOptions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|option| option.get("id").and_then(Value::as_str) == Some("effort"))
+                else {
+                    continue;
+                };
+                model.supported_reasoning_efforts = effort
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|options| {
+                        options
+                            .iter()
+                            .filter_map(|option| {
+                                option
+                                    .get("value")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                model.default_reasoning_effort = effort
+                    .get("currentValue")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            Ok(models)
+        }
+        .await;
+        close_probe_session(&mut process, &session).await;
         process.terminate().await;
-        Ok(super::devin::parse_devin_models(&session))
+        result
     }
 
     async fn discover_commands(
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
-        let (mut process, _session, updates) = self.session_probe(workspace).await?;
+        let (mut process, session, updates) = self.session_probe(workspace).await?;
+        close_probe_session(&mut process, &session).await;
         process.terminate().await;
         let commands = updates.iter().rev().find_map(|update| {
             update
@@ -409,7 +522,7 @@ async fn run_session_actor(
                             } else if let Some(sink) = &last_sink {
                                 super::acp::observe_config_options(&mut connection, &message);
                                 let (_tx, mut cancel) = watch::channel(false);
-                                if super::acp::handle_acp_message(process, message, sink, &mut cancel, ProviderKind::Opencode, true).await.is_err() { break; }
+                                if super::acp::handle_acp_message(process, message, sink, &mut cancel, ProviderKind::Opencode, true, super::acp::AutoApprove::Mediate).await.is_err() { break; }
                             }
                         }
                     }
@@ -655,7 +768,7 @@ mod tests {
             watch::Sender<bool>,
             tokio::task::JoinHandle<Result<DriverTurnResult, AppError>>,
         ) {
-            self.start_with(turn_id, text, None, None).await
+            self.start_with(turn_id, text, None, None, None, None).await
         }
 
         async fn start_with(
@@ -663,6 +776,8 @@ mod tests {
             turn_id: &str,
             text: &str,
             model: Option<&str>,
+            effort: Option<&str>,
+            permission_mode: Option<&str>,
             work_mode: Option<&str>,
         ) -> (
             watch::Sender<bool>,
@@ -678,8 +793,8 @@ mod tests {
                 content: vec![],
                 skills: vec![],
                 model: model.map(ToOwned::to_owned),
-                reasoning_effort: None,
-                permission_mode: None,
+                reasoning_effort: effort.map(ToOwned::to_owned),
+                permission_mode: permission_mode.map(ToOwned::to_owned),
                 work_mode: work_mode.map(ToOwned::to_owned),
                 permission_profile: None,
                 sandbox_mode: None,
@@ -827,6 +942,8 @@ mod tests {
                 "turn-plan",
                 "normal",
                 Some("opencode/other-model"),
+                None,
+                None,
                 Some("plan"),
             )
             .await;
@@ -945,13 +1062,23 @@ mod tests {
                 .stop_reason,
             "end_turn"
         );
+        // OpenCode advertises sessionCapabilities.resume; resuming attaches
+        // without replaying history instead of session/load.
+        assert_eq!(
+            fixture
+                .requests()
+                .iter()
+                .filter(|request| request["method"] == "session/resume")
+                .count(),
+            1
+        );
         assert_eq!(
             fixture
                 .requests()
                 .iter()
                 .filter(|request| request["method"] == "session/load")
                 .count(),
-            1
+            0
         );
         fixture.finish().await;
     }
@@ -961,9 +1088,23 @@ mod tests {
     async fn wire_probe_discovers_models_and_commands_then_closes() {
         let fixture = Fixture::new().await;
         let models = fixture.driver.discover_models(&fixture.root).await.unwrap();
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         assert_eq!(models[0].id, "opencode/fixture-model");
         assert!(models[0].is_default);
+        assert!(models[0].supported_reasoning_efforts.is_empty());
+        // `effort` is per-model in OpenCode; the probe sets each model to read it.
+        let effort_model = models
+            .iter()
+            .find(|model| model.id == "opencode/effort-model")
+            .unwrap();
+        assert_eq!(
+            effort_model.supported_reasoning_efforts,
+            vec!["low".to_owned(), "high".to_owned()]
+        );
+        assert_eq!(
+            effort_model.default_reasoning_effort.as_deref(),
+            Some("low")
+        );
         let commands = fixture
             .driver
             .discover_commands(&fixture.root)
@@ -975,6 +1116,178 @@ mod tests {
             .requests()
             .iter()
             .any(|request| request["method"] == "session/close"));
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_applies_effort_through_opencode_effort_option() {
+        let fixture = Fixture::new().await;
+        let (_cancel, task) = fixture
+            .start_with(
+                "turn-effort",
+                "normal",
+                Some("opencode/effort-model"),
+                Some("high"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .stop_reason,
+            "end_turn"
+        );
+        let writes = fixture.config_writes();
+        assert!(writes
+            .iter()
+            .any(|request| request["params"]["configId"] == "effort"
+                && request["params"]["value"] == "high"));
+        let events = fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "turn.configuration"
+                && event.payload["effectiveConfig"]["reasoningEffort"] == "high"));
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_auto_mode_answers_permission_requests_client_side() {
+        let fixture = Fixture::new().await;
+        let (_cancel, task) = fixture
+            .start_with("turn-auto", "permission", None, None, Some("auto"), None)
+            .await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .stop_reason,
+            "end_turn"
+        );
+        // The fixture finishes the turn only after the client answered request
+        // 17; reaching end_turn proves no broker wait occurred.
+        let response = fixture
+            .requests()
+            .into_iter()
+            .find(|request| request["id"] == 17)
+            .expect("permission response recorded");
+        assert_eq!(
+            response["result"]["outcome"]["optionId"].as_str(),
+            Some("once")
+        );
+        let events = fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "permission.resolved"
+                && event.payload["outcome"] == "allow_once"
+                && event.payload["autoApproved"] == true));
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_full_access_prefers_allow_always_option() {
+        let fixture = Fixture::new().await;
+        let (_cancel, task) = fixture
+            .start_with(
+                "turn-full",
+                "permission",
+                None,
+                None,
+                Some("full-access"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .stop_reason,
+            "end_turn"
+        );
+        let response = fixture
+            .requests()
+            .into_iter()
+            .find(|request| request["id"] == 17)
+            .expect("permission response recorded");
+        assert_eq!(
+            response["result"]["outcome"]["optionId"].as_str(),
+            Some("always")
+        );
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_ask_mode_brokers_permission_requests() {
+        let fixture = Fixture::new().await;
+        let (cancel, task) = fixture
+            .start_with("turn-ask", "permission", None, None, Some("ask"), None)
+            .await;
+        // The broker waits for a user decision; no answer is written for request
+        // 17 until cancellation ends the turn.
+        fixture.wait_for_method("session/prompt").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(fixture
+            .requests()
+            .iter()
+            .all(|request| request["id"] != 17 || request["method"].is_string()));
+        cancel.send(true).unwrap();
+        assert!(task.await.unwrap().unwrap().cancelled);
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_fork_session_creates_distinct_native_session() {
+        let fixture = Fixture::new().await;
+        let (_cancel, task) = fixture.start("turn-source", "normal").await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .stop_reason,
+            "end_turn"
+        );
+        let context = DriverContext {
+            manifest: fixture.manifest.clone(),
+            provider_state: fixture
+                .store
+                .provider_state(&fixture.manifest.id)
+                .await
+                .unwrap(),
+        };
+        let permit = fixture
+            .trust
+            .acquire_owned("local", &fixture.root)
+            .await
+            .unwrap();
+        let state = fixture.driver.fork_session(context, permit).await.unwrap();
+        assert_eq!(state.native_session_id.as_deref(), Some("ses_forked"));
+        assert!(fixture
+            .requests()
+            .iter()
+            .any(|request| request["method"] == "session/fork"
+                && request["params"]["sessionId"] == "ses_fixture"));
         fixture.finish().await;
     }
 }

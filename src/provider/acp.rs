@@ -5,7 +5,7 @@ use agent_client_protocol::schema::{
     v1::{
         CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
         ImageContent, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
-        LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOptionKind,
+        NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
         PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
         RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption,
         SessionConfigOptionsCapabilities, SessionNotification, SetSessionConfigOptionResponse,
@@ -259,6 +259,31 @@ pub(super) struct AcpConnectionState {
     session: Option<(String, Value)>,
 }
 
+/// How `session/request_permission` requests are answered during a turn.
+/// Providers that keep their own session-level approval modes (Devin,
+/// Claude Code) never use this; it exists for providers like OpenCode whose
+/// permission modes are mediated client-side.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum AutoApprove {
+    /// Forward every request to the user through the permission broker.
+    #[default]
+    Mediate,
+    /// Answer immediately with the best `allow_once` option (product mode `auto`).
+    Once,
+    /// Answer immediately with the best `allow_always` option (product mode `full-access`).
+    Always,
+}
+
+impl AutoApprove {
+    fn for_turn(provider: ProviderKind, permission_mode: Option<&str>) -> Self {
+        match (provider, permission_mode) {
+            (ProviderKind::Opencode, Some("auto")) => Self::Once,
+            (ProviderKind::Opencode, Some("full-access")) => Self::Always,
+            _ => Self::Mediate,
+        }
+    }
+}
+
 pub(super) async fn run_acp_turn(
     process: &mut JsonLineProcess,
     context: DriverContext,
@@ -300,12 +325,21 @@ pub(super) async fn run_acp_turn_controlled(
         prompt.sandbox_mode.as_deref(),
         prompt.approval_policy.as_deref(),
     )?;
+    let auto_approve = AutoApprove::for_turn(provider, prompt.permission_mode.as_deref());
     let initialize_value = if let Some(initialize) = &connection.initialize {
         initialize.clone()
     } else {
         send_request(process, "initialize", "initialize", initialize_request()).await?;
-        let initialize =
-            wait_for_response(process, "initialize", sink, cancel, provider, true).await?;
+        let initialize = wait_for_response(
+            process,
+            "initialize",
+            sink,
+            cancel,
+            provider,
+            true,
+            auto_approve,
+        )
+        .await?;
         initialize
     };
     let initialize: InitializeResponse =
@@ -343,36 +377,70 @@ pub(super) async fn run_acp_turn_controlled(
     } else {
         match context.provider_state.native_session_id.clone() {
             Some(session_id) => {
-                if !initialize.agent_capabilities.load_session {
+                // OpenCode's `session/resume` attaches without replaying history;
+                // TodeX keeps its own event log, so prefer it over session/load.
+                let can_resume = provider == ProviderKind::Opencode
+                    && initialize_value
+                        .pointer("/agentCapabilities/sessionCapabilities/resume")
+                        .is_some();
+                if !can_resume && !initialize.agent_capabilities.load_session {
                     return Err(AppError::Unsupported(
                     "ACP agent does not support session/load; historical prompts will not be replayed"
                         .to_owned(),
                 ));
                 }
-                let mut request = serde_json::to_value(LoadSessionRequest::new(
-                    session_id.clone(),
-                    context.manifest.workspace.clone(),
-                ))?;
-                apply_session_metadata(&mut request, &options, true);
-                send_request(process, "session", "session/load", request).await?;
-                let response_value = wait_for_response(
-                    process,
-                    "session",
-                    sink,
-                    cancel,
-                    provider,
-                    !options.suppress_load_replay,
-                )
-                .await?;
+                let response_value = if can_resume {
+                    send_request(
+                        process,
+                        "session",
+                        "session/resume",
+                        json!({
+                            "sessionId": session_id,
+                            "cwd": context.manifest.workspace,
+                        }),
+                    )
+                    .await?;
+                    wait_for_response(
+                        process,
+                        "session",
+                        sink,
+                        cancel,
+                        provider,
+                        false,
+                        auto_approve,
+                    )
+                    .await?
+                } else {
+                    let mut request = serde_json::to_value(LoadSessionRequest::new(
+                        session_id.clone(),
+                        context.manifest.workspace.clone(),
+                    ))?;
+                    apply_session_metadata(&mut request, &options, true);
+                    send_request(process, "session", "session/load", request).await?;
+                    wait_for_response(
+                        process,
+                        "session",
+                        sink,
+                        cancel,
+                        provider,
+                        !options.suppress_load_replay,
+                        auto_approve,
+                    )
+                    .await?
+                };
                 connection.session = Some((session_id.clone(), response_value.clone()));
                 let legacy_models = response_value.get("models").cloned();
-                let response: LoadSessionResponse = serde_json::from_value(response_value)
+                let config_options = response_value
+                    .get("configOptions")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
                     .map_err(|error| {
                         AppError::InvalidRequest(format!(
-                            "invalid ACP session/load response: {error}"
+                            "invalid ACP session resume response: {error}"
                         ))
                     })?;
-                (session_id, response.config_options, legacy_models)
+                (session_id, config_options, legacy_models)
             }
             None => {
                 let mut request = serde_json::to_value(NewSessionRequest::new(
@@ -380,8 +448,16 @@ pub(super) async fn run_acp_turn_controlled(
                 ))?;
                 apply_session_metadata(&mut request, &options, false);
                 send_request(process, "session", "session/new", request).await?;
-                let response_value =
-                    wait_for_response(process, "session", sink, cancel, provider, true).await?;
+                let response_value = wait_for_response(
+                    process,
+                    "session",
+                    sink,
+                    cancel,
+                    provider,
+                    true,
+                    auto_approve,
+                )
+                .await?;
                 let legacy_models = response_value.get("models").cloned();
                 let response: NewSessionResponse = serde_json::from_value(response_value.clone())
                     .map_err(|error| {
@@ -416,6 +492,7 @@ pub(super) async fn run_acp_turn_controlled(
             session_id: &native_session_id,
             provider,
             runtime: &options,
+            auto_approve,
         },
     )
     .await?;
@@ -480,7 +557,7 @@ pub(super) async fn run_acp_turn_controlled(
                     "session/cancel",
                     CancelNotification::new(native_session_id.clone()),
                 ).await?;
-                return drain_cancelled_turn(process, &native_session_id, &prompt.turn_id, sink, provider, &mut client_requests, terminal_response.is_some()).await;
+                return drain_cancelled_turn(process, &native_session_id, &prompt.turn_id, sink, provider, auto_approve, &mut client_requests, terminal_response.is_some()).await;
             }
         };
         let Some(message) = message else {
@@ -519,12 +596,15 @@ pub(super) async fn run_acp_turn_controlled(
             let mut cancel = cancel.clone();
             client_requests.spawn(async move {
                 let mut writer = BufferedAcpWriter::default();
-                let result = handle_client_request(&mut writer, &message, &sink, &mut cancel).await;
+                let result =
+                    handle_client_request(&mut writer, &message, &sink, &mut cancel, auto_approve)
+                        .await;
                 (writer.responses, result)
             });
             continue;
         }
-        if let Err(error) = handle_acp_message(process, message, sink, cancel, provider, true).await
+        if let Err(error) =
+            handle_acp_message(process, message, sink, cancel, provider, true, auto_approve).await
         {
             if matches!(error, AppError::TurnCancelled) && *cancel.borrow() {
                 send_notification(
@@ -539,6 +619,7 @@ pub(super) async fn run_acp_turn_controlled(
                     &prompt.turn_id,
                     sink,
                     provider,
+                    auto_approve,
                     &mut client_requests,
                     terminal_response.is_some(),
                 )
@@ -691,21 +772,20 @@ fn opencode_control_commands(
             model,
             reasoning_effort,
         } => {
-            if reasoning_effort.is_some() {
-                return Err(AppError::Unsupported(
-                    "OpenCode does not expose a separate reasoning effort control; choose a model variant"
-                        .to_owned(),
+            let mut commands = Vec::new();
+            if let Some(model) = model {
+                commands.push((
+                    "session/set_config_option".to_owned(),
+                    json!({"sessionId":session_id,"configId":"model","value":model}),
                 ));
             }
-            Ok(model
-                .as_ref()
-                .map(|value| {
-                    vec![(
-                        "session/set_config_option".to_owned(),
-                        json!({"sessionId":session_id,"configId":"model","value":value}),
-                    )]
-                })
-                .unwrap_or_default())
+            if let Some(effort) = reasoning_effort {
+                commands.push((
+                    "session/set_config_option".to_owned(),
+                    json!({"sessionId":session_id,"configId":"effort","value":effort}),
+                ));
+            }
+            Ok(commands)
         }
         ProviderControl::Steer { .. } => Err(AppError::Unsupported(
             "OpenCode does not expose mid-turn steering over ACP".to_owned(),
@@ -860,7 +940,7 @@ fn config_effective(options: &Value) -> Option<Value> {
     for option in options.as_array()? {
         let key = match option.get("id").and_then(Value::as_str) {
             Some("model") => "model",
-            Some("reasoning_effort") => "reasoningEffort",
+            Some("reasoning_effort" | "effort") => "reasoningEffort",
             Some("mode") => "mode",
             _ => continue,
         };
@@ -960,12 +1040,14 @@ async fn emit_prompt_metadata(
 
 /// Give cancellation a bounded protocol drain before the caller terminates the process.
 /// Reverse requests during this window are rejected without waiting for another user action.
+#[allow(clippy::too_many_arguments)]
 async fn drain_cancelled_turn(
     process: &mut JsonLineProcess,
     session_id: &str,
     turn_id: &str,
     sink: &DriverEventSink,
     provider: ProviderKind,
+    auto_approve: AutoApprove,
     client_requests: &mut tokio::task::JoinSet<(Vec<Value>, Result<(), AppError>)>,
     terminal_seen: bool,
 ) -> Result<DriverTurnResult, AppError> {
@@ -1008,7 +1090,16 @@ async fn drain_cancelled_turn(
                     process.send(&json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32800,"message":"turn cancelled"}})).await?;
                 }
             } else {
-                handle_acp_message(process, message, sink, &mut cancelled, provider, true).await?;
+                handle_acp_message(
+                    process,
+                    message,
+                    sink,
+                    &mut cancelled,
+                    provider,
+                    true,
+                    auto_approve,
+                )
+                .await?;
             }
         }
     };
@@ -1079,6 +1170,7 @@ async fn wait_for_response(
     cancel: &mut watch::Receiver<bool>,
     provider: ProviderKind,
     emit_stream_updates: bool,
+    auto_approve: AutoApprove,
 ) -> Result<Value, AppError> {
     wait_for_response_with_timeout(
         process,
@@ -1087,11 +1179,13 @@ async fn wait_for_response(
         cancel,
         provider,
         emit_stream_updates,
+        auto_approve,
         None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_response_with_timeout(
     process: &mut JsonLineProcess,
     request_id: &str,
@@ -1099,6 +1193,7 @@ async fn wait_for_response_with_timeout(
     cancel: &mut watch::Receiver<bool>,
     provider: ProviderKind,
     emit_stream_updates: bool,
+    auto_approve: AutoApprove,
     timeout: Option<Duration>,
 ) -> Result<Value, AppError> {
     let timeout = match timeout {
@@ -1150,6 +1245,7 @@ async fn wait_for_response_with_timeout(
             cancel,
             provider,
             emit_stream_updates,
+            auto_approve,
         )
         .await?;
         if waits_for_user {
@@ -1205,13 +1301,14 @@ pub(super) async fn handle_acp_message(
     cancel: &mut watch::Receiver<bool>,
     provider: ProviderKind,
     emit_stream_updates: bool,
+    auto_approve: AutoApprove,
 ) -> Result<(), AppError> {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return Ok(());
     };
     let params = message.get("params").cloned().unwrap_or(Value::Null);
     if is_client_request(&message) {
-        return handle_client_request(process, &message, sink, cancel).await;
+        return handle_client_request(process, &message, sink, cancel, auto_approve).await;
     }
     if provider == ProviderKind::GrokBuild && is_grok_update_method(method) {
         if !emit_stream_updates {
@@ -1347,6 +1444,7 @@ async fn handle_client_request(
     message: &Value,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
+    auto_approve: AutoApprove,
 ) -> Result<(), AppError> {
     let method = message
         .get("method")
@@ -1382,6 +1480,33 @@ async fn handle_client_request(
             serde_json::from_value(params.clone()).map_err(|error| {
                 AppError::InvalidRequest(format!("invalid ACP permission request: {error}"))
             })?;
+        if auto_approve != AutoApprove::Mediate {
+            if let Some(selected) = auto_select_permission_option(&request, auto_approve) {
+                let outcome = if selected.kind == PermissionOptionKind::AllowAlways {
+                    "allow_always"
+                } else {
+                    "allow_once"
+                };
+                emit_auto_permission(
+                    sink,
+                    &request,
+                    request_id_text(&request_id),
+                    outcome,
+                    selected.option_id.0.as_ref(),
+                )
+                .await?;
+                let response = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                    SelectedPermissionOutcome::new(selected.option_id.0),
+                ));
+                process
+                    .write_response(
+                        json!({ "jsonrpc": "2.0", "id": request_id, "result": response }),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            // No allow-style option offered; fall through and ask the user.
+        }
         let options = serde_json::to_value(&request.options)?;
         let decision = match sink
             .request_permission(
@@ -1841,6 +1966,7 @@ async fn authenticate_if_requested(
         cancel,
         provider,
         true,
+        AutoApprove::Mediate,
         options.auth_timeout,
     )
     .await?;
@@ -1902,6 +2028,7 @@ struct SessionConfigContext<'a> {
     session_id: &'a str,
     provider: ProviderKind,
     runtime: &'a AcpRuntimeOptions,
+    auto_approve: AutoApprove,
 }
 
 async fn apply_requested_config(
@@ -1917,9 +2044,16 @@ async fn apply_requested_config(
         apply_legacy_model_config(process, legacy_models, prompt, sink, cancel, context).await?;
         return Ok(None);
     }
+    // OpenCode names its per-model thinking-level option `effort`; other ACP
+    // profiles use `reasoning_effort`.
+    let effort_id = if context.provider == ProviderKind::Opencode {
+        "effort"
+    } else {
+        "reasoning_effort"
+    };
     let mut requested_configs = vec![
         ("model", prompt.model.as_deref()),
-        ("reasoning_effort", prompt.reasoning_effort.as_deref()),
+        (effort_id, prompt.reasoning_effort.as_deref()),
     ];
     if context.provider == ProviderKind::Devin {
         requested_configs.push(("mode", devin_session_mode(prompt)));
@@ -1959,8 +2093,16 @@ async fn apply_requested_config(
             }),
         )
         .await?;
-        let response =
-            wait_for_response(process, &request_id, sink, cancel, context.provider, true).await?;
+        let response = wait_for_response(
+            process,
+            &request_id,
+            sink,
+            cancel,
+            context.provider,
+            true,
+            context.auto_approve,
+        )
+        .await?;
         let response: SetSessionConfigOptionResponse =
             serde_json::from_value(response).map_err(|error| {
                 AppError::InvalidRequest(format!(
@@ -2073,6 +2215,74 @@ async fn apply_legacy_model_config(
         cancel,
         context.provider,
         true,
+        context.auto_approve,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Pick the option a client-side auto-approval should select. `Once` prefers
+/// `allow_once`; `Always` prefers `allow_always` so the agent stops asking for
+/// the same tool. Any other allow-style kind is a fallback; reject-only
+/// requests return `None` and fall back to user mediation.
+fn auto_select_permission_option(
+    request: &RequestPermissionRequest,
+    auto_approve: AutoApprove,
+) -> Option<PermissionOption> {
+    let preferred = if auto_approve == AutoApprove::Always {
+        PermissionOptionKind::AllowAlways
+    } else {
+        PermissionOptionKind::AllowOnce
+    };
+    let fallback = if preferred == PermissionOptionKind::AllowAlways {
+        PermissionOptionKind::AllowOnce
+    } else {
+        PermissionOptionKind::AllowAlways
+    };
+    request
+        .options
+        .iter()
+        .find(|option| option.kind == preferred)
+        .or_else(|| {
+            request
+                .options
+                .iter()
+                .find(|option| option.kind == fallback)
+        })
+        .cloned()
+}
+
+/// Mirror the broker's `permission.requested`/`permission.resolved` pair so an
+/// auto-approved tool call remains visible in the event log and UI.
+async fn emit_auto_permission(
+    sink: &DriverEventSink,
+    request: &RequestPermissionRequest,
+    provider_request_id: String,
+    outcome: &str,
+    option_id: &str,
+) -> Result<(), AppError> {
+    let permission_id = format!("perm_{}", uuid::Uuid::new_v4().simple());
+    sink.emit(
+        "permission.requested",
+        json!({
+            "permissionId": permission_id,
+            "providerRequestId": provider_request_id,
+            "kind": "tool",
+            "title": "Allow ACP tool call?",
+            "details": serde_json::to_value(&request.tool_call)?,
+            "options": serde_json::to_value(&request.options)?,
+            "autoApproved": true,
+        }),
+    )
+    .await?;
+    sink.emit(
+        "permission.resolved",
+        json!({
+            "permissionId": permission_id,
+            "outcome": outcome,
+            "optionId": option_id,
+            "autoApproved": true,
+        }),
     )
     .await?;
     Ok(())

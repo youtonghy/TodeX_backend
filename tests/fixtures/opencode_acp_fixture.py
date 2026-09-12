@@ -11,6 +11,7 @@ import time
 
 model = "opencode/fixture-model"
 mode = "build"
+effort = "low"
 session = "ses_fixture"
 active = None
 late_id = None
@@ -25,16 +26,24 @@ def result(request_id, value):
 
 
 def options():
-    return [
+    entries = [
         {"id": "model", "name": "Model", "category": "model", "type": "select",
          "currentValue": model,
          "options": [{"value": "opencode/fixture-model", "name": "Fixture"},
+                     {"value": "opencode/effort-model", "name": "Effort"},
                      {"value": "opencode/other-model", "name": "Other"}]},
         {"id": "mode", "name": "Session Mode", "category": "mode", "type": "select",
          "currentValue": mode,
          "options": [{"value": "build", "name": "build"},
                      {"value": "plan", "name": "plan"}]},
     ]
+    # Real OpenCode only offers `effort` while a variant-capable model is active.
+    if model == "opencode/effort-model":
+        entries.insert(1, {"id": "effort", "name": "Effort", "category": "thought_level",
+                           "type": "select", "currentValue": effort,
+                           "options": [{"value": "low", "name": "Low"},
+                                       {"value": "high", "name": "High"}]})
+    return entries
 
 
 def update(kind, **fields):
@@ -66,12 +75,14 @@ for line in sys.stdin:
                             "authMethods": [{"id": "opencode-login", "name": "Login with opencode",
                                              "description": "Run `opencode auth login` in the terminal"}],
                             "agentInfo": {"name": "OpenCode", "version": "fixture"}})
-    elif method in ("session/new", "session/load"):
-        if method == "session/load":
+    elif method in ("session/new", "session/load", "session/resume"):
+        if method in ("session/load", "session/resume"):
             session = params["sessionId"]
         result(request_id, {"sessionId": session, "configOptions": options()})
         update("available_commands_update", availableCommands=[
             {"name": "project:review", "description": "Project plugin"}])
+    elif method == "session/fork":
+        result(request_id, {"sessionId": "ses_forked", "configOptions": options()})
     elif method == "session/set_config_option":
         assert isinstance(params["value"], str)
         value = params["value"]
@@ -91,6 +102,12 @@ for line in sys.stdin:
             continue
         if params["configId"] == "model":
             model = value
+        elif params["configId"] == "effort":
+            if model != "opencode/effort-model":
+                write({"jsonrpc": "2.0", "id": request_id, "error": {
+                    "code": -32602, "message": "unknown config option: effort"}})
+                continue
+            effort = value
         else:
             mode = value
             # The prompt may finish before a configuration command is acknowledged.
@@ -106,7 +123,9 @@ for line in sys.stdin:
         elif text == "permission":
             write({"jsonrpc": "2.0", "id": 17, "method": "session/request_permission",
                    "params": {"sessionId": session, "toolCall": {"toolCallId": "tool"},
-                              "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]}})
+                              "options": [{"optionId": "once", "name": "Allow once", "kind": "allow_once"},
+                                          {"optionId": "always", "name": "Allow always", "kind": "allow_always"},
+                                          {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]}})
     elif method == "session/cancel":
         if late_id:
             result(late_id, {"configOptions": options()})
@@ -120,3 +139,6 @@ for line in sys.stdin:
         result(request_id, {})
     elif method is not None:
         write({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "unknown method"}})
+    elif request_id == 17 and active is not None:
+        # Client responded to the pending permission request; the tool ran.
+        finish()
