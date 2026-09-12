@@ -522,7 +522,7 @@ async fn run_session_actor(
                             } else if let Some(sink) = &last_sink {
                                 super::acp::observe_config_options(&mut connection, &message);
                                 let (_tx, mut cancel) = watch::channel(false);
-                                if super::acp::handle_acp_message(process, message, sink, &mut cancel, ProviderKind::Opencode, true, super::acp::AutoApprove::Mediate).await.is_err() { break; }
+                                if super::acp::handle_acp_message(process, message, sink, &mut cancel, ProviderKind::Opencode, true, super::acp::AutoApprove::Mediate, &mut connection).await.is_err() { break; }
                             }
                         }
                     }

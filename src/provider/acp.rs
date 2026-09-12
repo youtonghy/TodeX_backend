@@ -27,8 +27,8 @@ use super::process::{
 };
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PendingProviderControl, PermissionOutcome, ProviderCapabilities, ProviderControl,
-    ProviderDescriptor, ProviderDriver,
+    PendingProviderControl, PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor,
+    ProviderControl, ProviderDescriptor, ProviderDriver,
 };
 
 /// Interactive authentication methods (for example browser PKCE) need enough
@@ -257,6 +257,10 @@ fn initialize_request() -> InitializeRequest {
 pub(super) struct AcpConnectionState {
     initialize: Option<Value>,
     session: Option<(String, Value)>,
+    /// Fingerprint of the last announced command set; Devin re-broadcasts
+    /// `available_commands_update` throughout a session, so unchanged
+    /// announcements are suppressed instead of journalled again.
+    commands_fingerprint: Option<u64>,
 }
 
 /// How `session/request_permission` requests are answered during a turn.
@@ -603,8 +607,17 @@ pub(super) async fn run_acp_turn_controlled(
             });
             continue;
         }
-        if let Err(error) =
-            handle_acp_message(process, message, sink, cancel, provider, true, auto_approve).await
+        if let Err(error) = handle_acp_message(
+            process,
+            message,
+            sink,
+            cancel,
+            provider,
+            true,
+            auto_approve,
+            connection,
+        )
+        .await
         {
             if matches!(error, AppError::TurnCancelled) && *cancel.borrow() {
                 send_notification(
@@ -1098,6 +1111,7 @@ async fn drain_cancelled_turn(
                     provider,
                     true,
                     auto_approve,
+                    &mut AcpConnectionState::default(),
                 )
                 .await?;
             }
@@ -1246,6 +1260,7 @@ async fn wait_for_response_with_timeout(
             provider,
             emit_stream_updates,
             auto_approve,
+            &mut AcpConnectionState::default(),
         )
         .await?;
         if waits_for_user {
@@ -1294,6 +1309,7 @@ fn is_client_request(message: &Value) -> bool {
             })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_acp_message(
     process: &mut JsonLineProcess,
     message: Value,
@@ -1302,6 +1318,7 @@ pub(super) async fn handle_acp_message(
     provider: ProviderKind,
     emit_stream_updates: bool,
     auto_approve: AutoApprove,
+    connection: &mut AcpConnectionState,
 ) -> Result<(), AppError> {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return Ok(());
@@ -1338,6 +1355,16 @@ pub(super) async fn handle_acp_message(
                     json!({"provider":provider.as_str(),"providerMethod":method,"metadata":params}),
                 )
                 .await?;
+                return Ok(());
+            }
+            // Implementation-private update kinds (`_cognition.ai/*`) fail schema
+            // validation before dispatch; they are agent-internal noise, so
+            // ignoring them is safer than failing the turn.
+            let private_update = params
+                .pointer("/update/sessionUpdate")
+                .and_then(Value::as_str)
+                .is_some_and(|update_type| update_type.starts_with('_'));
+            if private_update {
                 return Ok(());
             }
             return Err(AppError::InvalidRequest(format!(
@@ -1394,9 +1421,17 @@ pub(super) async fn handle_acp_message(
                     ProviderKind::GrokBuild | ProviderKind::Devin | ProviderKind::Opencode
                 ) =>
             {
+                let commands = super::grok::parse_commands(
+                    &json!({"_meta":{"availableCommands":update.get("availableCommands")}}),
+                );
+                let fingerprint = commands_fingerprint(&commands);
+                if connection.commands_fingerprint == Some(fingerprint) {
+                    return Ok(());
+                }
+                connection.commands_fingerprint = Some(fingerprint);
                 (
                     "provider.commands.updated",
-                    json!({ "provider": provider_id, "commands": super::grok::parse_commands(&json!({"_meta":{"availableCommands":update.get("availableCommands")}})), "metadata":update }),
+                    json!({ "provider": provider_id, "commands": commands, "metadata":update }),
                 )
             }
             "usage_update" if matches!(provider, ProviderKind::Devin | ProviderKind::Opencode) => (
@@ -1412,6 +1447,12 @@ pub(super) async fn handle_acp_message(
                     "effectiveFrom": "current-turn", "metadata": update }),
             ),
             "user_message_chunk" => return Ok(()),
+            // Devin streams internal telemetry (`_cognition.ai/output` MCP logs,
+            // `thinking_complete`, `turn_stats`) as custom session updates; they
+            // carry no client-actionable state.
+            _ if provider == ProviderKind::Devin && update_type.starts_with("_cognition.") => {
+                return Ok(())
+            }
             _ => (
                 "provider.event",
                 json!({ "provider": provider_id, "providerMethod": method, "metadata": update }),
@@ -1429,7 +1470,9 @@ pub(super) async fn handle_acp_message(
                 "error": { "code": -32601, "message": "client capability is not supported" }
             }))
             .await?;
-    } else {
+    } else if !(provider == ProviderKind::Devin && method.starts_with("_cognition.")) {
+        // Devin emits MCP/server log lines as `_cognition.ai/*` notifications;
+        // they are agent-internal and must not reach the client timeline.
         sink.emit(
             "provider.event",
             json!({ "provider": provider.as_str(), "providerMethod": method, "metadata": params }),
@@ -1437,6 +1480,16 @@ pub(super) async fn handle_acp_message(
         .await?;
     }
     Ok(())
+}
+
+fn commands_fingerprint(commands: &[ProviderCommandDescriptor]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for command in commands {
+        command.name.hash(&mut hasher);
+        command.description.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 async fn handle_client_request(
@@ -1527,7 +1580,13 @@ async fn handle_client_request(
                         json!({ "jsonrpc": "2.0", "id": request_id, "result": response }),
                     )
                     .await?;
-                return Err(error);
+                // An expired or closed broker request already answered the agent
+                // with `cancelled`; let the turn continue without the tool rather
+                // than failing it. A user-initiated cancel still ends the turn.
+                return match error {
+                    AppError::TurnCancelled => Err(error),
+                    _ => Ok(()),
+                };
             }
         };
         let selected = select_acp_option(&request, &decision)?;
@@ -2741,5 +2800,73 @@ mod tests {
             prompt_metadata(&message).unwrap()["promptUsage"]["inputTokens"],
             8
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn devin_internal_notifications_and_repeated_commands_are_not_journalled() {
+        let root =
+            std::env::temp_dir().join(format!("todex-acp-noise-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = crate::conversation::ConversationStore::new(root.join("data"))
+            .await
+            .unwrap();
+        let manifest = store
+            .create(crate::conversation::ConversationManifest::new(
+                ProviderKind::Devin,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let hub = crate::conversation::ConversationEventHub::default();
+        let mut events = hub.subscribe(&manifest.id);
+        let sink = DriverEventSink::new(
+            store,
+            hub,
+            crate::provider::types::PermissionBroker::default(),
+            &manifest.id,
+        );
+        let mut process = JsonLineProcess::spawn(&CommandSpec::new("/bin/cat", &root))
+            .await
+            .unwrap();
+        let (_tx, mut cancel) = watch::channel(false);
+        let mut connection = AcpConnectionState::default();
+
+        let commands = json!({
+            "jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{
+                "sessionUpdate":"available_commands_update",
+                "availableCommands":[{"name":"/help","description":"Help"}]
+            }}
+        });
+        for message in [
+            commands.clone(),
+            commands,
+            json!({"jsonrpc":"2.0","method":"_cognition.ai/output","params":{"message":"MCP log"}}),
+            json!({"jsonrpc":"2.0","method":"_cognition.ai/mcp/serversChanged","params":{}}),
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"_cognition.ai/turn_stats","usedTokens":7}}}),
+        ] {
+            handle_acp_message(
+                &mut process,
+                message,
+                &sink,
+                &mut cancel,
+                ProviderKind::Devin,
+                true,
+                AutoApprove::Mediate,
+                &mut connection,
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut types = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            types.push(event.event_type);
+        }
+        assert_eq!(types, ["provider.commands.updated"]);
+        process.terminate().await;
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
