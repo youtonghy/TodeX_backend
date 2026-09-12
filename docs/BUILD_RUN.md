@@ -125,7 +125,7 @@ TUI 默认不捕获鼠标，终端中的文本可以直接拖选复制。按 `c`
 
 Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径、用户目录、locale、代理和 SSH agent 等运行环境。ACP profile 中的 `env` 会显式传入，但名称以 `TODEX_AGENTD_` 开头的变量会被拒绝。Codex、Pi、Claude Code 和 Grok Build 因此应优先使用各自保存在用户目录中的原生登录配置。Grok Build 通过 `grok --no-auto-update agent --no-leader stdio` 启动；仅 `grok_env_allowlist` 中名称合法的变量会额外传入。首次运行前使用 daemon 用户执行 `grok login`，或在白名单中保留 `XAI_API_KEY`。Pi 始终使用 RPC `--approve`：工作区通过 TodeX 信任门禁后，Pi 的工具和项目资源按 daemon 用户权限全自动运行。Pi 没有通用逐工具审批，也没有 OS sandbox；`permissions` capability 因此保持 `false`。
 
-Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。Devin 在 ACP 模式下有意不读取本地 `devin auth login` 登录态，daemon 会在每个 ACP 进程启动时执行 `authenticate`：配置 `devin_api_key_env`（例如 `"DEVIN_API_KEY"`）后读取 daemon 环境中对应变量并以 `_meta.api_key` 无头发送（不写入日志）；否则按上游声明的 `devin-browser` 方法执行一次浏览器授权，完成前 daemon 会等待。需要常驻无人值守部署时建议配置 API key，避免每次进程重启都要求浏览器交互。
+Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。Devin 在 ACP 模式下有意不读取本地 `devin auth login` 登录态，daemon 会在每个 ACP 进程启动时执行 `authenticate`：配置 `devin_api_key_env`（例如 `"DEVIN_API_KEY"`）后读取 daemon 环境中对应变量并以 `_meta.api_key` 无头发送（不写入日志）；否则按上游声明的 `devin-browser` 方法执行一次浏览器授权，daemon 最多等待 5 分钟供用户完成批准。需要常驻无人值守部署时建议配置 API key，避免每次进程重启都要求浏览器交互。
 
 ## Conversation 数据目录
 

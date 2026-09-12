@@ -326,6 +326,7 @@ impl ProviderDriver for GrokBuildDriver {
                     authenticate: true,
                     auth_method: self.auth_method.clone(),
                     auth_meta: Some(json!({ "headless": true })),
+                    auth_timeout: None,
                     suppress_load_replay: true,
                     allow_cli_config_fallback: true,
                     request_ask_mode: true,

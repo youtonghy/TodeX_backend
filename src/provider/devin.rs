@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -13,6 +13,7 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{
     run_acp_turn_controlled, select_auth_method, AcpConnectionState, AcpRuntimeOptions,
+    INTERACTIVE_AUTH_TIMEOUT,
 };
 use super::process::{executable_available, redact_sensitive_text, CommandSpec, JsonLineProcess};
 use super::types::{
@@ -26,6 +27,16 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_DRAIN: Duration = Duration::from_millis(1500);
+/// Model/command discovery spawns an authenticated probe process; cache it so
+/// routine client refreshes do not re-authenticate on every query.
+const DISCOVERY_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Clone)]
+struct DiscoverySnapshot {
+    fetched_at: Instant,
+    models: Vec<ProviderModelDescriptor>,
+    commands: Vec<ProviderCommandDescriptor>,
+}
 
 pub struct DevinDriver {
     binary: String,
@@ -33,6 +44,7 @@ pub struct DevinDriver {
     api_key_env: Option<String>,
     env_allowlist: Vec<String>,
     sessions: Mutex<HashMap<String, DevinSessionHandle>>,
+    discovery: Mutex<HashMap<PathBuf, DiscoverySnapshot>>,
 }
 
 #[derive(Clone)]
@@ -61,6 +73,7 @@ impl DevinDriver {
             api_key_env: config.devin_api_key_env.clone(),
             env_allowlist: config.devin_env_allowlist.clone(),
             sessions: Mutex::new(HashMap::new()),
+            discovery: Mutex::new(HashMap::new()),
         }
     }
 
@@ -107,11 +120,18 @@ impl DevinDriver {
         Ok(Some(params))
     }
 
+    /// Without an API key the advertised `devin-browser` method opens a PKCE
+    /// page the user must approve, which outlasts the diagnostic timeout.
+    fn auth_timeout(&self) -> Result<Option<Duration>, AppError> {
+        Ok((self.api_key()?.is_none()).then_some(INTERACTIVE_AUTH_TIMEOUT))
+    }
+
     fn runtime_options(&self) -> Result<AcpRuntimeOptions, AppError> {
         Ok(AcpRuntimeOptions {
             authenticate: true,
             auth_method: self.auth_method.clone(),
             auth_meta: self.api_key()?.map(|key| json!({ "api_key": key })),
+            auth_timeout: self.auth_timeout()?,
             suppress_load_replay: true,
             ..Default::default()
         })
@@ -123,7 +143,14 @@ impl DevinDriver {
         initialize: &Value,
     ) -> Result<(), AppError> {
         if let Some(params) = self.auth_params(initialize)? {
-            control_request(process, "authenticate", "authenticate", params).await?;
+            control_request(
+                process,
+                "authenticate",
+                "authenticate",
+                params,
+                self.auth_timeout()?.unwrap_or(DIAGNOSTIC_TIMEOUT),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -145,6 +172,7 @@ impl DevinDriver {
                 "session/new",
                 json!({ "cwd": workspace, "mcpServers": [] }),
                 &mut updates,
+                DIAGNOSTIC_TIMEOUT,
             )
             .await?;
             let session_id = response
@@ -185,6 +213,7 @@ impl DevinDriver {
                 "session:delete",
                 "session/delete",
                 json!({ "sessionId": session_id }),
+                DIAGNOSTIC_TIMEOUT,
             )
             .await;
             Ok((response, updates))
@@ -197,6 +226,27 @@ impl DevinDriver {
                 Err(error)
             }
         }
+    }
+
+    /// One authenticated probe yields both the model catalog and the command
+    /// catalog; reuse it briefly so independent client queries share a single
+    /// spawn (and a single interactive authentication when no key is set).
+    async fn discovery_snapshot(&self, workspace: &Path) -> Result<DiscoverySnapshot, AppError> {
+        let mut cache = self.discovery.lock().await;
+        if let Some(snapshot) = cache.get(workspace) {
+            if snapshot.fetched_at.elapsed() < DISCOVERY_TTL {
+                return Ok(snapshot.clone());
+            }
+        }
+        let (mut process, session, updates) = self.session_probe(workspace).await?;
+        process.terminate().await;
+        let snapshot = DiscoverySnapshot {
+            fetched_at: Instant::now(),
+            models: parse_devin_models(&session),
+            commands: parse_devin_commands(&updates),
+        };
+        cache.insert(workspace.to_path_buf(), snapshot.clone());
+        Ok(snapshot)
     }
 }
 
@@ -322,28 +372,14 @@ impl ProviderDriver for DevinDriver {
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
-        let (mut process, session, _updates) = self.session_probe(workspace).await?;
-        process.terminate().await;
-        Ok(parse_devin_models(&session))
+        Ok(self.discovery_snapshot(workspace).await?.models)
     }
 
     async fn discover_commands(
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
-        let (mut process, _session, updates) = self.session_probe(workspace).await?;
-        process.terminate().await;
-        let commands = updates.iter().rev().find_map(|update| {
-            update
-                .pointer("/update/availableCommands")
-                .filter(|commands| commands.is_array())
-                .cloned()
-        });
-        Ok(commands
-            .map(|commands| {
-                super::grok::parse_commands(&json!({ "_meta": { "availableCommands": commands } }))
-            })
-            .unwrap_or_default())
+        Ok(self.discovery_snapshot(workspace).await?.commands)
     }
 
     async fn run_turn(
@@ -513,11 +549,17 @@ async fn run_session_actor(
 }
 
 async fn initialize_process(process: &mut JsonLineProcess) -> Result<Value, AppError> {
-    let result = control_request(process, "initialize", "initialize", json!({
+    let result = control_request(
+        process,
+        "initialize",
+        "initialize",
+        json!({
         "protocolVersion":1,
         "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"configOptions":{}}},
         "clientInfo":{"name":"todex-agentd","title":"TodeX 2.0","version":crate::version::APP_VERSION},
-    })).await?;
+        }),
+        DIAGNOSTIC_TIMEOUT,
+    ).await?;
     if result.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
         return Err(AppError::Unsupported(
             "Devin negotiated an unsupported ACP protocol version".to_owned(),
@@ -531,9 +573,10 @@ async fn control_request(
     id: &str,
     method: &str,
     params: Value,
+    timeout: Duration,
 ) -> Result<Value, AppError> {
     let mut updates = Vec::new();
-    control_request_updates(process, id, method, params, &mut updates).await
+    control_request_updates(process, id, method, params, &mut updates, timeout).await
 }
 
 async fn control_request_updates(
@@ -542,11 +585,12 @@ async fn control_request_updates(
     method: &str,
     params: Value,
     updates: &mut Vec<Value>,
+    timeout: Duration,
 ) -> Result<Value, AppError> {
     process
         .send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
         .await?;
-    tokio::time::timeout(DIAGNOSTIC_TIMEOUT, async {
+    tokio::time::timeout(timeout, async {
         loop {
             let Some(message) = process.read().await? else {
                 return Err(AppError::ProviderUnavailable("Devin closed stdout during control request".to_owned()));
@@ -631,6 +675,22 @@ fn parse_devin_models(session: &Value) -> Vec<ProviderModelDescriptor> {
         .collect()
 }
 
+fn parse_devin_commands(updates: &[Value]) -> Vec<ProviderCommandDescriptor> {
+    updates
+        .iter()
+        .rev()
+        .find_map(|update| {
+            update
+                .pointer("/update/availableCommands")
+                .filter(|commands| commands.is_array())
+                .cloned()
+        })
+        .map(|commands| {
+            super::grok::parse_commands(&json!({ "_meta": { "availableCommands": commands } }))
+        })
+        .unwrap_or_default()
+}
+
 fn safe_message(value: &Value) -> String {
     redact_sensitive_text(
         value
@@ -713,6 +773,7 @@ mod tests {
             api_key_env: None,
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
+            discovery: Mutex::new(HashMap::new()),
         };
         assert_eq!(driver.api_key().unwrap(), None);
 
@@ -724,6 +785,7 @@ mod tests {
                 api_key_env: None,
                 env_allowlist: Vec::new(),
                 sessions: Mutex::new(HashMap::new()),
+                discovery: Mutex::new(HashMap::new()),
             }
         };
         assert!(driver.api_key().is_err());
@@ -734,5 +796,72 @@ mod tests {
         unsafe {
             std::env::remove_var("DEVIN_TEST_CONFIGURED_KEY");
         }
+    }
+
+    #[test]
+    fn interactive_auth_gets_extended_timeout() {
+        let driver = DevinDriver {
+            binary: "devin".to_owned(),
+            auth_method: None,
+            api_key_env: None,
+            env_allowlist: Vec::new(),
+            sessions: Mutex::new(HashMap::new()),
+            discovery: Mutex::new(HashMap::new()),
+        };
+        assert_eq!(
+            driver.auth_timeout().unwrap(),
+            Some(INTERACTIVE_AUTH_TIMEOUT)
+        );
+        assert_eq!(
+            driver.runtime_options().unwrap().auth_timeout,
+            Some(INTERACTIVE_AUTH_TIMEOUT)
+        );
+
+        unsafe {
+            std::env::set_var("DEVIN_TEST_TIMEOUT_KEY", "key-value");
+        }
+        let keyed = DevinDriver {
+            api_key_env: Some("DEVIN_TEST_TIMEOUT_KEY".to_owned()),
+            ..driver
+        };
+        assert_eq!(keyed.auth_timeout().unwrap(), None);
+        unsafe {
+            std::env::remove_var("DEVIN_TEST_TIMEOUT_KEY");
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_cache_serves_snapshot_without_respawning() {
+        let driver = DevinDriver {
+            binary: "definitely-missing-devin-binary".to_owned(),
+            auth_method: None,
+            api_key_env: None,
+            env_allowlist: Vec::new(),
+            sessions: Mutex::new(HashMap::new()),
+            discovery: Mutex::new(HashMap::new()),
+        };
+        let workspace = PathBuf::from("/tmp/todex-devin-discovery-test");
+        let snapshot = DiscoverySnapshot {
+            fetched_at: Instant::now(),
+            models: vec![ProviderModelDescriptor {
+                id: "swe-2-high".to_owned(),
+                display_name: "SWE 2 High".to_owned(),
+                description: String::new(),
+                is_default: true,
+                supported_reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+                context_window: None,
+                image_input: None,
+            }],
+            commands: Vec::new(),
+        };
+        driver
+            .discovery
+            .lock()
+            .await
+            .insert(workspace.clone(), snapshot);
+        let models = driver.discover_models(&workspace).await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "swe-2-high");
     }
 }

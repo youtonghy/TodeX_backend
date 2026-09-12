@@ -31,6 +31,10 @@ use super::types::{
     ProviderDescriptor, ProviderDriver,
 };
 
+/// Interactive authentication methods (for example browser PKCE) need enough
+/// time for the user to approve the flow; key-based checks answer instantly.
+pub(super) const INTERACTIVE_AUTH_TIMEOUT: Duration = Duration::from_secs(300);
+
 pub struct AcpDriver {
     profiles: BTreeMap<String, AcpProfileConfig>,
 }
@@ -40,6 +44,8 @@ pub(super) struct AcpRuntimeOptions {
     pub authenticate: bool,
     pub auth_method: Option<String>,
     pub auth_meta: Option<Value>,
+    /// Overrides the control timeout while waiting for `authenticate`.
+    pub auth_timeout: Option<Duration>,
     pub suppress_load_replay: bool,
     pub allow_cli_config_fallback: bool,
     pub request_ask_mode: bool,
@@ -224,10 +230,12 @@ fn profile_runtime_options(profile: &AcpProfileConfig) -> Result<AcpRuntimeOptio
                 })
         })
         .transpose()?;
+    let interactive_auth = profile.auth_method.is_some() && api_key.is_none();
     Ok(AcpRuntimeOptions {
         authenticate: profile.auth_method.is_some() || api_key.is_some(),
         auth_method: profile.auth_method.clone(),
         auth_meta: api_key.map(|key| json!({ "api_key": key })),
+        auth_timeout: interactive_auth.then_some(INTERACTIVE_AUTH_TIMEOUT),
         ..Default::default()
     })
 }
@@ -1035,7 +1043,32 @@ async fn wait_for_response(
     provider: ProviderKind,
     emit_stream_updates: bool,
 ) -> Result<Value, AppError> {
-    let mut deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
+    wait_for_response_with_timeout(
+        process,
+        request_id,
+        sink,
+        cancel,
+        provider,
+        emit_stream_updates,
+        None,
+    )
+    .await
+}
+
+async fn wait_for_response_with_timeout(
+    process: &mut JsonLineProcess,
+    request_id: &str,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+    provider: ProviderKind,
+    emit_stream_updates: bool,
+    timeout: Option<Duration>,
+) -> Result<Value, AppError> {
+    let timeout = match timeout {
+        Some(timeout) => timeout,
+        None => super::process::control_timeout()?,
+    };
+    let mut deadline = tokio::time::Instant::now() + timeout;
     loop {
         let message = tokio::select! {
             message = process.read_control_until(deadline) => message?,
@@ -1760,7 +1793,16 @@ async fn authenticate_if_requested(
         params["_meta"] = meta.clone();
     }
     send_request(process, "authenticate", "authenticate", params).await?;
-    wait_for_response(process, "authenticate", sink, cancel, provider, true).await?;
+    wait_for_response_with_timeout(
+        process,
+        "authenticate",
+        sink,
+        cancel,
+        provider,
+        true,
+        options.auth_timeout,
+    )
+    .await?;
     Ok(())
 }
 
@@ -2352,6 +2394,27 @@ mod tests {
         let options = profile_runtime_options(&profile).unwrap();
         assert!(!options.authenticate);
         assert_eq!(options.auth_meta, None);
+    }
+
+    #[test]
+    fn acp_profile_runtime_options_extend_timeout_for_interactive_auth() {
+        let profile = AcpProfileConfig {
+            command: "devin".to_owned(),
+            args: vec!["acp".to_owned()],
+            env: BTreeMap::new(),
+            auth_method: Some("devin-browser".to_owned()),
+            api_key_env: None,
+        };
+        let options = profile_runtime_options(&profile).unwrap();
+        assert_eq!(options.auth_timeout, Some(INTERACTIVE_AUTH_TIMEOUT));
+
+        let profile = AcpProfileConfig {
+            env: BTreeMap::from([("TODEX_TEST_ACP_KEY_8a1f02".to_owned(), "secret".to_owned())]),
+            api_key_env: Some("TODEX_TEST_ACP_KEY_8a1f02".to_owned()),
+            ..profile
+        };
+        let options = profile_runtime_options(&profile).unwrap();
+        assert_eq!(options.auth_timeout, None);
     }
 
     #[test]
