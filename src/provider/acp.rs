@@ -5,7 +5,7 @@ use agent_client_protocol::schema::{
     v1::{
         CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
         ImageContent, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
-        LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOptionKind,
+        NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
         PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
         RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption,
         SessionConfigOptionsCapabilities, SessionNotification, SetSessionConfigOptionResponse,
@@ -31,6 +31,10 @@ use super::types::{
     ProviderDescriptor, ProviderDriver,
 };
 
+/// Interactive authentication methods (for example browser PKCE) need enough
+/// time for the user to approve the flow; key-based checks answer instantly.
+pub(super) const INTERACTIVE_AUTH_TIMEOUT: Duration = Duration::from_secs(300);
+
 pub struct AcpDriver {
     profiles: BTreeMap<String, AcpProfileConfig>,
 }
@@ -39,6 +43,9 @@ pub struct AcpDriver {
 pub(super) struct AcpRuntimeOptions {
     pub authenticate: bool,
     pub auth_method: Option<String>,
+    pub auth_meta: Option<Value>,
+    /// Overrides the control timeout while waiting for `authenticate`.
+    pub auth_timeout: Option<Duration>,
     pub suppress_load_replay: bool,
     pub allow_cli_config_fallback: bool,
     pub request_ask_mode: bool,
@@ -197,12 +204,40 @@ impl ProviderDriver for AcpDriver {
             prompt,
             &sink,
             &mut cancel,
-            AcpRuntimeOptions::default(),
+            profile_runtime_options(profile)?,
         )
         .await;
         process.terminate().await;
         result
     }
+}
+
+fn profile_runtime_options(profile: &AcpProfileConfig) -> Result<AcpRuntimeOptions, AppError> {
+    let api_key = profile
+        .api_key_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            std::env::var(name)
+                .ok()
+                .or_else(|| profile.env.get(name).cloned())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    AppError::ProviderUnavailable(format!(
+                        "ACP profile api_key_env '{name}' is not set in the daemon environment or profile env"
+                    ))
+                })
+        })
+        .transpose()?;
+    let interactive_auth = profile.auth_method.is_some() && api_key.is_none();
+    Ok(AcpRuntimeOptions {
+        authenticate: profile.auth_method.is_some() || api_key.is_some(),
+        auth_method: profile.auth_method.clone(),
+        auth_meta: api_key.map(|key| json!({ "api_key": key })),
+        auth_timeout: interactive_auth.then_some(INTERACTIVE_AUTH_TIMEOUT),
+        ..Default::default()
+    })
 }
 
 fn initialize_request() -> InitializeRequest {
@@ -222,6 +257,31 @@ fn initialize_request() -> InitializeRequest {
 pub(super) struct AcpConnectionState {
     initialize: Option<Value>,
     session: Option<(String, Value)>,
+}
+
+/// How `session/request_permission` requests are answered during a turn.
+/// Providers that keep their own session-level approval modes (Devin,
+/// Claude Code) never use this; it exists for providers like OpenCode whose
+/// permission modes are mediated client-side.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum AutoApprove {
+    /// Forward every request to the user through the permission broker.
+    #[default]
+    Mediate,
+    /// Answer immediately with the best `allow_once` option (product mode `auto`).
+    Once,
+    /// Answer immediately with the best `allow_always` option (product mode `full-access`).
+    Always,
+}
+
+impl AutoApprove {
+    fn for_turn(provider: ProviderKind, permission_mode: Option<&str>) -> Self {
+        match (provider, permission_mode) {
+            (ProviderKind::Opencode, Some("auto")) => Self::Once,
+            (ProviderKind::Opencode, Some("full-access")) => Self::Always,
+            _ => Self::Mediate,
+        }
+    }
 }
 
 pub(super) async fn run_acp_turn(
@@ -265,12 +325,21 @@ pub(super) async fn run_acp_turn_controlled(
         prompt.sandbox_mode.as_deref(),
         prompt.approval_policy.as_deref(),
     )?;
+    let auto_approve = AutoApprove::for_turn(provider, prompt.permission_mode.as_deref());
     let initialize_value = if let Some(initialize) = &connection.initialize {
         initialize.clone()
     } else {
         send_request(process, "initialize", "initialize", initialize_request()).await?;
-        let initialize =
-            wait_for_response(process, "initialize", sink, cancel, provider, true).await?;
+        let initialize = wait_for_response(
+            process,
+            "initialize",
+            sink,
+            cancel,
+            provider,
+            true,
+            auto_approve,
+        )
+        .await?;
         initialize
     };
     let initialize: InitializeResponse =
@@ -308,36 +377,70 @@ pub(super) async fn run_acp_turn_controlled(
     } else {
         match context.provider_state.native_session_id.clone() {
             Some(session_id) => {
-                if !initialize.agent_capabilities.load_session {
+                // OpenCode's `session/resume` attaches without replaying history;
+                // TodeX keeps its own event log, so prefer it over session/load.
+                let can_resume = provider == ProviderKind::Opencode
+                    && initialize_value
+                        .pointer("/agentCapabilities/sessionCapabilities/resume")
+                        .is_some();
+                if !can_resume && !initialize.agent_capabilities.load_session {
                     return Err(AppError::Unsupported(
                     "ACP agent does not support session/load; historical prompts will not be replayed"
                         .to_owned(),
                 ));
                 }
-                let mut request = serde_json::to_value(LoadSessionRequest::new(
-                    session_id.clone(),
-                    context.manifest.workspace.clone(),
-                ))?;
-                apply_session_metadata(&mut request, &options, true);
-                send_request(process, "session", "session/load", request).await?;
-                let response_value = wait_for_response(
-                    process,
-                    "session",
-                    sink,
-                    cancel,
-                    provider,
-                    !options.suppress_load_replay,
-                )
-                .await?;
+                let response_value = if can_resume {
+                    send_request(
+                        process,
+                        "session",
+                        "session/resume",
+                        json!({
+                            "sessionId": session_id,
+                            "cwd": context.manifest.workspace,
+                        }),
+                    )
+                    .await?;
+                    wait_for_response(
+                        process,
+                        "session",
+                        sink,
+                        cancel,
+                        provider,
+                        false,
+                        auto_approve,
+                    )
+                    .await?
+                } else {
+                    let mut request = serde_json::to_value(LoadSessionRequest::new(
+                        session_id.clone(),
+                        context.manifest.workspace.clone(),
+                    ))?;
+                    apply_session_metadata(&mut request, &options, true);
+                    send_request(process, "session", "session/load", request).await?;
+                    wait_for_response(
+                        process,
+                        "session",
+                        sink,
+                        cancel,
+                        provider,
+                        !options.suppress_load_replay,
+                        auto_approve,
+                    )
+                    .await?
+                };
                 connection.session = Some((session_id.clone(), response_value.clone()));
                 let legacy_models = response_value.get("models").cloned();
-                let response: LoadSessionResponse = serde_json::from_value(response_value)
+                let config_options = response_value
+                    .get("configOptions")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
                     .map_err(|error| {
                         AppError::InvalidRequest(format!(
-                            "invalid ACP session/load response: {error}"
+                            "invalid ACP session resume response: {error}"
                         ))
                     })?;
-                (session_id, response.config_options, legacy_models)
+                (session_id, config_options, legacy_models)
             }
             None => {
                 let mut request = serde_json::to_value(NewSessionRequest::new(
@@ -345,8 +448,16 @@ pub(super) async fn run_acp_turn_controlled(
                 ))?;
                 apply_session_metadata(&mut request, &options, false);
                 send_request(process, "session", "session/new", request).await?;
-                let response_value =
-                    wait_for_response(process, "session", sink, cancel, provider, true).await?;
+                let response_value = wait_for_response(
+                    process,
+                    "session",
+                    sink,
+                    cancel,
+                    provider,
+                    true,
+                    auto_approve,
+                )
+                .await?;
                 let legacy_models = response_value.get("models").cloned();
                 let response: NewSessionResponse = serde_json::from_value(response_value.clone())
                     .map_err(|error| {
@@ -381,6 +492,7 @@ pub(super) async fn run_acp_turn_controlled(
             session_id: &native_session_id,
             provider,
             runtime: &options,
+            auto_approve,
         },
     )
     .await?;
@@ -422,7 +534,7 @@ pub(super) async fn run_acp_turn_controlled(
                     if request.expected_turn_id != prompt.turn_id {
                         let _ = request.respond_to.send(Err(AppError::InvalidRequest("control targets a stale turn".to_owned())));
                     } else {
-                        start_live_control(process, request, &native_session_id, &mut pending).await?;
+                        start_live_control(process, request, &native_session_id, &mut pending, provider).await?;
                     }
                 } else { controls = None; }
                 continue;
@@ -432,11 +544,11 @@ pub(super) async fn run_acp_turn_controlled(
                 let expired: Vec<_> = pending.iter().filter(|(_,value)| value.deadline <= now).map(|(id,_)| id.clone()).collect();
                 for id in expired {
                     if let Some(request) = pending.remove(&id) {
-                        let _ = request.request.respond_to.send(Err(AppError::ProviderUnavailable("Grok control timed out; effective configuration is unknown".to_owned())));
+                        let _ = request.request.respond_to.send(Err(AppError::ProviderUnavailable(format!("{} control timed out; effective configuration is unknown", provider.as_str()))));
                     }
                 }
                 // A timed-out mutation must never remain in a reusable process.
-                return Err(AppError::ProviderUnavailable("Grok control acknowledgement timed out".to_owned()));
+                return Err(AppError::ProviderUnavailable(format!("{} control acknowledgement timed out", provider.as_str())));
             }
             changed = cancel.changed() => {
                 let _ = changed;
@@ -445,7 +557,7 @@ pub(super) async fn run_acp_turn_controlled(
                     "session/cancel",
                     CancelNotification::new(native_session_id.clone()),
                 ).await?;
-                return drain_cancelled_turn(process, &native_session_id, &prompt.turn_id, sink, provider, &mut client_requests, terminal_response.is_some()).await;
+                return drain_cancelled_turn(process, &native_session_id, &prompt.turn_id, sink, provider, auto_approve, &mut client_requests, terminal_response.is_some()).await;
             }
         };
         let Some(message) = message else {
@@ -456,8 +568,16 @@ pub(super) async fn run_acp_turn_controlled(
         }
         if let Some(id) = jsonrpc_id(&message) {
             if let Some(request) = pending.remove(id) {
-                complete_live_control(process, message, request, sink, &mut pending, connection)
-                    .await?;
+                complete_live_control(
+                    process,
+                    message,
+                    request,
+                    sink,
+                    &mut pending,
+                    connection,
+                    provider,
+                )
+                .await?;
                 continue;
             }
         }
@@ -476,12 +596,15 @@ pub(super) async fn run_acp_turn_controlled(
             let mut cancel = cancel.clone();
             client_requests.spawn(async move {
                 let mut writer = BufferedAcpWriter::default();
-                let result = handle_client_request(&mut writer, &message, &sink, &mut cancel).await;
+                let result =
+                    handle_client_request(&mut writer, &message, &sink, &mut cancel, auto_approve)
+                        .await;
                 (writer.responses, result)
             });
             continue;
         }
-        if let Err(error) = handle_acp_message(process, message, sink, cancel, provider, true).await
+        if let Err(error) =
+            handle_acp_message(process, message, sink, cancel, provider, true, auto_approve).await
         {
             if matches!(error, AppError::TurnCancelled) && *cancel.borrow() {
                 send_notification(
@@ -496,6 +619,7 @@ pub(super) async fn run_acp_turn_controlled(
                     &prompt.turn_id,
                     sink,
                     provider,
+                    auto_approve,
                     &mut client_requests,
                     terminal_response.is_some(),
                 )
@@ -547,14 +671,16 @@ async fn start_live_control(
     request: PendingProviderControl,
     session_id: &str,
     pending: &mut BTreeMap<String, LiveAcpControl>,
+    provider: ProviderKind,
 ) -> Result<(), AppError> {
     if request.respond_to.is_closed() {
         return Ok(());
     }
     if pending.len() >= 16 {
-        let _ = request.respond_to.send(Err(AppError::Conflict(
-            "too many pending Grok controls".to_owned(),
-        )));
+        let _ = request.respond_to.send(Err(AppError::Conflict(format!(
+            "too many pending {} controls",
+            provider.as_str()
+        ))));
         return Ok(());
     }
     if matches!(request.control, ProviderControl::Configure { .. })
@@ -562,34 +688,16 @@ async fn start_live_control(
             .values()
             .any(|control| matches!(control.request.control, ProviderControl::Configure { .. }))
     {
-        let _ = request.respond_to.send(Err(AppError::Conflict(
-            "a Grok configuration change is already pending".to_owned(),
-        )));
+        let _ = request.respond_to.send(Err(AppError::Conflict(format!(
+            "a {} configuration change is already pending",
+            provider.as_str()
+        ))));
         return Ok(());
     }
-    let mut commands = match &request.control {
-        ProviderControl::Steer { text } => vec![(
-            "_x.ai/interject".to_owned(),
-            json!({"sessionId":session_id,"text":text,"interjectionId":request.request_id}),
-        )],
-        ProviderControl::Configure {
-            model,
-            reasoning_effort,
-        } => [("model", model), ("reasoning_effort", reasoning_effort)]
-            .into_iter()
-            .filter_map(|(id, value)| {
-                value.as_ref().map(|value| {
-                    (
-                        "session/set_config_option".to_owned(),
-                        json!({"sessionId":session_id,"configId":id,"value":{"value":value}}),
-                    )
-                })
-            })
-            .collect(),
-        _ => {
-            let _ = request.respond_to.send(Err(AppError::Unsupported(
-                "Grok does not expose native prompt queue controls".to_owned(),
-            )));
+    let mut commands = match control_commands(provider, &request, session_id) {
+        Ok(commands) => commands,
+        Err(error) => {
+            let _ = request.respond_to.send(Err(error));
             return Ok(());
         }
     };
@@ -619,6 +727,109 @@ async fn start_live_control(
     Ok(())
 }
 
+fn control_commands(
+    provider: ProviderKind,
+    request: &PendingProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
+    if provider == ProviderKind::Devin {
+        return devin_control_commands(&request.control, session_id);
+    }
+    if provider == ProviderKind::Opencode {
+        return opencode_control_commands(&request.control, session_id);
+    }
+    match &request.control {
+        ProviderControl::Steer { text } => Ok(vec![(
+            "_x.ai/interject".to_owned(),
+            json!({"sessionId":session_id,"text":text,"interjectionId":request.request_id}),
+        )]),
+        ProviderControl::Configure {
+            model,
+            reasoning_effort,
+        } => Ok([("model", model), ("reasoning_effort", reasoning_effort)]
+            .into_iter()
+            .filter_map(|(id, value)| {
+                value.as_ref().map(|value| {
+                    (
+                        "session/set_config_option".to_owned(),
+                        json!({"sessionId":session_id,"configId":id,"value":{"value":value}}),
+                    )
+                })
+            })
+            .collect()),
+        _ => Err(AppError::Unsupported(
+            "Grok does not expose native prompt queue controls".to_owned(),
+        )),
+    }
+}
+
+fn opencode_control_commands(
+    control: &ProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
+    match control {
+        ProviderControl::Configure {
+            model,
+            reasoning_effort,
+        } => {
+            let mut commands = Vec::new();
+            if let Some(model) = model {
+                commands.push((
+                    "session/set_config_option".to_owned(),
+                    json!({"sessionId":session_id,"configId":"model","value":model}),
+                ));
+            }
+            if let Some(effort) = reasoning_effort {
+                commands.push((
+                    "session/set_config_option".to_owned(),
+                    json!({"sessionId":session_id,"configId":"effort","value":effort}),
+                ));
+            }
+            Ok(commands)
+        }
+        ProviderControl::Steer { .. } => Err(AppError::Unsupported(
+            "OpenCode does not expose mid-turn steering over ACP".to_owned(),
+        )),
+        _ => Err(AppError::Unsupported(
+            "OpenCode does not expose native prompt queue controls".to_owned(),
+        )),
+    }
+}
+
+fn devin_control_commands(
+    control: &ProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
+    match control {
+        ProviderControl::Configure {
+            model,
+            reasoning_effort,
+        } => {
+            if reasoning_effort.is_some() {
+                return Err(AppError::Unsupported(
+                    "Devin does not expose a separate reasoning effort control; choose a model variant"
+                        .to_owned(),
+                ));
+            }
+            Ok(model
+                .as_ref()
+                .map(|value| {
+                    vec![(
+                        "session/set_config_option".to_owned(),
+                        json!({"sessionId":session_id,"configId":"model","value":value}),
+                    )]
+                })
+                .unwrap_or_default())
+        }
+        ProviderControl::Steer { .. } => Err(AppError::Unsupported(
+            "Devin does not expose mid-turn steering over ACP".to_owned(),
+        )),
+        _ => Err(AppError::Unsupported(
+            "Devin does not expose native prompt queue controls".to_owned(),
+        )),
+    }
+}
+
 async fn complete_live_control(
     process: &mut JsonLineProcess,
     message: Value,
@@ -626,13 +837,15 @@ async fn complete_live_control(
     sink: &DriverEventSink,
     pending: &mut BTreeMap<String, LiveAcpControl>,
     connection: &mut AcpConnectionState,
+    provider: ProviderKind,
 ) -> Result<(), AppError> {
     if let Some(error) = message.get("error") {
         let _ = control
             .request
             .respond_to
             .send(Err(AppError::InvalidRequest(format!(
-                "Grok control rejected: {}",
+                "{} control rejected: {}",
+                provider.as_str(),
                 safe_error_text(error)
             ))));
         return Ok(());
@@ -641,12 +854,14 @@ async fn complete_live_control(
         let _ = control
             .request
             .respond_to
-            .send(Err(AppError::ProviderUnavailable(
-                "Grok control response has no result; outcome is unknown".to_owned(),
-            )));
-        return Err(AppError::ProviderUnavailable(
-            "Grok control response has no result".to_owned(),
-        ));
+            .send(Err(AppError::ProviderUnavailable(format!(
+                "{} control response has no result; outcome is unknown",
+                provider.as_str()
+            ))));
+        return Err(AppError::ProviderUnavailable(format!(
+            "{} control response has no result",
+            provider.as_str()
+        )));
     };
     if let Some(config) = result.get("configOptions") {
         if let Some((_, response)) = &mut connection.session {
@@ -654,7 +869,7 @@ async fn complete_live_control(
         }
     }
     if let Some(effective) = result.get("configOptions").and_then(config_effective) {
-        sink.emit("turn.configuration", json!({"provider":"grok-build","source":"provider-confirmed","effectiveConfig":effective,"effectiveFrom":"next-safe-point"})).await?;
+        sink.emit("turn.configuration", json!({"provider":provider.as_str(),"source":"provider-confirmed","effectiveConfig":effective,"effectiveFrom":"next-safe-point"})).await?;
     }
     if !control.remaining.is_empty() {
         let (method, params) = control.remaining.remove(0);
@@ -685,7 +900,10 @@ async fn complete_live_control(
     let unknown_steer = matches!(control.request.control, ProviderControl::Steer { .. })
         && result.get("status").and_then(Value::as_str) != Some("queued");
     if missing_effective || unknown_steer {
-        let message = "Grok control acknowledgement does not confirm its effective result";
+        let message = format!(
+            "{} control acknowledgement does not confirm its effective result",
+            provider.as_str()
+        );
         let _ = control
             .request
             .respond_to
@@ -722,7 +940,8 @@ fn config_effective(options: &Value) -> Option<Value> {
     for option in options.as_array()? {
         let key = match option.get("id").and_then(Value::as_str) {
             Some("model") => "model",
-            Some("reasoning_effort") => "reasoningEffort",
+            Some("reasoning_effort" | "effort") => "reasoningEffort",
+            Some("mode") => "mode",
             _ => continue,
         };
         if let Some(value) = option
@@ -781,6 +1000,22 @@ async fn emit_prompt_metadata(
     sink.emit("provider.event", json!({
         "provider": provider.as_str(), "providerMethod": "session/prompt/result", "metadata": metadata,
     })).await?;
+    if matches!(provider, ProviderKind::Devin | ProviderKind::Opencode) {
+        if let Some(usage) = message
+            .pointer("/result/usage")
+            .filter(|value| value.is_object())
+        {
+            sink.emit(
+                "usage.updated",
+                json!({
+                    "provider": provider.as_str(), "source": "provider", "scope": "turn",
+                    "aggregation": "snapshot", "final": true,
+                    "usage": normalize_devin_usage(usage), "metadata": metadata,
+                }),
+            )
+            .await?;
+        }
+    }
     if provider == ProviderKind::GrokBuild {
         if let Some(usage) = metadata
             .get("usage")
@@ -805,12 +1040,14 @@ async fn emit_prompt_metadata(
 
 /// Give cancellation a bounded protocol drain before the caller terminates the process.
 /// Reverse requests during this window are rejected without waiting for another user action.
+#[allow(clippy::too_many_arguments)]
 async fn drain_cancelled_turn(
     process: &mut JsonLineProcess,
     session_id: &str,
     turn_id: &str,
     sink: &DriverEventSink,
     provider: ProviderKind,
+    auto_approve: AutoApprove,
     client_requests: &mut tokio::task::JoinSet<(Vec<Value>, Result<(), AppError>)>,
     terminal_seen: bool,
 ) -> Result<DriverTurnResult, AppError> {
@@ -853,7 +1090,16 @@ async fn drain_cancelled_turn(
                     process.send(&json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32800,"message":"turn cancelled"}})).await?;
                 }
             } else {
-                handle_acp_message(process, message, sink, &mut cancelled, provider, true).await?;
+                handle_acp_message(
+                    process,
+                    message,
+                    sink,
+                    &mut cancelled,
+                    provider,
+                    true,
+                    auto_approve,
+                )
+                .await?;
             }
         }
     };
@@ -924,8 +1170,37 @@ async fn wait_for_response(
     cancel: &mut watch::Receiver<bool>,
     provider: ProviderKind,
     emit_stream_updates: bool,
+    auto_approve: AutoApprove,
 ) -> Result<Value, AppError> {
-    let mut deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
+    wait_for_response_with_timeout(
+        process,
+        request_id,
+        sink,
+        cancel,
+        provider,
+        emit_stream_updates,
+        auto_approve,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_response_with_timeout(
+    process: &mut JsonLineProcess,
+    request_id: &str,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+    provider: ProviderKind,
+    emit_stream_updates: bool,
+    auto_approve: AutoApprove,
+    timeout: Option<Duration>,
+) -> Result<Value, AppError> {
+    let timeout = match timeout {
+        Some(timeout) => timeout,
+        None => super::process::control_timeout()?,
+    };
+    let mut deadline = tokio::time::Instant::now() + timeout;
     loop {
         let message = tokio::select! {
             message = process.read_control_until(deadline) => message?,
@@ -970,6 +1245,7 @@ async fn wait_for_response(
             cancel,
             provider,
             emit_stream_updates,
+            auto_approve,
         )
         .await?;
         if waits_for_user {
@@ -1025,13 +1301,14 @@ pub(super) async fn handle_acp_message(
     cancel: &mut watch::Receiver<bool>,
     provider: ProviderKind,
     emit_stream_updates: bool,
+    auto_approve: AutoApprove,
 ) -> Result<(), AppError> {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return Ok(());
     };
     let params = message.get("params").cloned().unwrap_or(Value::Null);
     if is_client_request(&message) {
-        return handle_client_request(process, &message, sink, cancel).await;
+        return handle_client_request(process, &message, sink, cancel, auto_approve).await;
     }
     if provider == ProviderKind::GrokBuild && is_grok_update_method(method) {
         if !emit_stream_updates {
@@ -1111,9 +1388,28 @@ pub(super) async fn handle_acp_message(
                 "turn.configuration",
                 json!({"provider":provider_id,"source":"provider-confirmed","effectiveConfig":update.get("configOptions").and_then(config_effective),"metadata":update}),
             ),
-            "available_commands_update" if provider == ProviderKind::GrokBuild => (
-                "provider.commands.updated",
-                json!({ "provider": provider_id, "commands": super::grok::parse_commands(&json!({"_meta":{"availableCommands":update.get("availableCommands")}})), "metadata":update }),
+            "available_commands_update"
+                if matches!(
+                    provider,
+                    ProviderKind::GrokBuild | ProviderKind::Devin | ProviderKind::Opencode
+                ) =>
+            {
+                (
+                    "provider.commands.updated",
+                    json!({ "provider": provider_id, "commands": super::grok::parse_commands(&json!({"_meta":{"availableCommands":update.get("availableCommands")}})), "metadata":update }),
+                )
+            }
+            "usage_update" if matches!(provider, ProviderKind::Devin | ProviderKind::Opencode) => (
+                "usage.updated",
+                json!({ "provider": provider_id, "source": "provider", "scope": "turn",
+                    "aggregation": "snapshot", "final": false,
+                    "usage": normalize_devin_usage(&update), "metadata": update }),
+            ),
+            "current_mode_update" if provider == ProviderKind::Devin => (
+                "turn.configuration",
+                json!({ "provider": provider_id, "source": "provider-confirmed",
+                    "effectiveConfig": { "mode": update.get("currentModeId"), "source": "provider-confirmed" },
+                    "effectiveFrom": "current-turn", "metadata": update }),
             ),
             "user_message_chunk" => return Ok(()),
             _ => (
@@ -1148,6 +1444,7 @@ async fn handle_client_request(
     message: &Value,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
+    auto_approve: AutoApprove,
 ) -> Result<(), AppError> {
     let method = message
         .get("method")
@@ -1183,6 +1480,33 @@ async fn handle_client_request(
             serde_json::from_value(params.clone()).map_err(|error| {
                 AppError::InvalidRequest(format!("invalid ACP permission request: {error}"))
             })?;
+        if auto_approve != AutoApprove::Mediate {
+            if let Some(selected) = auto_select_permission_option(&request, auto_approve) {
+                let outcome = if selected.kind == PermissionOptionKind::AllowAlways {
+                    "allow_always"
+                } else {
+                    "allow_once"
+                };
+                emit_auto_permission(
+                    sink,
+                    &request,
+                    request_id_text(&request_id),
+                    outcome,
+                    selected.option_id.0.as_ref(),
+                )
+                .await?;
+                let response = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                    SelectedPermissionOutcome::new(selected.option_id.0),
+                ));
+                process
+                    .write_response(
+                        json!({ "jsonrpc": "2.0", "id": request_id, "result": response }),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            // No allow-style option offered; fall through and ask the user.
+        }
         let options = serde_json::to_value(&request.options)?;
         let decision = match sink
             .request_permission(
@@ -1273,6 +1597,29 @@ fn normalize_grok_usage(raw: &Value, response: bool) -> Value {
         }
     }
     json!({"last":last, "cacheSemantics":"included", "raw":raw})
+}
+
+/// Devin reports turn usage both as `usage_update` notifications (used/size
+/// plus `_meta["cognition.ai/inputTokens"]` etc.) and as a flat `usage` object
+/// on the prompt response. Normalize both shapes into one summary.
+fn normalize_devin_usage(raw: &Value) -> Value {
+    let meta = raw.get("_meta").cloned().unwrap_or(Value::Null);
+    let pick = |keys: &[&str]| -> Option<Value> {
+        keys.iter().find_map(|key| {
+            raw.get(*key)
+                .or_else(|| meta.get(*key))
+                .or_else(|| meta.get(format!("cognition.ai/{key}")))
+                .cloned()
+        })
+    };
+    json!({
+        "input": pick(&["inputTokens", "input_tokens", "input"]),
+        "output": pick(&["outputTokens", "output_tokens", "output"]),
+        "total": pick(&["totalTokens", "total_tokens", "total", "used"]),
+        "cacheRead": pick(&["cachedReadTokens", "cacheRead", "cache_read_input_tokens"]),
+        "contextWindow": pick(&["size", "contextWindow", "contextTokens"]),
+        "raw": raw,
+    })
 }
 
 fn grok_activity_event(params: &Value) -> Option<(&'static str, Value)> {
@@ -1603,24 +1950,33 @@ async fn authenticate_if_requested(
     if !options.authenticate {
         return Ok(());
     }
-    let Some(selected) = select_headless_auth_method(initialize, options.auth_method.as_deref())?
+    let Some(selected) = select_auth_method(initialize, options.auth_method.as_deref(), provider)?
     else {
         return Ok(());
     };
-    send_request(
+    let mut params = json!({ "methodId": selected });
+    if let Some(meta) = &options.auth_meta {
+        params["_meta"] = meta.clone();
+    }
+    send_request(process, "authenticate", "authenticate", params).await?;
+    wait_for_response_with_timeout(
         process,
         "authenticate",
-        "authenticate",
-        json!({ "methodId": selected, "_meta": { "headless": true } }),
+        sink,
+        cancel,
+        provider,
+        true,
+        AutoApprove::Mediate,
+        options.auth_timeout,
     )
     .await?;
-    wait_for_response(process, "authenticate", sink, cancel, provider, true).await?;
     Ok(())
 }
 
-pub(super) fn select_headless_auth_method(
+pub(super) fn select_auth_method(
     initialize: &Value,
     configured: Option<&str>,
+    provider: ProviderKind,
 ) -> Result<Option<String>, AppError> {
     let advertised = initialize
         .get("authMethods")
@@ -1632,6 +1988,9 @@ pub(super) fn select_headless_auth_method(
     if advertised.is_empty() {
         return Ok(None);
     }
+    let configured = configured
+        .map(str::trim)
+        .filter(|method| !method.is_empty());
     let selected = configured
         .or_else(|| {
             initialize
@@ -1641,14 +2000,18 @@ pub(super) fn select_headless_auth_method(
         .or_else(|| advertised.contains(&"cached_token").then_some("cached_token"))
         .or_else(|| (advertised.len() == 1).then_some(advertised[0]))
         .ok_or_else(|| {
-            AppError::ProviderUnavailable("grok-build advertised multiple authentication methods but no default; configure agent.grok_auth_method".to_owned())
+            AppError::ProviderUnavailable(format!(
+                "{} advertised multiple authentication methods but no default; configure an auth method",
+                provider.as_str()
+            ))
         })?;
     if !advertised.contains(&selected) {
         return Err(AppError::ProviderUnavailable(format!(
-            "authentication method '{selected}' is not advertised by grok-build"
+            "authentication method '{selected}' is not advertised by {}",
+            provider.as_str()
         )));
     }
-    if !is_grok_headless_auth_method(selected) {
+    if provider == ProviderKind::GrokBuild && !is_grok_headless_auth_method(selected) {
         return Err(AppError::ProviderUnavailable(format!(
             "authentication method '{selected}' requires interaction; run `grok login` first or configure XAI_API_KEY"
         )));
@@ -1665,6 +2028,7 @@ struct SessionConfigContext<'a> {
     session_id: &'a str,
     provider: ProviderKind,
     runtime: &'a AcpRuntimeOptions,
+    auto_approve: AutoApprove,
 }
 
 async fn apply_requested_config(
@@ -1680,11 +2044,25 @@ async fn apply_requested_config(
         apply_legacy_model_config(process, legacy_models, prompt, sink, cancel, context).await?;
         return Ok(None);
     }
-    let mut current_options = options.map(<[SessionConfigOption]>::to_vec);
-    for (config_id, requested) in [
+    // OpenCode names its per-model thinking-level option `effort`; other ACP
+    // profiles use `reasoning_effort`.
+    let effort_id = if context.provider == ProviderKind::Opencode {
+        "effort"
+    } else {
+        "reasoning_effort"
+    };
+    let mut requested_configs = vec![
         ("model", prompt.model.as_deref()),
-        ("reasoning_effort", prompt.reasoning_effort.as_deref()),
-    ] {
+        (effort_id, prompt.reasoning_effort.as_deref()),
+    ];
+    if context.provider == ProviderKind::Devin {
+        requested_configs.push(("mode", devin_session_mode(prompt)));
+    }
+    if context.provider == ProviderKind::Opencode {
+        requested_configs.push(("mode", Some(opencode_session_mode(prompt))));
+    }
+    let mut current_options = options.map(<[SessionConfigOption]>::to_vec);
+    for (config_id, requested) in requested_configs {
         let Some(requested) = requested else {
             continue;
         };
@@ -1715,8 +2093,16 @@ async fn apply_requested_config(
             }),
         )
         .await?;
-        let response =
-            wait_for_response(process, &request_id, sink, cancel, context.provider, true).await?;
+        let response = wait_for_response(
+            process,
+            &request_id,
+            sink,
+            cancel,
+            context.provider,
+            true,
+            context.auto_approve,
+        )
+        .await?;
         let response: SetSessionConfigOptionResponse =
             serde_json::from_value(response).map_err(|error| {
                 AppError::InvalidRequest(format!(
@@ -1731,6 +2117,30 @@ async fn apply_requested_config(
         }
     }
     Ok(current_options)
+}
+
+/// Devin session modes map the product permission modes onto its native
+/// ask / accept-edits / plan / bypass selector. Plan work always wins.
+fn devin_session_mode(prompt: &DriverPrompt) -> Option<&'static str> {
+    if prompt.work_mode.as_deref() == Some("plan") {
+        return Some("plan");
+    }
+    match prompt.permission_mode.as_deref() {
+        Some("ask") => Some("ask"),
+        Some("auto") => Some("accept-edits"),
+        Some("full-access") => Some("bypass"),
+        _ => None,
+    }
+}
+
+/// OpenCode session modes are only build/plan; always restate the mode so a
+/// session left in plan mode returns to build on the next implement turn.
+fn opencode_session_mode(prompt: &DriverPrompt) -> &'static str {
+    if prompt.work_mode.as_deref() == Some("plan") {
+        "plan"
+    } else {
+        "build"
+    }
 }
 
 fn config_option_wire_value(requested: &str, nested: bool) -> Value {
@@ -1805,6 +2215,74 @@ async fn apply_legacy_model_config(
         cancel,
         context.provider,
         true,
+        context.auto_approve,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Pick the option a client-side auto-approval should select. `Once` prefers
+/// `allow_once`; `Always` prefers `allow_always` so the agent stops asking for
+/// the same tool. Any other allow-style kind is a fallback; reject-only
+/// requests return `None` and fall back to user mediation.
+fn auto_select_permission_option(
+    request: &RequestPermissionRequest,
+    auto_approve: AutoApprove,
+) -> Option<PermissionOption> {
+    let preferred = if auto_approve == AutoApprove::Always {
+        PermissionOptionKind::AllowAlways
+    } else {
+        PermissionOptionKind::AllowOnce
+    };
+    let fallback = if preferred == PermissionOptionKind::AllowAlways {
+        PermissionOptionKind::AllowOnce
+    } else {
+        PermissionOptionKind::AllowAlways
+    };
+    request
+        .options
+        .iter()
+        .find(|option| option.kind == preferred)
+        .or_else(|| {
+            request
+                .options
+                .iter()
+                .find(|option| option.kind == fallback)
+        })
+        .cloned()
+}
+
+/// Mirror the broker's `permission.requested`/`permission.resolved` pair so an
+/// auto-approved tool call remains visible in the event log and UI.
+async fn emit_auto_permission(
+    sink: &DriverEventSink,
+    request: &RequestPermissionRequest,
+    provider_request_id: String,
+    outcome: &str,
+    option_id: &str,
+) -> Result<(), AppError> {
+    let permission_id = format!("perm_{}", uuid::Uuid::new_v4().simple());
+    sink.emit(
+        "permission.requested",
+        json!({
+            "permissionId": permission_id,
+            "providerRequestId": provider_request_id,
+            "kind": "tool",
+            "title": "Allow ACP tool call?",
+            "details": serde_json::to_value(&request.tool_call)?,
+            "options": serde_json::to_value(&request.options)?,
+            "autoApproved": true,
+        }),
+    )
+    .await?;
+    sink.emit(
+        "permission.resolved",
+        json!({
+            "permissionId": permission_id,
+            "outcome": outcome,
+            "optionId": option_id,
+            "autoApproved": true,
+        }),
     )
     .await?;
     Ok(())
@@ -1916,6 +2394,83 @@ fn safe_error_text(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devin_session_mode_maps_permission_and_work_modes() {
+        let mut prompt = image_prompt();
+        prompt.permission_mode = Some("ask".to_owned());
+        assert_eq!(devin_session_mode(&prompt), Some("ask"));
+        prompt.permission_mode = Some("auto".to_owned());
+        assert_eq!(devin_session_mode(&prompt), Some("accept-edits"));
+        prompt.permission_mode = Some("full-access".to_owned());
+        assert_eq!(devin_session_mode(&prompt), Some("bypass"));
+        prompt.permission_mode = None;
+        assert_eq!(devin_session_mode(&prompt), None);
+        prompt.permission_mode = Some("auto".to_owned());
+        prompt.work_mode = Some("plan".to_owned());
+        assert_eq!(devin_session_mode(&prompt), Some("plan"));
+    }
+
+    #[test]
+    fn devin_usage_normalizes_notifications_and_prompt_results() {
+        let update = json!({
+            "used": 12466, "size": 262000,
+            "_meta": {
+                "cognition.ai/inputTokens": 12422,
+                "cognition.ai/outputTokens": 44
+            }
+        });
+        let usage = normalize_devin_usage(&update);
+        assert_eq!(usage["input"], 12422);
+        assert_eq!(usage["output"], 44);
+        assert_eq!(usage["total"], 12466);
+        assert_eq!(usage["contextWindow"], 262000);
+
+        let result = json!({"totalTokens": 12466, "inputTokens": 12422, "outputTokens": 44});
+        let usage = normalize_devin_usage(&result);
+        assert_eq!(usage["input"], 12422);
+        assert_eq!(usage["total"], 12466);
+        assert!(usage["contextWindow"].is_null());
+    }
+
+    #[test]
+    fn devin_controls_use_plain_string_config_values() {
+        let commands = devin_control_commands(
+            &ProviderControl::Configure {
+                model: Some("claude-opus-5-low".to_owned()),
+                reasoning_effort: None,
+            },
+            "devin-native",
+        )
+        .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].0, "session/set_config_option");
+        assert_eq!(commands[0].1["configId"], "model");
+        assert_eq!(commands[0].1["value"], "claude-opus-5-low");
+        assert!(matches!(
+            devin_control_commands(
+                &ProviderControl::Steer {
+                    text: "redirect".to_owned()
+                },
+                "devin-native"
+            ),
+            Err(AppError::Unsupported(_))
+        ));
+        assert!(matches!(
+            devin_control_commands(
+                &ProviderControl::Configure {
+                    model: None,
+                    reasoning_effort: Some("high".to_owned())
+                },
+                "devin-native"
+            ),
+            Err(AppError::Unsupported(_))
+        ));
+        assert!(matches!(
+            devin_control_commands(&ProviderControl::QueueList, "devin-native"),
+            Err(AppError::Unsupported(_))
+        ));
+    }
 
     fn image_prompt() -> DriverPrompt {
         DriverPrompt {
@@ -2033,6 +2588,97 @@ mod tests {
         assert!(!is_grok_headless_auth_method("grok.com"));
         assert!(!is_grok_headless_auth_method("oidc"));
         assert!(!is_grok_headless_auth_method("future-browser-flow"));
+    }
+
+    #[test]
+    fn acp_profile_auth_method_selects_single_advertised_method() {
+        let initialize = json!({ "authMethods": [{ "id": "devin-browser" }] });
+        assert_eq!(
+            select_auth_method(&initialize, None, ProviderKind::Acp)
+                .unwrap()
+                .as_deref(),
+            Some("devin-browser")
+        );
+    }
+
+    #[test]
+    fn acp_profile_auth_method_honors_configured_choice() {
+        let initialize = json!({ "authMethods": [{ "id": "a" }, { "id": "b" }] });
+        assert_eq!(
+            select_auth_method(&initialize, Some("b"), ProviderKind::Acp)
+                .unwrap()
+                .as_deref(),
+            Some("b")
+        );
+        assert!(matches!(
+            select_auth_method(&initialize, None, ProviderKind::Acp),
+            Err(AppError::ProviderUnavailable(message)) if message.contains("multiple authentication methods")
+        ));
+        assert!(matches!(
+            select_auth_method(&initialize, Some("missing"), ProviderKind::Acp),
+            Err(AppError::ProviderUnavailable(message)) if message.contains("not advertised")
+        ));
+        assert_eq!(
+            select_auth_method(&json!({}), Some("a"), ProviderKind::Acp).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn acp_profile_runtime_options_resolve_api_key_from_profile_env() {
+        let profile = AcpProfileConfig {
+            command: "devin".to_owned(),
+            args: vec!["acp".to_owned()],
+            env: BTreeMap::from([("TODEX_TEST_ACP_KEY_3f9b1c".to_owned(), "secret".to_owned())]),
+            auth_method: None,
+            api_key_env: Some("TODEX_TEST_ACP_KEY_3f9b1c".to_owned()),
+        };
+        let options = profile_runtime_options(&profile).unwrap();
+        assert!(options.authenticate);
+        assert_eq!(options.auth_meta, Some(json!({ "api_key": "secret" })));
+    }
+
+    #[test]
+    fn acp_profile_runtime_options_require_configured_api_key_env() {
+        let profile = AcpProfileConfig {
+            command: "devin".to_owned(),
+            args: vec!["acp".to_owned()],
+            env: BTreeMap::new(),
+            auth_method: None,
+            api_key_env: Some("TODEX_TEST_ACP_MISSING_7c2d4e".to_owned()),
+        };
+        assert!(matches!(
+            profile_runtime_options(&profile),
+            Err(AppError::ProviderUnavailable(message)) if message.contains("api_key_env")
+        ));
+        let profile = AcpProfileConfig {
+            api_key_env: None,
+            ..profile
+        };
+        let options = profile_runtime_options(&profile).unwrap();
+        assert!(!options.authenticate);
+        assert_eq!(options.auth_meta, None);
+    }
+
+    #[test]
+    fn acp_profile_runtime_options_extend_timeout_for_interactive_auth() {
+        let profile = AcpProfileConfig {
+            command: "devin".to_owned(),
+            args: vec!["acp".to_owned()],
+            env: BTreeMap::new(),
+            auth_method: Some("devin-browser".to_owned()),
+            api_key_env: None,
+        };
+        let options = profile_runtime_options(&profile).unwrap();
+        assert_eq!(options.auth_timeout, Some(INTERACTIVE_AUTH_TIMEOUT));
+
+        let profile = AcpProfileConfig {
+            env: BTreeMap::from([("TODEX_TEST_ACP_KEY_8a1f02".to_owned(), "secret".to_owned())]),
+            api_key_env: Some("TODEX_TEST_ACP_KEY_8a1f02".to_owned()),
+            ..profile
+        };
+        let options = profile_runtime_options(&profile).unwrap();
+        assert_eq!(options.auth_timeout, None);
     }
 
     #[test]

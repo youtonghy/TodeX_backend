@@ -75,9 +75,11 @@ impl GrokBuildDriver {
         process: &mut JsonLineProcess,
         initialize: &Value,
     ) -> Result<(), AppError> {
-        if let Some(method) =
-            super::acp::select_headless_auth_method(initialize, self.auth_method.as_deref())?
-        {
+        if let Some(method) = super::acp::select_auth_method(
+            initialize,
+            self.auth_method.as_deref(),
+            ProviderKind::GrokBuild,
+        )? {
             control_request(
                 process,
                 "authenticate",
@@ -323,6 +325,8 @@ impl ProviderDriver for GrokBuildDriver {
                 let runtime = AcpRuntimeOptions {
                     authenticate: true,
                     auth_method: self.auth_method.clone(),
+                    auth_meta: Some(json!({ "headless": true })),
+                    auth_timeout: None,
                     suppress_load_replay: true,
                     allow_cli_config_fallback: true,
                     request_ask_mode: true,
@@ -401,7 +405,7 @@ async fn run_session_actor(
                             } else if let Some(sink) = &last_sink {
                                 super::acp::observe_config_options(&mut connection, &message);
                                 let (_tx, mut cancel) = watch::channel(false);
-                                if super::acp::handle_acp_message(process, message, sink, &mut cancel, ProviderKind::GrokBuild, true).await.is_err() { break; }
+                                if super::acp::handle_acp_message(process, message, sink, &mut cancel, ProviderKind::GrokBuild, true, super::acp::AutoApprove::Mediate).await.is_err() { break; }
                             }
                         }
                     }
@@ -671,6 +675,8 @@ pub(super) fn parse_commands(initialize: &Value) -> Vec<ProviderCommandDescripto
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 invocation: "provider-prompt".to_owned(),
+                package_name: None,
+                package_version: None,
                 name,
             })
         })

@@ -55,7 +55,7 @@ pub(crate) async fn snapshot(root: &Path, workspace: &Path) -> Result<GitWorkspa
         .map_err(|_| AppError::GitCommandTimedOut("Git workspace inspection".to_owned()))?
 }
 
-async fn is_exact_repository(root: &Path, workspace: &Path) -> Result<bool> {
+pub(super) async fn is_exact_repository(root: &Path, workspace: &Path) -> Result<bool> {
     match resolve_repository(root, workspace).await? {
         Some(repository) if repository != workspace => Err(invalid(
             "请选择仓库根目录后再执行 Git 操作；当前工作目录是仓库的子目录。",
@@ -317,6 +317,20 @@ async fn operate_locked(
                 repository,
             )
             .await?;
+            return Ok(GitOperationResponse {
+                repository_path: workspace.display().to_string(),
+                action: operation.action().to_owned(),
+                output,
+            });
+        }
+        GitOperation::ClosePr {}
+        | GitOperation::ReopenPr {}
+        | GitOperation::DraftPr {}
+        | GitOperation::ReadyPr {}
+        | GitOperation::MergePr { .. }
+        | GitOperation::EnablePrAutoMerge { .. }
+        | GitOperation::DisablePrAutoMerge {} => {
+            let output = super::pull_request::mutate(workspace, operation).await?;
             return Ok(GitOperationResponse {
                 repository_path: workspace.display().to_string(),
                 action: operation.action().to_owned(),

@@ -57,6 +57,23 @@ pub struct GitScanQuery {
     pub workspace_path: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffQuery {
+    pub workspace_path: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffResponse {
+    pub repository_path: String,
+    pub path: String,
+    pub diff: String,
+    pub truncated: bool,
+    pub untracked: bool,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitFileChange {
@@ -131,6 +148,18 @@ pub enum GitOperation {
     RemoveWorktree {
         path: String,
     },
+    ClosePr {},
+    ReopenPr {},
+    DraftPr {},
+    ReadyPr {},
+    MergePr {
+        method: String,
+        head_sha: String,
+    },
+    EnablePrAutoMerge {
+        method: String,
+    },
+    DisablePrAutoMerge {},
 }
 
 impl GitOperation {
@@ -143,6 +172,13 @@ impl GitOperation {
             Self::SwitchBranch { .. } => "switch-branch",
             Self::CreateWorktree { .. } => "create-worktree",
             Self::RemoveWorktree { .. } => "remove-worktree",
+            Self::ClosePr {} => "close-pr",
+            Self::ReopenPr {} => "reopen-pr",
+            Self::DraftPr {} => "draft-pr",
+            Self::ReadyPr {} => "ready-pr",
+            Self::MergePr { .. } => "merge-pr",
+            Self::EnablePrAutoMerge { .. } => "enable-pr-auto-merge",
+            Self::DisablePrAutoMerge {} => "disable-pr-auto-merge",
         }
     }
 }
@@ -206,6 +242,52 @@ pub struct GitOperationResponse {
     pub repository_path: String,
     pub action: String,
     pub output: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullRequestResponse {
+    pub repository_path: String,
+    pub initialized: bool,
+    pub branch: String,
+    pub pull_request: Option<GitPullRequest>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    /// `open`, `closed`, or `merged`.
+    pub state: String,
+    pub draft: bool,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub head_sha: String,
+    /// `mergeable`, `unmergeable`, or `unknown` while GitHub computes it.
+    pub mergeable: String,
+    pub merge_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_merge_method: Option<String>,
+    pub reviews: GitPullRequestReviews,
+    pub checks: GitPullRequestChecks,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullRequestReviews {
+    pub approved: u64,
+    pub changes_requested: u64,
+    pub commented: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullRequestChecks {
+    pub passing: u64,
+    pub failing: u64,
+    pub pending: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]

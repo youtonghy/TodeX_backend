@@ -27,6 +27,8 @@ pub enum ManagedCli {
     Pi,
     ClaudeCode,
     GrokBuild,
+    Devin,
+    Opencode,
 }
 
 impl ManagedCli {
@@ -36,6 +38,8 @@ impl ManagedCli {
             Self::Pi => "pi",
             Self::ClaudeCode => "claude-code",
             Self::GrokBuild => "grok-build",
+            Self::Devin => "devin",
+            Self::Opencode => "opencode",
         }
     }
 
@@ -45,6 +49,8 @@ impl ManagedCli {
             Self::Pi => "Pi",
             Self::ClaudeCode => "Claude Code",
             Self::GrokBuild => "Grok Build",
+            Self::Devin => "Devin",
+            Self::Opencode => "OpenCode",
         }
     }
 
@@ -54,6 +60,8 @@ impl ManagedCli {
             Self::Pi => &config.agent.pi_bin,
             Self::ClaudeCode => &config.agent.claude_bin,
             Self::GrokBuild => &config.agent.grok_bin,
+            Self::Devin => &config.agent.devin_bin,
+            Self::Opencode => &config.agent.opencode_bin,
         }
     }
 
@@ -63,6 +71,8 @@ impl ManagedCli {
             Self::Pi => &["update", "--self", "--no-approve"],
             Self::ClaudeCode => &["update"],
             Self::GrokBuild => &["update"],
+            Self::Devin => &["update"],
+            Self::Opencode => &["upgrade"],
         }
     }
 }
@@ -142,13 +152,15 @@ impl CliManager {
         if let Some(cached) = self.cached_versions().await {
             return self.with_active_operation(cached).await;
         }
-        let (codex, pi, claude, grok) = tokio::join!(
+        let (codex, pi, claude, grok, devin, opencode) = tokio::join!(
             inspect_cli(config, ManagedCli::Codex),
             inspect_cli(config, ManagedCli::Pi),
             inspect_cli(config, ManagedCli::ClaudeCode),
             inspect_cli(config, ManagedCli::GrokBuild),
+            inspect_cli(config, ManagedCli::Devin),
+            inspect_cli(config, ManagedCli::Opencode),
         );
-        let mut clis = vec![codex, pi, claude, grok];
+        let mut clis = vec![codex, pi, claude, grok, devin, opencode];
         clis.extend(config.agent.acp_profiles.keys().map(|name| CliVersionInfo {
             id: format!("acp:{name}"),
             name: name.clone(),
@@ -359,6 +371,11 @@ async fn current_version(
 }
 
 async fn latest_version(config: &Config, provider: ManagedCli) -> Result<Option<String>, AppError> {
+    // Devin CLI exposes no read-only latest-version check; `devin update`
+    // performs the check and install together.
+    if provider == ManagedCli::Devin {
+        return Ok(None);
+    }
     if provider == ManagedCli::GrokBuild {
         let output = run_command(
             provider.binary(config),
@@ -390,7 +407,11 @@ async fn latest_version(config: &Config, provider: ManagedCli) -> Result<Option<
             "https://registry.npmjs.org/@anthropic-ai%2fclaude-code/latest",
             "version",
         ),
-        ManagedCli::GrokBuild => unreachable!(),
+        ManagedCli::Opencode => (
+            "https://api.github.com/repos/anomalyco/opencode/releases/latest",
+            "tag_name",
+        ),
+        ManagedCli::GrokBuild | ManagedCli::Devin => unreachable!(),
     };
     let response = client
         .get(url)

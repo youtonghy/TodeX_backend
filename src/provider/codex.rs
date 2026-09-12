@@ -361,6 +361,8 @@ impl ProviderDriver for CodexDriver {
                 source_info: None,
                 invocation: "desktop".to_owned(),
                 argument_hint: None,
+                package_name: None,
+                package_version: None,
             })
             .collect())
     }

@@ -33,7 +33,7 @@ cd TodeX_app && pnpm start
 - Rust 工具链
 - `cargo`
 - 至少安装要使用的 Provider CLI，并放在 `PATH` 中或通过对应环境变量指定路径
-- Codex、Pi、Claude Code 和 Grok Build 使用 daemon 所属系统用户的原生配置与登录状态
+- Codex、Pi、Claude Code、Grok Build 和 OpenCode 使用 daemon 所属系统用户的原生配置与登录状态；Devin 的 `devin acp` 自身不读本地登录态，TodeX 默认回退读取 `devin auth login` 写入的凭据，见下文认证说明
 
 建议先检查版本：
 
@@ -44,6 +44,8 @@ codex --version
 pi --version
 claude --version
 grok --version
+devin --version
+opencode --version
 ```
 
 ## 配置方式
@@ -69,6 +71,13 @@ grok --version
 | `TODEX_AGENTD_GROK_BIN` | `grok` 命令路径 |
 | `TODEX_AGENTD_GROK_AUTH_METHOD` | 可选的非交互认证方法 |
 | `TODEX_AGENTD_GROK_ENV_ALLOWLIST` | 允许传给 Grok 的逗号分隔环境变量名 |
+| `TODEX_AGENTD_DEVIN_BIN` | `devin` 命令路径 |
+| `TODEX_AGENTD_DEVIN_AUTH_METHOD` | 可选的 Devin ACP 认证方法 ID |
+| `TODEX_AGENTD_DEVIN_API_KEY_ENV` | 保存 Devin API key 的环境变量名（只存名称） |
+| `TODEX_AGENTD_DEVIN_CLI_CREDENTIALS` | 设为 `false` 时禁止回退读取 `devin auth login` 凭据（默认允许） |
+| `TODEX_AGENTD_DEVIN_ENV_ALLOWLIST` | 允许传给 Devin 的逗号分隔环境变量名 |
+| `TODEX_AGENTD_OPENCODE_BIN` | `opencode` 命令路径 |
+| `TODEX_AGENTD_OPENCODE_ENV_ALLOWLIST` | 允许传给 OpenCode 的逗号分隔环境变量名 |
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
@@ -92,10 +101,18 @@ pi_bin = "pi"
 grok_bin = "grok"
 grok_auth_method = "cached_token"
 grok_env_allowlist = ["GROK_HOME", "GROK_CONFIG", "GROK_CONFIG_PATH", "XAI_API_KEY"]
+devin_bin = "devin"
+# devin_auth_method = "devin-browser"
+# devin_api_key_env = "DEVIN_API_KEY"   # 无头认证：daemon 读取该环境变量并作为 ACP _meta.api_key 发送
+devin_env_allowlist = ["DEVIN_API_KEY", "DEVIN_MODEL", "WINDSURF_API_KEY"]
+opencode_bin = "opencode"
+opencode_env_allowlist = ["OPENCODE_CONFIG", "OPENCODE_API_KEY", "OPENCODE_PERMISSION"]
 
 [agent.acp_profiles.example]
 command = "example-acp-agent"
 args = []
+# auth_method = "some-auth-id"         # 需要认证的 ACP profile：initialize 声明的方法 ID
+# api_key_env = "EXAMPLE_API_KEY"      # 保存 API key 的环境变量名，经 ACP _meta.api_key 发送
 
 [security]
 enable_auth = true
@@ -113,6 +130,10 @@ language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
 TUI 默认不捕获鼠标，终端中的文本可以直接拖选复制。按 `c` 打开“凭据与复制”，可完整查看并复制 Auth Token 与当前加密方式的公钥；私钥不会显示或复制。日志使用 `PageUp`、`PageDown`、`Home`、`End` 滚动。daemon 启动会先检查端口占用，并等待最多 30 秒完成核心初始化和监听；旧 Codex 会话随后在后台迁移，不阻塞 daemon 就绪。
 
 Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径、用户目录、locale、代理和 SSH agent 等运行环境。ACP profile 中的 `env` 会显式传入，但名称以 `TODEX_AGENTD_` 开头的变量会被拒绝。Codex、Pi、Claude Code 和 Grok Build 因此应优先使用各自保存在用户目录中的原生登录配置。Grok Build 通过 `grok --no-auto-update agent --no-leader stdio` 启动；仅 `grok_env_allowlist` 中名称合法的变量会额外传入。首次运行前使用 daemon 用户执行 `grok login`，或在白名单中保留 `XAI_API_KEY`。Pi 始终使用 RPC `--approve`：工作区通过 TodeX 信任门禁后，Pi 的工具和项目资源按 daemon 用户权限全自动运行。Pi 没有通用逐工具审批，也没有 OS sandbox；`permissions` capability 因此保持 `false`。
+
+Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。`devin acp` 自身有意不读取本地 `devin auth login` 登录态（官方理由是避免用量归属到错误账号），daemon 会在每个 ACP 进程启动时执行 `authenticate`，按以下顺序解析 API key 并以 `_meta.api_key` 无头发送（不写入日志）：先读 `devin_api_key_env`（例如 `"DEVIN_API_KEY"`）指向的 daemon 环境变量，再默认回退读取 `devin auth login` 写入的 `~/.local/share/devin/credentials.toml` 中的 `windsurf_api_key`——因此已登录的 CLI 开箱即用；将 `TODEX_AGENTD_DEVIN_CLI_CREDENTIALS` 设为 `false` 可禁用该回退。两者都不可用时按上游声明的 `devin-browser` 方法执行一次浏览器授权，daemon 最多等待 5 分钟供用户完成批准。
+
+OpenCode 通过 `opencode acp` 接入，每个对话对应一个常驻 ACP 进程（空闲 300 秒回收，上限 32 个）。与 Devin 不同，`opencode acp` 直接读取 `opencode auth login` 保存的本地凭据，其 `opencode-login` authMethod 仅是指向该终端命令的说明，daemon 不发送 ACP `authenticate`；首次使用前用 daemon 用户执行一次 `opencode auth login` 即可。权限模式支持 `ask`/`auto`/`full-access`：`ask` 把每个 `session/request_permission` 转交用户逐条决定；`auto` 自动选 `allow_once`，`full-access` 优先 `allow_always`，自动批准写入 `permission.resolved`（`autoApproved: true`）事件留痕。OpenCode 原生 `permission` 配置（`opencode.json` 或白名单转发的 `OPENCODE_PERMISSION`）仍先生效。plan 工作模式经 `configOptions.mode` 映射为 `plan`/`build`。模型目录与 slash 命令来自真实 ACP 会话探测（探测会话随后 `session/close`）；模型以 `provider/model` 形式选择并支持会话内切换；reasoning effort 经 `configOptions.effort` 下发，仅当所选模型有 variant 时可用，模型探测会逐个读取各模型的 `supportedReasoningEfforts`。恢复对话优先用 `session/resume`（不回放历史），会话分叉走 `session/fork`。默认环境白名单转发 `OPENCODE_CONFIG*`、`OPENCODE_AUTH_CONTENT`、`OPENCODE_API_KEY` 等 `OPENCODE_*` 变量；进程固定注入 `OPENCODE_DISABLE_AUTOUPDATE=1`，自升级走 `POST /v2/providers/opencode/upgrade`（`opencode upgrade`）。
 
 ## Conversation 数据目录
 
@@ -165,7 +186,7 @@ cargo clippy
 以下命令检查 Codex/Pi 二进制、版本、现有登录、RPC 初始化、模型和命令发现，不发送 prompt，也不会消耗模型推理额度：
 
 ```bash
-cargo run -- doctor providers --provider codex,pi --format json
+cargo run -- doctor providers --provider codex,pi,opencode --format json
 ```
 
 报告中的 `success` 只有在所请求 provider 的全部阶段通过时才为 `true`。命令不会自动登录，也不会输出 credential 或原始 provider payload。

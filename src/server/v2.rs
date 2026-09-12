@@ -71,6 +71,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.cancel"
             | "conversation.interrupt"
             | "conversation.stop"
+            | "conversation.runtime.stop"
             | "conversation.permission.respond"
             | "mcp.list"
             | "mcp.refresh"
@@ -110,7 +111,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v2/git/scan", get(git_scan))
         .route("/v2/git/run", post(git_run))
         .route("/v2/git/workspace", get(git_workspace))
+        .route("/v2/git/pull-request", get(git_pull_request))
         .route("/v2/git/status", get(git_status))
+        .route("/v2/git/diff", get(git_diff))
         .route("/v2/git/operation", post(git_operation))
         .route("/v2/browser/fetch", post(browser_fetch))
         .route("/v2/providers", get(providers))
@@ -126,6 +129,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v2/providers/models", get(provider_models))
         .route("/v2/providers/image-input", get(provider_image_input))
         .route("/v2/providers/commands", get(provider_commands))
+        .route(
+            "/v2/conversations/{conversation_id}/runtime/stop",
+            post(stop_provider_runtime),
+        )
         .route("/v2/catalog/skills", get(skills))
         .route("/v2/catalog/skills/{resource_id}", get(skill_resource))
         .route("/v2/catalog/mcp", get(mcp))
@@ -433,16 +440,19 @@ pub(super) async fn workspace_file(
     }
     let data_url =
         is_image.then(|| format!("data:{mime_type};base64,{}", BASE64_STANDARD.encode(&bytes)));
-    let text = if mime_type.starts_with("text/") || mime_type == "application/json" {
-        Some(String::from_utf8_lossy(&bytes).to_string())
-    } else {
+    let size_bytes = bytes.len() as u64;
+    // Preview any UTF-8 decodable file as text so source files outside the
+    // MIME whitelist (Swift, Kotlin, extension-less scripts, ...) still render.
+    let text = if is_image {
         None
+    } else {
+        String::from_utf8(bytes).ok()
     };
     Ok(Json(WorkspaceFileResponse {
         name,
         path: path.display().to_string(),
         mime_type,
-        size_bytes: bytes.len() as u64,
+        size_bytes,
         text,
         data_url,
     }))
@@ -647,6 +657,54 @@ pub(super) async fn git_workspace(
         &state,
         &auth,
         "workspace",
+        &workspace,
+        None,
+        if result.is_ok() { "allow" } else { "deny" },
+        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
+        None,
+        None,
+    )
+    .await;
+    combine_git_result(result.map(Json), audit)
+}
+
+pub(super) async fn git_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<super::protocol::GitDiffQuery>,
+) -> Result<Json<super::protocol::GitDiffResponse>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace_path)?;
+    let result = git::diff::file(&state.config.workspace_root, &workspace, &query.path).await;
+    let audit = append_git_audit(
+        &state,
+        &auth,
+        "diff",
+        &workspace,
+        None,
+        if result.is_ok() { "allow" } else { "deny" },
+        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
+        None,
+        None,
+    )
+    .await;
+    combine_git_result(result.map(Json), audit)
+}
+
+pub(super) async fn git_pull_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<super::protocol::GitScanQuery>,
+) -> Result<Json<super::protocol::GitPullRequestResponse>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace_path)?;
+    let result = git::pull_request::summary(&state.config.workspace_root, &workspace).await;
+    let audit = append_git_audit(
+        &state,
+        &auth,
+        "pull-request",
         &workspace,
         None,
         if result.is_ok() { "allow" } else { "deny" },
@@ -1172,6 +1230,7 @@ async fn providers(
             let control_probe = state.conversations.control_probe(&provider_id);
             let live_controls = state.conversations.supports_live_controls(&provider_id);
             let native_queue = state.conversations.supports_native_queue(&provider_id);
+            let runtime_stop = state.conversations.supports_runtime_stop(&provider_id);
             let capabilities = provider
                 .get("capabilities")
                 .cloned()
@@ -1220,6 +1279,25 @@ async fn providers(
                     capabilities.insert("steering".to_owned(), json!(live_controls));
                     capabilities.insert("liveConfiguration".to_owned(), json!(live_controls));
                     capabilities.insert("followUpQueue".to_owned(), json!(native_queue));
+                    if runtime_stop {
+                        capabilities.insert("runtimeStop".to_owned(), json!(true));
+                        capabilities.insert("sessionCommands".to_owned(), json!(true));
+                        capabilities.insert("extensionMessages".to_owned(), json!(true));
+                        capabilities.insert(
+                            "extensionUi".to_owned(),
+                            json!([
+                                "select",
+                                "confirm",
+                                "input",
+                                "editor",
+                                "notify",
+                                "setStatus",
+                                "setWidget",
+                                "setTitle",
+                                "set_editor_text"
+                            ]),
+                        );
+                    }
                 }
             }
         }
@@ -1417,6 +1495,14 @@ struct ProviderModelsQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ProviderCommandsQuery {
+    provider: Option<ProviderKind>,
+    workspace: Option<String>,
+    conversation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProviderImageInputQuery {
     provider: ProviderKind,
     workspace: String,
@@ -1466,21 +1552,50 @@ async fn provider_models(
 async fn provider_commands(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ProviderModelsQuery>,
+    Query(query): Query<ProviderCommandsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
+    if let Some(conversation_id) = query.conversation_id {
+        // The authorized manifest is the sole authority for provider/workspace.
+        let catalog = state
+            .conversations
+            .conversation_commands_owned(&auth.tenant_id, &conversation_id)
+            .await?;
+        return Ok(Json(catalog));
+    }
+    let provider = query.provider.ok_or_else(|| {
+        AppError::InvalidRequest("provider is required without conversationId".to_owned())
+    })?;
+    let workspace_text = query.workspace.ok_or_else(|| {
+        AppError::InvalidRequest("workspace is required without conversationId".to_owned())
+    })?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace)?;
+        validate_workspace_directory_text(&state.config.workspace_root, &workspace_text)?;
     let commands = state
         .conversations
-        .commands_live(&auth.tenant_id, query.provider, &workspace)
+        .commands_live(&auth.tenant_id, provider, &workspace)
         .await?;
     Ok(Json(json!({
-        "provider": query.provider,
+        "provider": provider,
         "commands": commands,
         "source": "provider-discovery",
+        "catalogSource": "discovery",
         "fetchedAt": chrono::Utc::now().to_rfc3339(),
     })))
+}
+
+async fn stop_provider_runtime(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(conversation_id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    Ok(Json(
+        state
+            .conversations
+            .stop_runtime_owned(&auth.tenant_id, &conversation_id)
+            .await?,
+    ))
 }
 
 async fn list_conversations(
@@ -2045,7 +2160,7 @@ async fn dispatch_command_inner(
                     replay_cursor = event.sequence;
                     advanced = true;
                     outgoing
-                        .send(json!({ "type": "conversation.event", "payload": event }))
+                        .send(json!({ "type": "conversation.event", "delivery": "replay", "payload": event }))
                         .await
                         .map_err(|_| AppError::StreamClosed)?;
                 }
@@ -2079,7 +2194,7 @@ async fn dispatch_command_inner(
                                             if missing.sequence != delivered_through + 1 {
                                                 return Err(AppError::Conflict("Conversation replay contains a sequence gap".to_owned()));
                                             }
-                                            outgoing.send(json!({ "type": "conversation.event", "payload": missing })).await.map_err(|_| AppError::StreamClosed)?;
+                                            outgoing.send(json!({ "type": "conversation.event", "delivery": "replay", "payload": missing })).await.map_err(|_| AppError::StreamClosed)?;
                                             delivered_through = missing.sequence;
                                         }
                                         if previous == delivered_through { return Err(AppError::Conflict("Conversation sequence gap could not be recovered".to_owned())); }
@@ -2093,7 +2208,7 @@ async fn dispatch_command_inner(
                             }
                             delivered_through = event.sequence;
                             if outgoing
-                                .send(json!({ "type": "conversation.event", "payload": event }))
+                                .send(json!({ "type": "conversation.event", "delivery": "live", "payload": event }))
                                 .await
                                 .is_err()
                             {
@@ -2138,6 +2253,7 @@ async fn dispatch_command_inner(
                                         outgoing
                                             .send(json!({
                                                 "type": "conversation.event",
+                                                "delivery": "replay",
                                                 "payload": event,
                                             }))
                                             .await
@@ -2267,6 +2383,13 @@ async fn dispatch_command_inner(
                 .cancel_owned(owner_id, &request.conversation_id)
                 .await?;
             Ok(json!({ "conversationId": request.conversation_id, "accepted": true }))
+        }
+        "conversation.runtime.stop" => {
+            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            state
+                .conversations
+                .stop_runtime_owned(owner_id, &request.conversation_id)
+                .await
         }
         "conversation.permission.respond" => {
             let request: WsPermissionRequest = serde_json::from_value(command.payload.clone())?;
@@ -2821,6 +2944,12 @@ mod tests {
                 grok_bin: executable,
                 grok_auth_method: None,
                 grok_env_allowlist: vec![],
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -3046,6 +3175,12 @@ mod tests {
                 grok_bin: executable,
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -3056,7 +3191,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let app = crate::server::router(state);
+        let app = crate::server::router(state.clone());
 
         let unauthenticated = app
             .clone()
@@ -3115,10 +3250,25 @@ mod tests {
             let id = provider["id"].as_str().unwrap();
             assert_eq!(
                 actions.iter().any(|value| value == "fork"),
-                matches!(id, "grok-build" | "pi")
+                matches!(id, "grok-build" | "pi" | "opencode")
             );
             assert_eq!(actions.iter().any(|value| value == "compact"), id == "pi");
         }
+
+        let pi_capabilities = &providers_json["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "pi")
+            .unwrap()["capabilities"];
+        assert_eq!(pi_capabilities["runtimeStop"], true);
+        assert_eq!(pi_capabilities["sessionCommands"], true);
+        assert_eq!(pi_capabilities["extensionMessages"], true);
+        assert!(pi_capabilities["extensionUi"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method == "set_editor_text"));
 
         let create = app
             .clone()
@@ -3145,6 +3295,81 @@ mod tests {
             serde_json::from_slice(&to_bytes(create.into_body(), 1024 * 1024).await.unwrap())
                 .unwrap();
         assert_eq!(created.owner_id, "local");
+        state
+            .workspace_trust
+            .set_owned("local", &created.workspace, true)
+            .await
+            .unwrap();
+        let commands = app.clone().oneshot(Request::builder()
+            .uri(format!("/v2/providers/commands?conversationId={}&provider=pi&workspace=/untrusted-spoof", created.id))
+            .header("authorization", "Bearer v2-token").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(commands.status(), StatusCode::OK);
+        let catalog: Value =
+            serde_json::from_slice(&to_bytes(commands.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(catalog["provider"], "codex");
+        assert_eq!(catalog["conversationId"], created.id);
+        assert_eq!(catalog["catalogSource"], "discovery");
+        assert!(!catalog["commands"].as_array().unwrap().is_empty());
+        let foreign = state
+            .conversations
+            .create_owned(
+                "other-owner",
+                ProviderKind::Pi,
+                created.workspace.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for (method, uri) in [
+            (
+                "GET",
+                format!("/v2/providers/commands?conversationId={}", foreign.id),
+            ),
+            (
+                "POST",
+                format!("/v2/conversations/{}/runtime/stop", foreign.id),
+            ),
+        ] {
+            let denied = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("authorization", "Bearer v2-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        }
+        let pi = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::Pi,
+                created.workspace.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let stopped = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v2/conversations/{}/runtime/stop", pi.id))
+                    .header("authorization", "Bearer v2-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.status(), StatusCode::OK);
 
         let replay = app
             .oneshot(
@@ -3186,6 +3411,12 @@ mod tests {
                 grok_bin: executable,
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -3255,6 +3486,7 @@ mod tests {
         let mut sequences = Vec::new();
         for _ in 0..4 {
             let event = events.recv().await.expect("replayed conversation event");
+            assert_eq!(event["delivery"], "replay");
             sequences.push(event["payload"]["sequence"].as_u64().unwrap());
         }
         assert_eq!(sequences, vec![1, 2, 3, 4]);
@@ -3302,6 +3534,7 @@ mod tests {
             .expect("future-cursor subscription should receive a live event")
             .expect("future-cursor subscription channel should remain open");
         assert_eq!(received["payload"]["sequence"], 5);
+        assert_eq!(received["delivery"], "live");
         // A late publisher must not make a persisted predecessor disappear.
         let sixth = store
             .append(&manifest.id, "fixture.live", json!({}))
@@ -3319,6 +3552,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(received["payload"]["sequence"], expected);
+            assert_eq!(
+                received["delivery"],
+                if expected == 6 { "replay" } else { "live" }
+            );
         }
         for task in future_tasks {
             task.abort();
@@ -3439,6 +3676,12 @@ mod tests {
                 grok_bin: executable,
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -3733,6 +3976,35 @@ mod tests {
             .unwrap();
         assert_eq!(oversized_text.status(), StatusCode::BAD_REQUEST);
 
+        // Source files whose extension is not in the MIME whitelist still
+        // preview as text, while non-UTF-8 payloads stay unpreviewable.
+        let swift = workspace.join("Package.swift");
+        fs::write(&swift, "// swift-tools-version: 6.0\n").unwrap();
+        let swift_response = app
+            .clone()
+            .oneshot(preview_request(&swift, true))
+            .await
+            .unwrap();
+        assert_eq!(swift_response.status(), StatusCode::OK);
+        let swift_body = to_bytes(swift_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let swift_json: serde_json::Value = serde_json::from_slice(&swift_body).unwrap();
+        assert_eq!(swift_json["text"], "// swift-tools-version: 6.0\n");
+        let binary = workspace.join("preview.bin");
+        fs::write(&binary, [0x00u8, 0x9f, 0x92, 0x96, 0xff]).unwrap();
+        let binary_response = app
+            .clone()
+            .oneshot(preview_request(&binary, true))
+            .await
+            .unwrap();
+        assert_eq!(binary_response.status(), StatusCode::OK);
+        let binary_body = to_bytes(binary_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let binary_json: serde_json::Value = serde_json::from_slice(&binary_body).unwrap();
+        assert!(binary_json["text"].is_null());
+
         let save_request = |path: &Path, text: &str, expected: &str, authenticated: bool| {
             let mut builder = Request::builder()
                 .method("PUT")
@@ -4013,6 +4285,12 @@ mod tests {
                 grok_bin: executable,
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -4310,6 +4588,12 @@ mod tests {
                 grok_bin: executable,
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -4382,6 +4666,12 @@ mod tests {
                 grok_bin: executable,
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -4514,6 +4804,12 @@ mod tests {
                 grok_bin: executable,
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {

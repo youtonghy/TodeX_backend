@@ -16,15 +16,19 @@ pub enum ProviderKind {
     Pi,
     ClaudeCode,
     GrokBuild,
+    Devin,
+    Opencode,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Acp,
         Self::Codex,
         Self::Pi,
         Self::ClaudeCode,
         Self::GrokBuild,
+        Self::Devin,
+        Self::Opencode,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -34,13 +38,20 @@ impl ProviderKind {
             Self::Pi => "pi",
             Self::ClaudeCode => "claude-code",
             Self::GrokBuild => "grok-build",
+            Self::Devin => "devin",
+            Self::Opencode => "opencode",
         }
     }
 
     pub const fn supports_image_input(self) -> bool {
         matches!(
             self,
-            Self::Codex | Self::Pi | Self::ClaudeCode | Self::GrokBuild
+            Self::Codex
+                | Self::Pi
+                | Self::ClaudeCode
+                | Self::GrokBuild
+                | Self::Devin
+                | Self::Opencode
         )
     }
 }
@@ -55,6 +66,8 @@ impl std::str::FromStr for ProviderKind {
             "pi" => Ok(Self::Pi),
             "claude" | "claude-code" | "claude_code" => Ok(Self::ClaudeCode),
             "grok" | "grok-build" | "grok_build" => Ok(Self::GrokBuild),
+            "devin" | "devin-cli" | "devin_cli" => Ok(Self::Devin),
+            "opencode" | "open-code" | "open_code" => Ok(Self::Opencode),
             other => Err(format!("unsupported provider: {other}")),
         }
     }
@@ -287,6 +300,16 @@ pub fn status_after_conversation_event(
     current: ConversationStatus,
     event: &ConversationEvent,
 ) -> ConversationStatus {
+    // Extension dialogs can outlive a turn or arrive while the provider is
+    // otherwise idle. They are actionable UI, not a new model execution.
+    if event.payload.get("scope").and_then(Value::as_str) == Some("session")
+        && matches!(
+            event.event_type.as_str(),
+            "permission.requested" | "tool.awaitingApproval" | "permission.resolved"
+        )
+    {
+        return current;
+    }
     if event
         .payload
         .get("operationId")

@@ -43,6 +43,13 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 | Grok Build 可执行文件 | 无 | `TODEX_AGENTD_GROK_BIN` | `grok` |
 | Grok Build 认证方法 | 无 | `TODEX_AGENTD_GROK_AUTH_METHOD` | 上游默认方法 |
 | Grok Build 环境白名单 | 无 | `TODEX_AGENTD_GROK_ENV_ALLOWLIST` | Grok 配置变量与 `XAI_API_KEY` |
+| Devin 可执行文件 | 无 | `TODEX_AGENTD_DEVIN_BIN` | `devin` |
+| Devin 认证方法 | 无 | `TODEX_AGENTD_DEVIN_AUTH_METHOD` | 上游默认方法 |
+| Devin API key 环境变量 | 无 | `TODEX_AGENTD_DEVIN_API_KEY_ENV` | 无（回退到 CLI 登录凭据） |
+| Devin CLI 凭据回退 | 无 | `TODEX_AGENTD_DEVIN_CLI_CREDENTIALS` | `true` |
+| Devin 环境白名单 | 无 | `TODEX_AGENTD_DEVIN_ENV_ALLOWLIST` | `DEVIN_API_KEY`、`DEVIN_MODEL`、`WINDSURF_API_KEY` 等 |
+| OpenCode 可执行文件 | 无 | `TODEX_AGENTD_OPENCODE_BIN` | `opencode` |
+| OpenCode 环境白名单 | 无 | `TODEX_AGENTD_OPENCODE_ENV_ALLOWLIST` | `OPENCODE_CONFIG*`、`OPENCODE_AUTH_CONTENT`、`OPENCODE_API_KEY` 等 |
 | 默认 agent 名称 | 无 | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` |
 | 是否开启认证 | 无 | `TODEX_AGENTD_ENABLE_AUTH` | `true` |
 | Bearer token | 无 | `TODEX_AGENTD_AUTH_TOKEN` | 无 |
@@ -54,9 +61,13 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 
 ## v2 Conversation API
 
-Provider 标识为 `acp`、`codex`、`pi`、`claude-code`、`grok-build`（创建请求也接受 `grok` 与 `grok_build` 别名）。未指定时使用 `[agent].default_agent`，默认是 `codex`。ACP 必须使用后端 `config.toml` 中预配置的 `providerProfile`；客户端不能提交任意 command、args 或 env。
+Provider 标识为 `acp`、`codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode`（创建请求也接受 `grok` / `grok_build`、`devin-cli` / `devin_cli` 与 `open-code` / `open_code` 别名）。未指定时使用 `[agent].default_agent`，默认是 `codex`。ACP 必须使用后端 `config.toml` 中预配置的 `providerProfile`；客户端不能提交任意 command、args 或 env。
 
 Provider 子进程只继承运行所需的基础系统环境；ACP 额外使用管理员在 profile 中明确配置的 env。Codex、Pi、Claude Code 和 Grok Build 应先由运行 daemon 的同一系统用户完成原生登录。Grok Build 也可通过白名单传入 `XAI_API_KEY`；daemon 不会启动浏览器/OIDC 交互认证。Grok 的工具授权、提问、计划审批和 MCP elicitation 会转换为 TodeX `permission.requested`，客户端按服务器提供的 `optionId` 和 `kind` 回复。Pi 只有全自动执行模式：工作区获得 TodeX 信任后以 `--approve` 启动，工具与项目扩展按 daemon 用户权限运行。Pi 没有通用逐工具审批或 OS sandbox，因此 `permissions` capability 为 `false`；extension UI 请求仍可转成交互事件，但不能把它等同于工具授权。
+
+Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。`devin acp` 自身有意不读取本地 CLI 登录态，daemon 会在每个 ACP 进程启动时执行 `authenticate`：优先以 `devin_api_key_env` 指定的环境变量值作为 `_meta.api_key` 无头认证（不会写入日志），未配置时默认回退读取 `devin auth login` 写入的 `~/.local/share/devin/credentials.toml` 中的 `windsurf_api_key`（`TODEX_AGENTD_DEVIN_CLI_CREDENTIALS=false` 可禁用），再否则按其声明的 `devin-browser` 方法走一次浏览器授权。权限模式映射到 Devin 原生会话模式：`ask`→`ask`、`auto`→`accept-edits`、`full-access`→`bypass`，plan 工作模式→`plan`；其中 `ask` 在 Devin 语义下是只读问答，比其它 provider 的“先询问再执行”更严格。模型目录与 slash 命令通过真实 ACP 会话探测（探测会话随后调用 `session/delete` 清理，结果按工作区缓存约 5 分钟，避免客户端刷新反复触发认证）。Devin 支持会话内切换模型（`configure` live control），不支持独立的 reasoning effort——档位编码在模型 ID（如 `claude-opus-5-low`/`-fast`）中。
+
+OpenCode 通过 `opencode acp` 接入，每个对话对应一个常驻 ACP 进程（空闲 300 秒回收，daemon 级上限 32 个）。OpenCode 自己管理登录态（`opencode auth login` 写入其本地凭据存储），其声明的 `opencode-login` authMethod 仅指向该终端流程，daemon 因此不发送 ACP `authenticate`；未登录时模型调用错误原样上浮。权限模式提供 `ask`/`auto`/`full-access`：`ask` 把每个 `session/request_permission` 转成 TodeX `permission.requested` 逐条询问；`auto`/`full-access` 由 daemon 客户端侧自动应答（`auto` 选 `allow_once`，`full-access` 优先 `allow_always` 让 OpenCode 记住授权），自动批准同样记录 `permission.requested`/`permission.resolved`（`autoApproved: true`）事件。OpenCode 侧 `opencode.json` 中的 `permission` 配置（或白名单转发的 `OPENCODE_PERMISSION`）可让其原生策略先行放行。plan 工作模式经 `configOptions.mode` 映射到原生 `plan`，implement 显式重置为 `build`，避免上一轮 plan 残留。模型经 `configOptions.model` 选择（`provider/model` 形式），会话内支持 `configure` live control 切换；reasoning effort 经 `configOptions.effort` 下发——OpenCode 只在当前模型有 variant 时暴露该选项，模型目录探测会逐个模型读取其 `supportedReasoningEfforts`。OpenCode 声明 `loadSession` 与 `sessionCapabilities.resume`/`fork`，daemon 恢复对话时优先使用不重放历史的 `session/resume`（不支持时回退 `session/load`），会话分叉经 `session/fork` 完成；`session/list` 暂无消费方，未接入。Usage 来自 `usage_update`（`used`/`size`/`cost`）与 prompt 响应 `result.usage`（含 `cachedReadTokens`）。模型目录与 slash 命令（`available_commands_update`）通过真实 ACP 会话探测，探测会话随后调用 `session/close` 清理。OpenCode 的 skills 目录（`.opencode/skills`、`~/.config/opencode/skills`）进入 catalog；MCP 由 OpenCode 自己的 `opencode.json` 管理，不参与 TodeX catalog 解析。
 
 ```http
 GET /v2/providers
@@ -64,6 +75,7 @@ GET /v2/providers/versions
 POST /v2/providers/{provider}/upgrade
 GET /v2/providers/upgrades/{operationId}
 GET /v2/providers/models?provider=codex&workspace=/home/user/projects/demo
+GET /v2/providers/commands?conversationId={conversationId}
 GET /v2/conversations
 POST /v2/conversations
 GET /v2/conversations/{conversationId}
@@ -72,6 +84,7 @@ DELETE /v2/conversations/{conversationId}
 GET /v2/conversations/{conversationId}/events?afterSequence=0&limit=200
 POST /v2/conversations/{conversationId}/prompt
 POST /v2/conversations/{conversationId}/cancel
+POST /v2/conversations/{conversationId}/runtime/stop
 POST /v2/conversations/{conversationId}/permissions/{permissionId}
 ```
 
@@ -79,9 +92,9 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 `/v2/providers/models` 会实时向指定 Agent 查询模型目录，返回 `source` 与 `fetchedAt`。每个模型包含 `supportedReasoningEfforts`，并可通过 `defaultReasoningEffort` 声明后端当前默认强度。Codex 使用 app-server `model/list`，Pi 使用 RPC `get_available_models` 与 `get_state`，Claude Code 在配置了 `ANTHROPIC_BASE_URL` 时读取 `/v1/models`，Grok Build 从 ACP initialize 的原生模型状态读取。查询失败时客户端应保留上一次成功目录，并展示可恢复错误。
 
-`GET /v2/providers/versions` 在 daemon 所在主机读取配置的四个内建 CLI，并从各自官方发布源查询最新版；结果会短时缓存，单个查询失败不会隐藏其他 CLI。ACP profile 作为外部管理项列出，不执行任意 profile 命令，也不提供升级。`POST /v2/providers/{provider}/upgrade` 仅接受 `codex`、`pi`、`claude-code`、`grok-build` 固定标识，返回异步 operation；客户端使用 operation 查询接口轮询。升级命令不经过 shell、不读取工作区，并在升级后重新调用同一个配置 binary 验证版本。任一 Agent turn、本地 Codex adapter、Provider 发现或另一升级正在启动/运行时会返回 `409 CONFLICT`；升级中的版本查询只返回已有缓存，不会再启动 CLI。CLI 升级在 loopback 部署中也必须配置并提交 Bearer token，以免网页通过跨域请求改变宿主机工具链；已认证的尝试及最终结果会写入审计日志，初始审计记录无法落盘时不会启动升级。
+`GET /v2/providers/versions` 在 daemon 所在主机读取配置的六个内建 CLI，并从各自官方发布源查询最新版（OpenCode 查询 GitHub `anomalyco/opencode` 最新 release tag）；Devin 没有只读的最新版本检查接口，`latestVersion` 会保持为空。结果会短时缓存，单个查询失败不会隐藏其他 CLI。ACP profile 作为外部管理项列出，不执行任意 profile 命令，也不提供升级。`POST /v2/providers/{provider}/upgrade` 仅接受 `codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode` 固定标识（OpenCode 执行 `opencode upgrade`），返回异步 operation；客户端使用 operation 查询接口轮询。升级命令不经过 shell、不读取工作区，并在升级后重新调用同一个配置 binary 验证版本。任一 Agent turn、本地 Codex adapter、Provider 发现或另一升级正在启动/运行时会返回 `409 CONFLICT`；升级中的版本查询只返回已有缓存，不会再启动 CLI。CLI 升级在 loopback 部署中也必须配置并提交 Bearer token，以免网页通过跨域请求改变宿主机工具链；已认证的尝试及最终结果会写入审计日志，初始审计记录无法落盘时不会启动升级。
 
-`GET /v2/providers/commands?provider=pi&workspace=/path` 会实时读取 Agent 命令目录。Pi 使用 RPC `get_commands` 返回扩展、Prompt Template 和 Skill；响应失败会作为 Provider 错误返回，成功结果中的 `sourceInfo` 会原样保留。Codex 返回与本机 CLI 版本同步的 TUI 命令适配目录。命令描述包含 `invocation`，客户端应据此选择原生 RPC、桌面动作或 Provider prompt，不要把所有 `/` 输入都当作普通 prompt。
+`GET /v2/providers/commands?provider=pi&workspace=/path` 会实时读取 Agent 命令目录。Pi 使用 RPC `get_commands` 返回扩展、Prompt Template 和 Skill；响应失败会作为 Provider 错误返回，成功结果中的 `sourceInfo` 会原样保留。Codex 返回与本机 CLI 版本同步的 TUI 命令适配目录。命令描述包含 `invocation`，客户端应据此选择原生 RPC、桌面动作或 Provider prompt，不要把所有 `/` 输入都当作普通 prompt。 已有会话应使用 `?conversationId=...`：后端先校验 owner，再从会话 manifest 确定 provider 与 workspace，忽略客户端同时提交的对应查询参数。Pi runtime 存在时由同一 worker 发送 `get_commands`，响应含 `catalogSource: "session"` 与 `runtimeId`；尚未启动时使用临时发现进程，返回 `catalogSource: "discovery"`。目录查询总时限为 8 秒。可验证的本地包会附带 `packageName` / `packageVersion`：版本取自实际资源附近的 `package.json`，显式加载的资源还会检查 manifest 的 Pi 入口；无法确认时省略，不从 npm spec 猜测。
 
 创建对话：
 
@@ -134,9 +147,21 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 }
 ```
 
-支持 `conversation.subscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。
+支持 `conversation.subscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
 
 MCP 真实调用只走 Backend：客户端只发送 `resourceId`、`toolName` 和对象类型的 `arguments`。Catalog JSON 不含 command、URL 或凭据。调用前必须通过权限 broker，默认拒绝；仅 `allow_once` / `allow_always` 会放行。Backend 使用标准 MCP SDK 连接 stdio JSONL 或 Streamable HTTP transport，并对初始化、调用和关闭分别设置时限。
+
+### Pi 扩展与常驻 runtime
+
+Pi 在回合之间持续读取 RPC stdout，支持后台通知、消息、工具进度、压缩与扩展表单。`provider.runtime` 事件包含 `provider`、`runtimeId`、`scope: "session"`、`status: "ready" | "stopped"`，停止时附带 `reason`。回合成功、纯扩展命令，以及经 `abort` ACK、清队列 ACK 和 idle 状态确认的取消均保留进程；协议失步会关闭进程，不自动重放输入。每个 daemon 最多保留 32 个 Pi runtime，达到上限后拒绝新建，已有会话不会被静默淘汰；没有自动 idle 过期。
+
+`conversation.runtime.stop` 的 payload 为 `{ "conversationId": "..." }`，与 HTTP `/runtime/stop` 等价，关闭 Pi 进程及待答表单，保留会话日志与原生 session 信息。`conversation.cancel` / `conversation.stop` 仅取消当前回合。撤销工作区信任、删除工作区或会话、会话过期与 daemon 关闭也会停止对应 runtime。daemon 重启时补记旧 runtime 的停止事件，并将未答表单标记为取消；session 表单不会把空闲会话改成运行中。
+
+Pi capability 额外声明 `runtimeStop`、`sessionCommands`、`extensionMessages` 与 `extensionUi` 方法列表。标准 RPC 扩展输入 `select`、`confirm`、`input`、`editor` 继续经 permission broker 回答；`permission.requested` / `permission.resolved` 带 `runtimeId` 与 `scope: "session" | "turn"`，请求 details 中也保留上下文。session 表单可跨越回合，回合取消只关闭 turn 表单。
+
+`extension.ui` 保留 Pi 标准字段，并附带 `provider`、`runtimeId` 和生命周期 `scope`：`notify` 使用 `message` / `notifyType`；`setStatus` 使用 `statusKey` / `statusText`；`setWidget` 使用 `widgetKey` / `widgetLines` / `widgetPlacement`；`setTitle` 使用 `title`；编辑器填充方法名为 `set_editor_text`，文本字段为 `text`。省略 `statusText` 或 `widgetLines` 表示清空。状态、widget、标题按键去重，并以 100 ms 合并高频更新，最终值与清空操作会保留；通知与编辑器填充直接交付。
+
+原生 custom message 以 `extension.message` 交付，包含独立 `messageId` 与完整 `message`（`customType`、`content`、`display`、可选 `details`、`timestamp`）。客户端尊重 `display: false`，并以普通文本安全显示可见内容。原生后台消息与工具不携带旧 `turnId`；usage 保留既有 `scope: "message"` 用于计费去重。`ui.custom` 等依赖终端渲染的自定义界面没有通用 RPC 表示，客户端不能宣称支持或自动回退执行。
 
 ### 只读 Skill/MCP Catalog
 
@@ -311,6 +336,14 @@ GET /v2/git/scan?workspacePath=/home/user/projects/demo
 ```
 
 没有 Git 仓库的 workspace 仍会返回一个 `initialEligible: true`、`branch: "UNINITIALIZED"` 的占位摘要。`files` 和用于未跟踪行数统计的路径各自最多处理 2,000 项；单个命令的 stdout/stderr 各自最多读取 4 MiB。扫描最多并发执行 2 个请求，排队超过 2 秒返回 `409 CONFLICT`，单个扫描请求总计超过 30 秒返回 `GIT_COMMAND_TIMED_OUT`。
+
+单个变更文件的统一 diff 通过只读接口获取：
+
+```http
+GET /v2/git/diff?workspacePath=/home/user/projects/demo&path=src/main.rs
+```
+
+`path` 为仓库相对路径，禁止绝对路径和 `..`。响应对照 `HEAD`（无首个提交时为空树）返回 `repositoryPath`、`path`、统一格式的 `diff` 文本与 `truncated`；未跟踪文件与 `/dev/null` 对比返回新增内容并标记 `untracked: true`，未变更的已跟踪文件返回空 `diff`。响应文本最多 1 MiB，超出时 `truncated` 为真。
 
 仓库变更只能通过固定动作执行，不能传递任意 Git 子命令或参数：
 

@@ -374,6 +374,8 @@ fn provider_user_skill_root(home: &Path, provider: ProviderKind) -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".grok"))
             .join("skills"),
+        ProviderKind::Devin => home.join(".config/devin/skills"),
+        ProviderKind::Opencode => home.join(".config/opencode/skills"),
     }
 }
 
@@ -384,6 +386,8 @@ fn provider_project_skill_root(workspace: &Path, provider: ProviderKind) -> Path
         ProviderKind::Pi => workspace.join(".pi/skills"),
         ProviderKind::ClaudeCode => workspace.join(".claude/skills"),
         ProviderKind::GrokBuild => workspace.join(".grok/skills"),
+        ProviderKind::Devin => workspace.join(".devin/skills"),
+        ProviderKind::Opencode => workspace.join(".opencode/skills"),
     }
 }
 
@@ -563,7 +567,10 @@ fn scan_mcp(
     workspace: &Path,
     provider: ProviderKind,
 ) -> Result<Vec<McpServerDescriptor>, AppError> {
-    if matches!(provider, ProviderKind::Acp | ProviderKind::GrokBuild) {
+    if matches!(
+        provider,
+        ProviderKind::Acp | ProviderKind::GrokBuild | ProviderKind::Opencode
+    ) {
         return Ok(Vec::new());
     }
     let mut descriptors = Vec::new();
@@ -703,8 +710,36 @@ fn mcp_sources(home: Option<&Path>, workspace: &Path, provider: ProviderKind) ->
                 });
             }
         }
+        ProviderKind::Devin => {
+            if let Some(home) = home {
+                let devin_home = home.join(".config/devin");
+                for path in [
+                    devin_home.join("mcp_config.json"),
+                    devin_home.join("mcp_config.local.json"),
+                ] {
+                    sources.push(SourceRoot {
+                        path,
+                        scope: CatalogScope::User,
+                        source: "devin-user",
+                        priority: 20,
+                    });
+                }
+            }
+            for path in [
+                workspace.join(".devin/mcp_config.json"),
+                workspace.join(".devin/mcp_config.local.json"),
+            ] {
+                sources.push(SourceRoot {
+                    path,
+                    scope: CatalogScope::Project,
+                    source: "devin-project",
+                    priority: 40,
+                });
+            }
+        }
         ProviderKind::Acp => {}
         ProviderKind::GrokBuild => {}
+        ProviderKind::Opencode => {}
     }
     sources
 }
@@ -1216,6 +1251,12 @@ mod tests {
                 grok_bin: "grok".to_owned(),
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {

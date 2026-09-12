@@ -65,6 +65,16 @@ pub fn permission_config_capabilities(provider: ProviderKind) -> PermissionConfi
             permission_profiles: vec!["read-only", "workspace-write", "danger-full-access"],
             enforcement: "agent-policy", description: "Claude default / auto / bypassPermissions and independent plan mode; not an operating-system sandbox. Legacy combinations remain validated.",
         },
+        ProviderKind::Devin => PermissionConfigCapabilities {
+            modes: vec!["ask", "auto", "full-access"], default_mode: "auto", supports_plan: true,
+            sandbox_modes: vec![], approval_policies: vec![], permission_profiles: vec![],
+            enforcement: "agent-policy", description: "Devin session modes over ACP: ask / accept-edits / plan / bypass; enforced by the agent, not an operating-system sandbox",
+        },
+        ProviderKind::Opencode => PermissionConfigCapabilities {
+            modes: vec!["ask", "auto", "full-access"], default_mode: "ask", supports_plan: true,
+            sandbox_modes: vec![], approval_policies: vec![], permission_profiles: vec![],
+            enforcement: "agent-policy", description: "OpenCode build/plan session modes over ACP; ask mediates each tool approval, auto/full-access approve client-side",
+        },
         _ => PermissionConfigCapabilities {
             modes: vec![if provider == ProviderKind::Pi { "full-access" } else { "ask" }],
             default_mode: if provider == ProviderKind::Pi { "full-access" } else { "ask" }, supports_plan: false,
@@ -122,6 +132,16 @@ pub struct ProviderCommandDescriptor {
     pub source_info: Option<Value>,
     pub invocation: String,
     pub argument_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderSessionCommands {
+    pub commands: Vec<ProviderCommandDescriptor>,
+    pub runtime_id: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -465,6 +485,8 @@ pub struct DriverEventSink {
     permissions: PermissionBroker,
     conversation_id: String,
     current_turn_id: Option<String>,
+    runtime_id: Option<String>,
+    scope: Option<&'static str>,
 }
 
 impl DriverEventSink {
@@ -480,12 +502,34 @@ impl DriverEventSink {
             permissions,
             conversation_id: conversation_id.into(),
             current_turn_id: None,
+            runtime_id: None,
+            scope: None,
         }
     }
 
     pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
         self.current_turn_id = Some(turn_id.into());
+        if self.runtime_id.is_some() {
+            self.scope = Some("turn");
+        }
         self
+    }
+
+    /// A resident provider can emit between turns without attributing those
+    /// messages or dialogs to the most recently completed turn.
+    pub fn for_runtime(mut self, runtime_id: impl Into<String>) -> Self {
+        self.current_turn_id = None;
+        self.runtime_id = Some(runtime_id.into());
+        self.scope = Some("session");
+        self
+    }
+
+    pub fn runtime_id(&self) -> Option<&str> {
+        self.runtime_id.as_deref()
+    }
+
+    pub fn scope(&self) -> Option<&'static str> {
+        self.scope
     }
 
     pub async fn emit(
@@ -493,6 +537,18 @@ impl DriverEventSink {
         event_type: impl Into<String>,
         mut payload: Value,
     ) -> Result<ConversationEvent, AppError> {
+        let event_type = event_type.into();
+        if let Some(object) = payload.as_object_mut() {
+            if let Some(runtime_id) = &self.runtime_id {
+                object.insert("runtimeId".to_owned(), json!(runtime_id));
+            }
+            if let Some(scope) = self.scope {
+                // Usage already defines scope=message for accounting identity.
+                if event_type != "usage.updated" || object.get("scope") != Some(&json!("message")) {
+                    object.insert("scope".to_owned(), json!(scope));
+                }
+            }
+        }
         if let (Some(turn_id), Some(object)) = (&self.current_turn_id, payload.as_object_mut()) {
             if let Some(native_turn_id) = object
                 .get("turnId")
@@ -570,6 +626,27 @@ pub trait ProviderDriver: Send + Sync {
     }
 
     async fn shutdown_session(&self, _conversation_id: &str) {}
+
+    async fn shutdown_session_with_reason(&self, conversation_id: &str, _reason: &str) {
+        self.shutdown_session(conversation_id).await;
+    }
+
+    fn supports_runtime_stop(&self) -> bool {
+        false
+    }
+
+    async fn stop_runtime(&self, _conversation_id: &str) -> Result<Value, AppError> {
+        Err(AppError::Unsupported(
+            "This provider has no resident runtime to close.".to_owned(),
+        ))
+    }
+
+    async fn session_commands(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<ProviderSessionCommands>, AppError> {
+        Ok(None)
+    }
 
     async fn shutdown(&self) {}
 

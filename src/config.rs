@@ -89,6 +89,12 @@ pub struct AgentConfig {
     pub grok_bin: String,
     pub grok_auth_method: Option<String>,
     pub grok_env_allowlist: Vec<String>,
+    pub devin_bin: String,
+    pub devin_auth_method: Option<String>,
+    pub devin_api_key_env: Option<String>,
+    pub devin_env_allowlist: Vec<String>,
+    pub opencode_bin: String,
+    pub opencode_env_allowlist: Vec<String>,
     pub acp_profiles: BTreeMap<String, AcpProfileConfig>,
 }
 
@@ -99,6 +105,10 @@ pub struct AcpProfileConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub auth_method: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,6 +139,12 @@ struct PartialAgentConfig {
     grok_bin: Option<String>,
     grok_auth_method: Option<String>,
     grok_env_allowlist: Option<Vec<String>>,
+    devin_bin: Option<String>,
+    devin_auth_method: Option<String>,
+    devin_api_key_env: Option<String>,
+    devin_env_allowlist: Option<Vec<String>>,
+    opencode_bin: Option<String>,
+    opencode_env_allowlist: Option<Vec<String>>,
     acp_profiles: Option<BTreeMap<String, AcpProfileConfig>>,
 }
 
@@ -268,6 +284,34 @@ impl Config {
                 grok_env_allowlist: env_list("TODEX_AGENTD_GROK_ENV_ALLOWLIST")
                     .or(agent_file.grok_env_allowlist)
                     .unwrap_or(defaults.agent.grok_env_allowlist),
+                devin_bin: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_DEVIN_BIN").ok(),
+                    agent_file.devin_bin,
+                    defaults.agent.devin_bin,
+                ),
+                devin_auth_method: optional_non_empty(
+                    env::var("TODEX_AGENTD_DEVIN_AUTH_METHOD").ok(),
+                )
+                .or_else(|| optional_non_empty(agent_file.devin_auth_method))
+                .or(defaults.agent.devin_auth_method),
+                devin_api_key_env: optional_non_empty(
+                    env::var("TODEX_AGENTD_DEVIN_API_KEY_ENV").ok(),
+                )
+                .or_else(|| optional_non_empty(agent_file.devin_api_key_env))
+                .or(defaults.agent.devin_api_key_env),
+                devin_env_allowlist: env_list("TODEX_AGENTD_DEVIN_ENV_ALLOWLIST")
+                    .or(agent_file.devin_env_allowlist)
+                    .unwrap_or(defaults.agent.devin_env_allowlist),
+                opencode_bin: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_OPENCODE_BIN").ok(),
+                    agent_file.opencode_bin,
+                    defaults.agent.opencode_bin,
+                ),
+                opencode_env_allowlist: env_list("TODEX_AGENTD_OPENCODE_ENV_ALLOWLIST")
+                    .or(agent_file.opencode_env_allowlist)
+                    .unwrap_or(defaults.agent.opencode_env_allowlist),
                 acp_profiles: agent_file
                     .acp_profiles
                     .unwrap_or(defaults.agent.acp_profiles),
@@ -362,6 +406,12 @@ impl Default for Config {
                 grok_bin: "grok".to_owned(),
                 grok_auth_method: None,
                 grok_env_allowlist: default_grok_env_allowlist(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: default_devin_env_allowlist(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: default_opencode_env_allowlist(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -454,6 +504,24 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
             base_agent.grok_env_allowlist,
             overlay_agent.grok_env_allowlist
         );
+        replace_some!(base_agent.devin_bin, overlay_agent.devin_bin);
+        replace_some!(
+            base_agent.devin_auth_method,
+            overlay_agent.devin_auth_method
+        );
+        replace_some!(
+            base_agent.devin_api_key_env,
+            overlay_agent.devin_api_key_env
+        );
+        replace_some!(
+            base_agent.devin_env_allowlist,
+            overlay_agent.devin_env_allowlist
+        );
+        replace_some!(base_agent.opencode_bin, overlay_agent.opencode_bin);
+        replace_some!(
+            base_agent.opencode_env_allowlist,
+            overlay_agent.opencode_env_allowlist
+        );
         replace_some!(base_agent.acp_profiles, overlay_agent.acp_profiles);
     }
     if let Some(overlay_security) = overlay.security {
@@ -502,6 +570,37 @@ fn default_grok_env_allowlist() -> Vec<String> {
         "GROK_CLI_CHAT_PROXY_BASE_URL",
         "GROK_EXTRA_CA_BUNDLE",
         "XAI_API_KEY",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn default_devin_env_allowlist() -> Vec<String> {
+    [
+        "DEVIN_API_KEY",
+        "DEVIN_MODEL",
+        "WINDSURF_API_KEY",
+        "DEVIN_EXTRA_CA_BUNDLE",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn default_opencode_env_allowlist() -> Vec<String> {
+    [
+        "OPENCODE_API_KEY",
+        "OPENCODE_AUTH_CONTENT",
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_DISABLE_AUTOUPDATE",
+        "OPENCODE_DISABLE_DEFAULT_PLUGINS",
+        "OPENCODE_DISABLE_EXTERNAL_SKILLS",
+        "OPENCODE_DISABLE_PROJECT_CONFIG",
+        "OPENCODE_EXPERIMENTAL",
+        "OPENCODE_PERMISSION",
     ]
     .into_iter()
     .map(str::to_owned)
