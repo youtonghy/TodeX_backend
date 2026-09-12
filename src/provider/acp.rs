@@ -446,13 +446,15 @@ pub(super) async fn run_acp_turn_controlled(
                 };
                 let (session_id, response_value) = match loaded {
                     Ok(response_value) => (session_id, response_value),
-                    // Devin sessions are locked process-wide and can be held by
-                    // a stale or externally hosted instance; start a fresh
-                    // session rather than failing the turn.
-                    Err(AppError::Conflict(_)) if provider == ProviderKind::Devin => {
+                    Err(error @ AppError::TurnCancelled) => return Err(error),
+                    // Devin sessions live in a shared registry/lock table, so a
+                    // stored id can be held by another process or deleted
+                    // externally. Start a fresh session rather than failing the
+                    // turn.
+                    Err(error) if provider == ProviderKind::Devin => {
                         sink.emit(
                             "provider.event",
-                            json!({"provider":provider.as_str(),"providerMethod":"session/recreated","metadata":{"reason":"session_locked","previousSessionId":session_id}}),
+                            json!({"provider":provider.as_str(),"providerMethod":"session/recreated","metadata":{"reason":error.to_string(),"previousSessionId":session_id}}),
                         )
                         .await?;
                         new_acp_session(
