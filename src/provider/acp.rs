@@ -1520,7 +1520,7 @@ async fn handle_client_request(
             .await
         {
             Ok(decision) => decision,
-            Err(error @ AppError::TurnCancelled) => {
+            Err(error) => {
                 let response = RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
                 process
                     .write_response(
@@ -1529,7 +1529,6 @@ async fn handle_client_request(
                     .await?;
                 return Err(error);
             }
-            Err(error) => return Err(error),
         };
         let selected = select_acp_option(&request, &decision)?;
         let response = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
@@ -1690,11 +1689,10 @@ async fn handle_ask_user_question(
             .await
         {
             Ok(decision) => decision,
-            Err(error @ AppError::TurnCancelled) => {
+            Err(error) => {
                 send_result(process, request_id, json!({ "outcome": "cancelled" })).await?;
                 return Err(error);
             }
-            Err(error) => return Err(error),
         };
         if matches!(
             decision.outcome,
@@ -1754,11 +1752,10 @@ async fn handle_exit_plan_mode(
         .await
     {
         Ok(decision) => decision,
-        Err(error @ AppError::TurnCancelled) => {
+        Err(error) => {
             send_result(process, request_id, json!({ "outcome": "cancelled" })).await?;
             return Err(error);
         }
-        Err(error) => return Err(error),
     };
     let result = match decision.outcome {
         PermissionOutcome::AllowOnce | PermissionOutcome::AllowAlways => {
@@ -1818,11 +1815,10 @@ async fn handle_mcp_elicit(
         .await
     {
         Ok(decision) => decision,
-        Err(error @ AppError::TurnCancelled) => {
+        Err(error) => {
             send_result(process, request_id, json!({ "action": "cancel" })).await?;
             return Err(error);
         }
-        Err(error) => return Err(error),
     };
     let result = match decision.outcome {
         PermissionOutcome::Answer | PermissionOutcome::AllowOnce => decision
