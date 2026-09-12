@@ -8,6 +8,7 @@ use crate::{config::Config, conversation::ProviderKind, error::AppError};
 
 use super::{
     codex::CodexDriver,
+    opencode::OpencodeDriver,
     pi::PiDriver,
     process::{redact_sensitive_text, run_bounded_command, CommandSpec},
     types::ProviderDriver,
@@ -73,9 +74,12 @@ pub async fn inspect_providers(
         let provider = requested_provider
             .parse::<ProviderKind>()
             .map_err(AppError::InvalidRequest)?;
-        if !matches!(provider, ProviderKind::Codex | ProviderKind::Pi) {
+        if !matches!(
+            provider,
+            ProviderKind::Codex | ProviderKind::Pi | ProviderKind::Opencode
+        ) {
             return Err(AppError::Unsupported(format!(
-                "provider doctor currently supports codex and pi, got {}",
+                "provider doctor currently supports codex, pi and opencode, got {}",
                 provider.as_str()
             )));
         }
@@ -102,11 +106,13 @@ async fn inspect_provider(
     let binary = match provider {
         ProviderKind::Codex => config.agent.codex_bin.clone(),
         ProviderKind::Pi => config.agent.pi_bin.clone(),
+        ProviderKind::Opencode => config.agent.opencode_bin.clone(),
         _ => unreachable!("provider was validated by inspect_providers"),
     };
     let driver: Box<dyn ProviderDriver> = match provider {
         ProviderKind::Codex => Box::new(CodexDriver::new(&config.agent)),
         ProviderKind::Pi => Box::new(PiDriver::new(&config.agent)),
+        ProviderKind::Opencode => Box::new(OpencodeDriver::new(&config.agent)),
         _ => unreachable!("provider was validated by inspect_providers"),
     };
     let mut report = ProviderProbeReport {

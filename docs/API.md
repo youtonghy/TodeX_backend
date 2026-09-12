@@ -48,6 +48,8 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 | Devin API key 环境变量 | 无 | `TODEX_AGENTD_DEVIN_API_KEY_ENV` | 无（回退到 CLI 登录凭据） |
 | Devin CLI 凭据回退 | 无 | `TODEX_AGENTD_DEVIN_CLI_CREDENTIALS` | `true` |
 | Devin 环境白名单 | 无 | `TODEX_AGENTD_DEVIN_ENV_ALLOWLIST` | `DEVIN_API_KEY`、`DEVIN_MODEL`、`WINDSURF_API_KEY` 等 |
+| OpenCode 可执行文件 | 无 | `TODEX_AGENTD_OPENCODE_BIN` | `opencode` |
+| OpenCode 环境白名单 | 无 | `TODEX_AGENTD_OPENCODE_ENV_ALLOWLIST` | `OPENCODE_CONFIG*`、`OPENCODE_AUTH_CONTENT`、`OPENCODE_API_KEY` 等 |
 | 默认 agent 名称 | 无 | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` |
 | 是否开启认证 | 无 | `TODEX_AGENTD_ENABLE_AUTH` | `true` |
 | Bearer token | 无 | `TODEX_AGENTD_AUTH_TOKEN` | 无 |
@@ -59,11 +61,13 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 
 ## v2 Conversation API
 
-Provider 标识为 `acp`、`codex`、`pi`、`claude-code`、`grok-build`、`devin`（创建请求也接受 `grok` / `grok_build` 与 `devin-cli` / `devin_cli` 别名）。未指定时使用 `[agent].default_agent`，默认是 `codex`。ACP 必须使用后端 `config.toml` 中预配置的 `providerProfile`；客户端不能提交任意 command、args 或 env。
+Provider 标识为 `acp`、`codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode`（创建请求也接受 `grok` / `grok_build`、`devin-cli` / `devin_cli` 与 `open-code` / `open_code` 别名）。未指定时使用 `[agent].default_agent`，默认是 `codex`。ACP 必须使用后端 `config.toml` 中预配置的 `providerProfile`；客户端不能提交任意 command、args 或 env。
 
 Provider 子进程只继承运行所需的基础系统环境；ACP 额外使用管理员在 profile 中明确配置的 env。Codex、Pi、Claude Code 和 Grok Build 应先由运行 daemon 的同一系统用户完成原生登录。Grok Build 也可通过白名单传入 `XAI_API_KEY`；daemon 不会启动浏览器/OIDC 交互认证。Grok 的工具授权、提问、计划审批和 MCP elicitation 会转换为 TodeX `permission.requested`，客户端按服务器提供的 `optionId` 和 `kind` 回复。Pi 只有全自动执行模式：工作区获得 TodeX 信任后以 `--approve` 启动，工具与项目扩展按 daemon 用户权限运行。Pi 没有通用逐工具审批或 OS sandbox，因此 `permissions` capability 为 `false`；extension UI 请求仍可转成交互事件，但不能把它等同于工具授权。
 
 Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。`devin acp` 自身有意不读取本地 CLI 登录态，daemon 会在每个 ACP 进程启动时执行 `authenticate`：优先以 `devin_api_key_env` 指定的环境变量值作为 `_meta.api_key` 无头认证（不会写入日志），未配置时默认回退读取 `devin auth login` 写入的 `~/.local/share/devin/credentials.toml` 中的 `windsurf_api_key`（`TODEX_AGENTD_DEVIN_CLI_CREDENTIALS=false` 可禁用），再否则按其声明的 `devin-browser` 方法走一次浏览器授权。权限模式映射到 Devin 原生会话模式：`ask`→`ask`、`auto`→`accept-edits`、`full-access`→`bypass`，plan 工作模式→`plan`；其中 `ask` 在 Devin 语义下是只读问答，比其它 provider 的“先询问再执行”更严格。模型目录与 slash 命令通过真实 ACP 会话探测（探测会话随后调用 `session/delete` 清理，结果按工作区缓存约 5 分钟，避免客户端刷新反复触发认证）。Devin 支持会话内切换模型（`configure` live control），不支持独立的 reasoning effort——档位编码在模型 ID（如 `claude-opus-5-low`/`-fast`）中。
+
+OpenCode 通过 `opencode acp` 接入，每个对话对应一个常驻 ACP 进程（空闲 300 秒回收，daemon 级上限 32 个）。OpenCode 自己管理登录态（`opencode auth login` 写入其本地凭据存储），其声明的 `opencode-login` authMethod 仅指向该终端流程，daemon 因此不发送 ACP `authenticate`；未登录时模型调用错误原样上浮。权限模式只提供 `ask`：每个 `session/request_permission` 都会转成 TodeX `permission.requested` 逐条询问；OpenCode 侧 `opencode.json` 中的 `permission` 配置（或白名单转发的 `OPENCODE_PERMISSION`）可让其原生策略先行放行。plan 工作模式经 `configOptions.mode` 映射到原生 `plan`，implement 显式重置为 `build`，避免上一轮 plan 残留。模型经 `configOptions.model` 选择（`provider/model` 形式），会话内支持 `configure` live control 切换；不支持独立 reasoning effort。OpenCode 声明 `loadSession`，daemon 恢复对话时使用 `session/load`；`session/fork`/`session/list` 暂未接入。Usage 来自 `usage_update`（`used`/`size`/`cost`）与 prompt 响应 `result.usage`（含 `cachedReadTokens`）。模型目录与 slash 命令（`available_commands_update`）通过真实 ACP 会话探测，探测会话随后调用 `session/close` 清理。OpenCode 的 skills 目录（`.opencode/skills`、`~/.config/opencode/skills`）进入 catalog；MCP 由 OpenCode 自己的 `opencode.json` 管理，不参与 TodeX catalog 解析。
 
 ```http
 GET /v2/providers
@@ -88,7 +92,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 `/v2/providers/models` 会实时向指定 Agent 查询模型目录，返回 `source` 与 `fetchedAt`。每个模型包含 `supportedReasoningEfforts`，并可通过 `defaultReasoningEffort` 声明后端当前默认强度。Codex 使用 app-server `model/list`，Pi 使用 RPC `get_available_models` 与 `get_state`，Claude Code 在配置了 `ANTHROPIC_BASE_URL` 时读取 `/v1/models`，Grok Build 从 ACP initialize 的原生模型状态读取。查询失败时客户端应保留上一次成功目录，并展示可恢复错误。
 
-`GET /v2/providers/versions` 在 daemon 所在主机读取配置的五个内建 CLI，并从各自官方发布源查询最新版；Devin 没有只读的最新版本检查接口，`latestVersion` 会保持为空。结果会短时缓存，单个查询失败不会隐藏其他 CLI。ACP profile 作为外部管理项列出，不执行任意 profile 命令，也不提供升级。`POST /v2/providers/{provider}/upgrade` 仅接受 `codex`、`pi`、`claude-code`、`grok-build`、`devin` 固定标识，返回异步 operation；客户端使用 operation 查询接口轮询。升级命令不经过 shell、不读取工作区，并在升级后重新调用同一个配置 binary 验证版本。任一 Agent turn、本地 Codex adapter、Provider 发现或另一升级正在启动/运行时会返回 `409 CONFLICT`；升级中的版本查询只返回已有缓存，不会再启动 CLI。CLI 升级在 loopback 部署中也必须配置并提交 Bearer token，以免网页通过跨域请求改变宿主机工具链；已认证的尝试及最终结果会写入审计日志，初始审计记录无法落盘时不会启动升级。
+`GET /v2/providers/versions` 在 daemon 所在主机读取配置的六个内建 CLI，并从各自官方发布源查询最新版（OpenCode 查询 GitHub `anomalyco/opencode` 最新 release tag）；Devin 没有只读的最新版本检查接口，`latestVersion` 会保持为空。结果会短时缓存，单个查询失败不会隐藏其他 CLI。ACP profile 作为外部管理项列出，不执行任意 profile 命令，也不提供升级。`POST /v2/providers/{provider}/upgrade` 仅接受 `codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode` 固定标识（OpenCode 执行 `opencode upgrade`），返回异步 operation；客户端使用 operation 查询接口轮询。升级命令不经过 shell、不读取工作区，并在升级后重新调用同一个配置 binary 验证版本。任一 Agent turn、本地 Codex adapter、Provider 发现或另一升级正在启动/运行时会返回 `409 CONFLICT`；升级中的版本查询只返回已有缓存，不会再启动 CLI。CLI 升级在 loopback 部署中也必须配置并提交 Bearer token，以免网页通过跨域请求改变宿主机工具链；已认证的尝试及最终结果会写入审计日志，初始审计记录无法落盘时不会启动升级。
 
 `GET /v2/providers/commands?provider=pi&workspace=/path` 会实时读取 Agent 命令目录。Pi 使用 RPC `get_commands` 返回扩展、Prompt Template 和 Skill；响应失败会作为 Provider 错误返回，成功结果中的 `sourceInfo` 会原样保留。Codex 返回与本机 CLI 版本同步的 TUI 命令适配目录。命令描述包含 `invocation`，客户端应据此选择原生 RPC、桌面动作或 Provider prompt，不要把所有 `/` 输入都当作普通 prompt。 已有会话应使用 `?conversationId=...`：后端先校验 owner，再从会话 manifest 确定 provider 与 workspace，忽略客户端同时提交的对应查询参数。Pi runtime 存在时由同一 worker 发送 `get_commands`，响应含 `catalogSource: "session"` 与 `runtimeId`；尚未启动时使用临时发现进程，返回 `catalogSource: "discovery"`。目录查询总时限为 8 秒。可验证的本地包会附带 `packageName` / `packageVersion`：版本取自实际资源附近的 `package.json`，显式加载的资源还会检查 manifest 的 Pi 入口；无法确认时省略，不从 npm spec 猜测。
 

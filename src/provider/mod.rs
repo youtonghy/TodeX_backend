@@ -7,6 +7,7 @@ mod codex;
 mod devin;
 mod doctor;
 mod grok;
+mod opencode;
 mod pi;
 pub(crate) mod process;
 mod supervisor;

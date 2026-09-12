@@ -654,6 +654,9 @@ fn control_commands(
     if provider == ProviderKind::Devin {
         return devin_control_commands(&request.control, session_id);
     }
+    if provider == ProviderKind::Opencode {
+        return opencode_control_commands(&request.control, session_id);
+    }
     match &request.control {
         ProviderControl::Steer { text } => Ok(vec![(
             "_x.ai/interject".to_owned(),
@@ -675,6 +678,40 @@ fn control_commands(
             .collect()),
         _ => Err(AppError::Unsupported(
             "Grok does not expose native prompt queue controls".to_owned(),
+        )),
+    }
+}
+
+fn opencode_control_commands(
+    control: &ProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
+    match control {
+        ProviderControl::Configure {
+            model,
+            reasoning_effort,
+        } => {
+            if reasoning_effort.is_some() {
+                return Err(AppError::Unsupported(
+                    "OpenCode does not expose a separate reasoning effort control; choose a model variant"
+                        .to_owned(),
+                ));
+            }
+            Ok(model
+                .as_ref()
+                .map(|value| {
+                    vec![(
+                        "session/set_config_option".to_owned(),
+                        json!({"sessionId":session_id,"configId":"model","value":value}),
+                    )]
+                })
+                .unwrap_or_default())
+        }
+        ProviderControl::Steer { .. } => Err(AppError::Unsupported(
+            "OpenCode does not expose mid-turn steering over ACP".to_owned(),
+        )),
+        _ => Err(AppError::Unsupported(
+            "OpenCode does not expose native prompt queue controls".to_owned(),
         )),
     }
 }
@@ -883,7 +920,7 @@ async fn emit_prompt_metadata(
     sink.emit("provider.event", json!({
         "provider": provider.as_str(), "providerMethod": "session/prompt/result", "metadata": metadata,
     })).await?;
-    if provider == ProviderKind::Devin {
+    if matches!(provider, ProviderKind::Devin | ProviderKind::Opencode) {
         if let Some(usage) = message
             .pointer("/result/usage")
             .filter(|value| value.is_object())
@@ -1255,14 +1292,17 @@ pub(super) async fn handle_acp_message(
                 json!({"provider":provider_id,"source":"provider-confirmed","effectiveConfig":update.get("configOptions").and_then(config_effective),"metadata":update}),
             ),
             "available_commands_update"
-                if matches!(provider, ProviderKind::GrokBuild | ProviderKind::Devin) =>
+                if matches!(
+                    provider,
+                    ProviderKind::GrokBuild | ProviderKind::Devin | ProviderKind::Opencode
+                ) =>
             {
                 (
                     "provider.commands.updated",
                     json!({ "provider": provider_id, "commands": super::grok::parse_commands(&json!({"_meta":{"availableCommands":update.get("availableCommands")}})), "metadata":update }),
                 )
             }
-            "usage_update" if provider == ProviderKind::Devin => (
+            "usage_update" if matches!(provider, ProviderKind::Devin | ProviderKind::Opencode) => (
                 "usage.updated",
                 json!({ "provider": provider_id, "source": "provider", "scope": "turn",
                     "aggregation": "snapshot", "final": false,
@@ -1451,6 +1491,7 @@ fn normalize_devin_usage(raw: &Value) -> Value {
         "input": pick(&["inputTokens", "input_tokens", "input"]),
         "output": pick(&["outputTokens", "output_tokens", "output"]),
         "total": pick(&["totalTokens", "total_tokens", "total", "used"]),
+        "cacheRead": pick(&["cachedReadTokens", "cacheRead", "cache_read_input_tokens"]),
         "contextWindow": pick(&["size", "contextWindow", "contextTokens"]),
         "raw": raw,
     })
@@ -1883,6 +1924,9 @@ async fn apply_requested_config(
     if context.provider == ProviderKind::Devin {
         requested_configs.push(("mode", devin_session_mode(prompt)));
     }
+    if context.provider == ProviderKind::Opencode {
+        requested_configs.push(("mode", Some(opencode_session_mode(prompt))));
+    }
     let mut current_options = options.map(<[SessionConfigOption]>::to_vec);
     for (config_id, requested) in requested_configs {
         let Some(requested) = requested else {
@@ -1944,6 +1988,16 @@ fn devin_session_mode(prompt: &DriverPrompt) -> Option<&'static str> {
         Some("auto") => Some("accept-edits"),
         Some("full-access") => Some("bypass"),
         _ => None,
+    }
+}
+
+/// OpenCode session modes are only build/plan; always restate the mode so a
+/// session left in plan mode returns to build on the next implement turn.
+fn opencode_session_mode(prompt: &DriverPrompt) -> &'static str {
+    if prompt.work_mode.as_deref() == Some("plan") {
+        "plan"
+    } else {
+        "build"
     }
 }
 

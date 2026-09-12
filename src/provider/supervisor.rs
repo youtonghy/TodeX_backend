@@ -146,6 +146,11 @@ impl DriverRegistry {
                 ProviderKind::Devin,
                 Arc::new(super::devin::DevinDriver::new(&config.agent)) as Arc<dyn ProviderDriver>,
             ),
+            (
+                ProviderKind::Opencode,
+                Arc::new(super::opencode::OpencodeDriver::new(&config.agent))
+                    as Arc<dyn ProviderDriver>,
+            ),
         ]);
         Self {
             drivers: Arc::new(drivers),
@@ -2160,6 +2165,8 @@ mod tests {
                 devin_auth_method: None,
                 devin_api_key_env: None,
                 devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -2506,10 +2513,12 @@ mod tests {
                 grok_bin: fixture_text.clone(),
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
-                devin_bin: fixture_text,
+                devin_bin: fixture_text.clone(),
                 devin_auth_method: None,
                 devin_api_key_env: None,
                 devin_env_allowlist: Vec::new(),
+                opencode_bin: fixture_text,
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
             },
             security: SecurityConfig {
@@ -2619,6 +2628,8 @@ mod tests {
                 devin_auth_method: None,
                 devin_api_key_env: None,
                 devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -2838,6 +2849,8 @@ mod tests {
                 devin_auth_method: None,
                 devin_api_key_env: None,
                 devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -2895,6 +2908,8 @@ mod tests {
                 devin_auth_method: None,
                 devin_api_key_env: None,
                 devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -2987,10 +3002,14 @@ elif [ "$mode" = "acp" ]; then
         printf '{"jsonrpc":"2.0","id":"authenticate","result":{}}\n'
         ;;
       *'"method":"session/new"'*)
-        printf '{"jsonrpc":"2.0","id":"session","result":{"sessionId":"acp-native"}}\n'
+        printf '{"jsonrpc":"2.0","id":"session","result":{"sessionId":"acp-native","configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"fixture-model","options":[{"value":"fixture-model","name":"Fixture"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"build","options":[{"value":"build","name":"build"},{"value":"plan","name":"plan"}]}]}}\n'
         ;;
       *'"method":"session/load"'*)
-        printf '{"jsonrpc":"2.0","id":"session","result":{}}\n'
+        printf '{"jsonrpc":"2.0","id":"session","result":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"fixture-model","options":[{"value":"fixture-model","name":"Fixture"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"build","options":[{"value":"build","name":"build"},{"value":"plan","name":"plan"}]}]}}\n'
+        ;;
+      *'"method":"session/set_config_option"'*)
+        id=$(extract_id "$line")
+        printf '{"jsonrpc":"2.0","id":"%s","result":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"fixture-model","options":[{"value":"fixture-model","name":"Fixture"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"build","options":[{"value":"build","name":"build"},{"value":"plan","name":"plan"}]}]}}\n' "$id"
         ;;
       *'"method":"session/prompt"'*)
         id=$(extract_id "$line")
@@ -3240,6 +3259,8 @@ done
                 devin_auth_method: None,
                 devin_api_key_env: None,
                 devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {

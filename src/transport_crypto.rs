@@ -1499,6 +1499,8 @@ mod tests {
                 devin_auth_method: None,
                 devin_api_key_env: None,
                 devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: Default::default(),
             },
             security: SecurityConfig {

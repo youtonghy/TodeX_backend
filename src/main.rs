@@ -78,7 +78,7 @@ enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 enum DoctorCommand {
-    #[command(about = "Check Codex and Pi installation, login, and RPC discovery")]
+    #[command(about = "Check Codex, Pi and OpenCode installation, login, and RPC discovery")]
     Providers(ProviderDoctorArgs),
 }
 

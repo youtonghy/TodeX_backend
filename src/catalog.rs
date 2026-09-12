@@ -375,6 +375,7 @@ fn provider_user_skill_root(home: &Path, provider: ProviderKind) -> PathBuf {
             .unwrap_or_else(|| home.join(".grok"))
             .join("skills"),
         ProviderKind::Devin => home.join(".config/devin/skills"),
+        ProviderKind::Opencode => home.join(".config/opencode/skills"),
     }
 }
 
@@ -386,6 +387,7 @@ fn provider_project_skill_root(workspace: &Path, provider: ProviderKind) -> Path
         ProviderKind::ClaudeCode => workspace.join(".claude/skills"),
         ProviderKind::GrokBuild => workspace.join(".grok/skills"),
         ProviderKind::Devin => workspace.join(".devin/skills"),
+        ProviderKind::Opencode => workspace.join(".opencode/skills"),
     }
 }
 
@@ -565,7 +567,10 @@ fn scan_mcp(
     workspace: &Path,
     provider: ProviderKind,
 ) -> Result<Vec<McpServerDescriptor>, AppError> {
-    if matches!(provider, ProviderKind::Acp | ProviderKind::GrokBuild) {
+    if matches!(
+        provider,
+        ProviderKind::Acp | ProviderKind::GrokBuild | ProviderKind::Opencode
+    ) {
         return Ok(Vec::new());
     }
     let mut descriptors = Vec::new();
@@ -734,6 +739,7 @@ fn mcp_sources(home: Option<&Path>, workspace: &Path, provider: ProviderKind) ->
         }
         ProviderKind::Acp => {}
         ProviderKind::GrokBuild => {}
+        ProviderKind::Opencode => {}
     }
     sources
 }
@@ -1249,6 +1255,8 @@ mod tests {
                 devin_auth_method: None,
                 devin_api_key_env: None,
                 devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {

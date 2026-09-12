@@ -93,6 +93,8 @@ pub struct AgentConfig {
     pub devin_auth_method: Option<String>,
     pub devin_api_key_env: Option<String>,
     pub devin_env_allowlist: Vec<String>,
+    pub opencode_bin: String,
+    pub opencode_env_allowlist: Vec<String>,
     pub acp_profiles: BTreeMap<String, AcpProfileConfig>,
 }
 
@@ -141,6 +143,8 @@ struct PartialAgentConfig {
     devin_auth_method: Option<String>,
     devin_api_key_env: Option<String>,
     devin_env_allowlist: Option<Vec<String>>,
+    opencode_bin: Option<String>,
+    opencode_env_allowlist: Option<Vec<String>>,
     acp_profiles: Option<BTreeMap<String, AcpProfileConfig>>,
 }
 
@@ -299,6 +303,15 @@ impl Config {
                 devin_env_allowlist: env_list("TODEX_AGENTD_DEVIN_ENV_ALLOWLIST")
                     .or(agent_file.devin_env_allowlist)
                     .unwrap_or(defaults.agent.devin_env_allowlist),
+                opencode_bin: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_OPENCODE_BIN").ok(),
+                    agent_file.opencode_bin,
+                    defaults.agent.opencode_bin,
+                ),
+                opencode_env_allowlist: env_list("TODEX_AGENTD_OPENCODE_ENV_ALLOWLIST")
+                    .or(agent_file.opencode_env_allowlist)
+                    .unwrap_or(defaults.agent.opencode_env_allowlist),
                 acp_profiles: agent_file
                     .acp_profiles
                     .unwrap_or(defaults.agent.acp_profiles),
@@ -397,6 +410,8 @@ impl Default for Config {
                 devin_auth_method: None,
                 devin_api_key_env: None,
                 devin_env_allowlist: default_devin_env_allowlist(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: default_opencode_env_allowlist(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -502,6 +517,11 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
             base_agent.devin_env_allowlist,
             overlay_agent.devin_env_allowlist
         );
+        replace_some!(base_agent.opencode_bin, overlay_agent.opencode_bin);
+        replace_some!(
+            base_agent.opencode_env_allowlist,
+            overlay_agent.opencode_env_allowlist
+        );
         replace_some!(base_agent.acp_profiles, overlay_agent.acp_profiles);
     }
     if let Some(overlay_security) = overlay.security {
@@ -562,6 +582,25 @@ fn default_devin_env_allowlist() -> Vec<String> {
         "DEVIN_MODEL",
         "WINDSURF_API_KEY",
         "DEVIN_EXTRA_CA_BUNDLE",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn default_opencode_env_allowlist() -> Vec<String> {
+    [
+        "OPENCODE_API_KEY",
+        "OPENCODE_AUTH_CONTENT",
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_DISABLE_AUTOUPDATE",
+        "OPENCODE_DISABLE_DEFAULT_PLUGINS",
+        "OPENCODE_DISABLE_EXTERNAL_SKILLS",
+        "OPENCODE_DISABLE_PROJECT_CONFIG",
+        "OPENCODE_EXPERIMENTAL",
+        "OPENCODE_PERMISSION",
     ]
     .into_iter()
     .map(str::to_owned)

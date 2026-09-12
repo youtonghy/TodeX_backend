@@ -70,6 +70,11 @@ pub fn permission_config_capabilities(provider: ProviderKind) -> PermissionConfi
             sandbox_modes: vec![], approval_policies: vec![], permission_profiles: vec![],
             enforcement: "agent-policy", description: "Devin session modes over ACP: ask / accept-edits / plan / bypass; enforced by the agent, not an operating-system sandbox",
         },
+        ProviderKind::Opencode => PermissionConfigCapabilities {
+            modes: vec!["ask"], default_mode: "ask", supports_plan: true,
+            sandbox_modes: vec![], approval_policies: vec![], permission_profiles: vec![],
+            enforcement: "agent-policy", description: "OpenCode build/plan session modes over ACP; tool approvals are mediated per request",
+        },
         _ => PermissionConfigCapabilities {
             modes: vec![if provider == ProviderKind::Pi { "full-access" } else { "ask" }],
             default_mode: if provider == ProviderKind::Pi { "full-access" } else { "ask" }, supports_plan: false,
