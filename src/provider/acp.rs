@@ -262,6 +262,10 @@ pub(super) struct AcpConnectionState {
     /// so duplicates are dropped and genuine churn is rate-limited.
     commands_fingerprint: Option<u64>,
     commands_announced_at: Option<tokio::time::Instant>,
+    /// Normalized tool call fields keyed by `toolCallId`; `tool_call_update`
+    /// notifications omit name/input, so clients merge each event onto the
+    /// remembered call.
+    tools: BTreeMap<String, Value>,
 }
 
 /// How `session/request_permission` requests are answered during a turn.
@@ -1055,6 +1059,26 @@ async fn new_acp_session(
     Ok((response.session_id.0.to_string(), response_value))
 }
 
+/// Text output carried by an ACP `tool_call_update`. `content` items wrap text
+/// or resource blocks; `tool_call` previews are excluded by the caller.
+fn acp_tool_output_text(update: &Value) -> Option<String> {
+    let texts: Vec<&str> = update
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|item| {
+            item.pointer("/content/text")
+                .or_else(|| item.pointer("/content/resource/text"))
+                .and_then(Value::as_str)
+        })
+        .collect();
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n"))
+    }
+}
+
 fn is_grok_update_method(method: &str) -> bool {
     matches!(
         extension_method(method),
@@ -1488,14 +1512,61 @@ pub(super) async fn handle_acp_message(
                 "thought.delta",
                 json!({ "provider": provider_id, "content": update.get("content") }),
             ),
-            "tool_call" => (
-                "tool.started",
-                json!({ "provider": provider_id, "tool": update }),
-            ),
-            "tool_call_update" => (
-                "tool.updated",
-                json!({ "provider": provider_id, "tool": update }),
-            ),
+            "tool_call" | "tool_call_update" => {
+                let status = update.get("status").and_then(Value::as_str);
+                let tool_id = update
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let mut normalized = connection
+                    .tools
+                    .get(tool_id)
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                normalized["toolCallId"] = json!(tool_id);
+                if let Some(name) = update
+                    .pointer("/_meta/cognition.ai~1inferenceToolName")
+                    .or_else(|| update.get("title"))
+                    .or_else(|| update.get("kind"))
+                    .and_then(Value::as_str)
+                {
+                    normalized["toolName"] = json!(name);
+                }
+                if let Some(title) = update.get("title").and_then(Value::as_str) {
+                    normalized["title"] = json!(title);
+                }
+                if let Some(input) = update.get("rawInput") {
+                    normalized["arguments"] = input.clone();
+                }
+                // `tool_call` content previews the input (e.g. the shell
+                // script); only updates carry output text.
+                if update_type == "tool_call_update" {
+                    if let Some(text) = acp_tool_output_text(&update) {
+                        normalized["result"] = json!(text);
+                    } else if let Some(raw) = update.get("rawOutput") {
+                        normalized["result"] = raw.clone();
+                    }
+                }
+                if let Some(status) = status {
+                    normalized["status"] = json!(status);
+                    normalized["isError"] = json!(status == "failed");
+                }
+                if !tool_id.is_empty() {
+                    connection
+                        .tools
+                        .insert(tool_id.to_owned(), normalized.clone());
+                }
+                normalized["provider"] = json!(provider_id);
+                normalized["tool"] = update.clone();
+                (
+                    if update_type == "tool_call" {
+                        "tool.started"
+                    } else {
+                        "tool.updated"
+                    },
+                    normalized,
+                )
+            }
             "plan" => (
                 "plan.updated",
                 json!({ "provider": provider_id, "plan": update }),
@@ -2991,6 +3062,83 @@ mod tests {
             types.push(event.event_type);
         }
         assert_eq!(types, ["provider.commands.updated"]);
+        process.terminate().await;
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_updates_retain_call_details() {
+        let root =
+            std::env::temp_dir().join(format!("todex-acp-tool-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = crate::conversation::ConversationStore::new(root.join("data"))
+            .await
+            .unwrap();
+        let manifest = store
+            .create(crate::conversation::ConversationManifest::new(
+                ProviderKind::Devin,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let hub = crate::conversation::ConversationEventHub::default();
+        let mut events = hub.subscribe(&manifest.id);
+        let sink = DriverEventSink::new(
+            store,
+            hub,
+            crate::provider::types::PermissionBroker::default(),
+            &manifest.id,
+        );
+        let mut process = JsonLineProcess::spawn(&CommandSpec::new("/bin/cat", &root))
+            .await
+            .unwrap();
+        let (_tx, mut cancel) = watch::channel(false);
+        let mut connection = AcpConnectionState::default();
+
+        for message in [
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{
+                "sessionUpdate":"tool_call","toolCallId":"exec_0","title":"Ran find",
+                "kind":"execute","rawInput":{"command":"find . -name '*.md'"},
+                "_meta":{"cognition.ai/inferenceToolName":"exec"}
+            }}}),
+            // Updates carry neither title nor rawInput; clients merge onto the
+            // remembered call so the card keeps its name and arguments.
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{
+                "sessionUpdate":"tool_call_update","toolCallId":"exec_0","status":"completed",
+                "content":[{"type":"content","content":{"type":"text","text":"42"}}],
+                "_meta":{"cognition.ai/inferenceToolName":"exec"}
+            }}}),
+        ] {
+            handle_acp_message(
+                &mut process,
+                message,
+                &sink,
+                &mut cancel,
+                ProviderKind::Devin,
+                true,
+                AutoApprove::Mediate,
+                &mut connection,
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut payloads = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            payloads.push((event.event_type, event.payload));
+        }
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].0, "tool.started");
+        assert_eq!(payloads[0].1["toolCallId"], "exec_0");
+        assert_eq!(payloads[0].1["toolName"], "exec");
+        assert_eq!(payloads[0].1["arguments"]["command"], "find . -name '*.md'");
+        assert_eq!(payloads[1].0, "tool.updated");
+        assert_eq!(payloads[1].1["toolName"], "exec");
+        assert_eq!(payloads[1].1["arguments"]["command"], "find . -name '*.md'");
+        assert_eq!(payloads[1].1["result"], "42");
+        assert_eq!(payloads[1].1["status"], "completed");
         process.terminate().await;
         std::fs::remove_dir_all(&root).unwrap();
     }
