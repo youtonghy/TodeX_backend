@@ -326,6 +326,14 @@ GET /v2/git/scan?workspacePath=/home/user/projects/demo
 
 没有 Git 仓库的 workspace 仍会返回一个 `initialEligible: true`、`branch: "UNINITIALIZED"` 的占位摘要。`files` 和用于未跟踪行数统计的路径各自最多处理 2,000 项；单个命令的 stdout/stderr 各自最多读取 4 MiB。扫描最多并发执行 2 个请求，排队超过 2 秒返回 `409 CONFLICT`，单个扫描请求总计超过 30 秒返回 `GIT_COMMAND_TIMED_OUT`。
 
+单个变更文件的统一 diff 通过只读接口获取：
+
+```http
+GET /v2/git/diff?workspacePath=/home/user/projects/demo&path=src/main.rs
+```
+
+`path` 为仓库相对路径，禁止绝对路径和 `..`。响应对照 `HEAD`（无首个提交时为空树）返回 `repositoryPath`、`path`、统一格式的 `diff` 文本与 `truncated`；未跟踪文件与 `/dev/null` 对比返回新增内容并标记 `untracked: true`，未变更的已跟踪文件返回空 `diff`。响应文本最多 1 MiB，超出时 `truncated` 为真。
+
 仓库变更只能通过固定动作执行，不能传递任意 Git 子命令或参数：
 
 ```http

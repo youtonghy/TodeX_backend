@@ -57,6 +57,23 @@ pub struct GitScanQuery {
     pub workspace_path: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffQuery {
+    pub workspace_path: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffResponse {
+    pub repository_path: String,
+    pub path: String,
+    pub diff: String,
+    pub truncated: bool,
+    pub untracked: bool,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitFileChange {
