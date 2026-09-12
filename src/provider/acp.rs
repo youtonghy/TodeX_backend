@@ -257,10 +257,11 @@ fn initialize_request() -> InitializeRequest {
 pub(super) struct AcpConnectionState {
     initialize: Option<Value>,
     session: Option<(String, Value)>,
-    /// Fingerprint of the last announced command set; Devin re-broadcasts
-    /// `available_commands_update` throughout a session, so unchanged
-    /// announcements are suppressed instead of journalled again.
+    /// Last announced command set fingerprint and when it was emitted. Devin
+    /// re-broadcasts `available_commands_update` while MCP servers register,
+    /// so duplicates are dropped and genuine churn is rate-limited.
     commands_fingerprint: Option<u64>,
+    commands_announced_at: Option<tokio::time::Instant>,
 }
 
 /// How `session/request_permission` requests are answered during a turn.
@@ -342,6 +343,7 @@ pub(super) async fn run_acp_turn_controlled(
             provider,
             true,
             auto_approve,
+            connection,
         )
         .await?;
         initialize
@@ -364,8 +366,16 @@ pub(super) async fn run_acp_turn_controlled(
     )?;
 
     if connection.initialize.is_none() {
-        authenticate_if_requested(process, &initialize_value, sink, cancel, provider, &options)
-            .await?;
+        authenticate_if_requested(
+            process,
+            &initialize_value,
+            sink,
+            cancel,
+            provider,
+            &options,
+            connection,
+        )
+        .await?;
         connection.initialize = Some(initialize_value.clone());
     }
 
@@ -412,6 +422,7 @@ pub(super) async fn run_acp_turn_controlled(
                         provider,
                         false,
                         auto_approve,
+                        connection,
                     )
                     .await?
                 } else {
@@ -429,6 +440,7 @@ pub(super) async fn run_acp_turn_controlled(
                         provider,
                         !options.suppress_load_replay,
                         auto_approve,
+                        connection,
                     )
                     .await?
                 };
@@ -460,6 +472,7 @@ pub(super) async fn run_acp_turn_controlled(
                     provider,
                     true,
                     auto_approve,
+                    connection,
                 )
                 .await?;
                 let legacy_models = response_value.get("models").cloned();
@@ -498,6 +511,7 @@ pub(super) async fn run_acp_turn_controlled(
             runtime: &options,
             auto_approve,
         },
+        connection,
     )
     .await?;
     if let (Some((_, response)), Some(options)) = (&mut connection.session, applied_options) {
@@ -1177,6 +1191,7 @@ fn normalize_acp_image_wire(request: &mut Value) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_response(
     process: &mut JsonLineProcess,
     request_id: &str,
@@ -1185,6 +1200,7 @@ async fn wait_for_response(
     provider: ProviderKind,
     emit_stream_updates: bool,
     auto_approve: AutoApprove,
+    connection: &mut AcpConnectionState,
 ) -> Result<Value, AppError> {
     wait_for_response_with_timeout(
         process,
@@ -1194,6 +1210,7 @@ async fn wait_for_response(
         provider,
         emit_stream_updates,
         auto_approve,
+        connection,
         None,
     )
     .await
@@ -1208,6 +1225,7 @@ async fn wait_for_response_with_timeout(
     provider: ProviderKind,
     emit_stream_updates: bool,
     auto_approve: AutoApprove,
+    connection: &mut AcpConnectionState,
     timeout: Option<Duration>,
 ) -> Result<Value, AppError> {
     let timeout = match timeout {
@@ -1260,7 +1278,7 @@ async fn wait_for_response_with_timeout(
             provider,
             emit_stream_updates,
             auto_approve,
-            &mut AcpConnectionState::default(),
+            connection,
         )
         .await?;
         if waits_for_user {
@@ -1425,10 +1443,14 @@ pub(super) async fn handle_acp_message(
                     &json!({"_meta":{"availableCommands":update.get("availableCommands")}}),
                 );
                 let fingerprint = commands_fingerprint(&commands);
-                if connection.commands_fingerprint == Some(fingerprint) {
+                let last_emit = connection.commands_announced_at;
+                if connection.commands_fingerprint == Some(fingerprint)
+                    || last_emit.is_some_and(|at| at.elapsed() < COMMANDS_ANNOUNCE_INTERVAL)
+                {
                     return Ok(());
                 }
                 connection.commands_fingerprint = Some(fingerprint);
+                connection.commands_announced_at = Some(tokio::time::Instant::now());
                 (
                     "provider.commands.updated",
                     json!({ "provider": provider_id, "commands": commands, "metadata":update }),
@@ -1481,6 +1503,10 @@ pub(super) async fn handle_acp_message(
     }
     Ok(())
 }
+
+/// Command catalogs churn while agents register MCP servers; announcements
+/// within this window are coalesced instead of journalled individually.
+const COMMANDS_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 
 fn commands_fingerprint(commands: &[ProviderCommandDescriptor]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -2001,6 +2027,7 @@ async fn authenticate_if_requested(
     cancel: &mut watch::Receiver<bool>,
     provider: ProviderKind,
     options: &AcpRuntimeOptions,
+    connection: &mut AcpConnectionState,
 ) -> Result<(), AppError> {
     if !options.authenticate {
         return Ok(());
@@ -2022,6 +2049,7 @@ async fn authenticate_if_requested(
         provider,
         true,
         AutoApprove::Mediate,
+        connection,
         options.auth_timeout,
     )
     .await?;
@@ -2086,6 +2114,7 @@ struct SessionConfigContext<'a> {
     auto_approve: AutoApprove,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_requested_config(
     process: &mut JsonLineProcess,
     options: Option<&[SessionConfigOption]>,
@@ -2094,9 +2123,19 @@ async fn apply_requested_config(
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
     context: SessionConfigContext<'_>,
+    connection: &mut AcpConnectionState,
 ) -> Result<Option<Vec<SessionConfigOption>>, AppError> {
     if options.is_none() && context.runtime.legacy_model_state {
-        apply_legacy_model_config(process, legacy_models, prompt, sink, cancel, context).await?;
+        apply_legacy_model_config(
+            process,
+            legacy_models,
+            prompt,
+            sink,
+            cancel,
+            context,
+            connection,
+        )
+        .await?;
         return Ok(None);
     }
     // OpenCode names its per-model thinking-level option `effort`; other ACP
@@ -2156,6 +2195,7 @@ async fn apply_requested_config(
             context.provider,
             true,
             context.auto_approve,
+            connection,
         )
         .await?;
         let response: SetSessionConfigOptionResponse =
@@ -2213,6 +2253,7 @@ async fn apply_legacy_model_config(
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
     context: SessionConfigContext<'_>,
+    connection: &mut AcpConnectionState,
 ) -> Result<(), AppError> {
     if prompt.model.is_none() && prompt.reasoning_effort.is_none() {
         return Ok(());
@@ -2271,6 +2312,7 @@ async fn apply_legacy_model_config(
         context.provider,
         true,
         context.auto_approve,
+        connection,
     )
     .await?;
     Ok(())
@@ -2843,6 +2885,15 @@ mod tests {
         for message in [
             commands.clone(),
             commands,
+            // A genuinely different catalog inside the coalescing window is
+            // still suppressed; churning announcements would otherwise flood
+            // the journal while MCP servers register.
+            json!({
+                "jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{
+                    "sessionUpdate":"available_commands_update",
+                    "availableCommands":[{"name":"/help","description":"Help"},{"name":"/new","description":"New"}]
+                }}
+            }),
             json!({"jsonrpc":"2.0","method":"_cognition.ai/output","params":{"message":"MCP log"}}),
             json!({"jsonrpc":"2.0","method":"_cognition.ai/mcp/serversChanged","params":{}}),
             json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"_cognition.ai/turn_stats","usedTokens":7}}}),
