@@ -3970,6 +3970,10 @@ mod tests {
                 grok_bin: "grok".to_owned(),
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
                 acp_profiles: Default::default(),
             },
             security: SecurityConfig {

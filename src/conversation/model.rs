@@ -16,15 +16,17 @@ pub enum ProviderKind {
     Pi,
     ClaudeCode,
     GrokBuild,
+    Devin,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Acp,
         Self::Codex,
         Self::Pi,
         Self::ClaudeCode,
         Self::GrokBuild,
+        Self::Devin,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -34,13 +36,14 @@ impl ProviderKind {
             Self::Pi => "pi",
             Self::ClaudeCode => "claude-code",
             Self::GrokBuild => "grok-build",
+            Self::Devin => "devin",
         }
     }
 
     pub const fn supports_image_input(self) -> bool {
         matches!(
             self,
-            Self::Codex | Self::Pi | Self::ClaudeCode | Self::GrokBuild
+            Self::Codex | Self::Pi | Self::ClaudeCode | Self::GrokBuild | Self::Devin
         )
     }
 }
@@ -55,6 +58,7 @@ impl std::str::FromStr for ProviderKind {
             "pi" => Ok(Self::Pi),
             "claude" | "claude-code" | "claude_code" => Ok(Self::ClaudeCode),
             "grok" | "grok-build" | "grok_build" => Ok(Self::GrokBuild),
+            "devin" | "devin-cli" | "devin_cli" => Ok(Self::Devin),
             other => Err(format!("unsupported provider: {other}")),
         }
     }

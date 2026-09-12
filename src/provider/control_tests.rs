@@ -59,6 +59,10 @@ impl Harness {
                 grok_bin: executable,
                 grok_auth_method: None,
                 grok_env_allowlist: vec![],
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {

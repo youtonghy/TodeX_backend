@@ -4,6 +4,7 @@ mod acp;
 mod claude;
 mod cli_manager;
 mod codex;
+mod devin;
 mod doctor;
 mod grok;
 mod pi;

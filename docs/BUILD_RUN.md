@@ -33,7 +33,7 @@ cd TodeX_app && pnpm start
 - Rust 工具链
 - `cargo`
 - 至少安装要使用的 Provider CLI，并放在 `PATH` 中或通过对应环境变量指定路径
-- Codex、Pi、Claude Code 和 Grok Build 使用 daemon 所属系统用户的原生配置与登录状态
+- Codex、Pi、Claude Code 和 Grok Build 使用 daemon 所属系统用户的原生配置与登录状态；Devin 在 ACP 模式下不读本地登录态，见下文认证说明
 
 建议先检查版本：
 
@@ -44,6 +44,7 @@ codex --version
 pi --version
 claude --version
 grok --version
+devin --version
 ```
 
 ## 配置方式
@@ -69,6 +70,10 @@ grok --version
 | `TODEX_AGENTD_GROK_BIN` | `grok` 命令路径 |
 | `TODEX_AGENTD_GROK_AUTH_METHOD` | 可选的非交互认证方法 |
 | `TODEX_AGENTD_GROK_ENV_ALLOWLIST` | 允许传给 Grok 的逗号分隔环境变量名 |
+| `TODEX_AGENTD_DEVIN_BIN` | `devin` 命令路径 |
+| `TODEX_AGENTD_DEVIN_AUTH_METHOD` | 可选的 Devin ACP 认证方法 ID |
+| `TODEX_AGENTD_DEVIN_API_KEY_ENV` | 保存 Devin API key 的环境变量名（只存名称） |
+| `TODEX_AGENTD_DEVIN_ENV_ALLOWLIST` | 允许传给 Devin 的逗号分隔环境变量名 |
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
@@ -92,10 +97,16 @@ pi_bin = "pi"
 grok_bin = "grok"
 grok_auth_method = "cached_token"
 grok_env_allowlist = ["GROK_HOME", "GROK_CONFIG", "GROK_CONFIG_PATH", "XAI_API_KEY"]
+devin_bin = "devin"
+# devin_auth_method = "devin-browser"
+# devin_api_key_env = "DEVIN_API_KEY"   # 无头认证：daemon 读取该环境变量并作为 ACP _meta.api_key 发送
+devin_env_allowlist = ["DEVIN_API_KEY", "DEVIN_MODEL", "WINDSURF_API_KEY"]
 
 [agent.acp_profiles.example]
 command = "example-acp-agent"
 args = []
+# auth_method = "some-auth-id"         # 需要认证的 ACP profile：initialize 声明的方法 ID
+# api_key_env = "EXAMPLE_API_KEY"      # 保存 API key 的环境变量名，经 ACP _meta.api_key 发送
 
 [security]
 enable_auth = true
@@ -113,6 +124,8 @@ language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
 TUI 默认不捕获鼠标，终端中的文本可以直接拖选复制。按 `c` 打开“凭据与复制”，可完整查看并复制 Auth Token 与当前加密方式的公钥；私钥不会显示或复制。日志使用 `PageUp`、`PageDown`、`Home`、`End` 滚动。daemon 启动会先检查端口占用，并等待最多 30 秒完成核心初始化和监听；旧 Codex 会话随后在后台迁移，不阻塞 daemon 就绪。
 
 Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径、用户目录、locale、代理和 SSH agent 等运行环境。ACP profile 中的 `env` 会显式传入，但名称以 `TODEX_AGENTD_` 开头的变量会被拒绝。Codex、Pi、Claude Code 和 Grok Build 因此应优先使用各自保存在用户目录中的原生登录配置。Grok Build 通过 `grok --no-auto-update agent --no-leader stdio` 启动；仅 `grok_env_allowlist` 中名称合法的变量会额外传入。首次运行前使用 daemon 用户执行 `grok login`，或在白名单中保留 `XAI_API_KEY`。Pi 始终使用 RPC `--approve`：工作区通过 TodeX 信任门禁后，Pi 的工具和项目资源按 daemon 用户权限全自动运行。Pi 没有通用逐工具审批，也没有 OS sandbox；`permissions` capability 因此保持 `false`。
+
+Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。Devin 在 ACP 模式下有意不读取本地 `devin auth login` 登录态，daemon 会在每个 ACP 进程启动时执行 `authenticate`：配置 `devin_api_key_env`（例如 `"DEVIN_API_KEY"`）后读取 daemon 环境中对应变量并以 `_meta.api_key` 无头发送（不写入日志）；否则按上游声明的 `devin-browser` 方法执行一次浏览器授权，完成前 daemon 会等待。需要常驻无人值守部署时建议配置 API key，避免每次进程重启都要求浏览器交互。
 
 ## Conversation 数据目录
 

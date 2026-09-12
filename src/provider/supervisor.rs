@@ -142,6 +142,10 @@ impl DriverRegistry {
                 ProviderKind::GrokBuild,
                 Arc::new(GrokBuildDriver::new(&config.agent)) as Arc<dyn ProviderDriver>,
             ),
+            (
+                ProviderKind::Devin,
+                Arc::new(super::devin::DevinDriver::new(&config.agent)) as Arc<dyn ProviderDriver>,
+            ),
         ]);
         Self {
             drivers: Arc::new(drivers),
@@ -2152,6 +2156,10 @@ mod tests {
                 grok_bin: executable,
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -2479,6 +2487,8 @@ mod tests {
                 command: fixture_text.clone(),
                 args: vec!["acp".to_owned()],
                 env: BTreeMap::new(),
+                auth_method: None,
+                api_key_env: None,
             },
         );
         let config = Arc::new(Config {
@@ -2493,9 +2503,13 @@ mod tests {
                 codex_bin: fixture_text.clone(),
                 claude_bin: fixture_text.clone(),
                 pi_bin: fixture_text.clone(),
-                grok_bin: fixture_text,
+                grok_bin: fixture_text.clone(),
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: fixture_text,
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
             },
             security: SecurityConfig {
@@ -2601,6 +2615,10 @@ mod tests {
                 grok_bin: fixture_text,
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -2816,6 +2834,10 @@ mod tests {
                 grok_bin: "grok".to_owned(),
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -2869,6 +2891,10 @@ mod tests {
                 grok_bin: "grok".to_owned(),
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {
@@ -2955,7 +2981,10 @@ elif [ "$mode" = "acp" ]; then
   while IFS= read -r line; do
     case "$line" in
       *'"method":"initialize"'*)
-        printf '{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}\n'
+        printf '{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[{"id":"fixture-key","name":"API key"}]}}\n'
+        ;;
+      *'"method":"authenticate"'*)
+        printf '{"jsonrpc":"2.0","id":"authenticate","result":{}}\n'
         ;;
       *'"method":"session/new"'*)
         printf '{"jsonrpc":"2.0","id":"session","result":{"sessionId":"acp-native"}}\n'
@@ -3207,6 +3236,10 @@ done
                 grok_bin: executable,
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
             },
             security: SecurityConfig {

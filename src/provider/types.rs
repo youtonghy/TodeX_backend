@@ -65,6 +65,11 @@ pub fn permission_config_capabilities(provider: ProviderKind) -> PermissionConfi
             permission_profiles: vec!["read-only", "workspace-write", "danger-full-access"],
             enforcement: "agent-policy", description: "Claude default / auto / bypassPermissions and independent plan mode; not an operating-system sandbox. Legacy combinations remain validated.",
         },
+        ProviderKind::Devin => PermissionConfigCapabilities {
+            modes: vec!["ask", "auto", "full-access"], default_mode: "auto", supports_plan: true,
+            sandbox_modes: vec![], approval_policies: vec![], permission_profiles: vec![],
+            enforcement: "agent-policy", description: "Devin session modes over ACP: ask / accept-edits / plan / bypass; enforced by the agent, not an operating-system sandbox",
+        },
         _ => PermissionConfigCapabilities {
             modes: vec![if provider == ProviderKind::Pi { "full-access" } else { "ask" }],
             default_mode: if provider == ProviderKind::Pi { "full-access" } else { "ask" }, supports_plan: false,

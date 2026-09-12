@@ -39,6 +39,7 @@ pub struct AcpDriver {
 pub(super) struct AcpRuntimeOptions {
     pub authenticate: bool,
     pub auth_method: Option<String>,
+    pub auth_meta: Option<Value>,
     pub suppress_load_replay: bool,
     pub allow_cli_config_fallback: bool,
     pub request_ask_mode: bool,
@@ -197,12 +198,38 @@ impl ProviderDriver for AcpDriver {
             prompt,
             &sink,
             &mut cancel,
-            AcpRuntimeOptions::default(),
+            profile_runtime_options(profile)?,
         )
         .await;
         process.terminate().await;
         result
     }
+}
+
+fn profile_runtime_options(profile: &AcpProfileConfig) -> Result<AcpRuntimeOptions, AppError> {
+    let api_key = profile
+        .api_key_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            std::env::var(name)
+                .ok()
+                .or_else(|| profile.env.get(name).cloned())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    AppError::ProviderUnavailable(format!(
+                        "ACP profile api_key_env '{name}' is not set in the daemon environment or profile env"
+                    ))
+                })
+        })
+        .transpose()?;
+    Ok(AcpRuntimeOptions {
+        authenticate: profile.auth_method.is_some() || api_key.is_some(),
+        auth_method: profile.auth_method.clone(),
+        auth_meta: api_key.map(|key| json!({ "api_key": key })),
+        ..Default::default()
+    })
 }
 
 fn initialize_request() -> InitializeRequest {
@@ -422,7 +449,7 @@ pub(super) async fn run_acp_turn_controlled(
                     if request.expected_turn_id != prompt.turn_id {
                         let _ = request.respond_to.send(Err(AppError::InvalidRequest("control targets a stale turn".to_owned())));
                     } else {
-                        start_live_control(process, request, &native_session_id, &mut pending).await?;
+                        start_live_control(process, request, &native_session_id, &mut pending, provider).await?;
                     }
                 } else { controls = None; }
                 continue;
@@ -432,11 +459,11 @@ pub(super) async fn run_acp_turn_controlled(
                 let expired: Vec<_> = pending.iter().filter(|(_,value)| value.deadline <= now).map(|(id,_)| id.clone()).collect();
                 for id in expired {
                     if let Some(request) = pending.remove(&id) {
-                        let _ = request.request.respond_to.send(Err(AppError::ProviderUnavailable("Grok control timed out; effective configuration is unknown".to_owned())));
+                        let _ = request.request.respond_to.send(Err(AppError::ProviderUnavailable(format!("{} control timed out; effective configuration is unknown", provider.as_str()))));
                     }
                 }
                 // A timed-out mutation must never remain in a reusable process.
-                return Err(AppError::ProviderUnavailable("Grok control acknowledgement timed out".to_owned()));
+                return Err(AppError::ProviderUnavailable(format!("{} control acknowledgement timed out", provider.as_str())));
             }
             changed = cancel.changed() => {
                 let _ = changed;
@@ -456,8 +483,16 @@ pub(super) async fn run_acp_turn_controlled(
         }
         if let Some(id) = jsonrpc_id(&message) {
             if let Some(request) = pending.remove(id) {
-                complete_live_control(process, message, request, sink, &mut pending, connection)
-                    .await?;
+                complete_live_control(
+                    process,
+                    message,
+                    request,
+                    sink,
+                    &mut pending,
+                    connection,
+                    provider,
+                )
+                .await?;
                 continue;
             }
         }
@@ -547,14 +582,16 @@ async fn start_live_control(
     request: PendingProviderControl,
     session_id: &str,
     pending: &mut BTreeMap<String, LiveAcpControl>,
+    provider: ProviderKind,
 ) -> Result<(), AppError> {
     if request.respond_to.is_closed() {
         return Ok(());
     }
     if pending.len() >= 16 {
-        let _ = request.respond_to.send(Err(AppError::Conflict(
-            "too many pending Grok controls".to_owned(),
-        )));
+        let _ = request.respond_to.send(Err(AppError::Conflict(format!(
+            "too many pending {} controls",
+            provider.as_str()
+        ))));
         return Ok(());
     }
     if matches!(request.control, ProviderControl::Configure { .. })
@@ -562,34 +599,16 @@ async fn start_live_control(
             .values()
             .any(|control| matches!(control.request.control, ProviderControl::Configure { .. }))
     {
-        let _ = request.respond_to.send(Err(AppError::Conflict(
-            "a Grok configuration change is already pending".to_owned(),
-        )));
+        let _ = request.respond_to.send(Err(AppError::Conflict(format!(
+            "a {} configuration change is already pending",
+            provider.as_str()
+        ))));
         return Ok(());
     }
-    let mut commands = match &request.control {
-        ProviderControl::Steer { text } => vec![(
-            "_x.ai/interject".to_owned(),
-            json!({"sessionId":session_id,"text":text,"interjectionId":request.request_id}),
-        )],
-        ProviderControl::Configure {
-            model,
-            reasoning_effort,
-        } => [("model", model), ("reasoning_effort", reasoning_effort)]
-            .into_iter()
-            .filter_map(|(id, value)| {
-                value.as_ref().map(|value| {
-                    (
-                        "session/set_config_option".to_owned(),
-                        json!({"sessionId":session_id,"configId":id,"value":{"value":value}}),
-                    )
-                })
-            })
-            .collect(),
-        _ => {
-            let _ = request.respond_to.send(Err(AppError::Unsupported(
-                "Grok does not expose native prompt queue controls".to_owned(),
-            )));
+    let mut commands = match control_commands(provider, &request, session_id) {
+        Ok(commands) => commands,
+        Err(error) => {
+            let _ = request.respond_to.send(Err(error));
             return Ok(());
         }
     };
@@ -619,6 +638,73 @@ async fn start_live_control(
     Ok(())
 }
 
+fn control_commands(
+    provider: ProviderKind,
+    request: &PendingProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
+    if provider == ProviderKind::Devin {
+        return devin_control_commands(&request.control, session_id);
+    }
+    match &request.control {
+        ProviderControl::Steer { text } => Ok(vec![(
+            "_x.ai/interject".to_owned(),
+            json!({"sessionId":session_id,"text":text,"interjectionId":request.request_id}),
+        )]),
+        ProviderControl::Configure {
+            model,
+            reasoning_effort,
+        } => Ok([("model", model), ("reasoning_effort", reasoning_effort)]
+            .into_iter()
+            .filter_map(|(id, value)| {
+                value.as_ref().map(|value| {
+                    (
+                        "session/set_config_option".to_owned(),
+                        json!({"sessionId":session_id,"configId":id,"value":{"value":value}}),
+                    )
+                })
+            })
+            .collect()),
+        _ => Err(AppError::Unsupported(
+            "Grok does not expose native prompt queue controls".to_owned(),
+        )),
+    }
+}
+
+fn devin_control_commands(
+    control: &ProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
+    match control {
+        ProviderControl::Configure {
+            model,
+            reasoning_effort,
+        } => {
+            if reasoning_effort.is_some() {
+                return Err(AppError::Unsupported(
+                    "Devin does not expose a separate reasoning effort control; choose a model variant"
+                        .to_owned(),
+                ));
+            }
+            Ok(model
+                .as_ref()
+                .map(|value| {
+                    vec![(
+                        "session/set_config_option".to_owned(),
+                        json!({"sessionId":session_id,"configId":"model","value":value}),
+                    )]
+                })
+                .unwrap_or_default())
+        }
+        ProviderControl::Steer { .. } => Err(AppError::Unsupported(
+            "Devin does not expose mid-turn steering over ACP".to_owned(),
+        )),
+        _ => Err(AppError::Unsupported(
+            "Devin does not expose native prompt queue controls".to_owned(),
+        )),
+    }
+}
+
 async fn complete_live_control(
     process: &mut JsonLineProcess,
     message: Value,
@@ -626,13 +712,15 @@ async fn complete_live_control(
     sink: &DriverEventSink,
     pending: &mut BTreeMap<String, LiveAcpControl>,
     connection: &mut AcpConnectionState,
+    provider: ProviderKind,
 ) -> Result<(), AppError> {
     if let Some(error) = message.get("error") {
         let _ = control
             .request
             .respond_to
             .send(Err(AppError::InvalidRequest(format!(
-                "Grok control rejected: {}",
+                "{} control rejected: {}",
+                provider.as_str(),
                 safe_error_text(error)
             ))));
         return Ok(());
@@ -641,12 +729,14 @@ async fn complete_live_control(
         let _ = control
             .request
             .respond_to
-            .send(Err(AppError::ProviderUnavailable(
-                "Grok control response has no result; outcome is unknown".to_owned(),
-            )));
-        return Err(AppError::ProviderUnavailable(
-            "Grok control response has no result".to_owned(),
-        ));
+            .send(Err(AppError::ProviderUnavailable(format!(
+                "{} control response has no result; outcome is unknown",
+                provider.as_str()
+            ))));
+        return Err(AppError::ProviderUnavailable(format!(
+            "{} control response has no result",
+            provider.as_str()
+        )));
     };
     if let Some(config) = result.get("configOptions") {
         if let Some((_, response)) = &mut connection.session {
@@ -654,7 +744,7 @@ async fn complete_live_control(
         }
     }
     if let Some(effective) = result.get("configOptions").and_then(config_effective) {
-        sink.emit("turn.configuration", json!({"provider":"grok-build","source":"provider-confirmed","effectiveConfig":effective,"effectiveFrom":"next-safe-point"})).await?;
+        sink.emit("turn.configuration", json!({"provider":provider.as_str(),"source":"provider-confirmed","effectiveConfig":effective,"effectiveFrom":"next-safe-point"})).await?;
     }
     if !control.remaining.is_empty() {
         let (method, params) = control.remaining.remove(0);
@@ -685,7 +775,10 @@ async fn complete_live_control(
     let unknown_steer = matches!(control.request.control, ProviderControl::Steer { .. })
         && result.get("status").and_then(Value::as_str) != Some("queued");
     if missing_effective || unknown_steer {
-        let message = "Grok control acknowledgement does not confirm its effective result";
+        let message = format!(
+            "{} control acknowledgement does not confirm its effective result",
+            provider.as_str()
+        );
         let _ = control
             .request
             .respond_to
@@ -723,6 +816,7 @@ fn config_effective(options: &Value) -> Option<Value> {
         let key = match option.get("id").and_then(Value::as_str) {
             Some("model") => "model",
             Some("reasoning_effort") => "reasoningEffort",
+            Some("mode") => "mode",
             _ => continue,
         };
         if let Some(value) = option
@@ -781,6 +875,22 @@ async fn emit_prompt_metadata(
     sink.emit("provider.event", json!({
         "provider": provider.as_str(), "providerMethod": "session/prompt/result", "metadata": metadata,
     })).await?;
+    if provider == ProviderKind::Devin {
+        if let Some(usage) = message
+            .pointer("/result/usage")
+            .filter(|value| value.is_object())
+        {
+            sink.emit(
+                "usage.updated",
+                json!({
+                    "provider": provider.as_str(), "source": "provider", "scope": "turn",
+                    "aggregation": "snapshot", "final": true,
+                    "usage": normalize_devin_usage(usage), "metadata": metadata,
+                }),
+            )
+            .await?;
+        }
+    }
     if provider == ProviderKind::GrokBuild {
         if let Some(usage) = metadata
             .get("usage")
@@ -1111,9 +1221,25 @@ pub(super) async fn handle_acp_message(
                 "turn.configuration",
                 json!({"provider":provider_id,"source":"provider-confirmed","effectiveConfig":update.get("configOptions").and_then(config_effective),"metadata":update}),
             ),
-            "available_commands_update" if provider == ProviderKind::GrokBuild => (
-                "provider.commands.updated",
-                json!({ "provider": provider_id, "commands": super::grok::parse_commands(&json!({"_meta":{"availableCommands":update.get("availableCommands")}})), "metadata":update }),
+            "available_commands_update"
+                if matches!(provider, ProviderKind::GrokBuild | ProviderKind::Devin) =>
+            {
+                (
+                    "provider.commands.updated",
+                    json!({ "provider": provider_id, "commands": super::grok::parse_commands(&json!({"_meta":{"availableCommands":update.get("availableCommands")}})), "metadata":update }),
+                )
+            }
+            "usage_update" if provider == ProviderKind::Devin => (
+                "usage.updated",
+                json!({ "provider": provider_id, "source": "provider", "scope": "turn",
+                    "aggregation": "snapshot", "final": false,
+                    "usage": normalize_devin_usage(&update), "metadata": update }),
+            ),
+            "current_mode_update" if provider == ProviderKind::Devin => (
+                "turn.configuration",
+                json!({ "provider": provider_id, "source": "provider-confirmed",
+                    "effectiveConfig": { "mode": update.get("currentModeId"), "source": "provider-confirmed" },
+                    "effectiveFrom": "current-turn", "metadata": update }),
             ),
             "user_message_chunk" => return Ok(()),
             _ => (
@@ -1273,6 +1399,28 @@ fn normalize_grok_usage(raw: &Value, response: bool) -> Value {
         }
     }
     json!({"last":last, "cacheSemantics":"included", "raw":raw})
+}
+
+/// Devin reports turn usage both as `usage_update` notifications (used/size
+/// plus `_meta["cognition.ai/inputTokens"]` etc.) and as a flat `usage` object
+/// on the prompt response. Normalize both shapes into one summary.
+fn normalize_devin_usage(raw: &Value) -> Value {
+    let meta = raw.get("_meta").cloned().unwrap_or(Value::Null);
+    let pick = |keys: &[&str]| -> Option<Value> {
+        keys.iter().find_map(|key| {
+            raw.get(*key)
+                .or_else(|| meta.get(*key))
+                .or_else(|| meta.get(format!("cognition.ai/{key}")))
+                .cloned()
+        })
+    };
+    json!({
+        "input": pick(&["inputTokens", "input_tokens", "input"]),
+        "output": pick(&["outputTokens", "output_tokens", "output"]),
+        "total": pick(&["totalTokens", "total_tokens", "total", "used"]),
+        "contextWindow": pick(&["size", "contextWindow", "contextTokens"]),
+        "raw": raw,
+    })
 }
 
 fn grok_activity_event(params: &Value) -> Option<(&'static str, Value)> {
@@ -1603,24 +1751,23 @@ async fn authenticate_if_requested(
     if !options.authenticate {
         return Ok(());
     }
-    let Some(selected) = select_headless_auth_method(initialize, options.auth_method.as_deref())?
+    let Some(selected) = select_auth_method(initialize, options.auth_method.as_deref(), provider)?
     else {
         return Ok(());
     };
-    send_request(
-        process,
-        "authenticate",
-        "authenticate",
-        json!({ "methodId": selected, "_meta": { "headless": true } }),
-    )
-    .await?;
+    let mut params = json!({ "methodId": selected });
+    if let Some(meta) = &options.auth_meta {
+        params["_meta"] = meta.clone();
+    }
+    send_request(process, "authenticate", "authenticate", params).await?;
     wait_for_response(process, "authenticate", sink, cancel, provider, true).await?;
     Ok(())
 }
 
-pub(super) fn select_headless_auth_method(
+pub(super) fn select_auth_method(
     initialize: &Value,
     configured: Option<&str>,
+    provider: ProviderKind,
 ) -> Result<Option<String>, AppError> {
     let advertised = initialize
         .get("authMethods")
@@ -1632,6 +1779,9 @@ pub(super) fn select_headless_auth_method(
     if advertised.is_empty() {
         return Ok(None);
     }
+    let configured = configured
+        .map(str::trim)
+        .filter(|method| !method.is_empty());
     let selected = configured
         .or_else(|| {
             initialize
@@ -1641,14 +1791,18 @@ pub(super) fn select_headless_auth_method(
         .or_else(|| advertised.contains(&"cached_token").then_some("cached_token"))
         .or_else(|| (advertised.len() == 1).then_some(advertised[0]))
         .ok_or_else(|| {
-            AppError::ProviderUnavailable("grok-build advertised multiple authentication methods but no default; configure agent.grok_auth_method".to_owned())
+            AppError::ProviderUnavailable(format!(
+                "{} advertised multiple authentication methods but no default; configure an auth method",
+                provider.as_str()
+            ))
         })?;
     if !advertised.contains(&selected) {
         return Err(AppError::ProviderUnavailable(format!(
-            "authentication method '{selected}' is not advertised by grok-build"
+            "authentication method '{selected}' is not advertised by {}",
+            provider.as_str()
         )));
     }
-    if !is_grok_headless_auth_method(selected) {
+    if provider == ProviderKind::GrokBuild && !is_grok_headless_auth_method(selected) {
         return Err(AppError::ProviderUnavailable(format!(
             "authentication method '{selected}' requires interaction; run `grok login` first or configure XAI_API_KEY"
         )));
@@ -1680,11 +1834,15 @@ async fn apply_requested_config(
         apply_legacy_model_config(process, legacy_models, prompt, sink, cancel, context).await?;
         return Ok(None);
     }
-    let mut current_options = options.map(<[SessionConfigOption]>::to_vec);
-    for (config_id, requested) in [
+    let mut requested_configs = vec![
         ("model", prompt.model.as_deref()),
         ("reasoning_effort", prompt.reasoning_effort.as_deref()),
-    ] {
+    ];
+    if context.provider == ProviderKind::Devin {
+        requested_configs.push(("mode", devin_session_mode(prompt)));
+    }
+    let mut current_options = options.map(<[SessionConfigOption]>::to_vec);
+    for (config_id, requested) in requested_configs {
         let Some(requested) = requested else {
             continue;
         };
@@ -1731,6 +1889,20 @@ async fn apply_requested_config(
         }
     }
     Ok(current_options)
+}
+
+/// Devin session modes map the product permission modes onto its native
+/// ask / accept-edits / plan / bypass selector. Plan work always wins.
+fn devin_session_mode(prompt: &DriverPrompt) -> Option<&'static str> {
+    if prompt.work_mode.as_deref() == Some("plan") {
+        return Some("plan");
+    }
+    match prompt.permission_mode.as_deref() {
+        Some("ask") => Some("ask"),
+        Some("auto") => Some("accept-edits"),
+        Some("full-access") => Some("bypass"),
+        _ => None,
+    }
 }
 
 fn config_option_wire_value(requested: &str, nested: bool) -> Value {
@@ -1917,6 +2089,83 @@ fn safe_error_text(error: &Value) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn devin_session_mode_maps_permission_and_work_modes() {
+        let mut prompt = image_prompt();
+        prompt.permission_mode = Some("ask".to_owned());
+        assert_eq!(devin_session_mode(&prompt), Some("ask"));
+        prompt.permission_mode = Some("auto".to_owned());
+        assert_eq!(devin_session_mode(&prompt), Some("accept-edits"));
+        prompt.permission_mode = Some("full-access".to_owned());
+        assert_eq!(devin_session_mode(&prompt), Some("bypass"));
+        prompt.permission_mode = None;
+        assert_eq!(devin_session_mode(&prompt), None);
+        prompt.permission_mode = Some("auto".to_owned());
+        prompt.work_mode = Some("plan".to_owned());
+        assert_eq!(devin_session_mode(&prompt), Some("plan"));
+    }
+
+    #[test]
+    fn devin_usage_normalizes_notifications_and_prompt_results() {
+        let update = json!({
+            "used": 12466, "size": 262000,
+            "_meta": {
+                "cognition.ai/inputTokens": 12422,
+                "cognition.ai/outputTokens": 44
+            }
+        });
+        let usage = normalize_devin_usage(&update);
+        assert_eq!(usage["input"], 12422);
+        assert_eq!(usage["output"], 44);
+        assert_eq!(usage["total"], 12466);
+        assert_eq!(usage["contextWindow"], 262000);
+
+        let result = json!({"totalTokens": 12466, "inputTokens": 12422, "outputTokens": 44});
+        let usage = normalize_devin_usage(&result);
+        assert_eq!(usage["input"], 12422);
+        assert_eq!(usage["total"], 12466);
+        assert!(usage["contextWindow"].is_null());
+    }
+
+    #[test]
+    fn devin_controls_use_plain_string_config_values() {
+        let commands = devin_control_commands(
+            &ProviderControl::Configure {
+                model: Some("claude-opus-5-low".to_owned()),
+                reasoning_effort: None,
+            },
+            "devin-native",
+        )
+        .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].0, "session/set_config_option");
+        assert_eq!(commands[0].1["configId"], "model");
+        assert_eq!(commands[0].1["value"], "claude-opus-5-low");
+        assert!(matches!(
+            devin_control_commands(
+                &ProviderControl::Steer {
+                    text: "redirect".to_owned()
+                },
+                "devin-native"
+            ),
+            Err(AppError::Unsupported(_))
+        ));
+        assert!(matches!(
+            devin_control_commands(
+                &ProviderControl::Configure {
+                    model: None,
+                    reasoning_effort: Some("high".to_owned())
+                },
+                "devin-native"
+            ),
+            Err(AppError::Unsupported(_))
+        ));
+        assert!(matches!(
+            devin_control_commands(&ProviderControl::QueueList, "devin-native"),
+            Err(AppError::Unsupported(_))
+        ));
+    }
+
     fn image_prompt() -> DriverPrompt {
         DriverPrompt {
             turn_id: "turn-1".to_owned(),
@@ -2033,6 +2282,76 @@ mod tests {
         assert!(!is_grok_headless_auth_method("grok.com"));
         assert!(!is_grok_headless_auth_method("oidc"));
         assert!(!is_grok_headless_auth_method("future-browser-flow"));
+    }
+
+    #[test]
+    fn acp_profile_auth_method_selects_single_advertised_method() {
+        let initialize = json!({ "authMethods": [{ "id": "devin-browser" }] });
+        assert_eq!(
+            select_auth_method(&initialize, None, ProviderKind::Acp)
+                .unwrap()
+                .as_deref(),
+            Some("devin-browser")
+        );
+    }
+
+    #[test]
+    fn acp_profile_auth_method_honors_configured_choice() {
+        let initialize = json!({ "authMethods": [{ "id": "a" }, { "id": "b" }] });
+        assert_eq!(
+            select_auth_method(&initialize, Some("b"), ProviderKind::Acp)
+                .unwrap()
+                .as_deref(),
+            Some("b")
+        );
+        assert!(matches!(
+            select_auth_method(&initialize, None, ProviderKind::Acp),
+            Err(AppError::ProviderUnavailable(message)) if message.contains("multiple authentication methods")
+        ));
+        assert!(matches!(
+            select_auth_method(&initialize, Some("missing"), ProviderKind::Acp),
+            Err(AppError::ProviderUnavailable(message)) if message.contains("not advertised")
+        ));
+        assert_eq!(
+            select_auth_method(&json!({}), Some("a"), ProviderKind::Acp).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn acp_profile_runtime_options_resolve_api_key_from_profile_env() {
+        let profile = AcpProfileConfig {
+            command: "devin".to_owned(),
+            args: vec!["acp".to_owned()],
+            env: BTreeMap::from([("TODEX_TEST_ACP_KEY_3f9b1c".to_owned(), "secret".to_owned())]),
+            auth_method: None,
+            api_key_env: Some("TODEX_TEST_ACP_KEY_3f9b1c".to_owned()),
+        };
+        let options = profile_runtime_options(&profile).unwrap();
+        assert!(options.authenticate);
+        assert_eq!(options.auth_meta, Some(json!({ "api_key": "secret" })));
+    }
+
+    #[test]
+    fn acp_profile_runtime_options_require_configured_api_key_env() {
+        let profile = AcpProfileConfig {
+            command: "devin".to_owned(),
+            args: vec!["acp".to_owned()],
+            env: BTreeMap::new(),
+            auth_method: None,
+            api_key_env: Some("TODEX_TEST_ACP_MISSING_7c2d4e".to_owned()),
+        };
+        assert!(matches!(
+            profile_runtime_options(&profile),
+            Err(AppError::ProviderUnavailable(message)) if message.contains("api_key_env")
+        ));
+        let profile = AcpProfileConfig {
+            api_key_env: None,
+            ..profile
+        };
+        let options = profile_runtime_options(&profile).unwrap();
+        assert!(!options.authenticate);
+        assert_eq!(options.auth_meta, None);
     }
 
     #[test]

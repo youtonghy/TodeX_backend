@@ -75,9 +75,11 @@ impl GrokBuildDriver {
         process: &mut JsonLineProcess,
         initialize: &Value,
     ) -> Result<(), AppError> {
-        if let Some(method) =
-            super::acp::select_headless_auth_method(initialize, self.auth_method.as_deref())?
-        {
+        if let Some(method) = super::acp::select_auth_method(
+            initialize,
+            self.auth_method.as_deref(),
+            ProviderKind::GrokBuild,
+        )? {
             control_request(
                 process,
                 "authenticate",
@@ -323,6 +325,7 @@ impl ProviderDriver for GrokBuildDriver {
                 let runtime = AcpRuntimeOptions {
                     authenticate: true,
                     auth_method: self.auth_method.clone(),
+                    auth_meta: Some(json!({ "headless": true })),
                     suppress_load_replay: true,
                     allow_cli_config_fallback: true,
                     request_ask_mode: true,
