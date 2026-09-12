@@ -42,6 +42,7 @@ pub struct DevinDriver {
     binary: String,
     auth_method: Option<String>,
     api_key_env: Option<String>,
+    cli_credentials: bool,
     env_allowlist: Vec<String>,
     sessions: Mutex<HashMap<String, DevinSessionHandle>>,
     discovery: Mutex<HashMap<PathBuf, DiscoverySnapshot>>,
@@ -71,6 +72,7 @@ impl DevinDriver {
             binary: config.devin_bin.clone(),
             auth_method: config.devin_auth_method.clone(),
             api_key_env: config.devin_api_key_env.clone(),
+            cli_credentials: cli_credentials_enabled(),
             env_allowlist: config.devin_env_allowlist.clone(),
             sessions: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
@@ -87,24 +89,30 @@ impl DevinDriver {
     /// `devin acp` intentionally ignores local CLI credentials; the host must
     /// authenticate every ACP process. An API key goes through `_meta.api_key`
     /// (headless); without one the advertised browser method runs a PKCE flow.
+    /// The key resolves from the configured environment variable first, then
+    /// from the `windsurf_api_key` written by `devin auth login` when
+    /// `devin_cli_credentials` is enabled.
     fn api_key(&self) -> Result<Option<String>, AppError> {
-        let Some(name) = self
+        if let Some(name) = self
             .api_key_env
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
-        else {
-            return Ok(None);
-        };
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(Some)
-            .ok_or_else(|| {
-                AppError::ProviderUnavailable(format!(
-                    "Devin API key environment variable '{name}' is not set"
-                ))
-            })
+        {
+            return std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(Some)
+                .ok_or_else(|| {
+                    AppError::ProviderUnavailable(format!(
+                        "Devin API key environment variable '{name}' is not set"
+                    ))
+                });
+        }
+        if self.cli_credentials {
+            return Ok(cli_credentials_path().and_then(|path| cli_credentials_key(&path)));
+        }
+        Ok(None)
     }
 
     fn auth_params(&self, initialize: &Value) -> Result<Option<Value>, AppError> {
@@ -632,7 +640,7 @@ fn valid_env_name(value: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn parse_devin_models(session: &Value) -> Vec<ProviderModelDescriptor> {
+pub(super) fn parse_devin_models(session: &Value) -> Vec<ProviderModelDescriptor> {
     let option = session
         .get("configOptions")
         .and_then(Value::as_array)
@@ -673,6 +681,40 @@ fn parse_devin_models(session: &Value) -> Vec<ProviderModelDescriptor> {
             })
         })
         .collect()
+}
+
+/// `devin acp` ignores `devin auth login` credentials by design; TodeX opts
+/// back in so an existing CLI login authenticates ACP sessions headlessly.
+/// Set `TODEX_AGENTD_DEVIN_CLI_CREDENTIALS=false` to require explicit key or
+/// browser authentication instead.
+fn cli_credentials_enabled() -> bool {
+    match std::env::var("TODEX_AGENTD_DEVIN_CLI_CREDENTIALS") {
+        Ok(value) => !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// The fixed credentials store written by `devin auth login`
+/// (`~/.local/share/devin/credentials.toml`).
+fn cli_credentials_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".local/share/devin/credentials.toml"))
+}
+
+fn cli_credentials_key(path: &Path) -> Option<String> {
+    let document = std::fs::read_to_string(path)
+        .ok()?
+        .parse::<toml::Value>()
+        .ok()?;
+    document
+        .get("windsurf_api_key")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn parse_devin_commands(updates: &[Value]) -> Vec<ProviderCommandDescriptor> {
@@ -771,6 +813,7 @@ mod tests {
             binary: "devin".to_owned(),
             auth_method: None,
             api_key_env: None,
+            cli_credentials: false,
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
@@ -783,6 +826,7 @@ mod tests {
                 binary: "devin".to_owned(),
                 auth_method: None,
                 api_key_env: None,
+                cli_credentials: false,
                 env_allowlist: Vec::new(),
                 sessions: Mutex::new(HashMap::new()),
                 discovery: Mutex::new(HashMap::new()),
@@ -804,6 +848,7 @@ mod tests {
             binary: "devin".to_owned(),
             auth_method: None,
             api_key_env: None,
+            cli_credentials: false,
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
@@ -836,6 +881,7 @@ mod tests {
             binary: "definitely-missing-devin-binary".to_owned(),
             auth_method: None,
             api_key_env: None,
+            cli_credentials: false,
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
@@ -863,5 +909,26 @@ mod tests {
         let models = driver.discover_models(&workspace).await.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "swe-2-high");
+    }
+
+    #[test]
+    fn cli_credentials_key_reads_windsurf_api_key() {
+        let path =
+            std::env::temp_dir().join(format!("todex-devin-creds-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "windsurf_api_key = \"test-key-123\"\napi_server_url = \"https://example\"\n",
+        )
+        .unwrap();
+        assert_eq!(cli_credentials_key(&path).as_deref(), Some("test-key-123"));
+        std::fs::write(&path, "windsurf_api_key = \"\"\n").unwrap();
+        assert_eq!(cli_credentials_key(&path), None);
+        std::fs::write(&path, "not = [valid").unwrap();
+        assert_eq!(cli_credentials_key(&path), None);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            cli_credentials_key(Path::new("/missing/credentials.toml")),
+            None
+        );
     }
 }

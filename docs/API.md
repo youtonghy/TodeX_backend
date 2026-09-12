@@ -45,7 +45,8 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 | Grok Build 环境白名单 | 无 | `TODEX_AGENTD_GROK_ENV_ALLOWLIST` | Grok 配置变量与 `XAI_API_KEY` |
 | Devin 可执行文件 | 无 | `TODEX_AGENTD_DEVIN_BIN` | `devin` |
 | Devin 认证方法 | 无 | `TODEX_AGENTD_DEVIN_AUTH_METHOD` | 上游默认方法 |
-| Devin API key 环境变量 | 无 | `TODEX_AGENTD_DEVIN_API_KEY_ENV` | 无（交互授权） |
+| Devin API key 环境变量 | 无 | `TODEX_AGENTD_DEVIN_API_KEY_ENV` | 无（回退到 CLI 登录凭据） |
+| Devin CLI 凭据回退 | 无 | `TODEX_AGENTD_DEVIN_CLI_CREDENTIALS` | `true` |
 | Devin 环境白名单 | 无 | `TODEX_AGENTD_DEVIN_ENV_ALLOWLIST` | `DEVIN_API_KEY`、`DEVIN_MODEL`、`WINDSURF_API_KEY` 等 |
 | 默认 agent 名称 | 无 | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` |
 | 是否开启认证 | 无 | `TODEX_AGENTD_ENABLE_AUTH` | `true` |
@@ -62,7 +63,7 @@ Provider 标识为 `acp`、`codex`、`pi`、`claude-code`、`grok-build`、`devi
 
 Provider 子进程只继承运行所需的基础系统环境；ACP 额外使用管理员在 profile 中明确配置的 env。Codex、Pi、Claude Code 和 Grok Build 应先由运行 daemon 的同一系统用户完成原生登录。Grok Build 也可通过白名单传入 `XAI_API_KEY`；daemon 不会启动浏览器/OIDC 交互认证。Grok 的工具授权、提问、计划审批和 MCP elicitation 会转换为 TodeX `permission.requested`，客户端按服务器提供的 `optionId` 和 `kind` 回复。Pi 只有全自动执行模式：工作区获得 TodeX 信任后以 `--approve` 启动，工具与项目扩展按 daemon 用户权限运行。Pi 没有通用逐工具审批或 OS sandbox，因此 `permissions` capability 为 `false`；extension UI 请求仍可转成交互事件，但不能把它等同于工具授权。
 
-Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。Devin 在 ACP 模式下有意不读取本地 CLI 登录态，daemon 会在每个 ACP 进程启动时执行 `authenticate`：配置 `devin_api_key_env` 后以 `_meta.api_key` 无头认证（不会写入日志），否则按其声明的 `devin-browser` 方法走一次浏览器授权。权限模式映射到 Devin 原生会话模式：`ask`→`ask`、`auto`→`accept-edits`、`full-access`→`bypass`，plan 工作模式→`plan`；其中 `ask` 在 Devin 语义下是只读问答，比其它 provider 的“先询问再执行”更严格。模型目录与 slash 命令通过真实 ACP 会话探测（探测会话随后调用 `session/delete` 清理，结果按工作区缓存约 5 分钟，避免客户端刷新反复触发认证）。Devin 支持会话内切换模型（`configure` live control），不支持独立的 reasoning effort——档位编码在模型 ID（如 `claude-opus-5-low`/`-fast`）中。
+Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。`devin acp` 自身有意不读取本地 CLI 登录态，daemon 会在每个 ACP 进程启动时执行 `authenticate`：优先以 `devin_api_key_env` 指定的环境变量值作为 `_meta.api_key` 无头认证（不会写入日志），未配置时默认回退读取 `devin auth login` 写入的 `~/.local/share/devin/credentials.toml` 中的 `windsurf_api_key`（`TODEX_AGENTD_DEVIN_CLI_CREDENTIALS=false` 可禁用），再否则按其声明的 `devin-browser` 方法走一次浏览器授权。权限模式映射到 Devin 原生会话模式：`ask`→`ask`、`auto`→`accept-edits`、`full-access`→`bypass`，plan 工作模式→`plan`；其中 `ask` 在 Devin 语义下是只读问答，比其它 provider 的“先询问再执行”更严格。模型目录与 slash 命令通过真实 ACP 会话探测（探测会话随后调用 `session/delete` 清理，结果按工作区缓存约 5 分钟，避免客户端刷新反复触发认证）。Devin 支持会话内切换模型（`configure` live control），不支持独立的 reasoning effort——档位编码在模型 ID（如 `claude-opus-5-low`/`-fast`）中。
 
 ```http
 GET /v2/providers
