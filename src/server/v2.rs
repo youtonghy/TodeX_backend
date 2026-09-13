@@ -936,6 +936,33 @@ fn mime_for_name(name: &str) -> String {
         || lower.ends_with(".yaml")
         || lower.ends_with(".yml")
         || lower.ends_with(".sh")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".swift")
+        || lower.ends_with(".m")
+        || lower.ends_with(".mm")
+        || lower.ends_with(".h")
+        || lower.ends_with(".hpp")
+        || lower.ends_with(".java")
+        || lower.ends_with(".kt")
+        || lower.ends_with(".kts")
+        || lower.ends_with(".rb")
+        || lower.ends_with(".php")
+        || lower.ends_with(".cs")
+        || lower.ends_with(".lua")
+        || lower.ends_with(".pl")
+        || lower.ends_with(".pm")
+        || lower.ends_with(".scala")
+        || lower.ends_with(".hs")
+        || lower.ends_with(".ml")
+        || lower.ends_with(".mli")
+        || lower.ends_with(".vim")
+        || lower.ends_with(".sql")
+        || lower.ends_with(".r")
+        || lower.ends_with(".dart")
+        || lower.ends_with(".xml")
+        || lower.ends_with(".plist")
+        || lower.ends_with(".diff")
+        || lower.ends_with(".patch")
     {
         "text/plain"
     } else {
@@ -3906,6 +3933,34 @@ mod tests {
         assert_eq!(file_json["text"], "# readme");
         assert!(file_json.get("dataUrl").is_none());
 
+        for (name, text) in [
+            ("notes.txt", "plain notes"),
+            ("Sources/App.swift", "struct App {}"),
+            ("script.rb", "puts 'hi'"),
+        ] {
+            let path = workspace.join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, text).unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v2/workspace/file?path={}", path.display()))
+                        .header("authorization", auth)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["mimeType"], "text/plain");
+            assert_eq!(value["text"], text);
+        }
+
         let preview_request = |path: &Path, authenticated: bool| {
             let mut builder =
                 Request::builder().uri(format!("/v2/workspace/file?path={}", path.display()));
@@ -3978,19 +4033,20 @@ mod tests {
 
         // Source files whose extension is not in the MIME whitelist still
         // preview as text, while non-UTF-8 payloads stay unpreviewable.
-        let swift = workspace.join("Package.swift");
-        fs::write(&swift, "// swift-tools-version: 6.0\n").unwrap();
-        let swift_response = app
+        let brewfile = workspace.join("Brewfile");
+        fs::write(&brewfile, "brew \"ripgrep\"\n").unwrap();
+        let brewfile_response = app
             .clone()
-            .oneshot(preview_request(&swift, true))
+            .oneshot(preview_request(&brewfile, true))
             .await
             .unwrap();
-        assert_eq!(swift_response.status(), StatusCode::OK);
-        let swift_body = to_bytes(swift_response.into_body(), 1024 * 1024)
+        assert_eq!(brewfile_response.status(), StatusCode::OK);
+        let brewfile_body = to_bytes(brewfile_response.into_body(), 1024 * 1024)
             .await
             .unwrap();
-        let swift_json: serde_json::Value = serde_json::from_slice(&swift_body).unwrap();
-        assert_eq!(swift_json["text"], "// swift-tools-version: 6.0\n");
+        let brewfile_json: serde_json::Value = serde_json::from_slice(&brewfile_body).unwrap();
+        assert_eq!(brewfile_json["mimeType"], "application/octet-stream");
+        assert_eq!(brewfile_json["text"], "brew \"ripgrep\"\n");
         let binary = workspace.join("preview.bin");
         fs::write(&binary, [0x00u8, 0x9f, 0x92, 0x96, 0xff]).unwrap();
         let binary_response = app

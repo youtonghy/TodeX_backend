@@ -306,7 +306,7 @@ GET /v2/workspace/entries?cwd=/home/user/projects/demo&query=routes&limit=40
 GET /v2/workspace/file?path=/home/user/projects/demo/README.md
 ```
 
-路径必须是 `workspace_root` 内的绝对路径且指向文件，超过 1 MiB 拒绝预览。响应包含 `name`、`path`、`mimeType`、`sizeBytes`，文本类型附带 `text` 内容。
+路径必须是 `workspace_root` 内的绝对路径且指向文件。文本超过 1 MiB、图片超过 8 MiB 拒绝预览。响应包含 `name`、`path`、`mimeType`、`sizeBytes`；任何可解码为 UTF-8 的非图片文件都附带 `text` 内容（`mimeType` 仍按扩展名白名单分类），图片附带 `dataUrl`。保存（`PUT` 文本写回）仅限 `text/*` 与 `application/json` 类型。
 
 ### Git 扫描与操作
 
