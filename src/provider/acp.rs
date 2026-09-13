@@ -3066,6 +3066,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn tool_updates_retain_call_details() {
         let root =
