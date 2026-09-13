@@ -47,6 +47,8 @@ pub struct WorkspaceRecord {
     pub local_adapter_state: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -298,6 +300,7 @@ mod tests {
                     local_adapter_state: Some("idle".to_owned()),
                     created_at: 10,
                     updated_at: 20,
+                    sort_order: Some(3),
                 }],
             )
             .await
@@ -321,6 +324,7 @@ mod tests {
                 .display()
                 .to_string()
         );
+        assert_eq!(reloaded.workspaces[0].sort_order, Some(3));
         assert!(reloaded.updated_at > 0);
 
         let _ = fs::remove_dir_all(root);
@@ -352,6 +356,7 @@ mod tests {
             local_adapter_state: None,
             created_at: 10,
             updated_at: 20,
+            sort_order: None,
         };
 
         let snapshot = store

@@ -245,6 +245,7 @@ mod tests {
             local_adapter_state: None,
             created_at: 1,
             updated_at: 1,
+            sort_order: None,
         }
     }
 }
