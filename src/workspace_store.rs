@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{error::AppError, workspace_paths::validate_workspace_directory_text};
@@ -49,6 +50,30 @@ pub struct WorkspaceRecord {
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<i64>,
+}
+
+/// A workspace record rejected during normalization (for example because its
+/// directory no longer exists on disk).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectedWorkspace {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceMerge {
+    pub snapshot: WorkspaceSnapshot,
+    pub rejected: Vec<RejectedWorkspace>,
+}
+
+#[derive(Default)]
+struct NormalizedWorkspaces {
+    workspaces: Vec<WorkspaceRecord>,
+    rejected: Vec<RejectedWorkspace>,
 }
 
 #[derive(Clone)]
@@ -106,8 +131,15 @@ impl WorkspaceStore {
         &self,
         owner_id: &str,
         workspaces: Vec<WorkspaceRecord>,
-    ) -> Result<WorkspaceSnapshot, AppError> {
-        let incoming = normalize_workspaces(workspaces, &self.workspace_root, Some(owner_id))?;
+    ) -> Result<WorkspaceMerge, AppError> {
+        let normalized = normalize_workspaces(workspaces, &self.workspace_root, Some(owner_id));
+        if normalized.workspaces.is_empty() && !normalized.rejected.is_empty() {
+            let first = &normalized.rejected[0];
+            return Err(AppError::InvalidRequest(format!(
+                "workspace \"{}\" at {} was rejected: {}",
+                first.name, first.path, first.message
+            )));
+        }
         let mut current = self.inner.write().await;
         let mut by_id = current
             .workspaces
@@ -119,14 +151,14 @@ impl WorkspaceStore {
                 )
             })
             .collect::<HashMap<_, _>>();
-        for workspace in incoming {
+        for workspace in normalized.workspaces {
             by_id.insert(
                 (workspace.tenant_id.clone(), workspace.id.clone()),
                 workspace,
             );
         }
         let mut workspaces = by_id.into_values().collect::<Vec<_>>();
-        workspaces.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        workspaces.sort_by_key(|workspace| std::cmp::Reverse(workspace.updated_at));
         let snapshot = WorkspaceSnapshot {
             workspaces,
             updated_at: now_millis(),
@@ -134,7 +166,10 @@ impl WorkspaceStore {
         write_snapshot(&self.path, &snapshot).await?;
         *current = snapshot.clone();
         drop(current);
-        Ok(self.snapshot_owned(owner_id).await)
+        Ok(WorkspaceMerge {
+            snapshot: self.snapshot_owned(owner_id).await,
+            rejected: normalized.rejected,
+        })
     }
 
     pub async fn delete_owned(&self, owner_id: &str, workspace_id: &str) -> Result<bool, AppError> {
@@ -166,10 +201,19 @@ async fn load_snapshot(path: &Path, workspace_root: &Path) -> Result<WorkspaceSn
     }
 
     let mut snapshot: WorkspaceSnapshot = serde_json::from_str(&text)?;
-    snapshot.workspaces = normalize_workspaces(snapshot.workspaces, workspace_root, None)?;
+    let normalized = normalize_workspaces(snapshot.workspaces, workspace_root, None);
+    for rejected in &normalized.rejected {
+        warn!(
+            workspace_id = %rejected.id,
+            path = %rejected.path,
+            code = %rejected.code,
+            "stored workspace record skipped: {}", rejected.message
+        );
+    }
+    snapshot.workspaces = normalized.workspaces;
     snapshot
         .workspaces
-        .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        .sort_by_key(|workspace| std::cmp::Reverse(workspace.updated_at));
     Ok(snapshot)
 }
 
@@ -214,21 +258,24 @@ fn normalize_workspaces(
     workspaces: Vec<WorkspaceRecord>,
     workspace_root: &Path,
     owner_id: Option<&str>,
-) -> Result<Vec<WorkspaceRecord>, AppError> {
+) -> NormalizedWorkspaces {
     let mut normalized: HashMap<(String, String), WorkspaceRecord> =
         HashMap::with_capacity(workspaces.len());
+    let mut rejected = Vec::new();
     for mut workspace in workspaces {
-        if workspace.name.trim().is_empty() {
-            return Err(AppError::InvalidRequest(
-                "workspace name is required".to_owned(),
-            ));
-        }
-        if workspace.path.trim().is_empty() {
-            return Err(AppError::InvalidRequest(
-                "workspace path is required".to_owned(),
-            ));
-        }
-        let path = validate_workspace_directory_text(workspace_root, &workspace.path)?;
+        let path = match validate_workspace_record(workspace_root, &workspace) {
+            Ok(path) => path,
+            Err(error) => {
+                rejected.push(RejectedWorkspace {
+                    id: workspace.id,
+                    name: workspace.name,
+                    path: workspace.path,
+                    code: error.code().to_owned(),
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
         workspace.path = path.display().to_string();
         workspace.id = stable_workspace_id(&path);
         if let Some(owner_id) = owner_id {
@@ -245,7 +292,22 @@ fn normalize_workspaces(
             }
         }
     }
-    Ok(normalized.into_values().collect())
+    NormalizedWorkspaces {
+        workspaces: normalized.into_values().collect(),
+        rejected,
+    }
+}
+
+fn validate_workspace_record(
+    root: &Path,
+    workspace: &WorkspaceRecord,
+) -> Result<PathBuf, AppError> {
+    if workspace.name.trim().is_empty() {
+        return Err(AppError::InvalidRequest(
+            "workspace name is required".to_owned(),
+        ));
+    }
+    validate_workspace_directory_text(root, &workspace.path)
 }
 
 pub fn stable_workspace_id(path: &Path) -> String {
@@ -304,7 +366,8 @@ mod tests {
                 }],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .snapshot;
 
         assert_eq!(snapshot.workspaces.len(), 1);
 
@@ -362,7 +425,8 @@ mod tests {
         let snapshot = store
             .merge_owned("local", vec![workspace.clone(), workspace.clone()])
             .await
-            .unwrap();
+            .unwrap()
+            .snapshot;
 
         assert_eq!(snapshot.workspaces.len(), 1);
         assert_eq!(snapshot.workspaces[0].tenant_id, "local");
@@ -379,7 +443,8 @@ mod tests {
                 }],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .snapshot;
         assert_eq!(other_snapshot.workspaces.len(), 1);
         assert_eq!(other_snapshot.workspaces[0].tenant_id, "other");
         assert_eq!(store.snapshot_owned("local").await.workspaces.len(), 1);
@@ -389,6 +454,115 @@ mod tests {
         assert!(store.snapshot_owned("local").await.workspaces.is_empty());
         assert_eq!(store.snapshot_owned("other").await.workspaces.len(), 1);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn merge_skips_missing_workspace_paths_and_reports_rejections() {
+        let root = make_temp_dir("todex-workspace-store-partial");
+        let workspace_root = root.join("workspaces");
+        let workspace_path = workspace_root.join("app");
+        fs::create_dir_all(&workspace_path).unwrap();
+        let missing = workspace_root.join("gone");
+        let store = WorkspaceStore::new(root.clone(), workspace_root)
+            .await
+            .unwrap();
+
+        let merged = store
+            .merge_owned(
+                "local",
+                vec![
+                    test_record("App", &workspace_path),
+                    test_record("Gone", &missing),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(merged.snapshot.workspaces.len(), 1);
+        assert_eq!(merged.rejected.len(), 1);
+        assert_eq!(merged.rejected[0].name, "Gone");
+        assert_eq!(merged.rejected[0].path, missing.display().to_string());
+        assert_eq!(merged.rejected[0].code, "WORKSPACE_PATH_NOT_FOUND");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn merge_errors_when_every_workspace_is_rejected() {
+        let root = make_temp_dir("todex-workspace-store-allbad");
+        let workspace_root = root.join("workspaces");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let store = WorkspaceStore::new(root.clone(), workspace_root.clone())
+            .await
+            .unwrap();
+
+        let error = store
+            .merge_owned(
+                "local",
+                vec![test_record("Gone", &workspace_root.join("missing"))],
+            )
+            .await
+            .expect_err("all-invalid merge must fail");
+
+        assert!(matches!(error, AppError::InvalidRequest(_)));
+        assert!(store.snapshot_owned("local").await.workspaces.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn load_skips_stored_workspaces_with_missing_paths() {
+        let root = make_temp_dir("todex-workspace-store-stale");
+        let workspace_root = root.join("workspaces");
+        let workspace_path = workspace_root.join("app");
+        let stale_path = workspace_root.join("stale");
+        fs::create_dir_all(&workspace_path).unwrap();
+        fs::create_dir_all(&stale_path).unwrap();
+        let store = WorkspaceStore::new(root.clone(), workspace_root.clone())
+            .await
+            .unwrap();
+        store
+            .merge_owned(
+                "local",
+                vec![
+                    test_record("App", &workspace_path),
+                    test_record("Stale", &stale_path),
+                ],
+            )
+            .await
+            .unwrap();
+        drop(store);
+        fs::remove_dir_all(&stale_path).unwrap();
+
+        let reloaded = WorkspaceStore::new(root.clone(), workspace_root)
+            .await
+            .unwrap()
+            .snapshot_owned("local")
+            .await;
+
+        assert_eq!(reloaded.workspaces.len(), 1);
+        assert_eq!(reloaded.workspaces[0].name, "App");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_record(name: &str, path: &Path) -> WorkspaceRecord {
+        WorkspaceRecord {
+            id: format!("client-{name}"),
+            name: name.to_owned(),
+            path: path.display().to_string(),
+            session_id: String::new(),
+            tenant_id: "local".to_owned(),
+            thread_id: String::new(),
+            model: "gpt-5.5".to_owned(),
+            reasoning_effort: None,
+            approval_policy: "on-request".to_owned(),
+            sandbox_mode: "workspace-write".to_owned(),
+            permission_profile: None,
+            approvals_reviewer: None,
+            service_tier: None,
+            local_adapter_state: None,
+            created_at: 10,
+            updated_at: 20,
+            sort_order: None,
+        }
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {

@@ -29,7 +29,7 @@ use crate::provider::{
 };
 use crate::transport_crypto::TransportCryptoSession;
 use crate::workspace_paths::{canonical_workspace_root, validate_workspace_directory_text};
-use crate::workspace_store::WorkspaceRecord;
+use crate::workspace_store::{RejectedWorkspace, WorkspaceRecord};
 
 use super::git;
 use super::websocket::{self, AuthContext};
@@ -219,6 +219,7 @@ pub(super) async fn workspaces(
     Ok(Json(WorkspacesResponse {
         workspaces: snapshot.workspaces,
         updated_at: snapshot.updated_at,
+        rejected: Vec::new(),
     }))
 }
 
@@ -228,10 +229,21 @@ pub(super) async fn replace_workspaces(
     Json(request): Json<ReplaceWorkspacesRequest>,
 ) -> Result<Json<WorkspacesResponse>, AppError> {
     let auth = require_auth(&state, &headers)?;
-    let snapshot = state
+    let merged = state
         .workspaces
         .merge_owned(&auth.tenant_id, request.workspaces)
         .await?;
+    if !merged.rejected.is_empty() {
+        warn!(
+            rejected_paths = ?merged
+                .rejected
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            "workspace sync skipped invalid workspace records"
+        );
+    }
+    let snapshot = merged.snapshot;
     let workspace_paths = snapshot
         .workspaces
         .iter()
@@ -265,6 +277,7 @@ pub(super) async fn replace_workspaces(
     Ok(Json(WorkspacesResponse {
         workspaces: snapshot.workspaces,
         updated_at: snapshot.updated_at,
+        rejected: merged.rejected,
     }))
 }
 
@@ -2712,6 +2725,8 @@ pub(super) struct ReplaceWorkspacesRequest {
 pub(super) struct WorkspacesResponse {
     workspaces: Vec<WorkspaceRecord>,
     updated_at: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rejected: Vec<RejectedWorkspace>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4396,6 +4411,126 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(blocked_browser.status(), StatusCode::BAD_REQUEST);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn workspace_sync_skips_missing_paths_and_reports_them() {
+        let root = std::env::temp_dir().join(format!("todex-v2-ws-reject-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let missing = workspace_root.join("gone");
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_root,
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+        })
+        .await
+        .unwrap();
+        let device = enroll(&root.join("data"));
+        let app = crate::server::router(state);
+
+        let workspace_entry = |name: &str, path: &Path| {
+            json!({
+                "id": format!("client-{name}"),
+                "name": name,
+                "path": path.display().to_string(),
+                "sessionId": "session",
+                "tenantId": "local",
+                "threadId": "",
+                "model": "gpt-5",
+                "reasoningEffort": null,
+                "approvalPolicy": "on-request",
+                "sandboxMode": "workspace-write",
+                "serviceTier": null,
+                "localAdapterState": "idle",
+                "createdAt": 1,
+                "updatedAt": 1
+            })
+        };
+        let partial_payload = json!({
+            "workspaces": [
+                workspace_entry("project", &workspace),
+                workspace_entry("gone", &missing),
+            ]
+        })
+        .to_string();
+        let partial = app
+            .clone()
+            .oneshot(
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/v2/workspaces")
+                        .header("content-type", "application/json")
+                        .body(Body::from(partial_payload))
+                        .unwrap(),
+                )
+                .await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial.status(), StatusCode::OK);
+        let partial_body = to_bytes(partial.into_body(), 1024 * 1024).await.unwrap();
+        let partial_json: Value = serde_json::from_slice(&partial_body).unwrap();
+        assert_eq!(partial_json["workspaces"].as_array().unwrap().len(), 1);
+        assert_eq!(partial_json["rejected"].as_array().unwrap().len(), 1);
+        assert_eq!(partial_json["rejected"][0]["name"], "gone");
+        assert_eq!(
+            partial_json["rejected"][0]["code"],
+            "WORKSPACE_PATH_NOT_FOUND"
+        );
+
+        let all_bad_payload = json!({
+            "workspaces": [workspace_entry("gone", &missing)]
+        })
+        .to_string();
+        let all_bad = app
+            .oneshot(
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/v2/workspaces")
+                        .header("content-type", "application/json")
+                        .body(Body::from(all_bad_payload))
+                        .unwrap(),
+                )
+                .await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(all_bad.status(), StatusCode::BAD_REQUEST);
 
         let _ = fs::remove_dir_all(root);
     }
