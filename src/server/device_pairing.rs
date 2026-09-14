@@ -7,13 +7,39 @@ use crate::{
     error::AppError,
 };
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, State},
     http::header,
     routing::post,
     Json, Router,
 };
+use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+
+/// Wraps `Json` so deserialization failures return the API error envelope
+/// (400 INVALID_REQUEST) instead of axum's bare 422 text — old clients hitting
+/// the v2 pairing schema then surface a readable "missing field" message.
+struct ApiJson<T>(T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = AppError;
+
+    async fn from_request(
+        request: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(request, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(AppError::InvalidRequest(format!(
+                "invalid request body: {rejection}"
+            ))),
+        }
+    }
+}
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
@@ -26,7 +52,7 @@ pub(super) fn routes() -> Router<AppState> {
 async fn create(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Json(request): Json<CreateDevicePairingRequest>,
+    ApiJson(request): ApiJson<CreateDevicePairingRequest>,
 ) -> Result<
     (
         [(header::HeaderName, &'static str); 1],
@@ -42,7 +68,7 @@ async fn create(
 async fn poll(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Json(request): Json<DevicePairingProofRequest>,
+    ApiJson(request): ApiJson<DevicePairingProofRequest>,
 ) -> Result<
     (
         [(header::HeaderName, &'static str); 1],
@@ -58,7 +84,7 @@ async fn poll(
 async fn cancel(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Json(request): Json<DevicePairingProofRequest>,
+    ApiJson(request): ApiJson<DevicePairingProofRequest>,
 ) -> Result<([(header::HeaderName, &'static str); 1], Json<Value>), AppError> {
     state.device_pairing.cancel(peer.ip(), request)?;
     Ok((
