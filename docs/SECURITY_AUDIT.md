@@ -14,7 +14,7 @@
 - Provider 子进程清空环境后只恢复允许的基础变量；stdout 单行上限 4 MiB，stderr 保留窗口 64 KiB，停止时处理 Unix process group。
 - Provider 在信任读许可仍有效时完成子进程 spawn；撤销工作区信任取得写锁后会阻止后续启动，并取消已登记的活动 turn。信任状态只有在快照成功落盘后才更新内存。
 - Pi 在工作区获得 TodeX 信任后固定使用 `--approve` 全自动运行；TodeX 不为 Pi 声明逐工具审批或 OS sandbox，`permissions` capability 保持 `false`。
-- conversation event payload 上限 1 MiB，journal 上限 64 MiB，replay limit 上限 1000；v2 WebSocket 单消息上限 4 MiB、单连接订阅上限 128。
+- conversation event payload 上限 1 MiB，journal 上限 64 MiB，replay limit 上限 1000；journal 写满时先自动压缩（旧事件超长 payload 就地截断、sequence 不变），仍超限才返回 `RESOURCE_EXHAUSTED`；v2 WebSocket 单消息上限 4 MiB、单连接订阅上限 128。
 - MCP/Skill catalog 只读取配置，跳过 symlink，限制扫描深度、文件数和文件大小；响应不包含 command、args、env、URL 或凭据；现有测试验证输入文件未被修改。
 - 旧 Codex session migration 是 copy-only、redacted、idempotent，并保留原始文件。
 

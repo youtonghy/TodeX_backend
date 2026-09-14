@@ -24,6 +24,14 @@ const SNAPSHOT_FILE: &str = "snapshot.json";
 const PROVIDER_STATE_FILE: &str = "provider-state.json";
 const MAX_REPLAY_LIMIT: usize = 1000;
 const MAX_EVENTS_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+/// On overflow the journal is rewritten below this target so the next bursts
+/// of events fit without compacting again on every append.
+const JOURNAL_COMPACT_TARGET_BYTES: u64 = MAX_EVENTS_JOURNAL_BYTES * 3 / 4;
+/// The newest events keep byte-identical payloads; only older history is
+/// truncated so recent tool output stays intact for replay.
+const JOURNAL_COMPACT_PROTECTED_BYTES: u64 = MAX_EVENTS_JOURNAL_BYTES / 4;
+const JOURNAL_COMPACT_STRING_MAX: usize = 4 * 1024;
+const JOURNAL_COMPACT_STRING_KEEP: usize = 1024;
 
 #[derive(Clone)]
 pub struct ConversationStore {
@@ -83,7 +91,7 @@ impl ConversationStore {
             serde_json::to_writer(&mut journal, event)?;
             journal.push(b'\n');
             if journal.len() as u64 > MAX_EVENTS_JOURNAL_BYTES {
-                return Err(AppError::Conflict(
+                return Err(AppError::ResourceExhausted(
                     "Fork history exceeds the journal storage limit".to_owned(),
                 ));
             }
@@ -325,15 +333,15 @@ impl ConversationStore {
         let mut line = serde_json::to_vec(&event)?;
         line.push(b'\n');
         let event_path = directory.join(EVENTS_FILE);
-        let (journal_bytes, journal_modified) = match tokio::fs::metadata(&event_path).await {
-            Ok(metadata) => (metadata.len(), metadata.modified().ok()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (0, None),
-            Err(error) => return Err(error.into()),
-        };
+        let (mut journal_bytes, mut journal_modified) = journal_metadata(&event_path).await?;
         if journal_bytes.saturating_add(line.len() as u64) > MAX_EVENTS_JOURNAL_BYTES {
-            return Err(AppError::Conflict(format!(
-                "conversation {conversation_id} journal reached its storage limit"
-            )));
+            self.compact_journal(conversation_id).await?;
+            (journal_bytes, journal_modified) = journal_metadata(&event_path).await?;
+            if journal_bytes.saturating_add(line.len() as u64) > MAX_EVENTS_JOURNAL_BYTES {
+                return Err(AppError::ResourceExhausted(format!(
+                    "conversation {conversation_id} journal reached its storage limit"
+                )));
+            }
         }
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -682,6 +690,133 @@ impl ConversationStore {
         Ok(Some(event))
     }
 
+    /// Free journal space without disturbing replay cursors: oversized payload
+    /// strings in older events are truncated in place while every event keeps
+    /// its sequence. The newest `JOURNAL_COMPACT_PROTECTED_BYTES` of events
+    /// stay byte-identical so recent history retains full fidelity. Callers
+    /// must hold the conversation lock.
+    async fn compact_journal(&self, conversation_id: &str) -> Result<(), AppError> {
+        let directory = self.directory(conversation_id)?;
+        let path = directory.join(EVENTS_FILE);
+        let raw = match tokio::fs::read(&path).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut events = Vec::new();
+        for (start, end) in line_ranges(&raw) {
+            let line = trim_ascii(&raw[start..end]);
+            if line.is_empty() {
+                continue;
+            }
+            let event: ConversationEvent = serde_json::from_slice(line).map_err(|error| {
+                AppError::InvalidRequest(format!(
+                    "conversation {conversation_id} journal is corrupt at sequence {}: {error}",
+                    events.len() + 1
+                ))
+            })?;
+            validate_event(&event, conversation_id, events.len() as u64 + 1)?;
+            events.push(event);
+        }
+        let mut lines = Vec::with_capacity(events.len());
+        let mut total = 0u64;
+        for event in &events {
+            let mut line = serde_json::to_vec(event)?;
+            line.push(b'\n');
+            total += line.len() as u64;
+            lines.push(line);
+        }
+        if total <= JOURNAL_COMPACT_TARGET_BYTES {
+            return Ok(());
+        }
+        let mut protected = 0u64;
+        let mut protected_from = lines.len();
+        while protected_from > 0 && protected < JOURNAL_COMPACT_PROTECTED_BYTES {
+            protected_from -= 1;
+            protected += lines[protected_from].len() as u64;
+        }
+        // Truncate the bulkiest unprotected events first: the fewest possible
+        // events lose payload fidelity before the journal fits again.
+        let mut candidates: Vec<usize> = (0..protected_from).collect();
+        candidates.sort_by_key(|index| std::cmp::Reverse(lines[*index].len()));
+        let mut truncated = 0usize;
+        for index in candidates {
+            if total <= JOURNAL_COMPACT_TARGET_BYTES {
+                break;
+            }
+            if !truncate_journal_strings(&mut events[index].payload) {
+                continue;
+            }
+            let mut line = serde_json::to_vec(&events[index])?;
+            line.push(b'\n');
+            total = total - lines[index].len() as u64 + line.len() as u64;
+            lines[index] = line;
+            truncated += 1;
+        }
+        if truncated == 0 {
+            return Ok(());
+        }
+        let temporary = directory.join(format!(".events.{}.tmp", Uuid::new_v4().simple()));
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .await?;
+        let write_result = async {
+            for line in &lines {
+                file.write_all(line).await?;
+            }
+            file.flush().await?;
+            file.sync_data().await
+        }
+        .await;
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error.into());
+        }
+        set_owner_only(&temporary, false).await?;
+        #[cfg(windows)]
+        if tokio::fs::try_exists(&path).await? {
+            tokio::fs::remove_file(&path).await?;
+        }
+        tokio::fs::rename(&temporary, &path).await?;
+        set_owner_only(&path, false).await?;
+        sync_directory(&directory).await?;
+        let metadata = tokio::fs::metadata(&path).await?;
+        let mut offsets = Vec::with_capacity(lines.len());
+        let mut cursor = 0u64;
+        for line in &lines {
+            offsets.push((cursor, cursor + line.len() as u64 - 1));
+            cursor += line.len() as u64;
+        }
+        self.indexes.insert(
+            conversation_id.to_owned(),
+            JournalIndex {
+                bytes: metadata.len(),
+                modified: metadata.modified().ok(),
+                offsets,
+            },
+        );
+        if let Some(event) = events.last() {
+            self.tails.insert(
+                conversation_id.to_owned(),
+                JournalTail {
+                    bytes: metadata.len(),
+                    modified: metadata.modified().ok(),
+                    event: event.clone(),
+                },
+            );
+        }
+        tracing::warn!(
+            conversation_id,
+            truncated_events = truncated,
+            journal_bytes = metadata.len(),
+            "conversation journal compacted: oversized payloads truncated"
+        );
+        Ok(())
+    }
+
     fn directory(&self, conversation_id: &str) -> Result<PathBuf, AppError> {
         validate_id(conversation_id)?;
         Ok(self.root.join(conversation_id))
@@ -696,6 +831,44 @@ impl ConversationStore {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         lock.lock_owned().await
+    }
+}
+
+async fn journal_metadata(path: &Path) -> Result<(u64, Option<std::time::SystemTime>), AppError> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => Ok((metadata.len(), metadata.modified().ok())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((0, None)),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Truncate oversized strings inside a journal payload. Returns whether any
+/// string changed so callers can skip reserializing untouched events. Every
+/// branch is visited deliberately — `any` would short-circuit and leave later
+/// strings untouched.
+fn truncate_journal_strings(value: &mut Value) -> bool {
+    match value {
+        Value::String(text) if text.len() > JOURNAL_COMPACT_STRING_MAX => {
+            let original = text.len();
+            let kept: String = text.chars().take(JOURNAL_COMPACT_STRING_KEEP).collect();
+            *text = format!("{kept}…[truncated from {original} bytes]");
+            true
+        }
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= truncate_journal_strings(item);
+            }
+            changed
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            for item in map.values_mut() {
+                changed |= truncate_journal_strings(item);
+            }
+            changed
+        }
+        _ => false,
     }
 }
 
@@ -1440,6 +1613,152 @@ mod tests {
                 .len(),
             2
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn append_compacts_a_full_journal_and_preserves_sequences() {
+        let root = temp_dir("todex-journal-compact");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                workspace,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let path = root
+            .join("conversations")
+            .join(&manifest.id)
+            .join(EVENTS_FILE);
+
+        // Hand-write a journal just under the cap; each event carries one
+        // truncatable 256 KiB string.
+        use std::io::Write;
+        let bulky = "x".repeat(256 * 1024);
+        let mut file = fs::File::create(&path).unwrap();
+        let mut sequence = 0u64;
+        let mut written = 0u64;
+        loop {
+            let mut line = serde_json::to_vec(&ConversationEvent::new(
+                &manifest.id,
+                sequence + 1,
+                "tool.started",
+                json!({ "output": bulky, "index": sequence }),
+            ))
+            .unwrap();
+            line.push(b'\n');
+            if written + line.len() as u64 > MAX_EVENTS_JOURNAL_BYTES - 2048 {
+                break;
+            }
+            file.write_all(&line).unwrap();
+            written += line.len() as u64;
+            sequence += 1;
+        }
+        drop(file);
+        store.recover(&manifest.id).await.unwrap();
+
+        // A payload larger than the remaining headroom forces compaction.
+        let appended = store
+            .append(
+                &manifest.id,
+                "message.delta",
+                json!({ "content": "y".repeat(300 * 1024) }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(appended.sequence, sequence + 1);
+        let compacted = fs::metadata(&path).unwrap().len();
+        assert!(compacted <= JOURNAL_COMPACT_TARGET_BYTES + 400 * 1024);
+
+        let events = store.complete_history(&manifest.id).await.unwrap();
+        assert_eq!(events.len() as u64, sequence + 1);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.sequence, index as u64 + 1);
+        }
+        // Older unprotected events lost their oversized payloads.
+        let truncated_count = events[..sequence as usize]
+            .iter()
+            .filter(|event| {
+                event.payload["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("truncated"))
+            })
+            .count();
+        assert!(truncated_count > 0);
+        // The protected tail keeps full-fidelity payloads.
+        let recent = events[(sequence - 1) as usize].payload["output"]
+            .as_str()
+            .unwrap();
+        assert_eq!(recent.len(), bulky.len());
+        // The byte index rebuilt during compaction still serves replay.
+        let page = store.replay(&manifest.id, 0, 5).await.unwrap();
+        assert_eq!(page.events.len(), 5);
+        assert_eq!(page.events[0].sequence, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn journal_without_truncatable_payloads_still_reports_exhausted() {
+        let root = temp_dir("todex-journal-exhausted");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                workspace,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let path = root
+            .join("conversations")
+            .join(&manifest.id)
+            .join(EVENTS_FILE);
+
+        // Bulk made of many short strings leaves nothing to truncate.
+        use std::io::Write;
+        let items: Vec<String> = (0..3000).map(|index| format!("item-{index:05}")).collect();
+        let mut file = fs::File::create(&path).unwrap();
+        let mut sequence = 0u64;
+        let mut written = 0u64;
+        loop {
+            let mut line = serde_json::to_vec(&ConversationEvent::new(
+                &manifest.id,
+                sequence + 1,
+                "provider.event",
+                json!({ "items": items }),
+            ))
+            .unwrap();
+            line.push(b'\n');
+            if written + line.len() as u64 > MAX_EVENTS_JOURNAL_BYTES - 2048 {
+                break;
+            }
+            file.write_all(&line).unwrap();
+            written += line.len() as u64;
+            sequence += 1;
+        }
+        drop(file);
+        store.recover(&manifest.id).await.unwrap();
+
+        // A payload larger than the remaining headroom forces a compaction
+        // attempt; with nothing to truncate the journal stays full.
+        let error = store
+            .append(
+                &manifest.id,
+                "message.delta",
+                json!({ "content": "y".repeat(300 * 1024) }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::ResourceExhausted(_)));
+        assert_eq!(error.code(), "RESOURCE_EXHAUSTED");
         let _ = fs::remove_dir_all(root);
     }
 
