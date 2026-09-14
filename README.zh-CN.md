@@ -47,7 +47,7 @@
     - **ML-KEM-768** (`ml-kem-768`，NIST 后量子密码学标准)
   - 密钥交换参数通过 TUI 配对二维码无缝传输。
 - **安全与沙箱边界**：
-  - Fail-Closed Bearer Token 认证（未授权直接拦截并返回 `401 Unauthorized`）。
+  - Fail-Closed 设备签名认证：每个请求携带已注册设备的 Ed25519 签名，未授权请求直接返回 `401 Unauthorized`；设备经[设备验证](docs/device-verification.md)登记，可在 TUI 单独吊销。
   - 租户隔离（`tenant_id`），严格校验所有会话读取、订阅与变更入口。
   - 工作区根目录约束（`workspace_root`），强力防御未经授权的路径穿越。
   - 净化的子进程环境，只继承基础系统变量，避免泄露主机敏感凭据。
@@ -72,7 +72,7 @@
 |                                                                                 |
 |  +---------------------+  +----------------------+  +------------------------+  |
 |  |     认证与安全      |  |       传输加密       |  |       工作区存储       |  |
-|  | (Bearer / 租户隔离) |  | (X25519 / ML-KEM)    |  |  (沙箱 workspace_root) |  |
+|  | (设备签名/租户隔离)|  | (X25519 / ML-KEM)    |  |  (沙箱 workspace_root) |  |
 |  +---------------------+  +----------------------+  +------------------------+  |
 |                                                                                 |
 |  +---------------------------------------------------------------------------+  |
@@ -163,8 +163,7 @@ cargo run -- daemon stop
 | **Codex 可执行文件** | — | `TODEX_AGENTD_CODEX_BIN` | `codex` | Codex CLI 路径或命令名称。 |
 | **Claude 可执行文件**| — | `TODEX_AGENTD_CLAUDE_BIN` | `claude` | Claude Code CLI 路径或命令名称。 |
 | **Pi 可执行文件**    | — | `TODEX_AGENTD_PI_BIN` | `pi` | Pi CLI 路径或命令名称。 |
-| **启用认证** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | 是否启用 Fail-closed Bearer 认证。 |
-| **认证 Token** | — | `TODEX_AGENTD_AUTH_TOKEN` | *无* | Bearer Token 密钥。 |
+| **启用认证** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | 是否启用 Fail-closed 设备签名认证。 |
 | **配对加密方式** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | 配对加密算法（`none`、`x25519`、`ml-kem-768`）。 |
 
 ### `config.toml` 配置示例
@@ -191,7 +190,6 @@ args = ["--stdio"]
 [security]
 enable_auth = true
 enable_tls = false
-auth_token = "your-secure-secret-token"
 ```
 
 > [!NOTE]

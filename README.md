@@ -72,7 +72,7 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
 |                                                                                 |
 |  +---------------------+  +----------------------+  +------------------------+  |
 |  |   Auth & Security   |  |   Transport Crypto   |  |     Workspace Store    |  |
-|  | (Bearer / Tenants)  |  | (X25519 / ML-KEM)    |  | (Sandbox Root Bounds)  |  |
+|  | (Devices / Tenants) |  | (X25519 / ML-KEM)    |  | (Sandbox Root Bounds)  |  |
 |  +---------------------+  +----------------------+  +------------------------+  |
 |                                                                                 |
 |  +---------------------------------------------------------------------------+  |

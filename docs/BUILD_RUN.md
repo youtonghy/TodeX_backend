@@ -334,7 +334,6 @@ export TODEX_AGENTD_HOST=127.0.0.1
 export TODEX_AGENTD_PORT=7345
 export TODEX_AGENTD_DATA_DIR="$HOME/.todex-agent"
 export TODEX_AGENTD_WORKSPACE_ROOT="$HOME/projects"
-export TODEX_AGENTD_AUTH_TOKEN="replace-me"
 cargo run -- serve
 ```
 
@@ -402,11 +401,7 @@ cargo run -- serve --port 7346
 
 ### WebSocket 消息返回 `UNAUTHENTICATED`
 
-确认服务端设置了 `TODEX_AGENTD_AUTH_TOKEN`，并且 WebSocket 握手带上：
-
-```http
-Authorization: Bearer <TODEX_AGENTD_AUTH_TOKEN>
-```
+确认该设备已在后端完成设备验证（`devices.json` 中存在记录且未被吊销），并且 WebSocket 握手 URL 携带覆盖完整查询串的设备签名参数（`device_id`/`auth_ts`/`auth_nonce`/`auth_sig`）。签名校验与防重放规则见 [device-verification.md](device-verification.md)。
 
 ### `codex.local.start` 返回 `INVALID_CWD`
 
