@@ -143,20 +143,15 @@ impl ProviderDriver for AcpDriver {
             .collect();
         let mut process = JsonLineProcess::spawn(&spec).await?;
         let result = async {
-            send_request(
-                &mut process,
-                "initialize",
-                "initialize",
-                initialize_request(),
-            )
-            .await?;
+            let request_id =
+                send_request(&mut process, "initialize", initialize_request()).await?;
             loop {
                 let Some(message) = process.read().await? else {
                     break Err(
                         provider_exit_error(&process, "ACP agent closed during initialize").await,
                     );
                 };
-                if jsonrpc_id(&message) != Some("initialize") {
+                if jsonrpc_id(&message) != Some(request_id.as_str()) {
                     continue;
                 }
                 if let Some(error) = message.get("error") {
@@ -338,10 +333,10 @@ pub(super) async fn run_acp_turn_controlled(
     let initialize_value = if let Some(initialize) = &connection.initialize {
         initialize.clone()
     } else {
-        send_request(process, "initialize", "initialize", initialize_request()).await?;
+        let request_id = send_request(process, "initialize", initialize_request()).await?;
         let initialize = wait_for_response(
             process,
-            "initialize",
+            &request_id,
             sink,
             cancel,
             provider,
@@ -408,9 +403,8 @@ pub(super) async fn run_acp_turn_controlled(
                 ));
                 }
                 let loaded = if can_resume {
-                    send_request(
+                    let request_id = send_request(
                         process,
-                        "session",
                         "session/resume",
                         json!({
                             "sessionId": session_id,
@@ -420,7 +414,7 @@ pub(super) async fn run_acp_turn_controlled(
                     .await?;
                     wait_for_response(
                         process,
-                        "session",
+                        &request_id,
                         sink,
                         cancel,
                         provider,
@@ -435,10 +429,10 @@ pub(super) async fn run_acp_turn_controlled(
                         context.manifest.workspace.clone(),
                     ))?;
                     apply_session_metadata(&mut request, &options, true);
-                    send_request(process, "session", "session/load", request).await?;
+                    let request_id = send_request(process, "session/load", request).await?;
                     wait_for_response(
                         process,
-                        "session",
+                        &request_id,
                         sink,
                         cancel,
                         provider,
@@ -454,8 +448,15 @@ pub(super) async fn run_acp_turn_controlled(
                     // Devin sessions live in a shared registry/lock table, so a
                     // stored id can be held by another process or deleted
                     // externally. Start a fresh session rather than failing the
-                    // turn.
-                    Err(error) if provider == ProviderKind::Devin => {
+                    // turn — but only when the agent itself answered: a local
+                    // failure (journal full, write error) must surface as-is.
+                    Err(error)
+                        if provider == ProviderKind::Devin
+                            && matches!(
+                                error,
+                                AppError::Conflict(_) | AppError::ProviderUnavailable(_)
+                            ) =>
+                    {
                         sink.emit(
                             "provider.event",
                             json!({"provider":provider.as_str(),"providerMethod":"session/recreated","metadata":{"reason":error.to_string(),"previousSessionId":session_id}}),
@@ -554,7 +555,7 @@ pub(super) async fn run_acp_turn_controlled(
     if options.snake_case_image_mime {
         normalize_acp_image_wire(&mut request);
     }
-    send_request(process, &prompt.turn_id, "session/prompt", request).await?;
+    let prompt_request_id = send_request(process, "session/prompt", request).await?;
     let mut pending: BTreeMap<String, LiveAcpControl> = BTreeMap::new();
     let mut client_requests: tokio::task::JoinSet<(Vec<Value>, Result<(), AppError>)> =
         tokio::task::JoinSet::new();
@@ -603,7 +604,7 @@ pub(super) async fn run_acp_turn_controlled(
                     "session/cancel",
                     CancelNotification::new(native_session_id.clone()),
                 ).await?;
-                return drain_cancelled_turn(process, &native_session_id, &prompt.turn_id, sink, provider, auto_approve, &mut client_requests, terminal_response.is_some()).await;
+                return drain_cancelled_turn(process, &native_session_id, &prompt_request_id, sink, provider, auto_approve, &mut client_requests, terminal_response.is_some()).await;
             }
         };
         let Some(message) = message else {
@@ -627,7 +628,7 @@ pub(super) async fn run_acp_turn_controlled(
                 continue;
             }
         }
-        if jsonrpc_id(&message) == Some(prompt.turn_id.as_str()) {
+        if jsonrpc_id(&message) == Some(prompt_request_id.as_str()) {
             emit_prompt_metadata(&message, sink, provider).await?;
             terminal_response = Some(message);
             continue;
@@ -671,7 +672,7 @@ pub(super) async fn run_acp_turn_controlled(
                 return drain_cancelled_turn(
                     process,
                     &native_session_id,
-                    &prompt.turn_id,
+                    &prompt_request_id,
                     sink,
                     provider,
                     auto_approve,
@@ -762,15 +763,17 @@ async fn start_live_control(
         )));
         return Ok(());
     }
-    let id = format!("live:{}", request.request_id);
-    if pending.contains_key(&id) {
+    if pending
+        .values()
+        .any(|control| control.request.request_id == request.request_id)
+    {
         let _ = request.respond_to.send(Err(AppError::InvalidRequest(
             "duplicate live control request".to_owned(),
         )));
         return Ok(());
     }
     let (method, params) = commands.remove(0);
-    send_request(process, &id, &method, params).await?;
+    let id = send_request(process, &method, params).await?;
     pending.insert(
         id,
         LiveAcpControl {
@@ -928,8 +931,7 @@ async fn complete_live_control(
     }
     if !control.remaining.is_empty() {
         let (method, params) = control.remaining.remove(0);
-        let id = format!("live:{}", control.request.request_id);
-        send_request(process, &id, &method, params).await?;
+        let id = send_request(process, &method, params).await?;
         control.deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         pending.insert(id, control);
         return Ok(());
@@ -1040,10 +1042,10 @@ async fn new_acp_session(
     let mut request =
         serde_json::to_value(NewSessionRequest::new(context.manifest.workspace.clone()))?;
     apply_session_metadata(&mut request, options, false);
-    send_request(process, "session", "session/new", request).await?;
+    let request_id = send_request(process, "session/new", request).await?;
     let response_value = wait_for_response(
         process,
-        "session",
+        &request_id,
         sink,
         cancel,
         provider,
@@ -1154,7 +1156,7 @@ async fn emit_prompt_metadata(
 async fn drain_cancelled_turn(
     process: &mut JsonLineProcess,
     session_id: &str,
-    turn_id: &str,
+    prompt_request_id: &str,
     sink: &DriverEventSink,
     provider: ProviderKind,
     auto_approve: AutoApprove,
@@ -1177,7 +1179,7 @@ async fn drain_cancelled_turn(
             let Some(message) = message else {
                 return Ok::<bool, AppError>(false);
             };
-            if jsonrpc_id(&message) == Some(turn_id) {
+            if jsonrpc_id(&message) == Some(prompt_request_id) {
                 emit_prompt_metadata(&message, sink, provider).await?;
                 return Ok(true);
             }
@@ -2182,10 +2184,10 @@ async fn authenticate_if_requested(
     if let Some(meta) = &options.auth_meta {
         params["_meta"] = meta.clone();
     }
-    send_request(process, "authenticate", "authenticate", params).await?;
+    let request_id = send_request(process, "authenticate", params).await?;
     wait_for_response_with_timeout(
         process,
-        "authenticate",
+        &request_id,
         sink,
         cancel,
         provider,
@@ -2316,11 +2318,9 @@ async fn apply_requested_config(
                 context.provider.as_str()
             )));
         }
-        let request_id = format!("config:{config_id}");
         let value = config_option_wire_value(requested, context.runtime.nested_config_values);
-        send_request(
+        let request_id = send_request(
             process,
-            &request_id,
             "session/set_config_option",
             json!({
                 "sessionId": context.session_id,
@@ -2448,10 +2448,10 @@ async fn apply_legacy_model_config(
     if !meta.is_empty() {
         request["_meta"] = Value::Object(meta);
     }
-    send_request(process, "config:model", "session/set_model", request).await?;
+    let request_id = send_request(process, "session/set_model", request).await?;
     wait_for_response(
         process,
-        "config:model",
+        &request_id,
         sink,
         cancel,
         context.provider,
@@ -2586,12 +2586,15 @@ fn expected_kind_name(kind: PermissionOptionKind) -> &'static str {
     }
 }
 
+/// Every request gets a fresh JSON-RPC id: when a wait aborts early (timeout,
+/// cancellation, emit failure) the agent's late response stays queued on
+/// stdout, and a reused id would let the next wait consume it as its own answer.
 async fn send_request(
     process: &mut JsonLineProcess,
-    id: &str,
     method: &str,
     params: impl serde::Serialize,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
+    let id = format!("{method}:{}", uuid::Uuid::new_v4().simple());
     process
         .send(&json!({
             "jsonrpc": "2.0",
@@ -2599,7 +2602,8 @@ async fn send_request(
             "method": method,
             "params": serde_json::to_value(params)?,
         }))
-        .await
+        .await?;
+    Ok(id)
 }
 
 async fn send_notification(

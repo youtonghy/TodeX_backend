@@ -2978,13 +2978,16 @@ if [ "$mode" = "--no-auto-update" ]; then
   while IFS= read -r line; do
     case "$line" in
       *'"method":"initialize"'*)
-        printf '{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"_meta":{"modelState":{"currentModelId":"grok-fixture","availableModels":[{"modelId":"grok-fixture","name":"Grok Fixture","_meta":{"supportsReasoningEffort":true}}]}}}}\n'
+        id=$(extract_id "$line")
+        printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"_meta":{"modelState":{"currentModelId":"grok-fixture","availableModels":[{"modelId":"grok-fixture","name":"Grok Fixture","_meta":{"supportsReasoningEffort":true}}]}}}}\n' "$id"
         ;;
       *'"method":"session/new"'*)
-        printf '{"jsonrpc":"2.0","id":"session","result":{"sessionId":"grok-native","models":{"currentModelId":"grok-fixture","availableModels":[{"modelId":"grok-fixture","name":"Grok Fixture","_meta":{"supportsReasoningEffort":true}}]}}}\n'
+        id=$(extract_id "$line")
+        printf '{"jsonrpc":"2.0","id":"%s","result":{"sessionId":"grok-native","models":{"currentModelId":"grok-fixture","availableModels":[{"modelId":"grok-fixture","name":"Grok Fixture","_meta":{"supportsReasoningEffort":true}}]}}}\n' "$id"
         ;;
       *'"method":"session/load"'*)
-        printf '{"jsonrpc":"2.0","id":"session","result":{"models":{"currentModelId":"grok-fixture","availableModels":[{"modelId":"grok-fixture","name":"Grok Fixture","_meta":{"supportsReasoningEffort":true}}]}}}\n'
+        id=$(extract_id "$line")
+        printf '{"jsonrpc":"2.0","id":"%s","result":{"models":{"currentModelId":"grok-fixture","availableModels":[{"modelId":"grok-fixture","name":"Grok Fixture","_meta":{"supportsReasoningEffort":true}}]}}}\n' "$id"
         ;;
       *'"method":"session/prompt"'*)
         id=$(extract_id "$line")
@@ -2996,16 +2999,20 @@ elif [ "$mode" = "acp" ]; then
   while IFS= read -r line; do
     case "$line" in
       *'"method":"initialize"'*)
-        printf '{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[{"id":"fixture-key","name":"API key"}]}}\n'
+        id=$(extract_id "$line")
+        printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[{"id":"fixture-key","name":"API key"}]}}\n' "$id"
         ;;
       *'"method":"authenticate"'*)
-        printf '{"jsonrpc":"2.0","id":"authenticate","result":{}}\n'
+        id=$(extract_id "$line")
+        printf '{"jsonrpc":"2.0","id":"%s","result":{}}\n' "$id"
         ;;
       *'"method":"session/new"'*)
-        printf '{"jsonrpc":"2.0","id":"session","result":{"sessionId":"acp-native","configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"fixture-model","options":[{"value":"fixture-model","name":"Fixture"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"build","options":[{"value":"build","name":"build"},{"value":"plan","name":"plan"}]}]}}\n'
+        id=$(extract_id "$line")
+        printf '{"jsonrpc":"2.0","id":"%s","result":{"sessionId":"acp-native","configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"fixture-model","options":[{"value":"fixture-model","name":"Fixture"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"build","options":[{"value":"build","name":"build"},{"value":"plan","name":"plan"}]}]}}\n' "$id"
         ;;
       *'"method":"session/load"'*)
-        printf '{"jsonrpc":"2.0","id":"session","result":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"fixture-model","options":[{"value":"fixture-model","name":"Fixture"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"build","options":[{"value":"build","name":"build"},{"value":"plan","name":"plan"}]}]}}\n'
+        id=$(extract_id "$line")
+        printf '{"jsonrpc":"2.0","id":"%s","result":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"fixture-model","options":[{"value":"fixture-model","name":"Fixture"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"build","options":[{"value":"build","name":"build"},{"value":"plan","name":"plan"}]}]}}\n' "$id"
         ;;
       *'"method":"session/set_config_option"'*)
         id=$(extract_id "$line")
