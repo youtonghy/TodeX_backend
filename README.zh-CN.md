@@ -100,8 +100,29 @@
 
 ### 前置要求
 
-- Rust 工具链（推荐 MSRV 1.80+）
+- Rust 工具链（推荐 MSRV 1.80+；使用下方安装脚本时不需要）
 - 本机已安装并完成登录认证的 AI Agent CLI（如 `codex`、`pi`、`claude` 等）
+
+### 安装脚本（macOS / Linux / WSL）
+
+无需 Rust 工具链，一键下载并管理预编译版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/youtonghy/TodeX_backend/main/install.sh | bash
+```
+
+脚本将 `todex-agentd` 安装到 `~/.local/bin`（可用 `--prefix DIR` 或 `TODEX_INSTALL_DIR` 覆盖），校验 release 的 `SHA256SUMS`，在二进制旁保留一份回滚副本，并重启正在运行的托管 daemon。检测到 WSL 时自动使用 `linux-x64-gnu` 构建。
+
+```bash
+./install.sh install                 # 安装或更新到最新 release
+./install.sh update                  # 更新已安装的版本
+./install.sh install --version 2.0.2 # 安装指定版本
+./install.sh status                  # 查看已装/最新版本与 daemon 状态
+./install.sh uninstall               # 停止 daemon 并移除二进制
+./install.sh uninstall --purge       # 同时删除 ~/.todex-agent 数据目录
+```
+
+通过 `curl` 管道运行时，参数经 `bash -s --` 传入，例如 `... | bash -s -- uninstall --purge`。
 
 ### 1. 编译构建
 

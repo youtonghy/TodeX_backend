@@ -473,3 +473,16 @@ rollback, not a data migration rollback. Old backups can be removed after verify
 the new version. A concurrent update is refused using a sibling `*.update-lock`
 directory. If the updater is forcibly killed, inspect the installation and backup
 first, then remove the abandoned lock directory before retrying.
+
+### Install script (macOS / Linux / WSL)
+
+`install.sh` at the repository root manages the prebuilt binary end to end:
+`install` (default) downloads the latest release `.bin` asset for the detected
+platform, verifies `SHA256SUMS`, validates the executable's `--version`, installs
+to `~/.local/bin` (override with `--prefix` or `TODEX_INSTALL_DIR`), and restarts
+a running managed daemon. `update`, `status`, and `uninstall` cover the rest of
+the lifecycle; `uninstall --purge` also removes the data directory. Typical usage:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/youtonghy/TodeX_backend/main/install.sh | bash
+```

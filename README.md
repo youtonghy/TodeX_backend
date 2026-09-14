@@ -100,8 +100,29 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
 
 ### Prerequisites
 
-- Rust toolchain (MSRV 1.80+ recommended)
+- Rust toolchain (MSRV 1.80+ recommended; not needed when using the install script below)
 - At least one AI agent CLI installed and authenticated on the machine (`codex`, `pi`, `claude`, etc.)
+
+### Install Script (macOS / Linux / WSL)
+
+Download and manage a prebuilt release without a Rust toolchain:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/youtonghy/TodeX_backend/main/install.sh | bash
+```
+
+The script installs `todex-agentd` to `~/.local/bin` (override with `--prefix DIR` or `TODEX_INSTALL_DIR`), verifies the release `SHA256SUMS`, keeps one rollback copy beside the binary, and restarts a running managed daemon. It detects WSL and uses the `linux-x64-gnu` build there.
+
+```bash
+./install.sh install                 # install or update to the latest release
+./install.sh update                  # update an existing install
+./install.sh install --version 2.0.2 # pin a specific release
+./install.sh status                  # installed/latest versions and daemon state
+./install.sh uninstall               # stop the daemon and remove the binary
+./install.sh uninstall --purge       # also remove the ~/.todex-agent data directory
+```
+
+When piping from `curl`, pass arguments through `bash -s --`, for example `... | bash -s -- uninstall --purge`.
 
 ### 1. Build the Binary
 
