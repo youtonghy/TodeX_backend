@@ -393,11 +393,23 @@ async fn shutdown_signal() -> Result<()> {
     }
 }
 
+/// Signal the daemon's process group. Daemons spawned before `process_group(0)`
+/// was adopted are not group leaders, so fall back to the single pid on ESRCH.
+#[cfg(unix)]
+fn signal_process_group_or_self(pid: u32, signal: i32) -> bool {
+    if unsafe { libc::kill(-(pid as i32), signal) } == 0 {
+        return true;
+    }
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return unsafe { libc::kill(pid as i32, signal) } == 0;
+    }
+    false
+}
+
 fn continue_process(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        let result = unsafe { libc::kill(-(pid as i32), libc::SIGCONT) };
-        if result != 0 && !process_has_exited(pid) {
+        if !signal_process_group_or_self(pid, libc::SIGCONT) && !process_has_exited(pid) {
             bail!("failed to send SIGCONT to daemon pid {pid}");
         }
     }
@@ -410,8 +422,7 @@ fn continue_process(pid: u32) -> Result<()> {
 fn terminate_process(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        let result = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
-        if result != 0 && process_is_running(pid) {
+        if !signal_process_group_or_self(pid, libc::SIGTERM) && process_is_running(pid) {
             bail!("failed to send SIGTERM to daemon pid {pid}");
         }
     }
@@ -433,8 +444,7 @@ fn terminate_process(pid: u32) -> Result<()> {
 fn force_kill_process(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        if result != 0 && !process_has_exited(pid) {
+        if !signal_process_group_or_self(pid, libc::SIGKILL) && !process_has_exited(pid) {
             bail!("failed to send SIGKILL to daemon pid {pid}");
         }
     }
