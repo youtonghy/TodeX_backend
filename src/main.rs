@@ -7,6 +7,7 @@ mod daemon;
 mod device_pairing;
 mod error;
 mod event;
+mod kanban_store;
 mod local_terminal;
 mod mcp;
 mod provider;

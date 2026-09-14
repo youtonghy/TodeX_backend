@@ -16,6 +16,7 @@ use crate::{
     device_pairing::DevicePairingRegistry,
     error::Result,
     event::EventBus,
+    kanban_store::KanbanTaskStore,
     local_terminal::LocalTerminalManager,
     provider::{CliManager, ConversationSupervisor},
     transport_crypto::PairingKeys,
@@ -38,6 +39,7 @@ pub struct AppState {
     pub pairing_keys: PairingKeys,
     pub(crate) device_pairing: DevicePairingRegistry,
     pub workspaces: WorkspaceStore,
+    pub kanban_tasks: KanbanTaskStore,
     pub workspace_trust: WorkspaceTrustStore,
     pub(crate) audit_write_lock: Arc<tokio::sync::Mutex<()>>,
     websocket_connections: Arc<AtomicUsize>,
@@ -68,6 +70,7 @@ impl AppState {
                 .await?;
         let workspaces =
             WorkspaceStore::new(config.data_dir.clone(), config.workspace_root.clone()).await?;
+        let kanban_tasks = KanbanTaskStore::new(config.data_dir.clone()).await?;
         let mut workspace_paths_by_owner = HashMap::<String, Vec<PathBuf>>::new();
         for workspace in workspaces.snapshot().await.workspaces {
             workspace_paths_by_owner
@@ -112,6 +115,7 @@ impl AppState {
             pairing_keys,
             device_pairing,
             workspaces,
+            kanban_tasks,
             workspace_trust,
             audit_write_lock,
             websocket_connections,

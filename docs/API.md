@@ -266,6 +266,44 @@ DELETE /v2/workspaces/{workspaceId}
 
 `GET /v2/workspaces/{workspaceId}/trust` 返回当前状态；`PUT` 请求体为 `{ "trusted": true }` 或 `{ "trusted": false }`。信任记录同时绑定认证 owner 和规范化路径，独立保存在 `$DATA_DIR/workspace-trust.json`。Provider 模型/命令发现、prompt、MCP 调用、Git 写操作、本地终端和本地 Codex 启动前都必须通过信任检查；只读目录、文件预览与 Git 扫描仍受 `workspace_root` 边界约束。Provider 启动许可持有信任读锁直至子进程完成 spawn；撤销先取得写锁，再取消该 owner 在工作区内已登记的活动 turn，因此不会漏过处于检查与启动之间的任务。删除工作区会先撤销信任并取消活动 turn，但不会删除已有对话历史。
 
+## 任务看板同步
+
+任务看板的任务由后端持久化到 `$TODEX_AGENTD_DATA_DIR/kanban_tasks.json`，按认证 owner 隔离。与 workspace 清单一样，各客户端的本地存储只是离线缓存：连接后端后拉取快照、按 `updatedAt` 合并，本地变更经防抖后推送。任务通过 `workspaceId` 挂在工作区上，工作区 ID 与 `/v2/workspaces` 返回的稳定 ID 一致，因此不同设备恢复的是同一份任务列表。
+
+```http
+GET /v2/kanban/tasks
+PUT /v2/kanban/tasks
+```
+
+`GET` 响应：
+
+```json
+{
+  "tasks": [
+    {
+      "id": "task-m9k2x1-ab34cd",
+      "tenantId": "local",
+      "workspaceId": "ws_1f45e78a20d5a33556417b12",
+      "title": "Ship the release",
+      "description": "Tag and publish",
+      "dueDate": "2026-10-01",
+      "status": "planned",
+      "conversationId": "conv_abc",
+      "createdAt": 1700000000000,
+      "updatedAt": 1700000001000,
+      "deletedAt": null
+    }
+  ],
+  "updatedAt": 1700000002000
+}
+```
+
+`PUT` 请求体使用同样的 `tasks` 数组，是合并而非全量替换：后端按 `(tenantId, id)` upsert，`updatedAt` 较新的记录胜出，同毫秒时采用提交方记录。`tenantId` 一律由后端覆盖为当前认证 owner，客户端伪造无效。
+
+删除以墓碑同步：客户端把记录标记为非空的 `deletedAt`（Unix 毫秒）后再推送，`GET`/`PUT` 响应会继续携带墓碑直到其超过 30 天保留期被清理。其他端拉取到墓碑后同样隐藏该任务；比墓碑更旧的写入无法复活任务。接口不提供单独的 `DELETE`，避免抹掉墓碑后被旧端重新上传。
+
+后端校验与前端一致：`title` 非空且不超过 200 字符，`description` 不超过 2000 字符，`status` 为 `planned`、`in-progress` 或 `done`，`dueDate` 为 `YYYY-MM-DD`；每个 owner 最多 500 条未删除任务，超出时整批拒绝（`INVALID_REQUEST`）。
+
 ### Workspace 目录浏览
 
 ```http

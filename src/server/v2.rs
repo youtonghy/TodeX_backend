@@ -94,6 +94,14 @@ pub fn routes() -> Router<AppState> {
         .route("/v2/workspaces", get(workspaces).put(replace_workspaces))
         .route("/v2/workspaces/{workspace_id}", delete(delete_workspace))
         .route(
+            "/v2/kanban/tasks",
+            get(kanban_tasks).put(replace_kanban_tasks).layer(
+                // 500 tasks bounded by a 200-char title and 2k-char description
+                // stay well under 2 MiB even fully escaped.
+                DefaultBodyLimit::max(4 * 1024 * 1024),
+            ),
+        )
+        .route(
             "/v2/workspaces/{workspace_id}/trust",
             get(workspace_trust).put(update_workspace_trust),
         )
@@ -277,6 +285,34 @@ pub(super) async fn delete_workspace(
         "trustRevoked": true,
         "cancelledTurns": cancelled,
     })))
+}
+
+pub(super) async fn kanban_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<KanbanTasksResponse>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let snapshot = state.kanban_tasks.snapshot_owned(&auth.tenant_id).await;
+    Ok(Json(KanbanTasksResponse {
+        tasks: snapshot.tasks,
+        updated_at: snapshot.updated_at,
+    }))
+}
+
+pub(super) async fn replace_kanban_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReplaceKanbanTasksRequest>,
+) -> Result<Json<KanbanTasksResponse>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let snapshot = state
+        .kanban_tasks
+        .merge_owned(&auth.tenant_id, request.tasks)
+        .await?;
+    Ok(Json(KanbanTasksResponse {
+        tasks: snapshot.tasks,
+        updated_at: snapshot.updated_at,
+    }))
 }
 
 pub(super) async fn workspace_trust(
@@ -2678,6 +2714,19 @@ pub(super) struct ReplaceWorkspacesRequest {
 #[serde(rename_all = "camelCase")]
 pub(super) struct WorkspacesResponse {
     workspaces: Vec<WorkspaceRecord>,
+    updated_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ReplaceKanbanTasksRequest {
+    tasks: Vec<crate::kanban_store::KanbanTaskRecord>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct KanbanTasksResponse {
+    tasks: Vec<crate::kanban_store::KanbanTaskRecord>,
     updated_at: u64,
 }
 
