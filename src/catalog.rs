@@ -1262,7 +1262,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("test-token".to_owned()),
             },
         }
     }

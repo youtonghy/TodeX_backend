@@ -13,8 +13,202 @@ use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tungstenite::client::IntoClientRequest;
 
-const TOKEN: &str = "todex_real_e2e_token";
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use ed25519_dalek::{Signer, SigningKey};
+use rand_core::{OsRng, RngCore};
+use sha2::{Digest, Sha256};
+
 const IMAGE_BASE64: &str = include_str!("fixtures/claude_image.png.b64");
+
+/// Deterministic Ed25519 device identity used by the E2E harness. The daemon
+/// is seeded with this device in `devices.json`, then every HTTP request and
+/// WebSocket handshake carries a `todex.device-auth.v1` signature.
+struct E2eDevice {
+    key: SigningKey,
+    id: String,
+}
+
+fn test_device() -> E2eDevice {
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let public = key.verifying_key().to_bytes();
+    let fingerprint = Sha256::digest(public);
+    let id = format!("dev_{}", URL_SAFE_NO_PAD.encode(&fingerprint[..12]));
+    E2eDevice { key, id }
+}
+
+/// Register the device in `data_dir/devices.json`, matching the backend's
+/// registry file format (camelCase, deny_unknown_fields).
+fn seed_device(data_dir: &Path, device: &E2eDevice) {
+    let record = json!({
+        "deviceId": device.id,
+        "name": "e2e test device",
+        "publicKey": URL_SAFE_NO_PAD.encode(device.key.verifying_key().to_bytes()),
+        "pairedAt": 1_700_000_000_000u64,
+    });
+    let path = data_dir.join("devices.json");
+    fs::write(
+        &path,
+        json!({
+            "version": 1,
+            "devices": { device.id.clone(): record },
+        })
+        .to_string(),
+    )
+    .expect("seed devices.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("devices.json must be owner-only");
+    }
+}
+
+const AUTH_QUERY_KEYS: [&str; 4] = ["device_id", "auth_ts", "auth_nonce", "auth_sig"];
+
+fn form_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit) =>
+            {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        decoded.push(byte);
+                        index += 3;
+                    }
+                    Err(_) => {
+                        decoded.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn strict_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn canonical_query(query: &str) -> String {
+    let mut pairs: Vec<(String, String)> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (form_decode(key), form_decode(value))
+        })
+        .filter(|(key, _)| !AUTH_QUERY_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (strict_encode(&key), strict_encode(&value)))
+        .collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+impl E2eDevice {
+    /// `(name, value)` header pairs for an HTTP request signature.
+    fn auth_headers(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+    ) -> [(String, String); 4] {
+        let (path, query) = path_and_query
+            .split_once('?')
+            .unwrap_or((path_and_query, ""));
+        let mut nonce = [0u8; 16];
+        OsRng.fill_bytes(&mut nonce);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+        let nonce = URL_SAFE_NO_PAD.encode(nonce);
+        let signature = self.signature(method, path, query, &timestamp, &nonce, body);
+        [
+            ("x-todex-device-id".to_owned(), self.id.clone()),
+            ("x-todex-auth-ts".to_owned(), timestamp),
+            ("x-todex-auth-nonce".to_owned(), nonce),
+            ("x-todex-auth-sig".to_owned(), signature),
+        ]
+    }
+
+    /// Equivalent credential as query parameters for the WS handshake.
+    fn auth_query(&self, path_and_query: &str) -> String {
+        let (path, query) = path_and_query
+            .split_once('?')
+            .unwrap_or((path_and_query, ""));
+        let mut nonce = [0u8; 16];
+        OsRng.fill_bytes(&mut nonce);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+        let nonce = URL_SAFE_NO_PAD.encode(nonce);
+        let signature = self.signature("GET", path, query, &timestamp, &nonce, &[]);
+        format!(
+            "device_id={}&auth_ts={}&auth_nonce={}&auth_sig={}",
+            self.id, timestamp, nonce, signature
+        )
+    }
+
+    fn signature(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        timestamp: &str,
+        nonce: &str,
+        body: &[u8],
+    ) -> String {
+        let body_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(body));
+        let payload = [
+            b"todex.device-auth.v1\0".as_slice(),
+            self.id.as_bytes(),
+            b"\0",
+            method.as_bytes(),
+            b"\0",
+            path.as_bytes(),
+            b"\0",
+            canonical_query(query).as_bytes(),
+            b"\0",
+            timestamp.as_bytes(),
+            b"\0",
+            nonce.as_bytes(),
+            b"\0",
+            body_hash.as_bytes(),
+        ]
+        .concat();
+        URL_SAFE_NO_PAD.encode(self.key.sign(&payload).to_bytes())
+    }
+}
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -44,7 +238,7 @@ impl Drop for Daemon {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fake_codex_history_thread_list_read_and_resume_over_websocket() {
     let daemon = spawn_fake_history_daemon().await;
-    let mut ws = connect_ws(daemon.port, Some(TOKEN)).await;
+    let mut ws = connect_ws(daemon.port, Some(&test_device())).await;
     let session = "cdxs_fake_history";
 
     start_session(&mut ws, session, &daemon.workspace_root).await;
@@ -121,16 +315,19 @@ async fn real_codex_http_ws_auth_and_protocol_boundaries() {
         .contains(&daemon.workspace_root.display().to_string()));
     assert_ne!(http_get(daemon.port, "/missing").await.0, 200);
 
-    // Fail-closed authentication: with a token configured, anonymous and
-    // wrong-token WebSocket handshakes are rejected before the upgrade, so
-    // unauthenticated traffic never reaches the business dispatcher.
-    for label in ["anonymous", "wrong token"] {
-        let token = if label == "anonymous" {
-            None
-        } else {
-            Some("definitely-not-the-token")
-        };
-        let rejected = try_connect_ws(daemon.port, token).await;
+    // Fail-closed authentication: anonymous handshakes and signatures from
+    // unregistered devices are rejected before the upgrade, so unauthenticated
+    // traffic never reaches the business dispatcher.
+    let unregistered = SigningKey::from_bytes(&[9; 32]);
+    let unknown = E2eDevice {
+        id: format!(
+            "dev_{}",
+            URL_SAFE_NO_PAD.encode(&Sha256::digest(unregistered.verifying_key().to_bytes())[..12])
+        ),
+        key: unregistered,
+    };
+    for (label, device) in [("anonymous", None), ("unregistered device", Some(&unknown))] {
+        let rejected = try_connect_ws(daemon.port, device).await;
         let error = rejected.expect_err(&format!("{label} handshake must be rejected"));
         assert!(
             error.to_string().contains("401"),
@@ -138,12 +335,12 @@ async fn real_codex_http_ws_auth_and_protocol_boundaries() {
         );
     }
 
-    // The header-token connection drives the control-plane checks below.
-    let mut ws = connect_ws(daemon.port, Some(TOKEN)).await;
+    // The signed-header connection drives the control-plane checks below.
+    let mut ws = connect_ws(daemon.port, Some(&test_device())).await;
 
-    // Query-token authentication (Electron/browser clients cannot set
+    // Signed-query authentication (Electron/browser clients cannot set
     // WebSocket headers): the handshake succeeds and business commands work.
-    let mut query_ws = connect_ws_query_token(daemon.port).await;
+    let mut query_ws = connect_ws_signed_query(daemon.port, &test_device()).await;
     send_json(
         &mut query_ws,
         json!({
@@ -201,17 +398,17 @@ async fn real_codex_http_ws_auth_and_protocol_boundaries() {
     }
 
     // Fail-closed audit contract: authenticated tenants are audited with the
-    // gateway-token principal, anonymous access is never granted, and no
+    // device principal, anonymous access is never granted, and no
     // NO_AUTH_REQUIRED decision may appear for the WebSocket control plane.
     let audit = fs::read_to_string(daemon.data_dir.join("audit/audit.jsonl"))
         .expect("audit log should exist");
     assert!(
-        audit.contains("\"tenant_id\":\"local\"") && audit.contains("gateway-token"),
-        "authenticated control decisions must be audited under the gateway token principal"
+        audit.contains("\"tenant_id\":\"local\"") && audit.contains(&test_device().id),
+        "authenticated control decisions must be audited under the device principal"
     );
     assert!(
         !audit.contains("NO_AUTH_REQUIRED"),
-        "anonymous WebSocket control must never be granted while a token is configured"
+        "anonymous WebSocket control must never be granted while auth is enabled"
     );
 }
 
@@ -228,7 +425,14 @@ async fn real_v2_provider_http_ws_roundtrip() {
         .filter(|provider| !provider.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let providers = http_request(daemon.port, "GET", "/v2/providers", Some(TOKEN), None).await;
+    let providers = http_request(
+        daemon.port,
+        "GET",
+        "/v2/providers",
+        Some(&test_device()),
+        None,
+    )
+    .await;
     assert_eq!(
         providers.0, 200,
         "provider catalog response: {}",
@@ -257,7 +461,7 @@ async fn real_v2_provider_http_ws_roundtrip() {
             daemon.port,
             "POST",
             "/v2/conversations",
-            Some(TOKEN),
+            Some(&test_device()),
             Some(json!({
                 "provider": provider,
                 "workspace": daemon.workspace_root,
@@ -269,7 +473,7 @@ async fn real_v2_provider_http_ws_roundtrip() {
         let conversation: Value = serde_json::from_str(&create.1).expect("conversation JSON");
         let conversation_id = conversation["id"].as_str().expect("conversation id");
 
-        let mut ws = connect_v2_ws(daemon.port, Some(TOKEN)).await;
+        let mut ws = connect_v2_ws(daemon.port, Some(&test_device())).await;
         send_json(
             &mut ws,
             json!({
@@ -289,7 +493,7 @@ async fn real_v2_provider_http_ws_roundtrip() {
                     "/v2/providers/{endpoint}?provider={provider}&workspace={}",
                     daemon.workspace_root.display()
                 ),
-                Some(TOKEN),
+                Some(&test_device()),
                 None,
             )
             .await;
@@ -338,7 +542,7 @@ async fn real_v2_provider_http_ws_roundtrip() {
             daemon.port,
             "POST",
             &format!("/v2/conversations/{conversation_id}/prompt"),
-            Some(TOKEN),
+            Some(&test_device()),
             Some(prompt_payload),
         )
         .await;
@@ -410,7 +614,7 @@ fn require_real_v2_e2e() {
 async fn real_codex_single_session_plan_input_approval_replay_and_snapshot() {
     require_real_e2e();
     let daemon = spawn_daemon().await;
-    let mut ws = connect_ws(daemon.port, Some(TOKEN)).await;
+    let mut ws = connect_ws(daemon.port, Some(&test_device())).await;
     let session = "cdxs_real_single";
 
     assert_status(&mut ws, session, "idle").await;
@@ -556,7 +760,7 @@ async fn real_codex_single_session_plan_input_approval_replay_and_snapshot() {
     })
     .await;
 
-    let mut attach_ws = connect_ws(daemon.port, Some(TOKEN)).await;
+    let mut attach_ws = connect_ws(daemon.port, Some(&test_device())).await;
     send_json(
         &mut attach_ws,
         json!({
@@ -579,7 +783,7 @@ async fn real_codex_single_session_plan_input_approval_replay_and_snapshot() {
 async fn real_codex_common_native_controls_model_goal_permission_and_review() {
     require_real_e2e();
     let daemon = spawn_daemon().await;
-    let mut ws = connect_ws(daemon.port, Some(TOKEN)).await;
+    let mut ws = connect_ws(daemon.port, Some(&test_device())).await;
     let session = "cdxs_real_controls";
     let review_session = "cdxs_real_review";
 
@@ -642,7 +846,7 @@ async fn real_codex_common_native_controls_model_goal_permission_and_review() {
         .or_else(|| data_result_string(&thread_start, &["id"]))
         .expect("thread/start response should include thread id");
 
-    let mut review_ws = connect_ws(daemon.port, Some(TOKEN)).await;
+    let mut review_ws = connect_ws(daemon.port, Some(&test_device())).await;
     start_session(&mut review_ws, review_session, &daemon.workspace_root).await;
     let review_thread = start_thread_with_ephemeral(
         &mut review_ws,
@@ -736,7 +940,7 @@ async fn real_codex_common_native_controls_model_goal_permission_and_review() {
 async fn real_codex_parallel_sessions_and_busy_rejection() {
     require_real_e2e();
     let daemon = spawn_daemon().await;
-    let mut ws = connect_ws(daemon.port, Some(TOKEN)).await;
+    let mut ws = connect_ws(daemon.port, Some(&test_device())).await;
     let sessions = ["cdxs_parallel_a", "cdxs_parallel_b", "cdxs_parallel_c"];
 
     for session in sessions {
@@ -835,6 +1039,7 @@ async fn spawn_daemon() -> Daemon {
     fs::create_dir_all(&workspace_root).expect("create workspace dir");
     let port = free_port();
     write_real_acp_profile(&data_dir);
+    seed_device(&data_dir, &test_device());
     let bin = env!("CARGO_BIN_EXE_todex-agentd");
     let mut command = Command::new(bin);
     command
@@ -847,8 +1052,7 @@ async fn spawn_daemon() -> Daemon {
         .arg(&data_dir)
         .arg("--workspace-root")
         .arg(&workspace_root)
-        .env("TODEX_AGENTD_AUTH_TOKEN", TOKEN)
-        // This fixture uses token-authenticated plaintext WebSockets.
+        // This fixture uses device-signed plaintext WebSockets.
         .env("TODEX_AGENTD_PAIRING_ENCRYPTION", "none")
         .env("TODEX_AGENTD_CODEX_BIN", codex_binary())
         .env(
@@ -888,7 +1092,7 @@ async fn register_and_trust_workspace(daemon: &Daemon) {
         daemon.port,
         "PUT",
         "/v2/workspaces",
-        Some(TOKEN),
+        Some(&test_device()),
         Some(json!({
             "workspaces": [{
                 "id": "real-provider-e2e",
@@ -918,7 +1122,7 @@ async fn register_and_trust_workspace(daemon: &Daemon) {
         daemon.port,
         "PUT",
         &format!("/v2/workspaces/{workspace_id}/trust"),
-        Some(TOKEN),
+        Some(&test_device()),
         Some(json!({ "trusted": true })),
     )
     .await;
@@ -959,6 +1163,7 @@ async fn spawn_fake_history_daemon() -> Daemon {
     fs::create_dir_all(&workspace_root).expect("create workspace dir");
     let fake_codex = write_fake_history_codex_binary(&root, &workspace_root);
     let port = free_port();
+    seed_device(&data_dir, &test_device());
     let bin = env!("CARGO_BIN_EXE_todex-agentd");
     let mut command = Command::new(bin);
     command
@@ -971,8 +1176,7 @@ async fn spawn_fake_history_daemon() -> Daemon {
         .arg(&data_dir)
         .arg("--workspace-root")
         .arg(&workspace_root)
-        .env("TODEX_AGENTD_AUTH_TOKEN", TOKEN)
-        // This fixture uses token-authenticated plaintext WebSockets.
+        // This fixture uses device-signed plaintext WebSockets.
         .env("TODEX_AGENTD_PAIRING_ENCRYPTION", "none")
         .env("TODEX_AGENTD_CODEX_BIN", &fake_codex)
         .stdin(Stdio::null())
@@ -1166,51 +1370,54 @@ async fn send_local_request(
     response
 }
 
-async fn connect_ws(port: u16, token: Option<&str>) -> Ws {
-    try_connect_ws(port, token)
+async fn connect_ws(port: u16, device: Option<&E2eDevice>) -> Ws {
+    try_connect_ws(port, device)
         .await
         .expect("connect websocket")
 }
 
 async fn try_connect_ws(
     port: u16,
-    token: Option<&str>,
+    device: Option<&E2eDevice>,
 ) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
     let mut request = format!("ws://127.0.0.1:{port}/v2/ws")
         .into_client_request()
         .expect("build websocket request");
-    if let Some(token) = token {
-        request.headers_mut().insert(
-            "Authorization",
-            format!("Bearer {token}")
-                .parse()
-                .expect("valid auth header"),
-        );
+    if let Some(device) = device {
+        for (name, value) in device.auth_headers("GET", "/v2/ws", &[]) {
+            request.headers_mut().insert(
+                tungstenite::http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
     }
     connect_async(request).await.map(|(ws, _)| ws)
 }
 
-async fn connect_ws_query_token(port: u16) -> Ws {
-    let request = format!("ws://127.0.0.1:{port}/v2/ws?access_token={TOKEN}")
-        .into_client_request()
-        .expect("build query-token websocket request");
+async fn connect_ws_signed_query(port: u16, device: &E2eDevice) -> Ws {
+    let request = format!(
+        "ws://127.0.0.1:{port}/v2/ws?{}",
+        device.auth_query("/v2/ws")
+    )
+    .into_client_request()
+    .expect("build signed-query websocket request");
     let (ws, _) = connect_async(request)
         .await
-        .expect("connect with access_token query parameter");
+        .expect("connect with signed query parameters");
     ws
 }
 
-async fn connect_v2_ws(port: u16, token: Option<&str>) -> Ws {
+async fn connect_v2_ws(port: u16, device: Option<&E2eDevice>) -> Ws {
     let mut request = format!("ws://127.0.0.1:{port}/v2/ws")
         .into_client_request()
         .expect("build v2 websocket request");
-    if let Some(token) = token {
-        request.headers_mut().insert(
-            "Authorization",
-            format!("Bearer {token}")
-                .parse()
-                .expect("valid auth header"),
-        );
+    if let Some(device) = device {
+        for (name, value) in device.auth_headers("GET", "/v2/ws", &[]) {
+            request.headers_mut().insert(
+                tungstenite::http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
     }
     let (ws, _) = connect_async(request).await.expect("connect v2 websocket");
     ws
@@ -1383,15 +1590,19 @@ async fn http_request(
     port: u16,
     method: &str,
     path: &str,
-    token: Option<&str>,
+    device: Option<&E2eDevice>,
     body: Option<Value>,
 ) -> (u16, String) {
     let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)).await else {
         return (0, String::new());
     };
     let body = body.map_or_else(String::new, |value| value.to_string());
-    let auth = token.map_or_else(String::new, |value| {
-        format!("Authorization: Bearer {value}\r\n")
+    let auth = device.map_or_else(String::new, |device| {
+        device
+            .auth_headers(method, path, body.as_bytes())
+            .into_iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect()
     });
     let content_type = if body.is_empty() {
         String::new()

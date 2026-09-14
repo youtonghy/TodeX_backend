@@ -1,7 +1,9 @@
 //! Device enrollment is separate from normal authenticated API access. Only a
 //! local owner-private decision file can approve a request. A matching short
-//! code authenticates the ephemeral transcript; the credential is returned
-//! once, encrypted for the initiating client's ephemeral private key.
+//! code authenticates the ephemeral transcript; on approval the client's
+//! long-term Ed25519 device key is registered and the assigned device id is
+//! returned once, encrypted for the initiating client's ephemeral private key.
+use crate::devices::DeviceRegistry;
 use crate::error::AppError;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chacha20poly1305::{
@@ -31,16 +33,19 @@ const MAX_ACTIVE: usize = 16;
 const MAX_RECORDS: usize = 64;
 const MAX_LOCAL_FILE: u64 = 4096;
 const DIRECTORY: &str = "device-pairing";
-const TRANSCRIPT_DOMAIN: &[u8] = b"todex.device-pairing.v1/transcript\0";
-const WRAP_INFO: &[u8] = b"todex.device-pairing.v1/wrap-key";
-const POLL_INFO: &[u8] = b"todex.device-pairing.v1/poll-proof";
-const CANCEL_INFO: &[u8] = b"todex.device-pairing.v1/cancel-proof";
+const TRANSCRIPT_DOMAIN: &[u8] = b"todex.device-pairing.v2/transcript\0";
+const WRAP_INFO: &[u8] = b"todex.device-pairing.v2/wrap-key";
+const POLL_INFO: &[u8] = b"todex.device-pairing.v2/poll-proof";
+const CANCEL_INFO: &[u8] = b"todex.device-pairing.v2/cancel-proof";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CreateDevicePairingRequest {
+    /// Ephemeral X25519 key that encrypts the approval payload.
     pub client_public_key: String,
     pub device_name: String,
+    /// Long-term Ed25519 device identity key registered on approval.
+    pub device_public_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,17 +105,22 @@ impl PairingMaterial {
         request_id: &str,
         client_public: &[u8; 32],
         server_public: &[u8; 32],
+        device_public: &[u8; 32],
         shared: &[u8; 32],
     ) -> Result<Self> {
         if bool::from(shared.ct_eq(&[0; 32])) {
             return Err(invalid("invalid client public key"));
         }
+        // The enrolled device key is part of the transcript, so the short
+        // verification code also binds the identity being approved.
         let transcript = [
             TRANSCRIPT_DOMAIN,
             request_id.as_bytes(),
             &[0],
             client_public,
             server_public,
+            &[0],
+            device_public,
         ]
         .concat();
         let salt = Sha256::digest(&transcript);
@@ -134,13 +144,13 @@ impl PairingMaterial {
         })
     }
 
-    fn wrap(&self, token: &str, nonce: &[u8; 24]) -> Result<String> {
+    fn wrap(&self, device_id: &str, nonce: &[u8; 24]) -> Result<String> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Credential<'a> {
-            auth_token: &'a str,
+            device_id: &'a str,
         }
-        let plaintext = serde_json::to_vec(&Credential { auth_token: token })?;
+        let plaintext = serde_json::to_vec(&Credential { device_id })?;
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.wrap_key));
         let encrypted = cipher
             .encrypt(
@@ -163,6 +173,8 @@ enum RequestStatus {
 }
 struct PendingRequest {
     material: PairingMaterial,
+    device_name: String,
+    device_public_key: [u8; 32],
     expires: Instant,
     expires_at: u64,
     status: RequestStatus,
@@ -184,10 +196,11 @@ impl Drop for RegistryState {
 #[derive(Clone)]
 pub(crate) struct DevicePairingRegistry {
     inner: Arc<Mutex<RegistryState>>,
-    token: Option<Arc<String>>,
+    enabled: bool,
+    devices: DeviceRegistry,
 }
 impl DevicePairingRegistry {
-    pub(crate) fn new(data_dir: &Path, token: Option<String>) -> Result<Self> {
+    pub(crate) fn new(data_dir: &Path, enabled: bool, devices: DeviceRegistry) -> Result<Self> {
         let directory = prepare_directory(data_dir)?;
         // Another daemon can share this data directory, or a second start can
         // fail after constructing AppState. Never delete its live requests.
@@ -211,7 +224,8 @@ impl DevicePairingRegistry {
             }
         }
         Ok(Self {
-            token: token.map(Arc::new),
+            enabled,
+            devices,
             inner: Arc::new(Mutex::new(RegistryState {
                 directory,
                 requests: HashMap::new(),
@@ -226,7 +240,7 @@ impl DevicePairingRegistry {
         peer: IpAddr,
         request: CreateDevicePairingRequest,
     ) -> Result<CreateDevicePairingResponse> {
-        if self.token.is_none() {
+        if !self.enabled {
             return Err(AppError::Conflict(
                 "Authentication is disabled; connect without device pairing".to_owned(),
             ));
@@ -239,6 +253,7 @@ impl DevicePairingRegistry {
             ));
         }
         let client_public = decode_32(&request.client_public_key)?;
+        let device_public = crate::devices::parse_public_key(&request.device_public_key)?;
         let mut state = self
             .inner
             .lock()
@@ -263,17 +278,23 @@ impl DevicePairingRegistry {
             .diffie_hellman(&PublicKey::from(client_public))
             .to_bytes();
         let request_id = Uuid::new_v4().to_string();
-        let material =
-            PairingMaterial::derive(&request_id, &client_public, &server_public, &shared)?;
+        let material = PairingMaterial::derive(
+            &request_id,
+            &client_public,
+            &server_public,
+            &device_public,
+            &shared,
+        )?;
         let expires_at = unix_ms().saturating_add(TTL.as_millis() as u64);
+        let device_name = if request.device_name.trim().is_empty() {
+            "Unknown device".to_owned()
+        } else {
+            request.device_name.trim().to_owned()
+        };
         let summary = DevicePairingRequestSummary {
             request_id: request_id.clone(),
             verification_code: material.verification_code.clone(),
-            device_name: if request.device_name.trim().is_empty() {
-                "Unknown device".to_owned()
-            } else {
-                request.device_name.trim().to_owned()
-            },
+            device_name: device_name.clone(),
             expires_at,
             peer_address: peer.to_string(),
         };
@@ -286,6 +307,8 @@ impl DevicePairingRegistry {
             request_id.clone(),
             PendingRequest {
                 material,
+                device_name,
+                device_public_key: device_public,
                 expires: Instant::now() + TTL,
                 expires_at,
                 status: RequestStatus::Pending,
@@ -332,13 +355,15 @@ impl DevicePairingRegistry {
         if pending.status == RequestStatus::Rejected {
             return Ok(poll_state("rejected", pending.expires_at));
         }
+        // Approval commits the long-term device key to the registry before the
+        // id is delivered; a registration failure must not leak a device id
+        // that cannot authenticate.
+        let record = self
+            .devices
+            .register(&pending.device_name, &pending.device_public_key)?;
         let mut nonce = [0; 24];
         OsRng.fill_bytes(&mut nonce);
-        let token = self
-            .token
-            .as_deref()
-            .ok_or_else(|| invalid("authentication is disabled"))?;
-        let ciphertext = pending.material.wrap(token, &nonce)?;
+        let ciphertext = pending.material.wrap(&record.device_id, &nonce)?;
         Ok(DevicePairingPollResponse {
             status: "approved",
             expires_at: pending.expires_at,
@@ -676,7 +701,7 @@ mod tests {
             Self { root }
         }
         fn registry(&self) -> DevicePairingRegistry {
-            DevicePairingRegistry::new(&self.root, Some("synthetic-approved-token".to_owned()))
+            DevicePairingRegistry::new(&self.root, true, DeviceRegistry::load(&self.root).unwrap())
                 .unwrap()
         }
     }
@@ -688,6 +713,11 @@ mod tests {
     fn peer() -> IpAddr {
         "127.0.0.1".parse().unwrap()
     }
+    fn device_key() -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&[21; 32])
+            .verifying_key()
+            .to_bytes()
+    }
     fn begin(registry: &DevicePairingRegistry) -> (CreateDevicePairingResponse, PairingMaterial) {
         let client_secret = StaticSecret::from([7; 32]);
         let client_public = PublicKey::from(&client_secret).to_bytes();
@@ -697,6 +727,7 @@ mod tests {
                 CreateDevicePairingRequest {
                     client_public_key: URL_SAFE_NO_PAD.encode(client_public),
                     device_name: "Synthetic device".to_owned(),
+                    device_public_key: URL_SAFE_NO_PAD.encode(device_key()),
                 },
             )
             .unwrap();
@@ -708,6 +739,7 @@ mod tests {
             &response.request_id,
             &client_public,
             &server_public,
+            &device_key(),
             &shared,
         )
         .unwrap();
@@ -746,23 +778,34 @@ mod tests {
         let shared = server_secret
             .diffie_hellman(&PublicKey::from(client_public))
             .to_bytes();
+        let device_public = device_key();
+        let device_id = crate::devices::device_id_for(&device_public);
         let material =
-            PairingMaterial::derive(id, &client_public, &server_public, &shared).unwrap();
+            PairingMaterial::derive(id, &client_public, &server_public, &device_public, &shared)
+                .unwrap();
         json!({
             "requestId": id, "expiresAt": 2000000300000_u64,
             "clientSecret": URL_SAFE_NO_PAD.encode([7; 32]), "serverSecret": URL_SAFE_NO_PAD.encode([9; 32]),
+            "deviceSecret": URL_SAFE_NO_PAD.encode([21; 32]),
             "clientPublicKey": URL_SAFE_NO_PAD.encode(client_public), "serverPublicKey": URL_SAFE_NO_PAD.encode(server_public),
+            "devicePublicKey": URL_SAFE_NO_PAD.encode(device_public), "deviceId": device_id,
             "transcript": URL_SAFE_NO_PAD.encode(&material.transcript), "verificationCode": material.verification_code,
             "wrapKey": URL_SAFE_NO_PAD.encode(material.wrap_key), "pollProof": URL_SAFE_NO_PAD.encode(material.poll_proof), "cancelProof": URL_SAFE_NO_PAD.encode(material.cancel_proof),
-            "nonce": URL_SAFE_NO_PAD.encode([11; 24]), "authToken": "synthetic-device-pairing-token",
-            "ciphertext": material.wrap("synthetic-device-pairing-token", &[11; 24]).unwrap(),
+            "nonce": URL_SAFE_NO_PAD.encode([11; 24]),
+            "ciphertext": material.wrap(&device_id, &[11; 24]).unwrap(),
         })
     }
     #[test]
     fn device_pairing_cross_language_vector_matches() {
+        let actual = vector();
+        if std::env::var_os("TODEX_WRITE_FIXTURES").is_some() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/device-pairing-v2.json");
+            fs::write(&path, serde_json::to_string_pretty(&actual).unwrap()).unwrap();
+        }
         let expected: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/device-pairing-v1.json")).unwrap();
-        assert_eq!(vector(), expected);
+            serde_json::from_str(include_str!("../tests/fixtures/device-pairing-v2.json")).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -780,11 +823,11 @@ mod tests {
         .unwrap();
         for excluded in [
             "authToken",
-            "synthetic-approved-token",
             "pollProof",
             "cancelProof",
             "privateKey",
             "clientSecret",
+            "devicePublicKey",
         ] {
             assert!(!file.contains(excluded));
         }
@@ -806,11 +849,16 @@ mod tests {
         assert_eq!(response.status, "approved");
         assert!(!serde_json::to_string(&response)
             .unwrap()
-            .contains("synthetic-approved-token"));
-        assert_eq!(
-            decrypt(&material, &response)["authToken"],
-            "synthetic-approved-token"
-        );
+            .contains("authToken"));
+        let expected_id = crate::devices::device_id_for(&device_key());
+        assert_eq!(decrypt(&material, &response)["deviceId"], expected_id);
+        // Approval committed the device to the shared registry.
+        let record = crate::devices::list_devices(&fixture.root)
+            .unwrap()
+            .into_iter()
+            .find(|device| device.device_id == expected_id)
+            .expect("approved device is registered");
+        assert_eq!(record.name, "Synthetic device");
         assert_eq!(
             registry
                 .poll(peer(), proof(&created.request_id, &material.poll_proof))
@@ -930,7 +978,20 @@ mod tests {
                 peer(),
                 CreateDevicePairingRequest {
                     client_public_key: URL_SAFE_NO_PAD.encode([0; 32]),
-                    device_name: "Device".into()
+                    device_name: "Device".into(),
+                    device_public_key: URL_SAFE_NO_PAD.encode(device_key()),
+                }
+            )
+            .is_err());
+        // An invalid Ed25519 key is rejected before rate limits are consumed.
+        assert!(registry
+            .create(
+                peer(),
+                CreateDevicePairingRequest {
+                    client_public_key: URL_SAFE_NO_PAD
+                        .encode(PublicKey::from(&StaticSecret::from([7; 32])).to_bytes()),
+                    device_name: "Device".into(),
+                    device_public_key: "not-a-key".into(),
                 }
             )
             .is_err());
@@ -938,12 +999,14 @@ mod tests {
             begin(&registry);
         }
         let key = URL_SAFE_NO_PAD.encode(PublicKey::from(&StaticSecret::from([7; 32])).to_bytes());
+        let device = URL_SAFE_NO_PAD.encode(device_key());
         assert!(matches!(
             registry.create(
                 peer(),
                 CreateDevicePairingRequest {
                     client_public_key: key.clone(),
-                    device_name: "Device".into()
+                    device_name: "Device".into(),
+                    device_public_key: device.clone(),
                 }
             ),
             Err(AppError::ResourceExhausted(_))
@@ -955,6 +1018,7 @@ mod tests {
                     CreateDevicePairingRequest {
                         client_public_key: key.clone(),
                         device_name: "Device".into(),
+                        device_public_key: device.clone(),
                     },
                 )
                 .unwrap();
@@ -965,7 +1029,8 @@ mod tests {
                 "192.0.2.99".parse().unwrap(),
                 CreateDevicePairingRequest {
                     client_public_key: key,
-                    device_name: "Device".into()
+                    device_name: "Device".into(),
+                    device_public_key: device,
                 }
             ),
             Err(AppError::ResourceExhausted(_))
@@ -999,13 +1064,19 @@ mod tests {
     #[test]
     fn auth_disabled_server_does_not_offer_pairing() {
         let fixture = Fixture::new();
-        let registry = DevicePairingRegistry::new(&fixture.root, None).unwrap();
+        let registry = DevicePairingRegistry::new(
+            &fixture.root,
+            false,
+            DeviceRegistry::load(&fixture.root).unwrap(),
+        )
+        .unwrap();
         assert!(matches!(
             registry.create(
                 peer(),
                 CreateDevicePairingRequest {
                     client_public_key: String::new(),
-                    device_name: String::new()
+                    device_name: String::new(),
+                    device_public_key: String::new(),
                 }
             ),
             Err(AppError::Conflict(_))

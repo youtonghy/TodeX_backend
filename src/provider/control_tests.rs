@@ -70,7 +70,6 @@ impl Harness {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("fixture".to_owned()),
             },
         });
         let store = ConversationStore::new(config.data_dir.clone())

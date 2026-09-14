@@ -8,7 +8,7 @@
 
 ## 已验证控制
 
-- v2 HTTP 和 WebSocket 入口都要求 Bearer token，并以 authenticated tenant 作为 conversation owner；`get_owned`、replay、prompt、cancel、permission response 和 subscription 都执行 owner 校验。
+- v2 HTTP 和 WebSocket 入口都要求已注册设备的 Ed25519 请求签名（时间戳窗口 + 一次性 nonce 防重放），并以 device principal 作为 conversation owner；`get_owned`、replay、prompt、cancel、permission response 和 subscription 都执行 owner 校验。设备注册表见 `devices.json`，吊销入口在 TUI `d` 面板与 `x` 重置菜单。
 - workspace 路径在创建 conversation、catalog 查询、workspace API、终端和旧 Codex adapter 路径统一 canonicalize，并拒绝 workspace root 外的目录、符号链接逃逸和不存在目录。
 - ACP 的 command、args、env 只来自管理员配置的 profile；客户端只能提交 profile 名称。`TODEX_AGENTD_*` 不会被传入 Provider 子进程。
 - Provider 子进程清空环境后只恢复允许的基础变量；stdout 单行上限 4 MiB，stderr 保留窗口 64 KiB，停止时处理 Unix process group。
@@ -50,5 +50,5 @@ TODEX_REAL_E2E=1 TODEX_REAL_ALLOW_BILLABLE=1 TODEX_REAL_PROVIDERS=codex,pi \
 
 ## 剩余事项
 
-1. 生产部署前验证反向代理仅开放 HTTPS/WSS，daemon 仅监听 loopback，token、audit 和 provider 登录目录使用最小文件权限。
+1. 生产部署前验证反向代理仅开放 HTTPS/WSS，daemon 仅监听 loopback，`devices.json`、audit 和 provider 登录目录使用最小文件权限。
 2. 如果 replay 成为主要 CPU/IO 热点，先用生产规模 journal 做基准，再设计 checkpoint/index；不要以取消完整校验换取未经测量的优化。

@@ -81,9 +81,8 @@ opencode --version
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
-| `TODEX_AGENTD_AUTH_TOKEN` | WebSocket Bearer token |
 
-本机临时测试可设置 `TODEX_AGENTD_ENABLE_AUTH=false`；此时后端不会生成或要求 Auth token。生产环境应保持认证开启。
+本机临时测试可设置 `TODEX_AGENTD_ENABLE_AUTH=false`；此时后端不要求设备签名。生产环境应保持认证开启。`security.auth_token` 与 `TODEX_AGENTD_AUTH_TOKEN` 已废弃：授权只走设备验证（见 [device-verification.md](device-verification.md)），配置后会被忽略并产生告警。
 
 配置文件示例：
 
@@ -117,7 +116,6 @@ args = []
 [security]
 enable_auth = true
 enable_tls = false
-auth_token = "replace-me"
 
 [tui]
 language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
@@ -214,7 +212,7 @@ TODEX_REAL_E2E=1 TODEX_REAL_ALLOW_BILLABLE=1 TODEX_REAL_PROVIDERS=codex,pi \
 
 测试先验证模型和命令发现，再要求 assistant 返回随机 sentinel，并且必须观察到同一 conversation/turn 的 assistant 完成事件和 `turn.completed`。任何 `turn.failed`、`turn.cancelled`、缺失 turn ID 或缺失 Codex terminal status 都会失败。
 
-测试覆盖 HTTP `/health`、`/v2/version`、WebSocket `/v2/ws`（含统一命令面上的终端与本地 Codex 控制、`session.resume` 断线恢复）、认证矩阵（匿名/错 token 拒绝、header 与 URL 编码 query token 成功）、租户不匹配、旧协议拒绝、本地 Codex start/status/stop、真实 turn、Plan 模式、approval 响应、replay/attach/snapshot、并行多 session 和同 session busy rejection，以及 `/v1/*` 的 404 回归。
+测试覆盖 HTTP `/health`、`/v2/version`、WebSocket `/v2/ws`（含统一命令面上的终端与本地 Codex 控制、`session.resume` 断线恢复）、设备签名认证矩阵（匿名与未注册设备拒绝、header 与签名 query 成功）、租户不匹配、旧协议拒绝、本地 Codex start/status/stop、真实 turn、Plan 模式、approval 响应、replay/attach/snapshot、并行多 session 和同 session busy rejection，以及 `/v1/*` 的 404 回归。
 
 更深的 Codex Plan、approval、review 和并发测试仍是独立 ignored 测试，不应使用不带测试名的 `--ignored` 一次性运行。GitHub Actions 中的 `Real provider E2E` workflow 只允许手动触发，使用受保护的 `provider-e2e` environment 和专用 secrets，并上传脱敏 JSON 结果。
 
@@ -254,13 +252,13 @@ sudo systemctl enable --now todex-agentd
 sudo systemctl status todex-agentd
 ```
 
-macOS 可使用 launchd 的 `ProgramArguments` 指向同一 `serve` 命令，并把 `TODEX_AGENTD_AUTH_TOKEN` 放在 root-only 的 plist 或环境文件中；Windows 则使用 NSSM 或 Windows Service wrapper，服务账户必须拥有数据目录、workspace 和各 Provider CLI 的原生登录配置。不要把 token 写入命令行参数或提交到仓库。
+macOS 可使用 launchd 的 `ProgramArguments` 指向同一 `serve` 命令；Windows 则使用 NSSM 或 Windows Service wrapper，服务账户必须拥有数据目录、workspace 和各 Provider CLI 的原生登录配置。`devices.json` 注册表位于数据目录内，服务账户需对其有读写权限。
 
-反向代理至少需要转发 `/health` 与 `/v2/*`，启用 WebSocket upgrade，设置合理的 request/body timeout，并只允许 HTTPS 来源。代理到 daemon 的 upstream 仍使用 `http://127.0.0.1:7345`；移动端使用代理公开的 HTTPS/WSS 地址重新生成配对二维码。注意 `access_token` 查询参数可能进入代理访问日志：生产环境优先使用 `Authorization` header 认证。
+反向代理至少需要转发 `/health` 与 `/v2/*`，启用 WebSocket upgrade，设置合理的 request/body timeout，并只允许 HTTPS 来源。代理到 daemon 的 upstream 仍使用 `http://127.0.0.1:7345`；移动端使用代理公开的 HTTPS/WSS 地址重新生成配对二维码。注意设备签名的 `auth_sig` 等 query 参数可能进入代理访问日志：生产环境优先使用 header 认证。
 
 生产检查清单：
 
-- `TODEX_AGENTD_ENABLE_AUTH=true`，token 使用随机高熵值，并定期轮换。
+- `TODEX_AGENTD_ENABLE_AUTH=true`，设备经配对流程登记，丢失设备在 TUI `d` 面板按 `x` 吊销。
 - `enable_tls=false` 仅表示由代理终止 TLS；禁止直接暴露 7345 明文端口。
 - daemon 用户与登录 Provider 的用户一致，且 workspace 目录最小授权。
 - 日志、`daemon.json`、`audit/` 和配置文件设置为仅 daemon 用户可读。
@@ -357,11 +355,7 @@ curl http://127.0.0.1:7345/v2/version
 
 ## WebSocket 连接验证
 
-```bash
-websocat -H "Authorization: Bearer ${TODEX_AGENTD_AUTH_TOKEN}" ws://127.0.0.1:7345/v2/ws
-```
-
-无法设置 header 的客户端可使用查询参数：`ws://127.0.0.1:7345/v2/ws?access_token=<url-encoded-token>`。
+每个握手请求必须携带设备签名（`x-todex-*` header 或等价 `device_id`/`auth_ts`/`auth_nonce`/`auth_sig` query 参数），签名格式见 [device-verification.md](device-verification.md)。
 
 发送状态查询消息：
 
@@ -390,7 +384,7 @@ websocat -H "Authorization: Bearer ${TODEX_AGENTD_AUTH_TOKEN}" ws://127.0.0.1:73
 1. 本版本 Backend 已删除 `/v1/*`，Backend 与 Desktop/TodeX_app 必须同步升级发布；旧客户端访问本版本 Backend 会在 `/v1/*` 上得到 404。
 2. 无法同步发布时的过渡方案：先部署同时提供 `/v1` 与 `/v2` 的过渡版本，客户端切换完成并通过 E2E 后，再部署本版本。
 
-回滚说明：本版本 Backend 与客户端需一起回滚（只回滚 Backend 会让新客户端缺少 `/v2` 资源接口与统一 `/v2/ws` 命令面；只回滚客户端会让旧客户端撞上已删除的 `/v1`）。数据格式未变（conversation folder、workspace 缓存、认证 token 均沿用），回滚不涉及数据迁移。
+回滚说明：本版本 Backend 与客户端需一起回滚（只回滚 Backend 会让新客户端缺少 `/v2` 资源接口与统一 `/v2/ws` 命令面；只回滚客户端会让旧客户端撞上已删除的 `/v1`）。认证方式在本版本更换为设备签名：回滚后已配对设备需要重新走旧版 token 流程；除此之外数据格式未变（conversation folder、workspace 缓存均沿用）。
 
 ## 常见错误
 

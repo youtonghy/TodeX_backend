@@ -3,7 +3,7 @@ mod git;
 pub mod protocol;
 mod routes;
 mod v2;
-mod websocket;
+pub(crate) mod websocket;
 
 use std::net::IpAddr;
 
@@ -15,7 +15,7 @@ use crate::app_state::AppState;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .merge(routes::routes())
+        .merge(routes::routes(&state))
         .merge(device_pairing::routes())
         .layer(cors_layer(&state.config.host))
         .layer(TraceLayer::new_for_http())

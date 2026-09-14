@@ -185,11 +185,8 @@ impl PairingKeys {
             kind: "todex-pairing-link".to_owned(),
             version: PAIRING_VERSION,
             server_url: format!("http://{advertise_host}:{port}"),
-            // Do not put a long-lived bearer token in a QR advertised for a
-            // non-loopback listener. Remote clients can provide it manually.
-            auth_token: is_loopback_host(&config.host)
-                .then(|| config.security.auth_token.clone())
-                .flatten(),
+            // Pairing links never carry credentials: devices authenticate by
+            // signature after the device-verification ceremony registers them.
             preferred_encryption: Some(preferred_encryption),
             protocol: self.pairing_protocol_for(preferred_encryption),
         })?)
@@ -258,10 +255,6 @@ fn pairing_advertise_host(config_host: &str) -> String {
     }
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host.trim(), "127.0.0.1" | "localhost" | "::1")
-}
-
 fn default_route_ipv4() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
@@ -319,8 +312,6 @@ struct PairingLinkPayload {
     kind: String,
     version: u8,
     server_url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    auth_token: Option<String>,
     preferred_encryption: Option<PairingEncryption>,
     #[serde(skip_serializing_if = "Option::is_none")]
     protocol: Option<PairingProtocol>,
@@ -892,8 +883,7 @@ mod tests {
     #[test]
     fn browser_pairing_page_keeps_all_segments_with_one_visible_frame() {
         let keys = PairingKeys::generate();
-        let mut config = test_config();
-        config.security.auth_token = None;
+        let config = test_config();
         let payloads = keys
             .pairing_qr_payloads(&config, 7345, PairingEncryption::MlKem768)
             .unwrap();
@@ -920,7 +910,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&link).unwrap();
 
         assert_eq!(value["kind"], "todex-pairing-link");
-        assert_eq!(value["authToken"], "token");
+        // Pairing links carry no credentials; devices prove identity by
+        // signature after the verification ceremony registers their key.
+        assert!(value.get("authToken").is_none());
         assert_eq!(value["preferredEncryption"], "x25519");
         assert_eq!(value["protocol"]["id"], "x25519");
         assert!(value["protocol"]["publicKey"].as_str().unwrap().len() > 40);
@@ -1375,13 +1367,31 @@ mod tests {
                 policy.json::<serde_json::Value>().await.unwrap(),
                 json!({"requiredProtocol": required.as_str()})
             );
+            let device = crate::device_auth::test_support::TestDevice::new(11);
+            device.enroll(&root.join("data"));
             let client = X25519Secret::random_from_rng(OsRng);
-            let bootstrap = http.post(format!("http://{address}/v2/device-pairing/create")).json(&json!({
-                "deviceName": "policy test", "clientPublicKey": encode_b64(X25519PublicKey::from(&client).as_bytes())
-            })).send().await.unwrap();
+            let bootstrap = http
+                .post(format!("http://{address}/v2/device-pairing/create"))
+                .json(&json!({
+                    "deviceName": "policy test",
+                    "clientPublicKey": encode_b64(X25519PublicKey::from(&client).as_bytes()),
+                    "devicePublicKey": device.public_key_b64(),
+                }))
+                .send()
+                .await
+                .unwrap();
             assert_eq!(bootstrap.status(), 200);
-            let base = format!("ws://{address}/v2/ws?access_token=token");
-            let plaintext = tokio_tungstenite::connect_async(&base).await;
+            // The device signature covers the query, so `enc` handshake
+            // material is bound to the device identity.
+            let signed_url = |extra: &str| {
+                let (path, prefix) = if extra.is_empty() {
+                    ("/v2/ws".to_owned(), String::new())
+                } else {
+                    (format!("/v2/ws?{extra}"), format!("{extra}&"))
+                };
+                format!("ws://{address}/v2/ws?{prefix}{}", device.sign_query(&path))
+            };
+            let plaintext = tokio_tungstenite::connect_async(signed_url("")).await;
             if required == PairingEncryption::None {
                 plaintext.unwrap().0.close(None).await.unwrap();
             } else {
@@ -1395,7 +1405,7 @@ mod tests {
                 };
                 for enc in ["none", "", "invalid", wrong] {
                     assert!(
-                        tokio_tungstenite::connect_async(format!("{base}&enc={enc}"))
+                        tokio_tungstenite::connect_async(signed_url(&format!("enc={enc}")))
                             .await
                             .is_err()
                     );
@@ -1440,7 +1450,7 @@ mod tests {
                 send_counter: Arc::new(AtomicU64::new(0)),
                 receive_counter: Arc::new(AtomicU64::new(0)),
             };
-            let mut request = format!("{base}&{query}").into_client_request().unwrap();
+            let mut request = signed_url(&query).into_client_request().unwrap();
             request
                 .headers_mut()
                 .insert("x-todex-encryption", "none".parse().unwrap());
@@ -1506,7 +1516,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("token".to_owned()),
             },
         }
     }

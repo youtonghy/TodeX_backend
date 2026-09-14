@@ -126,9 +126,7 @@ struct PairingQrPopup {
 }
 
 struct CredentialsPopup {
-    auth_token: Option<String>,
     public_key: Option<String>,
-    selected: usize,
     scroll: u16,
 }
 
@@ -144,7 +142,12 @@ struct DevicePairingRequest {
 struct DevicePairingState {
     open: bool,
     requests: Vec<DevicePairingRequest>,
+    /// Paired devices from `devices.json`; revocable from this panel.
+    devices: Vec<crate::devices::DeviceRecord>,
+    /// Which list Up/Down moves: pending requests or registered devices.
+    focus_devices: bool,
     selected_id: Option<String>,
+    selected_device: Option<String>,
     displayed_request: RefCell<Option<(String, String)>>,
     refreshed_at: Option<Instant>,
     error: Option<String>,
@@ -163,7 +166,35 @@ impl DevicePairingState {
         self.requests = requests;
     }
 
+    fn replace_devices(&mut self, devices: Vec<crate::devices::DeviceRecord>) {
+        if self
+            .selected_device
+            .as_ref()
+            .is_some_and(|id| !devices.iter().any(|device| &device.device_id == id))
+        {
+            self.selected_device = None;
+        }
+        self.devices = devices;
+    }
+
     fn navigate(&mut self, down: bool) {
+        if self.focus_devices {
+            let current = self.selected_device.as_ref().and_then(|id| {
+                self.devices
+                    .iter()
+                    .position(|device| &device.device_id == id)
+            });
+            let index = match current {
+                Some(index) if down => (index + 1).min(self.devices.len().saturating_sub(1)),
+                Some(index) => index.saturating_sub(1),
+                None => 0,
+            };
+            self.selected_device = self
+                .devices
+                .get(index)
+                .map(|device| device.device_id.clone());
+            return;
+        }
         let current = self.selected_id.as_ref().and_then(|id| {
             self.requests
                 .iter()
@@ -186,6 +217,12 @@ impl DevicePairingState {
                 .iter()
                 .find(|request| &request.request_id == id)
         })
+    }
+
+    fn selected_device_record(&self) -> Option<&crate::devices::DeviceRecord> {
+        self.selected_device
+            .as_ref()
+            .and_then(|id| self.devices.iter().find(|device| &device.device_id == id))
     }
 }
 
@@ -409,15 +446,13 @@ impl TuiApp {
         match PairingKeys::load_or_generate(&self.config.data_dir).await {
             Ok(keys) => {
                 self.credentials = Some(CredentialsPopup {
-                    auth_token: self.config.security.auth_token.clone(),
                     public_key: keys.pairing_public_key(self.config.pairing_encryption),
-                    selected: 0,
                     scroll: 0,
                 });
                 self.notice = self
                     .text(
-                        "Credentials are open. Select an item and press Enter or c to copy.",
-                        "凭据窗口已打开。选择项目后按 Enter 或 c 复制。",
+                        "Encryption key window is open. Press Enter or c to copy the public key.",
+                        "加密密钥窗口已打开。按 Enter 或 c 复制公钥。",
                     )
                     .to_owned();
             }
@@ -433,7 +468,7 @@ impl TuiApp {
     fn close_credentials(&mut self) {
         self.credentials = None;
         self.notice = self
-            .text("Credentials closed.", "凭据窗口已关闭。")
+            .text("Encryption key window closed.", "加密密钥窗口已关闭。")
             .to_owned();
     }
 
@@ -441,17 +476,8 @@ impl TuiApp {
         let Some(credentials) = self.credentials.as_ref() else {
             return;
         };
-        let (label, value) = if credentials.selected == 0 {
-            (
-                self.text("Auth Token", "认证令牌").to_owned(),
-                credentials.auth_token.clone(),
-            )
-        } else {
-            (
-                self.text("Encryption public key", "加密公钥").to_owned(),
-                credentials.public_key.clone(),
-            )
-        };
+        let label = self.text("Encryption public key", "加密公钥").to_owned();
+        let value = credentials.public_key.clone();
         let Some(value) = value.filter(|value| !value.is_empty()) else {
             self.notice = self
                 .text(
@@ -590,7 +616,21 @@ impl TuiApp {
                         })
                         .collect(),
                 );
-                self.device_pairing.error = None;
+                match crate::devices::list_devices(data_dir) {
+                    Ok(devices) => {
+                        self.device_pairing.replace_devices(devices);
+                        self.device_pairing.error = None;
+                    }
+                    Err(_) => {
+                        self.device_pairing.error = Some(
+                            self.text(
+                                "Cannot read the paired device registry.",
+                                "无法读取已配对设备注册表。",
+                            )
+                            .to_owned(),
+                        );
+                    }
+                }
             }
             Err(_) => {
                 self.device_pairing.replace(Vec::new());
@@ -683,20 +723,63 @@ impl TuiApp {
     fn open_device_pairing(&mut self) {
         self.refresh_device_pairing(true);
         self.device_pairing.open = true;
+        self.device_pairing.focus_devices = false;
         self.device_pairing.selected_id = self
             .device_pairing
             .requests
             .first()
             .map(|request| request.request_id.clone());
+        if self.device_pairing.selected_device.is_none() {
+            self.device_pairing.selected_device = self
+                .device_pairing
+                .devices
+                .first()
+                .map(|device| device.device_id.clone());
+        }
+    }
+
+    fn revoke_selected_device(&mut self) {
+        let Some(device) = self.device_pairing.selected_device_record() else {
+            return;
+        };
+        let device_id = device.device_id.clone();
+        let data_dir = self
+            .daemon
+            .as_ref()
+            .map(|process| process.data_dir.as_path())
+            .unwrap_or(self.config.data_dir.as_path());
+        match crate::devices::revoke_device(data_dir, &device_id) {
+            Ok(true) => {
+                self.notice = self.text("Device revoked.", "设备已吊销。").to_owned();
+            }
+            Ok(false) => {
+                self.notice = self
+                    .text("Device is no longer registered.", "设备已不在注册表中。")
+                    .to_owned();
+            }
+            Err(error) => {
+                self.device_pairing.error = Some(
+                    self.text("Could not revoke the device.", "无法吊销设备。")
+                        .to_owned(),
+                );
+                self.last_error = Some(error.to_string());
+            }
+        }
+        self.refresh_device_pairing(true);
     }
 
     fn handle_device_pairing_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.device_pairing.open = false,
+            KeyCode::Tab => self.device_pairing.focus_devices = !self.device_pairing.focus_devices,
             KeyCode::Up | KeyCode::Char('k') => self.device_pairing.navigate(false),
             KeyCode::Down | KeyCode::Char('j') => self.device_pairing.navigate(true),
+            KeyCode::Char('x') if self.device_pairing.focus_devices => {
+                self.revoke_selected_device();
+            }
             KeyCode::Char('a') | KeyCode::Char('r')
-                if key.kind == crossterm::event::KeyEventKind::Press =>
+                if key.kind == crossterm::event::KeyEventKind::Press
+                    && !self.device_pairing.focus_devices =>
             {
                 self.decide_device_pairing(key.code == KeyCode::Char('a'));
             }
@@ -729,14 +812,15 @@ impl TuiApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
-                Constraint::Min(3),
-                Constraint::Length(10),
+                Constraint::Min(4),
+                Constraint::Min(4),
+                Constraint::Min(6),
                 Constraint::Length(2),
             ])
             .split(inner);
         frame.render_widget(Paragraph::new(self.text(
-            "Compare the full code with your client before approving. Device names are self-reported.",
-            "批准前请核对客户端的完整验证码。设备名称由请求方自行填写。",
+            "Compare the full code with your client before approving. Device names are self-reported. Tab switches lists.",
+            "批准前请核对客户端的完整验证码。设备名称由请求方自行填写。Tab 切换列表。",
         )).wrap(Wrap { trim: true }), sections[0]);
         let selected_index = self
             .device_pairing
@@ -749,25 +833,88 @@ impl TuiApp {
                     .position(|request| &request.request_id == id)
             })
             .unwrap_or(0);
-        let offset = selected_index.saturating_sub(sections[1].height.saturating_sub(1) as usize);
-        let lines: Vec<Line<'static>> = if self.device_pairing.requests.is_empty() {
-            vec![Line::from(
-                self.text("No pending devices.", "暂无待验证设备。")
+        let offset = selected_index.saturating_sub(sections[1].height.saturating_sub(2) as usize);
+        let pending_focus = !self.device_pairing.focus_devices;
+        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            self.text("Pending requests", "待验证请求").to_owned(),
+            if pending_focus {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ))];
+        if self.device_pairing.requests.is_empty() {
+            lines.push(Line::from(
+                self.text("  No pending devices.", "  暂无待验证设备。")
                     .to_owned(),
-            )]
+            ));
         } else {
-            self.device_pairing
-                .requests
-                .iter()
-                .skip(offset)
-                .map(|request| {
-                    let selected = self.device_pairing.selected_id.as_deref()
-                        == Some(request.request_id.as_str());
+            lines.extend(
+                self.device_pairing
+                    .requests
+                    .iter()
+                    .skip(offset)
+                    .map(|request| {
+                        let selected = pending_focus
+                            && self.device_pairing.selected_id.as_deref()
+                                == Some(request.request_id.as_str());
+                        Line::styled(
+                            format!(
+                                "{}{}",
+                                if selected { "> " } else { "  " },
+                                device_display_name(&request.device_name)
+                            ),
+                            if selected {
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default()
+                            },
+                        )
+                    }),
+            );
+        }
+        frame.render_widget(Paragraph::new(lines), sections[1]);
+
+        let device_selected_index = self
+            .device_pairing
+            .selected_device
+            .as_ref()
+            .and_then(|id| {
+                self.device_pairing
+                    .devices
+                    .iter()
+                    .position(|device| &device.device_id == id)
+            })
+            .unwrap_or(0);
+        let device_offset =
+            device_selected_index.saturating_sub(sections[2].height.saturating_sub(2) as usize);
+        let mut device_lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            self.text("Registered devices", "已注册设备").to_owned(),
+            if self.device_pairing.focus_devices {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ))];
+        if self.device_pairing.devices.is_empty() {
+            device_lines.push(Line::from(
+                self.text("  No paired devices.", "  暂无已配对设备。")
+                    .to_owned(),
+            ));
+        } else {
+            device_lines.extend(self.device_pairing.devices.iter().skip(device_offset).map(
+                |device| {
+                    let selected = self.device_pairing.focus_devices
+                        && self.device_pairing.selected_device.as_deref()
+                            == Some(device.device_id.as_str());
                     Line::styled(
                         format!(
-                            "{}{}",
+                            "{}{} ({})",
                             if selected { "> " } else { "  " },
-                            device_display_name(&request.device_name)
+                            device_display_name(&device.name),
+                            device.device_id
                         ),
                         if selected {
                             Style::default()
@@ -777,11 +924,59 @@ impl TuiApp {
                             Style::default()
                         },
                     )
+                },
+            ));
+        }
+        frame.render_widget(Paragraph::new(device_lines), sections[2]);
+        let details = if self.device_pairing.focus_devices {
+            self.device_pairing
+                .selected_device_record()
+                .map(|device| {
+                    let paired = chrono::DateTime::from_timestamp_millis(
+                        i64::try_from(device.paired_at).unwrap_or_default(),
+                    )
+                    .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                    let seen = device
+                        .last_seen_at
+                        .and_then(|value| {
+                            chrono::DateTime::from_timestamp_millis(
+                                i64::try_from(value).unwrap_or_default(),
+                            )
+                        })
+                        .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "-".to_owned());
+                    vec![
+                        Line::from(format!(
+                            "{}{}",
+                            self.text("Device: ", "设备："),
+                            device_display_name(&device.name)
+                        )),
+                        Line::from(format!("ID: {}", device.device_id)),
+                        Line::from(format!(
+                            "{}{paired}   {}{seen}",
+                            self.text("Paired: ", "配对于："),
+                            self.text("Last seen: ", "最近活动："),
+                        )),
+                        Line::from(
+                            self.text(
+                                "Press x to revoke this device's access.",
+                                "按 x 吊销该设备的访问权限。",
+                            )
+                            .to_owned(),
+                        ),
+                    ]
                 })
-                .collect()
-        };
-        frame.render_widget(Paragraph::new(lines), sections[1]);
-        let details = if let Some(request) = self.device_pairing.selected() {
+                .unwrap_or_else(|| {
+                    vec![Line::from(
+                        self.text(
+                            "Use Up/Down to select a registered device.",
+                            "请使用上下键选择已注册设备。",
+                        )
+                        .to_owned(),
+                    )]
+                })
+        } else if let Some(request) = self.device_pairing.selected() {
             self.device_pairing.displayed_request.replace(Some((
                 request.request_id.clone(),
                 request.verification_code.clone(),
@@ -825,18 +1020,25 @@ impl TuiApp {
         };
         frame.render_widget(
             Paragraph::new(details).wrap(Wrap { trim: true }),
-            sections[2],
+            sections[3],
         );
         let footer = self.device_pairing.error.clone().unwrap_or_else(|| {
-            self.text(
-                "a approve · r reject · Up/Down select · Esc close (Enter does not approve)",
-                "a 批准 · r 拒绝 · 上下选择 · Esc 关闭（Enter 不会批准）",
-            )
+            if self.device_pairing.focus_devices {
+                self.text(
+                    "x revoke · Tab pending list · Up/Down select · Esc close",
+                    "x 吊销 · Tab 切回待验证 · 上下选择 · Esc 关闭",
+                )
+            } else {
+                self.text(
+                    "a approve · r reject · Tab device list · Up/Down select · Esc close (Enter does not approve)",
+                    "a 批准 · r 拒绝 · Tab 切到设备列表 · 上下选择 · Esc 关闭（Enter 不会批准）",
+                )
+            }
             .to_owned()
         });
         frame.render_widget(
             Paragraph::new(footer).wrap(Wrap { trim: true }),
-            sections[3],
+            sections[4],
         );
     }
 
@@ -848,16 +1050,6 @@ impl TuiApp {
         if self.credentials.is_some() {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.close_credentials(),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if let Some(credentials) = &mut self.credentials {
-                        credentials.selected = credentials.selected.saturating_sub(1);
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if let Some(credentials) = &mut self.credentials {
-                        credentials.selected = (credentials.selected + 1).min(1);
-                    }
-                }
                 KeyCode::PageUp => {
                     if let Some(credentials) = &mut self.credentials {
                         credentials.scroll =
@@ -1413,14 +1605,22 @@ impl TuiApp {
     }
 
     async fn reset_auth(&mut self) -> Result<()> {
-        match Config::reset_auth_token(self.config.data_dir.clone()) {
-            Ok(token) => {
-                self.config.security.auth_token = Some(token);
-                let subject = self.text("Auth reset", "认证已重置").to_owned();
+        let data_dir = self
+            .daemon
+            .as_ref()
+            .map(|process| process.data_dir.clone())
+            .unwrap_or_else(|| self.config.data_dir.clone());
+        match crate::devices::revoke_all_devices(&data_dir) {
+            Ok(()) => {
+                let subject = self
+                    .text("All paired devices revoked", "已吊销全部已配对设备")
+                    .to_owned();
                 self.finish_reset(&subject).await;
             }
             Err(error) => {
-                self.notice = self.text("Auth reset failed.", "认证重置失败。").to_owned();
+                self.notice = self
+                    .text("Device revocation failed.", "设备吊销失败。")
+                    .to_owned();
                 self.last_error = Some(error.to_string());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
             }
@@ -1815,28 +2015,32 @@ impl TuiApp {
         let workspace_root = process
             .map(|process| process.workspace_root.as_path())
             .unwrap_or(self.config.workspace_root.as_path());
-        let token = self
-            .config
-            .security
-            .auth_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty());
-        let token_line = match token {
-            Some(token) => Line::from(vec![
-                Span::raw(self.text("Token: ", "令牌：")),
-                Span::styled(token.to_owned(), Style::default().fg(Color::Green)),
-            ]),
-            None => Line::from(vec![
-                Span::raw(self.text("Token: ", "令牌：")),
+        let device_count = crate::devices::list_devices(data_dir)
+            .map(|devices| devices.len())
+            .unwrap_or(0);
+        let devices_line = if self.config.security.enable_auth {
+            Line::from(vec![
+                Span::raw(self.text("Devices: ", "已配对设备：")),
                 Span::styled(
-                    self.text("not set", "未设置"),
-                    Style::default().fg(Color::Red),
+                    match self.language {
+                        TuiLanguage::English => format!("{device_count} registered"),
+                        TuiLanguage::Chinese => format!("{device_count} 台已注册"),
+                    },
+                    Style::default().fg(Color::Cyan),
                 ),
-            ]),
+            ])
+        } else {
+            Line::from(vec![
+                Span::raw(self.text("Devices: ", "已配对设备：")),
+                Span::styled(
+                    self.text("auth disabled", "认证已禁用"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
         };
         let auth_state = if self.config.security.enable_auth {
             Span::styled(
-                self.text("enabled", "已启用"),
+                self.text("device keys", "设备密钥"),
                 Style::default().fg(Color::Yellow),
             )
         } else {
@@ -1912,7 +2116,7 @@ impl TuiApp {
                 "g 配对二维码 · c 凭据 · d 设备验证",
             )),
             Line::from(vec![Span::raw(self.text("Auth: ", "认证：")), auth_state]),
-            token_line,
+            devices_line,
             Line::from(match self.language {
                 TuiLanguage::English => format!("Data dir: {}", data_dir.display()),
                 TuiLanguage::Chinese => format!("数据目录：{}", data_dir.display()),
@@ -2061,69 +2265,46 @@ impl TuiApp {
     }
 
     fn credentials_widget(&self, credentials: &CredentialsPopup) -> Paragraph<'static> {
-        let selected = |index| {
-            if credentials.selected == index {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().add_modifier(Modifier::BOLD)
-            }
-        };
-        let unavailable = self.text("Not available", "不可用").to_owned();
-        let token = credentials
-            .auth_token
-            .clone()
-            .unwrap_or_else(|| unavailable.clone());
-        let public_key = credentials
-            .public_key
-            .clone()
-            .unwrap_or_else(|| unavailable.clone());
         let encryption = pairing_encryption_label(self.config.pairing_encryption);
-        let token_marker = if credentials.selected == 0 {
-            "> "
-        } else {
-            "  "
+        let public_key = credentials.public_key.clone();
+        let key_lines = match public_key {
+            Some(public_key) => vec![
+                Line::from(Span::styled(
+                    match self.language {
+                        TuiLanguage::English => {
+                            format!("Encryption public key ({encryption})")
+                        }
+                        TuiLanguage::Chinese => format!("加密公钥（{encryption}）"),
+                    },
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(public_key),
+            ],
+            None => vec![Line::from(
+                self.text(
+                    "Transport encryption is disabled; there is no key to copy.",
+                    "传输加密未启用，没有可复制的密钥。",
+                )
+                .to_owned(),
+            )],
         };
-        let key_marker = if credentials.selected == 1 {
-            "> "
-        } else {
-            "  "
-        };
-        let lines = vec![
-            Line::from(Span::styled(
-                format!("{token_marker}{}", self.text("Auth Token", "认证令牌")),
-                selected(0),
-            )),
-            Line::from(token),
-            Line::from(""),
-            Line::from(Span::styled(
-                match self.language {
-                    TuiLanguage::English => {
-                        format!("{key_marker}Encryption public key ({encryption})")
-                    }
-                    TuiLanguage::Chinese => format!("{key_marker}加密公钥（{encryption}）"),
-                },
-                selected(1),
-            )),
-            Line::from(public_key),
-            Line::from(""),
-            Line::from(self.text(
-                "Up/Down selects. Enter or c copies. PageUp/PageDown scrolls. Esc closes.",
-                "上下方向键选择，Enter 或 c 复制，PageUp/PageDown 滚动，Esc 关闭。",
-            )),
-            Line::from(self.text(
-                "Only the public encryption key is shown; private keys never appear here.",
-                "这里只显示加密公钥，私钥绝不会在此展示。",
-            )),
-        ];
+        let mut lines = key_lines;
+        lines.push(Line::from(""));
+        lines.push(Line::from(self.text(
+            "Enter or c copies. PageUp/PageDown scrolls. Esc closes.",
+            "Enter 或 c 复制，PageUp/PageDown 滚动，Esc 关闭。",
+        )));
+        lines.push(Line::from(self.text(
+            "Only the public encryption key is shown; private keys never appear here.",
+            "这里只显示加密公钥，私钥绝不会在此展示。",
+        )));
 
         Paragraph::new(lines)
             .scroll((credentials.scroll, 0))
             .wrap(Wrap { trim: false })
             .block(
                 panel_block()
-                    .title(self.text("Credentials & Copy", "凭据与复制"))
+                    .title(self.text("Encryption Public Key", "加密公钥"))
                     .borders(Borders::ALL),
             )
     }
@@ -2253,7 +2434,7 @@ impl TuiApp {
                         Span::raw("  "),
                         Span::styled(
                             match (self.language, target) {
-                                (TuiLanguage::Chinese, ResetTarget::Auth) => "认证",
+                                (TuiLanguage::Chinese, ResetTarget::Auth) => "设备",
                                 (TuiLanguage::Chinese, ResetTarget::Encryption) => "加密",
                                 _ => reset_target_label(*target),
                             },
@@ -2272,7 +2453,7 @@ impl TuiApp {
                     Line::from(""),
                     Line::from(match (self.language, target) {
                         (TuiLanguage::Chinese, ResetTarget::Auth) => {
-                            "生成新的认证令牌并替换已保存的值。"
+                            "吊销 devices.json 中所有已配对设备。"
                         }
                         (TuiLanguage::Chinese, ResetTarget::Encryption) => {
                             "重新生成 X25519 和 ML-KEM-768 配对密钥。"
@@ -3588,14 +3769,14 @@ fn previous_pairing_encryption(value: PairingEncryption) -> PairingEncryption {
 
 fn reset_target_label(target: ResetTarget) -> &'static str {
     match target {
-        ResetTarget::Auth => "Auth",
+        ResetTarget::Auth => "Devices",
         ResetTarget::Encryption => "Encryption",
     }
 }
 
 fn reset_target_description(target: ResetTarget) -> &'static str {
     match target {
-        ResetTarget::Auth => "Generates a new bearer token and updates config.toml.",
+        ResetTarget::Auth => "Revokes every paired device in devices.json.",
         ResetTarget::Encryption => "Regenerates X25519 and ML-KEM-768 pairing keys.",
     }
 }
@@ -3663,7 +3844,6 @@ mod tests {
         for language in [TuiLanguage::English, TuiLanguage::Chinese] {
             let mut app = super::TuiApp::new(crate::config::Config::default());
             app.language = language;
-            app.config.security.auth_token = Some("preview-token".into());
             app.config.data_dir = "/data/todex".into();
             app.config.workspace_root = "/workspace".into();
             app.notice = app
@@ -3715,7 +3895,6 @@ mod tests {
         for language in [TuiLanguage::English, TuiLanguage::Chinese] {
             let mut app = super::TuiApp::new(crate::config::Config::default());
             app.language = language;
-            app.config.security.auth_token = Some("preview-token".into());
             app.notice = "A very long preview notice that should not hide an error. ".repeat(6);
             app.last_error = Some("Preview error".into());
             let buffer = render_preview(&app, 80, 24);
@@ -3757,9 +3936,7 @@ mod tests {
                     }
                     "Credentials" => {
                         app.credentials = Some(super::CredentialsPopup {
-                            auth_token: Some("preview-token".into()),
                             public_key: Some("preview-public-key".into()),
-                            selected: 1,
                             scroll: 0,
                         })
                     }

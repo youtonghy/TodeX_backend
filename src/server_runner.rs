@@ -185,7 +185,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: None,
             },
         };
 
@@ -240,7 +239,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("token".to_owned()),
             },
         };
 
@@ -288,7 +286,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: true,
-                auth_token: Some("token".to_owned()),
             },
         };
         assert!(ManagedServer::start(config).await.is_err());

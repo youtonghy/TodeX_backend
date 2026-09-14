@@ -47,7 +47,7 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
     - **ML-KEM-768** (`ml-kem-768`, NIST Post-Quantum standard)
   - Key exchange parameters are seamlessly exchanged via TUI pairing QR codes.
 - **Security & Sandboxing**:
-  - Fail-closed Bearer token authentication (unauthorized requests are rejected with `401 Unauthorized`).
+  - Fail-closed device authentication: every request carries an Ed25519 signature from a registered device (unauthorized requests are rejected with `401 Unauthorized`). Devices are enrolled via [device verification](docs/device-verification.md) and can be revoked individually in the TUI.
   - Tenant isolation (`tenant_id`) enforced across all conversation queries, event journals, and subscriptions.
   - Workspace root boundary enforcement (`workspace_root`) restricting client access to authorized filesystem scopes.
   - Sanitized subprocess environments preventing leak of administrative environment variables.
@@ -117,7 +117,7 @@ cargo build --release
 cargo run -- tui
 ```
 
-The TUI allows starting and stopping the background daemon, viewing live server logs, and displaying QR codes for mobile client pairing. [Device verification](docs/device-verification.md) lets Desktop/Web clients request access without copying the token: press `d` in the TUI, compare the full code, then use `a` to approve or `r` to reject. Encryption public keys still require QR or manual import. Quitting the TUI keeps the daemon running in the background.
+The TUI allows starting and stopping the background daemon, viewing live server logs, and displaying QR codes for mobile client pairing. [Device verification](docs/device-verification.md) is the only way clients gain access: press `d` in the TUI, compare the full code, then use `a` to approve or `r` to reject; the same panel lists registered devices (`x` revokes the selected one). Encryption public keys still require QR or manual import. Quitting the TUI keeps the daemon running in the background.
 
 Pairing QR codes use solid terminal cell backgrounds to avoid gaps caused by terminal fonts. If the code does not fit, press `b` in the QR popup to view it in your default browser. The browser page renders a square SVG code and supports Left/Right keys or buttons to switch ML-KEM segments. It loads no external resources; its private temporary file is removed when the TUI exits.
 
@@ -165,8 +165,7 @@ Configuration values are resolved using the following precedence:
 | **Codex Binary** | — | `TODEX_AGENTD_CODEX_BIN` | `codex` | Path or executable name for Codex CLI. |
 | **Claude Binary** | — | `TODEX_AGENTD_CLAUDE_BIN` | `claude` | Path or executable name for Claude Code CLI. |
 | **Pi Binary** | — | `TODEX_AGENTD_PI_BIN` | `pi` | Path or executable name for Pi CLI. |
-| **Enable Auth** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | Enables fail-closed Bearer authentication. |
-| **Auth Token** | — | `TODEX_AGENTD_AUTH_TOKEN` | *None* | Bearer token secret. |
+| **Enable Auth** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | Enables fail-closed device-signature authentication. |
 | **Pairing Encryption** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | Required WebSocket encryption (`x25519` or `ml-kem-768`); `none` permits plaintext or optional encryption. Clients must import the matching public key separately from device approval. |
 
 ### Example `config.toml`
@@ -193,7 +192,6 @@ args = ["--stdio"]
 [security]
 enable_auth = true
 enable_tls = false
-auth_token = "your-secure-secret-token"
 ```
 
 > [!NOTE]

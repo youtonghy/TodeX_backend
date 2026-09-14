@@ -55,80 +55,6 @@ pub(super) struct LegacyEventScope {
     delivered_cursors: std::collections::BTreeMap<String, u64>,
 }
 
-pub fn authenticate_headers(state: &AppState, headers: &HeaderMap) -> Option<AuthContext> {
-    // CodeX Gateway remote control is never implicitly trusted. The legacy
-    // `enable_auth` config flag is kept for broader transport compatibility,
-    // but CodeX control requires an explicit configured bearer token so that
-    // disabling generic auth cannot accidentally expose remote agent control.
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))?;
-
-    let expected = state.config.security.auth_token.as_deref()?;
-    if token != expected {
-        return None;
-    }
-
-    Some(AuthContext {
-        principal_id: "gateway-token".to_owned(),
-        tenant_id: "local".to_owned(),
-        token_id: "configured-token".to_owned(),
-    })
-}
-
-pub fn authenticate_headers_or_query(
-    state: &AppState,
-    headers: &HeaderMap,
-    query: Option<&str>,
-) -> Option<AuthContext> {
-    if let Some(auth) = authenticate_headers(state, headers) {
-        return Some(auth);
-    }
-    let token = query
-        .unwrap_or_default()
-        .split('&')
-        .find_map(|part| part.strip_prefix("access_token="))?;
-    let expected = state.config.security.auth_token.as_deref()?;
-    // Browser/Electron clients build the URL with URLSearchParams, which
-    // percent-encodes `&`, `=` and friends; decode before comparing so tokens
-    // containing reserved characters authenticate. Plain tokens are unchanged
-    // by decoding.
-    (percent_decode(token) == expected).then(|| AuthContext {
-        principal_id: "gateway-token".to_owned(),
-        tenant_id: "local".to_owned(),
-        token_id: "configured-token".to_owned(),
-    })
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
-            && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit)
-        {
-            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
-            match u8::from_str_radix(hex, 16) {
-                Ok(byte) => {
-                    decoded.push(byte);
-                    index += 3;
-                }
-                Err(_) => {
-                    decoded.push(bytes[index]);
-                    index += 1;
-                }
-            }
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
 pub fn transport_crypto_from_handshake(
     state: &AppState,
     headers: &HeaderMap,
@@ -318,7 +244,7 @@ fn legacy_scope_candidate_is_authorized(
 ) -> bool {
     match auth {
         Some(auth) => auth.tenant_id == candidate.tenant_id,
-        None => state.config.security.auth_token.is_none(),
+        None => !state.config.security.enable_auth,
     }
 }
 
@@ -1613,7 +1539,7 @@ async fn authorize_local_codex_request(
     state: &AppState,
 ) -> Result<(), AppError> {
     let Some(auth) = auth else {
-        if state.config.security.auth_token.is_some() {
+        if state.config.security.enable_auth {
             audit_codex_decision(
                 state,
                 request_id,
@@ -1677,7 +1603,7 @@ async fn authorize_terminal_request(
     state: &AppState,
 ) -> Result<(), AppError> {
     let Some(auth) = auth else {
-        if state.config.security.auth_token.is_some() {
+        if state.config.security.enable_auth {
             return Err(AppError::Unauthenticated);
         }
         let event = EventRecord::new(
@@ -1756,7 +1682,7 @@ async fn authorize_codex_access(
     auth: Option<&AuthContext>,
 ) -> Result<(), AppError> {
     let Some(auth) = auth else {
-        if state.config.security.auth_token.is_some() {
+        if state.config.security.enable_auth {
             audit_codex_decision(
                 state,
                 request_id,
@@ -2194,7 +2120,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unauthenticated_local_codex_start_is_allowed_without_token() {
         let mut state = test_state().await;
-        Arc::make_mut(&mut state.config).security.auth_token = None;
+        Arc::make_mut(&mut state.config).security.enable_auth = false;
         let mut events = state.events.subscribe();
 
         dispatch(
@@ -3052,9 +2978,9 @@ mod tests {
         let state = test_state().await;
         let mut events = state.events.subscribe();
         let auth = AuthContext {
-            principal_id: "gateway-token".to_owned(),
+            principal_id: "dev_test".to_owned(),
             tenant_id: "other".to_owned(),
-            token_id: "configured-token".to_owned(),
+            token_id: "dev_test".to_owned(),
         };
 
         let error = dispatch(
@@ -3090,19 +3016,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn websocket_authentication_rejects_missing_configured_token() {
+    async fn websocket_authentication_rejects_missing_device_marker() {
         let mut state = test_state().await;
-        Arc::make_mut(&mut state.config).security.auth_token = None;
+        Arc::make_mut(&mut state.config).security.enable_auth = false;
 
-        let auth = crate::server::websocket::authenticate_headers(
-            &state,
-            &axum::http::HeaderMap::from_iter([(
-                axum::http::header::AUTHORIZATION,
-                axum::http::HeaderValue::from_static("Bearer todex_gw_test"),
-            )]),
+        // With auth disabled the synthetic local principal is used.
+        assert_eq!(
+            crate::device_auth::verified_context(&state, &axum::http::HeaderMap::new())
+                .unwrap()
+                .principal_id,
+            "local"
         );
 
-        assert!(auth.is_none());
+        Arc::make_mut(&mut state.config).security.enable_auth = true;
+        // Without the middleware's verified-device marker the request fails.
+        assert!(matches!(
+            crate::device_auth::verified_context(&state, &axum::http::HeaderMap::new()),
+            Err(AppError::Unauthenticated)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3140,9 +3071,9 @@ mod tests {
         let mut events = state.events.subscribe();
         let message = codex_control_message("allow-1", "cdxs_allowed", "local");
         let auth = AuthContext {
-            principal_id: "gateway-token".to_owned(),
+            principal_id: "dev_test".to_owned(),
             tenant_id: "local".to_owned(),
-            token_id: "configured-token".to_owned(),
+            token_id: "dev_test".to_owned(),
         };
 
         dispatch(message, &state, Some(&auth))
@@ -3285,14 +3216,18 @@ mod tests {
         let turn_id = "turn-full-1";
         let plan_id = "plan-full-1";
 
-        assert!(crate::server::websocket::authenticate_headers(
-            &state,
-            &axum::http::HeaderMap::from_iter([(
-                axum::http::header::AUTHORIZATION,
-                axum::http::HeaderValue::from_static("Bearer todex_gw_test"),
-            )])
-        )
-        .is_some());
+        assert_eq!(
+            crate::device_auth::verified_context(
+                &state,
+                &axum::http::HeaderMap::from_iter([(
+                    axum::http::HeaderName::from_static(crate::device_auth::VERIFIED_HEADER),
+                    axum::http::HeaderValue::from_static("dev_test"),
+                )]),
+            )
+            .unwrap()
+            .principal_id,
+            "dev_test"
+        );
 
         state
             .codex_gateway
@@ -3786,9 +3721,9 @@ mod tests {
         let mut events = state.events.subscribe();
         let message = codex_control_message("tenant-1", "cdxs_wrong_tenant", "other");
         let auth = AuthContext {
-            principal_id: "gateway-token".to_owned(),
+            principal_id: "dev_test".to_owned(),
             tenant_id: "local".to_owned(),
-            token_id: "configured-token".to_owned(),
+            token_id: "dev_test".to_owned(),
         };
 
         let error = dispatch(message, &state, Some(&auth))
@@ -3810,9 +3745,9 @@ mod tests {
 
     fn test_auth() -> AuthContext {
         AuthContext {
-            principal_id: "gateway-token".to_owned(),
+            principal_id: "dev_test".to_owned(),
             tenant_id: "local".to_owned(),
-            token_id: "configured-token".to_owned(),
+            token_id: "dev_test".to_owned(),
         }
     }
 
@@ -3981,7 +3916,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("todex_gw_test".to_owned()),
             },
         })
         .await

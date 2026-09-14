@@ -269,8 +269,9 @@ fn is_valid_due_date(value: &str) -> bool {
 
 fn prune_tombstones(tasks: &mut Vec<KanbanTaskRecord>, now: u64) {
     tasks.retain(|task| {
-        task.deleted_at
-            .is_none_or(|deleted_at| now.saturating_sub(deleted_at) <= KANBAN_TOMBSTONE_RETENTION_MILLIS)
+        task.deleted_at.is_none_or(|deleted_at| {
+            now.saturating_sub(deleted_at) <= KANBAN_TOMBSTONE_RETENTION_MILLIS
+        })
     });
 }
 
@@ -382,7 +383,9 @@ mod tests {
             .merge_owned("local", vec![task("task-1", "revive", 10)])
             .await
             .unwrap();
-        assert!(store.snapshot_owned("local").await.tasks[0].deleted_at.is_some());
+        assert!(store.snapshot_owned("local").await.tasks[0]
+            .deleted_at
+            .is_some());
 
         // Tombstones older than the retention window are dropped.
         let mut expired = task("task-2", "expired", 10);
@@ -400,7 +403,10 @@ mod tests {
         let store = KanbanTaskStore::new(root.clone()).await.unwrap();
 
         let mut blank_title = task("task-1", "   ", 10);
-        assert!(store.merge_owned("local", vec![blank_title.clone()]).await.is_err());
+        assert!(store
+            .merge_owned("local", vec![blank_title.clone()])
+            .await
+            .is_err());
         blank_title.title = "x".repeat(201);
         assert!(store.merge_owned("local", vec![blank_title]).await.is_err());
 
@@ -410,11 +416,17 @@ mod tests {
 
         let mut bad_due_date = task("task-3", "ok", 10);
         bad_due_date.due_date = Some("13/01/2026".to_owned());
-        assert!(store.merge_owned("local", vec![bad_due_date]).await.is_err());
+        assert!(store
+            .merge_owned("local", vec![bad_due_date])
+            .await
+            .is_err());
 
         let mut bad_workspace = task("task-4", "ok", 10);
         bad_workspace.workspace_id = "  ".to_owned();
-        assert!(store.merge_owned("local", vec![bad_workspace]).await.is_err());
+        assert!(store
+            .merge_owned("local", vec![bad_workspace])
+            .await
+            .is_err());
         assert!(store.snapshot_owned("local").await.tasks.is_empty());
         let _ = fs::remove_dir_all(root);
     }

@@ -143,8 +143,7 @@ impl ProviderDriver for AcpDriver {
             .collect();
         let mut process = JsonLineProcess::spawn(&spec).await?;
         let result = async {
-            let request_id =
-                send_request(&mut process, "initialize", initialize_request()).await?;
+            let request_id = send_request(&mut process, "initialize", initialize_request()).await?;
             loop {
                 let Some(message) = process.read().await? else {
                     break Err(

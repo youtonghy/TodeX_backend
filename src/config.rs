@@ -115,7 +115,6 @@ pub struct AcpProfileConfig {
 pub struct SecurityConfig {
     pub enable_auth: bool,
     pub enable_tls: bool,
-    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -152,19 +151,21 @@ struct PartialAgentConfig {
 struct PartialSecurityConfig {
     enable_auth: Option<bool>,
     enable_tls: Option<bool>,
+    /// Legacy bearer token. Parsed only to warn that it is ignored; device
+    /// signature auth replaced it.
     auth_token: Option<String>,
 }
 
 impl Config {
     pub fn load(args: ServeArgs) -> anyhow::Result<Self> {
-        Self::load_internal(args, true)
+        Self::load_internal(args)
     }
 
     pub fn load_read_only(args: ServeArgs) -> anyhow::Result<Self> {
-        Self::load_internal(args, false)
+        Self::load_internal(args)
     }
 
-    fn load_internal(args: ServeArgs, persist_generated_token: bool) -> anyhow::Result<Self> {
+    fn load_internal(args: ServeArgs) -> anyhow::Result<Self> {
         let defaults = Config::default();
         let env_data_dir = env_path("TODEX_AGENTD_DATA_DIR");
         let bootstrap_data_dir = expand_home(
@@ -221,22 +222,14 @@ impl Config {
             security_file.enable_auth,
             defaults.security.enable_auth,
         );
-        let auth_token = if enable_auth {
-            let configured = optional_non_empty(env::var("TODEX_AGENTD_AUTH_TOKEN").ok())
-                .or_else(|| optional_non_empty(security_file.auth_token))
-                .or(defaults.security.auth_token);
-            match configured {
-                Some(token) => Some(token),
-                None if persist_generated_token => {
-                    let token = generate_auth_token();
-                    Self::save_auth_token(data_dir.clone(), &token)?;
-                    Some(token)
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
+        if optional_non_empty(env::var("TODEX_AGENTD_AUTH_TOKEN").ok()).is_some()
+            || optional_non_empty(security_file.auth_token).is_some()
+        {
+            tracing::warn!(
+                "security.auth_token / TODEX_AGENTD_AUTH_TOKEN is ignored; clients \
+                 authenticate with paired device keys"
+            );
+        }
 
         Ok(Config {
             host,
@@ -324,7 +317,6 @@ impl Config {
                     security_file.enable_tls,
                     defaults.security.enable_tls,
                 ),
-                auth_token,
             },
         })
     }
@@ -346,14 +338,6 @@ impl Config {
         Ok(())
     }
 
-    pub fn save_auth_token(data_dir: PathBuf, auth_token: &str) -> anyhow::Result<()> {
-        let data_dir = expand_home(data_dir);
-        let mut document = load_config_document(&data_dir)?;
-        document["security"]["auth_token"] = value(auth_token);
-        write_config_document(&data_dir, &document)?;
-        Ok(())
-    }
-
     pub fn load_tui_language(data_dir: &Path) -> anyhow::Result<Option<String>> {
         let document = load_config_document(&data_dir.to_path_buf())?;
         Ok(document
@@ -371,12 +355,6 @@ impl Config {
         }
         document["tui"]["language"] = value(language);
         write_config_document(&data_dir, &document)
-    }
-
-    pub fn reset_auth_token(data_dir: PathBuf) -> anyhow::Result<String> {
-        let token = generate_auth_token();
-        Self::save_auth_token(data_dir, &token)?;
-        Ok(token)
     }
 }
 
@@ -417,7 +395,6 @@ impl Default for Config {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: None,
             },
         }
     }
@@ -622,10 +599,6 @@ fn optional_non_empty(value: Option<String>) -> Option<String> {
     })
 }
 
-fn generate_auth_token() -> String {
-    format!("todex_{}", Uuid::new_v4().simple())
-}
-
 fn load_config_document(data_dir: &PathBuf) -> anyhow::Result<DocumentMut> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("failed to create config directory {}", data_dir.display()))?;
@@ -762,7 +735,6 @@ mod tests {
         let config = Config::default();
 
         assert!(config.security.enable_auth);
-        assert!(config.security.auth_token.is_none());
     }
 
     #[test]
@@ -780,8 +752,8 @@ mod tests {
     }
 
     #[test]
-    fn loaded_config_generates_and_persists_auth_token() {
-        let root = env::temp_dir().join(format!("todex-config-token-test-{}", std::process::id()));
+    fn loaded_config_does_not_write_files() {
+        let root = env::temp_dir().join(format!("todex-config-load-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
 
         let config = Config::load(ServeArgs {
@@ -791,18 +763,10 @@ mod tests {
             workspace_root: None,
             history_retention_days: None,
         })
-        .expect("load config and generate auth token");
+        .expect("load config");
 
-        let token = config
-            .security
-            .auth_token
-            .as_ref()
-            .expect("generated token should be present");
-        assert!(token.starts_with("todex_"));
-
-        let updated = fs::read_to_string(root.join("config.toml")).expect("read config");
-        assert!(updated.contains("auth_token"));
-        assert!(updated.contains(token));
+        assert!(config.security.enable_auth);
+        assert!(!root.join("config.toml").exists());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -824,7 +788,6 @@ mod tests {
         .expect("load config without writes");
 
         assert!(config.security.enable_auth);
-        assert!(config.security.auth_token.is_none());
         assert!(!root.exists());
     }
 
@@ -872,28 +835,6 @@ mod tests {
 
         let error = load_file_config(&bootstrap, true).unwrap_err();
         assert!(error.to_string().contains("redirect only once"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn reset_auth_token_replaces_persisted_token() {
-        let root = env::temp_dir().join(format!(
-            "todex-config-reset-token-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-
-        let first = Config::reset_auth_token(root.clone()).expect("write first token");
-        let second = Config::reset_auth_token(root.clone()).expect("write second token");
-
-        assert!(first.starts_with("todex_"));
-        assert!(second.starts_with("todex_"));
-        assert_ne!(first, second);
-
-        let updated = fs::read_to_string(root.join("config.toml")).expect("read config");
-        assert!(updated.contains(&second));
-        assert!(!updated.contains(&first));
 
         let _ = fs::remove_dir_all(root);
     }

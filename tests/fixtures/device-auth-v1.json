@@ -1,0 +1,14 @@
+{
+  "deviceSeed": "FRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRU",
+  "devicePublicKey": "1UIH2hlJd9z0atv-wrwudbUtWopCGE_t_cAAJPDj6No",
+  "deviceId": "dev_1-HghL4hOwHlBoUq",
+  "method": "POST",
+  "path": "/v2/conversations",
+  "rawQuery": "auth_sig=ignored&workspacePath=%2Ftmp%2Fx&a=1",
+  "canonicalQuery": "a=1&workspacePath=%2Ftmp%2Fx",
+  "timestamp": "1700000000",
+  "nonce": "AAECAwQFBgcICQohAg0ODxA",
+  "body": "{\"prompt\":\"hi\"}",
+  "payload": "dG9kZXguZGV2aWNlLWF1dGgudjEAZGV2XzEtSGdoTDRoT3dIbEJvVXEAUE9TVAAvdjIvY29udmVyc2F0aW9ucwBhPTEmd29ya3NwYWNlUGF0aD0lMkZ0bXAlMkZ4ADE3MDAwMDAwMDAAQUFFQ0F3UUZCZ2NJQ1FvaEFnME9EeEEARkVlZlRvZlRRUDRNb05VaTJIcGJPZ0tPdXhyeVQ3dU5QdlJWTUVUOGJiWQ",
+  "signature": "r4WrULjmt4h0X2wCcR_M-QI3j_SLG29Ev3Rr9i1sO1LK0B5zvLZRtsUSkRlNNscvUTZ4epx52GlsX48fNPeWDA"
+}

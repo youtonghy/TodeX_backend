@@ -13,7 +13,9 @@ use crate::{
     codex_gateway::{CodexGatewayStore, CodexLocalAdapterSupervisor},
     config::Config,
     conversation::{migrate_legacy_codex_sessions, ConversationEventHub, ConversationStore},
+    device_auth::DeviceAuthenticator,
     device_pairing::DevicePairingRegistry,
+    devices::DeviceRegistry,
     error::Result,
     event::EventBus,
     kanban_store::KanbanTaskStore,
@@ -37,6 +39,7 @@ pub struct AppState {
     conversation_store: ConversationStore,
     pub local_terminals: LocalTerminalManager,
     pub pairing_keys: PairingKeys,
+    pub(crate) device_auth: DeviceAuthenticator,
     pub(crate) device_pairing: DevicePairingRegistry,
     pub workspaces: WorkspaceStore,
     pub kanban_tasks: KanbanTaskStore,
@@ -96,8 +99,10 @@ impl AppState {
         let local_terminals = LocalTerminalManager::new(events.clone());
         let cli_manager = CliManager::default();
         let pairing_keys = PairingKeys::load_or_generate(&config.data_dir).await?;
+        let devices = DeviceRegistry::load(&config.data_dir)?;
+        let device_auth = DeviceAuthenticator::new(devices.clone());
         let device_pairing =
-            DevicePairingRegistry::new(&config.data_dir, config.security.auth_token.clone())?;
+            DevicePairingRegistry::new(&config.data_dir, config.security.enable_auth, devices)?;
         let websocket_connections = Arc::new(AtomicUsize::new(0));
         let audit_write_lock = Arc::new(tokio::sync::Mutex::new(()));
 
@@ -113,6 +118,7 @@ impl AppState {
             conversation_store,
             local_terminals,
             pairing_keys,
+            device_auth,
             device_pairing,
             workspaces,
             kanban_tasks,

@@ -346,7 +346,7 @@ async fn inspect_cli(config: &Config, provider: ManagedCli) -> CliVersionInfo {
         current_version,
         latest_version,
         status: status.to_owned(),
-        upgrade_supported: installed && config.security.auth_token.is_some(),
+        upgrade_supported: installed && config.security.enable_auth,
         error,
     }
 }

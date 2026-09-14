@@ -2172,7 +2172,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("test-token".to_owned()),
             },
         });
         let store = ConversationStore::new(config.data_dir.clone())
@@ -2524,7 +2523,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("test-token".to_owned()),
             },
         });
         let store = ConversationStore::new(config.data_dir.clone())
@@ -2635,7 +2633,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("token".to_owned()),
             },
         });
         let store = ConversationStore::new(config.data_dir.clone())
@@ -2856,7 +2853,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("token".to_owned()),
             },
         });
         let store = ConversationStore::new(config.data_dir.clone())
@@ -2915,7 +2911,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("token".to_owned()),
             },
         });
         let store = ConversationStore::new(data_dir.clone()).await.unwrap();
@@ -3273,7 +3268,6 @@ done
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("token".to_owned()),
             },
         });
         let store = ConversationStore::new(config.data_dir.clone())

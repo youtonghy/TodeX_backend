@@ -52,12 +52,11 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 | OpenCode 环境白名单 | 无 | `TODEX_AGENTD_OPENCODE_ENV_ALLOWLIST` | `OPENCODE_CONFIG*`、`OPENCODE_AUTH_CONTENT`、`OPENCODE_API_KEY` 等 |
 | 默认 agent 名称 | 无 | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` |
 | 是否开启认证 | 无 | `TODEX_AGENTD_ENABLE_AUTH` | `true` |
-| Bearer token | 无 | `TODEX_AGENTD_AUTH_TOKEN` | 无 |
 | 历史保留天数 | `--history-retention-days` | `TODEX_AGENTD_HISTORY_RETENTION_DAYS` | 关闭 |
 
-当前 HTTP 层没有实现 TLS 终止，配置 `enable_tls = true` 时服务会拒绝启动，避免产生“已经启用 TLS”的错误安全假设。生产环境应在可信反向代理终止 TLS，且不应直接暴露明文端口。v2 HTTP 和 WebSocket 都使用 `Authorization: Bearer <TODEX_AGENTD_AUTH_TOKEN>`；conversation 持久化 owner tenant，所有读取、订阅与变更入口都会校验 tenant。
+当前 HTTP 层没有实现 TLS 终止，配置 `enable_tls = true` 时服务会拒绝启动，避免产生“已经启用 TLS”的错误安全假设。生产环境应在可信反向代理终止 TLS，且不应直接暴露明文端口。v2 HTTP 和 WebSocket 都使用设备签名认证：每个请求携带 `x-todex-device-id`、`x-todex-auth-ts`、`x-todex-auth-nonce`、`x-todex-auth-sig` 四个 header（无法设置 header 的客户端使用等价 query 参数 `device_id`、`auth_ts`、`auth_nonce`、`auth_sig`），签名覆盖方法、路径、canonical query、时间戳、nonce 与 body 哈希，见 [设备验证](device-verification.md)。conversation 持久化 owner tenant，所有读取、订阅与变更入口都会校验 tenant。
 
-认证策略是 fail-closed 的：一旦配置了 token，匿名 `/v2/ws` 握手直接被拒绝（401），不存在“先连上再限制命令”的匿名模式；未配置 token 的本地部署才会以本地信任模式接受匿名连接。
+认证策略是 fail-closed 的：`enable_auth = true` 时匿名 `/v2/ws` 握手直接被拒绝（401），不存在“先连上再限制命令”的匿名模式；`enable_auth = false` 的本地部署才会以本地信任模式接受匿名连接。没有可配置的共享凭据：设备只能通过配对流程登记（见 `POST /v2/device-pairing/*`）。
 
 ## v2 Conversation API
 
@@ -92,7 +91,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 `/v2/providers/models` 会实时向指定 Agent 查询模型目录，返回 `source` 与 `fetchedAt`。每个模型包含 `supportedReasoningEfforts`，并可通过 `defaultReasoningEffort` 声明后端当前默认强度。Codex 使用 app-server `model/list`，Pi 使用 RPC `get_available_models` 与 `get_state`，Claude Code 在配置了 `ANTHROPIC_BASE_URL` 时读取 `/v1/models`，Grok Build 从 ACP initialize 的原生模型状态读取。查询失败时客户端应保留上一次成功目录，并展示可恢复错误。
 
-`GET /v2/providers/versions` 在 daemon 所在主机读取配置的六个内建 CLI，并从各自官方发布源查询最新版（OpenCode 查询 GitHub `anomalyco/opencode` 最新 release tag）；Devin 没有只读的最新版本检查接口，`latestVersion` 会保持为空。结果会短时缓存，单个查询失败不会隐藏其他 CLI。ACP profile 作为外部管理项列出，不执行任意 profile 命令，也不提供升级。`POST /v2/providers/{provider}/upgrade` 仅接受 `codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode` 固定标识（OpenCode 执行 `opencode upgrade`），返回异步 operation；客户端使用 operation 查询接口轮询。升级命令不经过 shell、不读取工作区，并在升级后重新调用同一个配置 binary 验证版本。任一 Agent turn、本地 Codex adapter、Provider 发现或另一升级正在启动/运行时会返回 `409 CONFLICT`；升级中的版本查询只返回已有缓存，不会再启动 CLI。CLI 升级在 loopback 部署中也必须配置并提交 Bearer token，以免网页通过跨域请求改变宿主机工具链；已认证的尝试及最终结果会写入审计日志，初始审计记录无法落盘时不会启动升级。
+`GET /v2/providers/versions` 在 daemon 所在主机读取配置的六个内建 CLI，并从各自官方发布源查询最新版（OpenCode 查询 GitHub `anomalyco/opencode` 最新 release tag）；Devin 没有只读的最新版本检查接口，`latestVersion` 会保持为空。结果会短时缓存，单个查询失败不会隐藏其他 CLI。ACP profile 作为外部管理项列出，不执行任意 profile 命令，也不提供升级。`POST /v2/providers/{provider}/upgrade` 仅接受 `codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode` 固定标识（OpenCode 执行 `opencode upgrade`），返回异步 operation；客户端使用 operation 查询接口轮询。升级命令不经过 shell、不读取工作区，并在升级后重新调用同一个配置 binary 验证版本。任一 Agent turn、本地 Codex adapter、Provider 发现或另一升级正在启动/运行时会返回 `409 CONFLICT`；升级中的版本查询只返回已有缓存，不会再启动 CLI。CLI 升级在 loopback 部署中也必须携带有效设备签名，以免网页通过跨域请求改变宿主机工具链；已认证的尝试及最终结果会写入审计日志，初始审计记录无法落盘时不会启动升级。
 
 `GET /v2/providers/commands?provider=pi&workspace=/path` 会实时读取 Agent 命令目录。Pi 使用 RPC `get_commands` 返回扩展、Prompt Template 和 Skill；响应失败会作为 Provider 错误返回，成功结果中的 `sourceInfo` 会原样保留。Codex 返回与本机 CLI 版本同步的 TUI 命令适配目录。命令描述包含 `invocation`，客户端应据此选择原生 RPC、桌面动作或 Provider prompt，不要把所有 `/` 输入都当作普通 prompt。 已有会话应使用 `?conversationId=...`：后端先校验 owner，再从会话 manifest 确定 provider 与 workspace，忽略客户端同时提交的对应查询参数。Pi runtime 存在时由同一 worker 发送 `get_commands`，响应含 `catalogSource: "session"` 与 `runtimeId`；尚未启动时使用临时发现进程，返回 `catalogSource: "discovery"`。目录查询总时限为 8 秒。可验证的本地包会附带 `packageName` / `packageVersion`：版本取自实际资源附近的 `package.json`，显式加载的资源还会检查 manifest 的 Pi 入口；无法确认时省略，不从 npm spec 猜测。
 
@@ -428,13 +427,9 @@ POST /v2/browser/fetch
 
 连接示例：
 
-```bash
-websocat -H "Authorization: Bearer ${TODEX_AGENTD_AUTH_TOKEN}" ws://127.0.0.1:7345/v2/ws
-```
+握手认证与 HTTP 一致：四个 `x-todex-*` header，或等价 query 参数（Electron 原生 WebSocket、浏览器等无法设置 header 的客户端）：`ws://127.0.0.1:7345/v2/ws?device_id=<id>&auth_ts=<unix>&auth_nonce=<b64url>&auth_sig=<b64url>`。签名按 `GET /v2/ws`、完整 canonical query 与空 body 计算；query 中的传输加密参数同样被签名覆盖，因此握手材料无法被中间人替换。注意 query 凭据可能进入反向代理日志，生产环境优先使用 header。
 
-无法设置 header 的客户端（Electron 原生 WebSocket、浏览器）可使用查询参数：`ws://127.0.0.1:7345/v2/ws?access_token=<url-encoded-token>`。服务端会先做 percent-decode 再比对，因此含 `&`、`=` 等保留字符的 token 也能通过该路径认证。注意查询参数可能进入反向代理日志，生产环境优先使用 header。
-
-TUI 配对二维码携带后端地址、当前首选加密方式和服务端公钥。仅 loopback 监听时二维码携带 Bearer token；非 loopback 监听会省略长期 token，需通过独立可信通道录入。客户端每次连接必须生成新的 X25519 client key 或 ML-KEM ciphertext，服务端会拒绝当前进程生命周期内重复使用的握手材料。进程内最多登记 65,536 份已使用握手材料；达到上限后新加密握手会失败关闭，需要重启 daemon 清空登记表。
+TUI 配对二维码只携带后端地址、当前首选加密方式和服务端公钥，不携带任何访问凭据——设备身份一律走 `/v2/device-pairing` 配对流程登记。客户端每次连接必须生成新的 X25519 client key 或 ML-KEM ciphertext，服务端会拒绝当前进程生命周期内重复使用的握手材料。进程内最多登记 65,536 份已使用握手材料；达到上限后新加密握手会失败关闭，需要重启 daemon 清空登记表。
 
 - X25519：客户端从配对信息读取服务端 X25519 公钥，连接 `ws://.../v2/ws?enc=x25519&client_key=<base64url-client-public-key>`。
 - ML-KEM-768：客户端从配对信息读取服务端 ML-KEM-768 公钥，连接 `ws://.../v2/ws?enc=ml-kem-768&ciphertext=<base64url-kem-ciphertext>`。
@@ -455,7 +450,7 @@ TUI 配对二维码携带后端地址、当前首选加密方式和服务端公�
 }
 ```
 
-本地 token 认证当前映射到租户 `local`。请求 payload 中的 `tenantId` 必须与认证上下文匹配。鉴权结果会写入 `$TODEX_AGENTD_DATA_DIR/audit/audit.jsonl`，并广播 `codex.audit` 事件。
+设备签名认证当前映射到租户 `local`，认证主体是 `deviceId`（由设备公钥派生）。请求 payload 中的 `tenantId` 必须与认证上下文匹配。鉴权结果会写入 `$TODEX_AGENTD_DATA_DIR/audit/audit.jsonl` 并广播 `codex.audit` 事件，审计记录中的 `token_id`/`principal_id` 即 `deviceId`。
 
 ### Codex 原生控制范围
 
@@ -788,7 +783,7 @@ TUI 配对二维码携带后端地址、当前首选加密方式和服务端公�
 | code | 说明 |
 | --- | --- |
 | `INVALID_REQUEST` | JSON 格式、字段或消息类型不符合当前协议。 |
-| `UNAUTHENTICATED` | 配置了 token 但未提供有效 Bearer header 或 `access_token` 查询参数。 |
+| `UNAUTHENTICATED` | `enable_auth` 开启时未提供有效设备签名（header 或 query 参数），或设备未注册/已吊销、时间戳超窗、nonce 重放。 |
 | `UNAUTHORIZED` | tenant 与认证上下文不匹配。 |
 | `UNSUPPORTED` | 请求能力不在当前后端支持范围。 |
 | `EVENT_STREAM_LAGGED` | WebSocket 事件接收端落后。 |

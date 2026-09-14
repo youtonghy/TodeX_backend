@@ -5,11 +5,11 @@ use crate::app_state::AppState;
 
 /// Version-independent liveness probe. Never part of a versioned API surface;
 /// everything else lives under `/v2` (see `v2::routes`).
-pub fn routes() -> Router<AppState> {
+pub fn routes(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/v2/transport-policy", get(transport_policy))
-        .merge(super::v2::routes())
+        .merge(super::v2::routes(state))
 }
 
 async fn health() -> &'static str {

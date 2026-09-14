@@ -1,0 +1,18 @@
+{
+  "requestId": "11111111-2222-4333-8444-555555555555",
+  "expiresAt": 2000000300000,
+  "clientSecret": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+  "serverSecret": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk",
+  "deviceSecret": "FRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRU",
+  "clientPublicKey": "E75P6uryBMf9M1j8nAByGIHRdCeBKCJ-xnTzf3_pe20",
+  "serverPublicKey": "V9tLNZ8jrl4Ubk4lEgVnBHIlBjSMFQwUdT0Mkz0E1CE",
+  "devicePublicKey": "1UIH2hlJd9z0atv-wrwudbUtWopCGE_t_cAAJPDj6No",
+  "deviceId": "dev_1-HghL4hOwHlBoUq",
+  "transcript": "dG9kZXguZGV2aWNlLXBhaXJpbmcudjIvdHJhbnNjcmlwdAAxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUAE75P6uryBMf9M1j8nAByGIHRdCeBKCJ-xnTzf3_pe21X20s1nyOuXhRuTiUSBWcEciUGNIwVDBR1PQyTPQTUIQDVQgfaGUl33PRq2_7CvC51tS1aikIYT-39wAAk8OPo2g",
+  "verificationCode": "4C62C-4C83F",
+  "wrapKey": "BEw73pJCmVWDrRwkM4agWrV4qustwqLCEShnyF9pM78",
+  "pollProof": "NfpnayjZHSBwdA1WmkGpUxxj4AH7gsoxZan0DOw-LvY",
+  "cancelProof": "cCqtcPGH1Y77iBS1DtHlF3eXRtu2RlTKv-cRC4PmjHw",
+  "nonce": "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsL",
+  "ciphertext": "pg9ke2BjSCm11hjADR1t20TwxwL03iXd2Em21PmbCxpvtYPrJh94ZfDTBjr3pNg8v6_2"
+}

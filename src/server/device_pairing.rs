@@ -103,22 +103,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_pairing_http_requires_local_approval_and_preserves_manual_auth() {
+    async fn device_pairing_http_requires_local_approval_and_enrolls_device() {
         let root = std::env::temp_dir().join(format!(
             "todex-device-pairing-http-{}",
             uuid::Uuid::new_v4()
         ));
-        let mut config = crate::config::Config::default();
-        config.data_dir = root.join("data");
-        config.workspace_root = root.join("workspaces");
-        config.security.auth_token = Some("synthetic-http-test-token".to_owned());
+        let config = crate::config::Config {
+            data_dir: root.join("data"),
+            workspace_root: root.join("workspaces"),
+            ..crate::config::Config::default()
+        };
         let state = AppState::new(config.clone()).await.unwrap();
         let app = super::super::router(state);
         let client = StaticSecret::from([7; 32]);
         let client_public = PublicKey::from(&client);
-        let (status, created) = post(&app, "/v2/device-pairing/create", json!({
-            "clientPublicKey": URL_SAFE_NO_PAD.encode(client_public.as_bytes()), "deviceName": "HTTP test"
-        })).await;
+        let device = crate::device_auth::test_support::TestDevice::new(21);
+        let device_public = device.key.verifying_key().to_bytes();
+        let (status, created) = post(
+            &app,
+            "/v2/device-pairing/create",
+            json!({
+                "clientPublicKey": URL_SAFE_NO_PAD.encode(client_public.as_bytes()),
+                "deviceName": "HTTP test",
+                "devicePublicKey": URL_SAFE_NO_PAD.encode(device_public),
+            }),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert!(created.get("authToken").is_none());
         assert!(created.get("verificationCode").is_none());
@@ -129,17 +139,19 @@ mod tests {
             .try_into()
             .unwrap();
         let transcript = [
-            b"todex.device-pairing.v1/transcript\0".as_slice(),
+            b"todex.device-pairing.v2/transcript\0".as_slice(),
             id.as_bytes(),
             &[0],
             client_public.as_bytes(),
             &server_public,
+            &[0],
+            &device_public,
         ]
         .concat();
         let shared = client.diffie_hellman(&PublicKey::from(server_public));
         let hkdf = Hkdf::<Sha256>::new(Some(&Sha256::digest(&transcript)), shared.as_bytes());
         let mut proof = [0; 32];
-        hkdf.expand(b"todex.device-pairing.v1/poll-proof", &mut proof)
+        hkdf.expand(b"todex.device-pairing.v2/poll-proof", &mut proof)
             .unwrap();
         let request = json!({"requestId": id, "proof": URL_SAFE_NO_PAD.encode(proof)});
         assert_eq!(
@@ -175,23 +187,47 @@ mod tests {
             post(&app, "/v2/device-pairing/poll", request).await.1["status"],
             "expired"
         );
-        for (token, expected) in [
-            (None, StatusCode::UNAUTHORIZED),
-            (Some("synthetic-http-test-token"), StatusCode::OK),
-        ] {
-            let mut request = Request::builder().uri("/v2/workspaces");
-            if let Some(token) = token {
-                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+
+        // Unsigned requests fail; the enrolled device authenticates by
+        // signature.
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v2/workspaces")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let signed_headers = device.sign("GET", "/v2/workspaces", &[]);
+        let signed_request = || {
+            let mut builder = Request::builder().uri("/v2/workspaces");
+            for (name, value) in &signed_headers {
+                builder = builder.header(name, value);
             }
-            assert_eq!(
-                app.clone()
-                    .oneshot(request.body(Body::empty()).unwrap())
-                    .await
-                    .unwrap()
-                    .status(),
-                expected
-            );
-        }
+            builder.body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_request())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // Replaying the exact same credential must fail on the nonce.
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_request())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }

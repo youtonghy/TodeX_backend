@@ -21,6 +21,7 @@ use tracing::warn;
 
 use crate::app_state::AppState;
 use crate::conversation::{ConversationManifest, ProviderKind};
+use crate::device_auth;
 use crate::error::AppError;
 use crate::provider::{
     read_current_version, run_upgrade, CliUpgradeOperation, CliVersionsResponse,
@@ -88,9 +89,20 @@ fn is_v2_background_command(command_type: &str) -> bool {
     )
 }
 
-pub fn routes() -> Router<AppState> {
+pub fn routes(state: &AppState) -> Router<AppState> {
+    // `/v2/version` stays unauthenticated (daemon self-checks and connection
+    // cards poll it). Every other route — HTTP and the `/v2/ws` upgrade —
+    // requires a paired device signature, verified by `device_auth_middleware`.
+    let public = Router::new().route("/v2/version", get(version));
+    let authenticated = authenticated_routes().route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        device_auth::device_auth_middleware,
+    ));
+    public.merge(authenticated)
+}
+
+fn authenticated_routes() -> Router<AppState> {
     Router::new()
-        .route("/v2/version", get(version))
         .route("/v2/workspaces", get(workspaces).put(replace_workspaces))
         .route("/v2/workspaces/{workspace_id}", delete(delete_workspace))
         .route(
@@ -1392,9 +1404,9 @@ async fn upgrade_provider_cli(
     AxumPath(provider): AxumPath<ManagedCli>,
 ) -> Result<Json<CliUpgradeOperation>, AppError> {
     let auth = require_auth(&state, &headers)?;
-    if state.config.security.auth_token.is_none() {
+    if !state.config.security.enable_auth {
         return Err(AppError::Unauthorized(
-            "CLI upgrades require bearer authentication".to_owned(),
+            "CLI upgrades require device authentication".to_owned(),
         ));
     }
     let execution_guard = match state.cli_execution_gate.clone().try_write_owned() {
@@ -1838,18 +1850,10 @@ async fn ws(
     uri: Uri,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
-    // Parity with the v2 HTTP `require_auth` and the retired `/v1/ws`: a
-    // deployment without a configured token accepts anonymous local
-    // connections under the synthetic `local` principal.
-    let auth = match websocket::authenticate_headers_or_query(&state, &headers, uri.query()) {
-        Some(auth) => auth,
-        None if state.config.security.auth_token.is_none() => AuthContext {
-            principal_id: "local".to_owned(),
-            tenant_id: "local".to_owned(),
-            token_id: "none".to_owned(),
-        },
-        None => return Err(AppError::Unauthenticated),
-    };
+    // Device signature auth already ran in `device_auth_middleware`, covering
+    // the full request query (including the transport-crypto handshake
+    // parameters) so the encrypted channel is bound to the device identity.
+    let auth = require_auth(&state, &headers)?;
     let crypto = websocket::transport_crypto_from_handshake(&state, &headers, uri.query())?;
     Ok(ws.on_upgrade(move |socket| handle_socket(state, socket, crypto, auth)))
 }
@@ -1860,7 +1864,7 @@ async fn handle_socket(
     crypto: Option<TransportCryptoSession>,
     auth: AuthContext,
 ) {
-    let authenticated = state.config.security.auth_token.is_some();
+    let authenticated = state.config.security.enable_auth;
     let active_connections = state.increment_websocket_connections();
     state
         .events
@@ -2608,14 +2612,7 @@ fn prompt_skills(skills: Vec<PromptSkillRequest>) -> Vec<PromptSkillRef> {
 }
 
 fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<AuthContext, AppError> {
-    if state.config.security.auth_token.is_none() {
-        return Ok(AuthContext {
-            principal_id: "local".to_owned(),
-            tenant_id: "local".to_owned(),
-            token_id: "none".to_owned(),
-        });
-    }
-    websocket::authenticate_headers(state, headers).ok_or(AppError::Unauthenticated)
+    device_auth::verified_context(state, headers)
 }
 
 async fn append_git_audit(
@@ -2993,7 +2990,42 @@ mod tests {
     use super::*;
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use crate::conversation::{ConversationEventHub, ConversationStore};
+    use crate::device_auth::test_support::TestDevice;
     use crate::provider::ConversationSupervisor;
+
+    /// Enroll a deterministic test device against the state's data directory.
+    /// The authenticator reloads the registry file when it changes on disk, so
+    /// enrolling after `AppState::new` is enough.
+    fn enroll(data_dir: &Path) -> TestDevice {
+        let device = TestDevice::new(11);
+        device.enroll(data_dir);
+        device
+    }
+
+    fn signed_request(device: &TestDevice, method: &str, uri: &str, body: &str) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        for (name, value) in device.sign(method, uri, body.as_bytes()) {
+            builder = builder.header(name, value);
+        }
+        builder.body(Body::from(body.to_owned())).unwrap()
+    }
+
+    /// Buffer an already-built request body and attach a device signature.
+    /// Keeps the existing builder-style test bodies intact.
+    async fn resign(device: &TestDevice, request: Request<Body>) -> Request<Body> {
+        let (parts, body) = request.into_parts();
+        let bytes = to_bytes(body, 32 * 1024 * 1024).await.unwrap();
+        let mut request = Request::from_parts(parts, Body::from(bytes.clone()));
+        let uri = request.uri().to_string();
+        let method = request.method().as_str().to_owned();
+        for (name, value) in device.sign(&method, &uri, &bytes) {
+            request.headers_mut().insert(name, value.parse().unwrap());
+        }
+        request
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -3031,27 +3063,25 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("git-token".into()),
             },
         })
         .await
         .unwrap();
         let app = crate::server::router(state.clone());
-        let request = |token: Option<&str>, operation: Value| {
-            let mut builder = Request::builder()
-                .method("POST")
-                .uri("/v2/git/operation")
-                .header("content-type", "application/json");
-            if let Some(token) = token {
-                builder = builder.header("authorization", token);
+        let device = enroll(&root.join("data"));
+        let request = |device: Option<&TestDevice>, operation: Value| {
+            let body = json!({"workspacePath":workspace, "operation":operation}).to_string();
+            match device {
+                Some(device) => signed_request(device, "POST", "/v2/git/operation", &body),
+                None => Request::builder()
+                    .method("POST")
+                    .uri("/v2/git/operation")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
             }
-            builder
-                .body(Body::from(
-                    json!({"workspacePath":workspace, "operation":operation}).to_string(),
-                ))
-                .unwrap()
         };
-        let auth = Some("Bearer git-token");
+        let auth = Some(&device);
         let init = json!({"action":"init"});
         assert_eq!(
             app.clone()
@@ -3111,13 +3141,7 @@ mod tests {
         );
         let snapshot = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(read_uri)
-                    .header("authorization", auth.unwrap())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(signed_request(&device, "GET", &read_uri, ""))
             .await
             .unwrap();
         assert_eq!(snapshot.status(), StatusCode::OK);
@@ -3142,13 +3166,7 @@ mod tests {
         );
         let status = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(status_uri)
-                    .header("authorization", auth.unwrap())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(signed_request(&device, "GET", &status_uri, ""))
             .await
             .unwrap();
         assert_eq!(status.status(), StatusCode::OK);
@@ -3184,16 +3202,12 @@ mod tests {
             StatusCode::CONFLICT
         );
         let outside = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/v2/git/workspace?workspacePath={}",
-                        root.display()
-                    ))
-                    .header("authorization", auth.unwrap())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(signed_request(
+                &device,
+                "GET",
+                &format!("/v2/git/workspace?workspacePath={}", root.display()),
+                "",
+            ))
             .await
             .unwrap();
         assert_eq!(outside.status(), StatusCode::FORBIDDEN);
@@ -3262,11 +3276,11 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("v2-token".to_owned()),
             },
         })
         .await
         .unwrap();
+        let device = enroll(&root.join("data"));
         let app = crate::server::router(state.clone());
 
         let unauthenticated = app
@@ -3283,13 +3297,7 @@ mod tests {
 
         let providers = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v2/providers")
-                    .header("authorization", "Bearer v2-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(signed_request(&device, "GET", "/v2/providers", ""))
             .await
             .unwrap();
         assert_eq!(providers.status(), StatusCode::OK);
@@ -3348,22 +3356,17 @@ mod tests {
 
         let create = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/conversations")
-                    .header("authorization", "Bearer v2-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "provider": "codex",
-                            "workspace": workspace,
-                            "title": "HTTP fixture",
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
+            .oneshot(signed_request(
+                &device,
+                "POST",
+                "/v2/conversations",
+                &json!({
+                    "provider": "codex",
+                    "workspace": workspace,
+                    "title": "HTTP fixture",
+                })
+                .to_string(),
+            ))
             .await
             .unwrap();
         assert_eq!(create.status(), StatusCode::OK);
@@ -3376,9 +3379,12 @@ mod tests {
             .set_owned("local", &created.workspace, true)
             .await
             .unwrap();
-        let commands = app.clone().oneshot(Request::builder()
-            .uri(format!("/v2/providers/commands?conversationId={}&provider=pi&workspace=/untrusted-spoof", created.id))
-            .header("authorization", "Bearer v2-token").body(Body::empty()).unwrap()).await.unwrap();
+        let commands = app.clone().oneshot(signed_request(
+            &device,
+            "GET",
+            &format!("/v2/providers/commands?conversationId={}&provider=pi&workspace=/untrusted-spoof", created.id),
+            "",
+        )).await.unwrap();
         assert_eq!(commands.status(), StatusCode::OK);
         let catalog: Value =
             serde_json::from_slice(&to_bytes(commands.into_body(), 1024 * 1024).await.unwrap())
@@ -3410,14 +3416,7 @@ mod tests {
         ] {
             let denied = app
                 .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .header("authorization", "Bearer v2-token")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(signed_request(&device, method, &uri, ""))
                 .await
                 .unwrap();
             assert_eq!(denied.status(), StatusCode::NOT_FOUND);
@@ -3435,26 +3434,23 @@ mod tests {
             .unwrap();
         let stopped = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/v2/conversations/{}/runtime/stop", pi.id))
-                    .header("authorization", "Bearer v2-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(signed_request(
+                &device,
+                "POST",
+                &format!("/v2/conversations/{}/runtime/stop", pi.id),
+                "",
+            ))
             .await
             .unwrap();
         assert_eq!(stopped.status(), StatusCode::OK);
 
         let replay = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/v2/conversations/{}/events", created.id))
-                    .header("authorization", "Bearer v2-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(signed_request(
+                &device,
+                "GET",
+                &format!("/v2/conversations/{}/events", created.id),
+                "",
+            ))
             .await
             .unwrap();
         assert_eq!(replay.status(), StatusCode::OK);
@@ -3498,7 +3494,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("v2-token".to_owned()),
             },
         })
         .await
@@ -3763,11 +3758,11 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("v2-token".to_owned()),
             },
         })
         .await
         .unwrap();
+        let device = enroll(&root.join("data"));
         let app = crate::server::router(state);
 
         // `/v2/version` mirrors the unauthenticated daemon self-check contract.
@@ -3786,7 +3781,7 @@ mod tests {
         let version_json: serde_json::Value = serde_json::from_slice(&version_body).unwrap();
         assert_eq!(version_json["name"], "todex-agentd");
 
-        // Workspace endpoints require the bearer token.
+        // Workspace endpoints require a paired device signature.
         let unauthenticated = app
             .clone()
             .oneshot(
@@ -3799,7 +3794,6 @@ mod tests {
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
-        let auth = "Bearer v2-token";
         let workspace_payload = json!({
             "workspaces": [{
                 "id": "client-generated",
@@ -3822,13 +3816,16 @@ mod tests {
         let replaced = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/v2/workspaces")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(workspace_payload.clone()))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/v2/workspaces")
+                        .header("content-type", "application/json")
+                        .body(Body::from(workspace_payload.clone()))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -3840,11 +3837,14 @@ mod tests {
         let trust = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!("/v2/workspaces/{workspace_id}/trust"))
-                    .header("authorization", auth)
-                    .body(Body::empty())
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .uri(format!("/v2/workspaces/{workspace_id}/trust"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -3859,13 +3859,16 @@ mod tests {
         let revoked = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri(format!("/v2/workspaces/{workspace_id}/trust"))
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(json!({ "trusted": false }).to_string()))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/v2/workspaces/{workspace_id}/trust"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({ "trusted": false }).to_string()))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -3874,13 +3877,16 @@ mod tests {
         let resynced = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/v2/workspaces")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(workspace_payload))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/v2/workspaces")
+                        .header("content-type", "application/json")
+                        .body(Body::from(workspace_payload))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -3888,11 +3894,14 @@ mod tests {
         let trust_after_resync = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!("/v2/workspaces/{workspace_id}/trust"))
-                    .header("authorization", auth)
-                    .body(Body::empty())
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .uri(format!("/v2/workspaces/{workspace_id}/trust"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -3908,13 +3917,16 @@ mod tests {
         let trusted = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri(format!("/v2/workspaces/{workspace_id}/trust"))
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(json!({ "trusted": true }).to_string()))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/v2/workspaces/{workspace_id}/trust"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({ "trusted": true }).to_string()))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -3929,14 +3941,17 @@ mod tests {
         let entries = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/v2/workspace/entries?cwd={}&query=main",
-                        workspace.display()
-                    ))
-                    .header("authorization", auth)
-                    .body(Body::empty())
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .uri(format!(
+                            "/v2/workspace/entries?cwd={}&query=main",
+                            workspace.display()
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -3948,14 +3963,17 @@ mod tests {
         let directories = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/v2/workspace/directories?path={}",
-                        workspace.display()
-                    ))
-                    .header("authorization", auth)
-                    .body(Body::empty())
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .uri(format!(
+                            "/v2/workspace/directories?path={}",
+                            workspace.display()
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -3964,14 +3982,17 @@ mod tests {
         let file = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/v2/workspace/file?path={}",
-                        workspace.join("README.md").display()
-                    ))
-                    .header("authorization", auth)
-                    .body(Body::empty())
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .uri(format!(
+                            "/v2/workspace/file?path={}",
+                            workspace.join("README.md").display()
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -3995,11 +4016,14 @@ mod tests {
             let response = app
                 .clone()
                 .oneshot(
-                    Request::builder()
-                        .uri(format!("/v2/workspace/file?path={}", path.display()))
-                        .header("authorization", auth)
-                        .body(Body::empty())
-                        .unwrap(),
+                    resign(
+                        &device,
+                        Request::builder()
+                            .uri(format!("/v2/workspace/file?path={}", path.display()))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await,
                 )
                 .await
                 .unwrap();
@@ -4011,12 +4035,12 @@ mod tests {
         }
 
         let preview_request = |path: &Path, authenticated: bool| {
-            let mut builder =
-                Request::builder().uri(format!("/v2/workspace/file?path={}", path.display()));
+            let uri = format!("/v2/workspace/file?path={}", path.display());
             if authenticated {
-                builder = builder.header("authorization", auth);
+                signed_request(&device, "GET", &uri, "")
+            } else {
+                Request::builder().uri(uri).body(Body::empty()).unwrap()
             }
-            builder.body(Body::empty()).unwrap()
         };
         for (name, mime, bytes) in [
             ("preview.png", "image/png", b"\x89PNG\r\n\x1a\n".as_slice()),
@@ -4111,21 +4135,20 @@ mod tests {
         assert!(binary_json["text"].is_null());
 
         let save_request = |path: &Path, text: &str, expected: &str, authenticated: bool| {
-            let mut builder = Request::builder()
-                .method("PUT")
-                .uri("/v2/workspace/file")
-                .header("content-type", "application/json");
+            let body = json!({
+                "path": path, "text": text, "expectedText": expected,
+            })
+            .to_string();
             if authenticated {
-                builder = builder.header("authorization", auth);
+                signed_request(&device, "PUT", "/v2/workspace/file", &body)
+            } else {
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v2/workspace/file")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap()
             }
-            builder
-                .body(Body::from(
-                    json!({
-                        "path": path, "text": text, "expectedText": expected,
-                    })
-                    .to_string(),
-                ))
-                .unwrap()
         };
         let readme = workspace.join("README.md");
         let unauthorized = app
@@ -4239,14 +4262,17 @@ mod tests {
         let escaped = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/v2/workspace/file?path={}",
-                        outside.join("secret.txt").display()
-                    ))
-                    .header("authorization", auth)
-                    .body(Body::empty())
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .uri(format!(
+                            "/v2/workspace/file?path={}",
+                            outside.join("secret.txt").display()
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4255,14 +4281,17 @@ mod tests {
         let missing = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/v2/workspace/file?path={}",
-                        workspace.join("missing.rs").display()
-                    ))
-                    .header("authorization", auth)
-                    .body(Body::empty())
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .uri(format!(
+                            "/v2/workspace/file?path={}",
+                            workspace.join("missing.rs").display()
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4287,15 +4316,18 @@ mod tests {
         let fetched_browser = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/browser/fetch")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "url": format!("http://{browser_address}/") }).to_string(),
-                    ))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v2/browser/fetch")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({ "url": format!("http://{browser_address}/") }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4327,15 +4359,18 @@ mod tests {
         let blocked_redirect = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/browser/fetch")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "url": format!("http://{redirect_address}/") }).to_string(),
-                    ))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v2/browser/fetch")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({ "url": format!("http://{redirect_address}/") }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4345,15 +4380,18 @@ mod tests {
         let blocked_browser = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/browser/fetch")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "url": "http://169.254.169.254/latest/meta-data" }).to_string(),
-                    ))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v2/browser/fetch")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({ "url": "http://169.254.169.254/latest/meta-data" }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4401,7 +4439,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("git-token".to_owned()),
             },
         })
         .await
@@ -4412,19 +4449,22 @@ mod tests {
             .await
             .unwrap();
         let app = crate::server::router(state.clone());
-        let auth = "Bearer git-token";
+        let device = enroll(&root.join("data"));
 
         let scan = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/v2/git/scan?workspacePath={}",
-                        workspace.display()
-                    ))
-                    .header("authorization", auth)
-                    .body(Body::empty())
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .uri(format!(
+                            "/v2/git/scan?workspacePath={}",
+                            workspace.display()
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4456,21 +4496,24 @@ mod tests {
         let initial = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/git/run")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "workspacePath": workspace,
-                            "action": "initial",
-                            "message": "Initial API commit",
-                            "includeUnstaged": true
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v2/git/run")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "workspacePath": workspace,
+                                "action": "initial",
+                                "message": "Initial API commit",
+                                "includeUnstaged": true
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4504,21 +4547,24 @@ mod tests {
         let commit = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/git/run")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "workspacePath": workspace,
-                            "action": "commit",
-                            "message": malicious_message,
-                            "includeUnstaged": true
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v2/git/run")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "workspacePath": workspace,
+                                "action": "commit",
+                                "message": malicious_message,
+                                "includeUnstaged": true
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4540,15 +4586,18 @@ mod tests {
         let nested_target = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/git/run")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "workspacePath": nested, "action": "push" }).to_string(),
-                    ))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v2/git/run")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({ "workspacePath": nested, "action": "push" }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4574,15 +4623,19 @@ mod tests {
         let external_metadata = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/git/run")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "workspacePath": linked_workspace, "action": "push" }).to_string(),
-                    ))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v2/git/run")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({ "workspacePath": linked_workspace, "action": "push" })
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4592,21 +4645,24 @@ mod tests {
         let partial = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/git/run")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "workspacePath": workspace,
-                            "action": "commit-push",
-                            "message": "Commit before expected push failure",
-                            "includeUnstaged": true
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v2/git/run")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "workspacePath": workspace,
+                                "action": "commit-push",
+                                "message": "Commit before expected push failure",
+                                "includeUnstaged": true
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4618,19 +4674,22 @@ mod tests {
         let escaped = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/git/run")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "workspacePath": outside,
-                            "action": "push"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v2/git/run")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "workspacePath": outside,
+                                "action": "push"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4639,19 +4698,22 @@ mod tests {
         let invalid_action = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/git/run")
-                    .header("authorization", auth)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "workspacePath": workspace,
-                            "action": "reset --hard"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v2/git/run")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "workspacePath": workspace,
+                                "action": "reset --hard"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await,
             )
             .await
             .unwrap();
@@ -4704,7 +4766,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: false,
                 enable_tls: false,
-                auth_token: None,
             },
         })
         .await
@@ -4747,7 +4808,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn v2_ws_accepts_query_token_and_dispatches_legacy_and_resume_commands() {
+    async fn v2_ws_accepts_signed_query_and_dispatches_legacy_and_resume_commands() {
         let root = std::env::temp_dir().join(format!("todex-v2-ws-{}", Uuid::new_v4()));
         let workspace_root = root.join("workspaces");
         let workspace = workspace_root.join("project");
@@ -4782,7 +4843,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: false,
-                auth_token: Some("v2-ws-token".to_owned()),
             },
         })
         .await
@@ -4804,6 +4864,7 @@ mod tests {
                 .unwrap();
         }
 
+        let device = enroll(&root.join("data"));
         let app = crate::server::router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4811,17 +4872,19 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        // Missing token is rejected at handshake.
+        // Missing device signature is rejected at handshake.
         assert!(
             tokio_tungstenite::connect_async(format!("ws://{addr}/v2/ws"))
                 .await
                 .is_err()
         );
 
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/v2/ws?access_token=v2-ws-token"))
-                .await
-                .expect("connect with query token");
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/v2/ws?{}",
+            device.sign_query("/v2/ws")
+        ))
+        .await
+        .expect("connect with signed query");
 
         // v2-native command: server.ping result envelope.
         ws.send(WsMessage::Text(
@@ -4886,7 +4949,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn v2_ws_auth_matrix_covers_anonymous_wrong_and_encoded_query_tokens() {
+    async fn v2_ws_auth_matrix_covers_anonymous_and_device_signed_queries() {
         let root = std::env::temp_dir().join(format!("todex-v2-ws-auth-{}", Uuid::new_v4()));
         let workspace_root = root.join("workspaces");
         fs::create_dir_all(&workspace_root).unwrap();
@@ -4920,7 +4983,6 @@ mod tests {
             security: SecurityConfig {
                 enable_auth: false,
                 enable_tls: false,
-                auth_token: None,
             },
         };
 
@@ -4950,26 +5012,39 @@ mod tests {
         assert_eq!(pong["payload"]["pong"], true);
         let _ = ws.close(None).await;
 
-        // Token-secured deployments: wrong tokens fail, and query tokens that
-        // need URL encoding (browser/Electron path) succeed.
+        // Device-secured deployments: unsigned or wrongly signed handshakes
+        // fail, and a correctly signed query (browser/Electron path) succeeds.
         let mut secured = base;
-        secured.security.auth_token = Some("tok&x=1".to_owned());
+        secured.security.enable_auth = true;
+        let secured_data_dir = secured.data_dir.clone();
         let state = AppState::new(secured).await.unwrap();
+        let device = enroll(&secured_data_dir);
+        let other = TestDevice::new(23);
         let app = crate::server::router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        assert!(
-            tokio_tungstenite::connect_async(format!("ws://{addr}/v2/ws?access_token=wrong"))
-                .await
-                .is_err()
-        );
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/v2/ws?access_token=tok%26x%3D1"))
-                .await
-                .expect("url-encoded query token should authenticate");
+        // Unknown device id.
+        assert!(tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/v2/ws?{}",
+            other.sign_query("/v2/ws")
+        ))
+        .await
+        .is_err());
+        // Legacy bearer query tokens are gone entirely.
+        assert!(tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/v2/ws?access_token=whatever"
+        ))
+        .await
+        .is_err());
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/v2/ws?{}",
+            device.sign_query("/v2/ws")
+        ))
+        .await
+        .expect("signed query should authenticate");
         ws.send(WsMessage::Text(
             json!({ "id": "ping-secured", "type": "server.ping", "payload": {} })
                 .to_string()
