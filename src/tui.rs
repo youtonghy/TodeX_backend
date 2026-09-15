@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 use crate::config::{Config, PairingEncryption, ServeArgs};
 use crate::daemon::{self, DaemonProcess};
@@ -60,6 +61,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     loop {
         app.refresh_daemon_status();
         app.refresh_device_pairing(false);
+        while let Ok(result) = app.daemon_op_rx.try_recv() {
+            app.apply_daemon_op_result(result);
+        }
         terminal.draw(|frame| app.render(frame))?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -128,6 +132,18 @@ struct PairingQrPopup {
 struct CredentialsPopup {
     public_key: Option<String>,
     scroll: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonOpKind {
+    Start,
+    Stop,
+    Restart,
+}
+
+struct DaemonOpResult {
+    kind: DaemonOpKind,
+    process: Result<Option<DaemonProcess>, String>,
 }
 
 #[derive(Clone)]
@@ -300,6 +316,10 @@ struct TuiApp {
     device_pairing: DevicePairingState,
     folder_picker: Option<FolderPicker>,
     roots_picker: Option<usize>,
+    daemon_op: Option<DaemonOpKind>,
+    daemon_op_pending: Option<DaemonOpKind>,
+    daemon_op_tx: mpsc::UnboundedSender<DaemonOpResult>,
+    daemon_op_rx: mpsc::UnboundedReceiver<DaemonOpResult>,
     language: TuiLanguage,
 }
 
@@ -316,6 +336,7 @@ impl TuiApp {
             .flatten()
             .and_then(|value| TuiLanguage::parse(&value))
             .unwrap_or_else(TuiLanguage::detect);
+        let (daemon_op_tx, daemon_op_rx) = mpsc::unbounded_channel();
         Self {
             config,
             daemon: None,
@@ -341,6 +362,10 @@ impl TuiApp {
             device_pairing: DevicePairingState::default(),
             folder_picker: None,
             roots_picker: None,
+            daemon_op: None,
+            daemon_op_pending: None,
+            daemon_op_tx,
+            daemon_op_rx,
             language,
         }
     }
@@ -1151,8 +1176,8 @@ impl TuiApp {
                     return Ok(true);
                 }
             }
-            KeyCode::Char('s') => self.toggle_daemon().await?,
-            KeyCode::Char('r') => self.restart_daemon().await?,
+            KeyCode::Char('s') => self.toggle_daemon(),
+            KeyCode::Char('r') => self.queue_daemon_op(DaemonOpKind::Restart),
             KeyCode::Char('h') => self.start_host_edit(),
             KeyCode::Char('p') => self.start_port_edit(),
             KeyCode::Char('w') => self.start_workspace_roots_manager(),
@@ -1281,8 +1306,8 @@ impl TuiApp {
 
     async fn run_selected_action(&mut self) -> Result<bool> {
         match self.selected_action {
-            0 => self.toggle_daemon().await?,
-            1 => self.restart_daemon().await?,
+            0 => self.toggle_daemon(),
+            1 => self.queue_daemon_op(DaemonOpKind::Restart),
             2 => self.start_host_edit(),
             3 => self.start_port_edit(),
             4 => self.start_workspace_roots_manager(),
@@ -1298,124 +1323,118 @@ impl TuiApp {
         Ok(false)
     }
 
-    async fn toggle_daemon(&mut self) -> Result<()> {
+    fn toggle_daemon(&mut self) {
         if self.daemon.is_some() {
-            self.stop_daemon().await
+            self.queue_daemon_op(DaemonOpKind::Stop);
         } else {
-            self.start_daemon().await
+            self.queue_daemon_op(DaemonOpKind::Start);
         }
     }
 
-    async fn start_daemon(&mut self) -> Result<()> {
-        if self.daemon.is_some() {
+    fn queue_daemon_op(&mut self, kind: DaemonOpKind) {
+        if self.daemon_op.is_some() {
+            self.daemon_op_pending = Some(kind);
+            self.notice = self
+                .text(
+                    "Daemon is busy; the operation is queued.",
+                    "daemon 正忙，该操作已排队等待执行。",
+                )
+                .to_owned();
+            return;
+        }
+        if kind == DaemonOpKind::Start && self.daemon.is_some() {
             self.notice = self
                 .text("Daemon is already running.", "Daemon 已在运行。")
                 .to_owned();
-            return Ok(());
+            return;
         }
+
+        self.daemon_op = Some(kind);
+        self.notice = match kind {
+            DaemonOpKind::Start => self.text("Starting daemon...", "正在启动 daemon..."),
+            DaemonOpKind::Stop => self.text("Stopping daemon...", "正在停止 daemon..."),
+            DaemonOpKind::Restart => self.text("Restarting daemon...", "正在重启 daemon..."),
+        }
+        .to_owned();
+        self.push_log(self.notice.clone());
 
         let mut config = self.config.clone();
-        config.host = self.config.host.trim().to_owned();
-        config.port = self.config.port;
-        self.notice = self
-            .text("Starting daemon...", "正在启动 daemon...")
-            .to_owned();
-        match daemon::start(config).await {
-            Ok(process) => {
-                self.notice = match self.language {
-                    TuiLanguage::English => format!(
-                        "Daemon started on {} with pid {}. It will keep running after the TUI exits.",
-                        process.listen_addr(), process.pid
-                    ),
-                    TuiLanguage::Chinese => format!(
-                        "Daemon 已在 {} 启动，PID 为 {}；退出 TUI 后仍会继续运行。",
-                        process.listen_addr(), process.pid
-                    ),
-                };
-                self.last_error = None;
-                self.push_log(self.notice.clone());
-                self.daemon = Some(process);
+        config.host = config.host.trim().to_owned();
+        let tx = self.daemon_op_tx.clone();
+        tokio::spawn(async move {
+            let process = match kind {
+                DaemonOpKind::Start => daemon::start(config).await.map(Some),
+                DaemonOpKind::Stop => daemon::stop(&config).await,
+                DaemonOpKind::Restart => daemon::restart(config).await.map(Some),
             }
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                self.notice = self
-                    .text("Daemon failed to start.", "Daemon 启动失败。")
-                    .to_owned();
-                self.push_log(format!("{} {error}", self.notice.clone()));
-            }
-        }
-        Ok(())
+            .map_err(|error| error.to_string());
+            let _ = tx.send(DaemonOpResult { kind, process });
+        });
     }
 
-    async fn stop_daemon(&mut self) -> Result<()> {
-        self.notice = self
-            .text("Stopping daemon...", "正在停止 daemon...")
-            .to_owned();
-        self.push_log(self.notice.clone());
-        match daemon::stop(&self.config).await {
-            Ok(Some(process)) => {
-                self.notice = match self.language {
-                    TuiLanguage::English => format!("Daemon stopped (pid {}).", process.pid),
-                    TuiLanguage::Chinese => format!("Daemon 已停止（PID {}）。", process.pid),
+    fn apply_daemon_op_result(&mut self, result: DaemonOpResult) {
+        self.daemon_op = None;
+        match result.process {
+            Ok(process) => {
+                self.notice = match (result.kind, process.as_ref()) {
+                    (DaemonOpKind::Start, Some(process)) => match self.language {
+                        TuiLanguage::English => format!(
+                            "Daemon started on {} with pid {}. It will keep running after the TUI exits.",
+                            process.listen_addr(),
+                            process.pid
+                        ),
+                        TuiLanguage::Chinese => format!(
+                            "Daemon 已在 {} 启动，PID 为 {}；退出 TUI 后仍会继续运行。",
+                            process.listen_addr(),
+                            process.pid
+                        ),
+                    },
+                    (DaemonOpKind::Restart, Some(process)) => match self.language {
+                        TuiLanguage::English => format!(
+                            "Daemon restarted on {} with pid {}.",
+                            process.listen_addr(),
+                            process.pid
+                        ),
+                        TuiLanguage::Chinese => format!(
+                            "Daemon 已在 {} 重启，PID 为 {}。",
+                            process.listen_addr(),
+                            process.pid
+                        ),
+                    },
+                    (DaemonOpKind::Stop, Some(process)) => match self.language {
+                        TuiLanguage::English => {
+                            format!("Daemon stopped (pid {}).", process.pid)
+                        }
+                        TuiLanguage::Chinese => {
+                            format!("Daemon 已停止（PID {}）。", process.pid)
+                        }
+                    },
+                    (_, None) => self
+                        .text("Daemon is already stopped.", "Daemon 已经停止。")
+                        .to_owned(),
                 };
                 self.last_error = None;
                 self.push_log(self.notice.clone());
-                self.daemon = None;
-            }
-            Ok(None) => {
-                self.notice = self
-                    .text("Daemon is already stopped.", "Daemon 已经停止。")
-                    .to_owned();
-                self.last_error = None;
-                self.push_log(self.notice.clone());
-                self.daemon = None;
+                self.daemon = process;
             }
             Err(error) => {
-                self.notice = self
-                    .text("Daemon stop failed.", "Daemon 停止失败。")
-                    .to_owned();
-                self.last_error = Some(error.to_string());
+                self.notice = match result.kind {
+                    DaemonOpKind::Start => {
+                        self.text("Daemon failed to start.", "Daemon 启动失败。")
+                    }
+                    DaemonOpKind::Stop => self.text("Daemon stop failed.", "Daemon 停止失败。"),
+                    DaemonOpKind::Restart => {
+                        self.text("Daemon restart failed.", "Daemon 重启失败。")
+                    }
+                }
+                .to_owned();
+                self.last_error = Some(error.clone());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
             }
         }
-        Ok(())
-    }
-
-    async fn restart_daemon(&mut self) -> Result<()> {
-        let mut config = self.config.clone();
-        config.host = self.config.host.trim().to_owned();
-        config.port = self.config.port;
-        self.notice = self
-            .text("Restarting daemon...", "正在重启 daemon...")
-            .to_owned();
-        self.push_log(self.notice.clone());
-        match daemon::restart(config).await {
-            Ok(process) => {
-                self.notice = match self.language {
-                    TuiLanguage::English => format!(
-                        "Daemon restarted on {} with pid {}.",
-                        process.listen_addr(),
-                        process.pid
-                    ),
-                    TuiLanguage::Chinese => format!(
-                        "Daemon 已在 {} 重启，PID 为 {}。",
-                        process.listen_addr(),
-                        process.pid
-                    ),
-                };
-                self.last_error = None;
-                self.push_log(self.notice.clone());
-                self.daemon = Some(process);
-            }
-            Err(error) => {
-                self.notice = self
-                    .text("Daemon restart failed.", "Daemon 重启失败。")
-                    .to_owned();
-                self.last_error = Some(error.to_string());
-                self.push_log(format!("{} {}", self.notice.clone(), error));
-            }
+        if let Some(pending) = self.daemon_op_pending.take() {
+            self.queue_daemon_op(pending);
         }
-        Ok(())
     }
 
     fn refresh_daemon_status(&mut self) {
@@ -1423,7 +1442,7 @@ impl TuiApp {
         match daemon::status(&self.config) {
             Ok(next) => {
                 let next_pid = next.as_ref().map(|process| process.pid);
-                if previous_pid != next_pid {
+                if previous_pid != next_pid && self.daemon_op.is_none() {
                     match next.as_ref() {
                         Some(process) => self.push_log(match self.language {
                             TuiLanguage::English => format!(
@@ -1624,7 +1643,7 @@ impl TuiApp {
 
     async fn persist_workspace_roots(&mut self, subject: &str) -> Result<()> {
         if self.auto_save_settings(subject) && self.daemon.is_some() {
-            self.restart_daemon().await?;
+            self.queue_daemon_op(DaemonOpKind::Restart);
         }
         Ok(())
     }
@@ -2071,7 +2090,16 @@ impl TuiApp {
 
     fn status_panel(&self, area: Rect) -> Paragraph<'_> {
         let process = self.daemon.as_ref();
-        let status = if process.is_some() {
+        let status = if let Some(op) = self.daemon_op {
+            Span::styled(
+                match op {
+                    DaemonOpKind::Start => self.text("Starting...", "正在启动..."),
+                    DaemonOpKind::Stop => self.text("Stopping...", "正在停止..."),
+                    DaemonOpKind::Restart => self.text("Restarting...", "正在重启..."),
+                },
+                Style::default().fg(Color::Cyan),
+            )
+        } else if process.is_some() {
             Span::styled(
                 self.text("Running", "运行中"),
                 Style::default().fg(Color::Green),
@@ -4252,6 +4280,37 @@ mod tests {
         assert!(saved.contains("workspace_root = \"/root-b\""));
         assert!(saved.contains("workspace_roots = [\"/root-b\"]"));
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn daemon_operations_apply_results_and_drain_pending() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "todex-tui-daemon-op-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut app = super::TuiApp::new(crate::config::Config {
+            data_dir,
+            ..crate::config::Config::default()
+        });
+
+        app.daemon_op = Some(super::DaemonOpKind::Restart);
+        app.daemon_op_pending = Some(super::DaemonOpKind::Stop);
+        app.apply_daemon_op_result(super::DaemonOpResult {
+            kind: super::DaemonOpKind::Restart,
+            process: Err("boom".to_owned()),
+        });
+        assert!(app.last_error.is_some());
+        // The pending stop was queued once the restart result was applied.
+        assert_eq!(app.daemon_op, Some(super::DaemonOpKind::Stop));
+        assert!(app.daemon_op_pending.is_none());
+
+        // No pid file exists in the temp data dir, so the spawned stop
+        // resolves immediately and reports an already-stopped daemon.
+        let result = app.daemon_op_rx.recv().await.unwrap();
+        app.apply_daemon_op_result(result);
+        assert!(app.daemon_op.is_none());
+        assert!(app.daemon.is_none());
+        assert!(app.last_error.is_none());
     }
 
     #[test]
