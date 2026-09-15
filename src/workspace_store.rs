@@ -79,18 +79,18 @@ struct NormalizedWorkspaces {
 #[derive(Clone)]
 pub struct WorkspaceStore {
     path: Arc<PathBuf>,
-    workspace_root: Arc<PathBuf>,
+    workspace_roots: Arc<Vec<PathBuf>>,
     inner: Arc<RwLock<WorkspaceSnapshot>>,
 }
 
 impl WorkspaceStore {
-    pub async fn new(data_dir: PathBuf, workspace_root: PathBuf) -> Result<Self, AppError> {
+    pub async fn new(data_dir: PathBuf, workspace_roots: Vec<PathBuf>) -> Result<Self, AppError> {
         tokio::fs::create_dir_all(&data_dir).await?;
         let path = data_dir.join(WORKSPACES_FILE);
-        let snapshot = load_snapshot(&path, &workspace_root).await?;
+        let snapshot = load_snapshot(&path, &workspace_roots).await?;
         Ok(Self {
             path: Arc::new(path),
-            workspace_root: Arc::new(workspace_root),
+            workspace_roots: Arc::new(workspace_roots),
             inner: Arc::new(RwLock::new(snapshot)),
         })
     }
@@ -132,7 +132,7 @@ impl WorkspaceStore {
         owner_id: &str,
         workspaces: Vec<WorkspaceRecord>,
     ) -> Result<WorkspaceMerge, AppError> {
-        let normalized = normalize_workspaces(workspaces, &self.workspace_root, Some(owner_id));
+        let normalized = normalize_workspaces(workspaces, &self.workspace_roots, Some(owner_id));
         let mut current = self.inner.write().await;
         let mut by_id = current
             .workspaces
@@ -180,7 +180,10 @@ impl WorkspaceStore {
     }
 }
 
-async fn load_snapshot(path: &Path, workspace_root: &Path) -> Result<WorkspaceSnapshot, AppError> {
+async fn load_snapshot(
+    path: &Path,
+    workspace_roots: &[PathBuf],
+) -> Result<WorkspaceSnapshot, AppError> {
     let text = match tokio::fs::read_to_string(path).await {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -194,7 +197,7 @@ async fn load_snapshot(path: &Path, workspace_root: &Path) -> Result<WorkspaceSn
     }
 
     let mut snapshot: WorkspaceSnapshot = serde_json::from_str(&text)?;
-    let normalized = normalize_workspaces(snapshot.workspaces, workspace_root, None);
+    let normalized = normalize_workspaces(snapshot.workspaces, workspace_roots, None);
     for rejected in &normalized.rejected {
         warn!(
             workspace_id = %rejected.id,
@@ -249,14 +252,14 @@ async fn set_owner_only(path: &Path) -> Result<(), AppError> {
 
 fn normalize_workspaces(
     workspaces: Vec<WorkspaceRecord>,
-    workspace_root: &Path,
+    workspace_roots: &[PathBuf],
     owner_id: Option<&str>,
 ) -> NormalizedWorkspaces {
     let mut normalized: HashMap<(String, String), WorkspaceRecord> =
         HashMap::with_capacity(workspaces.len());
     let mut rejected = Vec::new();
     for mut workspace in workspaces {
-        let path = match validate_workspace_record(workspace_root, &workspace) {
+        let path = match validate_workspace_record(workspace_roots, &workspace) {
             Ok(path) => path,
             Err(error) => {
                 rejected.push(RejectedWorkspace {
@@ -292,7 +295,7 @@ fn normalize_workspaces(
 }
 
 fn validate_workspace_record(
-    root: &Path,
+    roots: &[PathBuf],
     workspace: &WorkspaceRecord,
 ) -> Result<PathBuf, AppError> {
     if workspace.name.trim().is_empty() {
@@ -300,7 +303,7 @@ fn validate_workspace_record(
             "workspace name is required".to_owned(),
         ));
     }
-    validate_workspace_directory_text(root, &workspace.path)
+    validate_workspace_directory_text(roots, &workspace.path)
 }
 
 pub fn stable_workspace_id(path: &Path) -> String {
@@ -332,7 +335,7 @@ mod tests {
         let workspace_root = root.join("workspaces");
         let workspace_path = workspace_root.join("app");
         fs::create_dir_all(&workspace_path).unwrap();
-        let store = WorkspaceStore::new(root.clone(), workspace_root.clone())
+        let store = WorkspaceStore::new(root.clone(), vec![workspace_root.clone()])
             .await
             .unwrap();
         let snapshot = store
@@ -364,7 +367,7 @@ mod tests {
 
         assert_eq!(snapshot.workspaces.len(), 1);
 
-        let reloaded = WorkspaceStore::new(root.clone(), workspace_root)
+        let reloaded = WorkspaceStore::new(root.clone(), vec![workspace_root])
             .await
             .unwrap()
             .snapshot_owned("local")
@@ -392,7 +395,7 @@ mod tests {
         let workspace_root = root.join("workspaces");
         let workspace_path = workspace_root.join("app");
         fs::create_dir_all(&workspace_path).unwrap();
-        let store = WorkspaceStore::new(root.clone(), workspace_root)
+        let store = WorkspaceStore::new(root.clone(), vec![workspace_root])
             .await
             .unwrap();
         let workspace = WorkspaceRecord {
@@ -456,7 +459,7 @@ mod tests {
         let workspace_path = workspace_root.join("app");
         fs::create_dir_all(&workspace_path).unwrap();
         let missing = workspace_root.join("gone");
-        let store = WorkspaceStore::new(root.clone(), workspace_root)
+        let store = WorkspaceStore::new(root.clone(), vec![workspace_root])
             .await
             .unwrap();
 
@@ -484,7 +487,7 @@ mod tests {
         let root = make_temp_dir("todex-workspace-store-allbad");
         let workspace_root = root.join("workspaces");
         fs::create_dir_all(&workspace_root).unwrap();
-        let store = WorkspaceStore::new(root.clone(), workspace_root.clone())
+        let store = WorkspaceStore::new(root.clone(), vec![workspace_root.clone()])
             .await
             .unwrap();
 
@@ -511,7 +514,7 @@ mod tests {
         let stale_path = workspace_root.join("stale");
         fs::create_dir_all(&workspace_path).unwrap();
         fs::create_dir_all(&stale_path).unwrap();
-        let store = WorkspaceStore::new(root.clone(), workspace_root.clone())
+        let store = WorkspaceStore::new(root.clone(), vec![workspace_root.clone()])
             .await
             .unwrap();
         store
@@ -527,7 +530,7 @@ mod tests {
         drop(store);
         fs::remove_dir_all(&stale_path).unwrap();
 
-        let reloaded = WorkspaceStore::new(root.clone(), workspace_root)
+        let reloaded = WorkspaceStore::new(root.clone(), vec![workspace_root])
             .await
             .unwrap()
             .snapshot_owned("local")

@@ -48,7 +48,7 @@ pub struct WorkspaceTrustStatus {
 #[derive(Clone)]
 pub struct WorkspaceTrustStore {
     path: Arc<PathBuf>,
-    workspace_root: Arc<PathBuf>,
+    workspace_roots: Arc<Vec<PathBuf>>,
     inner: Arc<RwLock<WorkspaceTrustSnapshot>>,
 }
 
@@ -57,13 +57,13 @@ pub(crate) struct WorkspaceTrustPermit {
 }
 
 impl WorkspaceTrustStore {
-    pub async fn new(data_dir: PathBuf, workspace_root: PathBuf) -> Result<Self, AppError> {
+    pub async fn new(data_dir: PathBuf, workspace_roots: Vec<PathBuf>) -> Result<Self, AppError> {
         tokio::fs::create_dir_all(&data_dir).await?;
         let path = data_dir.join(WORKSPACE_TRUST_FILE);
-        let snapshot = load_snapshot(&path, &workspace_root).await?;
+        let snapshot = load_snapshot(&path, &workspace_roots).await?;
         Ok(Self {
             path: Arc::new(path),
-            workspace_root: Arc::new(workspace_root),
+            workspace_roots: Arc::new(workspace_roots),
             inner: Arc::new(RwLock::new(snapshot)),
         })
     }
@@ -236,7 +236,7 @@ impl WorkspaceTrustStore {
 
     fn validate(&self, workspace: &Path) -> Result<PathBuf, AppError> {
         validate_workspace_directory_text(
-            &self.workspace_root,
+            &self.workspace_roots,
             workspace.to_str().ok_or_else(|| {
                 AppError::InvalidRequest("workspace path is not UTF-8".to_owned())
             })?,
@@ -246,7 +246,7 @@ impl WorkspaceTrustStore {
 
 async fn load_snapshot(
     path: &Path,
-    workspace_root: &Path,
+    workspace_roots: &[PathBuf],
 ) -> Result<WorkspaceTrustSnapshot, AppError> {
     let text = match tokio::fs::read_to_string(path).await {
         Ok(text) => text,
@@ -262,7 +262,7 @@ async fn load_snapshot(
     let mut entries = HashMap::<(String, String), WorkspaceTrustEntry>::new();
     for mut entry in snapshot.entries {
         let Ok(workspace) =
-            validate_workspace_directory_text(workspace_root, &entry.workspace_path)
+            validate_workspace_directory_text(workspace_roots, &entry.workspace_path)
         else {
             tracing::warn!(workspace = %entry.workspace_path, "dropping stale workspace trust entry");
             continue;
@@ -333,7 +333,7 @@ mod tests {
         let workspace_root = root.join("workspaces");
         let workspace = workspace_root.join("project");
         tokio::fs::create_dir_all(&workspace).await.unwrap();
-        let store = WorkspaceTrustStore::new(root.clone(), workspace_root.clone())
+        let store = WorkspaceTrustStore::new(root.clone(), vec![workspace_root.clone()])
             .await
             .unwrap();
 
@@ -359,7 +359,7 @@ mod tests {
                 .trusted
         );
 
-        let reloaded = WorkspaceTrustStore::new(root.clone(), workspace_root)
+        let reloaded = WorkspaceTrustStore::new(root.clone(), vec![workspace_root])
             .await
             .unwrap();
         assert!(
@@ -391,7 +391,7 @@ mod tests {
         let second = workspace_root.join("second");
         tokio::fs::create_dir_all(&first).await.unwrap();
         tokio::fs::create_dir_all(&second).await.unwrap();
-        let store = WorkspaceTrustStore::new(root.clone(), workspace_root.clone())
+        let store = WorkspaceTrustStore::new(root.clone(), vec![workspace_root.clone()])
             .await
             .unwrap();
 
@@ -419,7 +419,7 @@ mod tests {
             Err(AppError::WorkspaceTrustRequired(_))
         ));
 
-        let reloaded = WorkspaceTrustStore::new(root.clone(), workspace_root)
+        let reloaded = WorkspaceTrustStore::new(root.clone(), vec![workspace_root])
             .await
             .unwrap();
         assert!(
@@ -464,7 +464,7 @@ mod tests {
         .await
         .unwrap();
 
-        let store = WorkspaceTrustStore::new(root.clone(), workspace_root)
+        let store = WorkspaceTrustStore::new(root.clone(), vec![workspace_root])
             .await
             .unwrap();
         assert!(
@@ -486,7 +486,7 @@ mod tests {
         let workspace_root = root.join("workspaces");
         let workspace = workspace_root.join("project");
         tokio::fs::create_dir_all(&workspace).await.unwrap();
-        let store = WorkspaceTrustStore::new(root.clone(), workspace_root)
+        let store = WorkspaceTrustStore::new(root.clone(), vec![workspace_root])
             .await
             .unwrap();
         store.set_owned("owner", &workspace, true).await.unwrap();
@@ -523,7 +523,7 @@ mod tests {
         let workspace_root = root.join("workspaces");
         let workspace = workspace_root.join("project");
         tokio::fs::create_dir_all(&workspace).await.unwrap();
-        let store = WorkspaceTrustStore::new(root.clone(), workspace_root)
+        let store = WorkspaceTrustStore::new(root.clone(), vec![workspace_root])
             .await
             .unwrap();
         tokio::fs::create_dir(&*store.path).await.unwrap();

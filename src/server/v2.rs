@@ -28,7 +28,9 @@ use crate::provider::{
     ConversationPrompt, ManagedCli, PermissionDecision, PromptContentRef, PromptSkillRef,
 };
 use crate::transport_crypto::TransportCryptoSession;
-use crate::workspace_paths::{canonical_workspace_root, validate_workspace_directory_text};
+use crate::workspace_paths::{
+    canonical_workspace_roots, containing_workspace_root, validate_workspace_directory_text,
+};
 use crate::workspace_store::{RejectedWorkspace, WorkspaceRecord};
 
 use super::git;
@@ -206,7 +208,13 @@ pub(super) async fn version(State(state): State<AppState>) -> Json<VersionRespon
         name: env!("CARGO_PKG_NAME"),
         version: crate::version::APP_VERSION,
         data_dir: state.config.data_dir.display().to_string(),
-        workspace_root: state.config.workspace_root.display().to_string(),
+        workspace_root: state.config.primary_workspace_root().display().to_string(),
+        workspace_roots: state
+            .config
+            .workspace_roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect(),
     })
 }
 
@@ -217,7 +225,7 @@ pub(super) async fn workspaces(
     let auth = require_auth(&state, &headers)?;
     let snapshot = state.workspaces.snapshot_owned(&auth.tenant_id).await;
     let (workspaces, rejected) =
-        partition_available_workspaces(&state.config.workspace_root, snapshot.workspaces);
+        partition_available_workspaces(&state.config.workspace_roots, snapshot.workspaces);
     Ok(Json(WorkspacesResponse {
         workspaces,
         updated_at: snapshot.updated_at,
@@ -228,13 +236,13 @@ pub(super) async fn workspaces(
 /// Revalidates stored workspace records against the filesystem so clients can
 /// grey out directories that were removed after they were synced.
 fn partition_available_workspaces(
-    workspace_root: &Path,
+    workspace_roots: &[PathBuf],
     records: Vec<WorkspaceRecord>,
 ) -> (Vec<WorkspaceRecord>, Vec<RejectedWorkspace>) {
     let mut workspaces = Vec::with_capacity(records.len());
     let mut rejected = Vec::new();
     for record in records {
-        match validate_workspace_directory_text(workspace_root, &record.path) {
+        match validate_workspace_directory_text(workspace_roots, &record.path) {
             Ok(_) => workspaces.push(record),
             Err(error) => rejected.push(RejectedWorkspace {
                 id: record.id,
@@ -270,7 +278,7 @@ pub(super) async fn replace_workspaces(
     }
     let snapshot = merged.snapshot;
     let (workspaces, mut rejected) =
-        partition_available_workspaces(&state.config.workspace_root, snapshot.workspaces);
+        partition_available_workspaces(&state.config.workspace_roots, snapshot.workspaces);
     let mut seen_rejected = rejected
         .iter()
         .map(|item| (item.id.clone(), item.path.clone()))
@@ -449,7 +457,7 @@ pub(super) async fn workspace_entries(
 ) -> Result<Json<WorkspaceEntriesResponse>, AppError> {
     require_auth(&state, &headers)?;
 
-    let cwd = validate_workspace_directory_text(&state.config.workspace_root, &query.cwd)?;
+    let cwd = validate_workspace_directory_text(&state.config.workspace_roots, &query.cwd)?;
 
     let raw_query = query.query.as_deref().unwrap_or("");
     let relative_query = normalize_relative_query(raw_query)?;
@@ -471,25 +479,35 @@ pub(super) async fn workspace_directories(
 ) -> Result<Json<WorkspaceDirectoriesResponse>, AppError> {
     require_auth(&state, &headers)?;
 
-    let root = canonical_workspace_root(&state.config.workspace_root)?;
+    let roots = canonical_workspace_roots(&state.config.workspace_roots);
     let current = match query
         .path
         .as_deref()
         .map(str::trim)
         .filter(|path| !path.is_empty())
     {
-        Some(path) => validate_workspace_directory_text(&state.config.workspace_root, path)?,
-        None => root.clone(),
+        Some(path) => validate_workspace_directory_text(&state.config.workspace_roots, path)?,
+        None => roots
+            .first()
+            .cloned()
+            .ok_or_else(|| AppError::InvalidRequest("workspace root is unavailable".to_owned()))?,
     };
     let limit = query.limit.unwrap_or(100).clamp(1, 300);
-    let entries = list_workspace_directories(&root, &current, limit).await?;
+    let containing_root = containing_workspace_root(&roots, &current)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| current.clone());
+    let entries = list_workspace_directories(&roots, &current, limit).await?;
     let parent = current
         .parent()
-        .filter(|parent| current != root && parent.starts_with(&root))
+        .filter(|parent| current != containing_root && parent.starts_with(&containing_root))
         .map(|parent| parent.display().to_string());
 
     Ok(Json(WorkspaceDirectoriesResponse {
-        root: root.display().to_string(),
+        root: containing_root.display().to_string(),
+        roots: roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect(),
         current: current.display().to_string(),
         parent,
         entries,
@@ -502,7 +520,7 @@ pub(super) async fn workspace_file(
     Query(query): Query<WorkspaceFileQuery>,
 ) -> Result<Json<WorkspaceFileResponse>, AppError> {
     require_auth(&state, &headers)?;
-    let path = validate_workspace_file_text(&state.config.workspace_root, &query.path)?;
+    let path = validate_workspace_file_text(&state.config.workspace_roots, &query.path)?;
     let metadata = tokio::fs::metadata(&path).await?;
     if !metadata.is_file() {
         return Err(AppError::InvalidRequest("path must be a file".to_owned()));
@@ -570,20 +588,23 @@ pub(super) async fn save_workspace_file(
             "file is too large to edit".to_owned(),
         ));
     }
-    let root = state.config.workspace_root.clone();
-    tokio::task::spawn_blocking(move || save_workspace_text(&root, request))
+    let roots = state.config.workspace_roots.clone();
+    tokio::task::spawn_blocking(move || save_workspace_text(&roots, request))
         .await
         .map_err(|error| AppError::Anyhow(error.into()))??;
     Ok(Json(json!({ "saved": true })))
 }
 
-fn save_workspace_text(root: &Path, request: SaveWorkspaceFileRequest) -> Result<(), AppError> {
+fn save_workspace_text(
+    roots: &[PathBuf],
+    request: SaveWorkspaceFileRequest,
+) -> Result<(), AppError> {
     use std::io::{Read, Write};
 
     let _guard = WORKSPACE_FILE_SAVE_LOCK
         .lock()
         .map_err(|_| AppError::Conflict("file save lock unavailable".to_owned()))?;
-    let path = validate_workspace_file_text(root, &request.path)?;
+    let path = validate_workspace_file_text(roots, &request.path)?;
     let mime = mime_for_name(
         path.file_name()
             .and_then(|name| name.to_str())
@@ -625,7 +646,7 @@ fn save_workspace_text(root: &Path, request: SaveWorkspaceFileRequest) -> Result
         output.write_all(request.text.as_bytes())?;
         output.sync_all()?;
         // Catch changes by other programs during preparation as well.
-        let current_path = validate_workspace_file_text(root, &request.path)?;
+        let current_path = validate_workspace_file_text(roots, &request.path)?;
         if current_path != path || std::fs::read(&path)? != bytes {
             return Err(AppError::Conflict(
                 "file changed since it was opened; reload before saving".to_owned(),
@@ -647,8 +668,8 @@ pub(super) async fn git_scan(
 ) -> Result<Json<super::protocol::GitScanResponse>, AppError> {
     let auth = require_auth(&state, &headers)?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace_path)?;
-    let result = git::scan(&state.config.workspace_root, &workspace).await;
+        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
+    let result = git::scan(&state.config.workspace_roots, &workspace).await;
     let audit = append_git_audit(
         &state,
         &auth,
@@ -678,13 +699,13 @@ pub(super) async fn git_run(
             ))
         })?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_root, &request.workspace_path)?;
+        validate_workspace_directory_text(&state.config.workspace_roots, &request.workspace_path)?;
     state
         .workspace_trust
         .ensure_trusted(&auth.tenant_id, &workspace)
         .await?;
     let result = git::run(
-        &state.config.workspace_root,
+        &state.config.workspace_roots,
         &state.config.data_dir,
         &workspace,
         &request,
@@ -726,8 +747,8 @@ pub(super) async fn git_status(
 ) -> Result<Json<super::protocol::GitStatusResponse>, AppError> {
     let auth = require_auth(&state, &headers)?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace_path)?;
-    let result = git::status::read(&state.config.workspace_root, &workspace).await;
+        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
+    let result = git::status::read(&state.config.workspace_roots, &workspace).await;
     let audit = append_git_audit(
         &state,
         &auth,
@@ -750,8 +771,8 @@ pub(super) async fn git_workspace(
 ) -> Result<Json<super::protocol::GitWorkspaceResponse>, AppError> {
     let auth = require_auth(&state, &headers)?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace_path)?;
-    let result = git::workspace::snapshot(&state.config.workspace_root, &workspace).await;
+        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
+    let result = git::workspace::snapshot(&state.config.workspace_roots, &workspace).await;
     let audit = append_git_audit(
         &state,
         &auth,
@@ -774,8 +795,8 @@ pub(super) async fn git_diff(
 ) -> Result<Json<super::protocol::GitDiffResponse>, AppError> {
     let auth = require_auth(&state, &headers)?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace_path)?;
-    let result = git::diff::file(&state.config.workspace_root, &workspace, &query.path).await;
+        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
+    let result = git::diff::file(&state.config.workspace_roots, &workspace, &query.path).await;
     let audit = append_git_audit(
         &state,
         &auth,
@@ -798,8 +819,8 @@ pub(super) async fn git_pull_request(
 ) -> Result<Json<super::protocol::GitPullRequestResponse>, AppError> {
     let auth = require_auth(&state, &headers)?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace_path)?;
-    let result = git::pull_request::summary(&state.config.workspace_root, &workspace).await;
+        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
+    let result = git::pull_request::summary(&state.config.workspace_roots, &workspace).await;
     let audit = append_git_audit(
         &state,
         &auth,
@@ -829,7 +850,7 @@ pub(super) async fn git_operation(
             ))
         })?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_root, &request.workspace_path)?;
+        validate_workspace_directory_text(&state.config.workspace_roots, &request.workspace_path)?;
     let _trust = state
         .workspace_trust
         .acquire_owned(&auth.tenant_id, &workspace)
@@ -838,7 +859,7 @@ pub(super) async fn git_operation(
     // beneath it. This is a preflight guard, not a lock against external Git tools.
     let target = match &request.operation {
         super::protocol::GitOperation::RemoveWorktree { path } => Some(
-            validate_workspace_directory_text(&state.config.workspace_root, path)?,
+            validate_workspace_directory_text(&state.config.workspace_roots, path)?,
         ),
         _ => None,
     };
@@ -862,7 +883,7 @@ pub(super) async fn git_operation(
         }
     }
     let result = git::workspace::operate(
-        &state.config.workspace_root,
+        &state.config.workspace_roots,
         &state.config.data_dir,
         &workspace,
         &request.operation,
@@ -883,14 +904,14 @@ pub(super) async fn git_operation(
     combine_git_result(result.map(Json), audit)
 }
 
-fn validate_workspace_file_text(root: &Path, raw: &str) -> Result<PathBuf, AppError> {
+fn validate_workspace_file_text(roots: &[PathBuf], raw: &str) -> Result<PathBuf, AppError> {
     let path = PathBuf::from(raw.trim());
     if !path.is_absolute() {
         return Err(AppError::InvalidRequest(
             "workspace file path must be absolute".to_owned(),
         ));
     }
-    let root = std::fs::canonicalize(root)?;
+    let roots = canonical_workspace_roots(roots);
     let canonical = std::fs::canonicalize(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             AppError::WorkspacePathNotFound
@@ -898,7 +919,7 @@ fn validate_workspace_file_text(root: &Path, raw: &str) -> Result<PathBuf, AppEr
             AppError::Io(error)
         }
     })?;
-    if !canonical.starts_with(&root) {
+    if containing_workspace_root(&roots, &canonical).is_none() {
         return Err(AppError::WorkspacePathOutsideRoot);
     }
     Ok(canonical)
@@ -1177,11 +1198,10 @@ async fn list_direct_workspace_entries(
 }
 
 async fn list_workspace_directories(
-    root: &Path,
+    roots: &[PathBuf],
     current: &Path,
     limit: usize,
 ) -> Result<Vec<WorkspaceDirectory>, AppError> {
-    let root = tokio::fs::canonicalize(root).await?;
     let current = tokio::fs::canonicalize(current).await?;
     let mut entries = Vec::new();
     let mut read_dir = tokio::fs::read_dir(&current).await?;
@@ -1203,7 +1223,7 @@ async fn list_workspace_directories(
         }
 
         let canonical = match tokio::fs::canonicalize(&path).await {
-            Ok(canonical) if canonical.starts_with(&root) => canonical,
+            Ok(canonical) if containing_workspace_root(roots, &canonical).is_some() => canonical,
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1333,7 +1353,7 @@ async fn mcp(
 }
 
 fn validate_catalog_workspace(state: &AppState, workspace: &str) -> Result<PathBuf, AppError> {
-    validate_workspace_directory_text(&state.catalog.config().workspace_root, workspace)
+    validate_workspace_directory_text(&state.catalog.config().workspace_roots, workspace)
 }
 
 async fn providers(
@@ -1643,7 +1663,7 @@ async fn provider_image_input(
 ) -> Result<Json<crate::provider::types::ProviderImageInputCapability>, AppError> {
     let auth = require_auth(&state, &headers)?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace)?;
+        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace)?;
     Ok(Json(
         state
             .conversations
@@ -1665,7 +1685,7 @@ async fn provider_models(
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_root, &query.workspace)?;
+        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace)?;
     let models = state
         .conversations
         .models_live(&auth.tenant_id, query.provider, &workspace)
@@ -1696,7 +1716,7 @@ async fn provider_commands(
         AppError::InvalidRequest("workspace is required without conversationId".to_owned())
     })?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_root, &workspace_text)?;
+        validate_workspace_directory_text(&state.config.workspace_roots, &workspace_text)?;
     let commands = state
         .conversations
         .commands_live(&auth.tenant_id, provider, &workspace)
@@ -2760,6 +2780,7 @@ pub(super) struct VersionResponse {
     version: &'static str,
     data_dir: String,
     workspace_root: String,
+    workspace_roots: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2863,6 +2884,7 @@ pub(super) struct WorkspaceEntriesResponse {
 #[serde(rename_all = "camelCase")]
 pub(super) struct WorkspaceDirectoriesResponse {
     root: String,
+    roots: Vec<String>,
     current: String,
     parent: Option<String>,
     entries: Vec<WorkspaceDirectory>,
@@ -3110,7 +3132,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root: root.join("workspaces"),
+            workspace_roots: vec![root.join("workspaces")],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".into(),
@@ -3323,7 +3345,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -3541,7 +3563,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -3746,6 +3768,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiple_workspace_roots_accept_workspaces_under_any_root() {
+        let root = std::env::temp_dir().join(format!("todex-v2-multi-root-{}", Uuid::new_v4()));
+        let primary = root.join("primary");
+        let secondary = root.join("secondary");
+        let extra = root.join("extra");
+        let workspace_a = primary.join("app-a");
+        let workspace_b = secondary.join("app-b");
+        let outside = root.join("outside").join("app");
+        fs::create_dir_all(&workspace_a).unwrap();
+        fs::create_dir_all(&workspace_b).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![primary.clone(), secondary.clone(), extra.clone()],
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+        })
+        .await
+        .unwrap();
+        let device = enroll(&root.join("data"));
+        let app = crate::server::router(state);
+
+        let version = app
+            .clone()
+            .oneshot(signed_request(&device, "GET", "/v2/version", ""))
+            .await
+            .unwrap();
+        assert_eq!(version.status(), StatusCode::OK);
+        let version_json: Value =
+            serde_json::from_slice(&to_bytes(version.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            version_json["workspace_root"],
+            primary.display().to_string()
+        );
+        assert_eq!(
+            version_json["workspace_roots"],
+            json!([
+                primary.display().to_string(),
+                secondary.display().to_string(),
+                extra.display().to_string(),
+            ])
+        );
+
+        let workspace_entry = |name: &str, path: &Path| {
+            json!({
+                "id": format!("client-{name}"),
+                "name": name,
+                "path": path.display().to_string(),
+                "sessionId": "session",
+                "tenantId": "local",
+                "threadId": "",
+                "model": "gpt-5",
+                "reasoningEffort": null,
+                "approvalPolicy": "on-request",
+                "sandboxMode": "workspace-write",
+                "serviceTier": null,
+                "localAdapterState": "idle",
+                "createdAt": 1,
+                "updatedAt": 1
+            })
+        };
+        let payload = json!({
+            "workspaces": [
+                workspace_entry("a", &workspace_a),
+                workspace_entry("b", &workspace_b),
+                workspace_entry("outside", &outside),
+            ]
+        })
+        .to_string();
+        let response = app
+            .clone()
+            .oneshot(signed_request(&device, "PUT", "/v2/workspaces", &payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["workspaces"].as_array().unwrap().len(), 2);
+        assert_eq!(body["rejected"].as_array().unwrap().len(), 1);
+        assert_eq!(body["rejected"][0]["name"], "outside");
+        assert_eq!(body["rejected"][0]["code"], "WORKSPACE_PATH_OUTSIDE_ROOT");
+
+        let directories_uri = format!("/v2/workspace/directories?path={}", secondary.display());
+        let directories = app
+            .clone()
+            .oneshot(signed_request(&device, "GET", &directories_uri, ""))
+            .await
+            .unwrap();
+        assert_eq!(directories.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(directories.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let canonical_secondary = fs::canonicalize(&secondary).unwrap();
+        let canonical_primary = fs::canonicalize(&primary).unwrap();
+        let canonical_extra = fs::canonicalize(&extra).unwrap();
+        assert_eq!(body["root"], canonical_secondary.display().to_string());
+        assert_eq!(body["current"], canonical_secondary.display().to_string());
+        assert_eq!(body["parent"], Value::Null);
+        assert_eq!(
+            body["roots"],
+            json!([
+                canonical_primary.display().to_string(),
+                canonical_secondary.display().to_string(),
+                canonical_extra.display().to_string(),
+            ])
+        );
+        let names: Vec<&str> = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["app-b"]);
+
+        let directories = app
+            .oneshot(signed_request(
+                &device,
+                "GET",
+                "/v2/workspace/directories",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(directories.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(directories.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["current"], canonical_primary.display().to_string());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn workspace_directories_lists_only_directories_under_root() {
         let root = make_temp_workspace("directory-browser");
         fs::create_dir_all(root.join("app")).unwrap();
@@ -3753,7 +3942,13 @@ mod tests {
         fs::create_dir_all(root.join(".hidden")).unwrap();
         fs::write(root.join("README.md"), "").unwrap();
 
-        let entries = list_workspace_directories(&root, &root, 20).await.unwrap();
+        let entries = list_workspace_directories(
+            &canonical_workspace_roots(std::slice::from_ref(&root)),
+            &root,
+            20,
+        )
+        .await
+        .unwrap();
         let paths = entries
             .iter()
             .map(|entry| entry.name.as_str())
@@ -3774,7 +3969,13 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
 
-        let entries = list_workspace_directories(&root, &root, 20).await.unwrap();
+        let entries = list_workspace_directories(
+            &canonical_workspace_roots(std::slice::from_ref(&root)),
+            &root,
+            20,
+        )
+        .await
+        .unwrap();
         let names = entries
             .iter()
             .map(|entry| entry.name.as_str())
@@ -3805,7 +4006,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -4484,7 +4685,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -4695,7 +4896,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -4880,7 +5081,7 @@ mod tests {
             .unwrap();
         assert_eq!(nested_target.status(), StatusCode::BAD_REQUEST);
 
-        let linked_workspace = state.config.workspace_root.join("linked");
+        let linked_workspace = state.config.primary_workspace_root().join("linked");
         let external_git_dir = outside.join("linked.git");
         let linked_status = StdCommand::new("git")
             .args([
@@ -5022,7 +5223,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -5099,7 +5300,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -5239,7 +5440,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),

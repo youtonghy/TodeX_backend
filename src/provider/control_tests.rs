@@ -49,7 +49,7 @@ impl Harness {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root: root.clone(),
+            workspace_roots: vec![root.clone()],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "pi".to_owned(),
@@ -75,7 +75,7 @@ impl Harness {
         let store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
-        let trust = WorkspaceTrustStore::new(root.join("trust"), root.clone())
+        let trust = WorkspaceTrustStore::new(root.join("trust"), vec![root.clone()])
             .await
             .unwrap();
         trust

@@ -49,7 +49,7 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
 - **Security & Sandboxing**:
   - Fail-closed device authentication: every request carries an Ed25519 signature from a registered device (unauthorized requests are rejected with `401 Unauthorized`). Devices are enrolled via [device verification](docs/device-verification.md) and can be revoked individually in the TUI.
   - Tenant isolation (`tenant_id`) enforced across all conversation queries, event journals, and subscriptions.
-  - Workspace root boundary enforcement (`workspace_root`) restricting client access to authorized filesystem scopes.
+  - Workspace root boundary enforcement (`workspace_roots`) restricting client access to authorized filesystem scopes.
   - Sanitized subprocess environments preventing leak of administrative environment variables.
 - **Interactive TUI & Daemon Management**:
   - Interactive Terminal UI (`cargo run -- tui`) built with Ratatui to monitor status, inspect logs, control daemon lifecycle, and generate pairing QR codes with automatic LAN IP resolution.
@@ -181,7 +181,7 @@ Configuration values are resolved using the following precedence:
 | **Host** | `--host` | `TODEX_AGENTD_HOST` | `127.0.0.1` | Binding network interface address. |
 | **Port** | `--port` | `TODEX_AGENTD_PORT` | `7345` | TCP port for HTTP and WebSocket. |
 | **Data Dir** | `--data-dir` | `TODEX_AGENTD_DATA_DIR` | `~/.todex-agent` | Storage directory for configs, manifests, and logs. |
-| **Workspace Root** | `--workspace-root` | `TODEX_AGENTD_WORKSPACE_ROOT` | `~/projects` | Root boundary for authorized project directories. |
+| **Workspace Root** | `--workspace-root` (repeatable) | `TODEX_AGENTD_WORKSPACE_ROOT`, `TODEX_AGENTD_WORKSPACE_ROOTS` (path-list) | `~/projects` | Root boundaries for authorized project directories; the first is the primary root. |
 | **Default Agent** | — | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` | Default provider (`codex`, `acp`, `pi`, `claude-code`, `grok-build`, `devin`, `opencode`). |
 | **Codex Binary** | — | `TODEX_AGENTD_CODEX_BIN` | `codex` | Path or executable name for Codex CLI. |
 | **Claude Binary** | — | `TODEX_AGENTD_CLAUDE_BIN` | `claude` | Path or executable name for Claude Code CLI. |
@@ -199,6 +199,8 @@ port = 7345
 pairing_encryption = "ml-kem-768"
 data_dir = "~/.todex-agent"
 workspace_root = "~/projects"
+# Multiple roots:
+# workspace_roots = ["~/projects", "/srv/repos"]
 
 [agent]
 default_agent = "codex"

@@ -101,7 +101,7 @@ struct LegacySource {
 
 pub async fn migrate_legacy_codex_sessions(
     data_dir: &Path,
-    workspace_root: &Path,
+    workspace_roots: &[PathBuf],
     store: &ConversationStore,
 ) -> Result<LegacyMigrationReport, AppError> {
     let legacy_root = data_dir.join("codex_gateway/sessions");
@@ -193,7 +193,7 @@ pub async fn migrate_legacy_codex_sessions(
         write_mapping(&mapping_path, &mapping).await?;
 
         let workspace =
-            legacy_workspace_for(&legacy_workspaces, &source.session_id, workspace_root);
+            legacy_workspace_for(&legacy_workspaces, &source.session_id, workspace_roots);
         match import_source(
             store,
             &conversation_id,
@@ -384,16 +384,17 @@ fn legacy_event_payload(record: &LegacyEventRecord) -> Value {
 fn legacy_workspace_for(
     snapshot: &LegacyWorkspaceSnapshot,
     session_id: &str,
-    workspace_root: &Path,
+    workspace_roots: &[PathBuf],
 ) -> PathBuf {
     snapshot
         .workspaces
         .iter()
         .find(|workspace| workspace.session_id == session_id)
         .and_then(|workspace| {
-            validate_workspace_directory_text(workspace_root, &workspace.path).ok()
+            validate_workspace_directory_text(workspace_roots, &workspace.path).ok()
         })
-        .unwrap_or_else(|| workspace_root.to_path_buf())
+        .or_else(|| workspace_roots.first().cloned())
+        .unwrap_or_default()
 }
 
 async fn conversation_matches_source(
@@ -691,7 +692,7 @@ mod tests {
         .unwrap();
 
         let store = ConversationStore::new(root.clone()).await.unwrap();
-        let first = migrate_legacy_codex_sessions(&root, &workspace_root, &store)
+        let first = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store)
             .await
             .unwrap();
         assert_eq!(first.imported, 1);
@@ -723,7 +724,7 @@ mod tests {
         );
         assert!(provider_state.recoverable);
 
-        let second = migrate_legacy_codex_sessions(&root, &workspace_root, &store)
+        let second = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store)
             .await
             .unwrap();
         assert_eq!(second.imported, 0);
@@ -744,7 +745,7 @@ mod tests {
             .unwrap()
             .write_all(format!("{}\n", appended).as_bytes())
             .unwrap();
-        let third = migrate_legacy_codex_sessions(&root, &workspace_root, &store)
+        let third = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store)
             .await
             .unwrap();
         assert_eq!(third.imported, 1);
@@ -802,7 +803,7 @@ mod tests {
 
         let store = ConversationStore::new(root.clone()).await.unwrap();
         assert_eq!(
-            migrate_legacy_codex_sessions(&root, &workspace_root, &store)
+            migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store)
                 .await
                 .unwrap()
                 .imported,
@@ -836,7 +837,7 @@ mod tests {
             )
             .unwrap();
 
-        let report = migrate_legacy_codex_sessions(&root, &workspace_root, &store)
+        let report = migrate_legacy_codex_sessions(&root, &[workspace_root.clone()], &store)
             .await
             .unwrap();
         assert_eq!(report.imported, 0);

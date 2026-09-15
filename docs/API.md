@@ -36,7 +36,7 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 | 监听主机 | `--host` | `TODEX_AGENTD_HOST` | `127.0.0.1` |
 | 监听端口 | `--port` | `TODEX_AGENTD_PORT` | `7345` |
 | 数据目录 | `--data-dir` | `TODEX_AGENTD_DATA_DIR` | `~/.todex-agent` |
-| Workspace 根目录 | `--workspace-root` | `TODEX_AGENTD_WORKSPACE_ROOT` | `~/projects` |
+| Workspace 根目录 | `--workspace-root`（可重复指定多个） | `TODEX_AGENTD_WORKSPACE_ROOT`、`TODEX_AGENTD_WORKSPACE_ROOTS`（按平台路径分隔符分隔多个） | `~/projects` |
 | Codex 可执行文件 | 无 | `TODEX_AGENTD_CODEX_BIN` | `codex` |
 | Claude Code 可执行文件 | 无 | `TODEX_AGENTD_CLAUDE_BIN` | `claude` |
 | Pi 可执行文件 | 无 | `TODEX_AGENTD_PI_BIN` | `pi` |
@@ -217,13 +217,14 @@ GET /v2/version
 | `name` | string | Cargo 包名 |
 | `version` | string | 构建时注入的应用版本；开发构建为 `DEV0.0.0` |
 | `data_dir` | string | 当前数据目录 |
-| `workspace_root` | string | 当前 workspace 根目录 |
+| `workspace_root` | string | 主 workspace 根目录（根列表第一项） |
+| `workspace_roots` | string[] | 全部已配置的 workspace 根目录 |
 
 ## Workspace 缓存同步与信任
 
 工作区清单由后端持久化到 `$TODEX_AGENTD_DATA_DIR/workspaces.json`。手机和桌面端的本地存储只作为离线缓存；连接成功后会拉取当前身份的后端快照。工作区 ID 由后端根据规范化路径稳定生成，并与对话 manifest 的 `workspaceId` 共用，从而让不同设备恢复同一工作区内的对话。
 
-后端会把 `workspace_root` 作为移动端可用工作区的权限边界。`PUT /v2/workspaces`、`/v2/workspace/entries`、本地 Codex 启动和本地终端启动都会拒绝 `workspace_root` 之外的目录；目录必须存在且是目录。
+后端会把 `workspace_roots` 作为移动端可用工作区的权限边界。`PUT /v2/workspaces`、`/v2/workspace/entries`、本地 Codex 启动和本地终端启动都会拒绝所有根目录之外的目录；目录必须存在且是目录。
 
 ```http
 GET /v2/workspaces
@@ -261,13 +262,13 @@ DELETE /v2/workspaces/{workspaceId}
 
 `PUT` 请求体使用同样的 `workspaces` 数组。后端会校验 `name`、`path`、路径存在性和根目录边界，按当前认证身份和规范化路径合并记录，并返回后端生成的稳定 ID。它不会接受客户端伪造的租户，也不会持久化设备本地的 `threadId` 和 `localAdapterState`。
 
-校验失败的记录（例如目录已被删除或位于 `workspace_root` 之外）不再让整个请求报错：它们会被跳过并在响应的 `rejected` 数组中回报，每项包含客户端提交的 `id`、`name`、`path`、错误 `code`（如 `WORKSPACE_PATH_NOT_FOUND`）和 `message`；即使请求中所有记录都被拒绝也按同样方式返回 200。`GET` 和 `PUT` 响应都会重新校验已持久化的记录：目录后来被删除的存量记录同样只出现在 `rejected` 中，不再阻塞同步；客户端可据此把失效工作区灰显并在路径恢复后自动复原。加载已持久化的快照时同样跳过失效路径并记录告警，因此目录被删除后 daemon 仍可正常启动。要彻底移除一条失效工作区记录，需要显式调用 `DELETE /v2/workspaces/{workspaceId}`；该操作允许目录已不存在的记录被删除。
+校验失败的记录（例如目录已被删除或位于 `workspace_roots` 之外）不再让整个请求报错：它们会被跳过并在响应的 `rejected` 数组中回报，每项包含客户端提交的 `id`、`name`、`path`、错误 `code`（如 `WORKSPACE_PATH_NOT_FOUND`）和 `message`；即使请求中所有记录都被拒绝也按同样方式返回 200。`GET` 和 `PUT` 响应都会重新校验已持久化的记录：目录后来被删除的存量记录同样只出现在 `rejected` 中，不再阻塞同步；客户端可据此把失效工作区灰显并在路径恢复后自动复原。加载已持久化的快照时同样跳过失效路径并记录告警，因此目录被删除后 daemon 仍可正常启动。要彻底移除一条失效工作区记录，需要显式调用 `DELETE /v2/workspaces/{workspaceId}`；该操作允许目录已不存在的记录被删除。
 
-`PUT /v2/workspaces` 会自动信任当前 owner 下、已经通过 `workspace_root` 边界校验且尚未做过信任决定的工作区。显式撤销会保留为拒绝决定，后续同步不会重新自动信任；未注册路径也不会因调用模型或执行接口而获得信任。
+`PUT /v2/workspaces` 会自动信任当前 owner 下、已经通过 `workspace_roots` 边界校验且尚未做过信任决定的工作区。显式撤销会保留为拒绝决定，后续同步不会重新自动信任；未注册路径也不会因调用模型或执行接口而获得信任。
 
 旧版信任文件没有保存撤销记录。首次升级时，旧版曾撤销的工作区与从未决定的工作区无法区分，都会在同步时获得信任；需要继续阻止的工作区应在升级后再次显式撤销。
 
-`GET /v2/workspaces/{workspaceId}/trust` 返回当前状态；`PUT` 请求体为 `{ "trusted": true }` 或 `{ "trusted": false }`。信任记录同时绑定认证 owner 和规范化路径，独立保存在 `$DATA_DIR/workspace-trust.json`。Provider 模型/命令发现、prompt、MCP 调用、Git 写操作、本地终端和本地 Codex 启动前都必须通过信任检查；只读目录、文件预览与 Git 扫描仍受 `workspace_root` 边界约束。Provider 启动许可持有信任读锁直至子进程完成 spawn；撤销先取得写锁，再取消该 owner 在工作区内已登记的活动 turn，因此不会漏过处于检查与启动之间的任务。删除工作区会先撤销信任并取消活动 turn，但不会删除已有对话历史。
+`GET /v2/workspaces/{workspaceId}/trust` 返回当前状态；`PUT` 请求体为 `{ "trusted": true }` 或 `{ "trusted": false }`。信任记录同时绑定认证 owner 和规范化路径，独立保存在 `$DATA_DIR/workspace-trust.json`。Provider 模型/命令发现、prompt、MCP 调用、Git 写操作、本地终端和本地 Codex 启动前都必须通过信任检查；只读目录、文件预览与 Git 扫描仍受 `workspace_roots` 边界约束。Provider 启动许可持有信任读锁直至子进程完成 spawn；撤销先取得写锁，再取消该 owner 在工作区内已登记的活动 turn，因此不会漏过处于检查与启动之间的任务。删除工作区会先撤销信任并取消活动 turn，但不会删除已有对话历史。
 
 ## 任务看板同步
 
@@ -319,6 +320,7 @@ GET /v2/workspace/directories?path=/home/user/projects/demo
 ```json
 {
   "root": "/home/user/projects",
+  "roots": ["/home/user/projects", "/srv/repos"],
   "current": "/home/user/projects",
   "parent": null,
   "entries": [
@@ -331,7 +333,7 @@ GET /v2/workspace/directories?path=/home/user/projects/demo
 }
 ```
 
-`path` 为空时从当前 `workspace_root` 开始。返回值只包含可进入的子目录，会跳过隐藏目录、文件，以及 canonical path 落在 `workspace_root` 之外的目录或符号链接。
+`path` 为空时从主 workspace 根目录（`workspace_roots` 第一项）开始，也可以指向任一已配置根目录或其子目录。`root` 是包含 `current` 的那个根目录，`roots` 列出全部生效的根目录，`parent` 只允许向上走到所在根的边界。返回值只包含可进入的子目录，会跳过隐藏目录、文件，以及 canonical path 落在所有根目录之外的目录或符号链接。
 
 ### 文件 `@` 引用建议
 
@@ -347,11 +349,11 @@ GET /v2/workspace/entries?cwd=/home/user/projects/demo&query=routes&limit=40
 GET /v2/workspace/file?path=/home/user/projects/demo/README.md
 ```
 
-路径必须是 `workspace_root` 内的绝对路径且指向文件。文本超过 1 MiB、图片超过 8 MiB 拒绝预览。响应包含 `name`、`path`、`mimeType`、`sizeBytes`；任何可解码为 UTF-8 的非图片文件都附带 `text` 内容（`mimeType` 仍按扩展名白名单分类），图片附带 `dataUrl`。保存（`PUT` 文本写回）仅限 `text/*` 与 `application/json` 类型。
+路径必须是 `workspace_roots` 内的绝对路径且指向文件。文本超过 1 MiB、图片超过 8 MiB 拒绝预览。响应包含 `name`、`path`、`mimeType`、`sizeBytes`；任何可解码为 UTF-8 的非图片文件都附带 `text` 内容（`mimeType` 仍按扩展名白名单分类），图片附带 `dataUrl`。保存（`PUT` 文本写回）仅限 `text/*` 与 `application/json` 类型。
 
 ### Git 扫描与操作
 
-Git HTTP API 只接受 `workspace_root` 内的现有目录。服务端会递归检查该目录及最多两层子目录中的仓库，并返回与桌面端 Git 面板兼容的摘要：
+Git HTTP API 只接受 `workspace_roots` 内的现有目录。服务端会递归检查该目录及最多两层子目录中的仓库，并返回与桌面端 Git 面板兼容的摘要：
 
 ```http
 GET /v2/git/scan?workspacePath=/home/user/projects/demo
@@ -410,7 +412,7 @@ Content-Type: application/json
 }
 ```
 
-Git 进程不经过 shell，stdin 关闭并设置 `GIT_TERMINAL_PROMPT=0`；子进程只继承必要的基础运行环境，不继承 `TODEX_AGENTD_*` 或 `GIT_DIR`/`GIT_WORK_TREE` 等路径覆盖变量。所有命令显式关闭 fsmonitor 与 untracked cache，差异统计禁用 external diff/textconv。写操作会再次确认 worktree、git-dir 和 git-common-dir 全部位于 `workspace_root` 内，拒绝写入相关 Git 元数据树中的符号链接和 object alternates，并使用 daemon 管理的空 hooks 目录、关闭 commit/push 签名和 `ext`/`file` transport；local 与 worktree 级配置都会展开 `include` 后检查，包含 clean/process filter、askpass、local credential helper、`core.sshCommand`、自定义 GPG program、自定义 remote helper 或仓库级 URL 重写时直接拒绝。仓库远端仅接受 HTTP(S)、SSH、Git URL 与 SCP-like SSH 写法；daemon 账户自己的全局 credential/SSH 配置仍可用于正常的非本地远端推送。同一 daemon 内的 Git 写操作串行执行，排队超过 2 秒返回 `409 CONFLICT`，单次写请求总计超过 120 秒返回 `GIT_PARTIAL_SUCCESS`，提醒客户端状态可能已改变、刷新后再决定后续动作。每条命令 15 秒超时；超时、输出超限或外层请求取消都会终止 Git 进程组并回收直接子进程。完整进程组清理依赖 Unix，因此非 Unix 平台的 Git 写 API 返回 `501 UNSUPPORTED`；Git 扫描仍可使用。
+Git 进程不经过 shell，stdin 关闭并设置 `GIT_TERMINAL_PROMPT=0`；子进程只继承必要的基础运行环境，不继承 `TODEX_AGENTD_*` 或 `GIT_DIR`/`GIT_WORK_TREE` 等路径覆盖变量。所有命令显式关闭 fsmonitor 与 untracked cache，差异统计禁用 external diff/textconv。写操作会再次确认 worktree、git-dir 和 git-common-dir 全部位于 `workspace_roots` 内，拒绝写入相关 Git 元数据树中的符号链接和 object alternates，并使用 daemon 管理的空 hooks 目录、关闭 commit/push 签名和 `ext`/`file` transport；local 与 worktree 级配置都会展开 `include` 后检查，包含 clean/process filter、askpass、local credential helper、`core.sshCommand`、自定义 GPG program、自定义 remote helper 或仓库级 URL 重写时直接拒绝。仓库远端仅接受 HTTP(S)、SSH、Git URL 与 SCP-like SSH 写法；daemon 账户自己的全局 credential/SSH 配置仍可用于正常的非本地远端推送。同一 daemon 内的 Git 写操作串行执行，排队超过 2 秒返回 `409 CONFLICT`，单次写请求总计超过 120 秒返回 `GIT_PARTIAL_SUCCESS`，提醒客户端状态可能已改变、刷新后再决定后续动作。每条命令 15 秒超时；超时、输出超限或外层请求取消都会终止 Git 进程组并回收直接子进程。完整进程组清理依赖 Unix，因此非 Unix 平台的 Git 写 API 返回 `501 UNSUPPORTED`；Git 扫描仍可使用。
 
 通过认证、schema 与路径校验并进入 Git 执行阶段的请求会尝试写入 `$TODEX_AGENTD_DATA_DIR/audit/audit.jsonl` 的 `git.audit` 事件，审计记录只包含动作、路径、结果码和输出长度，不记录提交说明。无效 token、无效 JSON/action 和路径校验失败发生在审计事件创建之前。Git 副作用完成后的审计 I/O 失败会记录 daemon 警告，但不会把已经成功的操作伪装成失败响应。
 

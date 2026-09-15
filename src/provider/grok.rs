@@ -830,10 +830,12 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let trust =
-                crate::workspace_trust::WorkspaceTrustStore::new(root.join("data"), root.clone())
-                    .await
-                    .unwrap();
+            let trust = crate::workspace_trust::WorkspaceTrustStore::new(
+                root.join("data"),
+                vec![root.clone()],
+            )
+            .await
+            .unwrap();
             trust.set_owned("local", &root, true).await.unwrap();
             Self {
                 root,

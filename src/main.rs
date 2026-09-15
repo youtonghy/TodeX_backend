@@ -92,7 +92,7 @@ struct ProviderDoctorArgs {
     #[arg(long)]
     data_dir: Option<std::path::PathBuf>,
     #[arg(long)]
-    workspace_root: Option<std::path::PathBuf>,
+    workspace_root: Vec<std::path::PathBuf>,
     #[arg(long, default_value = "json")]
     format: String,
 }

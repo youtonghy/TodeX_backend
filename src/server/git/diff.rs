@@ -7,24 +7,28 @@ use crate::server::protocol::GitDiffResponse;
 const DIFF_TIMEOUT: Duration = Duration::from_secs(10);
 const DIFF_PATH_LIMIT: usize = 4096;
 
-pub(crate) async fn file(root: &Path, workspace: &Path, path: &str) -> Result<GitDiffResponse> {
+pub(crate) async fn file(
+    roots: &[PathBuf],
+    workspace: &Path,
+    path: &str,
+) -> Result<GitDiffResponse> {
     let _permit = timeout(GIT_SCAN_QUEUE_TIMEOUT, GIT_SCAN_SEMAPHORE.acquire())
         .await
         .map_err(|_| AppError::Conflict("Git read capacity is busy".to_owned()))?
         .map_err(|_| AppError::Conflict("Git read capacity is closed".to_owned()))?;
-    timeout(DIFF_TIMEOUT, file_inner(root, workspace, path))
+    timeout(DIFF_TIMEOUT, file_inner(roots, workspace, path))
         .await
         .map_err(|_| AppError::GitCommandTimedOut("Git file diff".to_owned()))?
 }
 
-async fn file_inner(root: &Path, workspace: &Path, path: &str) -> Result<GitDiffResponse> {
-    let root = canonical_workspace_root(root)?;
-    let workspace = validate_workspace_directory(&root, workspace)?;
+async fn file_inner(roots: &[PathBuf], workspace: &Path, path: &str) -> Result<GitDiffResponse> {
+    let roots = canonical_workspace_roots(roots);
+    let workspace = validate_workspace_directory(&roots, workspace)?;
     let relative = checked_relative_path(path)?;
-    let repository = resolve_repository(&root, &workspace)
+    let repository = resolve_repository(&roots, &workspace)
         .await?
         .ok_or_else(|| AppError::InvalidRequest("工作区不是 Git 仓库".to_owned()))?;
-    repository_metadata_roots(&root, &repository).await?;
+    repository_metadata_roots(&roots, &repository).await?;
     validate_mutation_execution_config(&repository).await?;
 
     // Match the status summary: an unborn HEAD diffs against the empty tree so
@@ -212,7 +216,7 @@ mod tests {
             ]);
         }
         async fn diff(&self, path: &str) -> Result<GitDiffResponse> {
-            file(&self.root, &self.repo, path).await
+            file(std::slice::from_ref(&self.root), &self.repo, path).await
         }
     }
     impl Drop for Fixture {
@@ -259,7 +263,7 @@ mod tests {
         for path in ["../outside.txt", "/abs.txt", "", "dir/../../x"] {
             assert!(fixture.diff(path).await.is_err(), "path {path:?} accepted");
         }
-        let result = file(&fixture.root, &fixture.root, "a.txt").await;
+        let result = file(&[fixture.root.clone()], &fixture.root, "a.txt").await;
         assert!(matches!(result, Err(AppError::InvalidRequest(_))));
     }
 }

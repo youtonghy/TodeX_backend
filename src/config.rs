@@ -20,7 +20,7 @@ pub struct ServeArgs {
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
     #[arg(long)]
-    pub workspace_root: Option<PathBuf>,
+    pub workspace_root: Vec<PathBuf>,
     #[arg(long)]
     pub history_retention_days: Option<u64>,
 }
@@ -31,7 +31,7 @@ pub struct Config {
     pub port: u16,
     pub pairing_encryption: PairingEncryption,
     pub data_dir: PathBuf,
-    pub workspace_root: PathBuf,
+    pub workspace_roots: Vec<PathBuf>,
     pub history_retention_days: Option<u64>,
     pub agent: AgentConfig,
     pub security: SecurityConfig,
@@ -124,6 +124,7 @@ struct FileConfig {
     pairing_encryption: Option<PairingEncryption>,
     data_dir: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
+    workspace_roots: Option<Vec<PathBuf>>,
     history_retention_days: Option<u64>,
     agent: Option<PartialAgentConfig>,
     security: Option<PartialSecurityConfig>,
@@ -176,11 +177,11 @@ impl Config {
         );
         let data_dir_is_explicit = args.data_dir.is_some() || env_data_dir.is_some();
         let (data_dir, file_config) = load_file_config(&bootstrap_data_dir, !data_dir_is_explicit)?;
-        let workspace_root = coalesce_path(
+        let workspace_roots = resolve_workspace_roots(
             args.workspace_root,
-            env_path("TODEX_AGENTD_WORKSPACE_ROOT"),
-            file_config.workspace_root,
-            defaults.workspace_root,
+            env_workspace_roots(),
+            file_workspace_roots(&file_config),
+            defaults.workspace_roots,
         );
         let history_retention_days = args
             .history_retention_days
@@ -236,7 +237,7 @@ impl Config {
             port,
             pairing_encryption,
             data_dir,
-            workspace_root: expand_home(workspace_root),
+            workspace_roots,
             history_retention_days,
             agent: AgentConfig {
                 default_agent: coalesce(
@@ -321,19 +322,34 @@ impl Config {
         })
     }
 
+    /// The first configured root; `workspace_roots` is never empty after load.
+    pub fn primary_workspace_root(&self) -> &Path {
+        self.workspace_roots
+            .first()
+            .map(PathBuf::as_path)
+            .unwrap_or_else(|| Path::new(""))
+    }
+
     pub fn save_tui_settings(
         data_dir: PathBuf,
         host: &str,
         port: u16,
         pairing_encryption: PairingEncryption,
-        workspace_root: &Path,
+        workspace_roots: &[PathBuf],
     ) -> anyhow::Result<()> {
         let data_dir = expand_home(data_dir);
         let mut document = load_config_document(&data_dir)?;
         document["host"] = value(host);
         document["port"] = value(i64::from(port));
         document["pairing_encryption"] = value(pairing_encryption.as_str());
-        document["workspace_root"] = value(workspace_root.display().to_string());
+        if let Some(primary) = workspace_roots.first() {
+            document["workspace_root"] = value(primary.display().to_string());
+        }
+        let mut roots = toml_edit::Array::new();
+        for root in workspace_roots {
+            roots.push(root.display().to_string());
+        }
+        document["workspace_roots"] = value(roots);
         write_config_document(&data_dir, &document)?;
         Ok(())
     }
@@ -374,7 +390,7 @@ impl Default for Config {
             port: 7345,
             pairing_encryption: PairingEncryption::default(),
             data_dir,
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -467,6 +483,7 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
     replace_some!(base.pairing_encryption, overlay.pairing_encryption);
     replace_some!(base.data_dir, overlay.data_dir);
     replace_some!(base.workspace_root, overlay.workspace_root);
+    replace_some!(base.workspace_roots, overlay.workspace_roots);
     replace_some!(base.history_retention_days, overlay.history_retention_days);
 
     if let Some(overlay_agent) = overlay.agent {
@@ -660,13 +677,47 @@ fn set_owner_only(path: &Path, directory: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn coalesce_path(
-    cli: Option<PathBuf>,
-    env: Option<PathBuf>,
-    file: Option<PathBuf>,
-    default: PathBuf,
-) -> PathBuf {
-    coalesce(cli, env, file, default)
+fn env_workspace_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = env::var_os("TODEX_AGENTD_WORKSPACE_ROOTS")
+        .map(|value| env::split_paths(&value).collect())
+        .unwrap_or_default();
+    if let Some(root) = env_path("TODEX_AGENTD_WORKSPACE_ROOT") {
+        roots.insert(0, root);
+    }
+    roots
+}
+
+fn file_workspace_roots(file_config: &FileConfig) -> Vec<PathBuf> {
+    let mut roots = file_config.workspace_roots.clone().unwrap_or_default();
+    if let Some(root) = file_config.workspace_root.clone() {
+        roots.insert(0, root);
+    }
+    roots
+}
+
+fn resolve_workspace_roots(
+    cli: Vec<PathBuf>,
+    env: Vec<PathBuf>,
+    file: Vec<PathBuf>,
+    defaults: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let roots = if !cli.is_empty() {
+        cli
+    } else if !env.is_empty() {
+        env
+    } else if !file.is_empty() {
+        file
+    } else {
+        defaults
+    };
+    let mut resolved: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let root = expand_home(root);
+        if !resolved.contains(&root) {
+            resolved.push(root);
+        }
+    }
+    resolved
 }
 
 pub(crate) fn expand_home(path: PathBuf) -> PathBuf {
@@ -743,7 +794,7 @@ mod tests {
             host: None,
             port: None,
             data_dir: None,
-            workspace_root: None,
+            workspace_root: Vec::new(),
             history_retention_days: None,
         })
         .expect("load default config");
@@ -760,7 +811,7 @@ mod tests {
             host: None,
             port: None,
             data_dir: Some(root.clone()),
-            workspace_root: None,
+            workspace_root: Vec::new(),
             history_retention_days: None,
         })
         .expect("load config");
@@ -782,7 +833,7 @@ mod tests {
             host: None,
             port: None,
             data_dir: Some(root.clone()),
-            workspace_root: None,
+            workspace_root: Vec::new(),
             history_retention_days: None,
         })
         .expect("load config without writes");
@@ -840,6 +891,61 @@ mod tests {
     }
 
     #[test]
+    fn workspace_roots_load_from_array_and_legacy_key() {
+        let root = env::temp_dir().join(format!("todex-config-roots-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+
+        fs::write(root.join("config.toml"), "workspace_root = \"/srv/one\"\n").unwrap();
+        let config = Config::load(ServeArgs {
+            host: None,
+            port: None,
+            data_dir: Some(root.clone()),
+            workspace_root: Vec::new(),
+            history_retention_days: None,
+        })
+        .expect("load legacy config");
+        assert_eq!(config.workspace_roots, vec![PathBuf::from("/srv/one")]);
+
+        fs::write(
+            root.join("config.toml"),
+            "workspace_root = \"/srv/one\"\nworkspace_roots = [\"/srv/two\", \"/srv/two\", \"/srv/three\"]\n",
+        )
+        .unwrap();
+        let config = Config::load(ServeArgs {
+            host: None,
+            port: None,
+            data_dir: Some(root.clone()),
+            workspace_root: Vec::new(),
+            history_retention_days: None,
+        })
+        .expect("load multi-root config");
+        assert_eq!(
+            config.workspace_roots,
+            vec![
+                PathBuf::from("/srv/one"),
+                PathBuf::from("/srv/two"),
+                PathBuf::from("/srv/three"),
+            ]
+        );
+        assert_eq!(config.primary_workspace_root(), Path::new("/srv/one"));
+
+        let config = Config::load(ServeArgs {
+            host: None,
+            port: None,
+            data_dir: Some(root.clone()),
+            workspace_root: vec![PathBuf::from("/cli/only"), PathBuf::from("/cli/other")],
+            history_retention_days: None,
+        })
+        .expect("load cli config");
+        assert_eq!(
+            config.workspace_roots,
+            vec![PathBuf::from("/cli/only"), PathBuf::from("/cli/other")]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn save_tui_settings_preserves_existing_config_sections() {
         let root = env::temp_dir().join(format!("todex-config-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -861,7 +967,7 @@ codex_bin = "codex"
             "0.0.0.0",
             8080,
             PairingEncryption::X25519,
-            Path::new("/tmp/mobile-workspaces"),
+            &[PathBuf::from("/tmp/mobile-workspaces")],
         )
         .expect("save TUI settings");
         let updated = fs::read_to_string(root.join("config.toml")).expect("read updated config");
@@ -870,6 +976,7 @@ codex_bin = "codex"
         assert!(updated.contains("port = 8080"));
         assert!(updated.contains("pairing_encryption = \"x25519\""));
         assert!(updated.contains("workspace_root = \"/tmp/mobile-workspaces\""));
+        assert!(updated.contains("workspace_roots = [\"/tmp/mobile-workspaces\"]"));
         assert!(updated.contains("custom_value = \"kept\""));
         assert!(updated.contains("[agent]"));
 

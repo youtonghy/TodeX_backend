@@ -457,29 +457,29 @@ where
     })
 }
 
-pub(crate) async fn summary(root: &Path, workspace: &Path) -> Result<GitPullRequestResponse> {
+pub(crate) async fn summary(roots: &[PathBuf], workspace: &Path) -> Result<GitPullRequestResponse> {
     let _permit = timeout(GIT_SCAN_QUEUE_TIMEOUT, GIT_SCAN_SEMAPHORE.acquire())
         .await
         .map_err(|_| AppError::Conflict("Git read capacity is busy".to_owned()))?
         .map_err(|_| AppError::Conflict("Git read capacity is closed".to_owned()))?;
-    timeout(GIT_SCAN_TIMEOUT, summary_inner(root, workspace))
+    timeout(GIT_SCAN_TIMEOUT, summary_inner(roots, workspace))
         .await
         .map_err(|_| AppError::GitCommandTimedOut("Git pull request inspection".to_owned()))?
 }
 
-async fn summary_inner(root: &Path, workspace: &Path) -> Result<GitPullRequestResponse> {
-    let root = canonical_workspace_root(root)?;
-    let workspace = validate_workspace_directory(&root, workspace)?;
+async fn summary_inner(roots: &[PathBuf], workspace: &Path) -> Result<GitPullRequestResponse> {
+    let roots = canonical_workspace_roots(roots);
+    let workspace = validate_workspace_directory(&roots, workspace)?;
     let mut result = GitPullRequestResponse {
         repository_path: workspace.display().to_string(),
         initialized: false,
         branch: String::new(),
         pull_request: None,
     };
-    if !workspace::is_exact_repository(&root, &workspace).await? {
+    if !workspace::is_exact_repository(&roots, &workspace).await? {
         return Ok(result);
     }
-    validate_repository_metadata(&root, &workspace).await?;
+    validate_repository_metadata(&roots, &workspace).await?;
     result.initialized = true;
     result.branch = git_text(&workspace, &["branch", "--show-current"])
         .await?

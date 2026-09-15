@@ -25,7 +25,9 @@ use crate::{
         GitAction, GitFileChange, GitRepositorySummary, GitRunRequest, GitRunResponse,
         GitScanResponse,
     },
-    workspace_paths::{canonical_workspace_root, validate_workspace_directory},
+    workspace_paths::{
+        canonical_workspace_roots, containing_workspace_root, validate_workspace_directory,
+    },
 };
 
 /// Git is an external process, so both execution time and captured output are
@@ -294,7 +296,7 @@ fn command_failure(operation: &str, output: &GitCommandOutput) -> AppError {
 }
 
 pub(crate) async fn scan(
-    workspace_root: &Path,
+    workspace_roots: &[PathBuf],
     requested_workspace: &Path,
 ) -> Result<GitScanResponse> {
     let _permit = timeout(GIT_SCAN_QUEUE_TIMEOUT, GIT_SCAN_SEMAPHORE.acquire())
@@ -303,15 +305,18 @@ pub(crate) async fn scan(
         .map_err(|_| AppError::GitProcess("Git scan semaphore is closed".to_owned()))?;
     timeout(
         GIT_SCAN_TIMEOUT,
-        scan_inner(workspace_root, requested_workspace),
+        scan_inner(workspace_roots, requested_workspace),
     )
     .await
     .map_err(|_| AppError::GitCommandTimedOut("git scan".to_owned()))?
 }
 
-async fn scan_inner(workspace_root: &Path, requested_workspace: &Path) -> Result<GitScanResponse> {
-    let configured_root = canonical_workspace_root(workspace_root)?;
-    let workspace = validate_workspace_directory(&configured_root, requested_workspace)?;
+async fn scan_inner(
+    workspace_roots: &[PathBuf],
+    requested_workspace: &Path,
+) -> Result<GitScanResponse> {
+    let configured_roots = canonical_workspace_roots(workspace_roots);
+    let workspace = validate_workspace_directory(&configured_roots, requested_workspace)?;
     let candidates = collect_candidates(&workspace).await?;
     let mut repository_roots = HashSet::new();
 
@@ -322,7 +327,7 @@ async fn scan_inner(workspace_root: &Path, requested_workspace: &Path) -> Result
             continue;
         }
         if let Some(repository) =
-            parse_repository_root(&configured_root, &candidate, &output.stdout)?
+            parse_repository_root(&configured_roots, &candidate, &output.stdout)?
         {
             repository_roots.insert(repository);
         }
@@ -332,7 +337,7 @@ async fn scan_inner(workspace_root: &Path, requested_workspace: &Path) -> Result
     repository_roots.sort();
     let mut repositories = Vec::with_capacity(repository_roots.len() + 1);
     for repository in repository_roots {
-        match summarize_repository(&configured_root, &repository).await {
+        match summarize_repository(&configured_roots, &repository).await {
             Ok(summary) => repositories.push(summary),
             Err(error) if should_propagate_scan_error(&error) => return Err(error),
             Err(error) => repositories.push(summary_error(&repository, error)),
@@ -350,33 +355,33 @@ async fn scan_inner(workspace_root: &Path, requested_workspace: &Path) -> Result
 }
 
 pub(crate) async fn run(
-    workspace_root: &Path,
+    workspace_roots: &[PathBuf],
     data_dir: &Path,
     requested_workspace: &Path,
     request: &GitRunRequest,
 ) -> Result<GitRunResponse> {
     #[cfg(not(unix))]
     {
-        let _ = (workspace_root, data_dir, requested_workspace, request);
+        let _ = (workspace_roots, data_dir, requested_workspace, request);
         Err(AppError::Unsupported(
             "Git write operations require Unix process-group cleanup".to_owned(),
         ))
     }
     #[cfg(unix)]
     {
-        run_supported(workspace_root, data_dir, requested_workspace, request).await
+        run_supported(workspace_roots, data_dir, requested_workspace, request).await
     }
 }
 
 #[cfg(unix)]
 async fn run_supported(
-    workspace_root: &Path,
+    workspace_roots: &[PathBuf],
     data_dir: &Path,
     requested_workspace: &Path,
     request: &GitRunRequest,
 ) -> Result<GitRunResponse> {
-    let configured_root = canonical_workspace_root(workspace_root)?;
-    let workspace = validate_workspace_directory(&configured_root, requested_workspace)?;
+    let configured_roots = canonical_workspace_roots(workspace_roots);
+    let workspace = validate_workspace_directory(&configured_roots, requested_workspace)?;
     validate_run_request(request)?;
     let _write_guard = timeout(GIT_WRITE_QUEUE_TIMEOUT, GIT_WRITE_LOCK.lock())
         .await
@@ -384,7 +389,7 @@ async fn run_supported(
 
     match timeout(
         GIT_MUTATION_TIMEOUT,
-        run_locked(&configured_root, data_dir, &workspace, request),
+        run_locked(&configured_roots, data_dir, &workspace, request),
     )
     .await
     {
@@ -399,12 +404,12 @@ async fn run_supported(
 }
 
 async fn run_locked(
-    configured_root: &Path,
+    configured_roots: &[PathBuf],
     data_dir: &Path,
     workspace: &Path,
     request: &GitRunRequest,
 ) -> Result<GitRunResponse> {
-    let repository = resolve_repository(&configured_root, &workspace).await?;
+    let repository = resolve_repository(&configured_roots, &workspace).await?;
     let repository = match (&request.action, repository) {
         (GitAction::Initial, Some(repository)) if repository == workspace => repository,
         (GitAction::Initial, Some(_)) => {
@@ -423,7 +428,7 @@ async fn run_locked(
         (_, None) => return Err(AppError::GitRepositoryNotFound),
     };
     if repository.join(".git").exists() {
-        validate_mutation_repository_metadata(&configured_root, &repository).await?;
+        validate_mutation_repository_metadata(&configured_roots, &repository).await?;
         validate_mutation_execution_config(&repository).await?;
     }
     if request.action == GitAction::Initial {
@@ -445,7 +450,7 @@ async fn run_locked(
     match request.action {
         GitAction::Initial => {
             run_step(&repository, git_args(&["init"]), "git init", &mut output).await?;
-            validate_mutation_repository_metadata(&configured_root, &repository).await?;
+            validate_mutation_repository_metadata(&configured_roots, &repository).await?;
             validate_mutation_execution_config(&repository).await?;
             if request.include_unstaged {
                 run_step(
@@ -478,7 +483,7 @@ async fn run_locked(
                 )
                 .await?;
             }
-            let summary = summarize_repository(&configured_root, &repository).await?;
+            let summary = summarize_repository(&configured_roots, &repository).await?;
             let fallback = format_commit_message(&summary);
             let message = commit_message(request.message.as_deref(), &fallback)?;
             run_step(
@@ -759,23 +764,29 @@ fn append_output(destination: &mut String, bytes: &[u8]) {
     destination.push_str(&truncate_text(text, remaining));
 }
 
-async fn resolve_repository(configured_root: &Path, workspace: &Path) -> Result<Option<PathBuf>> {
+async fn resolve_repository(
+    configured_roots: &[PathBuf],
+    workspace: &Path,
+) -> Result<Option<PathBuf>> {
     let args = git_args(&["rev-parse", "--show-toplevel"]);
     let output = run_git_command(workspace, &args, "git rev-parse --show-toplevel").await?;
     if !output.status.success() {
         return Ok(None);
     }
-    parse_repository_root(configured_root, workspace, &output.stdout)
+    parse_repository_root(configured_roots, workspace, &output.stdout)
 }
 
-async fn validate_repository_metadata(configured_root: &Path, repository: &Path) -> Result<()> {
-    repository_metadata_roots(configured_root, repository)
+async fn validate_repository_metadata(
+    configured_roots: &[PathBuf],
+    repository: &Path,
+) -> Result<()> {
+    repository_metadata_roots(configured_roots, repository)
         .await
         .map(|_| ())
 }
 
 async fn repository_metadata_roots(
-    configured_root: &Path,
+    configured_roots: &[PathBuf],
     repository: &Path,
 ) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
@@ -797,7 +808,8 @@ async fn repository_metadata_roots(
             repository.join(path)
         };
         let canonical = std::fs::canonicalize(&path)?;
-        if !canonical.is_dir() || !canonical.starts_with(configured_root) {
+        if !canonical.is_dir() || containing_workspace_root(configured_roots, &canonical).is_none()
+        {
             return Err(AppError::WorkspacePathOutsideRoot);
         }
         if path != canonical {
@@ -813,10 +825,10 @@ async fn repository_metadata_roots(
 }
 
 async fn validate_mutation_repository_metadata(
-    configured_root: &Path,
+    configured_roots: &[PathBuf],
     repository: &Path,
 ) -> Result<()> {
-    let roots = repository_metadata_roots(configured_root, repository).await?;
+    let roots = repository_metadata_roots(configured_roots, repository).await?;
     let mut entry_count = 0_usize;
     for root in roots {
         validate_metadata_root(&root, &mut entry_count).await?;
@@ -933,7 +945,7 @@ fn unsupported_metadata_layout(path: &Path) -> AppError {
 }
 
 fn parse_repository_root(
-    configured_root: &Path,
+    configured_roots: &[PathBuf],
     cwd: &Path,
     bytes: &[u8],
 ) -> Result<Option<PathBuf>> {
@@ -953,7 +965,7 @@ fn parse_repository_root(
             AppError::Io(error)
         }
     })?;
-    if !canonical.starts_with(configured_root) {
+    if containing_workspace_root(configured_roots, &canonical).is_none() {
         return Err(AppError::WorkspacePathOutsideRoot);
     }
     if !canonical.is_dir() {
@@ -1060,11 +1072,11 @@ fn should_skip_directory(name: &str) -> bool {
 }
 
 async fn summarize_repository(
-    configured_root: &Path,
+    configured_roots: &[PathBuf],
     repository: &Path,
 ) -> Result<GitRepositorySummary> {
-    let repository = validate_workspace_directory(configured_root, repository)?;
-    validate_repository_metadata(configured_root, &repository).await?;
+    let repository = validate_workspace_directory(configured_roots, repository)?;
+    validate_repository_metadata(configured_roots, &repository).await?;
     let branch_output = run_git_command(
         &repository,
         &git_args(&["branch", "--show-current"]),
@@ -1424,7 +1436,9 @@ mod tests {
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         fs::write(workspace.join("README.md"), "hello\n").expect("file");
-        let response = scan(&root, &workspace).await.expect("scan");
+        let response = scan(std::slice::from_ref(&root), &workspace)
+            .await
+            .expect("scan");
         assert_eq!(response.repositories.len(), 1);
         assert!(response.repositories[0].initial_eligible);
         assert_eq!(response.repositories[0].branch, "UNINITIALIZED");
@@ -1580,9 +1594,9 @@ mod tests {
         fs::remove_dir_all(repository.join(".git/objects")).expect("remove objects");
         symlink(&outside_objects, repository.join(".git/objects")).expect("symlink objects");
 
-        let configured_root = fs::canonicalize(&workspace_root).expect("workspace root");
+        let configured_roots = vec![fs::canonicalize(&workspace_root).expect("workspace root")];
         assert!(matches!(
-            validate_mutation_repository_metadata(&configured_root, &repository).await,
+            validate_mutation_repository_metadata(&configured_roots, &repository).await,
             Err(AppError::InvalidRequest(_))
         ));
         let _ = fs::remove_dir_all(root);
@@ -1601,9 +1615,9 @@ mod tests {
         let info = repository.join(".git/objects/info");
         fs::write(info.join("alternates"), root.display().to_string()).expect("alternates");
 
-        let configured_root = fs::canonicalize(&root).expect("workspace root");
+        let configured_roots = vec![fs::canonicalize(&root).expect("workspace root")];
         assert!(matches!(
-            validate_mutation_repository_metadata(&configured_root, &repository).await,
+            validate_mutation_repository_metadata(&configured_roots, &repository).await,
             Err(AppError::InvalidRequest(_))
         ));
         let _ = fs::remove_dir_all(root);
@@ -1650,8 +1664,8 @@ mod tests {
             .expect("git worktree add");
         assert!(added.success());
 
-        let configured_root = fs::canonicalize(&root).expect("workspace root");
-        validate_mutation_repository_metadata(&configured_root, &worktree)
+        let configured_roots = vec![fs::canonicalize(&root).expect("workspace root")];
+        validate_mutation_repository_metadata(&configured_roots, &worktree)
             .await
             .expect("linked worktree metadata");
         let _ = fs::remove_dir_all(root);

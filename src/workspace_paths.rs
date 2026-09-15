@@ -17,8 +17,27 @@ pub fn canonical_workspace_root(root: &Path) -> Result<PathBuf, AppError> {
     fs::canonicalize(&root).map_err(AppError::Io)
 }
 
-pub fn validate_workspace_directory(root: &Path, path: &Path) -> Result<PathBuf, AppError> {
-    let root = canonical_workspace_root(root)?;
+/// Canonicalizes every configured root that currently exists. Roots that are
+/// missing (for example an unmounted volume) are skipped so they do not break
+/// validation of the remaining roots.
+pub fn canonical_workspace_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .filter_map(|root| canonical_workspace_root(root).ok())
+        .collect()
+}
+
+/// The configured root that contains `path`, if any. Both arguments are
+/// expected to be canonical already.
+pub fn containing_workspace_root<'a>(roots: &'a [PathBuf], path: &Path) -> Option<&'a Path> {
+    roots
+        .iter()
+        .map(PathBuf::as_path)
+        .find(|root| path.starts_with(root))
+}
+
+pub fn validate_workspace_directory(roots: &[PathBuf], path: &Path) -> Result<PathBuf, AppError> {
+    let canonical_roots = canonical_workspace_roots(roots);
     let path = expand_home(path);
     if !path.is_absolute() {
         return Err(AppError::InvalidRequest(
@@ -35,20 +54,23 @@ pub fn validate_workspace_directory(root: &Path, path: &Path) -> Result<PathBuf,
     }
 
     let canonical = fs::canonicalize(&path).map_err(AppError::Io)?;
-    if canonical.starts_with(&root) {
+    if containing_workspace_root(&canonical_roots, &canonical).is_some() {
         return Ok(canonical);
     }
     Err(AppError::WorkspacePathOutsideRoot)
 }
 
-pub fn validate_workspace_directory_text(root: &Path, path: &str) -> Result<PathBuf, AppError> {
+pub fn validate_workspace_directory_text(
+    roots: &[PathBuf],
+    path: &str,
+) -> Result<PathBuf, AppError> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err(AppError::InvalidRequest(
             "workspace path is required".to_owned(),
         ));
     }
-    validate_workspace_directory(root, Path::new(trimmed))
+    validate_workspace_directory(roots, Path::new(trimmed))
 }
 
 pub fn expand_home(path: &Path) -> PathBuf {
@@ -87,7 +109,7 @@ mod tests {
         let child = root.join("project");
         fs::create_dir_all(&child).unwrap();
 
-        let validated = validate_workspace_directory(&root, &child).unwrap();
+        let validated = validate_workspace_directory(&[root.clone()], &child).unwrap();
 
         assert_eq!(validated, fs::canonicalize(&child).unwrap());
         let _ = fs::remove_dir_all(root);
@@ -98,11 +120,31 @@ mod tests {
         let root = make_temp_dir("todex-workspace-paths-root");
         let outside = make_temp_dir("todex-workspace-paths-outside");
 
-        let error = validate_workspace_directory(&root, &outside).expect_err("outside root");
+        let error =
+            validate_workspace_directory(&[root.clone()], &outside).expect_err("outside root");
 
         assert!(matches!(error, AppError::WorkspacePathOutsideRoot));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn validates_directory_inside_any_workspace_root() {
+        let first = make_temp_dir("todex-workspace-paths-first");
+        let second = make_temp_dir("todex-workspace-paths-second");
+        let child = second.join("project");
+        fs::create_dir_all(&child).unwrap();
+
+        let validated =
+            validate_workspace_directory(&[first.clone(), second.clone()], &child).unwrap();
+
+        assert_eq!(validated, fs::canonicalize(&child).unwrap());
+        let missing = first.join("unmounted");
+        let validated_missing_root =
+            validate_workspace_directory(&[missing, second.clone()], &child).unwrap();
+        assert_eq!(validated_missing_root, fs::canonicalize(&child).unwrap());
+        let _ = fs::remove_dir_all(first);
+        let _ = fs::remove_dir_all(second);
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {

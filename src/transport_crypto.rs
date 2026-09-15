@@ -1340,7 +1340,7 @@ mod tests {
             let root = unique_tmp_dir("todex-transport-policy");
             let mut config = test_config();
             config.data_dir = root.join("data");
-            config.workspace_root = root.join("workspace");
+            config.workspace_roots = vec![root.join("workspace")];
             config.pairing_encryption = required;
             let state = crate::app_state::AppState::new(config).await.unwrap();
             let keys = state.pairing_keys.clone();
@@ -1495,7 +1495,7 @@ mod tests {
             port: 7345,
             pairing_encryption: PairingEncryption::default(),
             data_dir: PathBuf::from("/tmp/todex-test"),
-            workspace_root: PathBuf::from("/tmp/todex-test/workspace"),
+            workspace_roots: vec![PathBuf::from("/tmp/todex-test/workspace")],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),

@@ -53,7 +53,9 @@ impl AppState {
         tokio::fs::create_dir_all(&config.data_dir).await?;
         tokio::fs::create_dir_all(config.data_dir.join("logs")).await?;
         tokio::fs::create_dir_all(config.data_dir.join("audit")).await?;
-        tokio::fs::create_dir_all(&config.workspace_root).await?;
+        for root in &config.workspace_roots {
+            tokio::fs::create_dir_all(root).await?;
+        }
         set_owner_only_directory(&config.data_dir).await?;
         set_owner_only_directory(&config.data_dir.join("logs")).await?;
         set_owner_only_directory(&config.data_dir.join("audit")).await?;
@@ -69,10 +71,10 @@ impl AppState {
             cli_execution_gate.clone(),
         );
         let workspace_trust =
-            WorkspaceTrustStore::new(config.data_dir.clone(), config.workspace_root.clone())
+            WorkspaceTrustStore::new(config.data_dir.clone(), config.workspace_roots.clone())
                 .await?;
         let workspaces =
-            WorkspaceStore::new(config.data_dir.clone(), config.workspace_root.clone()).await?;
+            WorkspaceStore::new(config.data_dir.clone(), config.workspace_roots.clone()).await?;
         let kanban_tasks = KanbanTaskStore::new(config.data_dir.clone()).await?;
         let mut workspace_paths_by_owner = HashMap::<String, Vec<PathBuf>>::new();
         for workspace in workspaces.snapshot().await.workspaces {
@@ -130,10 +132,10 @@ impl AppState {
 
     pub(crate) fn spawn_legacy_conversation_migration(&self) -> JoinHandle<()> {
         let data_dir = self.config.data_dir.clone();
-        let workspace_root = self.config.workspace_root.clone();
+        let workspace_roots = self.config.workspace_roots.clone();
         let store = self.conversation_store.clone();
         tokio::spawn(async move {
-            match migrate_legacy_codex_sessions(&data_dir, &workspace_root, &store).await {
+            match migrate_legacy_codex_sessions(&data_dir, &workspace_roots, &store).await {
                 Ok(migration) if migration.imported > 0 || migration.skipped > 0 => {
                     tracing::info!(
                         imported = migration.imported,
@@ -190,7 +192,7 @@ mod tests {
         tokio::fs::create_dir_all(&automatic).await.unwrap();
         tokio::fs::create_dir_all(&revoked).await.unwrap();
 
-        let workspaces = WorkspaceStore::new(root.clone(), workspace_root.clone())
+        let workspaces = WorkspaceStore::new(root.clone(), vec![workspace_root.clone()])
             .await
             .unwrap();
         workspaces
@@ -203,7 +205,7 @@ mod tests {
             )
             .await
             .unwrap();
-        WorkspaceTrustStore::new(root.clone(), workspace_root.clone())
+        WorkspaceTrustStore::new(root.clone(), vec![workspace_root.clone()])
             .await
             .unwrap()
             .set_owned("local", &revoked, false)
@@ -212,7 +214,7 @@ mod tests {
 
         let config = Config {
             data_dir: root.clone(),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             ..Config::default()
         };
         let state = AppState::new(config).await.unwrap();

@@ -299,6 +299,7 @@ struct TuiApp {
     credentials: Option<CredentialsPopup>,
     device_pairing: DevicePairingState,
     folder_picker: Option<FolderPicker>,
+    roots_picker: Option<usize>,
     language: TuiLanguage,
 }
 
@@ -339,6 +340,7 @@ impl TuiApp {
             credentials: None,
             device_pairing: DevicePairingState::default(),
             folder_picker: None,
+            roots_picker: None,
             language,
         }
     }
@@ -1089,6 +1091,11 @@ impl TuiApp {
             return Ok(false);
         }
 
+        if self.roots_picker.is_some() {
+            self.handle_roots_picker_key(key).await?;
+            return Ok(false);
+        }
+
         if self.edit.is_some() {
             self.handle_edit_key(key).await?;
             return Ok(false);
@@ -1148,7 +1155,7 @@ impl TuiApp {
             KeyCode::Char('r') => self.restart_daemon().await?,
             KeyCode::Char('h') => self.start_host_edit(),
             KeyCode::Char('p') => self.start_port_edit(),
-            KeyCode::Char('w') => self.start_workspace_root_picker(),
+            KeyCode::Char('w') => self.start_workspace_roots_manager(),
             KeyCode::Char('e') => self.start_pairing_encryption_edit(),
             KeyCode::Char('x') => self.start_reset_edit(),
             KeyCode::Char('g') => self.show_pairing_qr().await,
@@ -1278,7 +1285,7 @@ impl TuiApp {
             1 => self.restart_daemon().await?,
             2 => self.start_host_edit(),
             3 => self.start_port_edit(),
-            4 => self.start_workspace_root_picker(),
+            4 => self.start_workspace_roots_manager(),
             5 => self.start_pairing_encryption_edit(),
             6 => self.start_reset_edit(),
             7 => self.show_pairing_qr().await,
@@ -1477,12 +1484,24 @@ impl TuiApp {
             .to_owned();
     }
 
-    fn start_workspace_root_picker(&mut self) {
-        self.folder_picker = Some(FolderPicker::new(self.config.workspace_root.clone()));
+    fn start_workspace_roots_manager(&mut self) {
+        self.roots_picker = Some(0);
         self.notice = self
             .text(
-                "Workspace root selector is open. Enter descends; Space selects current directory.",
-                "工作区根目录选择器已打开。Enter 进入目录，Space 选择当前目录。",
+                "Workspace roots manager is open. a adds a root; Space sets primary; d removes.",
+                "工作区根目录管理已打开。a 添加根目录，Space 设为主根目录，d 移除。",
+            )
+            .to_owned();
+    }
+
+    fn start_workspace_root_picker(&mut self) {
+        self.folder_picker = Some(FolderPicker::new(
+            self.config.primary_workspace_root().to_path_buf(),
+        ));
+        self.notice = self
+            .text(
+                "Workspace root selector is open. Enter descends; Space adds current directory.",
+                "工作区根目录选择器已打开。Enter 进入目录，Space 添加当前目录。",
             )
             .to_owned();
     }
@@ -1518,13 +1537,19 @@ impl TuiApp {
 
         match canonical_workspace_root(&picker.current) {
             Ok(root) => {
-                self.config.workspace_root = root;
-                let subject = self
-                    .text("Workspace root updated", "工作区根目录已更新")
-                    .to_owned();
-                let saved = self.auto_save_settings(&subject);
-                if saved && self.daemon.is_some() {
-                    self.restart_daemon().await?;
+                if self.config.workspace_roots.contains(&root) {
+                    self.notice = self
+                        .text(
+                            "Directory is already a workspace root.",
+                            "该目录已是工作区根目录。",
+                        )
+                        .to_owned();
+                } else {
+                    self.config.workspace_roots.push(root);
+                    let subject = self
+                        .text("Workspace root added", "已添加工作区根目录")
+                        .to_owned();
+                    self.persist_workspace_roots(&subject).await?;
                 }
             }
             Err(error) => {
@@ -1536,6 +1561,71 @@ impl TuiApp {
             }
         }
 
+        Ok(())
+    }
+
+    async fn handle_roots_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(selected) = self.roots_picker else {
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.roots_picker = None;
+                self.notice = self
+                    .text(
+                        "Workspace roots manager closed.",
+                        "已关闭工作区根目录管理。",
+                    )
+                    .to_owned();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.roots_picker = Some(selected.saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.config.workspace_roots.is_empty() {
+                    self.roots_picker =
+                        Some((selected + 1).min(self.config.workspace_roots.len() - 1));
+                }
+            }
+            KeyCode::Char('a') => self.start_workspace_root_picker(),
+            KeyCode::Enter | KeyCode::Char(' ')
+                if selected > 0 && selected < self.config.workspace_roots.len() =>
+            {
+                let root = self.config.workspace_roots.remove(selected);
+                self.config.workspace_roots.insert(0, root);
+                self.roots_picker = Some(0);
+                let subject = self
+                    .text("Primary workspace root updated", "主工作区根目录已更新")
+                    .to_owned();
+                self.persist_workspace_roots(&subject).await?;
+            }
+            KeyCode::Char('d') if self.config.workspace_roots.len() <= 1 => {
+                self.notice = self
+                    .text(
+                        "At least one workspace root is required.",
+                        "至少需要保留一个工作区根目录。",
+                    )
+                    .to_owned();
+            }
+            KeyCode::Char('d') if selected < self.config.workspace_roots.len() => {
+                self.config.workspace_roots.remove(selected);
+                self.roots_picker =
+                    Some(selected.min(self.config.workspace_roots.len().saturating_sub(1)));
+                let subject = self
+                    .text("Workspace root removed", "已移除工作区根目录")
+                    .to_owned();
+                self.persist_workspace_roots(&subject).await?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    async fn persist_workspace_roots(&mut self, subject: &str) -> Result<()> {
+        if self.auto_save_settings(subject) && self.daemon.is_some() {
+            self.restart_daemon().await?;
+        }
         Ok(())
     }
 
@@ -1708,7 +1798,7 @@ impl TuiApp {
             &self.config.host,
             self.config.port,
             self.config.pairing_encryption,
-            &self.config.workspace_root,
+            &self.config.workspace_roots,
         ) {
             Ok(()) => {
                 self.notice = match self.language {
@@ -1761,8 +1851,13 @@ impl TuiApp {
         text.push_str(&format!("listen={listen_host}:{listen_port}\n"));
         text.push_str(&format!("data_dir={}\n", self.config.data_dir.display()));
         text.push_str(&format!(
-            "workspace_root={}\n",
-            self.config.workspace_root.display()
+            "workspace_roots={}\n",
+            self.config
+                .workspace_roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         ));
         text.push_str(&format!(
             "daemon_log={}\n",
@@ -1904,6 +1999,11 @@ impl TuiApp {
             frame.render_widget(Clear, area);
             frame.render_widget(self.edit_popup_paragraph(edit), area);
         }
+        if let Some(selected) = self.roots_picker {
+            let area = self.roots_picker_area(frame.area());
+            frame.render_widget(Clear, area);
+            self.render_roots_picker(frame, area, selected);
+        }
         if let Some(picker) = &self.folder_picker {
             let area = self.folder_picker_area(frame.area());
             frame.render_widget(Clear, area);
@@ -1924,7 +2024,9 @@ impl TuiApp {
             || self.credentials.is_some()
             || self.device_pairing.open
             || (self.view == TuiView::Control
-                && (self.edit.is_some() || self.folder_picker.is_some()))
+                && (self.edit.is_some()
+                    || self.folder_picker.is_some()
+                    || self.roots_picker.is_some()))
         {
             for cell in &mut frame.buffer_mut().content {
                 cell.set_style(
@@ -2012,9 +2114,19 @@ impl TuiApp {
         let data_dir = process
             .map(|process| process.data_dir.as_path())
             .unwrap_or(self.config.data_dir.as_path());
-        let workspace_root = process
-            .map(|process| process.workspace_root.as_path())
-            .unwrap_or(self.config.workspace_root.as_path());
+        let workspace_roots = process
+            .map(|process| process.workspace_roots.clone())
+            .filter(|roots| !roots.is_empty())
+            .unwrap_or_else(|| self.config.workspace_roots.clone());
+        let workspace_roots_label = match workspace_roots.len() {
+            0 => String::new(),
+            1 => workspace_roots[0].display().to_string(),
+            count => format!(
+                "{} (+{})",
+                workspace_roots[0].display(),
+                count.saturating_sub(1)
+            ),
+        };
         let device_count = crate::devices::list_devices(data_dir)
             .map(|devices| devices.len())
             .unwrap_or(0);
@@ -2123,10 +2235,10 @@ impl TuiApp {
             }),
             Line::from(match self.language {
                 TuiLanguage::English => {
-                    format!("Workspace root: {} (action w)", workspace_root.display())
+                    format!("Workspace roots: {} (action w)", workspace_roots_label)
                 }
                 TuiLanguage::Chinese => {
-                    format!("工作区根目录：{}（操作 w）", workspace_root.display())
+                    format!("工作区根目录：{}（操作 w）", workspace_roots_label)
                 }
             }),
             Line::from(match self.language {
@@ -2188,7 +2300,7 @@ impl TuiApp {
             self.text("Restart daemon", "重启 daemon"),
             self.text("Edit listen IP", "编辑监听 IP"),
             self.text("Edit listen port", "编辑监听端口"),
-            self.text("Choose workspace root", "选择工作区根目录"),
+            self.text("Manage workspace roots", "管理工作区根目录"),
             self.text("Edit required encryption", "编辑强制加密"),
             self.text("Reset", "重置"),
             self.text("Show pairing QR", "显示配对二维码"),
@@ -2479,6 +2591,52 @@ impl TuiApp {
 
     fn folder_picker_area(&self, area: Rect) -> Rect {
         centered_area(area, 82, 24)
+    }
+
+    fn roots_picker_area(&self, area: Rect) -> Rect {
+        centered_area(area, 82, 18)
+    }
+
+    fn render_roots_picker(&self, frame: &mut Frame<'_>, area: Rect, selected: usize) {
+        let block = panel_block()
+            .title(self.text("Workspace Roots", "工作区根目录"))
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(inner);
+        let mut items = Vec::new();
+        for (idx, root) in self.config.workspace_roots.iter().enumerate() {
+            let marker = if idx == selected { "> " } else { "  " };
+            let badge = if idx == 0 {
+                self.text(" [primary]", " [主]")
+            } else {
+                ""
+            };
+            let style = if idx == selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            items.push(
+                ListItem::new(Line::from(format!("{marker}{}{badge}", root.display())))
+                    .style(style),
+            );
+        }
+        let mut selection =
+            ListState::default().with_selected((!items.is_empty()).then_some(selected));
+        frame.render_stateful_widget(List::new(items), sections[0], &mut selection);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(self.text(
+                    "a add root · Space/Enter set primary · d remove",
+                    "a 添加根目录 · Space/Enter 设为主根目录 · d 移除",
+                )),
+                Line::from(self.text("↑↓ navigate · Esc close", "↑↓ 选择 · Esc 关闭")),
+            ]),
+            sections[1],
+        );
     }
 
     fn render_folder_picker(&self, frame: &mut Frame<'_>, area: Rect, picker: &FolderPicker) {
@@ -3845,7 +4003,7 @@ mod tests {
             let mut app = super::TuiApp::new(crate::config::Config::default());
             app.language = language;
             app.config.data_dir = "/data/todex".into();
-            app.config.workspace_root = "/workspace".into();
+            app.config.workspace_roots = vec!["/workspace".into()];
             app.notice = app
                 .text(
                     "Ready. Settings are saved automatically.",
@@ -4029,6 +4187,71 @@ mod tests {
         assert!(state.selected().is_none());
         state.navigate(true);
         assert_eq!(state.selected().unwrap().request_id, "new");
+    }
+
+    #[tokio::test]
+    async fn workspace_roots_manager_manages_primary_and_removal() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let data_dir =
+            std::env::temp_dir().join(format!("todex-tui-roots-{}", uuid::Uuid::new_v4().simple()));
+        let mut app = super::TuiApp::new(crate::config::Config {
+            data_dir: data_dir.clone(),
+            workspace_roots: vec!["/root-a".into(), "/root-b".into()],
+            ..crate::config::Config::default()
+        });
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        app.start_workspace_roots_manager();
+        assert_eq!(app.roots_picker, Some(0));
+
+        app.handle_roots_picker_key(key(KeyCode::Down))
+            .await
+            .unwrap();
+        assert_eq!(app.roots_picker, Some(1));
+        app.handle_roots_picker_key(key(KeyCode::Char(' ')))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.config.workspace_roots,
+            vec![std::path::PathBuf::from("/root-b"), "/root-a".into()]
+        );
+        assert_eq!(app.roots_picker, Some(0));
+
+        app.handle_roots_picker_key(key(KeyCode::Down))
+            .await
+            .unwrap();
+        app.handle_roots_picker_key(key(KeyCode::Char('d')))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.config.workspace_roots,
+            vec![std::path::PathBuf::from("/root-b")]
+        );
+
+        app.handle_roots_picker_key(key(KeyCode::Char('d')))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.config.workspace_roots,
+            vec![std::path::PathBuf::from("/root-b")]
+        );
+
+        app.handle_roots_picker_key(key(KeyCode::Char('a')))
+            .await
+            .unwrap();
+        assert!(app.folder_picker.is_some());
+        app.folder_picker = None;
+
+        app.handle_roots_picker_key(key(KeyCode::Esc))
+            .await
+            .unwrap();
+        assert!(app.roots_picker.is_none());
+
+        let saved = std::fs::read_to_string(data_dir.join("config.toml")).unwrap();
+        assert!(saved.contains("workspace_root = \"/root-b\""));
+        assert!(saved.contains("workspace_roots = [\"/root-b\"]"));
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]

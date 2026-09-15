@@ -65,6 +65,7 @@ opencode --version
 | `TODEX_AGENTD_PORT` | 监听端口 |
 | `TODEX_AGENTD_DATA_DIR` | 数据目录 |
 | `TODEX_AGENTD_WORKSPACE_ROOT` | workspace 根目录 |
+| `TODEX_AGENTD_WORKSPACE_ROOTS` | 多个 workspace 根目录，按平台路径分隔符分隔（macOS/Linux 为 `:`，Windows 为 `;`） |
 | `TODEX_AGENTD_CODEX_BIN` | `codex` 命令路径 |
 | `TODEX_AGENTD_CLAUDE_BIN` | `claude` 命令路径 |
 | `TODEX_AGENTD_PI_BIN` | `pi` 命令路径 |
@@ -91,6 +92,8 @@ host = "127.0.0.1"
 port = 7345
 data_dir = "/home/user/.todex-agent"
 workspace_root = "/home/user/projects"
+# 多个根目录时使用数组；与 workspace_root 并存时取并集，主根为 workspace_root
+# workspace_roots = ["/home/user/projects", "/srv/repos"]
 
 [agent]
 default_agent = "codex"
@@ -325,6 +328,8 @@ cargo run -- tui --host 0.0.0.0 --port 7345
 cargo run -- serve \
   --data-dir ~/.todex-agent \
   --workspace-root ~/projects
+# 多个根目录可重复指定：
+#   --workspace-root ~/projects --workspace-root /srv/repos
 ```
 
 ### 使用环境变量运行
@@ -334,6 +339,8 @@ export TODEX_AGENTD_HOST=127.0.0.1
 export TODEX_AGENTD_PORT=7345
 export TODEX_AGENTD_DATA_DIR="$HOME/.todex-agent"
 export TODEX_AGENTD_WORKSPACE_ROOT="$HOME/projects"
+# 多个根目录：
+# export TODEX_AGENTD_WORKSPACE_ROOTS="$HOME/projects:/srv/repos"
 cargo run -- serve
 ```
 

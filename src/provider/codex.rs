@@ -1556,7 +1556,7 @@ done
             PermissionBroker::default(),
             manifest.id.clone(),
         );
-        let trust = WorkspaceTrustStore::new(root.join("trust"), root.clone())
+        let trust = WorkspaceTrustStore::new(root.join("trust"), vec![root.clone()])
             .await
             .unwrap();
         trust.set_owned("local", &root, true).await.unwrap();

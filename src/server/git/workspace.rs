@@ -45,18 +45,18 @@ async fn is_removal_dirty(cwd: &Path) -> Result<bool> {
     .is_empty())
 }
 
-pub(crate) async fn snapshot(root: &Path, workspace: &Path) -> Result<GitWorkspaceResponse> {
+pub(crate) async fn snapshot(roots: &[PathBuf], workspace: &Path) -> Result<GitWorkspaceResponse> {
     let _permit = timeout(GIT_SCAN_QUEUE_TIMEOUT, GIT_SCAN_SEMAPHORE.acquire())
         .await
         .map_err(|_| AppError::Conflict("Git read capacity is busy".to_owned()))?
         .map_err(|_| AppError::Conflict("Git read capacity is closed".to_owned()))?;
-    timeout(GIT_SCAN_TIMEOUT, snapshot_inner(root, workspace))
+    timeout(GIT_SCAN_TIMEOUT, snapshot_inner(roots, workspace))
         .await
         .map_err(|_| AppError::GitCommandTimedOut("Git workspace inspection".to_owned()))?
 }
 
-pub(super) async fn is_exact_repository(root: &Path, workspace: &Path) -> Result<bool> {
-    match resolve_repository(root, workspace).await? {
+pub(super) async fn is_exact_repository(roots: &[PathBuf], workspace: &Path) -> Result<bool> {
+    match resolve_repository(roots, workspace).await? {
         Some(repository) if repository != workspace => Err(invalid(
             "请选择仓库根目录后再执行 Git 操作；当前工作目录是仓库的子目录。",
         )),
@@ -65,9 +65,9 @@ pub(super) async fn is_exact_repository(root: &Path, workspace: &Path) -> Result
     }
 }
 
-async fn snapshot_inner(root: &Path, workspace: &Path) -> Result<GitWorkspaceResponse> {
-    let root = canonical_workspace_root(root)?;
-    let workspace = validate_workspace_directory(&root, workspace)?;
+async fn snapshot_inner(roots: &[PathBuf], workspace: &Path) -> Result<GitWorkspaceResponse> {
+    let roots = canonical_workspace_roots(roots);
+    let workspace = validate_workspace_directory(&roots, workspace)?;
     let mut result = GitWorkspaceResponse {
         repository_path: workspace.display().to_string(),
         initialized: false,
@@ -76,17 +76,17 @@ async fn snapshot_inner(root: &Path, workspace: &Path) -> Result<GitWorkspaceRes
         worktrees: vec![],
         dirty: false,
     };
-    if !is_exact_repository(&root, &workspace).await? {
+    if !is_exact_repository(&roots, &workspace).await? {
         return Ok(result);
     }
-    validate_repository_metadata(&root, &workspace).await?;
+    validate_repository_metadata(&roots, &workspace).await?;
     result.initialized = true;
     result.current_branch = text_command(&workspace, &["branch", "--show-current"])
         .await?
         .trim()
         .to_owned();
     result.dirty = is_dirty(&workspace).await?;
-    result.worktrees = worktrees(&root, &workspace).await?;
+    result.worktrees = worktrees(&roots, &workspace).await?;
     let refs = text_command(
         &workspace,
         &[
@@ -134,7 +134,7 @@ async fn snapshot_inner(root: &Path, workspace: &Path) -> Result<GitWorkspaceRes
     Ok(result)
 }
 
-async fn worktrees(root: &Path, workspace: &Path) -> Result<Vec<GitWorktree>> {
+async fn worktrees(roots: &[PathBuf], workspace: &Path) -> Result<Vec<GitWorktree>> {
     let records = text_command(workspace, &["worktree", "list", "--porcelain", "-z"]).await?;
     let mut trees = Vec::new();
     for record in records.split("\0\0").filter(|record| !record.is_empty()) {
@@ -150,9 +150,9 @@ async fn worktrees(root: &Path, workspace: &Path) -> Result<Vec<GitWorktree>> {
             .iter()
             .find_map(|field| field.strip_prefix("branch refs/heads/"))
             .unwrap_or("");
-        let accessible_path = validate_workspace_directory(root, Path::new(path)).ok();
+        let accessible_path = validate_workspace_directory(roots, Path::new(path)).ok();
         let accessible = if let Some(path) = accessible_path.as_deref() {
-            validate_repository_metadata(root, path).await.is_ok()
+            validate_repository_metadata(roots, path).await.is_ok()
         } else {
             false
         };
@@ -219,7 +219,7 @@ async fn start_commit(workspace: &Path, value: Option<&str>) -> Result<String> {
     Ok(oid.to_owned())
 }
 
-fn new_worktree_path(root: &Path, value: &str) -> Result<PathBuf> {
+fn new_worktree_path(roots: &[PathBuf], value: &str) -> Result<PathBuf> {
     let path = Path::new(value);
     if !path.is_absolute()
         || path.components().any(|part| {
@@ -236,7 +236,7 @@ fn new_worktree_path(root: &Path, value: &str) -> Result<PathBuf> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid("Worktree needs a parent directory"))?;
-    let parent = validate_workspace_directory(root, parent)?;
+    let parent = validate_workspace_directory(roots, parent)?;
     let name = path
         .file_name()
         .ok_or_else(|| invalid("Worktree needs a directory name"))?;
@@ -249,28 +249,28 @@ fn new_worktree_path(root: &Path, value: &str) -> Result<PathBuf> {
 }
 
 pub(crate) async fn operate(
-    root: &Path,
+    roots: &[PathBuf],
     data_dir: &Path,
     workspace: &Path,
     operation: &GitOperation,
 ) -> Result<GitOperationResponse> {
     #[cfg(not(unix))]
     {
-        let _ = (root, data_dir, workspace, operation);
+        let _ = (roots, data_dir, workspace, operation);
         return Err(AppError::Unsupported(
             "Fixed Git mutations require Unix process isolation".to_owned(),
         ));
     }
     #[cfg(unix)]
     {
-        let root = canonical_workspace_root(root)?;
-        let workspace = validate_workspace_directory(&root, workspace)?;
+        let roots = canonical_workspace_roots(roots);
+        let workspace = validate_workspace_directory(&roots, workspace)?;
         let _guard = timeout(GIT_WRITE_QUEUE_TIMEOUT, GIT_WRITE_LOCK.lock())
             .await
             .map_err(|_| AppError::Conflict("Git write capacity is busy".to_owned()))?;
         timeout(
             GIT_MUTATION_TIMEOUT,
-            operate_locked(&root, data_dir, &workspace, operation),
+            operate_locked(&roots, data_dir, &workspace, operation),
         )
         .await
         .map_err(|_| AppError::GitPartialSuccess {
@@ -282,17 +282,17 @@ pub(crate) async fn operate(
 }
 
 async fn operate_locked(
-    root: &Path,
+    roots: &[PathBuf],
     data_dir: &Path,
     workspace: &Path,
     operation: &GitOperation,
 ) -> Result<GitOperationResponse> {
-    let initialized = is_exact_repository(root, workspace).await?;
+    let initialized = is_exact_repository(roots, workspace).await?;
     if !initialized && !matches!(operation, GitOperation::Init {}) {
         return Err(AppError::GitRepositoryNotFound);
     }
     if initialized {
-        validate_mutation_repository_metadata(root, workspace).await?;
+        validate_mutation_repository_metadata(roots, workspace).await?;
         validate_mutation_execution_config(workspace).await?;
     } else if std::fs::symlink_metadata(workspace.join(".git")).is_ok() {
         return Err(invalid(
@@ -358,7 +358,7 @@ async fn operate_locked(
                     "Working tree has changes; commit or resolve them before switching",
                 ));
             }
-            let trees = worktrees(root, workspace).await?;
+            let trees = worktrees(roots, workspace).await?;
             if trees
                 .iter()
                 .any(|tree| tree.branch == *branch_name && !tree.current)
@@ -374,7 +374,7 @@ async fn operate_locked(
             start_point,
         } => {
             validate_branch(workspace, branch_name).await?;
-            let path = new_worktree_path(root, path)?;
+            let path = new_worktree_path(roots, path)?;
             let oid = start_commit(workspace, start_point.as_deref()).await?;
             vec![
                 "worktree".to_owned(),
@@ -387,8 +387,8 @@ async fn operate_locked(
             ]
         }
         GitOperation::RemoveWorktree { path } => {
-            let target = validate_workspace_directory(root, Path::new(path))?;
-            let trees = worktrees(root, workspace).await?;
+            let target = validate_workspace_directory(roots, Path::new(path))?;
+            let trees = worktrees(roots, workspace).await?;
             let tree = trees
                 .iter()
                 .find(|tree| Path::new(&tree.path) == target)
@@ -396,10 +396,10 @@ async fn operate_locked(
             if tree.main || tree.current || tree.locked || tree.dirty || !tree.accessible {
                 return Err(invalid("Only a clean, unlocked, accessible, non-current linked worktree can be removed"));
             }
-            validate_mutation_repository_metadata(root, &target).await?;
+            validate_mutation_repository_metadata(roots, &target).await?;
             // Never delete a registered path whose .git pointer has been replaced.
-            if repository_metadata_roots(root, &target).await?.last()
-                != repository_metadata_roots(root, workspace).await?.last()
+            if repository_metadata_roots(roots, &target).await?.last()
+                != repository_metadata_roots(roots, workspace).await?.last()
             {
                 return Err(invalid(
                     "Worktree metadata does not belong to this repository",
@@ -525,7 +525,7 @@ mod tests {
             }
         }
         async fn action(&self, operation: GitOperation) -> Result<GitOperationResponse> {
-            operate(&self.root, &self.data, &self.repo, &operation).await
+            operate(&[self.root.clone()], &self.data, &self.repo, &operation).await
         }
         async fn seed(&self) {
             self.action(GitOperation::Init {}).await.unwrap();
@@ -567,10 +567,14 @@ mod tests {
     #[tokio::test]
     async fn init_branch_and_worktree_lifecycle_preserves_commits_and_branches() {
         let fixture = Fixture::new();
-        let before = snapshot(&fixture.root, &fixture.repo).await.unwrap();
+        let before = snapshot(&[fixture.root.clone()], &fixture.repo)
+            .await
+            .unwrap();
         assert!(!before.initialized);
         fixture.action(GitOperation::Init {}).await.unwrap();
-        let initialized = snapshot(&fixture.root, &fixture.repo).await.unwrap();
+        let initialized = snapshot(&[fixture.root.clone()], &fixture.repo)
+            .await
+            .unwrap();
         assert!(initialized.initialized);
         assert!(initialized.branches.is_empty()); // init deliberately creates no commit
         assert!(start_commit(&fixture.repo, None).await.is_err());
@@ -598,7 +602,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let before_branch = snapshot(&fixture.root, &fixture.repo)
+        let before_branch = snapshot(&[fixture.root.clone()], &fixture.repo)
             .await
             .unwrap()
             .current_branch;
@@ -610,7 +614,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            snapshot(&fixture.root, &fixture.repo)
+            snapshot(&[fixture.root.clone()], &fixture.repo)
                 .await
                 .unwrap()
                 .current_branch,
@@ -631,7 +635,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let state = snapshot(&fixture.root, &fixture.repo).await.unwrap();
+        let state = snapshot(&[fixture.root.clone()], &fixture.repo)
+            .await
+            .unwrap();
         assert_eq!(state.current_branch, "feature");
         assert_eq!(state.worktrees.len(), 2);
         assert!(state.worktrees[0].main && state.worktrees[0].current);
@@ -659,7 +665,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!tree.exists());
-        assert!(snapshot(&fixture.root, &fixture.repo)
+        assert!(snapshot(&[fixture.root.clone()], &fixture.repo)
             .await
             .unwrap()
             .branches
@@ -686,12 +692,14 @@ mod tests {
         let nested = fixture.repo.join("nested");
         fs::create_dir(&nested).unwrap();
         let before = start_commit(&fixture.repo, None).await.unwrap();
-        let read_error = snapshot(&fixture.root, &nested).await.unwrap_err();
+        let read_error = snapshot(std::slice::from_ref(&fixture.root), &nested)
+            .await
+            .unwrap_err();
         assert!(
             matches!(read_error, AppError::InvalidRequest(ref message) if message.contains("请选择仓库根目录"))
         );
         let init_error = operate(
-            &fixture.root,
+            std::slice::from_ref(&fixture.root),
             &fixture.data,
             &nested,
             &GitOperation::Init {},

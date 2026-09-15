@@ -63,7 +63,7 @@ impl ManagedServer {
             host = %config.host,
             port = config.port,
             data_dir = %config.data_dir.display(),
-            workspace_root = %config.workspace_root.display(),
+            workspace_roots = ?config.workspace_roots,
             "todex-agentd listening"
         );
         if !config.security.enable_tls && config.host != "127.0.0.1" && config.host != "::1" {
@@ -164,7 +164,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::default(),
             data_dir,
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -218,7 +218,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::default(),
             data_dir,
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -265,7 +265,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::default(),
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),

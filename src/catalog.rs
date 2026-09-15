@@ -1241,7 +1241,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir,
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),

@@ -523,7 +523,7 @@ impl ConversationSupervisor {
     ) -> Result<ConversationManifest, AppError> {
         validate_owner_id(owner_id)?;
         let workspace = validate_workspace_directory_text(
-            &self.config.workspace_root,
+            &self.config.workspace_roots,
             workspace.to_str().ok_or_else(|| {
                 AppError::InvalidRequest("workspace path is not UTF-8".to_owned())
             })?,
@@ -2127,7 +2127,7 @@ mod tests {
         workspace: Option<&Path>,
     ) -> WorkspaceTrustStore {
         let trust =
-            WorkspaceTrustStore::new(config.data_dir.clone(), config.workspace_root.clone())
+            WorkspaceTrustStore::new(config.data_dir.clone(), config.workspace_roots.clone())
                 .await
                 .unwrap();
         if let Some(workspace) = workspace {
@@ -2151,7 +2151,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -2502,7 +2502,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -2612,7 +2612,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir,
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "pi".to_owned(),
@@ -2832,7 +2832,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -2890,7 +2890,7 @@ mod tests {
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: data_dir.clone(),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
@@ -3247,7 +3247,7 @@ done
             port: 0,
             pairing_encryption: PairingEncryption::None,
             data_dir: root.join("data"),
-            workspace_root,
+            workspace_roots: vec![workspace_root],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),

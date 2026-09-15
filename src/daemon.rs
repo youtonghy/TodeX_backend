@@ -28,7 +28,8 @@ pub struct DaemonProcess {
     pub host: String,
     pub port: u16,
     pub data_dir: PathBuf,
-    pub workspace_root: PathBuf,
+    #[serde(default)]
+    pub workspace_roots: Vec<PathBuf>,
     pub started_at: DateTime<Utc>,
     pub executable: PathBuf,
 }
@@ -77,9 +78,11 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
         .arg("--port")
         .arg(config.port.to_string())
         .arg("--data-dir")
-        .arg(&config.data_dir)
-        .arg("--workspace-root")
-        .arg(&config.workspace_root)
+        .arg(&config.data_dir);
+    for root in &config.workspace_roots {
+        command.arg("--workspace-root").arg(root);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().with_context(|| {
             format!("failed to clone daemon log {}", log_path.display())
@@ -289,7 +292,7 @@ fn write_pid_file(config: &Config, port: u16) -> Result<DaemonProcess> {
         host: config.host.clone(),
         port,
         data_dir: config.data_dir.clone(),
-        workspace_root: config.workspace_root.clone(),
+        workspace_roots: config.workspace_roots.clone(),
         started_at: Utc::now(),
         executable: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("todex-agentd")),
     };
@@ -733,7 +736,7 @@ mod tests {
             host: config.host.clone(),
             port: config.port,
             data_dir: config.data_dir.clone(),
-            workspace_root: config.workspace_root.clone(),
+            workspace_roots: config.workspace_roots.clone(),
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
         };
@@ -760,7 +763,7 @@ mod tests {
             host: config.host.clone(),
             port: config.port,
             data_dir: config.data_dir.clone(),
-            workspace_root: config.workspace_root.clone(),
+            workspace_roots: config.workspace_roots.clone(),
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
         };
@@ -782,7 +785,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             port: 0,
             data_dir: std::env::temp_dir(),
-            workspace_root: std::env::temp_dir(),
+            workspace_roots: vec![std::env::temp_dir()],
             started_at: Utc::now(),
             executable: std::env::temp_dir().join("definitely-not-todex-agentd"),
         };
@@ -815,7 +818,7 @@ mod tests {
             host: config.host.clone(),
             port: config.port,
             data_dir: config.data_dir.clone(),
-            workspace_root: config.workspace_root.clone(),
+            workspace_roots: config.workspace_roots.clone(),
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
         };
@@ -876,7 +879,7 @@ mod tests {
             port: 7345,
             pairing_encryption: PairingEncryption::default(),
             data_dir: root.join("data"),
-            workspace_root: root.join("workspace"),
+            workspace_roots: vec![root.join("workspace")],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),

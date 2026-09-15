@@ -564,30 +564,31 @@ async fn dispatch(
                 .recover_session(&payload.codex_session_id)
                 .await?
                 .last_cursor;
-            let cwd =
-                match validate_workspace_directory_text(&state.config.workspace_root, &payload.cwd)
-                {
-                    Ok(cwd) => cwd,
-                    Err(error) => {
-                        publish_local_codex_error_after(
-                            state,
-                            &payload.codex_session_id,
-                            last_cursor,
-                            CodexLocalAdapterProcessError {
-                                payload: CodexLocalErrorPayload {
-                                    code: CodexLocalErrorCode::InvalidCwd,
-                                    message: error.to_string(),
-                                    codex_session_id: payload.codex_session_id.clone(),
-                                    request_id: Some(message.id.clone()),
-                                    operation: Some("codex.local.start".to_owned()),
-                                    upstream_request_id: None,
-                                },
+            let cwd = match validate_workspace_directory_text(
+                &state.config.workspace_roots,
+                &payload.cwd,
+            ) {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    publish_local_codex_error_after(
+                        state,
+                        &payload.codex_session_id,
+                        last_cursor,
+                        CodexLocalAdapterProcessError {
+                            payload: CodexLocalErrorPayload {
+                                code: CodexLocalErrorCode::InvalidCwd,
+                                message: error.to_string(),
+                                codex_session_id: payload.codex_session_id.clone(),
+                                request_id: Some(message.id.clone()),
+                                operation: Some("codex.local.start".to_owned()),
+                                upstream_request_id: None,
                             },
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
             if let Err(error) = state
                 .workspace_trust
                 .ensure_trusted(&payload.tenant_id, &cwd)
@@ -1042,7 +1043,7 @@ async fn dispatch(
             )
             .await?;
             let cwd =
-                validate_workspace_directory_text(&state.config.workspace_root, &payload.cwd)?;
+                validate_workspace_directory_text(&state.config.workspace_roots, &payload.cwd)?;
             state
                 .workspace_trust
                 .ensure_trusted(&payload.tenant_id, &cwd)
@@ -3895,7 +3896,7 @@ mod tests {
             port: 0,
             pairing_encryption: crate::config::PairingEncryption::default(),
             data_dir: unique_tmp_dir("todex-codex-auth-test-data"),
-            workspace_root: std::env::temp_dir(),
+            workspace_roots: vec![std::env::temp_dir()],
             history_retention_days: None,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),

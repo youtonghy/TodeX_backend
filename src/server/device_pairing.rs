@@ -136,7 +136,7 @@ mod tests {
         ));
         let config = crate::config::Config {
             data_dir: root.join("data"),
-            workspace_root: root.join("workspaces"),
+            workspace_roots: vec![root.join("workspaces")],
             ..crate::config::Config::default()
         };
         let state = AppState::new(config.clone()).await.unwrap();

@@ -772,7 +772,7 @@ done
             manifest.id.clone(),
         )
         .with_turn_id("local-turn");
-        let trust = WorkspaceTrustStore::new(root.join("trust"), root.clone())
+        let trust = WorkspaceTrustStore::new(root.join("trust"), vec![root.clone()])
             .await
             .unwrap();
         trust.set_owned("local", &root, true).await.unwrap();

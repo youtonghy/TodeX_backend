@@ -5,12 +5,12 @@ use crate::server::protocol::{GitStatusResponse, GitWorktreeKind};
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(crate) async fn read(root: &Path, workspace: &Path) -> Result<GitStatusResponse> {
+pub(crate) async fn read(roots: &[PathBuf], workspace: &Path) -> Result<GitStatusResponse> {
     let _permit = timeout(GIT_SCAN_QUEUE_TIMEOUT, GIT_SCAN_SEMAPHORE.acquire())
         .await
         .map_err(|_| AppError::Conflict("Git read capacity is busy".to_owned()))?
         .map_err(|_| AppError::Conflict("Git read capacity is closed".to_owned()))?;
-    timeout(STATUS_TIMEOUT, read_inner(root, workspace))
+    timeout(STATUS_TIMEOUT, read_inner(roots, workspace))
         .await
         .map_err(|_| AppError::GitCommandTimedOut("Git status summary".to_owned()))?
 }
@@ -21,9 +21,9 @@ async fn command(repository: &Path, args: &[&str]) -> Result<GitCommandOutput> {
     run_checked(repository, &arguments, "Git status summary").await
 }
 
-async fn read_inner(root: &Path, workspace: &Path) -> Result<GitStatusResponse> {
-    let root = canonical_workspace_root(root)?;
-    let workspace = validate_workspace_directory(&root, workspace)?;
+async fn read_inner(roots: &[PathBuf], workspace: &Path) -> Result<GitStatusResponse> {
+    let roots = canonical_workspace_roots(roots);
+    let workspace = validate_workspace_directory(&roots, workspace)?;
     let mut result = GitStatusResponse {
         repository_path: workspace.display().to_string(),
         initialized: false,
@@ -34,12 +34,12 @@ async fn read_inner(root: &Path, workspace: &Path) -> Result<GitStatusResponse> 
         deletions: 0,
         stats_truncated: false,
     };
-    let Some(repository) = resolve_repository(&root, &workspace).await? else {
+    let Some(repository) = resolve_repository(&roots, &workspace).await? else {
         return Ok(result);
     };
     // Reject external/symlinked metadata and executable local filters before
     // status or diff can cause Git to evaluate file contents.
-    let metadata = repository_metadata_roots(&root, &repository).await?;
+    let metadata = repository_metadata_roots(&roots, &repository).await?;
     validate_mutation_execution_config(&repository).await?;
     result.repository_path = repository.display().to_string();
     result.initialized = true;
@@ -332,7 +332,9 @@ mod tests {
             .await;
         }
         async fn status(&self) -> GitStatusResponse {
-            read(&self.root, &self.repo).await.unwrap()
+            read(std::slice::from_ref(&self.root), &self.repo)
+                .await
+                .unwrap()
         }
     }
     impl Drop for Fixture {
@@ -345,7 +347,7 @@ mod tests {
     async fn status_resolves_main_linked_and_subdirectories_without_scanning_children() {
         let fixture = Fixture::new().await;
         fixture.commit().await;
-        let not_repository = read(&fixture.root, &fixture.root).await.unwrap();
+        let not_repository = read(&[fixture.root.clone()], &fixture.root).await.unwrap();
         assert!(
             !not_repository.initialized,
             "a child repository must not be scanned"
@@ -362,7 +364,7 @@ mod tests {
         assert_eq!(main.changed_files, 0);
         let nested = fixture.repo.join("nested");
         fs::create_dir(&nested).unwrap();
-        let nested_status = read(&fixture.root, &nested).await.unwrap();
+        let nested_status = read(&[fixture.root.clone()], &nested).await.unwrap();
         assert_eq!(nested_status.repository_path, main.repository_path);
         assert_eq!(nested_status.branch, main.branch);
         let linked = fixture.root.join("linked");
@@ -377,7 +379,7 @@ mod tests {
                 linked.to_str().unwrap(),
             ])
             .await;
-        let linked_status = read(&fixture.root, &linked).await.unwrap();
+        let linked_status = read(&[fixture.root.clone()], &linked).await.unwrap();
         assert_eq!(linked_status.worktree_kind, Some(GitWorktreeKind::Linked));
         assert_eq!(linked_status.branch.as_deref(), Some("linked"));
         assert_eq!(linked_status.changed_files, 0);
