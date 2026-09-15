@@ -2,6 +2,7 @@ mod hub;
 mod migration;
 mod model;
 mod store;
+mod summary;
 
 pub use hub::ConversationEventHub;
 pub use migration::migrate_legacy_codex_sessions;
@@ -11,3 +12,4 @@ pub use model::{
     CONVERSATION_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES,
 };
 pub use store::ConversationStore;
+pub use summary::summarize_event;

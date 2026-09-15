@@ -80,7 +80,7 @@ POST /v2/conversations
 GET /v2/conversations/{conversationId}
 PATCH /v2/conversations/{conversationId}
 DELETE /v2/conversations/{conversationId}
-GET /v2/conversations/{conversationId}/events?afterSequence=0&limit=200
+GET /v2/conversations/{conversationId}/events?afterSequence=0&limit=200&detail=full
 POST /v2/conversations/{conversationId}/prompt
 POST /v2/conversations/{conversationId}/cancel
 POST /v2/conversations/{conversationId}/runtime/stop
@@ -129,6 +129,8 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 `content` 可选，最多 16 项，支持 `text`、`localImage`、内联 `image`（`data` + `mimeType`）和 `file`。本地路径可相对 workspace，也可使用 workspace 内绝对路径；规范化后越界、符号链接逃逸和非普通文件都会拒绝。图片仅对 Codex 和 Pi 开放，允许 PNG/JPEG/GIF/WebP，解码后合计最多 10 MiB；不支持图片的 Provider 返回明确的 `UNSUPPORTED`。Codex 把文件映射为原生 mention，其他 Provider 使用 workspace 相对 `@` 引用。
 
 每个 conversation 同时只允许一个 mutating turn；并发 prompt 返回 `409 CONFLICT`，不会排队。daemon 重启会把未完成 turn 标记为 `interrupted`，不会通过重放 prompt 猜测恢复。原生会话 ID 由 `provider-state.json` 保存，Provider 支持时下一 turn 使用原生 resume。
+
+事件回放支持 `detail=summary`（默认 `full`）：summary 模式把只产生折叠过程行的事件（工具调用、思考、状态、进度）的 `payload` 替换为 `{ "detailStub": true, ... }` 占位对象，保留分类、turn 与流身份所需的元数据，因此事件 sequence 与投影出的时间线条目身份保持不变；结果输出、审批、权限、队列、配置、压缩、subagent、memory、extension 及携带用量数据的事件始终完整返回。客户端展开过程组时用同一接口按 `afterSequence`/`limit` 以 `detail=full` 拉取对应序列区间。
 
 ### v2 WebSocket
 

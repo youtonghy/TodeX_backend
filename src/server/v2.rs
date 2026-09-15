@@ -1779,17 +1779,27 @@ async fn replay_conversation(
     Query(query): Query<ReplayQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
-    Ok(Json(serde_json::to_value(
-        state
-            .conversations
-            .replay_owned(
-                &auth.tenant_id,
-                &conversation_id,
-                query.after_sequence.unwrap_or(0),
-                query.limit.unwrap_or(200),
-            )
-            .await?,
-    )?))
+    let detail = query.detail.as_deref().unwrap_or("full");
+    if !matches!(detail, "full" | "summary") {
+        return Err(AppError::InvalidRequest(
+            "events detail must be \"full\" or \"summary\"".to_owned(),
+        ));
+    }
+    let mut replay = state
+        .conversations
+        .replay_owned(
+            &auth.tenant_id,
+            &conversation_id,
+            query.after_sequence.unwrap_or(0),
+            query.limit.unwrap_or(200),
+        )
+        .await?;
+    if detail == "summary" {
+        for event in &mut replay.events {
+            crate::conversation::summarize_event(event);
+        }
+    }
+    Ok(Json(serde_json::to_value(replay)?))
 }
 
 async fn prompt_conversation(
@@ -2869,6 +2879,11 @@ struct ReplayQuery {
     after_sequence: Option<u64>,
     #[serde(default)]
     limit: Option<usize>,
+    /// `summary` folds process-only events (tool calls, reasoning, status and
+    /// progress chatter) down to classification metadata; clients fetch the
+    /// full payloads for a sequence range on demand.
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
