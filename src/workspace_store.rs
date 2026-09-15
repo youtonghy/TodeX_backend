@@ -133,13 +133,6 @@ impl WorkspaceStore {
         workspaces: Vec<WorkspaceRecord>,
     ) -> Result<WorkspaceMerge, AppError> {
         let normalized = normalize_workspaces(workspaces, &self.workspace_root, Some(owner_id));
-        if normalized.workspaces.is_empty() && !normalized.rejected.is_empty() {
-            let first = &normalized.rejected[0];
-            return Err(AppError::InvalidRequest(format!(
-                "workspace \"{}\" at {} was rejected: {}",
-                first.name, first.path, first.message
-            )));
-        }
         let mut current = self.inner.write().await;
         let mut by_id = current
             .workspaces
@@ -487,7 +480,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_errors_when_every_workspace_is_rejected() {
+    async fn merge_reports_rejections_when_every_workspace_is_invalid() {
         let root = make_temp_dir("todex-workspace-store-allbad");
         let workspace_root = root.join("workspaces");
         fs::create_dir_all(&workspace_root).unwrap();
@@ -495,15 +488,17 @@ mod tests {
             .await
             .unwrap();
 
-        let error = store
+        let merged = store
             .merge_owned(
                 "local",
                 vec![test_record("Gone", &workspace_root.join("missing"))],
             )
             .await
-            .expect_err("all-invalid merge must fail");
+            .unwrap();
 
-        assert!(matches!(error, AppError::InvalidRequest(_)));
+        assert_eq!(merged.rejected.len(), 1);
+        assert_eq!(merged.rejected[0].code, "WORKSPACE_PATH_NOT_FOUND");
+        assert!(merged.snapshot.workspaces.is_empty());
         assert!(store.snapshot_owned("local").await.workspaces.is_empty());
         let _ = fs::remove_dir_all(root);
     }

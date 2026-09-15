@@ -10,7 +10,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use uuid::Uuid;
 
-use crate::{error::AppError, workspace_paths::validate_workspace_directory_text};
+use crate::{
+    error::AppError,
+    workspace_paths::{expand_home, validate_workspace_directory_text},
+};
 
 const WORKSPACE_TRUST_FILE: &str = "workspace-trust.json";
 
@@ -94,7 +97,36 @@ impl WorkspaceTrustStore {
         trusted: bool,
     ) -> Result<WorkspaceTrustStatus, AppError> {
         let workspace = self.validate(workspace)?;
-        let workspace_path = workspace.display().to_string();
+        self.set_normalized_owned(owner_id, workspace.display().to_string(), trusted)
+            .await
+    }
+
+    /// Revokes trust without requiring the workspace directory to still exist.
+    /// Workspace deletion uses this so a removed-on-disk path cannot block the
+    /// delete; the stored record path is already canonical, so a best-effort
+    /// normalization is enough to match existing entries.
+    pub async fn revoke_owned(
+        &self,
+        owner_id: &str,
+        workspace: &Path,
+    ) -> Result<WorkspaceTrustStatus, AppError> {
+        let workspace = expand_home(workspace);
+        if !workspace.is_absolute() {
+            return Err(AppError::InvalidRequest(
+                "workspace path must be absolute".to_owned(),
+            ));
+        }
+        let workspace = std::fs::canonicalize(&workspace).unwrap_or(workspace);
+        self.set_normalized_owned(owner_id, workspace.display().to_string(), false)
+            .await
+    }
+
+    async fn set_normalized_owned(
+        &self,
+        owner_id: &str,
+        workspace_path: String,
+        trusted: bool,
+    ) -> Result<WorkspaceTrustStatus, AppError> {
         let mut current = self.inner.write().await;
         let mut snapshot = current.clone();
         snapshot

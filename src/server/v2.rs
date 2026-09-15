@@ -216,11 +216,36 @@ pub(super) async fn workspaces(
 ) -> Result<Json<WorkspacesResponse>, AppError> {
     let auth = require_auth(&state, &headers)?;
     let snapshot = state.workspaces.snapshot_owned(&auth.tenant_id).await;
+    let (workspaces, rejected) =
+        partition_available_workspaces(&state.config.workspace_root, snapshot.workspaces);
     Ok(Json(WorkspacesResponse {
-        workspaces: snapshot.workspaces,
+        workspaces,
         updated_at: snapshot.updated_at,
-        rejected: Vec::new(),
+        rejected,
     }))
+}
+
+/// Revalidates stored workspace records against the filesystem so clients can
+/// grey out directories that were removed after they were synced.
+fn partition_available_workspaces(
+    workspace_root: &Path,
+    records: Vec<WorkspaceRecord>,
+) -> (Vec<WorkspaceRecord>, Vec<RejectedWorkspace>) {
+    let mut workspaces = Vec::with_capacity(records.len());
+    let mut rejected = Vec::new();
+    for record in records {
+        match validate_workspace_directory_text(workspace_root, &record.path) {
+            Ok(_) => workspaces.push(record),
+            Err(error) => rejected.push(RejectedWorkspace {
+                id: record.id,
+                name: record.name,
+                path: record.path,
+                code: error.code().to_owned(),
+                message: error.to_string(),
+            }),
+        }
+    }
+    (workspaces, rejected)
 }
 
 pub(super) async fn replace_workspaces(
@@ -244,8 +269,19 @@ pub(super) async fn replace_workspaces(
         );
     }
     let snapshot = merged.snapshot;
-    let workspace_paths = snapshot
-        .workspaces
+    let (workspaces, mut rejected) =
+        partition_available_workspaces(&state.config.workspace_root, snapshot.workspaces);
+    let mut seen_rejected = rejected
+        .iter()
+        .map(|item| (item.id.clone(), item.path.clone()))
+        .collect::<HashSet<_>>();
+    rejected.extend(
+        merged
+            .rejected
+            .into_iter()
+            .filter(|item| seen_rejected.insert((item.id.clone(), item.path.clone()))),
+    );
+    let workspace_paths = workspaces
         .iter()
         .map(|workspace| PathBuf::from(&workspace.path))
         .collect::<Vec<_>>();
@@ -275,9 +311,9 @@ pub(super) async fn replace_workspaces(
         state.events.publish(audit).await;
     }
     Ok(Json(WorkspacesResponse {
-        workspaces: snapshot.workspaces,
+        workspaces,
         updated_at: snapshot.updated_at,
-        rejected: merged.rejected,
+        rejected,
     }))
 }
 
@@ -292,9 +328,11 @@ pub(super) async fn delete_workspace(
         .get_owned(&auth.tenant_id, &workspace_id)
         .await?;
     let workspace_path = PathBuf::from(&workspace.path);
+    // Revocation tolerates a directory that is already gone so deleting a
+    // workspace whose path was removed on disk still works.
     state
         .workspace_trust
-        .set_owned(&auth.tenant_id, &workspace_path, false)
+        .revoke_owned(&auth.tenant_id, &workspace_path)
         .await?;
     let cancelled = state
         .conversations
@@ -4531,6 +4569,7 @@ mod tests {
         })
         .to_string();
         let all_bad = app
+            .clone()
             .oneshot(
                 resign(
                     &device,
@@ -4545,7 +4584,95 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(all_bad.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(all_bad.status(), StatusCode::OK);
+        let all_bad_body = to_bytes(all_bad.into_body(), 1024 * 1024).await.unwrap();
+        let all_bad_json: Value = serde_json::from_slice(&all_bad_body).unwrap();
+        assert_eq!(all_bad_json["workspaces"].as_array().unwrap().len(), 1);
+        assert_eq!(all_bad_json["rejected"].as_array().unwrap().len(), 1);
+        assert_eq!(all_bad_json["rejected"][0]["name"], "gone");
+
+        // A stored record whose directory disappears later must not break
+        // syncs: it is reported under `rejected` instead of failing the PUT.
+        let stored_id = partial_json["workspaces"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        fs::remove_dir_all(&workspace).unwrap();
+        let other = root.join("workspaces").join("other");
+        fs::create_dir_all(&other).unwrap();
+        let stale_payload = json!({ "workspaces": [workspace_entry("other", &other)] }).to_string();
+        let stale = app
+            .clone()
+            .oneshot(
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/v2/workspaces")
+                        .header("content-type", "application/json")
+                        .body(Body::from(stale_payload))
+                        .unwrap(),
+                )
+                .await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::OK);
+        let stale_body = to_bytes(stale.into_body(), 1024 * 1024).await.unwrap();
+        let stale_json: Value = serde_json::from_slice(&stale_body).unwrap();
+        assert_eq!(stale_json["workspaces"].as_array().unwrap().len(), 1);
+        assert!(stale_json["rejected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == stored_id && item["code"] == "WORKSPACE_PATH_NOT_FOUND"));
+
+        // GET reports the stale record the same way.
+        let list = app
+            .clone()
+            .oneshot(
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("GET")
+                        .uri("/v2/workspaces")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let list_body = to_bytes(list.into_body(), 1024 * 1024).await.unwrap();
+        let list_json: Value = serde_json::from_slice(&list_body).unwrap();
+        assert_eq!(list_json["workspaces"].as_array().unwrap().len(), 1);
+        assert!(list_json["rejected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == stored_id));
+
+        // DELETE must still succeed for a workspace whose path is gone so
+        // clients can drop it for good instead of resurrecting it on sync.
+        let deleted = app
+            .oneshot(
+                resign(
+                    &device,
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/v2/workspaces/{stored_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted_body = to_bytes(deleted.into_body(), 1024 * 1024).await.unwrap();
+        let deleted_json: Value = serde_json::from_slice(&deleted_body).unwrap();
+        assert_eq!(deleted_json["deleted"], true);
 
         let _ = fs::remove_dir_all(root);
     }
