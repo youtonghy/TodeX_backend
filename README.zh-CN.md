@@ -280,7 +280,8 @@ TODEX_REAL_E2E=1 cargo test --test e2e_real_codex -- --ignored --test-threads=1
 ## 相关仓库
 
 - **[TodeX Desktop](../TodeX_desktop)**：基于 Electron、React 19 与 HeroUI Pro 的 macOS 桌面端客户端。
-- **[TodeX App](../TodeX_app)**：基于 React Native 与 Expo SDK 57 的移动端应用。
+- **[TodeX Protocol](../TodeX_protocol)**：桌面端与 Web 客户端共用的 `@todex/protocol` 协议源码。
+- **[Todex Mobile](../Todex_mobile)**：基于 Swift 的移动端应用。
 
 ---
 

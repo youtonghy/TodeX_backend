@@ -290,7 +290,8 @@ TODEX_REAL_E2E=1 TODEX_REAL_ALLOW_BILLABLE=1 TODEX_REAL_PROVIDERS=codex,pi \
 ## Related Repositories
 
 - **[TodeX Desktop](../TodeX_desktop)**: macOS desktop client built with Electron, React 19, and HeroUI Pro.
-- **[TodeX App](../TodeX_app)**: Mobile client built with React Native and Expo SDK 57.
+- **[TodeX Protocol](../TodeX_protocol)**: Shared `@todex/protocol` sources consumed by the desktop and web clients.
+- **[Todex Mobile](../Todex_mobile)**: Mobile client built with Swift.
 
 ---
 

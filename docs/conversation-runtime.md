@@ -1,7 +1,7 @@
 # Conversation runtime contract
 
 Deploy the compatible backend before updating clients. Desktop and Web use the
-shared runtime in `TodeX_app/src/lib/conversationRuntime.ts`; new wire fields are
+shared runtime in `TodeX_protocol/src/conversationRuntime.ts`; new wire fields are
 optional and canonical aliases are recomputed when old journals are replayed.
 
 - REST pages and live frames enter one contiguous projection. A high sequence

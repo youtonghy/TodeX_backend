@@ -24,8 +24,8 @@ cd TodeX_backend && cargo run -- tui
 # Desktop（三栏）
 cd TodeX_desktop && pnpm run dev
 
-# App（移动端堆叠导航）
-cd TodeX_app && pnpm start
+# Mobile（Swift 客户端）
+# 在 Xcode 中打开 Todex_mobile 运行
 ```
 
 ## 环境要求
