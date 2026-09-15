@@ -2517,9 +2517,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let wire_log = tokio::fs::read_to_string(root.join("wire.log"))
-            .await
-            .expect("fake Codex should record passthrough wire messages");
+        let wire_log =
+            wait_for_wire_log(&root.join("wire.log"), "\"method\":\"thread/start\"").await;
         assert!(wire_log.contains("\"method\":\"thread/start\""));
 
         let _ = state
@@ -3978,6 +3977,22 @@ mod tests {
 
     fn unique_tmp_dir(prefix: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{}-{}", prefix, uuid::Uuid::new_v4().simple()))
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_wire_log(path: &std::path::Path, needle: &str) -> String {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(log) = tokio::fs::read_to_string(path).await {
+                    if log.contains(needle) {
+                        return log;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake Codex should record wire message")
     }
 
     #[cfg(unix)]
