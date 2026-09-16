@@ -491,7 +491,17 @@ impl ConversationStore {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn recover(&self, conversation_id: &str) -> Result<ConversationManifest, AppError> {
+        self.recover_with_history(conversation_id)
+            .await
+            .map(|(manifest, _)| manifest)
+    }
+
+    pub async fn recover_with_history(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(ConversationManifest, Vec<ConversationEvent>), AppError> {
         let _guard = self.lock(conversation_id).await;
         let directory = self.directory(conversation_id)?;
         let mut manifest: ConversationManifest =
@@ -519,7 +529,7 @@ impl ConversationStore {
             &ConversationSnapshot::from_manifest(&manifest),
         )
         .await?;
-        Ok(manifest)
+        Ok((manifest, events))
     }
 
     pub async fn provider_state(&self, conversation_id: &str) -> Result<ProviderState, AppError> {
@@ -1262,6 +1272,45 @@ mod tests {
             store.recover(&conversation.id).await.unwrap().status,
             ConversationStatus::Interrupted
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_returns_validated_history_and_repaired_manifest() {
+        let root = temp_dir("todex-recovery-history");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(&manifest.id, "codex.turn.started", json!({ "turnId": "t" }))
+            .await
+            .unwrap();
+        store
+            .append(
+                &manifest.id,
+                "permission.requested",
+                json!({ "permissionId": "p" }),
+            )
+            .await
+            .unwrap();
+        let (recovered, history) = store.recover_with_history(&manifest.id).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].event_type, "codex.turn.started");
+        assert_eq!(history[1].sequence, 2);
+        assert_eq!(recovered.last_sequence, 2);
+        assert_eq!(recovered.status, ConversationStatus::Interrupted);
+        assert_eq!(
+            store.get(&manifest.id).await.unwrap().status,
+            ConversationStatus::Interrupted
+        );
+        assert_eq!(store.recover(&manifest.id).await.unwrap().last_sequence, 2);
         fs::remove_dir_all(root).unwrap();
     }
 

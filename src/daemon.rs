@@ -16,7 +16,7 @@ use crate::transport_crypto::PairingKeys;
 
 const PID_FILE_NAME: &str = "daemon.json";
 const LOG_FILE_NAME: &str = "todex-agentd-daemon.log";
-const START_TIMEOUT: Duration = Duration::from_secs(30);
+const START_TIMEOUT: Duration = Duration::from_secs(120);
 const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 const STOP_FORCE_AFTER: Duration = Duration::from_secs(8);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -116,7 +116,7 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
         if started.elapsed() >= START_TIMEOUT {
             terminate_spawned_child(&mut child).await;
             bail!(
-                "daemon did not become ready within {:?}; see {}",
+                "daemon did not become ready within {:?}; check conversation recovery progress in {}",
                 START_TIMEOUT,
                 log_path.display()
             );

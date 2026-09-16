@@ -261,15 +261,19 @@ impl ConversationSupervisor {
     }
 
     pub async fn recover_all(&self) -> Result<(), AppError> {
-        for manifest in self.store.list().await? {
+        let started = std::time::Instant::now();
+        let manifests = self.store.list().await?;
+        let total = manifests.len();
+        tracing::info!(conversations = total, "recovering conversation journals");
+        for (index, manifest) in manifests.into_iter().enumerate() {
             let was_active = matches!(
                 manifest.status,
                 ConversationStatus::Running | ConversationStatus::WaitingPermission
             );
-            let recovered = self.store.recover(&manifest.id).await?;
+            let (recovered, history) = self.store.recover_with_history(&manifest.id).await?;
             let mut expired = std::collections::BTreeMap::new();
             let mut resident_runtimes = std::collections::BTreeSet::new();
-            for event in self.store.complete_history(&manifest.id).await? {
+            for event in history {
                 if event.event_type == "provider.runtime" {
                     if let Some(id) = event.payload.get("runtimeId").and_then(Value::as_str) {
                         match event.payload.get("status").and_then(Value::as_str) {
@@ -323,6 +327,14 @@ impl ConversationSupervisor {
                     }),
                 )
                 .await?;
+            }
+            if (index + 1) % 25 == 0 || index + 1 == total {
+                tracing::info!(
+                    recovered = index + 1,
+                    total,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "conversation recovery progress"
+                );
             }
         }
         self.permissions.expire_all();

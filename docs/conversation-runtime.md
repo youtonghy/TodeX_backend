@@ -34,6 +34,13 @@ index is rebuildable. A local debug fixture with 200 events per page measured
 warm indexing; 10,000 events measured 6084.97 ms versus 199.97 / 78.05 ms. These
 are local measurements, not production latency guarantees.
 
+Before reporting daemon readiness, startup validates each conversation journal
+once and reuses that recovered history to cancel stale approvals and mark
+resident runtimes stopped. Recovery progress is logged every 25 conversations.
+Daemon startup waits up to 120 seconds for initialization; on timeout the
+spawned child is terminated and the daemon log identifies the last recovery
+progress. No in-progress turn is replayed automatically.
+
 Regression coverage includes malformed approvals, provider wire parameters,
 quiet processes and blocked writes, replay/live races, late acknowledgements,
 partial replay approvals, legacy gaps, usage snapshots and status rendering.
