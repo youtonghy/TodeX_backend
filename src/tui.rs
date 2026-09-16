@@ -21,6 +21,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 
 use crate::config::{Config, PairingEncryption, ServeArgs};
 use crate::daemon::{self, DaemonProcess};
@@ -33,6 +34,10 @@ const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
 const EDIT_POPUP_WIDTH: u16 = 64;
+const TICK_MIN_INTERVAL: Duration = Duration::from_millis(50);
+const DAEMON_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+const DAEMON_OP_RETRY_BASE: Duration = Duration::from_millis(500);
+const DAEMON_OP_RETRY_MAX: Duration = Duration::from_secs(8);
 
 mod positioned_backend;
 use positioned_backend::PositionedBackend;
@@ -58,23 +63,36 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let _guard = TerminalGuard;
     let mut app = TuiApp::new(config);
 
-    loop {
+    'main: loop {
+        let tick_started = Instant::now();
         app.refresh_daemon_status();
         app.refresh_device_pairing(false);
         while let Ok(result) = app.daemon_op_rx.try_recv() {
             app.apply_daemon_op_result(result);
         }
+        app.run_pending_daemon_op();
         terminal.draw(|frame| app.render(frame))?;
 
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) => {
+            // Drain bursts of queued events into a single frame so a flood of
+            // terminal input cannot spin this loop faster than intended.
+            loop {
+                if let Event::Key(key) = event::read()? {
                     if app.handle_key(key).await? {
-                        break;
+                        break 'main;
                     }
                 }
-                _ => {}
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
+        }
+
+        // `event::poll` does not pace the loop when buffered input keeps it
+        // returning early; enforce a minimum iteration time instead.
+        let elapsed = tick_started.elapsed();
+        if elapsed < TICK_MIN_INTERVAL {
+            sleep(TICK_MIN_INTERVAL - elapsed).await;
         }
     }
 
@@ -144,6 +162,19 @@ enum DaemonOpKind {
 struct DaemonOpResult {
     kind: DaemonOpKind,
     process: Result<Option<DaemonProcess>, String>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingDaemonOp {
+    kind: DaemonOpKind,
+    not_before: Instant,
+}
+
+fn daemon_op_retry_delay(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(4);
+    DAEMON_OP_RETRY_BASE
+        .saturating_mul(1_u32 << shift)
+        .min(DAEMON_OP_RETRY_MAX)
 }
 
 #[derive(Clone)]
@@ -317,7 +348,9 @@ struct TuiApp {
     folder_picker: Option<FolderPicker>,
     roots_picker: Option<usize>,
     daemon_op: Option<DaemonOpKind>,
-    daemon_op_pending: Option<DaemonOpKind>,
+    daemon_op_pending: Option<PendingDaemonOp>,
+    daemon_op_failures: u32,
+    daemon_status_refreshed_at: Option<Instant>,
     daemon_op_tx: mpsc::UnboundedSender<DaemonOpResult>,
     daemon_op_rx: mpsc::UnboundedReceiver<DaemonOpResult>,
     language: TuiLanguage,
@@ -364,6 +397,8 @@ impl TuiApp {
             roots_picker: None,
             daemon_op: None,
             daemon_op_pending: None,
+            daemon_op_failures: 0,
+            daemon_status_refreshed_at: None,
             daemon_op_tx,
             daemon_op_rx,
             language,
@@ -1333,7 +1368,10 @@ impl TuiApp {
 
     fn queue_daemon_op(&mut self, kind: DaemonOpKind) {
         if self.daemon_op.is_some() {
-            self.daemon_op_pending = Some(kind);
+            self.daemon_op_pending = Some(PendingDaemonOp {
+                kind,
+                not_before: Instant::now(),
+            });
             self.notice = self
                 .text(
                     "Daemon is busy; the operation is queued.",
@@ -1374,8 +1412,10 @@ impl TuiApp {
 
     fn apply_daemon_op_result(&mut self, result: DaemonOpResult) {
         self.daemon_op = None;
+        let failed = result.process.is_err();
         match result.process {
             Ok(process) => {
+                self.daemon_op_failures = 0;
                 self.notice = match (result.kind, process.as_ref()) {
                     (DaemonOpKind::Start, Some(process)) => match self.language {
                         TuiLanguage::English => format!(
@@ -1430,14 +1470,44 @@ impl TuiApp {
                 .to_owned();
                 self.last_error = Some(error.clone());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
+                self.daemon_op_failures = self.daemon_op_failures.saturating_add(1);
             }
         }
-        if let Some(pending) = self.daemon_op_pending.take() {
-            self.queue_daemon_op(pending);
+        // A failed operation delays any queued follow-up: spawning the daemon
+        // executable is evaluated by syspolicyd on every attempt, so retrying
+        // immediately after a rejection creates an evaluation storm.
+        if let Some(mut pending) = self.daemon_op_pending.take() {
+            if failed {
+                pending.not_before =
+                    Instant::now() + daemon_op_retry_delay(self.daemon_op_failures);
+            }
+            self.daemon_op_pending = Some(pending);
         }
+        self.run_pending_daemon_op();
+    }
+
+    fn run_pending_daemon_op(&mut self) {
+        if self.daemon_op.is_some() {
+            return;
+        }
+        let Some(pending) = self.daemon_op_pending else {
+            return;
+        };
+        if Instant::now() < pending.not_before {
+            return;
+        }
+        self.daemon_op_pending = None;
+        self.queue_daemon_op(pending.kind);
     }
 
     fn refresh_daemon_status(&mut self) {
+        if self
+            .daemon_status_refreshed_at
+            .is_some_and(|time| time.elapsed() < DAEMON_STATUS_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        self.daemon_status_refreshed_at = Some(Instant::now());
         let previous_pid = self.daemon.as_ref().map(|process| process.pid);
         match daemon::status(&self.config) {
             Ok(next) => {
@@ -4294,13 +4364,25 @@ mod tests {
         });
 
         app.daemon_op = Some(super::DaemonOpKind::Restart);
-        app.daemon_op_pending = Some(super::DaemonOpKind::Stop);
+        app.daemon_op_pending = Some(super::PendingDaemonOp {
+            kind: super::DaemonOpKind::Stop,
+            not_before: std::time::Instant::now(),
+        });
         app.apply_daemon_op_result(super::DaemonOpResult {
             kind: super::DaemonOpKind::Restart,
             process: Err("boom".to_owned()),
         });
         assert!(app.last_error.is_some());
-        // The pending stop was queued once the restart result was applied.
+        // A failed operation defers the queued op instead of dispatching it
+        // immediately, so repeated failures cannot spawn the daemon binary in
+        // a tight loop.
+        assert!(app.daemon_op.is_none());
+        assert!(app.daemon_op_pending.is_some());
+
+        // Once the backoff elapses the pending stop is dispatched.
+        app.daemon_op_pending.as_mut().unwrap().not_before =
+            std::time::Instant::now() - std::time::Duration::from_secs(1);
+        app.run_pending_daemon_op();
         assert_eq!(app.daemon_op, Some(super::DaemonOpKind::Stop));
         assert!(app.daemon_op_pending.is_none());
 

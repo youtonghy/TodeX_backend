@@ -598,7 +598,41 @@ fn process_liveness(pid: u32) -> ProcessLiveness {
         }
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        // `ps` costs a fork+exec per call; the TUI polls liveness every tick
+        // and each spawn triggers a fresh syspolicyd/XProtect evaluation of
+        // this binary. `proc_pidinfo` answers the same question in-process.
+        let Ok(pid) = libc::c_int::try_from(pid) else {
+            return ProcessLiveness::Missing;
+        };
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+            )
+        };
+        if written != std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int {
+            // ESRCH means the pid is gone; anything else (for example EPERM on
+            // a process owned by another user) means it exists but cannot be
+            // inspected, which must not be reported as "exited".
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => ProcessLiveness::Missing,
+                _ => ProcessLiveness::Running,
+            };
+        }
+        match info.pbi_status {
+            libc::SSTOP => ProcessLiveness::Stopped,
+            libc::SZOMB => ProcessLiveness::Zombie,
+            _ => ProcessLiveness::Running,
+        }
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         let output = Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "state="])
