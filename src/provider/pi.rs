@@ -1171,6 +1171,16 @@ async fn run_pi_turn(
                     .cloned()
                     .unwrap_or(Value::Null);
                 let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
+                // Argument fragments carry no tool call id on the wire; they
+                // would surface as an orphan card next to the execution events.
+                // A start frame without an id cannot merge either, so the
+                // toolcall_end frame gets to introduce the card instead.
+                if delta_type == "toolcall_delta"
+                    || (delta_type == "toolcall_start"
+                        && delta.get("id").and_then(Value::as_str).is_none())
+                {
+                    continue;
+                }
                 let (event_type, category) = if delta_type.starts_with("thinking_") {
                     ("thought.delta", "reasoning")
                 } else if delta_type.starts_with("toolcall_") {
@@ -1187,44 +1197,50 @@ async fn run_pi_turn(
                 };
                 let content_index = delta.get("contentIndex").and_then(Value::as_u64);
                 let block_id = pi_delta_block_id(&delta, &active_message_id, category);
-                sink.emit(
-                    event_type,
-                    json!({
-                        "provider": "pi",
-                        "role": "assistant",
-                        "delta": delta,
-                        "usage": message.get("usage"),
-                        "block": {
-                            "category": category,
-                            "id": block_id,
-                            "turnId": prompt.turn_id,
-                            "phase": phase,
-                            "contentIndex": content_index,
-                        },
-                    }),
-                )
-                .await?;
+                let mut payload = json!({
+                    "provider": "pi",
+                    "role": "assistant",
+                    "delta": delta,
+                    "usage": message.get("usage"),
+                    "block": {
+                        "category": category,
+                        "id": block_id,
+                        "turnId": prompt.turn_id,
+                        "phase": phase,
+                        "contentIndex": content_index,
+                    },
+                });
+                // `toolcall_start` only carries id/toolName; lift them so the
+                // card shows the tool name instead of the raw delta envelope.
+                if delta_type == "toolcall_start" {
+                    payload["toolCallId"] = delta.get("id").cloned().unwrap_or(Value::Null);
+                    payload["toolName"] = delta.get("toolName").cloned().unwrap_or(Value::Null);
+                }
+                sink.emit(event_type, payload).await?;
             }
             Some("tool_execution_start") => {
+                cache_pi_tool_args(&mut rpc.tool_args, &message);
                 sink.emit(
                     "tool.started",
-                    pi_tool_payload(&message, &prompt.turn_id, "started"),
+                    pi_tool_payload(&message, &prompt.turn_id, "started", &rpc.tool_args),
                 )
                 .await?;
             }
             Some("tool_execution_update") => {
+                cache_pi_tool_args(&mut rpc.tool_args, &message);
                 sink.emit(
                     "tool.updated",
-                    pi_tool_payload(&message, &prompt.turn_id, "delta"),
+                    pi_tool_payload(&message, &prompt.turn_id, "delta", &rpc.tool_args),
                 )
                 .await?;
             }
             Some("tool_execution_end") => {
-                sink.emit(
-                    "tool.completed",
-                    pi_tool_payload(&message, &prompt.turn_id, "completed"),
-                )
-                .await?;
+                let payload =
+                    pi_tool_payload(&message, &prompt.turn_id, "completed", &rpc.tool_args);
+                if let Some(id) = message.get("toolCallId").and_then(Value::as_str) {
+                    rpc.tool_args.remove(id);
+                }
+                sink.emit("tool.completed", payload).await?;
             }
             Some("response" | "agent_start" | "agent_end" | "turn_start" | "turn_end") => {}
             Some(event_type) => {
@@ -1531,6 +1547,9 @@ struct PiRpc<'a> {
     ui_values: HashMap<String, Value>,
     ui_emitted_at: HashMap<String, tokio::time::Instant>,
     ui_pending: HashMap<String, (DriverEventSink, Value)>,
+    /// `tool_execution_end` drops `args`; the last known arguments are kept so
+    /// the completed card still shows what ran.
+    tool_args: HashMap<String, Value>,
 }
 
 impl<'a> PiRpc<'a> {
@@ -1562,6 +1581,7 @@ impl<'a> PiRpc<'a> {
             ui_values: HashMap::new(),
             ui_emitted_at: HashMap::new(),
             ui_pending: HashMap::new(),
+            tool_args: HashMap::new(),
         }
     }
 
@@ -2110,6 +2130,12 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                 .cloned()
                 .unwrap_or(Value::Null);
             let kind = delta.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind == "toolcall_delta"
+                || (kind == "toolcall_start"
+                    && delta.get("id").and_then(Value::as_str).is_none())
+            {
+                return Ok(());
+            }
             let (event_type, category) = if kind.starts_with("thinking_") {
                 ("thought.delta", "reasoning")
             } else if kind.starts_with("toolcall_") {
@@ -2130,8 +2156,13 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                 rpc.idle_message_sequence
             );
             let block_id = pi_delta_block_id(&delta, &message_id, category);
-            sink.emit(event_type, json!({"provider":"pi","role":"assistant","delta":delta,"usage":message.get("usage"),
-                "block":{"category":category,"id":block_id,"phase":phase}})).await?;
+            let mut payload = json!({"provider":"pi","role":"assistant","delta":delta,"usage":message.get("usage"),
+                "block":{"category":category,"id":block_id,"phase":phase}});
+            if kind == "toolcall_start" {
+                payload["toolCallId"] = delta.get("id").cloned().unwrap_or(Value::Null);
+                payload["toolName"] = delta.get("toolName").cloned().unwrap_or(Value::Null);
+            }
+            sink.emit(event_type, payload).await?;
         }
         Some("tool_execution_start" | "tool_execution_update" | "tool_execution_end") => {
             let (kind, phase) = match message.get("type").and_then(Value::as_str) {
@@ -2139,9 +2170,21 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                 Some("tool_execution_update") => ("tool.updated", "delta"),
                 _ => ("tool.completed", "completed"),
             };
-            let mut payload = pi_tool_payload(&message, sink.runtime_id().unwrap_or("pi"), phase);
-            clear_pi_turn_identity(&mut payload);
-            sink.emit(kind, payload).await?;
+            if phase == "completed" {
+                let mut payload =
+                    pi_tool_payload(&message, sink.runtime_id().unwrap_or("pi"), phase, &rpc.tool_args);
+                clear_pi_turn_identity(&mut payload);
+                if let Some(id) = message.get("toolCallId").and_then(Value::as_str) {
+                    rpc.tool_args.remove(id);
+                }
+                sink.emit(kind, payload).await?;
+            } else {
+                cache_pi_tool_args(&mut rpc.tool_args, &message);
+                let mut payload =
+                    pi_tool_payload(&message, sink.runtime_id().unwrap_or("pi"), phase, &rpc.tool_args);
+                clear_pi_turn_identity(&mut payload);
+                sink.emit(kind, payload).await?;
+            }
         }
         Some("compaction_start" | "compaction_end") => {
             let kind = if message["type"] == "compaction_start" {
@@ -2179,7 +2222,21 @@ fn clear_pi_turn_identity(payload: &mut Value) {
     }
 }
 
-fn pi_tool_payload(message: &Value, turn_id: &str, phase: &str) -> Value {
+fn cache_pi_tool_args(cache: &mut HashMap<String, Value>, message: &Value) {
+    if let (Some(id), Some(args)) = (
+        message.get("toolCallId").and_then(Value::as_str),
+        message.get("args").filter(|args| !args.is_null()),
+    ) {
+        cache.insert(id.to_owned(), args.clone());
+    }
+}
+
+fn pi_tool_payload(
+    message: &Value,
+    turn_id: &str,
+    phase: &str,
+    args_cache: &HashMap<String, Value>,
+) -> Value {
     let tool_call_id = message
         .get("toolCallId")
         .and_then(Value::as_str)
@@ -2193,11 +2250,17 @@ fn pi_tool_payload(message: &Value, turn_id: &str, phase: &str) -> Value {
                     .unwrap_or("unknown")
             )
         });
+    let arguments = message.get("args").cloned().or_else(|| {
+        message
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .and_then(|id| args_cache.get(id).cloned())
+    });
     json!({
         "provider": "pi",
         "toolCallId": message.get("toolCallId"),
         "toolName": message.get("toolName"),
-        "arguments": message.get("args"),
+        "arguments": arguments,
         "partialResult": message.get("partialResult"),
         "result": message.get("result"),
         "isError": message.get("isError"),
@@ -2403,6 +2466,31 @@ mod tests {
             ),
             "call-1"
         );
+    }
+
+    #[test]
+    fn tool_execution_end_restores_cached_arguments() {
+        let mut cache = HashMap::new();
+        cache_pi_tool_args(
+            &mut cache,
+            &json!({ "toolCallId": "call-1", "toolName": "bash", "args": { "command": "ls" } }),
+        );
+        let payload = pi_tool_payload(
+            &json!({ "toolCallId": "call-1", "toolName": "bash", "result": { "content": [] }, "isError": false }),
+            "turn-1",
+            "completed",
+            &cache,
+        );
+        assert_eq!(payload["arguments"], json!({ "command": "ls" }));
+        assert_eq!(payload["block"]["id"], "call-1");
+        // Calls without a cached start still emit rather than inventing args.
+        let orphan = pi_tool_payload(
+            &json!({ "toolCallId": "call-2", "toolName": "read", "result": null }),
+            "turn-1",
+            "completed",
+            &cache,
+        );
+        assert!(orphan["arguments"].is_null());
     }
     #[cfg(unix)]
     struct Fixture {
