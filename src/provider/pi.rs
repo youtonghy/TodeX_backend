@@ -2131,8 +2131,7 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                 .unwrap_or(Value::Null);
             let kind = delta.get("type").and_then(Value::as_str).unwrap_or("");
             if kind == "toolcall_delta"
-                || (kind == "toolcall_start"
-                    && delta.get("id").and_then(Value::as_str).is_none())
+                || (kind == "toolcall_start" && delta.get("id").and_then(Value::as_str).is_none())
             {
                 return Ok(());
             }
@@ -2171,8 +2170,12 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                 _ => ("tool.completed", "completed"),
             };
             if phase == "completed" {
-                let mut payload =
-                    pi_tool_payload(&message, sink.runtime_id().unwrap_or("pi"), phase, &rpc.tool_args);
+                let mut payload = pi_tool_payload(
+                    &message,
+                    sink.runtime_id().unwrap_or("pi"),
+                    phase,
+                    &rpc.tool_args,
+                );
                 clear_pi_turn_identity(&mut payload);
                 if let Some(id) = message.get("toolCallId").and_then(Value::as_str) {
                     rpc.tool_args.remove(id);
@@ -2180,8 +2183,12 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                 sink.emit(kind, payload).await?;
             } else {
                 cache_pi_tool_args(&mut rpc.tool_args, &message);
-                let mut payload =
-                    pi_tool_payload(&message, sink.runtime_id().unwrap_or("pi"), phase, &rpc.tool_args);
+                let mut payload = pi_tool_payload(
+                    &message,
+                    sink.runtime_id().unwrap_or("pi"),
+                    phase,
+                    &rpc.tool_args,
+                );
                 clear_pi_turn_identity(&mut payload);
                 sink.emit(kind, payload).await?;
             }

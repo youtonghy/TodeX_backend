@@ -1,3 +1,4 @@
+mod agent_providers;
 mod app_state;
 mod catalog;
 mod codex_gateway;

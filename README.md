@@ -37,6 +37,10 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
   - Real-time introspection of native Skills, MCP servers, Slash Commands, and Model catalogs directly from installed providers.
   - Applies project-over-user precedence hierarchy without mutating local provider configurations.
   - Native Skill injection into agent prompts via `resourceId` (no client file uploads required).
+- **Agent Provider Accounts (cc-switch model)**:
+  - `/v2/agent-providers` stores multiple provider/account profiles per agent (Codex, Claude Code, Pi, OpenCode) and activates one by rewriting the agent's native global config (`settings.json`, `config.toml`/`auth.json`, `models.json`, `opencode.json`) so both TodeX-launched and manually started CLI sessions pick it up.
+  - Exclusive agents backfill the current live config into the outgoing profile before switching; additive agents merge managed nodes while leaving external provider entries untouched.
+  - Secret values are masked in API responses and preserved on write-back; model lists are proxied server-side; additive edits carry a content-revision conflict check.
 - **Unified Multiplexed WebSocket (`/v2/ws`)**:
   - Single connection handling conversation streams, turn events, interactive permission requests, local terminal/PTY sessions, and runtime controls.
   - Heartbeat detection, sequence-based reconnection (`afterSequence`), and UTF-8 frame length enforcement.

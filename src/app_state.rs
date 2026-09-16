@@ -9,6 +9,7 @@ use std::{
 use tokio::task::JoinHandle;
 
 use crate::{
+    agent_providers::AgentProviderService,
     catalog::CatalogService,
     codex_gateway::{CodexGatewayStore, CodexLocalAdapterSupervisor},
     config::Config,
@@ -43,6 +44,7 @@ pub struct AppState {
     pub(crate) device_pairing: DevicePairingRegistry,
     pub workspaces: WorkspaceStore,
     pub kanban_tasks: KanbanTaskStore,
+    pub agent_providers: AgentProviderService,
     pub workspace_trust: WorkspaceTrustStore,
     pub(crate) audit_write_lock: Arc<tokio::sync::Mutex<()>>,
     websocket_connections: Arc<AtomicUsize>,
@@ -76,6 +78,7 @@ impl AppState {
         let workspaces =
             WorkspaceStore::new(config.data_dir.clone(), config.workspace_roots.clone()).await?;
         let kanban_tasks = KanbanTaskStore::new(config.data_dir.clone()).await?;
+        let agent_providers = AgentProviderService::new(config.data_dir.clone()).await?;
         let mut workspace_paths_by_owner = HashMap::<String, Vec<PathBuf>>::new();
         for workspace in workspaces.snapshot().await.workspaces {
             workspace_paths_by_owner
@@ -124,6 +127,7 @@ impl AppState {
             device_pairing,
             workspaces,
             kanban_tasks,
+            agent_providers,
             workspace_trust,
             audit_write_lock,
             websocket_connections,

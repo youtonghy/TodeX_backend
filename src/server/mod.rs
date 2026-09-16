@@ -1,3 +1,4 @@
+mod agent_providers;
 mod device_pairing;
 mod git;
 pub mod protocol;

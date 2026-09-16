@@ -75,6 +75,13 @@ POST /v2/providers/{provider}/upgrade
 GET /v2/providers/upgrades/{operationId}
 GET /v2/providers/models?provider=codex&workspace=/home/user/projects/demo
 GET /v2/providers/commands?conversationId={conversationId}
+GET /v2/agent-providers?agent={codex|claude-code|pi|opencode}
+GET /v2/agent-providers/{agent}/live
+PUT /v2/agent-providers/{agent}/{id}
+DELETE /v2/agent-providers/{agent}/{id}
+POST /v2/agent-providers/{agent}/{id}/activate
+POST /v2/agent-providers/{agent}/import-live
+GET /v2/agent-providers/{agent}/{id}/models
 GET /v2/conversations
 POST /v2/conversations
 GET /v2/conversations/{conversationId}
@@ -94,6 +101,12 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 `GET /v2/providers/versions` 在 daemon 所在主机读取配置的六个内建 CLI，并从各自官方发布源查询最新版（OpenCode 查询 GitHub `anomalyco/opencode` 最新 release tag）；Devin 没有只读的最新版本检查接口，`latestVersion` 会保持为空。结果会短时缓存，单个查询失败不会隐藏其他 CLI。ACP profile 作为外部管理项列出，不执行任意 profile 命令，也不提供升级。`POST /v2/providers/{provider}/upgrade` 仅接受 `codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode` 固定标识（OpenCode 执行 `opencode upgrade`），返回异步 operation；客户端使用 operation 查询接口轮询。升级命令不经过 shell、不读取工作区，并在升级后重新调用同一个配置 binary 验证版本。任一 Agent turn、本地 Codex adapter、Provider 发现或另一升级正在启动/运行时会返回 `409 CONFLICT`；升级中的版本查询只返回已有缓存，不会再启动 CLI。CLI 升级在 loopback 部署中也必须携带有效设备签名，以免网页通过跨域请求改变宿主机工具链；已认证的尝试及最终结果会写入审计日志，初始审计记录无法落盘时不会启动升级。
 
 `GET /v2/providers/commands?provider=pi&workspace=/path` 会实时读取 Agent 命令目录。Pi 使用 RPC `get_commands` 返回扩展、Prompt Template 和 Skill；响应失败会作为 Provider 错误返回，成功结果中的 `sourceInfo` 会原样保留。Codex 返回与本机 CLI 版本同步的 TUI 命令适配目录。命令描述包含 `invocation`，客户端应据此选择原生 RPC、桌面动作或 Provider prompt，不要把所有 `/` 输入都当作普通 prompt。 已有会话应使用 `?conversationId=...`：后端先校验 owner，再从会话 manifest 确定 provider 与 workspace，忽略客户端同时提交的对应查询参数。Pi runtime 存在时由同一 worker 发送 `get_commands`，响应含 `catalogSource: "session"` 与 `runtimeId`；尚未启动时使用临时发现进程，返回 `catalogSource: "discovery"`。目录查询总时限为 8 秒。可验证的本地包会附带 `packageName` / `packageVersion`：版本取自实际资源附近的 `package.json`，显式加载的资源还会检查 manifest 的 Pi 入口；无法确认时省略，不从 npm spec 猜测。
+
+`/v2/agent-providers` 实现 cc-switch 同款的多供应商/账户管理，当前覆盖 `codex`、`claude-code`、`pi`、`opencode`。档案库持久化在 `$TODEX_AGENTD_DATA_DIR/agent-providers.json`（owner-only 0600），`settingsConfig` 是不透明的按 Agent 配置：Claude Code 为完整 `settings.json` 对象（`env` 内含 `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL` 等），Codex 为 `{auth, config}`（分别对应 `~/.codex/auth.json` 与 `config.toml` 文本），Pi/OpenCode 为各自 `models.json`/`opencode.json` 中的 provider 节点。
+
+激活（`activate`）改写该 Agent 的全局配置文件，对 TodeX 拉起的会话和终端里直接运行的 CLI 同时生效；运行中的会话不受影响。独占型 Agent（Claude Code、Codex）先把当前 live 配置回填进旧档案再写入新档案，外部编辑与凭据（含 Codex `auth.json`）因此被保留可恢复；`auth` 缺失的 Codex 档案仅在回填成功后删除 `auth.json`。叠加型 Agent（Pi、OpenCode）在保存时即把 provider 节点同步进 live 文件，`activate` 只移动原生默认选中（Pi 写 `settings.json` 的 `defaultProvider`/`defaultModel`；OpenCode 写顶层 `model`，可经请求体 `{"modelId": "..."}` 指定，缺省取首个声明模型）。删除叠加型档案同时移除 live 节点，并清理指向它的默认选中。
+
+`GET` 响应中按字段名模式（`api_key`/`token`/`secret`/`password`/`authorization`/`credential`/`bearer`，含 Codex `config` TOML 内的 `experimental_bearer_token` 与 `http_headers` 值）把密钥替换为 `__TODEX_MASKED__`；写回掩码值表示保留已存密钥，新档案不得携带掩码。`/{id}/models` 由后端携带档案凭据代理请求 `{base}/models`（Claude 为 `/v1/models`），客户端不经手真实密钥。`import-live` 对独占型捕获当前 live 为新档案并记为当前；对叠加型把 live 中未托管节点按 `id` 收编。所有 live 写入为原子 owner-only 文件，叠加型编辑带内容 revision 校验——外部并发修改返回 `409 CONFLICT`，客户端应刷新后重试。
 
 创建对话：
 

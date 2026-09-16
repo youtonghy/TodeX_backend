@@ -81,15 +81,28 @@ impl ProviderDriver for ClaudeDriver {
         &self,
         _workspace: &Path,
     ) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
-        let Some(base) = std::env::var("ANTHROPIC_BASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
+        // The managed provider (live settings.json env) wins over the daemon's
+        // own process environment so the catalog follows the active account.
+        let Some(base) =
+            crate::agent_providers::claude_live_env("ANTHROPIC_BASE_URL").or_else(|| {
+                std::env::var("ANTHROPIC_BASE_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
         else {
             return Ok(claude_model_aliases());
         };
         let url = format!("{}/v1/models", base.trim_end_matches('/'));
-        let response = reqwest::Client::new()
-            .get(url)
+        let request = reqwest::Client::new().get(url);
+        let request = match crate::agent_providers::claude_live_env("ANTHROPIC_AUTH_TOKEN")
+            .or_else(|| std::env::var("ANTHROPIC_AUTH_TOKEN").ok())
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(token) => request.header("x-api-key", token),
+            None => request,
+        };
+        let response = request
+            .header("anthropic-version", "2023-06-01")
             .send()
             .await
             .map_err(|error| {

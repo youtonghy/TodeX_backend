@@ -33,6 +33,7 @@ use crate::workspace_paths::{
 };
 use crate::workspace_store::{RejectedWorkspace, WorkspaceRecord};
 
+use super::agent_providers;
 use super::git;
 use super::websocket::{self, AuthContext};
 
@@ -151,6 +152,7 @@ fn authenticated_routes() -> Router<AppState> {
         .route("/v2/providers/models", get(provider_models))
         .route("/v2/providers/image-input", get(provider_image_input))
         .route("/v2/providers/commands", get(provider_commands))
+        .merge(agent_providers::routes())
         .route(
             "/v2/conversations/{conversation_id}/runtime/stop",
             post(stop_provider_runtime),
@@ -2692,7 +2694,7 @@ fn prompt_skills(skills: Vec<PromptSkillRequest>) -> Vec<PromptSkillRef> {
         .collect()
 }
 
-fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<AuthContext, AppError> {
+pub(super) fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<AuthContext, AppError> {
     device_auth::verified_context(state, headers)
 }
 
