@@ -233,19 +233,44 @@ fn new_worktree_path(roots: &[PathBuf], value: &str) -> Result<PathBuf> {
             "Worktree path must be absolute without relative components",
         ));
     }
-    let parent = path
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Err(invalid("Worktree destination must not already exist")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(AppError::Io(error)),
+    }
+    // Intermediate directories may not exist yet (for example the `todex/`
+    // prefix of a `todex/name` layout). The deepest existing ancestor must be a
+    // real directory inside the allowed roots; the missing tail is created one
+    // component at a time so a planted symlink can never redirect it outside.
+    let mut missing = Vec::new();
+    let mut cursor = path
         .parent()
         .ok_or_else(|| invalid("Worktree needs a parent directory"))?;
-    let parent = validate_workspace_directory(roots, parent)?;
+    let ancestor = loop {
+        match std::fs::symlink_metadata(cursor) {
+            Ok(_) => break cursor,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(cursor);
+                cursor = cursor
+                    .parent()
+                    .ok_or_else(|| invalid("Worktree needs a parent directory"))?;
+            }
+            Err(error) => return Err(AppError::Io(error)),
+        }
+    };
+    validate_workspace_directory(roots, ancestor)?;
+    for directory in missing.iter().rev() {
+        std::fs::create_dir(directory).map_err(AppError::Io)?;
+    }
+    let parent = std::fs::canonicalize(
+        path.parent()
+            .ok_or_else(|| invalid("Worktree needs a parent directory"))?,
+    )
+    .map_err(AppError::Io)?;
     let name = path
         .file_name()
         .ok_or_else(|| invalid("Worktree needs a directory name"))?;
-    let destination = parent.join(name);
-    match std::fs::symlink_metadata(&destination) {
-        Ok(_) => Err(invalid("Worktree destination must not already exist")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(destination),
-        Err(error) => Err(AppError::Io(error)),
-    }
+    Ok(parent.join(name))
 }
 
 pub(crate) async fn operate(
@@ -838,6 +863,41 @@ mod tests {
             })
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_makes_missing_parent_directories() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        fixture.seed().await;
+        let tree = fixture.root.join("todex/nested/tree");
+        fixture
+            .action(GitOperation::CreateWorktree {
+                path: tree.display().to_string(),
+                branch_name: "todex/nested".into(),
+                start_point: None,
+            })
+            .await
+            .unwrap();
+        assert!(tree.join("README.md").exists());
+        assert!(snapshot(&[fixture.root.clone()], &fixture.repo)
+            .await
+            .unwrap()
+            .worktrees
+            .iter()
+            .any(|item| Path::new(&item.path) == tree));
+        // A planted symlink in the path can never redirect creation outside roots.
+        let outside = Fixture::new();
+        symlink(&outside.root, fixture.root.join("escape")).unwrap();
+        assert!(fixture
+            .action(GitOperation::CreateWorktree {
+                path: fixture.root.join("escape/inner/tree").display().to_string(),
+                branch_name: "escape".into(),
+                start_point: None,
+            })
+            .await
+            .is_err());
+        assert!(!outside.root.join("inner").exists());
     }
 
     #[tokio::test]
