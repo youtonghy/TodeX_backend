@@ -12,4 +12,6 @@ pub use model::{
     CONVERSATION_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES,
 };
 pub use store::ConversationStore;
+#[cfg(test)]
+pub(crate) use store::MAX_EVENTS_JOURNAL_BYTES;
 pub use summary::summarize_event;

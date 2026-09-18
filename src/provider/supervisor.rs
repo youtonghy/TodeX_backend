@@ -265,68 +265,17 @@ impl ConversationSupervisor {
         let manifests = self.store.list().await?;
         let total = manifests.len();
         tracing::info!(conversations = total, "recovering conversation journals");
+        let mut failed = 0usize;
         for (index, manifest) in manifests.into_iter().enumerate() {
-            let was_active = matches!(
-                manifest.status,
-                ConversationStatus::Running | ConversationStatus::WaitingPermission
-            );
-            let (recovered, history) = self.store.recover_with_history(&manifest.id).await?;
-            let mut expired = std::collections::BTreeMap::new();
-            let mut resident_runtimes = std::collections::BTreeSet::new();
-            for event in history {
-                if event.event_type == "provider.runtime" {
-                    if let Some(id) = event.payload.get("runtimeId").and_then(Value::as_str) {
-                        match event.payload.get("status").and_then(Value::as_str) {
-                            Some("ready") => {
-                                resident_runtimes.insert(id.to_owned());
-                            }
-                            Some("stopped") => {
-                                resident_runtimes.remove(id);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                if let Some(id) = event.payload.get("permissionId").and_then(Value::as_str) {
-                    match event.event_type.as_str() {
-                        "permission.requested" | "tool.awaitingApproval" => {
-                            expired.insert(id.to_owned(), json!({"scope":event.payload.get("scope"),"runtimeId":event.payload.get("runtimeId")}));
-                        }
-                        "permission.resolved" => {
-                            expired.remove(id);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            for (permission_id, context) in expired {
-                self.emit(&manifest.id, "permission.resolved", json!({
-                    "permissionId": permission_id, "outcome": "cancelled", "optionId": Value::Null,
-                    "reason": "daemon_restarted", "scope":context.get("scope"),"runtimeId":context.get("runtimeId"),
-                })).await?;
-            }
-            for runtime_id in resident_runtimes {
-                self.emit(
-                    &manifest.id,
-                    "provider.runtime",
-                    json!({
-                        "provider":manifest.provider,"runtimeId":runtime_id,"scope":"session",
-                        "status":"stopped","reason":"daemon_restarted",
-                    }),
-                )
-                .await?;
-            }
-
-            if was_active {
-                self.emit(
-                    &recovered.id,
-                    "conversation.interrupted",
-                    json!({
-                        "reason": "daemon_restarted",
-                        "message": "The previous in-progress turn was interrupted; it was not replayed.",
-                    }),
-                )
-                .await?;
+            // A single unreadable or exhausted journal must not keep the daemon
+            // from starting; recover the rest and report the failures.
+            if let Err(error) = self.recover_conversation(&manifest).await {
+                failed += 1;
+                tracing::error!(
+                    conversation_id = %manifest.id,
+                    error = %error,
+                    "conversation recovery failed; continuing startup"
+                );
             }
             if (index + 1) % 25 == 0 || index + 1 == total {
                 tracing::info!(
@@ -337,7 +286,80 @@ impl ConversationSupervisor {
                 );
             }
         }
+        if failed > 0 {
+            tracing::warn!(
+                failed,
+                total,
+                "conversation recovery finished with failures"
+            );
+        }
         self.permissions.expire_all();
+        Ok(())
+    }
+
+    async fn recover_conversation(&self, manifest: &ConversationManifest) -> Result<(), AppError> {
+        let was_active = matches!(
+            manifest.status,
+            ConversationStatus::Running | ConversationStatus::WaitingPermission
+        );
+        let (recovered, history) = self.store.recover_with_history(&manifest.id).await?;
+        let mut expired = std::collections::BTreeMap::new();
+        let mut resident_runtimes = std::collections::BTreeSet::new();
+        for event in history {
+            if event.event_type == "provider.runtime" {
+                if let Some(id) = event.payload.get("runtimeId").and_then(Value::as_str) {
+                    match event.payload.get("status").and_then(Value::as_str) {
+                        Some("ready") => {
+                            resident_runtimes.insert(id.to_owned());
+                        }
+                        Some("stopped") => {
+                            resident_runtimes.remove(id);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(id) = event.payload.get("permissionId").and_then(Value::as_str) {
+                match event.event_type.as_str() {
+                    "permission.requested" | "tool.awaitingApproval" => {
+                        expired.insert(id.to_owned(), json!({"scope":event.payload.get("scope"),"runtimeId":event.payload.get("runtimeId")}));
+                    }
+                    "permission.resolved" => {
+                        expired.remove(id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (permission_id, context) in expired {
+            self.emit(&manifest.id, "permission.resolved", json!({
+                "permissionId": permission_id, "outcome": "cancelled", "optionId": Value::Null,
+                "reason": "daemon_restarted", "scope":context.get("scope"),"runtimeId":context.get("runtimeId"),
+            })).await?;
+        }
+        for runtime_id in resident_runtimes {
+            self.emit(
+                &manifest.id,
+                "provider.runtime",
+                json!({
+                    "provider":manifest.provider,"runtimeId":runtime_id,"scope":"session",
+                    "status":"stopped","reason":"daemon_restarted",
+                }),
+            )
+            .await?;
+        }
+
+        if was_active {
+            self.emit(
+                &recovered.id,
+                "conversation.interrupted",
+                json!({
+                    "reason": "daemon_restarted",
+                    "message": "The previous in-progress turn was interrupted; it was not replayed.",
+                }),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -2131,7 +2153,9 @@ mod tests {
 
     use super::*;
     use crate::config::{AcpProfileConfig, AgentConfig, PairingEncryption, SecurityConfig};
-    use crate::conversation::{ConversationEventHub, ConversationStore};
+    use crate::conversation::{
+        ConversationEvent, ConversationEventHub, ConversationStore, MAX_EVENTS_JOURNAL_BYTES,
+    };
 
     async fn trust_store(
         config: &Config,
@@ -2483,6 +2507,96 @@ mod tests {
         assert_eq!(
             store.complete_history(&manifest.id).await.unwrap().len(),
             count
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recover_all_skips_a_conversation_whose_journal_cannot_grow() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-recover-full-journal").await;
+        let healthy = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                workspace.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(&healthy.id, "turn.started", json!({ "turnId": "t" }))
+            .await
+            .unwrap();
+
+        // A journal packed with small strings has nothing compaction can
+        // truncate; once it reaches the cap, recovery bookkeeping cannot be
+        // appended but startup must still recover the other journals.
+        let wedged = ConversationManifest::new(ProviderKind::Codex, workspace, None, None);
+        let wedged_id = wedged.id.clone();
+        let chunk = "x".repeat(3900);
+        let mut events = Vec::new();
+        let mut bytes = 0u64;
+        loop {
+            let event = ConversationEvent::new(
+                &wedged_id,
+                events.len() as u64 + 1,
+                "provider.event",
+                json!({ "items": vec![chunk.clone(); 16] }),
+            );
+            let len = serde_json::to_vec(&event).unwrap().len() as u64 + 1;
+            if bytes + len > MAX_EVENTS_JOURNAL_BYTES - 4096 {
+                break;
+            }
+            bytes += len;
+            events.push(event);
+        }
+        // An unresolved permission request sized to leave less headroom than
+        // the resolution event recovery tries to append.
+        let probe = ConversationEvent::new(
+            &wedged_id,
+            events.len() as u64 + 1,
+            "permission.requested",
+            json!({ "permissionId": "stuck", "items": [] }),
+        );
+        let base = serde_json::to_vec(&probe).unwrap().len() as u64 + 1;
+        let mut count = (MAX_EVENTS_JOURNAL_BYTES - bytes - 96 - base) / 13;
+        let event = loop {
+            let event = ConversationEvent::new(
+                &wedged_id,
+                events.len() as u64 + 1,
+                "permission.requested",
+                json!({
+                    "permissionId": "stuck",
+                    "items": (0..count).map(|index| format!("pad-{index:06}")).collect::<Vec<_>>(),
+                }),
+            );
+            let len = serde_json::to_vec(&event).unwrap().len() as u64 + 1;
+            if bytes + len <= MAX_EVENTS_JOURNAL_BYTES - 32 {
+                break event;
+            }
+            count -= 1;
+        };
+        events.push(event);
+        store
+            .create_with_history(wedged, events, None, None)
+            .await
+            .unwrap();
+
+        supervisor.recover_all().await.unwrap();
+        assert_eq!(
+            store.get(&healthy.id).await.unwrap().status,
+            ConversationStatus::Interrupted
+        );
+        assert!(store
+            .complete_history(&healthy.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "conversation.interrupted"));
+        assert_eq!(
+            store.get(&wedged_id).await.unwrap().status,
+            ConversationStatus::Interrupted
         );
         fs::remove_dir_all(root).unwrap();
     }

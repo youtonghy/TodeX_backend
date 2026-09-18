@@ -23,7 +23,7 @@ const EVENTS_FILE: &str = "events.jsonl";
 const SNAPSHOT_FILE: &str = "snapshot.json";
 const PROVIDER_STATE_FILE: &str = "provider-state.json";
 const MAX_REPLAY_LIMIT: usize = 1000;
-const MAX_EVENTS_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_EVENTS_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 /// On overflow the journal is rewritten below this target so the next bursts
 /// of events fit without compacting again on every append.
 const JOURNAL_COMPACT_TARGET_BYTES: u64 = MAX_EVENTS_JOURNAL_BYTES * 3 / 4;
