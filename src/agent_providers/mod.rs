@@ -548,6 +548,36 @@ impl AgentProviderService {
         })?;
         model_fetch::fetch_models(agent, &profile.settings_config).await
     }
+
+    /// Fetch the model catalog for a proposed settingsConfig — the provider
+    /// editor posts its current form before saving. Masked secrets resolve
+    /// against the stored profile or the live additive node of the same id.
+    pub async fn preview_models(
+        &self,
+        agent: ProviderKind,
+        id: &str,
+        settings_config: Value,
+    ) -> Result<Value, AppError> {
+        if !settings_config.is_object() {
+            return Err(AppError::InvalidRequest(
+                "settingsConfig must be a JSON object".to_owned(),
+            ));
+        }
+        if serde_json::to_vec(&settings_config)?.len() > MAX_PROVIDER_SETTINGS_BYTES {
+            return Err(AppError::InvalidRequest(format!(
+                "settingsConfig exceeds the {} byte limit",
+                MAX_PROVIDER_SETTINGS_BYTES
+            )));
+        }
+        let existing = match self.store.profile(agent, id).await {
+            Some(profile) => Some(profile.settings_config),
+            None if is_additive(agent) => additive_nodes(&self.dirs(), agent)?.get(id).cloned(),
+            None => None,
+        };
+        let mut settings_config = settings_config;
+        restore_masked(agent, &mut settings_config, existing.as_ref());
+        model_fetch::fetch_models(agent, &settings_config).await
+    }
 }
 
 // ---------- per-agent live dispatch ----------
@@ -1267,6 +1297,71 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn pi_preview_models_restores_live_node_secret() {
+        let temp = TestRoot::new();
+        let service = service_in(temp.path()).await;
+        let dirs = dirs_in(temp.path());
+
+        // Stub catalog endpoint returning one model; captures the request.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let read = socket.read(&mut buf).await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf[..read]).to_string());
+            let body = r#"{"data":[{"id":"m-live","name":"Live"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        // The unmanaged live node holds the real key; the editor posts the mask.
+        pi::upsert_provider(
+            &dirs,
+            "pico",
+            &json!({
+                "baseUrl": format!("http://{addr}/v1"),
+                "api": "openai-completions",
+                "apiKey": "k-live",
+                "models": []
+            }),
+        )
+        .unwrap();
+
+        let preview = json!({
+            "baseUrl": format!("http://{addr}/v1"),
+            "api": "openai-completions",
+            "apiKey": MASKED_SECRET,
+            "models": []
+        });
+        let result = service
+            .preview_models(ProviderKind::Pi, "pico", preview)
+            .await
+            .unwrap();
+        assert_eq!(result["models"][0]["id"], "m-live");
+
+        let request = rx.await.unwrap();
+        assert!(request.starts_with("GET /v1/models "));
+        assert!(request.contains("authorization: Bearer k-live"));
+    }
+
+    #[tokio::test]
+    async fn preview_models_rejects_non_object_config() {
+        let temp = TestRoot::new();
+        let service = service_in(temp.path()).await;
+        let error = service
+            .preview_models(ProviderKind::Pi, "pico", json!("nope"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::InvalidRequest(_)));
     }
 
     #[test]

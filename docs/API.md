@@ -82,6 +82,7 @@ DELETE /v2/agent-providers/{agent}/{id}
 POST /v2/agent-providers/{agent}/{id}/activate
 POST /v2/agent-providers/{agent}/import-live
 GET /v2/agent-providers/{agent}/{id}/models
+POST /v2/agent-providers/{agent}/{id}/models
 GET /v2/conversations
 POST /v2/conversations
 GET /v2/conversations/{conversationId}
@@ -106,7 +107,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 激活（`activate`）改写该 Agent 的全局配置文件，对 TodeX 拉起的会话和终端里直接运行的 CLI 同时生效；运行中的会话不受影响。独占型 Agent（Claude Code、Codex）先把当前 live 配置回填进旧档案再写入新档案，外部编辑与凭据（含 Codex `auth.json`）因此被保留可恢复；`auth` 缺失的 Codex 档案仅在回填成功后删除 `auth.json`。叠加型 Agent（Pi、OpenCode）在保存时即把 provider 节点同步进 live 文件，`activate` 只移动原生默认选中（Pi 写 `settings.json` 的 `defaultProvider`/`defaultModel`；OpenCode 写顶层 `model`，可经请求体 `{"modelId": "..."}` 指定，缺省取首个声明模型）。删除叠加型档案同时移除 live 节点，并清理指向它的默认选中。
 
-`GET` 响应中按字段名模式（`api_key`/`token`/`secret`/`password`/`authorization`/`credential`/`bearer`，含 Codex `config` TOML 内的 `experimental_bearer_token` 与 `http_headers` 值）把密钥替换为 `__TODEX_MASKED__`；写回掩码值表示保留已存密钥，新档案不得携带掩码。`/{id}/models` 由后端携带档案凭据代理请求 `{base}/models`（Claude 为 `/v1/models`），客户端不经手真实密钥。`import-live` 对独占型捕获当前 live 为新档案并记为当前；对叠加型把 live 中未托管节点按 `id` 收编。所有 live 写入为原子 owner-only 文件，叠加型编辑带内容 revision 校验——外部并发修改返回 `409 CONFLICT`，客户端应刷新后重试。
+`GET` 响应中按字段名模式（`api_key`/`token`/`secret`/`password`/`authorization`/`credential`/`bearer`，含 Codex `config` TOML 内的 `experimental_bearer_token` 与 `http_headers` 值）把密钥替换为 `__TODEX_MASKED__`；写回掩码值表示保留已存密钥，新档案不得携带掩码。`/{id}/models` 由后端携带档案凭据代理请求 `{base}/models`（Claude 为 `/v1/models`），客户端不经手真实密钥。`GET` 读取已存档案；`POST` 接受 `{"settingsConfig": {...}}` 用于保存前的预览拉取，掩码值按同 id 的已存档案或叠加型 live 节点还原。`import-live` 对独占型捕获当前 live 为新档案并记为当前；对叠加型把 live 中未托管节点按 `id` 收编。所有 live 写入为原子 owner-only 文件，叠加型编辑带内容 revision 校验——外部并发修改返回 `409 CONFLICT`，客户端应刷新后重试。
 
 创建对话：
 

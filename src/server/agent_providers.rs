@@ -35,7 +35,7 @@ pub(super) fn routes() -> Router<AppState> {
         )
         .route(
             "/v2/agent-providers/{agent}/{id}/models",
-            get(agent_provider_models),
+            get(agent_provider_models).post(preview_agent_provider_models),
         )
 }
 
@@ -118,4 +118,27 @@ async fn agent_provider_models(
     require_auth(&state, &headers)?;
     let agent = agent_providers::supported_agent(&agent)?;
     Ok(Json(state.agent_providers.models(agent, &id).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewModelsInput {
+    #[serde(default)]
+    settings_config: Value,
+}
+
+async fn preview_agent_provider_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((agent, id)): AxumPath<(String, String)>,
+    Json(input): Json<PreviewModelsInput>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let agent = agent_providers::supported_agent(&agent)?;
+    Ok(Json(
+        state
+            .agent_providers
+            .preview_models(agent, &id, input.settings_config)
+            .await?,
+    ))
 }
