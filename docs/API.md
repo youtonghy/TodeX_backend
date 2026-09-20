@@ -162,7 +162,9 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 }
 ```
 
-支持 `conversation.subscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
+支持 `conversation.subscribe`、`conversation.unsubscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
+
+每条 socket 最多同时持有 128 个会话订阅，超出后 `conversation.subscribe` 返回 `INVALID_REQUEST`。`conversation.unsubscribe` 的 payload 为 `{ "conversationId": "..." }`，释放该订阅槽位并停止转发任务，幂等且返回 `{ "conversationId", "unsubscribed" }`；订阅任务因补放失败终止时发出的 `server.error` 在 `payload.conversationId` 中携带会话 ID，客户端可据此清理本地订阅记录并重订阅。删除会话（含过期清理）会关闭其广播通道，等同于终止该会话的全部订阅。
 
 MCP 真实调用只走 Backend：客户端只发送 `resourceId`、`toolName` 和对象类型的 `arguments`。Catalog JSON 不含 command、URL 或凭据。调用前必须通过权限 broker，默认拒绝；仅 `allow_once` / `allow_always` 会放行。Backend 使用标准 MCP SDK 连接 stdio JSONL 或 Streamable HTTP transport，并对初始化、调用和关闭分别设置时限。
 

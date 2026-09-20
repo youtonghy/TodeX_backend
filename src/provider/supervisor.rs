@@ -659,6 +659,9 @@ impl ConversationSupervisor {
             .shutdown_session_with_reason(&manifest.id, "conversation_deleted")
             .await;
         self.store.delete(&manifest.id).await?;
+        // Close the broadcast channel so live websocket subscriptions exit
+        // instead of holding their per-connection slot forever.
+        self.hub.remove(&manifest.id);
         Ok(manifest)
     }
 
@@ -679,6 +682,7 @@ impl ConversationSupervisor {
                 .driver(manifest.provider)?
                 .shutdown_session_with_reason(&manifest.id, "conversation_expired")
                 .await;
+            self.hub.remove(&manifest.id);
         }
         Ok(removed)
     }

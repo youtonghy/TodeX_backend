@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::FileType;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
@@ -64,6 +64,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
     matches!(
         command_type,
         "conversation.subscribe"
+            | "conversation.unsubscribe"
             | "conversation.create"
             | "conversation.prompt"
             | "conversation.followUp"
@@ -2069,7 +2070,7 @@ async fn handle_socket(
     });
 
     let subscriptions = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let mut subscription_tasks = Vec::new();
+    let mut subscription_tasks = HashMap::<String, tokio::task::JoinHandle<()>>::new();
     let operation_limit = Arc::new(Semaphore::new(MAX_WS_IN_FLIGHT_OPERATIONS));
     let mut operation_tasks = Vec::new();
     let client_timeout = tokio::time::Duration::from_secs(WS_CLIENT_TIMEOUT_SECS);
@@ -2198,7 +2199,7 @@ async fn handle_socket(
         }
     }
 
-    for task in subscription_tasks {
+    for (_, task) in subscription_tasks {
         task.abort();
     }
     for task in operation_tasks {
@@ -2233,10 +2234,13 @@ async fn dispatch_command(
     outgoing: &mpsc::Sender<Value>,
     subscriptions: &Arc<Mutex<HashSet<String>>>,
     event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
-    subscription_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    subscription_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     owner_id: &str,
     command: V2Command,
 ) -> Option<Value> {
+    // Reap forwarding tasks that exited on their own (channel closed, send
+    // failure) so the map does not accumulate finished handles.
+    subscription_tasks.retain(|_, task| !task.is_finished());
     let result = dispatch_command_inner(
         state,
         outgoing,
@@ -2262,7 +2266,7 @@ async fn dispatch_command_inner(
     outgoing: &mpsc::Sender<Value>,
     subscriptions: &Arc<Mutex<HashSet<String>>>,
     event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
-    subscription_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    subscription_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     owner_id: &str,
     command: &V2Command,
 ) -> Result<Value, AppError> {
@@ -2330,7 +2334,7 @@ async fn dispatch_command_inner(
             let owner_id = owner_id.to_owned();
             let conversations = state.conversations.clone();
             let active_subscriptions = subscriptions.clone();
-            subscription_tasks.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let mut delivered_through = high_water;
                 loop {
                     match receiver.recv().await {
@@ -2352,7 +2356,9 @@ async fn dispatch_command_inner(
                                     Ok::<(), AppError>(())
                                 }.await;
                                 if let Err(error) = recovery {
-                                    let _ = outgoing.send(error_response(None, error)).await;
+                                    let mut frame = error_response(None, error);
+                                    frame["payload"]["conversationId"] = json!(conversation_id);
+                                    let _ = outgoing.send(frame).await;
                                     break;
                                 }
                             }
@@ -2419,7 +2425,9 @@ async fn dispatch_command_inner(
                             }
                             .await;
                             if let Err(error) = recovery {
-                                let _ = outgoing.send(error_response(None, error)).await;
+                                let mut frame = error_response(None, error);
+                                frame["payload"]["conversationId"] = json!(conversation_id);
+                                let _ = outgoing.send(frame).await;
                                 break;
                             }
                         }
@@ -2427,12 +2435,27 @@ async fn dispatch_command_inner(
                     }
                 }
                 active_subscriptions.lock().await.remove(&conversation_id);
-            }));
+            });
+            if let Some(previous) = subscription_tasks.insert(request.conversation_id.clone(), task)
+            {
+                previous.abort();
+            }
             Ok(json!({
                 "conversationId": request.conversation_id,
                 "subscribed": true,
                 "nextSequence": high_water,
                 "hasMore": false,
+            }))
+        }
+        "conversation.unsubscribe" => {
+            let request: UnsubscribeRequest = serde_json::from_value(command.payload.clone())?;
+            let was_subscribed = subscriptions.lock().await.remove(&request.conversation_id);
+            if let Some(task) = subscription_tasks.remove(&request.conversation_id) {
+                task.abort();
+            }
+            Ok(json!({
+                "conversationId": request.conversation_id,
+                "unsubscribed": was_subscribed,
             }))
         }
         "conversation.create" => {
@@ -3007,6 +3030,12 @@ struct SubscribeRequest {
     after_sequence: Option<u64>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnsubscribeRequest {
+    conversation_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3623,7 +3652,7 @@ mod tests {
         let event_scope = Arc::new(tokio::sync::RwLock::new(
             websocket::LegacyEventScope::default(),
         ));
-        let mut subscription_tasks = Vec::new();
+        let mut subscription_tasks = HashMap::new();
         let result = dispatch_command_inner(
             &state,
             &outgoing,
@@ -3653,7 +3682,7 @@ mod tests {
             sequences.push(event["payload"]["sequence"].as_u64().unwrap());
         }
         assert_eq!(sequences, vec![1, 2, 3, 4]);
-        for task in subscription_tasks {
+        for (_, task) in subscription_tasks {
             task.abort();
         }
 
@@ -3662,7 +3691,7 @@ mod tests {
         let future_scope = Arc::new(tokio::sync::RwLock::new(
             websocket::LegacyEventScope::default(),
         ));
-        let mut future_tasks = Vec::new();
+        let mut future_tasks = HashMap::new();
         let result = dispatch_command_inner(
             &state,
             &future_outgoing,
@@ -3720,9 +3749,246 @@ mod tests {
                 if expected == 6 { "replay" } else { "live" }
             );
         }
-        for task in future_tasks {
+        for (_, task) in future_tasks {
             task.abort();
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_unsubscribe_releases_the_subscription_slot() {
+        let root = std::env::temp_dir().join(format!("todex-v2-unsub-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root],
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+        })
+        .await
+        .unwrap();
+        let store = ConversationStore::new(state.config.data_dir.clone())
+            .await
+            .unwrap();
+        let hub = ConversationEventHub::default();
+        state.conversations = ConversationSupervisor::new(
+            state.config.clone(),
+            store.clone(),
+            hub.clone(),
+            state.workspace_trust.clone(),
+        );
+        let manifest = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::Codex,
+                workspace,
+                Some("Unsubscribe fixture".to_owned()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (outgoing, _events) = mpsc::channel(16);
+        let subscriptions = Arc::new(Mutex::new(HashSet::new()));
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        let mut subscription_tasks = HashMap::new();
+        let subscribed = dispatch_command_inner(
+            &state,
+            &outgoing,
+            &subscriptions,
+            &event_scope,
+            &mut subscription_tasks,
+            "local",
+            &V2Command {
+                id: "sub".to_owned(),
+                command_type: "conversation.subscribe".to_owned(),
+                payload: json!({ "conversationId": manifest.id }),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(subscribed["subscribed"], true);
+        assert_eq!(subscription_tasks.len(), 1);
+
+        let result = dispatch_command_inner(
+            &state,
+            &outgoing,
+            &subscriptions,
+            &event_scope,
+            &mut subscription_tasks,
+            "local",
+            &V2Command {
+                id: "unsub".to_owned(),
+                command_type: "conversation.unsubscribe".to_owned(),
+                payload: json!({ "conversationId": manifest.id }),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["unsubscribed"], true);
+        assert!(subscriptions.lock().await.is_empty());
+        assert!(subscription_tasks.is_empty());
+
+        // Unsubscribing an absent conversation is idempotent, and the freed
+        // slot accepts a fresh subscription.
+        let repeated = dispatch_command_inner(
+            &state,
+            &outgoing,
+            &subscriptions,
+            &event_scope,
+            &mut subscription_tasks,
+            "local",
+            &V2Command {
+                id: "unsub-again".to_owned(),
+                command_type: "conversation.unsubscribe".to_owned(),
+                payload: json!({ "conversationId": manifest.id }),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated["unsubscribed"], false);
+
+        let resubscribed = dispatch_command_inner(
+            &state,
+            &outgoing,
+            &subscriptions,
+            &event_scope,
+            &mut subscription_tasks,
+            "local",
+            &V2Command {
+                id: "resub".to_owned(),
+                command_type: "conversation.subscribe".to_owned(),
+                payload: json!({ "conversationId": manifest.id }),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resubscribed["subscribed"], true);
+        for (_, task) in subscription_tasks {
+            task.abort();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_subscribe_beyond_limit_is_rejected() {
+        let root = std::env::temp_dir().join(format!("todex-v2-sublimit-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root],
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+        })
+        .await
+        .unwrap();
+        let store = ConversationStore::new(state.config.data_dir.clone())
+            .await
+            .unwrap();
+        let hub = ConversationEventHub::default();
+        state.conversations = ConversationSupervisor::new(
+            state.config.clone(),
+            store.clone(),
+            hub.clone(),
+            state.workspace_trust.clone(),
+        );
+        let manifest = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::Codex,
+                workspace,
+                Some("Limit fixture".to_owned()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (outgoing, _events) = mpsc::channel(16);
+        let subscriptions = Arc::new(Mutex::new(
+            (0..MAX_WS_SUBSCRIPTIONS)
+                .map(|index| format!("occupied-{index}"))
+                .collect::<HashSet<_>>(),
+        ));
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        let mut subscription_tasks = HashMap::new();
+        let error = dispatch_command_inner(
+            &state,
+            &outgoing,
+            &subscriptions,
+            &event_scope,
+            &mut subscription_tasks,
+            "local",
+            &V2Command {
+                id: "over-limit".to_owned(),
+                command_type: "conversation.subscribe".to_owned(),
+                payload: json!({ "conversationId": manifest.id }),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "INVALID_REQUEST");
         let _ = fs::remove_dir_all(root);
     }
 
