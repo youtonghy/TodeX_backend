@@ -12,6 +12,8 @@ pub use model::{
     CONVERSATION_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES,
 };
 pub use store::ConversationStore;
-#[cfg(test)]
+// Only the unix-gated supervisor tests consume this; keep the same gate so
+// windows test builds do not trip -D unused-imports.
+#[cfg(all(test, unix))]
 pub(crate) use store::MAX_EVENTS_JOURNAL_BYTES;
 pub use summary::summarize_event;
