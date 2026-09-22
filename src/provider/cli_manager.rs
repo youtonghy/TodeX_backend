@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::conversation::ProviderKind;
 use crate::error::AppError;
 
 use super::process::{run_bounded_command, CommandSpec};
@@ -43,7 +44,7 @@ impl ManagedCli {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
             Self::Pi => "Pi",
@@ -54,7 +55,18 @@ impl ManagedCli {
         }
     }
 
-    fn binary(self, config: &Config) -> &str {
+    pub(crate) fn provider_kind(self) -> ProviderKind {
+        match self {
+            Self::Codex => ProviderKind::Codex,
+            Self::Pi => ProviderKind::Pi,
+            Self::ClaudeCode => ProviderKind::ClaudeCode,
+            Self::GrokBuild => ProviderKind::GrokBuild,
+            Self::Devin => ProviderKind::Devin,
+            Self::Opencode => ProviderKind::Opencode,
+        }
+    }
+
+    pub(crate) fn binary(self, config: &Config) -> &str {
         match self {
             Self::Codex => &config.agent.codex_bin,
             Self::Pi => &config.agent.pi_bin,

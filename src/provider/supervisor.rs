@@ -28,9 +28,11 @@ use crate::workspace_trust::WorkspaceTrustStore;
 
 use super::acp::AcpDriver;
 use super::claude::ClaudeDriver;
+use super::cli_manager::ManagedCli;
 use super::codex::CodexDriver;
 use super::grok::GrokBuildDriver;
 use super::pi::PiDriver;
+use super::process::same_executable;
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill, ImageInputMode,
     PermissionBroker, PermissionDecision, PermissionOutcome, ProviderCommandDescriptor,
@@ -190,6 +192,8 @@ pub struct ConversationSupervisor {
 struct ActiveTurn {
     turn_id: String,
     cancel: watch::Sender<bool>,
+    provider: ProviderKind,
+    provider_profile: Option<String>,
 }
 
 struct ActiveTurnCleanup {
@@ -367,8 +371,27 @@ impl ConversationSupervisor {
         self.registry.descriptors()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn has_active_turns(&self) -> bool {
         !self.active.is_empty()
+    }
+
+    pub fn has_active_turns_for_cli(&self, cli: ManagedCli) -> bool {
+        let provider = cli.provider_kind();
+        let binary = cli.binary(&self.config);
+        self.active.iter().any(|entry| {
+            let turn = entry.value();
+            if turn.provider == provider {
+                return true;
+            }
+            if turn.provider != ProviderKind::Acp {
+                return false;
+            }
+            turn.provider_profile
+                .as_deref()
+                .and_then(|name| self.config.agent.acp_profiles.get(name))
+                .is_some_and(|profile| same_executable(&profile.command, binary))
+        })
     }
 
     pub async fn models_live(
@@ -769,6 +792,8 @@ impl ConversationSupervisor {
                 entry.insert(ActiveTurn {
                     turn_id: "fork".to_owned(),
                     cancel,
+                    provider: source.provider,
+                    provider_profile: source.provider_profile.clone(),
                 });
             }
         }
@@ -852,6 +877,8 @@ impl ConversationSupervisor {
                 entry.insert(ActiveTurn {
                     turn_id: operation_id.clone(),
                     cancel,
+                    provider: manifest.provider,
+                    provider_profile: manifest.provider_profile.clone(),
                 });
             }
         }
@@ -1349,6 +1376,8 @@ impl ConversationSupervisor {
                 entry.insert(ActiveTurn {
                     turn_id: turn_id.clone(),
                     cancel,
+                    provider: manifest.provider,
+                    provider_profile: manifest.provider_profile.clone(),
                 });
             }
         }
@@ -2415,6 +2444,8 @@ mod tests {
             ActiveTurn {
                 turn_id: "preparing".to_owned(),
                 cancel,
+                provider: ProviderKind::Codex,
+                provider_profile: None,
             },
         );
         assert!(matches!(
@@ -2426,6 +2457,110 @@ mod tests {
         assert!(store.get(&manifest.id).await.is_ok());
         supervisor.active.remove(&manifest.id);
         assert_eq!(supervisor.cleanup_expired(cutoff).await.unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cli_upgrade_blocking_scopes_to_the_running_agent() {
+        let root = temp_dir("todex-cli-upgrade-scope");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace_root = fs::canonicalize(workspace_root).unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let managed_binary = write_provider_fixture(&root).to_string_lossy().to_string();
+        let mut profiles = BTreeMap::new();
+        for (name, command) in [
+            ("managed", managed_binary.clone()),
+            ("external", "/bin/cat".to_owned()),
+        ] {
+            profiles.insert(
+                name.to_owned(),
+                AcpProfileConfig {
+                    command,
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    auth_method: None,
+                    api_key_env: None,
+                },
+            );
+        }
+        let config = Arc::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root],
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: managed_binary,
+                claude_bin: "claude".to_owned(),
+                pi_bin: "pi".to_owned(),
+                grok_bin: "grok".to_owned(),
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                acp_profiles: profiles,
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+        });
+        let store = ConversationStore::new(config.data_dir.clone())
+            .await
+            .unwrap();
+        let trust = trust_store(&config, "local", Some(&workspace)).await;
+        let supervisor =
+            ConversationSupervisor::new(config, store, ConversationEventHub::default(), trust);
+        for (id, provider, profile) in [
+            ("conv-codex", ProviderKind::Codex, None),
+            (
+                "conv-acp-managed",
+                ProviderKind::Acp,
+                Some("managed".to_owned()),
+            ),
+            (
+                "conv-acp-external",
+                ProviderKind::Acp,
+                Some("external".to_owned()),
+            ),
+        ] {
+            let (cancel, _) = watch::channel(false);
+            supervisor.active.insert(
+                id.to_owned(),
+                ActiveTurn {
+                    turn_id: format!("turn-{id}"),
+                    cancel,
+                    provider,
+                    provider_profile: profile,
+                },
+            );
+        }
+        assert!(supervisor.has_active_turns_for_cli(ManagedCli::Codex));
+        for cli in [
+            ManagedCli::Pi,
+            ManagedCli::ClaudeCode,
+            ManagedCli::GrokBuild,
+            ManagedCli::Devin,
+            ManagedCli::Opencode,
+        ] {
+            assert!(!supervisor.has_active_turns_for_cli(cli));
+        }
+        // The "managed" ACP profile still runs the Codex binary.
+        supervisor.active.remove("conv-codex");
+        assert!(supervisor.has_active_turns_for_cli(ManagedCli::Codex));
+        // The remaining ACP turn runs an unmanaged executable.
+        supervisor.active.remove("conv-acp-managed");
+        assert!(!supervisor.has_active_turns_for_cli(ManagedCli::Codex));
+        supervisor.active.remove("conv-acp-external");
+        assert!(!supervisor.has_active_turns());
         fs::remove_dir_all(root).unwrap();
     }
 

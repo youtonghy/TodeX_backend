@@ -452,6 +452,17 @@ pub fn executable_available(program: &str) -> bool {
     resolve_executable(program).is_some()
 }
 
+pub(crate) fn same_executable(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(a), Some(b)) = (resolve_executable(a), resolve_executable(b)) else {
+        return false;
+    };
+    let canonical = |path: PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
+    canonical(a) == canonical(b)
+}
+
 fn resolve_executable(program: &str) -> Option<PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 {

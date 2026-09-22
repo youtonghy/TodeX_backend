@@ -1500,11 +1500,14 @@ async fn upgrade_provider_cli(
             ));
         }
     };
-    if state.conversations.has_active_turns() || state.codex_local_adapters.has_active_adapters() {
+    if state.conversations.has_active_turns_for_cli(provider)
+        || (provider == ManagedCli::Codex && state.codex_local_adapters.has_active_adapters())
+    {
         append_cli_audit(&state, &auth, provider, None, "deny", Some("AGENT_ACTIVE")).await?;
-        return Err(AppError::Conflict(
-            "finish active Agent tasks before upgrading a CLI".to_owned(),
-        ));
+        return Err(AppError::Conflict(format!(
+            "finish active {} tasks before upgrading it",
+            provider.name()
+        )));
     }
     let previous_version = match read_current_version(&state.config, provider).await {
         Ok(version) => version,
