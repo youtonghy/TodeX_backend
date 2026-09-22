@@ -407,17 +407,15 @@ impl ConversationSupervisor {
             .workspace_trust
             .acquire_owned(owner_id, workspace)
             .await?;
-        tokio::time::timeout(
-            Duration::from_secs(8),
-            self.registry.driver(provider)?.discover_models(workspace),
-        )
-        .await
-        .map_err(|_| {
-            AppError::ProviderUnavailable(format!(
-                "{} model discovery timed out",
-                provider.as_str()
-            ))
-        })?
+        let driver = self.registry.driver(provider)?;
+        tokio::time::timeout(driver.discovery_timeout(), driver.discover_models(workspace))
+            .await
+            .map_err(|_| {
+                AppError::ProviderUnavailable(format!(
+                    "{} model discovery timed out",
+                    provider.as_str()
+                ))
+            })?
     }
 
     pub async fn image_input_live(
@@ -459,11 +457,10 @@ impl ConversationSupervisor {
                     .workspace_trust
                     .acquire_owned(owner_id, workspace)
                     .await?;
+                let driver = self.registry.driver(provider)?;
                 let image_input = tokio::time::timeout(
-                    Duration::from_secs(8),
-                    self.registry
-                        .driver(provider)?
-                        .discover_image_input(workspace, profile),
+                    driver.discovery_timeout(),
+                    driver.discover_image_input(workspace, profile),
                 )
                 .await
                 .map_err(|_| {
@@ -504,9 +501,10 @@ impl ConversationSupervisor {
             .workspace_trust
             .acquire_owned(owner_id, workspace)
             .await?;
+        let driver = self.registry.driver(provider)?;
         tokio::time::timeout(
-            Duration::from_secs(8),
-            self.registry.driver(provider)?.discover_commands(workspace),
+            driver.discovery_timeout(),
+            driver.discover_commands(workspace),
         )
         .await
         .map_err(|_| {
@@ -534,7 +532,7 @@ impl ConversationSupervisor {
             .acquire_owned(owner_id, &manifest.workspace)
             .await?;
         let driver = self.registry.driver(manifest.provider)?;
-        let catalog = tokio::time::timeout(Duration::from_secs(8), async {
+        let catalog = tokio::time::timeout(driver.discovery_timeout(), async {
             if let Some(catalog) = driver.session_commands(&manifest.id).await? {
                 Ok(json!({
                     "provider": manifest.provider, "conversationId": manifest.id,

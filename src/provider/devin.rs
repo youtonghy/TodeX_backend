@@ -372,6 +372,13 @@ impl ProviderDriver for DevinDriver {
         }
     }
 
+    /// A cold probe authenticates a session, drains the command drain window,
+    /// and sweeps every catalog model for its `thought_level` options, which
+    /// takes ~10s against the current catalog.
+    fn discovery_timeout(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+
     async fn discover_models(
         &self,
         workspace: &Path,

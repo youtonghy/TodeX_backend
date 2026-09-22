@@ -688,6 +688,13 @@ pub trait ProviderDriver: Send + Sync {
 
     fn descriptor(&self) -> ProviderDescriptor;
 
+    /// Discovery may spawn an authenticated probe session; providers whose
+    /// catalogs need expensive per-model sweeps can raise this budget. The
+    /// default keeps local CLI reads responsive.
+    fn discovery_timeout(&self) -> Duration {
+        Duration::from_secs(8)
+    }
+
     async fn discover_models(
         &self,
         _workspace: &Path,
