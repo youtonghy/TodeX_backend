@@ -71,8 +71,8 @@ for line in sys.stdin:
             session = params["sessionId"]
         result(request_id, {"sessionId": session, "configOptions": options()})
     elif method == "session/set_config_option":
-        assert isinstance(params["value"], dict)
-        value = params["value"]["value"]
+        value = params["value"]
+        assert isinstance(value, str)
         if value == "malformed":
             result(request_id, {})
             continue

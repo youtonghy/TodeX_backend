@@ -50,7 +50,6 @@ pub(super) struct AcpRuntimeOptions {
     pub allow_cli_config_fallback: bool,
     pub request_ask_mode: bool,
     pub legacy_model_state: bool,
-    pub nested_config_values: bool,
     pub allow_unadvertised_images: bool,
     pub snake_case_image_mime: bool,
 }
@@ -809,7 +808,7 @@ fn control_commands(
                 value.as_ref().map(|value| {
                     (
                         "session/set_config_option".to_owned(),
-                        json!({"sessionId":session_id,"configId":id,"value":{"value":value}}),
+                        json!({"sessionId":session_id,"configId":id,"value":value}),
                     )
                 })
             })
@@ -2317,14 +2316,13 @@ async fn apply_requested_config(
                 context.provider.as_str()
             )));
         }
-        let value = config_option_wire_value(requested, context.runtime.nested_config_values);
         let request_id = send_request(
             process,
             "session/set_config_option",
             json!({
                 "sessionId": context.session_id,
                 "configId": config_id,
-                "value": value,
+                "value": requested,
             }),
         )
         .await?;
@@ -2379,14 +2377,6 @@ fn opencode_session_mode(prompt: &DriverPrompt) -> &'static str {
         "plan"
     } else {
         "build"
-    }
-}
-
-fn config_option_wire_value(requested: &str, nested: bool) -> Value {
-    if nested {
-        json!({ "value": requested })
-    } else {
-        json!(requested)
     }
 }
 
@@ -2924,15 +2914,6 @@ mod tests {
         };
         let options = profile_runtime_options(&profile).unwrap();
         assert_eq!(options.auth_timeout, None);
-    }
-
-    #[test]
-    fn grok_config_options_use_vendor_nested_values() {
-        assert_eq!(
-            config_option_wire_value("high", true),
-            json!({ "value": "high" })
-        );
-        assert_eq!(config_option_wire_value("high", false), json!("high"));
     }
 
     #[test]
