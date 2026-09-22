@@ -822,8 +822,28 @@ fn restore_masked_in_place(new: &mut Value, old: &Value) {
             }
         }
         (Value::Array(new_items), Value::Array(old_items)) => {
-            for (value, old_value) in new_items.iter_mut().zip(old_items.iter()) {
-                restore_masked_in_place(value, old_value);
+            // Arrays of id-bearing objects (e.g. Pi models[] entries) pair by
+            // `id` so reordering or deleting entries cannot restore a masked
+            // per-model secret onto the wrong element.
+            let pairable = !new_items.is_empty()
+                && new_items
+                    .iter()
+                    .chain(old_items.iter())
+                    .all(|item| item.get("id").and_then(Value::as_str).is_some());
+            if pairable {
+                for value in new_items.iter_mut() {
+                    let id = value.get("id").and_then(Value::as_str);
+                    if let Some(old_value) = old_items
+                        .iter()
+                        .find(|item| item.get("id").and_then(Value::as_str) == id)
+                    {
+                        restore_masked_in_place(value, old_value);
+                    }
+                }
+            } else {
+                for (value, old_value) in new_items.iter_mut().zip(old_items.iter()) {
+                    restore_masked_in_place(value, old_value);
+                }
             }
         }
         (Value::String(new_text), Value::String(old_text)) if new_text == MASKED_SECRET => {
@@ -1226,6 +1246,54 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, AppError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn masked_model_entries_restore_by_id_not_position() {
+        let temp = TestRoot::new();
+        let service = service_in(temp.path()).await;
+
+        let node = json!({
+            "baseUrl": "https://pi.example.com/v1",
+            "apiKey": "k-provider",
+            "models": [
+                {"id": "m-a", "apiKey": "key-a"},
+                {"id": "m-b", "apiKey": "key-b"}
+            ]
+        });
+        service
+            .upsert(ProviderKind::Pi, "pico", input("Pi Co", node))
+            .await
+            .unwrap();
+
+        let block = service
+            .snapshot(Some(ProviderKind::Pi))
+            .await
+            .unwrap();
+        let listed = &providers_of(&block["agents"]["pi"])[0];
+        assert_eq!(
+            listed["settingsConfig"]["models"][0]["apiKey"],
+            MASKED_SECRET
+        );
+
+        // Reordering entries must not shuffle their secrets.
+        let mut update = listed["settingsConfig"].clone();
+        update["models"].as_array_mut().unwrap().reverse();
+        service
+            .upsert(ProviderKind::Pi, "pico", input("Pi Co", update))
+            .await
+            .unwrap();
+
+        let stored = service
+            .store
+            .profile(ProviderKind::Pi, "pico")
+            .await
+            .unwrap();
+        let models = stored.settings_config["models"].as_array().unwrap();
+        assert_eq!(models[0]["id"], "m-b");
+        assert_eq!(models[0]["apiKey"], "key-b");
+        assert_eq!(models[1]["id"], "m-a");
+        assert_eq!(models[1]["apiKey"], "key-a");
     }
 
     #[tokio::test]
