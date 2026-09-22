@@ -830,6 +830,20 @@ fn safe_message(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires the real devin CLI and credentials; run manually"]
+    async fn real_devin_discovery_lists_models() {
+        let config = crate::config::Config::default();
+        let driver = DevinDriver::new(&config.agent);
+        let workspace = PathBuf::from(
+            std::env::var("TODEX_DEVIN_TEST_WORKSPACE")
+                .unwrap_or_else(|_| "/Users/youtonghy/github/Project".to_owned()),
+        );
+        let models = driver.discover_models(&workspace).await.unwrap();
+        assert!(!models.is_empty());
+        eprintln!("discovered {} models", models.len());
+    }
+
     #[test]
     fn parses_model_config_option_into_descriptors() {
         let session = json!({
