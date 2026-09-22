@@ -383,11 +383,6 @@ async fn current_version(
 }
 
 async fn latest_version(config: &Config, provider: ManagedCli) -> Result<Option<String>, AppError> {
-    // Devin CLI exposes no read-only latest-version check; `devin update`
-    // performs the check and install together.
-    if provider == ManagedCli::Devin {
-        return Ok(None);
-    }
     if provider == ManagedCli::GrokBuild {
         let output = run_command(
             provider.binary(config),
@@ -410,20 +405,21 @@ async fn latest_version(config: &Config, provider: ManagedCli) -> Result<Option<
         .build()
         .map_err(|error| AppError::Anyhow(error.into()))?;
     let (url, field) = match provider {
-        ManagedCli::Codex => (
-            "https://api.github.com/repos/openai/codex/releases/latest",
-            "tag_name",
-        ),
+        // GitHub's unauthenticated API is rate-limited per IP; the npm registry
+        // mirrors the published CLI version without that cap.
+        ManagedCli::Codex => ("https://registry.npmjs.org/@openai%2fcodex/latest", "version"),
         ManagedCli::Pi => ("https://pi.dev/api/latest-version", "version"),
         ManagedCli::ClaudeCode => (
             "https://registry.npmjs.org/@anthropic-ai%2fclaude-code/latest",
             "version",
         ),
-        ManagedCli::Opencode => (
-            "https://api.github.com/repos/anomalyco/opencode/releases/latest",
-            "tag_name",
+        // The self-update manifest is the same source `devin update` reads.
+        ManagedCli::Devin => (
+            "https://static.devin.ai/cli/current/manifest.json",
+            "version",
         ),
-        ManagedCli::GrokBuild | ManagedCli::Devin => unreachable!(),
+        ManagedCli::Opencode => ("https://registry.npmjs.org/opencode-ai/latest", "version"),
+        ManagedCli::GrokBuild => unreachable!(),
     };
     let response = client
         .get(url)
