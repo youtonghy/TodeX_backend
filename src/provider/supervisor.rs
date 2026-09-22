@@ -408,14 +408,17 @@ impl ConversationSupervisor {
             .acquire_owned(owner_id, workspace)
             .await?;
         let driver = self.registry.driver(provider)?;
-        tokio::time::timeout(driver.discovery_timeout(), driver.discover_models(workspace))
-            .await
-            .map_err(|_| {
-                AppError::ProviderUnavailable(format!(
-                    "{} model discovery timed out",
-                    provider.as_str()
-                ))
-            })?
+        tokio::time::timeout(
+            driver.discovery_timeout(),
+            driver.discover_models(workspace),
+        )
+        .await
+        .map_err(|_| {
+            AppError::ProviderUnavailable(format!(
+                "{} model discovery timed out",
+                provider.as_str()
+            ))
+        })?
     }
 
     pub async fn image_input_live(
@@ -728,6 +731,19 @@ impl ConversationSupervisor {
     ) -> Result<ConversationReplay, AppError> {
         self.get_owned(owner_id, conversation_id).await?;
         self.replay(conversation_id, after_sequence, limit).await
+    }
+
+    pub async fn replay_before_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        before_sequence: u64,
+        limit: usize,
+    ) -> Result<ConversationReplay, AppError> {
+        self.get_owned(owner_id, conversation_id).await?;
+        self.store
+            .replay_before(conversation_id, before_sequence, limit)
+            .await
     }
 
     pub async fn retry_owned(

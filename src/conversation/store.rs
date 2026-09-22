@@ -437,13 +437,69 @@ impl ConversationStore {
         limit: usize,
     ) -> Result<ConversationReplay, AppError> {
         let _guard = self.lock(conversation_id).await;
+        let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
+        let event_path = self.replay_journal(conversation_id).await?;
+        let total = self.journal_len(conversation_id);
+        let from = usize::try_from(after_sequence)
+            .unwrap_or(usize::MAX)
+            .min(total);
+        let to = from.saturating_add(limit).min(total);
+        let events = self
+            .read_replay_window(conversation_id, &event_path, from, to)
+            .await?;
+        let next_sequence = events.last().map_or(after_sequence, |event| event.sequence);
+        Ok(ConversationReplay {
+            conversation_id: conversation_id.to_owned(),
+            from_sequence: after_sequence,
+            next_sequence,
+            has_more: to < total,
+            events,
+        })
+    }
+
+    /// Reverse replay for lazy history loading: returns the newest events with
+    /// `sequence <= before_sequence` in ascending order. `has_more` reports
+    /// whether earlier events remain, so clients page back with
+    /// `before_sequence = first_returned_sequence - 1`.
+    pub async fn replay_before(
+        &self,
+        conversation_id: &str,
+        before_sequence: u64,
+        limit: usize,
+    ) -> Result<ConversationReplay, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
+        let event_path = self.replay_journal(conversation_id).await?;
+        let total = self.journal_len(conversation_id);
+        let to = usize::try_from(before_sequence)
+            .unwrap_or(usize::MAX)
+            .min(total);
+        let from = to.saturating_sub(limit);
+        let events = self
+            .read_replay_window(conversation_id, &event_path, from, to)
+            .await?;
+        let next_sequence = events
+            .last()
+            .map_or(before_sequence, |event| event.sequence);
+        Ok(ConversationReplay {
+            conversation_id: conversation_id.to_owned(),
+            from_sequence: from as u64,
+            next_sequence,
+            has_more: from > 0,
+            events,
+        })
+    }
+
+    /// Shared replay prelude: the manifest must exist and the byte-offset
+    /// index — a rebuildable cache — must match the journal file. Callers hold
+    /// the conversation lock.
+    async fn replay_journal(&self, conversation_id: &str) -> Result<PathBuf, AppError> {
         let directory = self.directory(conversation_id)?;
         if !tokio::fs::try_exists(directory.join(MANIFEST_FILE)).await? {
             return Err(AppError::NotFound(format!(
                 "conversation {conversation_id}"
             )));
         }
-        let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
         let event_path = directory.join(EVENTS_FILE);
         let metadata = tokio::fs::metadata(&event_path).await?;
         let valid_index = self.indexes.get(conversation_id).is_some_and(|index| {
@@ -453,23 +509,39 @@ impl ConversationStore {
             // Validate and repair once; the byte index is only a rebuildable cache.
             self.read_and_recover_events(conversation_id).await?;
         }
-        let (from, has_more, offsets) = {
+        Ok(event_path)
+    }
+
+    fn journal_len(&self, conversation_id: &str) -> usize {
+        self.indexes
+            .get(conversation_id)
+            .map(|index| index.offsets.len())
+            .unwrap_or_default()
+    }
+
+    /// Read `offsets[from..to]` as one contiguous journal page. `from` is the
+    /// absolute index so sequence validation still matches journal positions.
+    async fn read_replay_window(
+        &self,
+        conversation_id: &str,
+        event_path: &Path,
+        from: usize,
+        to: usize,
+    ) -> Result<Vec<ConversationEvent>, AppError> {
+        let offsets = {
             let index = self.indexes.get(conversation_id);
-            let offsets = index
-                .as_ref()
-                .map(|entry| entry.offsets.as_slice())
-                .unwrap_or_default();
-            let from = usize::try_from(after_sequence)
-                .unwrap_or(usize::MAX)
-                .min(offsets.len());
-            let to = from.saturating_add(limit).min(offsets.len());
-            (from, to < offsets.len(), offsets[from..to].to_vec())
+            index
+                .map(|entry| {
+                    let len = entry.offsets.len();
+                    entry.offsets[from.min(len)..to.min(len)].to_vec()
+                })
+                .unwrap_or_default()
         };
         let mut events = Vec::with_capacity(offsets.len());
         if let (Some(first), Some(last)) = (offsets.first(), offsets.last()) {
             let start = first.0;
             let end = last.1;
-            let mut file = tokio::fs::File::open(&event_path).await?;
+            let mut file = tokio::fs::File::open(event_path).await?;
             file.seek(std::io::SeekFrom::Start(start)).await?;
             let mut page = vec![0u8; (end - start) as usize];
             file.read_exact(&mut page).await?;
@@ -481,14 +553,7 @@ impl ConversationStore {
                 events.push(event);
             }
         }
-        let next_sequence = events.last().map_or(after_sequence, |event| event.sequence);
-        Ok(ConversationReplay {
-            conversation_id: conversation_id.to_owned(),
-            from_sequence: after_sequence,
-            next_sequence,
-            has_more,
-            events,
-        })
+        Ok(events)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1442,6 +1507,62 @@ mod tests {
                 .len(),
             3
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_before_pages_backward_from_an_inclusive_cursor() {
+        let root = temp_dir("todex-replay-before");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = ConversationManifest::new(ProviderKind::Codex, root.clone(), None, None);
+        let events = (1..=50)
+            .map(|sequence| {
+                ConversationEvent::new(
+                    &conversation.id,
+                    sequence,
+                    "message.created",
+                    json!({ "role": "user", "content": format!("message-{sequence}") }),
+                )
+            })
+            .collect();
+        store
+            .create_with_history(conversation.clone(), events, None, None)
+            .await
+            .unwrap();
+
+        // A full tail page ends exactly at the inclusive cursor.
+        let tail = store.replay_before(&conversation.id, 50, 20).await.unwrap();
+        assert_eq!(tail.events.len(), 20);
+        assert_eq!(tail.events[0].sequence, 31);
+        assert_eq!(tail.events[19].sequence, 50);
+        assert_eq!(tail.next_sequence, 50);
+        assert!(tail.has_more);
+
+        // The next page continues with no overlap or gap.
+        let middle = store
+            .replay_before(&conversation.id, tail.events[0].sequence - 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(middle.events.len(), 20);
+        assert_eq!(middle.events[0].sequence, 11);
+        assert_eq!(middle.events[19].sequence, 30);
+        assert!(middle.has_more);
+
+        // A short first page reports exhaustion.
+        let head = store.replay_before(&conversation.id, 10, 20).await.unwrap();
+        assert_eq!(head.events.len(), 10);
+        assert_eq!(head.events[0].sequence, 1);
+        assert!(!head.has_more);
+
+        // Cursors past the end clamp to the journal; empty ranges stay empty.
+        let clamped = store
+            .replay_before(&conversation.id, 10_000, 5)
+            .await
+            .unwrap();
+        assert_eq!(clamped.events[0].sequence, 46);
+        let empty = store.replay_before(&conversation.id, 0, 5).await.unwrap();
+        assert!(empty.events.is_empty());
+        assert!(!empty.has_more);
         fs::remove_dir_all(root).unwrap();
     }
 

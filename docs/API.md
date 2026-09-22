@@ -89,6 +89,7 @@ GET /v2/conversations/{conversationId}
 PATCH /v2/conversations/{conversationId}
 DELETE /v2/conversations/{conversationId}
 GET /v2/conversations/{conversationId}/events?afterSequence=0&limit=200&detail=full
+GET /v2/conversations/{conversationId}/events?beforeSequence=500&limit=200&detail=summary
 POST /v2/conversations/{conversationId}/prompt
 POST /v2/conversations/{conversationId}/cancel
 POST /v2/conversations/{conversationId}/runtime/stop
@@ -145,6 +146,8 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 每个 conversation 同时只允许一个 mutating turn；并发 prompt 返回 `409 CONFLICT`，不会排队。daemon 重启会把未完成 turn 标记为 `interrupted`，不会通过重放 prompt 猜测恢复。原生会话 ID 由 `provider-state.json` 保存，Provider 支持时下一 turn 使用原生 resume。
 
 事件回放支持 `detail=summary`（默认 `full`）：summary 模式把只产生折叠过程行的事件（工具调用、思考、状态、进度）的 `payload` 替换为 `{ "detailStub": true, ... }` 占位对象，保留分类、turn 与流身份所需的元数据，因此事件 sequence 与投影出的时间线条目身份保持不变；结果输出、审批、权限、队列、配置、压缩、subagent、memory、extension 及携带用量数据的事件始终完整返回。客户端展开过程组时用同一接口按 `afterSequence`/`limit` 以 `detail=full` 拉取对应序列区间。
+
+`beforeSequence=N` 提供反向翻页（与 `afterSequence` 互斥，优先生效）：返回 `sequence <= N` 的最后 `limit` 条（升序），`hasMore` 表示是否还有更早的事件，下一页游标为本页首条 `sequence - 1`。用于长对话自下向上懒加载：首屏用 manifest 的 `lastSequence` 拉取尾页，滚动到顶部再继续向前翻页。
 
 ### v2 WebSocket
 

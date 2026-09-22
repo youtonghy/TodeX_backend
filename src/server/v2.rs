@@ -1849,15 +1849,28 @@ async fn replay_conversation(
             "events detail must be \"full\" or \"summary\"".to_owned(),
         ));
     }
-    let mut replay = state
-        .conversations
-        .replay_owned(
-            &auth.tenant_id,
-            &conversation_id,
-            query.after_sequence.unwrap_or(0),
-            query.limit.unwrap_or(200),
-        )
-        .await?;
+    let limit = query.limit.unwrap_or(200);
+    // `beforeSequence` pages backwards through the journal for lazy history
+    // loading; `hasMore` then reports whether earlier events remain.
+    let mut replay = match query.before_sequence {
+        Some(before_sequence) => {
+            state
+                .conversations
+                .replay_before_owned(&auth.tenant_id, &conversation_id, before_sequence, limit)
+                .await?
+        }
+        None => {
+            state
+                .conversations
+                .replay_owned(
+                    &auth.tenant_id,
+                    &conversation_id,
+                    query.after_sequence.unwrap_or(0),
+                    limit,
+                )
+                .await?
+        }
+    };
     if detail == "summary" {
         for event in &mut replay.events {
             crate::conversation::summarize_event(event);
@@ -2965,6 +2978,10 @@ struct UpdateConversationRequest {
 struct ReplayQuery {
     #[serde(default)]
     after_sequence: Option<u64>,
+    /// Inclusive upper bound for reverse pagination: returns the newest events
+    /// with `sequence <= beforeSequence`. Wins over `afterSequence`.
+    #[serde(default)]
+    before_sequence: Option<u64>,
     #[serde(default)]
     limit: Option<usize>,
     /// `summary` folds process-only events (tool calls, reasoning, status and
@@ -3578,6 +3595,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay.status(), StatusCode::OK);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_events_before_sequence_pages_backward() {
+        let root = std::env::temp_dir().join(format!("todex-v2-events-before-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root],
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+        })
+        .await
+        .unwrap();
+        let device = enroll(&root.join("data"));
+        let app = crate::server::router(state.clone());
+        let manifest = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::Codex,
+                workspace,
+                Some("Reverse replay fixture".to_owned()),
+                None,
+            )
+            .await
+            .unwrap();
+        let store = ConversationStore::new(state.config.data_dir.clone())
+            .await
+            .unwrap();
+        for index in 1..=8 {
+            store
+                .append(&manifest.id, "fixture.event", json!({ "index": index }))
+                .await
+                .unwrap();
+        }
+
+        let response = app
+            .clone()
+            .oneshot(signed_request(
+                &device,
+                "GET",
+                &format!(
+                    "/v2/conversations/{}/events?beforeSequence=8&limit=3",
+                    manifest.id
+                ),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["sequence"], 6);
+        assert_eq!(events[2]["sequence"], 8);
+        assert_eq!(body["hasMore"], true);
+
+        let head = app
+            .oneshot(signed_request(
+                &device,
+                "GET",
+                &format!(
+                    "/v2/conversations/{}/events?beforeSequence=5&limit=10",
+                    manifest.id
+                ),
+                "",
+            ))
+            .await
+            .unwrap();
+        let head_body: Value =
+            serde_json::from_slice(&to_bytes(head.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(head_body["events"].as_array().unwrap().len(), 5);
+        assert_eq!(head_body["hasMore"], false);
 
         let _ = fs::remove_dir_all(root);
     }

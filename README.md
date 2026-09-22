@@ -249,7 +249,7 @@ enable_tls = false
 - `GET /v2/conversations`: List persisted conversations for tenant.
 - `POST /v2/conversations`: Create a new conversation folder with selected agent provider.
 - `GET /v2/conversations/{id}`: Fetch conversation manifest and details.
-- `GET /v2/conversations/{id}/events?afterSequence=0&limit=200`: Paginated event journal query.
+- `GET /v2/conversations/{id}/events?afterSequence=0&limit=200`: Paginated event journal query. `beforeSequence=N` pages backwards (`sequence <= N`, `hasMore` = earlier events remain) for lazy history loading.
 - `POST /v2/conversations/{id}/prompt`: Dispatch a prompt turn with text, typed content, model, reasoning effort, and skill resource IDs. Local files remain confined to the trusted workspace.
 - `POST /v2/conversations/{id}/cancel`: Cancel active running turn.
 - `POST /v2/conversations/{id}/permissions/{permissionId}`: Resolve interactive approval request.
