@@ -164,7 +164,9 @@ impl DevinDriver {
     }
 
     /// Models and slash commands live behind `session/new`, which requires an
-    /// authenticated session; the probe session is deleted before returning.
+    /// authenticated session. The session is left open so callers can issue
+    /// follow-up probes (per-model `thought_level` options); callers must
+    /// delete it best-effort via `delete_probe_session`.
     async fn session_probe(
         &self,
         workspace: &Path,
@@ -183,14 +185,13 @@ impl DevinDriver {
                 DIAGNOSTIC_TIMEOUT,
             )
             .await?;
-            let session_id = response
+            response
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| {
                     AppError::InvalidRequest("invalid Devin session/new response".to_owned())
-                })?
-                .to_owned();
+                })?;
             // Command and config announcements trail the session/new response.
             let deadline = tokio::time::Instant::now() + COMMAND_DRAIN;
             loop {
@@ -216,14 +217,6 @@ impl DevinDriver {
                         .await?;
                 }
             }
-            let _ = control_request(
-                &mut process,
-                "session:delete",
-                "session/delete",
-                json!({ "sessionId": session_id }),
-                DIAGNOSTIC_TIMEOUT,
-            )
-            .await;
             Ok((response, updates))
         }
         .await;
@@ -247,10 +240,13 @@ impl DevinDriver {
             }
         }
         let (mut process, session, updates) = self.session_probe(workspace).await?;
+        let mut models = parse_devin_models(&session);
+        probe_thought_levels(&mut process, &session, &mut models).await;
+        delete_probe_session(&mut process, &session).await;
         process.terminate().await;
         let snapshot = DiscoverySnapshot {
             fetched_at: Instant::now(),
-            models: parse_devin_models(&session),
+            models,
             commands: parse_devin_commands(&updates),
         };
         cache.insert(workspace.to_path_buf(), snapshot.clone());
@@ -640,6 +636,94 @@ fn valid_env_name(value: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+/// Best-effort delete for a probe session; failures are ignored because the
+/// process is terminated immediately afterwards either way.
+async fn delete_probe_session(process: &mut JsonLineProcess, session: &Value) {
+    let Some(session_id) = session.get("sessionId").and_then(Value::as_str) else {
+        return;
+    };
+    let _ = control_request(
+        process,
+        "session:delete",
+        "session/delete",
+        json!({ "sessionId": session_id }),
+        DIAGNOSTIC_TIMEOUT,
+    )
+    .await;
+}
+
+/// Devin exposes `thought_level` only for the currently selected model, and
+/// each model advertises a different level set, so probe every catalog model
+/// to learn its thinking levels. Older `devin acp` builds expose no such
+/// option at all; skip the sweep then.
+async fn probe_thought_levels(
+    process: &mut JsonLineProcess,
+    session: &Value,
+    models: &mut [ProviderModelDescriptor],
+) {
+    let exposes_thought_level = session
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|option| option.get("id").and_then(Value::as_str) == Some("thought_level"));
+    if !exposes_thought_level {
+        return;
+    }
+    let session_id = session
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    for model in models.iter_mut() {
+        let response = control_request(
+            process,
+            "probe:model",
+            "session/set_config_option",
+            json!({"sessionId": session_id, "configId": "model", "value": model.id}),
+            CONTROL_TIMEOUT,
+        )
+        .await;
+        let Ok(response) = response else {
+            continue;
+        };
+        let Some((efforts, default)) = thought_level_option(&response) else {
+            continue;
+        };
+        model.supported_reasoning_efforts = efforts;
+        model.default_reasoning_effort = default;
+    }
+}
+
+fn thought_level_option(response: &Value) -> Option<(Vec<String>, Option<String>)> {
+    let option = response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some("thought_level"))?;
+    let efforts = option
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| {
+                    option
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let default = option
+        .get("currentValue")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some((efforts, default))
+}
+
 pub(super) fn parse_devin_models(session: &Value) -> Vec<ProviderModelDescriptor> {
     let option = session
         .get("configOptions")
@@ -777,6 +861,30 @@ mod tests {
         assert_eq!(models[1].image_input, Some(true));
         assert_eq!(models[2].image_input, Some(false));
         assert!(!models.iter().any(|model| model.id == "accept-edits"));
+    }
+
+    #[test]
+    fn thought_level_option_reads_levels_and_default() {
+        let response = json!({
+            "configOptions": [
+                {"id": "model", "currentValue": "swe-2-high"},
+                {
+                    "id": "thought_level",
+                    "currentValue": "high",
+                    "options": [
+                        {"value": "medium"},
+                        {"value": "high"},
+                        {"value": "max"}
+                    ]
+                }
+            ]
+        });
+        let (efforts, default) = thought_level_option(&response).unwrap();
+        assert_eq!(efforts, vec!["medium", "high", "max"]);
+        assert_eq!(default.as_deref(), Some("high"));
+
+        assert!(thought_level_option(&json!({"configOptions": []})).is_none());
+        assert!(thought_level_option(&json!({})).is_none());
     }
 
     #[test]

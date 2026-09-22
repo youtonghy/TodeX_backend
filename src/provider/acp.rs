@@ -861,21 +861,20 @@ fn devin_control_commands(
             model,
             reasoning_effort,
         } => {
-            if reasoning_effort.is_some() {
-                return Err(AppError::Unsupported(
-                    "Devin does not expose a separate reasoning effort control; choose a model variant"
-                        .to_owned(),
+            let mut commands = Vec::new();
+            if let Some(model) = model {
+                commands.push((
+                    "session/set_config_option".to_owned(),
+                    json!({"sessionId":session_id,"configId":"model","value":model}),
                 ));
             }
-            Ok(model
-                .as_ref()
-                .map(|value| {
-                    vec![(
-                        "session/set_config_option".to_owned(),
-                        json!({"sessionId":session_id,"configId":"model","value":value}),
-                    )]
-                })
-                .unwrap_or_default())
+            if let Some(effort) = reasoning_effort {
+                commands.push((
+                    "session/set_config_option".to_owned(),
+                    json!({"sessionId":session_id,"configId":"thought_level","value":effort}),
+                ));
+            }
+            Ok(commands)
         }
         ProviderControl::Steer { .. } => Err(AppError::Unsupported(
             "Devin does not expose mid-turn steering over ACP".to_owned(),
@@ -995,7 +994,7 @@ fn config_effective(options: &Value) -> Option<Value> {
     for option in options.as_array()? {
         let key = match option.get("id").and_then(Value::as_str) {
             Some("model") => "model",
-            Some("reasoning_effort" | "effort") => "reasoningEffort",
+            Some("reasoning_effort" | "effort" | "thought_level") => "reasoningEffort",
             Some("mode") => "mode",
             _ => continue,
         };
@@ -2280,12 +2279,12 @@ async fn apply_requested_config(
         .await?;
         return Ok(None);
     }
-    // OpenCode names its per-model thinking-level option `effort`; other ACP
-    // profiles use `reasoning_effort`.
-    let effort_id = if context.provider == ProviderKind::Opencode {
-        "effort"
-    } else {
-        "reasoning_effort"
+    // OpenCode names its per-model thinking-level option `effort` and Devin
+    // calls it `thought_level`; other ACP profiles use `reasoning_effort`.
+    let effort_id = match context.provider {
+        ProviderKind::Opencode => "effort",
+        ProviderKind::Devin => "thought_level",
+        _ => "reasoning_effort",
     };
     let mut requested_configs = vec![
         ("model", prompt.model.as_deref()),
@@ -2691,16 +2690,18 @@ mod tests {
             ),
             Err(AppError::Unsupported(_))
         ));
-        assert!(matches!(
-            devin_control_commands(
-                &ProviderControl::Configure {
-                    model: None,
-                    reasoning_effort: Some("high".to_owned())
-                },
-                "devin-native"
-            ),
-            Err(AppError::Unsupported(_))
-        ));
+        let effort = devin_control_commands(
+            &ProviderControl::Configure {
+                model: None,
+                reasoning_effort: Some("high".to_owned()),
+            },
+            "devin-native",
+        )
+        .unwrap();
+        assert_eq!(effort.len(), 1);
+        assert_eq!(effort[0].0, "session/set_config_option");
+        assert_eq!(effort[0].1["configId"], "thought_level");
+        assert_eq!(effort[0].1["value"], "high");
         assert!(matches!(
             devin_control_commands(&ProviderControl::QueueList, "devin-native"),
             Err(AppError::Unsupported(_))
