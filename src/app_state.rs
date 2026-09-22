@@ -56,7 +56,16 @@ impl AppState {
         tokio::fs::create_dir_all(config.data_dir.join("logs")).await?;
         tokio::fs::create_dir_all(config.data_dir.join("audit")).await?;
         for root in &config.workspace_roots {
-            tokio::fs::create_dir_all(root).await?;
+            if let Err(error) = tokio::fs::create_dir_all(root).await {
+                // An unavailable root (for example an unmounted volume) must not
+                // abort startup; workspace validation already rejects paths
+                // under missing roots.
+                tracing::warn!(
+                    root = %root.display(),
+                    error = %error,
+                    "workspace root is unavailable; continuing startup without it"
+                );
+            }
         }
         set_owner_only_directory(&config.data_dir).await?;
         set_owner_only_directory(&config.data_dir.join("logs")).await?;
@@ -239,6 +248,32 @@ mod tests {
                 .unwrap()
                 .trusted
         );
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn startup_tolerates_unavailable_workspace_root() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-app-state-missing-root-{}",
+            Uuid::new_v4().simple()
+        ));
+        let workspace_root = root.join("workspaces");
+        tokio::fs::create_dir_all(&workspace_root).await.unwrap();
+        // A root nested under a regular file can never be created, the same way
+        // a root on an unmounted volume cannot.
+        let blocker = root.join("blocker");
+        tokio::fs::write(&blocker, b"not a directory")
+            .await
+            .unwrap();
+        let unavailable_root = blocker.join("nested");
+
+        let config = Config {
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root, unavailable_root],
+            ..Config::default()
+        };
+        AppState::new(config).await.unwrap();
 
         let _ = tokio::fs::remove_dir_all(root).await;
     }
