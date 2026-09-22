@@ -15,7 +15,8 @@ use super::{now_millis, AGENT_PROVIDERS_FILE, MAX_PROVIDER_SETTINGS_BYTES};
 
 /// One account/provider profile as managed by TodeX, modeled on cc-switch's
 /// `Provider` record. `settings_config` is opaque per-agent data: the whole
-/// `settings.json` object for Claude Code, `{auth, config}` for Codex, and the
+/// `settings.json` object for Claude Code, `{auth, config}` for Codex and
+/// Grok Build, and the
 /// native provider node for the additive agents (Pi `models.json`, OpenCode
 /// `opencode.json`).
 #[derive(Clone, Debug, Deserialize, Serialize)]

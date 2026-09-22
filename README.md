@@ -38,7 +38,7 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
   - Applies project-over-user precedence hierarchy without mutating local provider configurations.
   - Native Skill injection into agent prompts via `resourceId` (no client file uploads required).
 - **Agent Provider Accounts (cc-switch model)**:
-  - `/v2/agent-providers` stores multiple provider/account profiles per agent (Codex, Claude Code, Pi, OpenCode) and activates one by rewriting the agent's native global config (`settings.json`, `config.toml`/`auth.json`, `models.json`, `opencode.json`) so both TodeX-launched and manually started CLI sessions pick it up.
+  - `/v2/agent-providers` stores multiple provider/account profiles per agent (Codex, Claude Code, Grok Build, Pi, OpenCode) and activates one by rewriting the agent's native global config (`settings.json`, `config.toml`/`auth.json` for Codex and Grok Build, `models.json`, `opencode.json`) so both TodeX-launched and manually started CLI sessions pick it up.
   - Exclusive agents backfill the current live config into the outgoing profile before switching; additive agents merge managed nodes while leaving external provider entries untouched.
   - Secret values are masked in API responses and preserved on write-back; model lists are proxied server-side; additive edits carry a content-revision conflict check.
 - **Unified Multiplexed WebSocket (`/v2/ws`)**:

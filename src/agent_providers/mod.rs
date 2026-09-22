@@ -2,13 +2,16 @@
 //!
 //! The store at `$DATA_DIR/agent-providers.json` is the source of truth; each
 //! agent's native config file is a projection written on save (additive
-//! agents: Pi, OpenCode) or on activate (exclusive agents: Claude, Codex).
+//! agents: Pi, OpenCode) or on activate (exclusive agents: Claude, Codex,
+//! Grok Build).
 //! Writes use atomic owner-only files plus a content-revision check so edits
 //! made outside TodeX surface as conflicts rather than being overwritten.
 
+mod auth_config;
 mod claude;
 mod codex;
 mod files;
+mod grok;
 mod model_fetch;
 mod opencode;
 mod pi;
@@ -35,9 +38,10 @@ const MAX_PROVIDER_NAME_CHARS: usize = 120;
 const MAX_PROVIDER_ID_CHARS: usize = 64;
 
 /// Agents that support managed providers in this first pass.
-pub const SUPPORTED_AGENTS: [ProviderKind; 4] = [
+pub const SUPPORTED_AGENTS: [ProviderKind; 5] = [
     ProviderKind::Codex,
     ProviderKind::ClaudeCode,
+    ProviderKind::GrokBuild,
     ProviderKind::Pi,
     ProviderKind::Opencode,
 ];
@@ -80,12 +84,15 @@ fn is_additive(agent: ProviderKind) -> bool {
 }
 
 /// Per-agent config directories, resolved per call so environment overrides
-/// (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `XDG_CONFIG_HOME`)
-/// picked up after daemon start still apply.
+/// (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `GROK_HOME`, `GROK_AUTH_PATH`,
+/// `PI_CODING_AGENT_DIR`, `XDG_CONFIG_HOME`) picked up after daemon start
+/// still apply.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentDirs {
     codex_home: PathBuf,
     claude_dir: PathBuf,
+    grok_home: PathBuf,
+    grok_auth_path: PathBuf,
     pi_dir: PathBuf,
     opencode_dir: PathBuf,
 }
@@ -102,9 +109,12 @@ impl AgentDirs {
                 .map(PathBuf::from)
                 .unwrap_or(fallback)
         };
+        let grok_home = env_dir("GROK_HOME", home.join(".grok"));
         Self {
             codex_home: env_dir("CODEX_HOME", home.join(".codex")),
             claude_dir: env_dir("CLAUDE_CONFIG_DIR", home.join(".claude")),
+            grok_auth_path: env_dir("GROK_AUTH_PATH", grok_home.join("auth.json")),
+            grok_home,
             pi_dir: env_dir("PI_CODING_AGENT_DIR", home.join(".pi").join("agent")),
             opencode_dir: env_dir("XDG_CONFIG_HOME", home.join(".config")).join("opencode"),
         }
@@ -150,7 +160,7 @@ pub struct ImportLiveInput {
 #[derive(Clone)]
 pub struct AgentProviderService {
     store: AgentProviderStore,
-    locks: [std::sync::Arc<Mutex<()>>; 4],
+    locks: [std::sync::Arc<Mutex<()>>; SUPPORTED_AGENTS.len()],
     dirs_override: Option<AgentDirs>,
 }
 
@@ -162,12 +172,7 @@ impl AgentProviderService {
     async fn with_dirs(data_dir: PathBuf, dirs: Option<AgentDirs>) -> Result<Self, AppError> {
         Ok(Self {
             store: AgentProviderStore::new(data_dir).await?,
-            locks: [
-                std::sync::Arc::new(Mutex::new(())),
-                std::sync::Arc::new(Mutex::new(())),
-                std::sync::Arc::new(Mutex::new(())),
-                std::sync::Arc::new(Mutex::new(())),
-            ],
+            locks: std::array::from_fn(|_| std::sync::Arc::new(Mutex::new(()))),
             dirs_override: dirs,
         })
     }
@@ -327,7 +332,8 @@ impl AgentProviderService {
             existing.as_ref().map(|p| &p.settings_config),
         );
         if contains_masked(&settings_config)
-            || (agent == ProviderKind::Codex && codex::config_text_has_mask(&settings_config))
+            || (toml_header_tables(agent).is_some()
+                && auth_config::config_text_has_mask(&settings_config))
         {
             return Err(AppError::InvalidRequest(
                 "masked secret has no stored value to restore".to_owned(),
@@ -358,10 +364,19 @@ impl AgentProviderService {
             == Some(id);
 
         self.enforce_limit(agent, id).await?;
+        let mut profile = profile;
         // Live first: a conflict there must not leave the store ahead of disk.
         if is_additive(agent) {
             additive_upsert(&dirs, agent, id, &profile.settings_config)?;
         } else if is_current {
+            if let Some(stored) = existing.as_ref() {
+                carry_live_auth(
+                    &dirs,
+                    agent,
+                    &mut profile.settings_config,
+                    &stored.settings_config,
+                )?;
+            }
             write_live(&dirs, agent, &profile.settings_config, false)?;
         }
         self.store.upsert(agent, profile).await?;
@@ -450,14 +465,16 @@ impl AgentProviderService {
                         backfilled = self.store.backfill_settings(agent, old_id, live).await?;
                     }
                 }
-                let remove_auth = agent == ProviderKind::Codex
-                    && !codex::has_auth(&profile.settings_config)
+                let remove_auth = matches!(agent, ProviderKind::Codex | ProviderKind::GrokBuild)
+                    && !auth_config::has_auth(&profile.settings_config)
                     && backfilled;
                 write_live(&dirs, agent, &profile.settings_config, remove_auth)?;
                 self.store.set_current(agent, Some(id.to_owned())).await?;
             } else {
                 // Re-activating the current provider self-heals the live file.
-                write_live(&dirs, agent, &profile.settings_config, false)?;
+                let mut settings = profile.settings_config.clone();
+                carry_live_auth(&dirs, agent, &mut settings, &profile.settings_config)?;
+                write_live(&dirs, agent, &settings, false)?;
             }
         }
         self.agent_block(&dirs, agent, &self.bucket(agent).await)
@@ -586,6 +603,7 @@ fn read_live(dirs: &AgentDirs, agent: ProviderKind) -> Result<Option<Value>, App
     match agent {
         ProviderKind::ClaudeCode => claude::read_live(dirs),
         ProviderKind::Codex => codex::read_live(dirs),
+        ProviderKind::GrokBuild => grok::read_live(dirs),
         _ => Err(AppError::Unsupported(format!(
             "{} is not an exclusive-mode agent",
             agent.as_str()
@@ -602,6 +620,7 @@ fn write_live(
     match agent {
         ProviderKind::ClaudeCode => claude::write_live(dirs, settings),
         ProviderKind::Codex => codex::write_live(dirs, settings, remove_auth),
+        ProviderKind::GrokBuild => grok::write_live(dirs, settings, remove_auth),
         _ => Err(AppError::Unsupported(format!(
             "{} is not an exclusive-mode agent",
             agent.as_str()
@@ -702,23 +721,26 @@ fn live_matches(agent: ProviderKind, live: &Value, settings: &Value) -> bool {
     match agent {
         ProviderKind::ClaudeCode => live == settings,
         ProviderKind::Codex => {
-            let auth_eq = live.get("auth") == settings.get("auth")
-                || (live.get("auth").is_some_and(Value::is_null)
-                    && settings.get("auth").is_none_or(Value::is_null));
-            let toml_eq = match (
-                live.get("config").and_then(Value::as_str),
-                settings.get("config").and_then(Value::as_str),
-            ) {
-                (Some(a), Some(b)) => match (a.parse::<toml::Value>(), b.parse::<toml::Value>()) {
-                    (Ok(a), Ok(b)) => a == b,
-                    _ => a.trim() == b.trim(),
-                },
-                (a, b) => a == b,
-            };
-            auth_eq && toml_eq
+            auth_config::auth_matches(live, settings) && auth_config::config_matches(live, settings)
         }
+        ProviderKind::GrokBuild => grok::live_matches(live, settings),
         _ => false,
     }
+}
+
+/// Grok Build refreshes session tokens inside `auth.json` in the background;
+/// rewriting the live files for an unchanged profile keeps the live tokens of
+/// the same account instead of restoring the stored (possibly rotated) ones.
+fn carry_live_auth(
+    dirs: &AgentDirs,
+    agent: ProviderKind,
+    settings: &mut Value,
+    stored: &Value,
+) -> Result<(), AppError> {
+    if agent == ProviderKind::GrokBuild {
+        grok::carry_live_auth(settings, stored, read_live(dirs, agent)?.as_ref());
+    }
+    Ok(())
 }
 
 // ---------- secret masking ----------
@@ -769,7 +791,18 @@ fn mask_json_secrets_in_place(item: &mut Value) {
 fn mask_agent_settings(agent: ProviderKind, settings: &Value) -> Value {
     match agent {
         ProviderKind::Codex => codex::masked_settings(settings),
+        ProviderKind::GrokBuild => grok::masked_settings(settings),
         _ => mask_json_secrets(settings.clone()),
+    }
+}
+
+/// TOML tables holding literal header values for agents whose `config` is a
+/// TOML document; `None` for agents without one.
+fn toml_header_tables(agent: ProviderKind) -> Option<&'static [&'static str]> {
+    match agent {
+        ProviderKind::Codex => Some(codex::HEADER_TABLES),
+        ProviderKind::GrokBuild => Some(grok::HEADER_TABLES),
+        _ => None,
     }
 }
 
@@ -800,8 +833,10 @@ fn restore_masked(agent: ProviderKind, new: &mut Value, old: Option<&Value>) {
         old.and_then(|old| old.get("config"))
             .and_then(Value::as_str),
     ) {
-        if agent == ProviderKind::Codex && new_config.contains(MASKED_SECRET) {
-            let restored = codex::restore_config_text(new_config, old_config);
+        let header_tables =
+            toml_header_tables(agent).filter(|_| new_config.contains(MASKED_SECRET));
+        if let Some(header_tables) = header_tables {
+            let restored = auth_config::restore_config_text(new_config, old_config, header_tables);
             if let Some(object) = new.as_object_mut() {
                 object.insert("config".to_owned(), json!(restored));
             }
@@ -916,6 +951,8 @@ mod tests {
         AgentDirs {
             codex_home: root.join("codex"),
             claude_dir: root.join("claude"),
+            grok_home: root.join("grok"),
+            grok_auth_path: root.join("grok").join("auth.json"),
             pi_dir: root.join("pi"),
             opencode_dir: root.join("opencode"),
         }
@@ -1099,6 +1136,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grok_switches_between_subscription_and_api_profiles() {
+        let temp = TestRoot::new();
+        let service = service_in(temp.path()).await;
+        let dirs = dirs_in(temp.path());
+        let auth_path = dirs.grok_auth_path.clone();
+        let config_path = grok::config_path(&dirs);
+
+        // `grok login` left a session in auth.json; import it as a profile.
+        std::fs::create_dir_all(&dirs.grok_home).unwrap();
+        let session = json!({
+            "https://auth.x.ai": {
+                "key": "session-token",
+                "auth_mode": "oidc",
+                "create_time": "2026-09-01T00:00:00Z",
+                "user_id": "u1",
+                "refresh_token": "refresh-1"
+            }
+        });
+        std::fs::write(&auth_path, session.to_string()).unwrap();
+        std::fs::write(&config_path, "[models]\ndefault = \"grok-build\"\n").unwrap();
+        service
+            .import_live(
+                ProviderKind::GrokBuild,
+                ImportLiveInput {
+                    id: "sub".to_owned(),
+                    name: Some("Subscription".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Session keys never leave the daemon, and a masked write-back keeps them.
+        let block = service
+            .snapshot(Some(ProviderKind::GrokBuild))
+            .await
+            .unwrap();
+        let listed = providers_of(&block["agents"]["grok-build"])[0].clone();
+        assert_eq!(
+            listed["settingsConfig"]["auth"]["https://auth.x.ai"]["key"],
+            MASKED_SECRET
+        );
+        service
+            .upsert(
+                ProviderKind::GrokBuild,
+                "sub",
+                input("Subscription", listed["settingsConfig"].clone()),
+            )
+            .await
+            .unwrap();
+        let live: Value =
+            serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap()).unwrap();
+        assert_eq!(live["https://auth.x.ai"]["key"], "session-token");
+
+        // A background token refresh is not reported as drift.
+        let mut refreshed = session.clone();
+        refreshed["https://auth.x.ai"]["key"] = json!("session-token-2");
+        std::fs::write(&auth_path, refreshed.to_string()).unwrap();
+        let block = service
+            .snapshot(Some(ProviderKind::GrokBuild))
+            .await
+            .unwrap();
+        assert_eq!(
+            block["agents"]["grok-build"]["live"]["matchesCurrent"],
+            true
+        );
+
+        // API profile: per-model key, no auth.json.
+        let api_config = "[models]\ndefault = \"grok-4.7\"\n\n[model.\"grok-4.7\"]\nmodel = \"grok-4.7\"\nbase_url = \"https://api.x.ai/v1\"\napi_key = \"xai-key\"\napi_backend = \"responses\"\n";
+        service
+            .upsert(
+                ProviderKind::GrokBuild,
+                "api",
+                input("API", json!({ "auth": null, "config": api_config })),
+            )
+            .await
+            .unwrap();
+        service
+            .activate(ProviderKind::GrokBuild, "api", None)
+            .await
+            .unwrap();
+        assert!(!auth_path.exists());
+        assert!(std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("xai-key"));
+        // The refreshed session was captured into the outgoing profile.
+        let stored = service
+            .store
+            .profile(ProviderKind::GrokBuild, "sub")
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.settings_config["auth"]["https://auth.x.ai"]["key"],
+            "session-token-2"
+        );
+
+        service
+            .activate(ProviderKind::GrokBuild, "sub", None)
+            .await
+            .unwrap();
+        let live: Value =
+            serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap()).unwrap();
+        assert_eq!(live["https://auth.x.ai"]["key"], "session-token-2");
+        assert!(!std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("xai-key"));
+    }
+
+    #[tokio::test]
     async fn opencode_additive_sync_and_selection() {
         let temp = TestRoot::new();
         let service = service_in(temp.path()).await;
@@ -1266,10 +1411,7 @@ mod tests {
             .await
             .unwrap();
 
-        let block = service
-            .snapshot(Some(ProviderKind::Pi))
-            .await
-            .unwrap();
+        let block = service.snapshot(Some(ProviderKind::Pi)).await.unwrap();
         let listed = &providers_of(&block["agents"]["pi"])[0];
         assert_eq!(
             listed["settingsConfig"]["models"][0]["apiKey"],
@@ -1447,7 +1589,11 @@ mod tests {
         assert_eq!(masked["auth"]["OPENAI_API_KEY"], MASKED_SECRET);
 
         // The masked text restores real values against the stored profile.
-        let restored = codex::restore_config_text(config, settings["config"].as_str().unwrap());
+        let restored = auth_config::restore_config_text(
+            config,
+            settings["config"].as_str().unwrap(),
+            codex::HEADER_TABLES,
+        );
         assert!(restored.contains("tok-secret"));
         assert!(restored.contains("hdr-secret"));
         assert!(restored.contains("env_key = \"MY_VAR\""));
