@@ -247,8 +247,10 @@ start_daemon() {
 # ---------- download & install ----------
 
 download() {
-    local url="$1" dest="$2" max_bytes="$3"
-    curl -fL --proto '=https' --tlsv1.2 --max-time 300 --max-filesize "$max_bytes" \
+    local url="$1" dest="$2" max_bytes="$3" progress="-sS"
+    # A compact bar on terminals; no meter spam in logs or CI.
+    if [[ -t 2 ]]; then progress="--progress-bar"; fi
+    curl -fL "$progress" --proto '=https' --tlsv1.2 --max-time 300 --max-filesize "$max_bytes" \
         -H "User-Agent: todex-agentd-installer" \
         -o "$dest" "$url" \
         || die "download failed: $url"
