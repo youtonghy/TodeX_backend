@@ -489,8 +489,15 @@ first, then remove the abandoned lock directory before retrying.
 `install` (default) downloads the latest release `.bin` asset for the detected
 platform, verifies `SHA256SUMS`, validates the executable's `--version`, installs
 to `~/.local/bin` (override with `--prefix` or `TODEX_INSTALL_DIR`), and restarts
-a running managed daemon. `update`, `status`, and `uninstall` cover the rest of
-the lifecycle; `uninstall --purge` also removes the data directory. Typical usage:
+a running managed daemon. The running daemon is stopped only after the new release
+is verified, the swap takes the same `*.update-lock` as the built-in updater, and
+one rollback copy is kept. The restart skips the startup self-update, but later
+launches still update to the latest release, so set `TODEX_AUTO_UPDATE=0` to stay
+on a version installed with `--version`. `update`, `status`, and `uninstall` cover
+the rest of the lifecycle; `uninstall --purge` also removes the data directory and
+needs `--yes` when no terminal is available to confirm (for example, when piped
+from `curl`). A `data_dir` redirect in that directory's `config.toml` is reported
+but not deleted. Typical usage:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/youtonghy/TodeX_backend/main/install.sh | bash

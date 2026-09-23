@@ -122,7 +122,7 @@ curl -fsSL https://raw.githubusercontent.com/youtonghy/TodeX_backend/main/instal
 ./install.sh uninstall --purge       # 同时删除 ~/.todex-agent 数据目录
 ```
 
-通过 `curl` 管道运行时，参数经 `bash -s --` 传入，例如 `... | bash -s -- uninstall --purge`。
+通过 `curl` 管道运行时，参数经 `bash -s --` 传入，例如 `... | bash -s -- uninstall --purge --yes`（没有终端可供确认时，`--purge` 必须带 `--yes`）。用 `--version` 安装的指定版本需配合 `TODEX_AUTO_UPDATE=0` 才能保持，否则 `serve`、`tui`、`daemon start` 启动时会自动更新到最新 release。
 
 ### 1. 编译构建
 
