@@ -26,6 +26,7 @@ use tokio::time::sleep;
 use crate::config::{Config, PairingEncryption, ServeArgs};
 use crate::daemon::{self, DaemonProcess};
 use crate::event::EventRecord;
+use crate::listen_addrs::{self, ConnectAddress};
 use crate::transport_crypto::{render_qr_text_for_bounds, PairingKeys};
 use crate::workspace_paths::canonical_workspace_root;
 
@@ -36,6 +37,7 @@ const QR_POPUP_MARGIN: u16 = 1;
 const EDIT_POPUP_WIDTH: u16 = 64;
 const TICK_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+const CONNECT_ADDRESSES_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_OP_RETRY_BASE: Duration = Duration::from_millis(500);
 const DAEMON_OP_RETRY_MAX: Duration = Duration::from_secs(8);
 
@@ -66,6 +68,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     'main: loop {
         let tick_started = Instant::now();
         app.refresh_daemon_status();
+        app.refresh_connect_addresses();
         app.refresh_device_pairing(false);
         while let Ok(result) = app.daemon_op_rx.try_recv() {
             app.apply_daemon_op_result(result);
@@ -351,6 +354,10 @@ struct TuiApp {
     daemon_op_pending: Option<PendingDaemonOp>,
     daemon_op_failures: u32,
     daemon_status_refreshed_at: Option<Instant>,
+    /// Client-reachable addresses for the listen host, or the enumeration error.
+    connect_addresses: Result<Vec<ConnectAddress>, String>,
+    connect_addresses_host: String,
+    connect_addresses_refreshed_at: Option<Instant>,
     daemon_op_tx: mpsc::UnboundedSender<DaemonOpResult>,
     daemon_op_rx: mpsc::UnboundedReceiver<DaemonOpResult>,
     language: TuiLanguage,
@@ -399,6 +406,9 @@ impl TuiApp {
             daemon_op_pending: None,
             daemon_op_failures: 0,
             daemon_status_refreshed_at: None,
+            connect_addresses: Ok(Vec::new()),
+            connect_addresses_host: String::new(),
+            connect_addresses_refreshed_at: None,
             daemon_op_tx,
             daemon_op_rx,
             language,
@@ -1500,6 +1510,63 @@ impl TuiApp {
         self.queue_daemon_op(pending.kind);
     }
 
+    fn listen_host(&self) -> &str {
+        self.daemon
+            .as_ref()
+            .map(|process| process.host.as_str())
+            .unwrap_or(self.config.host.as_str())
+    }
+
+    /// Re-enumerates interfaces when the listen host changes and periodically
+    /// otherwise, so network switches show up without polling every frame.
+    fn refresh_connect_addresses(&mut self) {
+        let host_changed = self.connect_addresses_host != self.listen_host();
+        if !host_changed
+            && self
+                .connect_addresses_refreshed_at
+                .is_some_and(|time| time.elapsed() < CONNECT_ADDRESSES_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        self.connect_addresses_refreshed_at = Some(Instant::now());
+        self.connect_addresses_host = self.listen_host().to_owned();
+        let next = listen_addrs::connect_addresses(&self.connect_addresses_host)
+            .map_err(|error| error.to_string());
+        if let Err(error) = &next {
+            if self.connect_addresses.as_ref().err() != Some(error) {
+                self.push_log(match self.language {
+                    TuiLanguage::English => {
+                        format!("Failed to list network interface addresses: {error}")
+                    }
+                    TuiLanguage::Chinese => format!("无法读取网卡地址：{error}"),
+                });
+            }
+        }
+        self.connect_addresses = next;
+    }
+
+    /// Preferred host for clients, falling back to the listen host.
+    fn primary_connect_host(&self) -> &str {
+        self.connect_addresses
+            .as_ref()
+            .ok()
+            .and_then(|addresses| addresses.first())
+            .map(|address| address.host.as_str())
+            .unwrap_or_else(|| self.listen_host())
+    }
+
+    fn connect_addresses_label(&self) -> String {
+        match &self.connect_addresses {
+            Ok(addresses) if !addresses.is_empty() => addresses
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" · "),
+            Ok(_) => "-".to_owned(),
+            Err(_) => self.text("unavailable", "读取失败").to_owned(),
+        }
+    }
+
     fn refresh_daemon_status(&mut self) {
         if self
             .daemon_status_refreshed_at
@@ -1924,11 +1991,7 @@ impl TuiApp {
         let text_path = dir.join(format!("todex-tui-{timestamp}.log"));
         let jsonl_path = dir.join(format!("todex-tui-{timestamp}.jsonl"));
 
-        let listen_host = self
-            .daemon
-            .as_ref()
-            .map(|process| process.host.as_str())
-            .unwrap_or(self.config.host.as_str());
+        let listen_host = self.listen_host();
         let listen_port = self
             .daemon
             .as_ref()
@@ -1938,6 +2001,16 @@ impl TuiApp {
         text.push_str("TodeX TUI log export\n");
         text.push_str(&format!("exported_at={}\n", Utc::now().to_rfc3339()));
         text.push_str(&format!("listen={listen_host}:{listen_port}\n"));
+        if let Ok(addresses) = &self.connect_addresses {
+            text.push_str(&format!(
+                "connect_addresses={}\n",
+                addresses
+                    .iter()
+                    .map(|address| address.host.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
         text.push_str(&format!("data_dir={}\n", self.config.data_dir.display()));
         text.push_str(&format!(
             "workspace_roots={}\n",
@@ -2034,7 +2107,7 @@ impl TuiApp {
         .spacing(u16::from(wide))
         .split(chunks[0]);
         if wide {
-            let status_height = if main[0].height >= 25 { 14 } else { 7 };
+            let status_height = if main[0].height >= 26 { 15 } else { 7 };
             let left = Layout::vertical([Constraint::Length(status_height), Constraint::Min(3)])
                 .spacing(1)
                 .split(main[0]);
@@ -2062,7 +2135,7 @@ impl TuiApp {
                             "已停止"
                         },
                     ),
-                    self.config.host,
+                    self.primary_connect_host(),
                     self.config.port
                 ))
                 .block(panel_block().title("TodeX Backend").borders(Borders::ALL)),
@@ -2203,9 +2276,8 @@ impl TuiApp {
                 Style::default().fg(Color::Yellow),
             )
         };
-        let listen_host = process
-            .map(|process| process.host.as_str())
-            .unwrap_or(self.config.host.as_str());
+        let listen_host = self.listen_host();
+        let connect_host = self.primary_connect_host();
         let listen_port = process
             .map(|process| process.port)
             .unwrap_or(self.config.port);
@@ -2263,7 +2335,11 @@ impl TuiApp {
         if area.height < 14 {
             return Paragraph::new(vec![
                 Line::from(vec![Span::raw(self.text("Status: ", "状态：")), status]),
-                Line::from(format!("{listen_host}:{listen_port}")),
+                Line::from(if connect_host == listen_host {
+                    format!("{listen_host}:{listen_port}")
+                } else {
+                    format!("{listen_host}:{listen_port} -> {connect_host}")
+                }),
                 Line::from(format!(
                     "{}{}",
                     self.text("Encryption: ", "加密："),
@@ -2308,8 +2384,16 @@ impl TuiApp {
                 TuiLanguage::English => format!("Listen: {listen_host}:{listen_port}"),
                 TuiLanguage::Chinese => format!("监听：{listen_host}:{listen_port}"),
             }),
+            Line::from(match self.language {
+                TuiLanguage::English => {
+                    format!("Connect IPs: {}", self.connect_addresses_label())
+                }
+                TuiLanguage::Chinese => {
+                    format!("可连接 IP：{}", self.connect_addresses_label())
+                }
+            }),
             Line::from(format!(
-                "WS endpoint: ws://{listen_host}:{listen_port}/v2/ws"
+                "WS endpoint: ws://{connect_host}:{listen_port}/v2/ws"
             )),
             Line::from(match self.language {
                 TuiLanguage::English => format!(

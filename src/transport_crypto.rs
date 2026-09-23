@@ -1,7 +1,7 @@
 pub(crate) mod pairing_browser;
 
 use std::collections::HashSet;
-use std::net::{IpAddr, UdpSocket};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -246,21 +246,11 @@ struct PersistedPairingKeys {
 fn pairing_advertise_host(config_host: &str) -> String {
     let host = config_host.trim();
     match host.parse::<IpAddr>() {
-        Ok(ip) if ip.is_unspecified() => {
-            default_route_ipv4().unwrap_or_else(|| "127.0.0.1".to_owned())
-        }
+        Ok(ip) if ip.is_unspecified() => crate::listen_addrs::default_route_ipv4()
+            .map_or_else(|| "127.0.0.1".to_owned(), |ip| ip.to_string()),
         Ok(IpAddr::V6(ip)) => format!("[{ip}]"),
         Ok(_) => host.to_owned(),
         Err(_) => host.to_owned(),
-    }
-}
-
-fn default_route_ipv4() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
-        _ => None,
     }
 }
 

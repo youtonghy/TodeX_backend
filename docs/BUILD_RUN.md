@@ -280,7 +280,7 @@ cargo run -- daemon status
 cargo run -- daemon stop
 ```
 
-daemon 启动后会写入 `~/.todex-agent/daemon.json`，日志写入 `~/.todex-agent/logs/todex-agentd-daemon.log`。
+daemon 启动后会写入 `~/.todex-agent/daemon.json`，日志写入 `~/.todex-agent/logs/todex-agentd-daemon.log`。`daemon start`、`restart` 和 `status` 会在监听地址下方逐行列出客户端可用的连接地址（`connect: ws://<IP>:<端口>/v2/ws (<网卡>)`）。
 
 前台运行：
 
@@ -294,7 +294,7 @@ cargo run -- serve
 cargo run -- tui
 ```
 
-TUI 是 daemon 控制器，不再承载核心服务进程。可以在界面里查看当前监听地址、数据目录、workspace 根目录、daemon pid 和运行时长。常用快捷键：
+TUI 是 daemon 控制器，不再承载核心服务进程。可以在界面里查看当前监听地址、可连接 IP、数据目录、workspace 根目录、daemon pid 和运行时长。常用快捷键：
 
 | 按键 | 作用 |
 | --- | --- |
@@ -320,7 +320,7 @@ cargo run -- tui --host 127.0.0.1 --port 7345
 cargo run -- tui --host 0.0.0.0 --port 7345
 ```
 
-此时服务监听所有网卡，TUI 配对二维码会尽量写入当前局域网 IP，而不是不可访问的 `0.0.0.0`。
+此时服务监听所有网卡，TUI 配对二维码会尽量写入当前局域网 IP，而不是不可访问的 `0.0.0.0`。监听主机为 `0.0.0.0` 或 `::` 时，TUI 的“可连接 IP”、`serve` 启动日志和 `daemon` 命令输出都会展开为各个已启用网卡的实际地址：默认路由对应的 IPv4 排在最前，回环地址排在最后，链路本地地址会被跳过；约每 5 秒刷新一次，切换网络后会自动更新。`::` 在 Linux/macOS 默认是双栈，会同时列出 IPv4；在 Windows 上只列出 IPv6。
 
 ### 指定数据目录和 workspace 根目录
 
@@ -346,10 +346,12 @@ cargo run -- serve
 
 ## 启动后检查
 
-服务启动后会打印一条监听日志，类似：
+服务启动后会打印监听日志，以及每个客户端可用的连接地址，类似：
 
 ```text
-todex-agentd listening
+todex-agentd listening host=0.0.0.0 port=7345 ...
+client connect address url=ws://192.168.1.20:7345/v2/ws interface="en0"
+client connect address url=ws://127.0.0.1:7345/v2/ws interface="lo0"
 ```
 
 可以用以下接口确认服务正常：

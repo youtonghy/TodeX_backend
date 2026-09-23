@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::app_state::AppState;
 use crate::config::Config;
+use crate::listen_addrs;
 use crate::server;
 
 pub struct ManagedServer {
@@ -66,6 +67,21 @@ impl ManagedServer {
             workspace_roots = ?config.workspace_roots,
             "todex-agentd listening"
         );
+        match listen_addrs::connect_addresses(&config.host) {
+            Ok(addresses) => {
+                for address in addresses {
+                    info!(
+                        url = %address.ws_url(addr.port()),
+                        interface = address.interface.as_deref().unwrap_or("-"),
+                        "client connect address"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to list network interface addresses for the listener"
+            ),
+        }
         if !config.security.enable_tls && config.host != "127.0.0.1" && config.host != "::1" {
             tracing::warn!(
                 host = %config.host,

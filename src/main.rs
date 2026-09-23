@@ -11,6 +11,7 @@ mod devices;
 mod error;
 mod event;
 mod kanban_store;
+mod listen_addrs;
 mod local_terminal;
 mod mcp;
 mod provider;
@@ -213,6 +214,7 @@ async fn daemon_command(command: DaemonCommand) -> anyhow::Result<()> {
                 process.pid,
                 process.listen_addr()
             );
+            print_connect_addresses(&process);
         }
         DaemonCommand::Stop(args) => {
             let config = Config::load(args).context("failed to load configuration")?;
@@ -233,20 +235,40 @@ async fn daemon_command(command: DaemonCommand) -> anyhow::Result<()> {
                 process.pid,
                 process.listen_addr()
             );
+            print_connect_addresses(&process);
         }
         DaemonCommand::Status(args) => {
             let config = Config::load(args).context("failed to load configuration")?;
             match daemon::status(&config)? {
-                Some(process) => println!(
-                    "Daemon running: pid={} listen={} started_at={}",
-                    process.pid,
-                    process.listen_addr(),
-                    process.started_at.to_rfc3339()
-                ),
+                Some(process) => {
+                    println!(
+                        "Daemon running: pid={} listen={} started_at={}",
+                        process.pid,
+                        process.listen_addr(),
+                        process.started_at.to_rfc3339()
+                    );
+                    print_connect_addresses(&process);
+                }
                 None => println!("Daemon stopped."),
             }
         }
     }
 
     Ok(())
+}
+
+fn print_connect_addresses(process: &daemon::DaemonProcess) {
+    match listen_addrs::connect_addresses(&process.host) {
+        Ok(addresses) => {
+            for address in addresses {
+                let interface = address
+                    .interface
+                    .as_deref()
+                    .map(|name| format!(" ({name})"))
+                    .unwrap_or_default();
+                println!("  connect: {}{interface}", address.ws_url(process.port));
+            }
+        }
+        Err(error) => eprintln!("warning: failed to list network interface addresses: {error}"),
+    }
 }
