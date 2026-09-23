@@ -21,6 +21,16 @@ optional and canonical aliases are recomputed when old journals are replayed.
 - Usage belongs to a turn/message and updates a stable snapshot. Unknown usage
   is not zero. TPS is omitted without a reliable generation interval. Automatic
   compaction updates its own state without ending the parent turn.
+- Claude Code `result` frames close a model turn, not the process. A turn stays
+  open while provider-reported background tasks remain; a zero-iteration result
+  means the prompt was consumed unanswered and is resent on the open stream.
+- Subagent runs are normalized to `subagent.*` events carrying a stable
+  `subagentId`, `title`, `task`, `status` and optional `parentId`, `turnId`,
+  `providerItemId`, `agentKind`, `agentId`, `result`, `error` and `metadata`.
+  Claude Code surfaces Task/Agent tool calls plus `task_started`/
+  `task_progress`/`task_notification` frames; Codex uses `subAgentActivity` and
+  `collabAgentToolCall` items; Grok Build maps `subagent_*` session updates.
+  Providers without native subagent signals emit no `subagent.*` events.
 - Memory configuration is separate from memory content; the panel explicitly
   reports when the provider has no readable content source.
 - Streaming is coalesced before it reaches the journal. Pi thinking/text

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tokio::sync::watch;
 
@@ -11,7 +12,8 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PermissionOutcome, ProviderCapabilities, ProviderDescriptor, ProviderDriver,
+    PermissionDecision, PermissionOutcome, ProviderCapabilities, ProviderDescriptor,
+    ProviderDriver,
 };
 
 pub struct ClaudeDriver {
@@ -254,8 +256,113 @@ fn claude_user_content(prompt: &DriverPrompt) -> Value {
 mod tests {
     use serde_json::json;
 
-    use super::{claude_model_aliases, claude_user_content};
-    use crate::provider::types::{DriverPrompt, DriverPromptContent};
+    use super::{
+        claude_model_aliases, claude_question_details, claude_question_response,
+        claude_user_content, BackgroundTasks, ClaudeSubagents, ClaudeToolCalls,
+    };
+    use crate::provider::types::{
+        DriverPrompt, DriverPromptContent, PermissionDecision, PermissionOutcome,
+    };
+
+    fn ask_user_question_input() -> serde_json::Value {
+        json!({
+            "questions": [
+                {
+                    "question": "Which file?",
+                    "header": "Target",
+                    "options": [
+                        { "label": "web", "description": "TodeX_web/AGENTS.md" },
+                        { "label": "desktop", "description": "TodeX_desktop/AGENTS.md" }
+                    ],
+                    "multiSelect": false
+                },
+                {
+                    "question": "Which steps?",
+                    "header": "Steps",
+                    "options": [{ "label": "commit" }, { "label": "push" }],
+                    "multiSelect": true
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn tool_snapshots_accumulate_name_input_and_result_under_one_block() {
+        let mut tools = ClaudeToolCalls::default();
+        let id = tools
+            .record(&json!({ "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {} }))
+            .unwrap();
+        let started = tools.payload(&id, "turn-1", "started");
+        assert_eq!(started["toolName"], "Bash");
+        assert_eq!(started["block"]["id"], "toolu_1");
+        assert_eq!(started["block"]["category"], "tool");
+
+        tools.record(&json!({
+            "type": "tool_use", "id": "toolu_1", "name": "Bash",
+            "input": { "command": "echo ok" }
+        }));
+        // A late empty-input block never erases the complete arguments.
+        tools.record(&json!({ "type": "tool_use", "id": "toolu_1", "input": {} }));
+        assert_eq!(
+            tools.payload(&id, "turn-1", "delta")["arguments"]["command"],
+            "echo ok"
+        );
+
+        tools.complete(&json!({
+            "type": "tool_result", "tool_use_id": "toolu_1",
+            "content": [{ "type": "text", "text": "ok" }], "is_error": false
+        }));
+        let completed = tools.payload(&id, "turn-1", "completed");
+        assert_eq!(completed["toolName"], "Bash");
+        assert_eq!(completed["arguments"]["command"], "echo ok");
+        assert_eq!(completed["result"], "ok");
+        assert_eq!(completed["isError"], false);
+        assert_eq!(completed["block"]["phase"], "completed");
+    }
+
+    #[test]
+    fn ask_user_question_maps_to_the_shared_user_input_shape() {
+        let details = claude_question_details(&ask_user_question_input()).unwrap();
+        assert_eq!(details["questions"][0]["id"], "q0");
+        assert_eq!(details["questions"][0]["question"], "Which file?");
+        assert_eq!(details["questions"][0]["options"][1]["label"], "desktop");
+        assert_eq!(details["questions"][1]["multiSelect"], true);
+        assert_eq!(details["questions"][0]["isOther"], true);
+        assert!(claude_question_details(&json!({ "questions": [] })).is_none());
+        assert!(claude_question_details(&json!({ "questions": [{ "header": "x" }] })).is_none());
+    }
+
+    #[test]
+    fn ask_user_question_answers_are_keyed_by_question_text() {
+        let input = ask_user_question_input();
+        let answered = claude_question_response(
+            &input,
+            &PermissionDecision {
+                outcome: PermissionOutcome::Answer,
+                option_id: Some("answer".to_owned()),
+                data: Some(json!({ "answers": {
+                    "q0": { "answers": ["web"] },
+                    "q1": { "answers": ["commit", "push"] }
+                } })),
+            },
+        );
+        assert_eq!(answered["behavior"], "allow");
+        assert_eq!(answered["updatedInput"]["questions"], input["questions"]);
+        assert_eq!(
+            answered["updatedInput"]["answers"],
+            json!({ "Which file?": "web", "Which steps?": "commit, push" })
+        );
+
+        let skipped = claude_question_response(
+            &input,
+            &PermissionDecision {
+                outcome: PermissionOutcome::RejectOnce,
+                option_id: Some("reject_once".to_owned()),
+                data: None,
+            },
+        );
+        assert_eq!(skipped["behavior"], "deny");
+    }
 
     #[test]
     fn built_in_model_aliases_are_selectable_without_gateway_discovery() {
@@ -273,6 +380,156 @@ mod tests {
             models[0].supported_reasoning_efforts,
             ["low", "medium", "high", "xhigh", "max"]
         );
+    }
+
+    #[test]
+    fn background_tasks_track_live_set_until_notifications() {
+        let mut tasks = BackgroundTasks::default();
+        assert!(tasks.is_empty());
+
+        tasks.apply(&json!({ "subtype": "task_started", "task_id": "a1" }));
+        tasks
+            .apply(&json!({ "subtype": "task_started", "task_id": "b2", "is_backgrounded": true }));
+        assert!(!tasks.is_empty());
+
+        // Foreground task starts are not background work that outlives a turn.
+        tasks.apply(
+            &json!({ "subtype": "task_started", "task_id": "fg", "is_backgrounded": false }),
+        );
+        tasks.apply(
+            &json!({ "subtype": "task_notification", "task_id": "a1", "status": "completed" }),
+        );
+        assert_eq!(tasks.ids().len(), 1);
+
+        // background_tasks_changed replaces the whole live set.
+        tasks.apply(&json!({
+            "subtype": "background_tasks_changed",
+            "tasks": [{ "task_id": "c3" }, { "task_id": "d4" }]
+        }));
+        let mut ids = tasks
+            .ids()
+            .into_iter()
+            .filter_map(|id| id.as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["c3", "d4"]);
+
+        tasks.apply(&json!({ "subtype": "background_tasks_changed", "tasks": [] }));
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn task_tool_call_opens_a_subagent_and_task_frames_update_it() {
+        let mut subagents = ClaudeSubagents::default();
+
+        let started = subagents
+            .start_from_tool(
+                &json!({
+                    "type": "tool_use", "id": "toolu_1", "name": "Task",
+                    "input": { "description": "Map contracts", "subagent_type": "Explore",
+                        "prompt": "inspect the workspace" }
+                }),
+                "turn-1",
+            )
+            .unwrap();
+        assert_eq!(started["subagentId"], "toolu_1");
+        assert_eq!(started["providerItemId"], "toolu_1");
+        assert_eq!(started["agentKind"], "Explore");
+        assert_eq!(started["task"], "inspect the workspace");
+        assert!(subagents
+            .start_from_tool(
+                &json!({ "type": "tool_use", "id": "toolu_1", "name": "Task", "input": {} }),
+                "turn-1",
+            )
+            .is_none());
+
+        // task_started only links the task id back to the surfaced run.
+        assert!(subagents
+            .system_event(
+                &json!({ "subtype": "task_started", "task_id": "agent-9",
+                    "task_type": "local_agent", "tool_use_id": "toolu_1" }),
+                "turn-1",
+            )
+            .is_none());
+
+        let progress = subagents
+            .system_event(
+                &json!({ "subtype": "task_progress", "task_id": "agent-9",
+                    "status": "running" }),
+                "turn-1",
+            )
+            .unwrap();
+        assert_eq!(progress.0, "subagent.updated");
+        assert_eq!(progress.1["subagentId"], "toolu_1");
+
+        let done = subagents
+            .system_event(
+                &json!({ "subtype": "task_notification", "task_id": "agent-9",
+                    "status": "completed", "summary": "mapped",
+                    "agent_id": "aabe", "output_file": "/tmp/out.md" }),
+                "turn-1",
+            )
+            .unwrap();
+        assert_eq!(done.0, "subagent.completed");
+        assert_eq!(done.1["subagentId"], "toolu_1");
+        assert_eq!(done.1["providerItemId"], "toolu_1");
+        assert_eq!(done.1["agentId"], "aabe");
+        assert_eq!(done.1["result"], "mapped");
+        assert_eq!(done.1["metadata"]["outputFile"], "/tmp/out.md");
+
+        // A trailing tool_result cannot reopen a notified run.
+        assert!(subagents
+            .finish_from_tool("toolu_1", &json!({}), &json!("late"), false, "turn-1")
+            .is_none());
+    }
+
+    #[test]
+    fn foreground_agent_finishes_with_its_tool_result() {
+        let mut subagents = ClaudeSubagents::default();
+        subagents.start_from_tool(
+            &json!({ "type": "tool_use", "id": "toolu_2", "name": "Agent",
+                "input": { "description": "run tests" } }),
+            "turn-1",
+        );
+
+        let done = subagents
+            .finish_from_tool("toolu_2", &json!({}), &json!("all green"), false, "turn-1")
+            .unwrap();
+        assert_eq!(done.0, "subagent.completed");
+        assert_eq!(done.1["result"], "all green");
+    }
+
+    #[test]
+    fn async_tool_result_keeps_the_subagent_running() {
+        let mut subagents = ClaudeSubagents::default();
+        subagents.start_from_tool(
+            &json!({ "type": "tool_use", "id": "toolu_3", "name": "Task",
+                "input": { "description": "background sweep" } }),
+            "turn-1",
+        );
+
+        let update = subagents
+            .finish_from_tool(
+                "toolu_3",
+                &json!({ "tool_use_result": {
+                    "isAsync": true, "status": "async_launched", "agentId": "a1" } }),
+                &json!("Async agent launched"),
+                false,
+                "turn-1",
+            )
+            .unwrap();
+        assert_eq!(update.0, "subagent.updated");
+        assert_eq!(update.1["agentId"], "a1");
+        assert_eq!(update.1["status"], "running");
+
+        // Non-agent task kinds never enter the subagent surface.
+        assert!(subagents
+            .system_event(
+                &json!({ "subtype": "task_started", "task_id": "sh-1",
+                    "task_type": "local_shell", "tool_use_id": "toolu_sh" }),
+                "turn-1",
+            )
+            .is_none());
     }
 
     #[test]
@@ -413,20 +670,26 @@ async fn run_claude_turn(
         prompt.approval_policy.as_deref(),
     )?
     .provider_mode;
-    let message_content = claude_user_content(&prompt);
-    process
-        .send(&json!({
-            "type": "user",
-            "session_id": requested_session_id,
-            "parent_tool_use_id": null,
-            "message": {
-                "role": "user",
-                "content": message_content,
-            }
-        }))
-        .await?;
+    let user_message = json!({
+        "type": "user",
+        "session_id": requested_session_id,
+        "parent_tool_use_id": null,
+        "message": {
+            "role": "user",
+            "content": claude_user_content(&prompt),
+        }
+    });
+    process.send(&user_message).await?;
 
     let mut saw_output = false;
+    let mut tools = ClaudeToolCalls::default();
+    let mut background_tasks = BackgroundTasks::default();
+    let mut subagents = ClaudeSubagents::default();
+    // A `result` with zero model turns means the invocation ended without an
+    // API call — a task notification queued during resume consumes the prompt
+    // without answering it. The process stays alive on the open stream, so
+    // resend the prompt instead of failing the turn.
+    let mut empty_results = 0_u32;
     loop {
         let message = tokio::select! {
             message = process.read() => message?,
@@ -470,6 +733,30 @@ async fn run_claude_turn(
                             .collect(),
                     ));
                 }
+                if message.get("num_turns").and_then(Value::as_u64) == Some(0)
+                    && empty_results < MAX_EMPTY_RESULT_RESENDS
+                {
+                    empty_results += 1;
+                    process.send(&user_message).await?;
+                    continue;
+                }
+                // `result` ends the model turn, not the process: while live
+                // background tasks remain, Claude keeps the stream open,
+                // delivers task_notification, and runs a follow-up turn that
+                // ends in another `result`. Terminating here kills those
+                // subagents mid-flight.
+                if !background_tasks.is_empty() {
+                    sink.emit(
+                        "provider.event",
+                        json!({
+                            "provider": "claude-code",
+                            "providerMethod": "background_tasks_pending",
+                            "metadata": { "taskIds": background_tasks.ids() },
+                        }),
+                    )
+                    .await?;
+                    continue;
+                }
                 if !saw_output {
                     return Err(AppError::ProviderUnavailable(
                         "Claude Code completed without producing output; please retry".to_owned(),
@@ -492,7 +779,7 @@ async fn run_claude_turn(
             }
             Some("stream_event") => {
                 saw_output = true;
-                handle_stream_event(&message, sink).await?;
+                handle_stream_event(&message, &prompt.turn_id, &mut tools, sink).await?;
             }
             Some("assistant") => {
                 saw_output = true;
@@ -501,24 +788,57 @@ async fn run_claude_turn(
                     json!({ "provider": "claude-code", "message": message.get("message") }),
                 )
                 .await?;
+                // The streamed `tool_use` start carries an empty input; the
+                // complete assistant message is the first with arguments.
+                for block in content_blocks(&message, "tool_use") {
+                    if let Some(id) = tools.record(block) {
+                        if ClaudeSubagents::is_agent_tool(block.get("name")) {
+                            if let Some(payload) = subagents.start_from_tool(block, &prompt.turn_id)
+                            {
+                                sink.emit("subagent.started", payload).await?;
+                            }
+                        }
+                        sink.emit("tool.updated", tools.payload(&id, &prompt.turn_id, "delta"))
+                            .await?;
+                    }
+                }
+            }
+            Some("user") => {
+                for block in content_blocks(&message, "tool_result") {
+                    if let Some(id) = tools.complete(block) {
+                        let payload = tools.payload(&id, &prompt.turn_id, "completed");
+                        sink.emit("tool.completed", payload.clone()).await?;
+                        if let Some((event, subagent)) = subagents.finish_from_tool(
+                            &id,
+                            &message,
+                            payload.get("result").unwrap_or(&Value::Null),
+                            payload
+                                .get("isError")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            &prompt.turn_id,
+                        ) {
+                            sink.emit(event, subagent).await?;
+                        }
+                    }
+                }
             }
             Some("tool_progress") => {
                 saw_output = true;
-                sink.emit(
-                    "tool.updated",
-                    json!({
-                        "provider": "claude-code",
-                        "toolUseId": message.get("tool_use_id"),
-                        "toolName": message.get("tool_name"),
-                        "elapsedSeconds": message.get("elapsed_time_seconds"),
-                    }),
-                )
-                .await?;
+                if let Some(id) = message.get("tool_use_id").and_then(Value::as_str) {
+                    tools.name_if_unknown(id, message.get("tool_name"));
+                    sink.emit("tool.updated", tools.payload(id, &prompt.turn_id, "delta"))
+                        .await?;
+                }
             }
             Some("control_request") => {
                 handle_control_request(process, message, sink, cancel).await?;
             }
             Some("system") => {
+                background_tasks.apply(&message);
+                if let Some((event, payload)) = subagents.system_event(&message, &prompt.turn_id) {
+                    sink.emit(event, payload).await?;
+                }
                 if message.get("subtype").and_then(Value::as_str) == Some("init") {
                     if let Some(actual) = message.get("permissionMode").and_then(Value::as_str) {
                         if expected_mode.as_deref() != Some(actual) {
@@ -538,12 +858,17 @@ async fn run_claude_turn(
                             "sessionId": message.get("session_id"),
                             "model": message.get("model"),
                             "permissionMode": message.get("permissionMode"),
+                            "taskId": message.get("task_id"),
+                            "taskType": message.get("task_type"),
+                            "taskStatus": message.get("status"),
+                            "description": message.get("description"),
+                            "toolUseId": message.get("tool_use_id"),
                         }
                     }),
                 )
                 .await?;
             }
-            Some("user" | "control_response") => {}
+            Some("control_response") => {}
             Some(event_type) => {
                 sink.emit(
                     "provider.event",
@@ -556,7 +881,382 @@ async fn run_claude_turn(
     }
 }
 
-async fn handle_stream_event(message: &Value, sink: &DriverEventSink) -> Result<(), AppError> {
+fn content_blocks<'a>(message: &'a Value, kind: &'a str) -> impl Iterator<Item = &'a Value> {
+    message
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(move |block| block.get("type").and_then(Value::as_str) == Some(kind))
+}
+
+/// Resend attempts allowed when a `result` reports zero model turns. Several
+/// queued notifications can each consume an invocation, so the cap is above
+/// one but still bounded.
+const MAX_EMPTY_RESULT_RESENDS: u32 = 3;
+
+/// Live background-task set, mirroring the Agent SDK: `task_started` adds
+/// (unless explicitly foreground), `task_notification` removes, and
+/// `background_tasks_changed` replaces the whole set — its `tasks` payload is
+/// "every live background task after the change".
+#[derive(Default)]
+struct BackgroundTasks(HashSet<String>);
+
+impl BackgroundTasks {
+    fn apply(&mut self, message: &Value) {
+        match message.get("subtype").and_then(Value::as_str) {
+            Some("task_started") => {
+                if message.get("is_backgrounded").and_then(Value::as_bool) == Some(false) {
+                    return;
+                }
+                if let Some(id) = message.get("task_id").and_then(Value::as_str) {
+                    self.0.insert(id.to_owned());
+                }
+            }
+            Some("task_notification") => {
+                if let Some(id) = message.get("task_id").and_then(Value::as_str) {
+                    self.0.remove(id);
+                }
+            }
+            Some("background_tasks_changed") => {
+                self.0.clear();
+                if let Some(tasks) = message.get("tasks").and_then(Value::as_array) {
+                    self.0.extend(tasks.iter().filter_map(|task| {
+                        task.get("task_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn ids(&self) -> Vec<Value> {
+        self.0.iter().map(|id| Value::String(id.clone())).collect()
+    }
+}
+
+/// Subagent runs keyed by the surfaced `subagentId`: the spawning Task/Agent
+/// tool_use id when the run came from a tool call, otherwise the provider
+/// task_id. `by_task` links background task frames (keyed by task_id) back to
+/// that surfaced id so progress and terminal notifications update one entry.
+#[derive(Default)]
+struct ClaudeSubagents {
+    /// subagentId → tool_use_id of the spawning Task/Agent call.
+    items: HashMap<String, String>,
+    /// task_id → subagentId for every task classified as a subagent.
+    by_task: HashMap<String, String>,
+    /// subagentIds that already emitted a terminal event.
+    finished: HashSet<String>,
+}
+
+impl ClaudeSubagents {
+    fn is_agent_tool(name: Option<&Value>) -> bool {
+        matches!(name.and_then(Value::as_str), Some("Task" | "Agent"))
+    }
+
+    /// Background shells and monitors ride the same task frames; only agent
+    /// kinds belong on the subagent surface.
+    fn is_agent_task_kind(kind: Option<&Value>) -> bool {
+        kind.and_then(Value::as_str)
+            .is_some_and(|kind| kind.contains("agent"))
+    }
+
+    /// A Task/Agent `tool_use` opens a subagent run even when no task frame
+    /// ever arrives — foreground agents only report through their tool result.
+    fn start_from_tool(&mut self, block: &Value, turn_id: &str) -> Option<Value> {
+        let tool_id = block.get("id").and_then(Value::as_str)?.to_owned();
+        if self.items.contains_key(&tool_id) {
+            return None;
+        }
+        self.items.insert(tool_id.clone(), tool_id.clone());
+        let input = block.get("input").cloned().unwrap_or(Value::Null);
+        Some(json!({
+            "provider": "claude-code",
+            "source": "provider",
+            "turnId": turn_id,
+            "subagentId": tool_id,
+            "providerItemId": tool_id,
+            "agentKind": input.get("subagent_type"),
+            "title": input.get("description").or_else(|| input.get("subagent_type")),
+            "task": input.get("prompt").or_else(|| input.get("description")),
+            "status": "running",
+        }))
+    }
+
+    /// The tool_result of a Task/Agent call ends the run for foreground
+    /// agents. Background launches report `async_launched` and finish through
+    /// their task_notification instead.
+    fn finish_from_tool(
+        &mut self,
+        tool_id: &str,
+        message: &Value,
+        result: &Value,
+        is_error: bool,
+        turn_id: &str,
+    ) -> Option<(&'static str, Value)> {
+        if !self.items.contains_key(tool_id) || self.finished.contains(tool_id) {
+            return None;
+        }
+        let tool_use_result = message
+            .get("tool_use_result")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let async_launch = tool_use_result
+            .get("isAsync")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || tool_use_result
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status == "async_launched");
+        if async_launch {
+            return Some((
+                "subagent.updated",
+                json!({
+                    "provider": "claude-code",
+                    "source": "provider",
+                    "turnId": turn_id,
+                    "subagentId": tool_id,
+                    "providerItemId": tool_id,
+                    "agentId": tool_use_result.get("agentId"),
+                    "status": "running",
+                    "metadata": { "outputFile": tool_use_result.get("outputFile") },
+                }),
+            ));
+        }
+        self.finished.insert(tool_id.to_owned());
+        Some((
+            if is_error {
+                "subagent.failed"
+            } else {
+                "subagent.completed"
+            },
+            json!({
+                "provider": "claude-code",
+                "source": "provider",
+                "turnId": turn_id,
+                "subagentId": tool_id,
+                "providerItemId": tool_id,
+                "status": if is_error { "failed" } else { "completed" },
+                "result": result,
+                "error": is_error.then(|| result.clone()),
+            }),
+        ))
+    }
+
+    /// `task_started`, `task_progress` and `task_notification` frames carry the
+    /// subagent lifecycle for provider-side tasks.
+    fn system_event(&mut self, message: &Value, turn_id: &str) -> Option<(&'static str, Value)> {
+        let task_id = message.get("task_id").and_then(Value::as_str)?;
+        match message.get("subtype").and_then(Value::as_str) {
+            Some("task_started") => {
+                let tool_use_id = message.get("tool_use_id").and_then(Value::as_str);
+                let kind = message.get("task_type");
+                // A linked Task call already opened the run from its tool_use;
+                // record the task_id link so later task frames find it.
+                if let Some(subagent_id) = tool_use_id.and_then(|id| self.items.get(id)).cloned() {
+                    self.by_task.insert(task_id.to_owned(), subagent_id);
+                    return None;
+                }
+                if !Self::is_agent_task_kind(kind) {
+                    return None;
+                }
+                self.by_task.insert(task_id.to_owned(), task_id.to_owned());
+                if let Some(tool_use_id) = tool_use_id {
+                    self.items
+                        .insert(task_id.to_owned(), tool_use_id.to_owned());
+                }
+                Some((
+                    "subagent.started",
+                    json!({
+                        "provider": "claude-code",
+                        "source": "provider",
+                        "turnId": turn_id,
+                        "subagentId": task_id,
+                        "providerItemId": tool_use_id,
+                        "agentKind": kind,
+                        "agentId": message.get("agent_id"),
+                        "title": message
+                            .get("description")
+                            .or(kind)
+                            .filter(|title| title.is_string()),
+                        "task": message.get("description"),
+                        "status": "running",
+                    }),
+                ))
+            }
+            Some("task_progress") => {
+                let subagent_id = self.by_task.get(task_id)?;
+                if self.finished.contains(subagent_id) {
+                    return None;
+                }
+                Some((
+                    "subagent.updated",
+                    json!({
+                        "provider": "claude-code",
+                        "source": "provider",
+                        "turnId": turn_id,
+                        "subagentId": subagent_id,
+                        "status": message.get("status"),
+                        "metadata": {
+                            "taskId": task_id,
+                            "description": message.get("description"),
+                            "toolName": message.get("tool_name"),
+                            "usage": message.get("usage"),
+                        },
+                    }),
+                ))
+            }
+            Some("task_notification") => {
+                let subagent_id = self.by_task.get(task_id)?.clone();
+                if self.finished.contains(&subagent_id) {
+                    return None;
+                }
+                self.finished.insert(subagent_id.clone());
+                let status = message
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+                let event = match status {
+                    "completed" => "subagent.completed",
+                    "failed" => "subagent.failed",
+                    _ => "subagent.cancelled",
+                };
+                Some((
+                    event,
+                    json!({
+                        "provider": "claude-code",
+                        "source": "provider",
+                        "turnId": turn_id,
+                        "subagentId": subagent_id,
+                        "providerItemId": self.items.get(&subagent_id),
+                        "agentId": message.get("agent_id"),
+                        "status": status,
+                        "result": message.get("summary"),
+                        "error": (status != "completed")
+                            .then(|| message.get("summary").cloned())
+                            .flatten(),
+                        "metadata": {
+                            "taskId": task_id,
+                            "outputFile": message.get("output_file"),
+                            "stopCause": message.get("stop_cause"),
+                            "snapshot": message.get("snapshot"),
+                        },
+                    }),
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ClaudeToolCall {
+    name: Value,
+    input: Value,
+    result: Option<Value>,
+    is_error: Option<bool>,
+}
+
+/// Claude reports one tool call across several messages: the streamed
+/// `tool_use` start (empty input), the complete assistant message, progress
+/// ticks and the replayed `tool_result`. Clients replace a tool card with the
+/// latest snapshot, so every event carries everything known about the call.
+#[derive(Default)]
+struct ClaudeToolCalls(HashMap<String, ClaudeToolCall>);
+
+impl ClaudeToolCalls {
+    /// Record a `tool_use` block, keeping earlier non-empty input when a
+    /// later block (the stream start) has none.
+    fn record(&mut self, block: &Value) -> Option<String> {
+        let id = block.get("id").and_then(Value::as_str)?.to_owned();
+        let call = self.0.entry(id.clone()).or_default();
+        if let Some(name) = block.get("name").filter(|name| name.is_string()) {
+            call.name = name.clone();
+        }
+        if let Some(input) = block
+            .get("input")
+            .filter(|input| input.as_object().is_some_and(|input| !input.is_empty()))
+        {
+            call.input = input.clone();
+        }
+        Some(id)
+    }
+
+    fn name_if_unknown(&mut self, id: &str, name: Option<&Value>) {
+        let call = self.0.entry(id.to_owned()).or_default();
+        if call.name.is_null() {
+            if let Some(name) = name.filter(|name| name.is_string()) {
+                call.name = name.clone();
+            }
+        }
+    }
+
+    fn complete(&mut self, block: &Value) -> Option<String> {
+        let id = block.get("tool_use_id").and_then(Value::as_str)?.to_owned();
+        let call = self.0.entry(id.clone()).or_default();
+        call.result = Some(tool_result_text(block.get("content")));
+        call.is_error = Some(
+            block
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        );
+        Some(id)
+    }
+
+    fn payload(&self, id: &str, turn_id: &str, phase: &str) -> Value {
+        let call = self.0.get(id);
+        json!({
+            "provider": "claude-code",
+            "toolCallId": id,
+            "toolName": call.map_or(&Value::Null, |call| &call.name),
+            "arguments": call.map_or(&Value::Null, |call| &call.input),
+            "result": call.and_then(|call| call.result.as_ref()),
+            "isError": call.and_then(|call| call.is_error),
+            "block": {
+                "category": "tool",
+                "id": id,
+                "turnId": turn_id,
+                "phase": phase,
+            },
+        })
+    }
+}
+
+/// `tool_result` content is a string or a list of content blocks; text blocks
+/// are joined, anything else (images) is kept as-is.
+fn tool_result_text(content: Option<&Value>) -> Value {
+    match content {
+        Some(Value::Array(blocks)) => {
+            let text = blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                Value::Array(blocks.clone())
+            } else {
+                Value::String(text)
+            }
+        }
+        Some(value) => value.clone(),
+        None => Value::Null,
+    }
+}
+
+async fn handle_stream_event(
+    message: &Value,
+    turn_id: &str,
+    tools: &mut ClaudeToolCalls,
+    sink: &DriverEventSink,
+) -> Result<(), AppError> {
     let event = message.get("event").cloned().unwrap_or(Value::Null);
     let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
     match event_type {
@@ -577,11 +1277,10 @@ async fn handle_stream_event(message: &Value, sink: &DriverEventSink) -> Result<
         "content_block_start" => {
             let content = event.get("content_block").cloned().unwrap_or(Value::Null);
             if content.get("type").and_then(Value::as_str) == Some("tool_use") {
-                sink.emit(
-                    "tool.started",
-                    json!({ "provider": "claude-code", "tool": content }),
-                )
-                .await?;
+                if let Some(id) = tools.record(&content) {
+                    sink.emit("tool.started", tools.payload(&id, turn_id, "started"))
+                        .await?;
+                }
             }
         }
         "message_stop" | "message_start" | "content_block_stop" => {}
@@ -628,17 +1327,40 @@ async fn handle_control_request(
         return Ok(());
     }
 
+    let tool_name = request
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("operation");
+    if tool_name == ASK_USER_QUESTION_TOOL {
+        if let Some(details) = request.get("input").and_then(claude_question_details) {
+            let decision = sink
+                .request_permission(
+                    request_id.to_owned(),
+                    "user_input",
+                    "Claude needs input",
+                    details,
+                    json!([
+                        { "id": "answer", "kind": "answer", "name": "Answer" },
+                        { "id": "reject_once", "kind": "reject_once", "name": "Skip" }
+                    ]),
+                    cancel,
+                )
+                .await?;
+            let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
+            return send_permission_response(
+                process,
+                request_id,
+                claude_question_response(&input, &decision),
+            )
+            .await;
+        }
+    }
+
     let decision = sink
         .request_permission(
             request_id.to_owned(),
             "tool",
-            format!(
-                "Allow Claude tool {}?",
-                request
-                    .get("tool_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("operation")
-            ),
+            format!("Allow Claude tool {tool_name}?"),
             request.clone(),
             json!([
                 { "id": "allow_once", "kind": "allow_once", "name": "Allow once" },
@@ -662,6 +1384,14 @@ async fn handle_control_request(
             "message": "User rejected this tool request",
         }),
     };
+    send_permission_response(process, request_id, response).await
+}
+
+async fn send_permission_response(
+    process: &mut JsonLineProcess,
+    request_id: &str,
+    response: Value,
+) -> Result<(), AppError> {
     process
         .send(&json!({
             "type": "control_response",
@@ -672,4 +1402,79 @@ async fn handle_control_request(
             }
         }))
         .await
+}
+
+/// Claude's clarifying-question tool. It is answered rather than approved:
+/// the tool reads the user's picks from `updatedInput.answers`, so allowing it
+/// with the original input reads as "the user did not answer".
+const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
+
+fn claude_question_id(index: usize) -> String {
+    format!("q{index}")
+}
+
+/// Surface `AskUserQuestion` as the shared `user_input` request so every
+/// client's question form applies. Returns `None` for malformed input, which
+/// then falls back to a plain tool approval.
+fn claude_question_details(input: &Value) -> Option<Value> {
+    let questions = input.get("questions")?.as_array()?;
+    if questions.is_empty() {
+        return None;
+    }
+    let questions = questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| {
+            let text = question
+                .get("question")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())?;
+            Some(json!({
+                "id": claude_question_id(index),
+                "question": text,
+                "header": question.get("header").and_then(Value::as_str),
+                "options": question.get("options").filter(|options| options.is_array()),
+                "multiSelect": question.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
+                // Claude accepts a free-text answer in place of the options.
+                "isOther": true,
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(json!({ "questions": questions }))
+}
+
+/// Map `user_input` answers (validated by the broker to cover every question)
+/// back to Claude's shape: keyed by question text, multi-select picks joined
+/// with ", " as the SDK documents.
+fn claude_question_response(input: &Value, decision: &PermissionDecision) -> Value {
+    if !matches!(decision.outcome, PermissionOutcome::Answer) {
+        return json!({
+            "behavior": "deny",
+            "message": "User declined to answer the question",
+        });
+    }
+    let answers = decision.data.as_ref().and_then(|data| data.get("answers"));
+    let mut mapped = Map::new();
+    let questions = input.get("questions").and_then(Value::as_array);
+    for (index, question) in questions.into_iter().flatten().enumerate() {
+        let Some(text) = question.get("question").and_then(Value::as_str) else {
+            continue;
+        };
+        let picks = answers
+            .and_then(|answers| answers.get(claude_question_id(index)))
+            .and_then(|answer| answer.get("answers"))
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        mapped.insert(text.to_owned(), Value::String(picks));
+    }
+    let mut updated = input.as_object().cloned().unwrap_or_default();
+    updated.insert("answers".to_owned(), Value::Object(mapped));
+    json!({ "behavior": "allow", "updatedInput": updated })
 }
