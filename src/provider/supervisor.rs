@@ -371,7 +371,7 @@ impl ConversationSupervisor {
         self.registry.descriptors()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
     pub fn has_active_turns(&self) -> bool {
         !self.active.is_empty()
     }
