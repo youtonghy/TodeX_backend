@@ -82,6 +82,7 @@ for line in sys.stdin:
                 for index, reason in enumerate(['toolUse', 'stop']):
                     out({'type': 'message_start', 'message': {'role': 'assistant'}})
                     out({'type': 'message_update', 'assistantMessageEvent': {'type': 'thinking_delta', 'contentIndex': 0, 'delta': 'thought' + str(index)}})
+                    out({'type': 'message_update', 'assistantMessageEvent': {'type': 'thinking_delta', 'contentIndex': 0, 'delta': ' more'}})
                     out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': reason, 'content': [{'type': 'text', 'text': 'part'}]}})
                 streaming = False
                 out({'type': 'agent_settled'})

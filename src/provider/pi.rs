@@ -21,6 +21,11 @@ use super::types::{
 
 const MAX_PI_SESSIONS: usize = 32;
 const PI_UI_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+/// Pi streams thinking/text a few characters at a time; fragments of one block
+/// are merged for this long so the journal does not store one event per token.
+const PI_DELTA_COALESCE_INTERVAL: Duration = Duration::from_millis(100);
+/// Merged text stays below the journal compaction string limit.
+const PI_DELTA_COALESCE_MAX_BYTES: usize = 2 * 1024;
 
 pub struct PiDriver {
     binary: String,
@@ -678,6 +683,9 @@ async fn pi_session_worker(
                     continue;
                 }
             };
+            if let Err(error) = rpc.flush_pending_delta().await {
+                tracing::warn!(error = %error, "failed to persist Pi background text");
+            }
             let native = turn
                 .context
                 .provider_state
@@ -692,6 +700,13 @@ async fn pi_session_worker(
                 result = run_pi_turn(&mut rpc, turn.context, turn.prompt, &sink, &mut controls, &mut requests, &mut queue) => result,
                 _ = shutdown.changed() => Err(AppError::TurnCancelled),
             };
+            // Text streamed right before a cancel or failure still belongs to this turn.
+            if let Err(error) = rpc.flush_pending_delta().await {
+                tracing::error!(error = %error, "failed to persist Pi streamed text");
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
             let requested_shutdown = shutdown.borrow().clone();
             if requested_shutdown.is_none() && matches!(result, Err(AppError::TurnCancelled)) {
                 // Abort acknowledgement plus an idle state is the authority for
@@ -756,6 +771,9 @@ async fn pi_session_worker(
         }
     } else {
         reason = "persistence_error".to_owned();
+    }
+    if let Err(error) = rpc.flush_pending_delta().await {
+        tracing::warn!(error = %error, "failed to persist Pi background text");
     }
     rpc.close_all_dialogs().await;
     if let Err(error) = rpc.flush_pending_ui(true).await {
@@ -1047,6 +1065,8 @@ async fn run_pi_turn(
             biased;
             event = rpc.next_event() => event,
             control = controls.recv() => {
+                // Controls emit queue/configuration events after streamed text.
+                rpc.flush_pending_delta().await?;
                 if let Some(control) = control {
                     if control.expected_turn_id != prompt.turn_id || control.respond_to.is_closed() || rpc.events.iter().any(|event| event.get("type").and_then(Value::as_str) == Some("agent_settled")) {
                         let _ = control.respond_to.send(Err(AppError::Conflict("Pi live control targets a stale turn".to_owned())));
@@ -1197,11 +1217,11 @@ async fn run_pi_turn(
                 };
                 let content_index = delta.get("contentIndex").and_then(Value::as_u64);
                 let block_id = pi_delta_block_id(&delta, &active_message_id, category);
+                // Streaming frames carry no final usage; `usage.updated` reports it.
                 let mut payload = json!({
                     "provider": "pi",
                     "role": "assistant",
                     "delta": delta,
-                    "usage": message.get("usage"),
                     "block": {
                         "category": category,
                         "id": block_id,
@@ -1216,7 +1236,11 @@ async fn run_pi_turn(
                     payload["toolCallId"] = delta.get("id").cloned().unwrap_or(Value::Null);
                     payload["toolName"] = delta.get("toolName").cloned().unwrap_or(Value::Null);
                 }
-                sink.emit(event_type, payload).await?;
+                if pi_frame_is_mergeable_delta(&message) {
+                    rpc.queue_delta(sink, event_type, payload).await?;
+                } else {
+                    sink.emit(event_type, payload).await?;
+                }
             }
             Some("tool_execution_start") => {
                 cache_pi_tool_args(&mut rpc.tool_args, &message);
@@ -1550,6 +1574,50 @@ struct PiRpc<'a> {
     /// `tool_execution_end` drops `args`; the last known arguments are kept so
     /// the completed card still shows what ran.
     tool_args: HashMap<String, Value>,
+    /// Latest thinking/text fragment, held back so following fragments of the
+    /// same block can be appended. Any other frame flushes it first.
+    pending_delta: Option<PiPendingDelta>,
+}
+
+struct PiPendingDelta {
+    sink: DriverEventSink,
+    event_type: &'static str,
+    payload: Value,
+    started: tokio::time::Instant,
+}
+
+impl PiPendingDelta {
+    /// Clients append `delta.delta` per block, so a merged fragment renders
+    /// exactly like the sequence it replaces.
+    fn append(&mut self, payload: &Value) -> bool {
+        let same_block = ["/block/id", "/delta/type", "/delta/contentIndex"]
+            .iter()
+            .all(|pointer| self.payload.pointer(pointer) == payload.pointer(pointer));
+        let (Some(text), Some(next)) = (
+            self.payload.pointer("/delta/delta").and_then(Value::as_str),
+            payload.pointer("/delta/delta").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+        if !same_block || text.len() + next.len() > PI_DELTA_COALESCE_MAX_BYTES {
+            return false;
+        }
+        let merged = format!("{text}{next}");
+        self.payload["delta"] = payload["delta"].clone();
+        self.payload["delta"]["delta"] = Value::String(merged);
+        true
+    }
+}
+
+/// Only fragments inside an open thinking/text block are merged.
+fn pi_frame_is_mergeable_delta(message: &Value) -> bool {
+    message.get("type").and_then(Value::as_str) == Some("message_update")
+        && matches!(
+            message
+                .pointer("/assistantMessageEvent/type")
+                .and_then(Value::as_str),
+            Some("thinking_delta" | "text_delta")
+        )
 }
 
 impl<'a> PiRpc<'a> {
@@ -1582,7 +1650,42 @@ impl<'a> PiRpc<'a> {
             ui_emitted_at: HashMap::new(),
             ui_pending: HashMap::new(),
             tool_args: HashMap::new(),
+            pending_delta: None,
         }
+    }
+
+    async fn queue_delta(
+        &mut self,
+        sink: &DriverEventSink,
+        event_type: &'static str,
+        payload: Value,
+    ) -> Result<(), AppError> {
+        if let Some(pending) = self.pending_delta.as_mut() {
+            if pending.event_type == event_type
+                && pending.started.elapsed() < PI_DELTA_COALESCE_INTERVAL
+                && pending.append(&payload)
+            {
+                return Ok(());
+            }
+        }
+        self.flush_pending_delta().await?;
+        self.pending_delta = Some(PiPendingDelta {
+            sink: sink.clone(),
+            event_type,
+            payload,
+            started: tokio::time::Instant::now(),
+        });
+        Ok(())
+    }
+
+    async fn flush_pending_delta(&mut self) -> Result<(), AppError> {
+        if let Some(pending) = self.pending_delta.take() {
+            pending
+                .sink
+                .emit(pending.event_type, pending.payload)
+                .await?;
+        }
+        Ok(())
     }
 
     fn begin_turn(&mut self, sink: DriverEventSink, cancel: watch::Receiver<bool>) {
@@ -1641,6 +1744,9 @@ impl<'a> PiRpc<'a> {
             })
             .cloned()
             .collect();
+        if !keys.is_empty() {
+            self.flush_pending_delta().await?;
+        }
         for key in keys {
             if let Some((sink, message)) = self.ui_pending.remove(&key) {
                 sink.emit("extension.ui", message).await?;
@@ -1672,6 +1778,10 @@ impl<'a> PiRpc<'a> {
                 .filter_map(|key| self.ui_emitted_at.get(key))
                 .min()
                 .map(|last| *last + PI_UI_UPDATE_INTERVAL);
+            let delta_deadline = self
+                .pending_delta
+                .as_ref()
+                .map(|pending| pending.started + PI_DELTA_COALESCE_INTERVAL);
             let message = tokio::select! {
                 _ = async {
                     match ui_deadline {
@@ -1680,6 +1790,15 @@ impl<'a> PiRpc<'a> {
                     }
                 } => {
                     self.flush_pending_ui(false).await?;
+                    continue;
+                }
+                _ = async {
+                    match delta_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.flush_pending_delta().await?;
                     continue;
                 }
                 value = async {
@@ -1733,6 +1852,9 @@ impl<'a> PiRpc<'a> {
                 let elapsed = started.elapsed();
                 self.dialog_wait += elapsed;
                 deadline = deadline.map(|deadline| deadline + elapsed);
+            }
+            if !pi_frame_is_mergeable_delta(&message) {
+                self.flush_pending_delta().await?;
             }
             if message.get("type").and_then(Value::as_str) == Some("message_end")
                 && message.pointer("/message/role").and_then(Value::as_str) == Some("custom")
@@ -1898,6 +2020,9 @@ impl<'a> PiRpc<'a> {
         }
         if let Some(event) = self.events.pop_front() {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(event.to_string().len());
+            if !pi_frame_is_mergeable_delta(&event) {
+                self.flush_pending_delta().await?;
+            }
             return Ok(event);
         }
         self.read_frame(None).await
@@ -2104,6 +2229,10 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
     let Some(sink) = rpc.sink.clone() else {
         return Ok(());
     };
+    // Buffered frames bypass `next_event`, which otherwise orders the flush.
+    if !pi_frame_is_mergeable_delta(&message) {
+        rpc.flush_pending_delta().await?;
+    }
     match message.get("type").and_then(Value::as_str) {
         Some("message_start") => {
             rpc.idle_message_sequence = rpc.idle_message_sequence.saturating_add(1);
@@ -2155,13 +2284,17 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                 rpc.idle_message_sequence
             );
             let block_id = pi_delta_block_id(&delta, &message_id, category);
-            let mut payload = json!({"provider":"pi","role":"assistant","delta":delta,"usage":message.get("usage"),
+            let mut payload = json!({"provider":"pi","role":"assistant","delta":delta,
                 "block":{"category":category,"id":block_id,"phase":phase}});
             if kind == "toolcall_start" {
                 payload["toolCallId"] = delta.get("id").cloned().unwrap_or(Value::Null);
                 payload["toolName"] = delta.get("toolName").cloned().unwrap_or(Value::Null);
             }
-            sink.emit(event_type, payload).await?;
+            if pi_frame_is_mergeable_delta(&message) {
+                rpc.queue_delta(&sink, event_type, payload).await?;
+            } else {
+                sink.emit(event_type, payload).await?;
+            }
         }
         Some("tool_execution_start" | "tool_execution_update" | "tool_execution_end") => {
             let (kind, phase) = match message.get("type").and_then(Value::as_str) {
@@ -2775,6 +2908,10 @@ mod tests {
             thoughts[0].payload.pointer("/block/id"),
             thoughts[1].payload.pointer("/block/id")
         );
+        // Fragments of one block merge into a single journal event.
+        assert_eq!(thoughts[0].payload["delta"]["delta"], "thought0 more");
+        assert_eq!(thoughts[1].payload["delta"]["delta"], "thought1 more");
+        assert!(thoughts[0].payload.get("usage").is_none());
         let requested = events
             .iter()
             .filter(|event| event.event_type == "permission.requested")
