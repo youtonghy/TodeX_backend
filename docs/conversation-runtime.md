@@ -39,6 +39,10 @@ optional and canonical aliases are recomputed when old journals are replayed.
   sent at most every 500 ms, while terminal status is always sent. Clients
   append deltas per block and replace tool rows per event, so the rendered
   result is unchanged.
+- A final `message.completed` may carry `block.supersedes`: the
+  `assistant_progress` block ids its text was streamed under. Clients remove
+  those progress entries so the answer is shown once. Pi sets it only on final
+  (`stop`/`length`) messages; tool-use narration stays as progress.
 
 Backend control/write/cancel/compact defaults are 30/10/10/300 seconds, configured
 with `TODEX_AGENTD_PROVIDER_{CONTROL,WRITE,CANCEL,COMPACT}_TIMEOUT_SECONDS`.

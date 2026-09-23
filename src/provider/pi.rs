@@ -1125,6 +1125,7 @@ async fn run_pi_turn(
                 }
                 message_sequence = message_sequence.saturating_add(1);
                 message_open = true;
+                rpc.streamed_text_blocks.clear();
                 active_message_id = pi_message_id(&message)
                     .unwrap_or_else(|| format!("{}-message-{message_sequence}", prompt.turn_id));
             }
@@ -1163,9 +1164,13 @@ async fn run_pi_turn(
                     message_sequence = message_sequence.saturating_add(1);
                 }
                 message_open = false;
-                for (event_type, payload) in
-                    pi_completed_message_events(&message, &prompt.turn_id, message_sequence)
-                {
+                let streamed = std::mem::take(&mut rpc.streamed_text_blocks);
+                for (event_type, payload) in pi_completed_message_events(
+                    &message,
+                    &prompt.turn_id,
+                    message_sequence,
+                    &streamed,
+                ) {
                     sink.emit(event_type, payload).await?;
                 }
                 let reason = message
@@ -1217,6 +1222,7 @@ async fn run_pi_turn(
                 };
                 let content_index = delta.get("contentIndex").and_then(Value::as_u64);
                 let block_id = pi_delta_block_id(&delta, &active_message_id, category);
+                note_pi_text_block(&mut rpc.streamed_text_blocks, category, &block_id);
                 // Streaming frames carry no final usage; `usage.updated` reports it.
                 let mut payload = json!({
                     "provider": "pi",
@@ -1577,6 +1583,10 @@ struct PiRpc<'a> {
     /// Latest thinking/text fragment, held back so following fragments of the
     /// same block can be appended. Any other frame flushes it first.
     pending_delta: Option<PiPendingDelta>,
+    /// Assistant-text blocks streamed for the open native message. Its final
+    /// answer lists them in `block.supersedes` so clients drop the progress
+    /// copy instead of showing the answer twice.
+    streamed_text_blocks: Vec<String>,
 }
 
 struct PiPendingDelta {
@@ -1651,6 +1661,7 @@ impl<'a> PiRpc<'a> {
             ui_pending: HashMap::new(),
             tool_args: HashMap::new(),
             pending_delta: None,
+            streamed_text_blocks: Vec::new(),
         }
     }
 
@@ -2236,6 +2247,7 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
     match message.get("type").and_then(Value::as_str) {
         Some("message_start") => {
             rpc.idle_message_sequence = rpc.idle_message_sequence.saturating_add(1);
+            rpc.streamed_text_blocks.clear();
             if message.pointer("/message/role").and_then(Value::as_str) == Some("user") {
                 sink.emit(
                     "message.created",
@@ -2246,9 +2258,13 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
         }
         Some("message_end") => {
             let identity = format!("{}-background", sink.runtime_id().unwrap_or("pi"));
-            for (kind, mut payload) in
-                pi_completed_message_events(&message, &identity, rpc.idle_message_sequence)
-            {
+            let streamed = std::mem::take(&mut rpc.streamed_text_blocks);
+            for (kind, mut payload) in pi_completed_message_events(
+                &message,
+                &identity,
+                rpc.idle_message_sequence,
+                &streamed,
+            ) {
                 clear_pi_turn_identity(&mut payload);
                 sink.emit(kind, payload).await?;
             }
@@ -2284,6 +2300,7 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                 rpc.idle_message_sequence
             );
             let block_id = pi_delta_block_id(&delta, &message_id, category);
+            note_pi_text_block(&mut rpc.streamed_text_blocks, category, &block_id);
             let mut payload = json!({"provider":"pi","role":"assistant","delta":delta,
                 "block":{"category":category,"id":block_id,"phase":phase}});
             if kind == "toolcall_start" {
@@ -2421,6 +2438,12 @@ fn is_pi_final_message(message: &Value) -> bool {
             .is_some_and(|reason| matches!(reason, "stop" | "length"))
 }
 
+fn note_pi_text_block(blocks: &mut Vec<String>, category: &str, block_id: &str) {
+    if category == "assistant_progress" && !blocks.iter().any(|known| known == block_id) {
+        blocks.push(block_id.to_owned());
+    }
+}
+
 fn pi_delta_block_id(delta: &Value, turn_id: &str, category: &str) -> String {
     delta
         .get("id")
@@ -2456,6 +2479,7 @@ fn pi_completed_message_events(
     message: &Value,
     turn_id: &str,
     sequence: u64,
+    streamed_text_blocks: &[String],
 ) -> Vec<(&'static str, Value)> {
     let message_id =
         pi_message_id(message).unwrap_or_else(|| format!("{turn_id}-message-{sequence}"));
@@ -2474,11 +2498,17 @@ fn pi_completed_message_events(
     }
     // Tool-use messages carry usage but are not the turn's final answer.
     if is_pi_final_message(message) {
-        events.push(("message.completed", json!({
+        let mut payload = json!({
             "provider": "pi", "turnId": turn_id, "messageId": message_id,
             "role": "assistant", "message": message.get("message"),
             "block": { "category": "assistant_final", "id": message_id, "turnId": turn_id, "phase": "completed" },
-        })));
+        });
+        // The answer was streamed as progress blocks under another identity;
+        // naming them lets clients replace that copy with the final answer.
+        if !streamed_text_blocks.is_empty() {
+            payload["block"]["supersedes"] = json!(streamed_text_blocks);
+        }
+        events.push(("message.completed", payload));
     }
     events
 }
@@ -2525,7 +2555,7 @@ mod tests {
     #[test]
     fn unsigned_messages_share_usage_identity_with_final_output() {
         let message = json!({ "type": "message_end", "message": { "role": "assistant", "stopReason": "stop", "content": [{ "type": "text", "text": "answer" }], "usage": { "input": 10, "output": 4 } } });
-        let events = pi_completed_message_events(&message, "turn-local", 1);
+        let events = pi_completed_message_events(&message, "turn-local", 1, &[]);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].0, "usage.updated");
         assert_eq!(events[1].0, "message.completed");
@@ -2534,14 +2564,21 @@ mod tests {
         assert_eq!(events[0].1["messageId"], events[1].1["block"]["id"]);
         assert_ne!(
             events[0].1["messageId"],
-            pi_completed_message_events(&message, "turn-local", 2)[0].1["messageId"]
+            pi_completed_message_events(&message, "turn-local", 2, &[])[0].1["messageId"]
         );
         let mut tool_message = message;
         tool_message["message"]["stopReason"] = json!("toolUse");
         tool_message["message"]["id"] = json!("native-message");
-        let events = pi_completed_message_events(&tool_message, "turn-local", 3);
+        let streamed = ["turn-local-message-3-assistant_progress-0".to_owned()];
+        let events = pi_completed_message_events(&tool_message, "turn-local", 3, &streamed);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].1["messageId"], "native-message");
+        // Only a final answer replaces its streamed progress copy.
+        tool_message["message"]["stopReason"] = json!("stop");
+        let events = pi_completed_message_events(&tool_message, "turn-local", 3, &streamed);
+        assert_eq!(events[1].1["block"]["supersedes"], json!(streamed));
+        let events = pi_completed_message_events(&tool_message, "turn-local", 3, &[]);
+        assert!(events[1].1["block"].get("supersedes").is_none());
     }
 
     #[test]
@@ -2907,6 +2944,26 @@ mod tests {
         assert_ne!(
             thoughts[0].payload.pointer("/block/id"),
             thoughts[1].payload.pointer("/block/id")
+        );
+        // The streamed answer text is replaced by the final message only when
+        // the message is final; tool-use narration stays as progress.
+        let progress = events
+            .iter()
+            .filter(|event| event.event_type == "message.delta")
+            .collect::<Vec<_>>();
+        assert_eq!(progress.len(), 2);
+        let finals = events
+            .iter()
+            .filter(|event| {
+                event.event_type == "message.completed"
+                    && event.payload.pointer("/block/category") == Some(&json!("assistant_final"))
+                    && event.payload["turnId"] == "thought-turn"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(finals.len(), 1);
+        assert_eq!(
+            finals[0].payload["block"]["supersedes"],
+            json!([progress[1].payload["block"]["id"]])
         );
         // Fragments of one block merge into a single journal event.
         assert_eq!(thoughts[0].payload["delta"]["delta"], "thought0 more");

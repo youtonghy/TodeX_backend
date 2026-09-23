@@ -83,6 +83,7 @@ for line in sys.stdin:
                     out({'type': 'message_start', 'message': {'role': 'assistant'}})
                     out({'type': 'message_update', 'assistantMessageEvent': {'type': 'thinking_delta', 'contentIndex': 0, 'delta': 'thought' + str(index)}})
                     out({'type': 'message_update', 'assistantMessageEvent': {'type': 'thinking_delta', 'contentIndex': 0, 'delta': ' more'}})
+                    out({'type': 'message_update', 'assistantMessageEvent': {'type': 'text_delta', 'contentIndex': 1, 'delta': 'part'}})
                     out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': reason, 'content': [{'type': 'text', 'text': 'part'}]}})
                 streaming = False
                 out({'type': 'agent_settled'})
