@@ -23,6 +23,12 @@ optional and canonical aliases are recomputed when old journals are replayed.
   compaction updates its own state without ending the parent turn.
 - Memory configuration is separate from memory content; the panel explicitly
   reports when the provider has no readable content source.
+- Streaming is coalesced before it reaches the journal. Pi thinking/text
+  fragments of one block merge for up to 100 ms (2 KiB) into one delta; ACP
+  `tool.updated` carries a full snapshot and in-progress snapshots of a call are
+  sent at most every 500 ms, while terminal status is always sent. Clients
+  append deltas per block and replace tool rows per event, so the rendered
+  result is unchanged.
 
 Backend control/write/cancel/compact defaults are 30/10/10/300 seconds, configured
 with `TODEX_AGENTD_PROVIDER_{CONTROL,WRITE,CANCEL,COMPACT}_TIMEOUT_SECONDS`.

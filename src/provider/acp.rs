@@ -259,6 +259,48 @@ pub(super) struct AcpConnectionState {
     /// notifications omit name/input, so clients merge each event onto the
     /// remembered call.
     tools: BTreeMap<String, Value>,
+    /// Every `tool.updated` is a full snapshot, so in-progress snapshots are
+    /// rate-limited per call: only the newest unsent one is kept, and a
+    /// terminal status replaces it.
+    tool_pending: BTreeMap<String, (DriverEventSink, Value)>,
+    tool_emitted_at: BTreeMap<String, tokio::time::Instant>,
+}
+
+/// Minimum spacing between in-progress snapshots of one tool call. Streaming
+/// shell output otherwise journals the whole accumulated output per line.
+const ACP_TOOL_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+
+impl AcpConnectionState {
+    fn tool_flush_deadline(&self) -> Option<tokio::time::Instant> {
+        self.tool_pending
+            .keys()
+            .filter_map(|id| self.tool_emitted_at.get(id))
+            .min()
+            .map(|at| *at + ACP_TOOL_UPDATE_INTERVAL)
+    }
+
+    async fn flush_tool_updates(&mut self, force: bool) -> Result<(), AppError> {
+        let now = tokio::time::Instant::now();
+        let due: Vec<_> = self
+            .tool_pending
+            .keys()
+            .filter(|id| {
+                force
+                    || self
+                        .tool_emitted_at
+                        .get(*id)
+                        .is_none_or(|at| now >= *at + ACP_TOOL_UPDATE_INTERVAL)
+            })
+            .cloned()
+            .collect();
+        for id in due {
+            if let Some((sink, payload)) = self.tool_pending.remove(&id) {
+                sink.emit("tool.updated", payload).await?;
+                self.tool_emitted_at.insert(id, now);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// How `session/request_permission` requests are answered during a turn.
@@ -309,6 +351,32 @@ pub(super) async fn run_acp_turn(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_acp_turn_controlled(
+    process: &mut JsonLineProcess,
+    context: DriverContext,
+    prompt: DriverPrompt,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+    options: AcpRuntimeOptions,
+    connection: &mut AcpConnectionState,
+    controls: Option<&mut mpsc::Receiver<PendingProviderControl>>,
+) -> Result<DriverTurnResult, AppError> {
+    let result = run_acp_turn_steps(
+        process, context, prompt, sink, cancel, options, connection, controls,
+    )
+    .await;
+    // Throttled tool progress belongs to this turn and must precede its end.
+    match connection.flush_tool_updates(true).await {
+        Ok(()) => result,
+        Err(error) if result.is_ok() => Err(error),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to persist ACP tool progress");
+            result
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_acp_turn_steps(
     process: &mut JsonLineProcess,
     context: DriverContext,
     prompt: DriverPrompt,
@@ -563,8 +631,13 @@ pub(super) async fn run_acp_turn_controlled(
             return finish_prompt(terminal_response.take().unwrap(), native_session_id);
         }
         let control_deadline = pending.values().map(|entry| entry.deadline).min();
+        let tool_deadline = connection.tool_flush_deadline();
         let message = tokio::select! {
             message = process.read() => message?,
+            _ = async { if let Some(deadline) = tool_deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending::<()>().await } } => {
+                connection.flush_tool_updates(false).await?;
+                continue;
+            }
             response = client_requests.join_next(), if !client_requests.is_empty() => {
                 if let Some(Ok((responses, outcome))) = response {
                     for response in responses { process.send(&response).await?; }
@@ -1316,8 +1389,13 @@ async fn wait_for_response_with_timeout(
     };
     let mut deadline = tokio::time::Instant::now() + timeout;
     loop {
+        let tool_deadline = connection.tool_flush_deadline();
         let message = tokio::select! {
             message = process.read_control_until(deadline) => message?,
+            _ = async { if let Some(deadline) = tool_deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending::<()>().await } } => {
+                connection.flush_tool_updates(false).await?;
+                continue;
+            }
             changed = cancel.changed() => {
                 let _ = changed;
                 return Err(AppError::TurnCancelled);
@@ -1556,15 +1634,40 @@ pub(super) async fn handle_acp_message(
                         .insert(tool_id.to_owned(), normalized.clone());
                 }
                 normalized["provider"] = json!(provider_id);
-                normalized["tool"] = update.clone();
-                (
-                    if update_type == "tool_call" {
-                        "tool.started"
-                    } else {
-                        "tool.updated"
-                    },
-                    normalized,
-                )
+                if update_type == "tool_call" {
+                    // The raw call is only a preview fallback when there are no
+                    // arguments; otherwise `rawInput`/`content` repeat them, and
+                    // on updates `content` repeats `result`.
+                    if update.get("rawInput").is_none() {
+                        normalized["tool"] = update.clone();
+                    }
+                    ("tool.started", normalized)
+                } else {
+                    if !tool_id.is_empty() {
+                        let terminal = matches!(
+                            normalized.get("status").and_then(Value::as_str),
+                            Some("completed" | "failed")
+                        );
+                        connection.tool_pending.remove(tool_id);
+                        if terminal {
+                            connection.tool_emitted_at.remove(tool_id);
+                        } else {
+                            let now = tokio::time::Instant::now();
+                            if connection
+                                .tool_emitted_at
+                                .get(tool_id)
+                                .is_some_and(|at| now < *at + ACP_TOOL_UPDATE_INTERVAL)
+                            {
+                                connection
+                                    .tool_pending
+                                    .insert(tool_id.to_owned(), (sink.clone(), normalized));
+                                return Ok(());
+                            }
+                            connection.tool_emitted_at.insert(tool_id.to_owned(), now);
+                        }
+                    }
+                    ("tool.updated", normalized)
+                }
             }
             "plan" => (
                 "plan.updated",
@@ -1649,13 +1752,17 @@ pub(super) async fn handle_acp_message(
 /// within this window are coalesced instead of journalled individually.
 const COMMANDS_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Devin re-lists the same skills in a different order on each broadcast, so
+/// the fingerprint ignores ordering.
 fn commands_fingerprint(commands: &[ProviderCommandDescriptor]) -> u64 {
     use std::hash::{Hash, Hasher};
+    let mut entries: Vec<_> = commands
+        .iter()
+        .map(|command| (&command.name, &command.description))
+        .collect();
+    entries.sort_unstable();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for command in commands {
-        command.name.hash(&mut hasher);
-        command.description.hash(&mut hasher);
-    }
+    entries.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -3091,10 +3198,28 @@ mod tests {
             }}}),
             // Updates carry neither title nor rawInput; clients merge onto the
             // remembered call so the card keeps its name and arguments.
+            // Progress snapshots inside the throttle window are held back and
+            // superseded by the terminal snapshot.
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{
+                "sessionUpdate":"tool_call_update","toolCallId":"exec_0","status":"in_progress",
+                "content":[{"type":"content","content":{"type":"text","text":"4"}}]
+            }}}),
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{
+                "sessionUpdate":"tool_call_update","toolCallId":"exec_0","status":"in_progress",
+                "content":[{"type":"content","content":{"type":"text","text":"4 "}}]
+            }}}),
             json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{
                 "sessionUpdate":"tool_call_update","toolCallId":"exec_0","status":"completed",
                 "content":[{"type":"content","content":{"type":"text","text":"42"}}],
                 "_meta":{"cognition.ai/inferenceToolName":"exec"}
+            }}}),
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{
+                "sessionUpdate":"tool_call_update","toolCallId":"exec_1","status":"in_progress",
+                "content":[{"type":"content","content":{"type":"text","text":"a"}}]
+            }}}),
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{
+                "sessionUpdate":"tool_call_update","toolCallId":"exec_1","status":"in_progress",
+                "content":[{"type":"content","content":{"type":"text","text":"ab"}}]
             }}}),
         ] {
             handle_acp_message(
@@ -3111,21 +3236,66 @@ mod tests {
             .unwrap();
         }
 
+        // The held snapshot of an unfinished call is flushed at turn end.
+        connection.flush_tool_updates(true).await.unwrap();
+
         let mut payloads = Vec::new();
         while let Ok(event) = events.try_recv() {
             payloads.push((event.event_type, event.payload));
         }
-        assert_eq!(payloads.len(), 2);
+        let results: Vec<_> = payloads
+            .iter()
+            .map(|(_, payload)| payload["result"].clone())
+            .collect();
+        assert_eq!(
+            results,
+            [
+                Value::Null,
+                json!("4"),
+                json!("42"),
+                json!("a"),
+                json!("ab")
+            ]
+        );
         assert_eq!(payloads[0].0, "tool.started");
         assert_eq!(payloads[0].1["toolCallId"], "exec_0");
         assert_eq!(payloads[0].1["toolName"], "exec");
         assert_eq!(payloads[0].1["arguments"]["command"], "find . -name '*.md'");
-        assert_eq!(payloads[1].0, "tool.updated");
-        assert_eq!(payloads[1].1["toolName"], "exec");
-        assert_eq!(payloads[1].1["arguments"]["command"], "find . -name '*.md'");
-        assert_eq!(payloads[1].1["result"], "42");
-        assert_eq!(payloads[1].1["status"], "completed");
+        assert_eq!(payloads[2].0, "tool.updated");
+        assert_eq!(payloads[2].1["toolName"], "exec");
+        assert_eq!(payloads[2].1["arguments"]["command"], "find . -name '*.md'");
+        assert_eq!(payloads[2].1["status"], "completed");
+        // With arguments present, the raw ACP object would only repeat
+        // `arguments` and `result`.
+        assert!(payloads
+            .iter()
+            .all(|(_, payload)| payload.get("tool").is_none()));
+        assert!(connection.tool_pending.is_empty());
         process.terminate().await;
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn commands_fingerprint_ignores_order() {
+        let command = |name: &str| ProviderCommandDescriptor {
+            name: name.to_owned(),
+            description: format!("{name} command"),
+            source: "builtin".to_owned(),
+            source_info: None,
+            invocation: "provider-prompt".to_owned(),
+            argument_hint: None,
+            package_name: None,
+            package_version: None,
+        };
+        let first = [command("help"), command("plan")];
+        let reordered = [command("plan"), command("help")];
+        assert_eq!(
+            commands_fingerprint(&first),
+            commands_fingerprint(&reordered)
+        );
+        assert_ne!(
+            commands_fingerprint(&first),
+            commands_fingerprint(&first[..1])
+        );
     }
 }
