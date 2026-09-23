@@ -407,7 +407,10 @@ async fn latest_version(config: &Config, provider: ManagedCli) -> Result<Option<
     let (url, field) = match provider {
         // GitHub's unauthenticated API is rate-limited per IP; the npm registry
         // mirrors the published CLI version without that cap.
-        ManagedCli::Codex => ("https://registry.npmjs.org/@openai%2fcodex/latest", "version"),
+        ManagedCli::Codex => (
+            "https://registry.npmjs.org/@openai%2fcodex/latest",
+            "version",
+        ),
         ManagedCli::Pi => ("https://pi.dev/api/latest-version", "version"),
         ManagedCli::ClaudeCode => (
             "https://registry.npmjs.org/@anthropic-ai%2fclaude-code/latest",
