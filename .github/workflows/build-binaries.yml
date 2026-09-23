@@ -121,9 +121,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linked by Zig against an older glibc so the binary runs on Debian 10+,
+          # Ubuntu 20.04+, and RHEL 8+ rather than only the runner's glibc.
           - os: ubuntu-24.04
             label: linux-x64-gnu
             archive: tar.gz
+            cargo_target: x86_64-unknown-linux-gnu
+            glibc: "2.28"
           - os: macos-15
             label: macos-arm64
             archive: tar.gz
@@ -142,8 +146,43 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Install cargo-zigbuild
+        if: ${{ matrix.glibc }}
+        run: |
+          rustup target add "${{ matrix.cargo_target }}"
+          python3 -m venv "${RUNNER_TEMP}/zigbuild"
+          "${RUNNER_TEMP}/zigbuild/bin/pip" install --disable-pip-version-check cargo-zigbuild==0.23.4 ziglang==0.16.0
+          # cargo-zigbuild locates Zig through `python3 -m ziglang`, so the venv must come first on PATH.
+          echo "${RUNNER_TEMP}/zigbuild/bin" >> "${GITHUB_PATH}"
+
       - name: Build release binary
-        run: cargo build --release --locked
+        shell: bash
+        env:
+          CARGO_TARGET: ${{ matrix.cargo_target }}
+          GLIBC_VERSION: ${{ matrix.glibc }}
+        run: |
+          if [[ -n "${GLIBC_VERSION}" ]]; then
+            # With Cargo's default debuginfo strip, Zig's linker also drops the symbol
+            # table. Link unstripped, then remove only debug info so panic backtraces
+            # keep function names like the other platforms.
+            CARGO_PROFILE_RELEASE_STRIP=none cargo zigbuild --release --locked --target "${CARGO_TARGET}.${GLIBC_VERSION}"
+            objcopy --strip-debug "target/${CARGO_TARGET}/release/todex-agentd"
+          else
+            cargo build --release --locked
+          fi
+
+      - name: Verify glibc compatibility
+        if: ${{ matrix.glibc }}
+        env:
+          BINARY_PATH: target/${{ matrix.cargo_target }}/release/todex-agentd
+          GLIBC_VERSION: ${{ matrix.glibc }}
+        run: |
+          required="$(objdump -T "${BINARY_PATH}" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n1)"
+          echo "Highest required glibc symbol version: ${required}"
+          if [[ -z "${required}" || "$(printf '%s\n%s\n' "${required}" "${GLIBC_VERSION}" | sort -V | tail -n1)" != "${GLIBC_VERSION}" ]]; then
+            echo "Binary requires glibc ${required:-unknown}, above the ${GLIBC_VERSION} baseline." >&2
+            exit 1
+          fi
 
       - name: Verify and package binary
         id: package
@@ -152,13 +191,18 @@ jobs:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           PLATFORM_LABEL: ${{ matrix.label }}
           ARCHIVE_FORMAT: ${{ matrix.archive }}
+          CARGO_TARGET: ${{ matrix.cargo_target }}
         run: |
           binary_name="todex-agentd"
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             binary_name="todex-agentd.exe"
           fi
 
-          binary_path="target/release/${binary_name}"
+          binary_dir="target/release"
+          if [[ -n "${CARGO_TARGET}" ]]; then
+            binary_dir="target/${CARGO_TARGET}/release"
+          fi
+          binary_path="${binary_dir}/${binary_name}"
           actual_version="$("${binary_path}" --version)"
           if [[ "${actual_version}" != "todex-agentd ${RELEASE_VERSION}" ]]; then
             echo "Unexpected binary version: ${actual_version}" >&2

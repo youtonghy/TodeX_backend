@@ -111,7 +111,7 @@
 curl -fsSL https://raw.githubusercontent.com/youtonghy/TodeX_backend/main/install.sh | bash
 ```
 
-脚本将 `todex-agentd` 安装到 `~/.local/bin`（可用 `--prefix DIR` 或 `TODEX_INSTALL_DIR` 覆盖），校验 release 的 `SHA256SUMS`，在二进制旁保留一份回滚副本，并重启正在运行的托管 daemon。检测到 WSL 时自动使用 `linux-x64-gnu` 构建。
+脚本将 `todex-agentd` 安装到 `~/.local/bin`（可用 `--prefix DIR` 或 `TODEX_INSTALL_DIR` 覆盖），校验 release 的 `SHA256SUMS`，在二进制旁保留一份回滚副本，并重启正在运行的托管 daemon。检测到 WSL 时自动使用 `linux-x64-gnu` 构建。Linux 构建需要 glibc 2.28 及以上（Debian 10、Ubuntu 20.04、RHEL 8 或更新版本）；Alpine 等 musl 发行版需从源码编译。
 
 ```bash
 ./install.sh install                 # 安装或更新到最新 release

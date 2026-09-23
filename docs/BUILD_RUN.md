@@ -444,7 +444,9 @@ compile-time marker and a strict stable `TODEX_BUILD_VERSION=X.Y.Z` other than
 `cargo run`, debug builds, and unversioned builds perform no update network calls.
 Only newer stable releases are considered; no downgrades or prereleases.
 Supported update platforms match the release matrix: Linux x64 GNU, macOS arm64,
-and Windows x64.
+and Windows x64. The Linux build is linked with `cargo zigbuild` against glibc 2.28,
+so it runs on Debian 10, Ubuntu 20.04, RHEL 8, and newer; the release workflow fails
+if the binary requires a newer glibc symbol.
 
 ```sh
 # Read-only JSON status (also reports enabled=false for development builds)

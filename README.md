@@ -115,7 +115,7 @@ Download and manage a prebuilt release without a Rust toolchain:
 curl -fsSL https://raw.githubusercontent.com/youtonghy/TodeX_backend/main/install.sh | bash
 ```
 
-The script installs `todex-agentd` to `~/.local/bin` (override with `--prefix DIR` or `TODEX_INSTALL_DIR`), verifies the release `SHA256SUMS`, keeps one rollback copy beside the binary, and restarts a running managed daemon. It detects WSL and uses the `linux-x64-gnu` build there.
+The script installs `todex-agentd` to `~/.local/bin` (override with `--prefix DIR` or `TODEX_INSTALL_DIR`), verifies the release `SHA256SUMS`, keeps one rollback copy beside the binary, and restarts a running managed daemon. It detects WSL and uses the `linux-x64-gnu` build there. The Linux build needs glibc 2.28 or newer (Debian 10, Ubuntu 20.04, RHEL 8, or later); musl distributions such as Alpine must build from source.
 
 ```bash
 ./install.sh install                 # install or update to the latest release
