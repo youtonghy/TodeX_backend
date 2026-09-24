@@ -30,6 +30,15 @@ const COMMAND_DRAIN: Duration = Duration::from_millis(1500);
 /// Model/command discovery spawns an authenticated probe process; cache it so
 /// routine client refreshes do not re-authenticate on every query.
 const DISCOVERY_TTL: Duration = Duration::from_secs(300);
+/// Concurrent probe sessions for the per-model `thought_level` sweep. `devin
+/// acp` serves config requests on different sessions in parallel: a 95-model
+/// catalog takes ~18s one model at a time and ~4s across eight sessions.
+const THOUGHT_LEVEL_PROBE_LANES: usize = 8;
+/// Keeps the sweep inside `discovery_timeout`; models it does not reach keep
+/// an empty effort list instead of failing the whole catalog.
+const THOUGHT_LEVEL_PROBE_BUDGET: Duration = Duration::from_secs(15);
+/// Probe sessions are deleted best-effort right before the process exits.
+const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct DiscoverySnapshot {
@@ -166,7 +175,7 @@ impl DevinDriver {
     /// Models and slash commands live behind `session/new`, which requires an
     /// authenticated session. The session is left open so callers can issue
     /// follow-up probes (per-model `thought_level` options); callers must
-    /// delete it best-effort via `delete_probe_session`.
+    /// delete it best-effort via `delete_probe_sessions`.
     async fn session_probe(
         &self,
         workspace: &Path,
@@ -241,15 +250,33 @@ impl DevinDriver {
         }
         let (mut process, session, updates) = self.session_probe(workspace).await?;
         let mut models = parse_devin_models(&session);
-        probe_thought_levels(&mut process, &session, &mut models).await;
-        delete_probe_session(&mut process, &session).await;
+        let mut probe_sessions: Vec<String> = session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        let complete = probe_thought_levels(
+            &mut process,
+            workspace,
+            &session,
+            &mut probe_sessions,
+            &mut models,
+            tokio::time::Instant::now() + THOUGHT_LEVEL_PROBE_BUDGET,
+        )
+        .await;
+        delete_probe_sessions(&mut process, &probe_sessions).await;
         process.terminate().await;
         let snapshot = DiscoverySnapshot {
             fetched_at: Instant::now(),
             models,
             commands: parse_devin_commands(&updates),
         };
-        cache.insert(workspace.to_path_buf(), snapshot.clone());
+        // A sweep cut short by its budget is served but not cached, so the next
+        // query fills in the missing thinking levels.
+        if complete {
+            cache.insert(workspace.to_path_buf(), snapshot.clone());
+        }
         Ok(snapshot)
     }
 }
@@ -373,8 +400,8 @@ impl ProviderDriver for DevinDriver {
     }
 
     /// A cold probe authenticates a session, drains the command drain window,
-    /// and sweeps every catalog model for its `thought_level` options, which
-    /// takes ~10s against the current catalog.
+    /// and sweeps every catalog model for its `thought_level` options within
+    /// `THOUGHT_LEVEL_PROBE_BUDGET` (~4s for the 95-model catalog).
     fn discovery_timeout(&self) -> Duration {
         Duration::from_secs(30)
     }
@@ -643,31 +670,34 @@ fn valid_env_name(value: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-/// Best-effort delete for a probe session; failures are ignored because the
+/// Best-effort delete for probe sessions; failures are ignored because the
 /// process is terminated immediately afterwards either way.
-async fn delete_probe_session(process: &mut JsonLineProcess, session: &Value) {
-    let Some(session_id) = session.get("sessionId").and_then(Value::as_str) else {
-        return;
-    };
-    let _ = control_request(
+async fn delete_probe_sessions(process: &mut JsonLineProcess, sessions: &[String]) {
+    pipelined_requests(
         process,
-        "session:delete",
         "session/delete",
-        json!({ "sessionId": session_id }),
-        DIAGNOSTIC_TIMEOUT,
+        sessions.len(),
+        sessions.len(),
+        tokio::time::Instant::now() + PROBE_CLEANUP_TIMEOUT,
+        |_, index| json!({ "sessionId": sessions[index] }),
     )
     .await;
 }
 
 /// Devin exposes `thought_level` only for the currently selected model, and
-/// each model advertises a different level set, so probe every catalog model
-/// to learn its thinking levels. Older `devin acp` builds expose no such
-/// option at all; skip the sweep then.
+/// each model advertises a different level set, so every catalog model is
+/// selected once to learn its thinking levels. The sweep fans out over extra
+/// probe sessions (appended to `sessions` for cleanup) and stops at
+/// `deadline`. Returns whether every model answered; older `devin acp` builds
+/// expose no such option at all, so the sweep is skipped then.
 async fn probe_thought_levels(
     process: &mut JsonLineProcess,
+    workspace: &Path,
     session: &Value,
+    sessions: &mut Vec<String>,
     models: &mut [ProviderModelDescriptor],
-) {
+    deadline: tokio::time::Instant,
+) -> bool {
     let exposes_thought_level = session
         .get("configOptions")
         .and_then(Value::as_array)
@@ -675,31 +705,132 @@ async fn probe_thought_levels(
         .flatten()
         .any(|option| option.get("id").and_then(Value::as_str) == Some("thought_level"));
     if !exposes_thought_level {
-        return;
+        return true;
     }
-    let session_id = session
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    for model in models.iter_mut() {
-        let response = control_request(
-            process,
-            "probe:model",
-            "session/set_config_option",
-            json!({"sessionId": session_id, "configId": "model", "value": model.id}),
-            CONTROL_TIMEOUT,
-        )
-        .await;
-        let Ok(response) = response else {
+    let extra = THOUGHT_LEVEL_PROBE_LANES
+        .min(models.len())
+        .saturating_sub(sessions.len());
+    let opened = pipelined_requests(
+        process,
+        "session/new",
+        extra,
+        extra,
+        deadline,
+        |_, _| json!({ "cwd": workspace, "mcpServers": [] }),
+    )
+    .await;
+    sessions.extend(
+        opened
+            .iter()
+            .flatten()
+            .filter_map(|response| response.pointer("/result/sessionId")?.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+    );
+    if sessions.is_empty() {
+        return false;
+    }
+    let responses = pipelined_requests(
+        process,
+        "session/set_config_option",
+        sessions.len(),
+        models.len(),
+        deadline,
+        |lane, index| {
+            json!({"sessionId": sessions[lane], "configId": "model", "value": models[index].id})
+        },
+    )
+    .await;
+    let mut complete = true;
+    for (model, response) in models.iter_mut().zip(responses) {
+        let Some(response) = response else {
+            complete = false;
             continue;
         };
-        let Some((efforts, default)) = thought_level_option(&response) else {
+        let Some((efforts, default)) = response.get("result").and_then(thought_level_option) else {
             continue;
         };
         model.supported_reasoning_efforts = efforts;
         model.default_reasoning_effort = default;
     }
+    complete
+}
+
+/// Issues `count` `method` requests over `lanes` concurrent slots on one ACP
+/// process, keeping at most one request in flight per lane so per-session
+/// state (the selected model) is never raced. Returns each response message
+/// by request index; `None` marks a request that got no answer before
+/// `deadline` or before the process stopped responding.
+async fn pipelined_requests(
+    process: &mut JsonLineProcess,
+    method: &str,
+    lanes: usize,
+    count: usize,
+    deadline: tokio::time::Instant,
+    mut params: impl FnMut(usize, usize) -> Value,
+) -> Vec<Option<Value>> {
+    let mut responses = vec![None; count];
+    let mut in_flight = HashMap::new();
+    let mut next = 0;
+    while next < lanes.min(count) {
+        let id = format!("probe:{method}:{next}");
+        if send_request(process, &id, method, params(next, next))
+            .await
+            .is_err()
+        {
+            return responses;
+        }
+        in_flight.insert(id, (next, next));
+        next += 1;
+    }
+    while !in_flight.is_empty() {
+        let Ok(Ok(Some(message))) = tokio::time::timeout_at(deadline, process.read()).await else {
+            break;
+        };
+        if message.get("method").is_some() {
+            if let Some(request_id) = message.get("id") {
+                if process
+                    .send(&json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"client capability is not supported during probe"}}))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            continue;
+        }
+        let Some((lane, index)) = message
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| in_flight.remove(id))
+        else {
+            continue;
+        };
+        responses[index] = Some(message);
+        if next < count {
+            let id = format!("probe:{method}:{next}");
+            if send_request(process, &id, method, params(lane, next))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            in_flight.insert(id, (lane, next));
+            next += 1;
+        }
+    }
+    responses
+}
+
+async fn send_request(
+    process: &mut JsonLineProcess,
+    id: &str,
+    method: &str,
+    params: Value,
+) -> Result<(), AppError> {
+    process
+        .send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+        .await
 }
 
 fn thought_level_option(response: &Value) -> Option<(Vec<String>, Option<String>)> {
@@ -848,7 +979,15 @@ mod tests {
         );
         let models = driver.discover_models(&workspace).await.unwrap();
         assert!(!models.is_empty());
-        eprintln!("discovered {} models", models.len());
+        let thinking = models
+            .iter()
+            .filter(|model| !model.supported_reasoning_efforts.is_empty())
+            .count();
+        assert!(thinking > 0);
+        eprintln!(
+            "discovered {} models ({thinking} with thinking levels)",
+            models.len()
+        );
     }
 
     #[test]
@@ -1059,5 +1198,116 @@ mod tests {
             cli_credentials_key(Path::new("/missing/credentials.toml")),
             None
         );
+    }
+
+    #[cfg(unix)]
+    fn fixture_driver(stall: bool) -> (DevinDriver, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("todex-devin-wire-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let binary = root.join("devin-fixture");
+        std::fs::write(
+            &binary,
+            include_str!("../../tests/fixtures/devin_acp_fixture.py"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if stall {
+            std::fs::write(root.join("stall"), "").unwrap();
+        }
+        let driver = DevinDriver {
+            binary: binary.to_string_lossy().to_string(),
+            auth_method: None,
+            api_key_env: None,
+            cli_credentials: false,
+            env_allowlist: Vec::new(),
+            sessions: Mutex::new(HashMap::new()),
+            discovery: Mutex::new(HashMap::new()),
+        };
+        (driver, root)
+    }
+
+    #[cfg(unix)]
+    fn fixture_journal(root: &Path) -> Vec<Value> {
+        std::fs::read_to_string(root.join("journal.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_sweeps_thought_levels_across_parallel_sessions() {
+        let (driver, root) = fixture_driver(false);
+        let models = driver.discover_models(&root).await.unwrap();
+        assert_eq!(models.len(), 12);
+        for (index, model) in models.iter().enumerate() {
+            if index % 2 == 0 {
+                assert_eq!(model.supported_reasoning_efforts, ["medium", "high", "max"]);
+                assert_eq!(model.default_reasoning_effort.as_deref(), Some("high"));
+            } else {
+                assert!(model.supported_reasoning_efforts.is_empty(), "{}", model.id);
+            }
+        }
+        assert!(driver.discovery.lock().await.contains_key(&root));
+
+        let journal = fixture_journal(&root);
+        let calls = |method: &str| {
+            journal
+                .iter()
+                .filter(|entry| entry["method"] == method)
+                .map(|entry| entry["params"].clone())
+                .collect::<Vec<_>>()
+        };
+        let opened = calls("session/new").len();
+        assert_eq!(opened, THOUGHT_LEVEL_PROBE_LANES);
+        let lanes = calls("session/set_config_option")
+            .iter()
+            .map(|params| params["sessionId"].as_str().unwrap().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(lanes.len(), THOUGHT_LEVEL_PROBE_LANES);
+        assert_eq!(calls("session/set_config_option").len(), 12);
+        assert_eq!(calls("session/delete").len(), opened);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn thought_level_sweep_returns_partial_levels_at_deadline() {
+        let (driver, root) = fixture_driver(true);
+        let (mut process, session, _) = driver.session_probe(&root).await.unwrap();
+        let mut models = parse_devin_models(&session);
+        let mut sessions = vec![session["sessionId"].as_str().unwrap().to_owned()];
+        let complete = probe_thought_levels(
+            &mut process,
+            &root,
+            &session,
+            &mut sessions,
+            &mut models,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+        delete_probe_sessions(&mut process, &sessions).await;
+        process.terminate().await;
+
+        assert!(!complete);
+        assert_eq!(models.len(), 13);
+        let stalled = models
+            .iter()
+            .find(|model| model.id == "stall-model")
+            .unwrap();
+        assert!(stalled.supported_reasoning_efforts.is_empty());
+        assert_eq!(
+            models[0].supported_reasoning_efforts,
+            ["medium", "high", "max"]
+        );
+        let deleted = fixture_journal(&root)
+            .iter()
+            .filter(|entry| entry["method"] == "session/delete")
+            .count();
+        assert_eq!(deleted, sessions.len());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
