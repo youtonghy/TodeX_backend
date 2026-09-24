@@ -1891,6 +1891,8 @@ impl ConversationSupervisor {
         for driver in self.registry.drivers.values() {
             driver.shutdown().await;
         }
+        // Coalesced stream text waits on timers that die with the runtime.
+        self.store.flush_pending_deltas().await;
     }
 
     async fn emit(

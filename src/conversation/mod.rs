@@ -1,9 +1,11 @@
+mod coalesce;
 mod hub;
 mod migration;
 mod model;
 mod store;
 mod summary;
 
+pub use coalesce::{DeltaFragment, PendingDelta};
 pub use hub::ConversationEventHub;
 pub use migration::migrate_legacy_codex_sessions;
 pub use model::{

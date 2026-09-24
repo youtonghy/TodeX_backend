@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinSet;
 
 use crate::config::AgentConfig;
-use crate::conversation::ProviderKind;
+use crate::conversation::{DeltaFragment, PendingDelta, ProviderKind};
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
@@ -22,10 +22,9 @@ use super::types::{
 const MAX_PI_SESSIONS: usize = 32;
 const PI_UI_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// Pi streams thinking/text a few characters at a time; fragments of one block
-/// are merged for this long so the journal does not store one event per token.
-const PI_DELTA_COALESCE_INTERVAL: Duration = Duration::from_millis(100);
-/// Merged text stays below the journal compaction string limit.
-const PI_DELTA_COALESCE_MAX_BYTES: usize = 2 * 1024;
+/// are merged (shared window and size limits) so the journal does not store
+/// one event per token.
+const PI_DELTA_TEXT: &[&str] = &["/delta/delta"];
 
 pub struct PiDriver {
     binary: String,
@@ -1582,41 +1581,22 @@ struct PiRpc<'a> {
     tool_args: HashMap<String, Value>,
     /// Latest thinking/text fragment, held back so following fragments of the
     /// same block can be appended. Any other frame flushes it first.
-    pending_delta: Option<PiPendingDelta>,
+    pending_delta: Option<PendingDelta<DriverEventSink>>,
     /// Assistant-text blocks streamed for the open native message. Its final
     /// answer lists them in `block.supersedes` so clients drop the progress
     /// copy instead of showing the answer twice.
     streamed_text_blocks: Vec<String>,
 }
 
-struct PiPendingDelta {
-    sink: DriverEventSink,
-    event_type: &'static str,
-    payload: Value,
-    started: tokio::time::Instant,
-}
-
-impl PiPendingDelta {
-    /// Clients append `delta.delta` per block, so a merged fragment renders
-    /// exactly like the sequence it replaces.
-    fn append(&mut self, payload: &Value) -> bool {
-        let same_block = ["/block/id", "/delta/type", "/delta/contentIndex"]
-            .iter()
-            .all(|pointer| self.payload.pointer(pointer) == payload.pointer(pointer));
-        let (Some(text), Some(next)) = (
-            self.payload.pointer("/delta/delta").and_then(Value::as_str),
-            payload.pointer("/delta/delta").and_then(Value::as_str),
-        ) else {
-            return false;
-        };
-        if !same_block || text.len() + next.len() > PI_DELTA_COALESCE_MAX_BYTES {
-            return false;
-        }
-        let merged = format!("{text}{next}");
-        self.payload["delta"] = payload["delta"].clone();
-        self.payload["delta"]["delta"] = Value::String(merged);
-        true
-    }
+/// Clients append `delta.delta` per block, so a merged fragment renders
+/// exactly like the sequence it replaces. The rest of the delta (Pi's
+/// `partial` snapshot) changes per frame, so identity is the block alone.
+fn pi_delta_fragment(payload: &Value) -> DeltaFragment {
+    let identity: Vec<_> = ["/block/id", "/delta/type", "/delta/contentIndex"]
+        .iter()
+        .map(|pointer| payload.pointer(pointer))
+        .collect();
+    DeltaFragment::keyed(json!(identity).to_string(), PI_DELTA_TEXT)
 }
 
 /// Only fragments inside an open thinking/text block are merged.
@@ -1669,32 +1649,29 @@ impl<'a> PiRpc<'a> {
         &mut self,
         sink: &DriverEventSink,
         event_type: &'static str,
-        payload: Value,
+        mut payload: Value,
     ) -> Result<(), AppError> {
+        let fragment = pi_delta_fragment(&payload);
         if let Some(pending) = self.pending_delta.as_mut() {
-            if pending.event_type == event_type
-                && pending.started.elapsed() < PI_DELTA_COALESCE_INTERVAL
-                && pending.append(&payload)
-            {
-                return Ok(());
+            match pending.try_append(event_type, &fragment, payload) {
+                Ok(()) => return Ok(()),
+                Err(unmerged) => payload = unmerged,
             }
         }
         self.flush_pending_delta().await?;
-        self.pending_delta = Some(PiPendingDelta {
-            sink: sink.clone(),
+        self.pending_delta = Some(PendingDelta::new(
+            sink.clone(),
             event_type,
+            fragment,
             payload,
-            started: tokio::time::Instant::now(),
-        });
+        ));
         Ok(())
     }
 
     async fn flush_pending_delta(&mut self) -> Result<(), AppError> {
         if let Some(pending) = self.pending_delta.take() {
-            pending
-                .sink
-                .emit(pending.event_type, pending.payload)
-                .await?;
+            let (sink, event_type, payload) = pending.into_parts();
+            sink.emit(event_type, payload).await?;
         }
         Ok(())
     }
@@ -1789,10 +1766,7 @@ impl<'a> PiRpc<'a> {
                 .filter_map(|key| self.ui_emitted_at.get(key))
                 .min()
                 .map(|last| *last + PI_UI_UPDATE_INTERVAL);
-            let delta_deadline = self
-                .pending_delta
-                .as_ref()
-                .map(|pending| pending.started + PI_DELTA_COALESCE_INTERVAL);
+            let delta_deadline = self.pending_delta.as_ref().map(PendingDelta::deadline);
             let message = tokio::select! {
                 _ = async {
                     match ui_deadline {

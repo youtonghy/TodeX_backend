@@ -1843,12 +1843,7 @@ async fn replay_conversation(
     Query(query): Query<ReplayQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
-    let detail = query.detail.as_deref().unwrap_or("full");
-    if !matches!(detail, "full" | "summary") {
-        return Err(AppError::InvalidRequest(
-            "events detail must be \"full\" or \"summary\"".to_owned(),
-        ));
-    }
+    let summary = summary_detail(query.detail.as_deref())?;
     let limit = query.limit.unwrap_or(200);
     // `beforeSequence` pages backwards through the journal for lazy history
     // loading; `hasMore` then reports whether earlier events remain.
@@ -1871,12 +1866,24 @@ async fn replay_conversation(
                 .await?
         }
     };
-    if detail == "summary" {
+    if summary {
         for event in &mut replay.events {
             crate::conversation::summarize_event(event);
         }
     }
     Ok(Json(serde_json::to_value(replay)?))
+}
+
+/// Shared `detail` switch of HTTP event pages and websocket backfill:
+/// `full` (default) or `summary`, which folds process-only payloads.
+fn summary_detail(detail: Option<&str>) -> Result<bool, AppError> {
+    match detail.unwrap_or("full") {
+        "full" => Ok(false),
+        "summary" => Ok(true),
+        _ => Err(AppError::InvalidRequest(
+            "events detail must be \"full\" or \"summary\"".to_owned(),
+        )),
+    }
 }
 
 async fn prompt_conversation(
@@ -2289,6 +2296,7 @@ async fn dispatch_command_inner(
     match command.command_type.as_str() {
         "conversation.subscribe" => {
             let request: SubscribeRequest = serde_json::from_value(command.payload.clone())?;
+            let summary = summary_detail(request.detail.as_deref())?;
             state
                 .conversations
                 .get_owned(owner_id, &request.conversation_id)
@@ -2316,19 +2324,35 @@ async fn dispatch_command_inner(
                 .last_sequence;
             let mut replay_cursor = request.after_sequence.unwrap_or(0).min(high_water);
             let page_size = request.limit.unwrap_or(500);
-            while replay_cursor < high_water {
+            // Backfill stops at the cap; the client pages the rest of the
+            // backlog over HTTP from `nextSequence` (reported with `hasMore`).
+            let backfill_end = request.backfill_limit.map_or(high_water, |limit| {
+                replay_cursor
+                    .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+                    .min(high_water)
+            });
+            while replay_cursor < backfill_end {
+                let remaining = usize::try_from(backfill_end - replay_cursor).unwrap_or(usize::MAX);
                 let replay = state
                     .conversations
-                    .replay_owned(owner_id, &request.conversation_id, replay_cursor, page_size)
+                    .replay_owned(
+                        owner_id,
+                        &request.conversation_id,
+                        replay_cursor,
+                        page_size.min(remaining),
+                    )
                     .await?;
                 let mut advanced = false;
-                for event in replay
+                for mut event in replay
                     .events
                     .into_iter()
-                    .take_while(|event| event.sequence <= high_water)
+                    .take_while(|event| event.sequence <= backfill_end)
                 {
                     replay_cursor = event.sequence;
                     advanced = true;
+                    if summary {
+                        crate::conversation::summarize_event(&mut event);
+                    }
                     outgoing
                         .send(json!({ "type": "conversation.event", "delivery": "replay", "payload": event }))
                         .await
@@ -2336,7 +2360,7 @@ async fn dispatch_command_inner(
                 }
                 if !advanced {
                     return Err(AppError::Conflict(format!(
-                        "conversation {} replay did not reach sequence {high_water}",
+                        "conversation {} replay did not reach sequence {backfill_end}",
                         request.conversation_id
                     )));
                 }
@@ -2459,8 +2483,11 @@ async fn dispatch_command_inner(
             Ok(json!({
                 "conversationId": request.conversation_id,
                 "subscribed": true,
-                "nextSequence": high_water,
-                "hasMore": false,
+                // Last replayed sequence (the high-water mark unless capped).
+                "nextSequence": replay_cursor,
+                "hasMore": replay_cursor < high_water,
+                // Live delivery continues after this sequence.
+                "lastSequence": high_water,
             }))
         }
         "conversation.unsubscribe" => {
@@ -3048,8 +3075,17 @@ struct SubscribeRequest {
     conversation_id: String,
     #[serde(default)]
     after_sequence: Option<u64>,
+    /// Replay page size, not a cap.
     #[serde(default)]
     limit: Option<usize>,
+    /// `full` (default) or `summary`, folding backfilled process events like
+    /// the HTTP `detail=summary`. Live events and gap recovery stay full.
+    #[serde(default)]
+    detail: Option<String>,
+    /// Maximum number of backfilled events. Omitted replays through the
+    /// high-water mark.
+    #[serde(default)]
+    backfill_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3879,6 +3915,324 @@ mod tests {
         for (_, task) in future_tasks {
             task.abort();
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_subscription_backfill_honors_summary_detail_and_cap() {
+        let root = std::env::temp_dir().join(format!("todex-v2-backfill-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root],
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+        })
+        .await
+        .unwrap();
+        let store = ConversationStore::new(state.config.data_dir.clone())
+            .await
+            .unwrap();
+        let hub = ConversationEventHub::default();
+        state.conversations = ConversationSupervisor::new(
+            state.config.clone(),
+            store.clone(),
+            hub.clone(),
+            state.workspace_trust.clone(),
+        );
+        let manifest = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::Codex,
+                workspace,
+                Some("Backfill fixture".to_owned()),
+                None,
+            )
+            .await
+            .unwrap();
+        let tool_event = |index: u64| {
+            json!({
+                "turnId": "turn-1",
+                "block": {"id": format!("call-{index}"), "category": "tool", "phase": "completed", "turnId": "turn-1"},
+                "toolCallId": format!("call-{index}"),
+                "result": "x".repeat(4096),
+            })
+        };
+        for index in 1..=5 {
+            store
+                .append(&manifest.id, "provider.event", tool_event(index))
+                .await
+                .unwrap();
+        }
+        let subscribe = |id: &str, payload: Value| V2Command {
+            id: id.to_owned(),
+            command_type: "conversation.subscribe".to_owned(),
+            payload,
+        };
+        let (outgoing, mut events) = mpsc::channel(16);
+        let subscriptions = Arc::new(Mutex::new(HashSet::new()));
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        let mut tasks = HashMap::new();
+
+        let invalid = dispatch_command_inner(
+            &state,
+            &outgoing,
+            &subscriptions,
+            &event_scope,
+            &mut tasks,
+            "local",
+            &subscribe(
+                "bad-detail",
+                json!({"conversationId": manifest.id, "detail": "compact"}),
+            ),
+        )
+        .await;
+        assert!(matches!(invalid, Err(AppError::InvalidRequest(_))));
+
+        let result = dispatch_command_inner(
+            &state,
+            &outgoing,
+            &subscriptions,
+            &event_scope,
+            &mut tasks,
+            "local",
+            &subscribe(
+                "capped",
+                json!({
+                    "conversationId": manifest.id,
+                    // Sequence 1 is `conversation.created`.
+                    "afterSequence": 1,
+                    "limit": 2,
+                    "detail": "summary",
+                    "backfillLimit": 3,
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["nextSequence"], 4);
+        assert_eq!(result["hasMore"], true);
+        assert_eq!(result["lastSequence"], 6);
+        for expected in 2..=4 {
+            let event = events.try_recv().expect("capped backfill event");
+            assert_eq!(event["delivery"], "replay");
+            assert_eq!(event["payload"]["sequence"], expected);
+            assert_eq!(event["payload"]["payload"]["detailStub"], true);
+            assert!(event["payload"]["payload"].get("result").is_none());
+        }
+        assert!(events.try_recv().is_err(), "backfill must stop at the cap");
+
+        // Live delivery resumes after the high-water mark; the capped range is
+        // left to HTTP paging instead of being replayed as a gap.
+        let live = store
+            .append(&manifest.id, "provider.event", tool_event(6))
+            .await
+            .unwrap();
+        hub.publish(live);
+        let received = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received["delivery"], "live");
+        assert_eq!(received["payload"]["sequence"], 7);
+        assert_eq!(received["payload"]["payload"]["result"], "x".repeat(4096));
+        for (_, task) in tasks {
+            task.abort();
+        }
+
+        // A cap covering the backlog behaves like an uncapped subscription.
+        let (outgoing, mut events) = mpsc::channel(16);
+        let mut tasks = HashMap::new();
+        let result = dispatch_command_inner(
+            &state,
+            &outgoing,
+            &Arc::new(Mutex::new(HashSet::new())),
+            &event_scope,
+            &mut tasks,
+            "local",
+            &subscribe(
+                "covered",
+                json!({"conversationId": manifest.id, "afterSequence": 5, "backfillLimit": 10}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["nextSequence"], 7);
+        assert_eq!(result["hasMore"], false);
+        for expected in [6, 7] {
+            let event = events.try_recv().unwrap();
+            assert_eq!(event["payload"]["sequence"], expected);
+            assert_eq!(event["payload"]["payload"]["result"], "x".repeat(4096));
+        }
+        for (_, task) in tasks {
+            task.abort();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_http_responses_are_gzipped_without_breaking_signatures_or_websockets() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let root = std::env::temp_dir().join(format!("todex-v2-gzip-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root],
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+        })
+        .await
+        .unwrap();
+        let store = ConversationStore::new(state.config.data_dir.clone())
+            .await
+            .unwrap();
+        let device = enroll(&root.join("data"));
+        let app = crate::server::router(state.clone());
+        let manifest = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::Codex,
+                workspace,
+                Some("Gzip fixture".to_owned()),
+                None,
+            )
+            .await
+            .unwrap();
+        for index in 1..=20 {
+            store
+                .append(
+                    &manifest.id,
+                    "fixture.event",
+                    json!({ "index": index, "text": "history ".repeat(64) }),
+                )
+                .await
+                .unwrap();
+        }
+        let uri = format!(
+            "/v2/conversations/{}/events?afterSequence=0&limit=200",
+            manifest.id
+        );
+        let mut request = signed_request(&device, "GET", &uri, "");
+        request
+            .headers_mut()
+            .insert("accept-encoding", "gzip".parse().unwrap());
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-encoding"], "gzip");
+        let compressed = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(&compressed[..2], &[0x1f, 0x8b]);
+
+        let plain = app
+            .clone()
+            .oneshot(signed_request(&device, "GET", &uri, ""))
+            .await
+            .unwrap();
+        assert!(plain.headers().get("content-encoding").is_none());
+        let plain = to_bytes(plain.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&plain).unwrap();
+        // `conversation.created` plus the fixtures.
+        assert_eq!(body["events"].as_array().unwrap().len(), 21);
+        assert!(compressed.len() * 4 < plain.len());
+
+        let mut small = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        small
+            .headers_mut()
+            .insert("accept-encoding", "gzip".parse().unwrap());
+        let small = app.clone().oneshot(small).await.unwrap();
+        assert!(small.headers().get("content-encoding").is_none());
+
+        // Browsers send Accept-Encoding on the upgrade request as well.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut upgrade = format!("ws://{addr}/v2/ws?{}", device.sign_query("/v2/ws"))
+            .into_client_request()
+            .unwrap();
+        upgrade
+            .headers_mut()
+            .insert("accept-encoding", "gzip, deflate".parse().unwrap());
+        let (mut ws, response) = tokio_tungstenite::connect_async(upgrade)
+            .await
+            .expect("websocket upgrade with accept-encoding");
+        assert!(response.headers().get("content-encoding").is_none());
+        ws.send(WsMessage::Text(
+            json!({ "id": "ping-1", "type": "server.ping", "payload": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let ping = wait_for_ws_message(&mut ws, |message| {
+            message["id"] == "ping-1" && message["type"] == "server.result"
+        })
+        .await;
+        assert_eq!(ping["payload"]["pong"], true);
         let _ = fs::remove_dir_all(root);
     }
 

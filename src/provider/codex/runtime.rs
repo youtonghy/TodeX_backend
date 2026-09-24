@@ -523,7 +523,7 @@ async fn active_turn(
                     }
                 }
                 if method == "item/agentMessage/delta" && params.get("itemId").and_then(Value::as_str).and_then(|id| item_phases.get(id)).is_some_and(|phase| phase == "commentary") {
-                    sink.emit("message.delta", json!({"role":"assistant","provider":"codex","delta":params.get("delta"),"nativeTurnId":params.get("turnId"),"nativeSessionId":thread,"block":codex_block(&params,"assistant_progress","delta",&prompt.turn_id)})).await?;
+                    sink.emit_delta("message.delta", json!({"role":"assistant","provider":"codex","delta":params.get("delta"),"nativeTurnId":params.get("turnId"),"nativeSessionId":thread,"block":codex_block(&params,"assistant_progress","delta",&prompt.turn_id)}), CODEX_MESSAGE_TEXT, None).await?;
                 } else {
                     handle_codex_message(process, message, sink, cancel, &prompt.turn_id).await?;
                 }

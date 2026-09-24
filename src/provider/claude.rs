@@ -258,11 +258,96 @@ mod tests {
 
     use super::{
         claude_model_aliases, claude_question_details, claude_question_response,
-        claude_user_content, BackgroundTasks, ClaudeSubagents, ClaudeToolCalls,
+        claude_user_content, handle_stream_event, BackgroundTasks, ClaudeSubagents,
+        ClaudeToolCalls,
     };
+    use crate::conversation::{
+        ConversationEventHub, ConversationManifest, ConversationStore, ProviderKind,
+    };
+    use crate::provider::types::{DriverEventSink, PermissionBroker};
     use crate::provider::types::{
         DriverPrompt, DriverPromptContent, PermissionDecision, PermissionOutcome,
     };
+
+    #[tokio::test]
+    async fn stream_text_merges_per_content_block_and_keeps_tool_json_fragments() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-claude-deltas-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = ConversationStore::new(root.join("data")).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::ClaudeCode,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let sink = DriverEventSink::new(
+            store.clone(),
+            ConversationEventHub::default(),
+            PermissionBroker::default(),
+            &manifest.id,
+        )
+        .with_turn_id("turn-1");
+        let mut tools = ClaudeToolCalls::default();
+        let delta = |index: u64, delta: serde_json::Value| {
+            json!({"type":"stream_event","event":{
+                "type":"content_block_delta","index":index,"delta":delta
+            }})
+        };
+        for message in [
+            delta(0, json!({"type":"thinking_delta","thinking":"let me "})),
+            delta(0, json!({"type":"thinking_delta","thinking":"see"})),
+            delta(1, json!({"type":"text_delta","text":"Hel"})),
+            delta(1, json!({"type":"text_delta","text":"lo"})),
+            delta(2, json!({"type":"text_delta","text":" there"})),
+            delta(
+                3,
+                json!({"type":"input_json_delta","partial_json":"{\"a\""}),
+            ),
+            delta(3, json!({"type":"input_json_delta","partial_json":":1}"})),
+        ] {
+            handle_stream_event(&message, "turn-1", &mut tools, &sink)
+                .await
+                .unwrap();
+        }
+        sink.emit("message.completed", json!({"provider":"claude-code"}))
+            .await
+            .unwrap();
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let journalled: Vec<_> = history
+            .iter()
+            .map(|event| (event.event_type.as_str(), event.payload["delta"].clone()))
+            .collect();
+        assert_eq!(
+            journalled,
+            [
+                (
+                    "thought.delta",
+                    json!({"type":"thinking_delta","thinking":"let me see"})
+                ),
+                ("message.delta", json!({"type":"text_delta","text":"Hello"})),
+                (
+                    "message.delta",
+                    json!({"type":"text_delta","text":" there"})
+                ),
+                (
+                    "message.delta",
+                    json!({"type":"input_json_delta","partial_json":"{\"a\""})
+                ),
+                (
+                    "message.delta",
+                    json!({"type":"input_json_delta","partial_json":":1}"})
+                ),
+                ("message.completed", serde_json::Value::Null),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     fn ask_user_question_input() -> serde_json::Value {
         json!({
@@ -1262,17 +1347,32 @@ async fn handle_stream_event(
     match event_type {
         "content_block_delta" => {
             let delta = event.get("delta").cloned().unwrap_or(Value::Null);
-            let event_type = if delta.get("type").and_then(Value::as_str) == Some("thinking_delta")
-            {
+            let delta_type = delta.get("type").and_then(Value::as_str);
+            let event_type = if delta_type == Some("thinking_delta") {
                 "thought.delta"
             } else {
                 "message.delta"
             };
-            sink.emit(
-                event_type,
-                json!({ "provider": "claude-code", "role": "assistant", "delta": delta }),
-            )
-            .await?;
+            let payload = json!({ "provider": "claude-code", "role": "assistant", "delta": delta });
+            // Only text and thinking merge; tool-argument JSON and signatures
+            // stay one event per fragment.
+            let text: Option<&'static [&'static str]> = match delta_type {
+                Some("text_delta") => Some(&["/delta/text"]),
+                Some("thinking_delta") => Some(&["/delta/thinking"]),
+                _ => None,
+            };
+            match text {
+                Some(text) => {
+                    // The payload omits the content-block index; keep blocks
+                    // (and subagent streams) apart anyway.
+                    let block = json!([event.get("index"), message.get("parent_tool_use_id")]);
+                    sink.emit_delta(event_type, payload, text, Some(&block.to_string()))
+                        .await?;
+                }
+                None => {
+                    sink.emit(event_type, payload).await?;
+                }
+            }
         }
         "content_block_start" => {
             let content = event.get("content_block").cloned().unwrap_or(Value::Null);

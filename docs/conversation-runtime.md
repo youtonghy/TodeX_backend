@@ -33,12 +33,19 @@ optional and canonical aliases are recomputed when old journals are replayed.
   Providers without native subagent signals emit no `subagent.*` events.
 - Memory configuration is separate from memory content; the panel explicitly
   reports when the provider has no readable content source.
-- Streaming is coalesced before it reaches the journal. Pi thinking/text
-  fragments of one block merge for up to 100 ms (2 KiB) into one delta; ACP
+- Streaming is coalesced before it reaches the journal. Text fragments of one
+  stream merge for up to 100 ms (2 KiB of text) into one `message.delta` /
+  `thought.delta` whose text is the concatenation: Pi per content block; Codex
+  per item block (reasoning keeps `delta` and `thought` equal); Claude Code
+  `text_delta`/`thinking_delta` per content-block index (tool-argument JSON and
+  signatures stay per fragment); ACP text chunks per message. Codex, Claude and
+  ACP buffer in the conversation store, so any other event of the conversation
+  (from any writer), a history read and daemon shutdown flush the open window
+  first and sequences stay contiguous and in emission order. ACP
   `tool.updated` carries a full snapshot and in-progress snapshots of a call are
   sent at most every 500 ms, while terminal status is always sent. Clients
   append deltas per block and replace tool rows per event, so the rendered
-  result is unchanged.
+  result is unchanged; live deltas arrive at most 100 ms later.
 - A final `message.completed` may carry `block.supersedes`: the
   `assistant_progress` block ids its text was streamed under. Clients remove
   those progress entries so the answer is shown once. Pi sets it only on final

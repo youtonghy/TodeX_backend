@@ -9,6 +9,8 @@ pub(crate) mod websocket;
 use std::net::IpAddr;
 
 use axum::Router;
+use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -18,9 +20,27 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::routes(&state))
         .merge(device_pairing::routes())
+        .layer(compression_layer())
         .layer(cors_layer(&state.config.host))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Responses below this size are sent as-is; gzip framing would not pay off.
+const MIN_COMPRESSED_RESPONSE_BYTES: u16 = 1024;
+
+/// Gzip for clients that send `Accept-Encoding: gzip` (mainly large history
+/// pages). Only response bodies are touched, so device signatures, which
+/// cover the request, are unaffected. Bodyless responses such as the
+/// websocket `101 Switching Protocols` fall below the size threshold, and
+/// images, gRPC and event streams keep the default exclusions.
+fn compression_layer() -> CompressionLayer<impl Predicate> {
+    CompressionLayer::new().compress_when(
+        SizeAbove::new(MIN_COMPRESSED_RESPONSE_BYTES)
+            .and(NotForContentType::GRPC)
+            .and(NotForContentType::IMAGES)
+            .and(NotForContentType::SSE),
+    )
 }
 
 fn cors_layer(host: &str) -> CorsLayer {

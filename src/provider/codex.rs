@@ -814,9 +814,26 @@ async fn handle_codex_message(
     };
     payload["nativeTurnId"] = params.get("turnId").cloned().unwrap_or(Value::Null);
     payload["nativeSessionId"] = params.get("threadId").cloned().unwrap_or(Value::Null);
-    sink.emit(event_type, payload).await?;
+    match event_type {
+        "message.delta" => {
+            sink.emit_delta(event_type, payload, CODEX_MESSAGE_TEXT, None)
+                .await?
+        }
+        "thought.delta" => {
+            sink.emit_delta(event_type, payload, CODEX_THOUGHT_TEXT, None)
+                .await?
+        }
+        _ => {
+            sink.emit(event_type, payload).await?;
+        }
+    }
     Ok(())
 }
+
+/// Text fields of streamed Codex fragments; the rest of the payload (item
+/// block, native turn) identifies the stream they merge within.
+pub(super) const CODEX_MESSAGE_TEXT: &[&str] = &["/delta"];
+const CODEX_THOUGHT_TEXT: &[&str] = &["/delta", "/thought"];
 
 fn codex_usage_event(params: &Value) -> Option<Value> {
     let usage = params.get("tokenUsage")?.as_object()?;
@@ -1199,6 +1216,104 @@ mod tests {
     use super::*;
     use crate::conversation::redact_secrets;
     use crate::provider::types::{DriverPromptContent, DriverSkill};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streamed_text_merges_per_item_and_flushes_before_item_events() {
+        use crate::conversation::{ConversationEventHub, ConversationManifest, ConversationStore};
+        use crate::provider::types::PermissionBroker;
+
+        let root = std::env::temp_dir().join(format!(
+            "todex-codex-deltas-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = ConversationStore::new(root.join("data")).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let sink = DriverEventSink::new(
+            store.clone(),
+            ConversationEventHub::default(),
+            PermissionBroker::default(),
+            &manifest.id,
+        )
+        .with_turn_id("turn-1");
+        let mut process = JsonLineProcess::spawn(&CommandSpec::new("/bin/cat", &root))
+            .await
+            .unwrap();
+        let (_tx, mut cancel) = watch::channel(false);
+        let notify = |method: &str, params: Value| json!({"method": method, "params": params});
+        for message in [
+            notify(
+                "item/reasoning/summaryTextDelta",
+                json!({"itemId":"r1","summaryIndex":0,"delta":"think ","turnId":"n1","threadId":"th"}),
+            ),
+            notify(
+                "item/reasoning/summaryTextDelta",
+                json!({"itemId":"r1","summaryIndex":0,"delta":"hard","turnId":"n1","threadId":"th"}),
+            ),
+            notify(
+                "item/reasoning/summaryTextDelta",
+                json!({"itemId":"r1","summaryIndex":1,"delta":"next","turnId":"n1","threadId":"th"}),
+            ),
+            notify(
+                "item/agentMessage/delta",
+                json!({"itemId":"m1","delta":"Hel","turnId":"n1","threadId":"th"}),
+            ),
+            notify(
+                "item/agentMessage/delta",
+                json!({"itemId":"m1","delta":"lo","turnId":"n1","threadId":"th"}),
+            ),
+            notify(
+                "item/agentMessage/delta",
+                json!({"itemId":"m2","delta":"Bye","turnId":"n1","threadId":"th"}),
+            ),
+            notify(
+                "item/completed",
+                json!({"item":{"id":"m2","type":"agentMessage","text":"Bye"},"turnId":"n1","threadId":"th"}),
+            ),
+        ] {
+            handle_codex_message(&mut process, message, &sink, &mut cancel, "turn-1")
+                .await
+                .unwrap();
+        }
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let deltas: Vec<_> = history
+            .iter()
+            .filter(|event| event.event_type.ends_with(".delta"))
+            .map(|event| {
+                (
+                    event.event_type.as_str(),
+                    event.payload["block"]["id"].clone(),
+                    event.payload["delta"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            [
+                ("thought.delta", json!("r1:summary:0"), json!("think hard")),
+                ("thought.delta", json!("r1:summary:1"), json!("next")),
+                ("message.delta", json!("m1"), json!("Hello")),
+                ("message.delta", json!("m2"), json!("Bye")),
+            ]
+        );
+        // Reasoning renders from `thought`, which must carry the same text.
+        assert_eq!(history[0].payload["thought"], "think hard");
+        assert!(!history.last().unwrap().event_type.ends_with(".delta"));
+        let sequences: Vec<_> = history.iter().map(|event| event.sequence).collect();
+        assert_eq!(sequences, (1..=history.len() as u64).collect::<Vec<_>>());
+        process.terminate().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn codex_items_keep_phase_metadata_and_unknown_payloads() {

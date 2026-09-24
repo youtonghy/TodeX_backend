@@ -147,6 +147,8 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 事件回放支持 `detail=summary`（默认 `full`）：summary 模式把只产生折叠过程行的事件（工具调用、思考、状态、进度）的 `payload` 替换为 `{ "detailStub": true, ... }` 占位对象，保留分类、turn 与流身份所需的元数据，因此事件 sequence 与投影出的时间线条目身份保持不变；结果输出、审批、权限、队列、配置、压缩、subagent、memory、extension 及携带用量数据的事件始终完整返回。客户端展开过程组时用同一接口按 `afterSequence`/`limit` 以 `detail=full` 拉取对应序列区间。
 
+HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB 时使用 gzip 压缩（图片、gRPC 与 SSE 除外）；压缩只作用于响应体，设备签名覆盖的请求方法、路径、查询与请求体不受影响，WebSocket 升级不压缩。
+
 `beforeSequence=N` 提供反向翻页（与 `afterSequence` 互斥，优先生效）：返回 `sequence <= N` 的最后 `limit` 条（升序），`hasMore` 表示是否还有更早的事件，下一页游标为本页首条 `sequence - 1`。用于长对话自下向上懒加载：首屏用 manifest 的 `lastSequence` 拉取尾页，滚动到顶部再继续向前翻页。
 
 ### v2 WebSocket
@@ -160,10 +162,14 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
   "payload": {
     "conversationId": "00000000-0000-4000-8000-000000000000",
     "afterSequence": 0,
-    "limit": 500
+    "limit": 500,
+    "detail": "full",
+    "backfillLimit": 2000
   }
 }
 ```
+
+`conversation.subscribe` 的 `limit` 只是 replay 分页大小。可选 `detail`（`full` 默认 | `summary`）按 HTTP `detail=summary` 同样的规则折叠首次 replay 的过程事件；实时事件与缺口/滞后补放始终完整。可选 `backfillLimit` 限制首次 replay 的事件数：从 `afterSequence` 之后按 sequence 升序最多发送 `backfillLimit` 条，不跳过也不只发最新事件。结果为 `{ "conversationId", "subscribed": true, "nextSequence", "hasMore", "lastSequence" }`：`nextSequence` 是最后一条已 replay 的 sequence（未截断时等于高水位），`hasMore` 表示 `nextSequence` 与 `lastSequence`（订阅时的 journal 高水位）之间仍有未发送事件，实时推送从 `lastSequence` 之后继续。`hasMore: true` 时客户端用 HTTP `afterSequence=nextSequence` 翻页补齐 `(nextSequence, lastSequence]`，服务端不会把这段当作序号缺口补放。两个字段都省略时行为与之前完全一致（`hasMore` 恒为 `false`）。
 
 支持 `conversation.subscribe`、`conversation.unsubscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
 

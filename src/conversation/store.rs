@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -12,6 +13,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 
+use super::coalesce::{DeltaFragment, PendingDelta};
 use super::{
     redact_secrets, status_after_conversation_event, ConversationEvent, ConversationEventHub,
     ConversationManifest, ConversationReplay, ConversationSnapshot, ProviderState,
@@ -39,6 +41,16 @@ pub struct ConversationStore {
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     indexes: Arc<DashMap<String, JournalIndex>>,
     tails: Arc<DashMap<String, JournalTail>>,
+    /// Open streaming-text merge window per conversation. Only touched while
+    /// the conversation lock is held, so any other write flushes it first and
+    /// journal order matches emission order.
+    pending_deltas: Arc<DashMap<String, StoreDelta>>,
+    delta_generation: Arc<AtomicU64>,
+}
+
+struct StoreDelta {
+    generation: u64,
+    delta: PendingDelta<Option<ConversationEventHub>>,
 }
 
 #[derive(Clone)]
@@ -65,6 +77,8 @@ impl ConversationStore {
             locks: Arc::new(DashMap::new()),
             indexes: Arc::new(DashMap::new()),
             tails: Arc::new(DashMap::new()),
+            pending_deltas: Arc::new(DashMap::new()),
+            delta_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -220,6 +234,7 @@ impl ConversationStore {
         tokio::fs::remove_dir_all(directory).await?;
         self.indexes.remove(conversation_id);
         self.tails.remove(conversation_id);
+        self.pending_deltas.remove(conversation_id);
         Ok(())
     }
 
@@ -258,6 +273,7 @@ impl ConversationStore {
                 tokio::fs::remove_dir_all(self.directory(&id)?).await?;
                 self.indexes.remove(&id);
                 self.tails.remove(&id);
+                self.pending_deltas.remove(&id);
                 removed.push(current);
             }
         }
@@ -286,22 +302,121 @@ impl ConversationStore {
             .await
     }
 
+    /// Streaming text fragment: merged with the open window of the same stream
+    /// (see [`super::coalesce`]) and journalled when the window expires, fills,
+    /// or any other event of this conversation is written or read. The merged
+    /// event is published like any other append, so live latency grows by at
+    /// most the coalescing window.
+    pub async fn append_delta_and_publish(
+        &self,
+        conversation_id: &str,
+        event_type: impl Into<String>,
+        payload: Value,
+        fragment: DeltaFragment,
+        hub: &ConversationEventHub,
+    ) -> Result<(), AppError> {
+        let event_type = event_type.into();
+        validate_event_type(&event_type)?;
+        // Reject an unknown conversation now instead of from the flush timer.
+        self.directory(conversation_id)?;
+        let _guard = self.lock(conversation_id).await;
+        let payload = match self.pending_deltas.get_mut(conversation_id) {
+            Some(mut pending) => match pending.delta.try_append(&event_type, &fragment, payload) {
+                Ok(()) => return Ok(()),
+                Err(payload) => payload,
+            },
+            None => payload,
+        };
+        self.flush_pending_delta_locked(conversation_id).await?;
+        let generation = self.delta_generation.fetch_add(1, Ordering::Relaxed);
+        let delta = PendingDelta::new(Some(hub.clone()), event_type, fragment, payload);
+        let deadline = delta.deadline();
+        self.pending_deltas
+            .insert(conversation_id.to_owned(), StoreDelta { generation, delta });
+        let store = self.clone();
+        let conversation_id = conversation_id.to_owned();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            store
+                .flush_expired_delta(&conversation_id, generation)
+                .await;
+        });
+        Ok(())
+    }
+
+    /// Journals every open merge window; called on shutdown so no streamed
+    /// text is lost with the flush timers.
+    pub async fn flush_pending_deltas(&self) {
+        let conversation_ids: Vec<String> = self
+            .pending_deltas
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for conversation_id in conversation_ids {
+            let _guard = self.lock(&conversation_id).await;
+            self.flush_pending_delta_logged(&conversation_id).await;
+        }
+    }
+
+    async fn flush_expired_delta(&self, conversation_id: &str, generation: u64) {
+        let _guard = self.lock(conversation_id).await;
+        let current = self
+            .pending_deltas
+            .get(conversation_id)
+            .is_some_and(|pending| pending.generation == generation);
+        if current {
+            self.flush_pending_delta_logged(conversation_id).await;
+        }
+    }
+
+    /// For flushes without a caller to report to (timer, shutdown, reads):
+    /// the fragment is lost, so the failure is logged loudly.
+    async fn flush_pending_delta_logged(&self, conversation_id: &str) {
+        if let Err(error) = self.flush_pending_delta_locked(conversation_id).await {
+            tracing::error!(conversation_id, error = %error, "failed to journal coalesced stream text");
+        }
+    }
+
+    /// Callers hold the conversation lock.
+    async fn flush_pending_delta_locked(&self, conversation_id: &str) -> Result<(), AppError> {
+        let Some((_, pending)) = self.pending_deltas.remove(conversation_id) else {
+            return Ok(());
+        };
+        let (hub, event_type, payload) = pending.delta.into_parts();
+        self.append_locked(conversation_id, event_type, payload, hub.as_ref())
+            .await
+            .map(|_| ())
+    }
+
     async fn append_inner(
+        &self,
+        conversation_id: &str,
+        event_type: String,
+        payload: Value,
+        hub: Option<&ConversationEventHub>,
+    ) -> Result<ConversationEvent, AppError> {
+        validate_event_type(&event_type)?;
+        let _guard = self.lock(conversation_id).await;
+        // Buffered stream text precedes this event in emission order.
+        self.flush_pending_delta_locked(conversation_id).await?;
+        self.append_locked(conversation_id, event_type, payload, hub)
+            .await
+    }
+
+    /// Callers hold the conversation lock.
+    async fn append_locked(
         &self,
         conversation_id: &str,
         event_type: String,
         mut payload: Value,
         hub: Option<&ConversationEventHub>,
     ) -> Result<ConversationEvent, AppError> {
-        validate_event_type(&event_type)?;
         redact_secrets(&mut payload);
         if serde_json::to_vec(&payload)?.len() > MAX_EVENT_PAYLOAD_BYTES {
             return Err(AppError::InvalidRequest(format!(
                 "conversation event payload exceeds {MAX_EVENT_PAYLOAD_BYTES} bytes"
             )));
         }
-
-        let _guard = self.lock(conversation_id).await;
         let directory = self.directory(conversation_id)?;
         let mut manifest: ConversationManifest =
             read_json(&directory.join(MANIFEST_FILE), "conversation manifest").await?;
@@ -414,6 +529,7 @@ impl ConversationStore {
         conversation_id: &str,
     ) -> Result<Vec<ConversationEvent>, AppError> {
         let _guard = self.lock(conversation_id).await;
+        self.flush_pending_delta_logged(conversation_id).await;
         self.read_and_recover_events(conversation_id).await
     }
 
@@ -423,6 +539,7 @@ impl ConversationStore {
         conversation_id: &str,
     ) -> Result<Option<ConversationEvent>, AppError> {
         let _guard = self.lock(conversation_id).await;
+        self.flush_pending_delta_logged(conversation_id).await;
         let events = self.read_and_recover_events(conversation_id).await?;
         Ok(events.into_iter().rev().find(|event| {
             event.event_type == "message.created"
@@ -437,6 +554,8 @@ impl ConversationStore {
         limit: usize,
     ) -> Result<ConversationReplay, AppError> {
         let _guard = self.lock(conversation_id).await;
+        // Readers see every fragment emitted so far.
+        self.flush_pending_delta_logged(conversation_id).await;
         let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
         let event_path = self.replay_journal(conversation_id).await?;
         let total = self.journal_len(conversation_id);
@@ -468,6 +587,8 @@ impl ConversationStore {
         limit: usize,
     ) -> Result<ConversationReplay, AppError> {
         let _guard = self.lock(conversation_id).await;
+        // Readers see every fragment emitted so far.
+        self.flush_pending_delta_logged(conversation_id).await;
         let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
         let event_path = self.replay_journal(conversation_id).await?;
         let total = self.journal_len(conversation_id);
@@ -568,6 +689,7 @@ impl ConversationStore {
         conversation_id: &str,
     ) -> Result<(ConversationManifest, Vec<ConversationEvent>), AppError> {
         let _guard = self.lock(conversation_id).await;
+        self.flush_pending_delta_logged(conversation_id).await;
         let directory = self.directory(conversation_id)?;
         let mut manifest: ConversationManifest =
             read_json(&directory.join(MANIFEST_FILE), "conversation manifest").await?;
@@ -1119,6 +1241,7 @@ async fn set_owner_only(path: &Path, directory: bool) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::Duration;
 
     use serde_json::json;
     use tokio::io::AsyncWriteExt;
@@ -1930,6 +2053,124 @@ mod tests {
         assert!(matches!(error, AppError::ResourceExhausted(_)));
         assert_eq!(error.code(), "RESOURCE_EXHAUSTED");
         let _ = fs::remove_dir_all(root);
+    }
+
+    async fn delta(
+        store: &ConversationStore,
+        hub: &ConversationEventHub,
+        id: &str,
+        event_type: &str,
+        block: &str,
+        text: &str,
+    ) {
+        let payload = json!({ "delta": text, "block": { "id": block } });
+        let fragment = DeltaFragment::from_payload(&payload, &["/delta"], None).unwrap();
+        store
+            .append_delta_and_publish(id, event_type, payload, fragment, hub)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn coalesced_deltas_flush_in_order_before_any_other_event() {
+        let root = temp_dir("todex-delta-order");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let id = conversation.id.as_str();
+        let hub = ConversationEventHub::default();
+        let mut receiver = hub.subscribe(id);
+        for text in ["He", "ll", "o"] {
+            delta(&store, &hub, id, "message.delta", "a", text).await;
+        }
+        delta(&store, &hub, id, "thought.delta", "a", "hmm").await;
+        delta(&store, &hub, id, "message.delta", "b", "x").await;
+        delta(&store, &hub, id, "message.delta", "b", "y").await;
+        store
+            .append_and_publish(id, "turn.completed", json!({ "turnId": "t" }), &hub)
+            .await
+            .unwrap();
+
+        let expected = [
+            ("message.delta", json!("Hello")),
+            ("thought.delta", json!("hmm")),
+            ("message.delta", json!("xy")),
+            ("turn.completed", Value::Null),
+        ];
+        let history = store.complete_history(id).await.unwrap();
+        assert_eq!(history.len(), expected.len());
+        for (index, (event_type, text)) in expected.iter().enumerate() {
+            let journalled = &history[index];
+            let published = receiver.recv().await.unwrap();
+            assert_eq!(journalled.sequence, index as u64 + 1);
+            assert_eq!(journalled.event_type, *event_type);
+            assert_eq!(journalled.payload["delta"], *text);
+            assert_eq!(published.sequence, journalled.sequence);
+            assert_eq!(published.payload, journalled.payload);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn coalesced_delta_is_published_when_its_window_expires() {
+        let root = temp_dir("todex-delta-window");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let hub = ConversationEventHub::default();
+        let mut receiver = hub.subscribe(&conversation.id);
+        delta(&store, &hub, &conversation.id, "message.delta", "a", "tail").await;
+        let published = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("window expiry must publish the buffered fragment")
+            .unwrap();
+        assert_eq!(published.payload["delta"], "tail");
+        assert_eq!(store.get(&conversation.id).await.unwrap().last_sequence, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_delta_windows_are_journalled_on_shutdown_and_before_reads() {
+        let root = temp_dir("todex-delta-flush");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let hub = ConversationEventHub::default();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let conversation = store
+                .create(ConversationManifest::new(
+                    ProviderKind::Codex,
+                    root.clone(),
+                    None,
+                    None,
+                ))
+                .await
+                .unwrap();
+            delta(&store, &hub, &conversation.id, "message.delta", "a", "x").await;
+            ids.push(conversation.id);
+        }
+        store.flush_pending_deltas().await;
+        assert_eq!(store.get(&ids[0]).await.unwrap().last_sequence, 1);
+        assert_eq!(store.get(&ids[1]).await.unwrap().last_sequence, 1);
+
+        delta(&store, &hub, &ids[0], "message.delta", "a", "y").await;
+        let replay = store.replay(&ids[0], 0, 10).await.unwrap();
+        assert_eq!(replay.events.len(), 2);
+        assert_eq!(replay.events[1].payload["delta"], "y");
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

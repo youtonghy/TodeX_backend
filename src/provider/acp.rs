@@ -269,6 +269,8 @@ pub(super) struct AcpConnectionState {
 /// Minimum spacing between in-progress snapshots of one tool call. Streaming
 /// shell output otherwise journals the whole accumulated output per line.
 const ACP_TOOL_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+/// Text field of a streamed `agent_message_chunk` / `agent_thought_chunk`.
+const ACP_CHUNK_TEXT: &[&str] = &["/content/text"];
 
 impl AcpConnectionState {
     fn tool_flush_deadline(&self) -> Option<tokio::time::Instant> {
@@ -1724,7 +1726,17 @@ pub(super) async fn handle_acp_message(
                 json!({ "provider": provider_id, "providerMethod": method, "metadata": update }),
             ),
         };
-        sink.emit(event_type, payload).await?;
+        if matches!(event_type, "message.delta" | "thought.delta")
+            && payload.pointer("/content/type").and_then(Value::as_str) == Some("text")
+        {
+            // Chunks of one agent message/thought merge; image or resource
+            // chunks stay separate events.
+            let message_id = update.get("messageId").and_then(Value::as_str);
+            sink.emit_delta(event_type, payload, ACP_CHUNK_TEXT, message_id)
+                .await?;
+        } else {
+            sink.emit(event_type, payload).await?;
+        }
         return Ok(());
     }
 
@@ -3154,6 +3166,99 @@ mod tests {
             types.push(event.event_type);
         }
         assert_eq!(types, ["provider.commands.updated"]);
+        process.terminate().await;
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_chunks_are_journalled_merged_and_before_the_next_event() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-acp-chunks-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = crate::conversation::ConversationStore::new(root.join("data"))
+            .await
+            .unwrap();
+        let manifest = store
+            .create(crate::conversation::ConversationManifest::new(
+                ProviderKind::Devin,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let sink = DriverEventSink::new(
+            store.clone(),
+            crate::conversation::ConversationEventHub::default(),
+            crate::provider::types::PermissionBroker::default(),
+            &manifest.id,
+        )
+        .with_turn_id("turn-1");
+        let mut process = JsonLineProcess::spawn(&CommandSpec::new("/bin/cat", &root))
+            .await
+            .unwrap();
+        let (_tx, mut cancel) = watch::channel(false);
+        let mut connection = AcpConnectionState::default();
+        let chunk = |kind: &str, content: Value| {
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{
+                "sessionUpdate":kind,"content":content
+            }}})
+        };
+        let text = |text: &str| json!({"type":"text","text":text});
+        for message in [
+            chunk("agent_thought_chunk", text("plan ")),
+            chunk("agent_thought_chunk", text("it")),
+            chunk("agent_message_chunk", text("Hel")),
+            chunk("agent_message_chunk", text("lo")),
+            chunk(
+                "agent_message_chunk",
+                json!({"type":"image","data":"AA==","mimeType":"image/png"}),
+            ),
+            chunk("agent_message_chunk", text("!")),
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{
+                "sessionUpdate":"tool_call","toolCallId":"exec_0","title":"Ran ls","kind":"execute"
+            }}}),
+        ] {
+            handle_acp_message(
+                &mut process,
+                message,
+                &sink,
+                &mut cancel,
+                ProviderKind::Devin,
+                true,
+                AutoApprove::Mediate,
+                &mut connection,
+            )
+            .await
+            .unwrap();
+        }
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let journalled: Vec<_> = history
+            .iter()
+            .map(|event| {
+                (
+                    event.event_type.as_str(),
+                    event.payload.pointer("/content/text").cloned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            journalled,
+            [
+                ("thought.delta", Some(json!("plan it"))),
+                ("message.delta", Some(json!("Hello"))),
+                ("message.delta", None),
+                ("message.delta", Some(json!("!"))),
+                ("tool.started", None),
+            ]
+        );
+        assert!(history
+            .iter()
+            .all(|event| event.payload["turnId"] == "turn-1"));
         process.terminate().await;
         std::fs::remove_dir_all(&root).unwrap();
     }

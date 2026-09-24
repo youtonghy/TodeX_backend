@@ -10,8 +10,8 @@ use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 use crate::conversation::{
-    ConversationEvent, ConversationEventHub, ConversationManifest, ConversationStore, ProviderKind,
-    ProviderState,
+    ConversationEvent, ConversationEventHub, ConversationManifest, ConversationStore,
+    DeltaFragment, ProviderKind, ProviderState,
 };
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
@@ -545,6 +545,48 @@ impl DriverEventSink {
         mut payload: Value,
     ) -> Result<ConversationEvent, AppError> {
         let event_type = event_type.into();
+        self.decorate(&event_type, &mut payload);
+        self.store
+            .append_and_publish(&self.conversation_id, event_type, payload, &self.hub)
+            .await
+    }
+
+    /// Streaming text fragment (`message.delta` / `thought.delta`). Adjacent
+    /// fragments whose payloads differ only in the `text_pointers` fields (and
+    /// in `extra`, for provider identity that is not part of the payload) are
+    /// journalled as one event carrying the concatenated text; see
+    /// [`ConversationStore::append_delta_and_publish`]. Payloads without string
+    /// text at every pointer are emitted unmerged.
+    pub async fn emit_delta(
+        &self,
+        event_type: &str,
+        mut payload: Value,
+        text_pointers: &'static [&'static str],
+        extra: Option<&str>,
+    ) -> Result<(), AppError> {
+        self.decorate(event_type, &mut payload);
+        match DeltaFragment::from_payload(&payload, text_pointers, extra) {
+            Some(fragment) => {
+                self.store
+                    .append_delta_and_publish(
+                        &self.conversation_id,
+                        event_type,
+                        payload,
+                        fragment,
+                        &self.hub,
+                    )
+                    .await
+            }
+            None => self
+                .store
+                .append_and_publish(&self.conversation_id, event_type, payload, &self.hub)
+                .await
+                .map(|_| ()),
+        }
+    }
+
+    /// Runtime, scope and turn attribution shared by every emitted event.
+    fn decorate(&self, event_type: &str, payload: &mut Value) {
         if let Some(object) = payload.as_object_mut() {
             if let Some(runtime_id) = &self.runtime_id {
                 object.insert("runtimeId".to_owned(), json!(runtime_id));
@@ -569,9 +611,6 @@ impl DriverEventSink {
             }
             object.insert("turnId".to_owned(), Value::String(turn_id.clone()));
         }
-        self.store
-            .append_and_publish(&self.conversation_id, event_type, payload, &self.hub)
-            .await
     }
 
     pub async fn save_provider_state(&self, state: ProviderState) -> Result<(), AppError> {
