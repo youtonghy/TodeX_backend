@@ -34,6 +34,8 @@ const JOURNAL_COMPACT_TARGET_BYTES: u64 = MAX_EVENTS_JOURNAL_BYTES * 3 / 4;
 const JOURNAL_COMPACT_PROTECTED_BYTES: u64 = MAX_EVENTS_JOURNAL_BYTES / 4;
 const JOURNAL_COMPACT_STRING_MAX: usize = 4 * 1024;
 const JOURNAL_COMPACT_STRING_KEEP: usize = 1024;
+/// Read buffer for the cold-index newline scan.
+const JOURNAL_SCAN_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub struct ConversationStore {
@@ -58,6 +60,11 @@ struct JournalIndex {
     bytes: u64,
     modified: Option<std::time::SystemTime>,
     offsets: Vec<(u64, u64)>,
+    /// `false` when built by the cold newline scan, which parsed only the
+    /// first and last records. Pages still validate every record they return;
+    /// one that fails triggers the full validating scan (see
+    /// [`ConversationStore::read_indexed_page`]).
+    fully_validated: bool,
 }
 
 #[derive(Clone)]
@@ -558,13 +565,13 @@ impl ConversationStore {
         self.flush_pending_delta_logged(conversation_id).await;
         let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
         let event_path = self.replay_journal(conversation_id).await?;
-        let total = self.journal_len(conversation_id);
-        let from = usize::try_from(after_sequence)
-            .unwrap_or(usize::MAX)
-            .min(total);
-        let to = from.saturating_add(limit).min(total);
-        let events = self
-            .read_replay_window(conversation_id, &event_path, from, to)
+        let (_, to, total, events) = self
+            .read_indexed_page(conversation_id, &event_path, |total| {
+                let from = usize::try_from(after_sequence)
+                    .unwrap_or(usize::MAX)
+                    .min(total);
+                (from, from.saturating_add(limit).min(total))
+            })
             .await?;
         let next_sequence = events.last().map_or(after_sequence, |event| event.sequence);
         Ok(ConversationReplay {
@@ -591,13 +598,13 @@ impl ConversationStore {
         self.flush_pending_delta_logged(conversation_id).await;
         let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
         let event_path = self.replay_journal(conversation_id).await?;
-        let total = self.journal_len(conversation_id);
-        let to = usize::try_from(before_sequence)
-            .unwrap_or(usize::MAX)
-            .min(total);
-        let from = to.saturating_sub(limit);
-        let events = self
-            .read_replay_window(conversation_id, &event_path, from, to)
+        let (from, _, _, events) = self
+            .read_indexed_page(conversation_id, &event_path, |total| {
+                let to = usize::try_from(before_sequence)
+                    .unwrap_or(usize::MAX)
+                    .min(total);
+                (to.saturating_sub(limit), to)
+            })
             .await?;
         let next_sequence = events
             .last()
@@ -626,11 +633,94 @@ impl ConversationStore {
         let valid_index = self.indexes.get(conversation_id).is_some_and(|index| {
             index.bytes == metadata.len() && index.modified == metadata.modified().ok()
         });
-        if !valid_index {
+        if !valid_index
+            && !self
+                .index_journal_fast(conversation_id, &event_path)
+                .await?
+        {
             // Validate and repair once; the byte index is only a rebuildable cache.
             self.read_and_recover_events(conversation_id).await?;
         }
         Ok(event_path)
+    }
+
+    /// Cold index build without deserializing every record: a newline scan
+    /// plus validation of the first and last records. Returns `false` when
+    /// the journal is not in the clean shape appends leave behind (see
+    /// [`scan_journal_offsets`]) so the caller runs the full validating scan
+    /// with its tail repair.
+    async fn index_journal_fast(
+        &self,
+        conversation_id: &str,
+        event_path: &Path,
+    ) -> Result<bool, AppError> {
+        let path = event_path.to_path_buf();
+        let id = conversation_id.to_owned();
+        let scanned = tokio::task::spawn_blocking(move || scan_journal_offsets(&path, &id))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
+        let Some(scanned) = scanned else {
+            tracing::debug!(
+                conversation_id,
+                "journal needs a full scan to build its replay index"
+            );
+            return Ok(false);
+        };
+        self.indexes.insert(
+            conversation_id.to_owned(),
+            JournalIndex {
+                bytes: scanned.bytes,
+                modified: scanned.modified,
+                offsets: scanned.offsets,
+                fully_validated: false,
+            },
+        );
+        self.tails.insert(
+            conversation_id.to_owned(),
+            JournalTail {
+                bytes: scanned.bytes,
+                modified: scanned.modified,
+                event: scanned.last,
+            },
+        );
+        Ok(true)
+    }
+
+    /// Read the page `window(total)` selects from the current index. When a
+    /// fast-built index meets a record that does not parse or validate, the
+    /// full scan runs so corruption is reported (or a tail repaired) exactly
+    /// as an eagerly validated index would, then the page is read again.
+    /// Returns `(from, to, total, events)`.
+    async fn read_indexed_page(
+        &self,
+        conversation_id: &str,
+        event_path: &Path,
+        window: impl Fn(usize) -> (usize, usize),
+    ) -> Result<(usize, usize, usize, Vec<ConversationEvent>), AppError> {
+        let total = self.journal_len(conversation_id);
+        let (from, to) = window(total);
+        let error = match self
+            .read_replay_window(conversation_id, event_path, from, to)
+            .await
+        {
+            Ok(events) => return Ok((from, to, total, events)),
+            Err(error) => error,
+        };
+        let fully_validated = self
+            .indexes
+            .get(conversation_id)
+            .is_none_or(|index| index.fully_validated);
+        if fully_validated {
+            return Err(error);
+        }
+        tracing::warn!(conversation_id, error = %error, "unreadable record behind the fast journal index; running full validation");
+        self.read_and_recover_events(conversation_id).await?;
+        let total = self.journal_len(conversation_id);
+        let (from, to) = window(total);
+        let events = self
+            .read_replay_window(conversation_id, event_path, from, to)
+            .await?;
+        Ok((from, to, total, events))
     }
 
     fn journal_len(&self, conversation_id: &str) -> usize {
@@ -810,6 +900,7 @@ impl ConversationStore {
                 bytes: metadata.len(),
                 modified: metadata.modified().ok(),
                 offsets,
+                fully_validated: true,
             },
         );
         if let Some(event) = events.last() {
@@ -993,6 +1084,7 @@ impl ConversationStore {
                 bytes: metadata.len(),
                 modified: metadata.modified().ok(),
                 offsets,
+                fully_validated: true,
             },
         );
         if let Some(event) = events.last() {
@@ -1191,6 +1283,85 @@ async fn quarantine_tail(path: &Path, tail: &[u8]) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Offset index produced by [`scan_journal_offsets`].
+struct ScannedJournal {
+    bytes: u64,
+    modified: Option<std::time::SystemTime>,
+    offsets: Vec<(u64, u64)>,
+    last: ConversationEvent,
+}
+
+/// Blocking newline scan for a cold replay index; memory stays bounded by the
+/// read buffer plus the first and last records. Sequence `N` must be line `N`,
+/// so only the first and last records are parsed. Returns `None` whenever the
+/// journal differs from what appends produce — empty, over the size limit,
+/// lacking the final newline of an interrupted write, or with a first/last
+/// record that fails to parse or validate (including a last sequence that
+/// differs from the line count). Callers then run the full validating scan,
+/// which owns tail repair and corruption reporting.
+fn scan_journal_offsets(
+    path: &Path,
+    conversation_id: &str,
+) -> Result<Option<ScannedJournal>, AppError> {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let bytes = metadata.len();
+    if bytes == 0 || bytes > MAX_EVENTS_JOURNAL_BYTES {
+        return Ok(None);
+    }
+    let mut final_byte = [0u8; 1];
+    file.seek(SeekFrom::End(-1))?;
+    file.read_exact(&mut final_byte)?;
+    if final_byte[0] != b'\n' {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = std::io::BufReader::with_capacity(JOURNAL_SCAN_BUFFER_BYTES, file);
+    let mut offsets = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let read = reader.skip_until(b'\n')? as u64;
+        if read == 0 {
+            break;
+        }
+        // `end` excludes the newline, matching `line_ranges`.
+        offsets.push((cursor, cursor + read - 1));
+        cursor += read;
+    }
+    if cursor != bytes {
+        return Ok(None);
+    }
+    let mut file = reader.into_inner();
+    let mut read_record =
+        |(start, end): (u64, u64)| -> Result<Option<ConversationEvent>, AppError> {
+            let mut line = vec![0u8; (end - start) as usize];
+            file.seek(SeekFrom::Start(start))?;
+            file.read_exact(&mut line)?;
+            Ok(serde_json::from_slice(&line).ok())
+        };
+    let count = offsets.len() as u64;
+    if count > 1 {
+        let first_valid = read_record(offsets[0])?
+            .is_some_and(|event| validate_event(&event, conversation_id, 1).is_ok());
+        if !first_valid {
+            return Ok(None);
+        }
+    }
+    let Some(last) = read_record(offsets[offsets.len() - 1])?
+        .filter(|event| validate_event(event, conversation_id, count).is_ok())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ScannedJournal {
+        bytes,
+        modified: metadata.modified().ok(),
+        offsets,
+        last,
+    }))
+}
+
 fn line_ranges(raw: &[u8]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -1351,6 +1522,77 @@ mod tests {
             reader.await.unwrap();
             append_ms.sort_by(f64::total_cmp);
             eprintln!("replay_measurement events={count} page=200 baseline_full_scan_ms={:.2} indexed_cold_ms={:.2} indexed_warm_ms={:.2} baseline_first_page_ms={:.2} indexed_first_page_ms={:.2} concurrent_append_samples=20 append_p50_ms={:.2} append_p95_ms={:.2} append_max_ms={:.2} index_offset_capacity_bytes={offset_capacity_bytes}", baseline.as_secs_f64()*1000., cold.as_secs_f64()*1000., warm.as_secs_f64()*1000., baseline_first_page.as_secs_f64()*1000., cold_first_page.as_secs_f64()*1000., append_ms[9], append_ms[18], append_ms[19]);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Cold first read after a daemon restart: a fresh store has no offset
+    /// index, so the first tail page pays for building it. Run with
+    /// `cargo test --release --locked -- --ignored measure_cold_first_page --nocapture`.
+    #[tokio::test]
+    #[ignore = "opt-in 10k/100k cold first-page latency measurement"]
+    async fn measure_cold_first_page_10k_and_100k() {
+        for count in [10_000u64, 100_000] {
+            let root = temp_dir("todex-cold-first-page");
+            let store = ConversationStore::new(root.clone()).await.unwrap();
+            let manifest = ConversationManifest::new(ProviderKind::Codex, root.clone(), None, None);
+            let history = (1..=count)
+                .map(|sequence| {
+                    ConversationEvent::new(
+                        &manifest.id,
+                        sequence,
+                        "message.delta",
+                        json!({ "turnId": "t", "content": "representative delta ".repeat(12) }),
+                    )
+                })
+                .collect();
+            store
+                .create_with_history(manifest.clone(), history, None, None)
+                .await
+                .unwrap();
+            let journal_bytes = fs::metadata(
+                root.join("conversations")
+                    .join(&manifest.id)
+                    .join(EVENTS_FILE),
+            )
+            .unwrap()
+            .len();
+            let mut tail_ms = Vec::new();
+            let mut head_ms = Vec::new();
+            for _ in 0..5 {
+                // A new store instance has no cached index, like a restarted daemon.
+                let cold = ConversationStore::new(root.clone()).await.unwrap();
+                let start = std::time::Instant::now();
+                let page = cold
+                    .replay_before(&manifest.id, u64::MAX, 50)
+                    .await
+                    .unwrap();
+                tail_ms.push(start.elapsed().as_secs_f64() * 1000.);
+                assert_eq!(page.events.last().unwrap().sequence, count);
+                let cold = ConversationStore::new(root.clone()).await.unwrap();
+                let start = std::time::Instant::now();
+                let page = cold.replay(&manifest.id, 0, 200).await.unwrap();
+                head_ms.push(start.elapsed().as_secs_f64() * 1000.);
+                assert_eq!(page.events.len(), 200);
+            }
+            tail_ms.sort_by(f64::total_cmp);
+            head_ms.sort_by(f64::total_cmp);
+            // Daemon startup runs full recovery per conversation before
+            // readiness, which leaves a validated index behind.
+            let recovered = ConversationStore::new(root.clone()).await.unwrap();
+            let start = std::time::Instant::now();
+            recovered.recover_with_history(&manifest.id).await.unwrap();
+            let recovery_ms = start.elapsed().as_secs_f64() * 1000.;
+            let start = std::time::Instant::now();
+            recovered
+                .replay_before(&manifest.id, u64::MAX, 50)
+                .await
+                .unwrap();
+            let after_recovery_tail_ms = start.elapsed().as_secs_f64() * 1000.;
+            eprintln!(
+                "cold_first_page events={count} journal_bytes={journal_bytes} runs=5 tail_page50_median_ms={:.2} tail_page50_min_ms={:.2} head_page200_median_ms={:.2} head_page200_min_ms={:.2} startup_recovery_ms={recovery_ms:.2} tail_page50_after_recovery_ms={after_recovery_tail_ms:.2}",
+                tail_ms[2], tail_ms[0], head_ms[2], head_ms[0]
+            );
             fs::remove_dir_all(root).unwrap();
         }
     }
@@ -1686,6 +1928,158 @@ mod tests {
         let empty = store.replay_before(&conversation.id, 0, 5).await.unwrap();
         assert!(empty.events.is_empty());
         assert!(!empty.has_more);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Seeds `count` events; the returned store has no replay index yet.
+    async fn seed_journal(prefix: &str, count: u64) -> (PathBuf, String, PathBuf) {
+        let root = temp_dir(prefix);
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = ConversationManifest::new(ProviderKind::Codex, root.clone(), None, None);
+        let events = (1..=count)
+            .map(|sequence| {
+                ConversationEvent::new(
+                    &conversation.id,
+                    sequence,
+                    "message.created",
+                    json!({ "role": "user", "content": format!("message-{sequence}") }),
+                )
+            })
+            .collect();
+        store
+            .create_with_history(conversation.clone(), events, None, None)
+            .await
+            .unwrap();
+        let path = root
+            .join("conversations")
+            .join(&conversation.id)
+            .join(EVENTS_FILE);
+        (root, conversation.id, path)
+    }
+
+    fn sequences(replay: &ConversationReplay) -> Vec<u64> {
+        replay.events.iter().map(|event| event.sequence).collect()
+    }
+
+    #[tokio::test]
+    async fn cold_index_on_a_clean_journal_skips_full_validation() {
+        let (root, id, _) = seed_journal("todex-cold-index-fast", 120).await;
+        // A fresh store, like a restarted daemon, starts without an index.
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+
+        let tail = store.replay_before(&id, u64::MAX, 20).await.unwrap();
+        assert_eq!(sequences(&tail), (101..=120).collect::<Vec<_>>());
+        assert!(tail.has_more);
+        {
+            let index = store.indexes.get(&id).unwrap();
+            assert!(
+                !index.fully_validated,
+                "clean journal must use the fast scan"
+            );
+            assert_eq!(index.offsets.len(), 120);
+        }
+        assert_eq!(store.tails.get(&id).unwrap().event.sequence, 120);
+
+        let before = store.replay_before(&id, 50, 20).await.unwrap();
+        assert_eq!(sequences(&before), (31..=50).collect::<Vec<_>>());
+        assert!(before.has_more);
+        let head = store.replay(&id, 0, 10).await.unwrap();
+        assert_eq!(sequences(&head), (1..=10).collect::<Vec<_>>());
+        assert!(head.has_more);
+        assert_eq!(head.events[4].payload["content"], "message-5");
+
+        // Appends extend the fast index in place instead of rebuilding it.
+        let appended = store
+            .append(&id, "turn.completed", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(appended.sequence, 121);
+        {
+            let index = store.indexes.get(&id).unwrap();
+            assert!(!index.fully_validated);
+            assert_eq!(index.offsets.len(), 121);
+        }
+        let newest = store.replay_before(&id, u64::MAX, 2).await.unwrap();
+        assert_eq!(sequences(&newest), vec![120, 121]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_index_falls_back_to_full_recovery_for_a_torn_tail() {
+        let (root, id, path) = seed_journal("todex-cold-index-torn", 30).await;
+        let clean = fs::read(&path).unwrap();
+        let mut torn = clean.clone();
+        torn.extend_from_slice(b"{\"schemaVersion\":2,\"sequence\":31");
+        fs::write(&path, &torn).unwrap();
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+
+        let tail = store.replay_before(&id, u64::MAX, 10).await.unwrap();
+        assert_eq!(sequences(&tail), (21..=30).collect::<Vec<_>>());
+        assert!(store.indexes.get(&id).unwrap().fully_validated);
+        // The torn record is quarantined and the journal cut back to its last
+        // complete record, as the full scan always did.
+        assert_eq!(fs::read(&path).unwrap(), clean);
+        let quarantined = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("events.corrupt.")
+            });
+        assert!(quarantined);
+        let appended = store
+            .append(&id, "turn.completed", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(appended.sequence, 31);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_index_falls_back_when_sequence_disagrees_with_line_count() {
+        let (root, id, path) = seed_journal("todex-cold-index-mismatch", 10).await;
+        let mut raw = fs::read_to_string(&path).unwrap();
+        let last_line = raw.lines().last().unwrap().to_owned();
+        raw.push_str(&last_line);
+        raw.push('\n');
+        fs::write(&path, &raw).unwrap();
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+
+        let result = store.replay_before(&id, u64::MAX, 5).await;
+        assert!(
+            matches!(&result, Err(AppError::InvalidRequest(message)) if message.contains("continuity check failed at sequence 11")),
+            "unexpected result: {:?}",
+            result.map(|replay| sequences(&replay))
+        );
+        assert!(store.indexes.get(&id).is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fast_index_reports_interior_corruption_through_the_full_scan() {
+        let (root, id, path) = seed_journal("todex-cold-index-interior", 10).await;
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut lines = raw.lines().map(str::to_owned).collect::<Vec<_>>();
+        lines[2] = "{".to_owned();
+        let corrupt = format!("{}\n", lines.join("\n"));
+        fs::write(&path, &corrupt).unwrap();
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+
+        // First and last records are intact, so the cold scan accepts the
+        // journal; pages that avoid the damaged record stay readable.
+        let tail = store.replay_before(&id, u64::MAX, 5).await.unwrap();
+        assert_eq!(sequences(&tail), (6..=10).collect::<Vec<_>>());
+        // The page that reaches it reports the full scan's error.
+        let result = store.replay(&id, 0, 10).await;
+        assert!(
+            matches!(&result, Err(AppError::InvalidRequest(message)) if message.contains("corrupt at sequence 3")),
+            "unexpected result: {:?}",
+            result.map(|replay| sequences(&replay))
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
         fs::remove_dir_all(root).unwrap();
     }
 

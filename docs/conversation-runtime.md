@@ -60,6 +60,13 @@ index is rebuildable. A local debug fixture with 200 events per page measured
 1,000 events at 66.09 ms for repeated full parsing versus 22.12 ms cold / 8.49 ms
 warm indexing; 10,000 events measured 6084.97 ms versus 199.97 / 78.05 ms. These
 are local measurements, not production latency guarantees.
+A cold index (for example after fork or migration) is built by a newline scan
+that parses only the first and last records; a journal without its final
+newline, or whose last sequence differs from its line count, gets the full
+validating scan with tail repair. Every page still validates its records, and a
+page that reaches a damaged record runs the full scan and returns its error. A
+local release fixture measured the cold 50-event tail page at 7.8 → 0.5 ms for
+10,000 events and 77 → 5 ms for 100,000 events (53 MB).
 
 Before reporting daemon readiness, startup validates each conversation journal
 once and reuses that recovered history to cancel stale approvals and mark
