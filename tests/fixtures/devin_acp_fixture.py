@@ -3,15 +3,21 @@
 
 Mirrors Devin 3000.11: `thought_level` is advertised only for the currently
 selected model. No credentials or network. Every request is journaled to
-`journal.jsonl` next to this script; a `stall` file there makes
-`stall-model` never answer, to exercise the sweep deadline.
+`journal.jsonl` next to this script. Marker files there shape timing: `stall`
+makes `stall-model` never answer (sweep deadline); `slow-open` delays the
+first extra `session/new` answer (late session cleanup).
+
+Tests run it as `python acp` from the workspace, matching the driver's
+`<binary> acp` spawn on every platform without a shebang or wrapper.
 """
 import json
 import os
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STALL = os.path.exists(os.path.join(HERE, "stall"))
+SLOW_OPEN = os.path.exists(os.path.join(HERE, "slow-open"))
 MODELS = [f"model-{index}" for index in range(12)] + (["stall-model"] if STALL else [])
 sessions = {}
 
@@ -58,6 +64,8 @@ for line in sys.stdin:
         write({"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": 1, "authMethods": []}})
     elif method == "session/new":
         session_id = f"session-{len(sessions)}"
+        if SLOW_OPEN and len(sessions) == 1:
+            time.sleep(1)
         sessions[session_id] = MODELS[0]
         write({"jsonrpc": "2.0", "id": request_id,
                "result": {"sessionId": session_id, "configOptions": options(MODELS[0])}})
