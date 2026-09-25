@@ -52,6 +52,9 @@ pub struct WorkspaceRecord {
     /// User-picked sidebar icon tint as '#rrggbb'; opaque to the backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_color: Option<String>,
+    /// User-picked sidebar status ring style key; opaque to the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_style: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -364,6 +367,7 @@ mod tests {
                     local_adapter_state: Some("idle".to_owned()),
                     icon: Some("rocket".to_owned()),
                     icon_color: Some("#3b82f6".to_owned()),
+                    ring_style: Some("beads".to_owned()),
                     created_at: 10,
                     updated_at: 20,
                     sort_order: Some(3),
@@ -394,6 +398,7 @@ mod tests {
         assert_eq!(reloaded.workspaces[0].sort_order, Some(3));
         assert_eq!(reloaded.workspaces[0].icon.as_deref(), Some("rocket"));
         assert_eq!(reloaded.workspaces[0].icon_color.as_deref(), Some("#3b82f6"));
+        assert_eq!(reloaded.workspaces[0].ring_style.as_deref(), Some("beads"));
         assert!(reloaded.updated_at > 0);
 
         let _ = fs::remove_dir_all(root);
@@ -425,6 +430,7 @@ mod tests {
             local_adapter_state: None,
             icon: None,
             icon_color: None,
+            ring_style: None,
             created_at: 10,
             updated_at: 20,
             sort_order: None,
@@ -571,6 +577,7 @@ mod tests {
             local_adapter_state: None,
             icon: None,
             icon_color: None,
+            ring_style: None,
             created_at: 10,
             updated_at: 20,
             sort_order: None,

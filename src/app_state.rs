@@ -296,6 +296,7 @@ mod tests {
             local_adapter_state: None,
             icon: None,
             icon_color: None,
+            ring_style: None,
             created_at: 1,
             updated_at: 1,
             sort_order: None,
