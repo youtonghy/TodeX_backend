@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use tokio::sync::watch;
+use std::time::Duration;
+use tokio::sync::{watch, Mutex};
 
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
@@ -12,12 +13,17 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PermissionDecision, PermissionOutcome, ProviderCapabilities, ProviderDescriptor,
-    ProviderDriver,
+    PermissionDecision, PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor,
+    ProviderDescriptor, ProviderDriver, ProviderSessionCommands,
 };
 
 pub struct ClaudeDriver {
     binary: String,
+    /// Slash-command catalogs captured from each session's `initialize`
+    /// control response, keyed by conversation id. Claude has no resident
+    /// runtime, so this is the only place the live catalog survives between
+    /// the per-turn process exits.
+    catalogs: Mutex<HashMap<String, ProviderSessionCommands>>,
 }
 
 fn claude_model_aliases() -> Vec<super::types::ProviderModelDescriptor> {
@@ -43,6 +49,7 @@ impl ClaudeDriver {
     pub fn new(config: &AgentConfig) -> Self {
         Self {
             binary: config.claude_bin.clone(),
+            catalogs: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -148,6 +155,51 @@ impl ProviderDriver for ClaudeDriver {
         } else {
             models
         })
+    }
+
+    // Claude startup can wait on MCP servers before answering initialize, so
+    // the default 8s catalog budget is too tight for a cold probe.
+    fn discovery_timeout(&self) -> Duration {
+        Duration::from_secs(20)
+    }
+
+    async fn session_commands(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ProviderSessionCommands>, AppError> {
+        Ok(self.catalogs.lock().await.get(conversation_id).cloned())
+    }
+
+    async fn discover_commands(
+        &self,
+        workspace: &Path,
+    ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
+        // The initialize control response carries the slash-command catalog,
+        // so a session-less probe gets builtins, workspace commands, plugin
+        // commands and skills without ever reaching a model call.
+        let mut spec = CommandSpec::new(&self.binary, workspace);
+        spec.args = vec![
+            "-p".to_owned(),
+            "--input-format".to_owned(),
+            "stream-json".to_owned(),
+            "--output-format".to_owned(),
+            "stream-json".to_owned(),
+            "--verbose".to_owned(),
+            "--no-session-persistence".to_owned(),
+            "--permission-prompts".to_owned(),
+            "host".to_owned(),
+            "--permission-prompt-tool".to_owned(),
+            "stdio".to_owned(),
+            "--permission-mode".to_owned(),
+            "default".to_owned(),
+        ];
+        let mut process = JsonLineProcess::spawn(&spec).await?;
+        // The sender must outlive initialize: `cancel.changed()` resolves as
+        // soon as every sender drops and would masquerade as a cancellation.
+        let (_cancel, mut receiver) = watch::channel(false);
+        let commands = initialize_claude(&mut process, &mut receiver).await;
+        process.terminate().await;
+        commands
     }
 
     fn supports_native_fork(&self) -> bool {
@@ -256,6 +308,7 @@ impl ProviderDriver for ClaudeDriver {
             prompt,
             requested_session_id,
             &sink,
+            &self.catalogs,
             &mut cancel,
         )
         .await;
@@ -414,9 +467,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        claude_model_aliases, claude_question_details, claude_question_response,
-        claude_user_content, handle_stream_event, BackgroundTasks, ClaudeSubagents,
-        ClaudeToolCalls,
+        claude_command_catalog, claude_model_aliases, claude_question_details,
+        claude_question_response, claude_user_content, handle_stream_event, BackgroundTasks,
+        ClaudeSubagents, ClaudeToolCalls,
     };
     use crate::conversation::{
         ConversationEventHub, ConversationManifest, ConversationStore, ProviderKind,
@@ -940,6 +993,53 @@ mod tests {
             ])
         );
     }
+
+    #[test]
+    fn initialize_response_commands_become_prompt_invocations() {
+        let response = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "todex-initialize",
+                "response": {
+                    "commands": [
+                        {
+                            "name": "compact",
+                            "description": "Free up context by summarizing the conversation so far",
+                            "argumentHint": "<optional custom summarization instructions>",
+                            "builtin": true,
+                        },
+                        {
+                            "name": "docs",
+                            "description": "living docs",
+                            "argumentHint": "",
+                            "aliases": ["anthropic-skills:docs"],
+                        },
+                        { "name": "my-skill", "description": "user skill", "argumentHint": "" },
+                        { "name": "__remote-workflow", "description": "internal", "argumentHint": "" },
+                        { "name": "compact", "description": "duplicate", "argumentHint": "" },
+                    ],
+                },
+            },
+        });
+
+        let commands = claude_command_catalog(&response);
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].name, "compact");
+        assert_eq!(commands[0].source, "builtin");
+        assert_eq!(commands[0].invocation, "prompt");
+        assert_eq!(
+            commands[0].argument_hint.as_deref(),
+            Some("<optional custom summarization instructions>")
+        );
+        assert_eq!(commands[1].name, "docs");
+        assert_eq!(commands[1].source, "plugin");
+        assert_eq!(commands[1].argument_hint, None);
+        assert_eq!(commands[2].name, "my-skill");
+        assert_eq!(commands[2].source, "user");
+
+        assert!(claude_command_catalog(&json!({"response": {"response": {}}})).is_empty());
+    }
 }
 
 // Protocol reference: anthropics/claude-agent-sdk-python, _internal/query.py.
@@ -948,7 +1048,7 @@ mod tests {
 async fn initialize_claude(
     process: &mut JsonLineProcess,
     cancel: &mut watch::Receiver<bool>,
-) -> Result<(), AppError> {
+) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
     process
         .send(&json!({
             "type": "control_request",
@@ -985,7 +1085,7 @@ async fn initialize_claude(
                 return if message.pointer("/response/subtype").and_then(Value::as_str)
                     == Some("success")
                 {
-                    Ok(())
+                    Ok(claude_command_catalog(&message))
                 } else {
                     Err(AppError::ProviderUnavailable(format!(
                         "Claude Code initialization rejected: {}",
@@ -1006,15 +1106,89 @@ async fn initialize_claude(
     }
 }
 
+/// The initialize response carries the session's slash-command catalog —
+/// builtins, workspace commands, plugin commands and invocable skills — each
+/// invoked by sending `/name` as an ordinary user message. `builtin: true`
+/// marks CLI-native commands and an alias containing `:` identifies the plugin
+/// form (`plugin:command`), so user-authored entries are what remain.
+fn claude_command_catalog(initialize_response: &Value) -> Vec<ProviderCommandDescriptor> {
+    let Some(items) = initialize_response
+        .pointer("/response/response/commands")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)?
+                .trim()
+                .trim_start_matches('/');
+            // `__`-prefixed entries are internal harness plumbing, not commands.
+            if name.is_empty() || name.starts_with("__") || !seen.insert(name.to_owned()) {
+                return None;
+            }
+            let builtin = item
+                .get("builtin")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let plugin = item
+                .get("aliases")
+                .and_then(Value::as_array)
+                .is_some_and(|aliases| {
+                    aliases
+                        .iter()
+                        .any(|alias| alias.as_str().is_some_and(|alias| alias.contains(':')))
+                });
+            Some(ProviderCommandDescriptor {
+                name: name.to_owned(),
+                description: item
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                source: if builtin {
+                    "builtin"
+                } else if plugin {
+                    "plugin"
+                } else {
+                    "user"
+                }
+                .to_owned(),
+                source_info: None,
+                invocation: "prompt".to_owned(),
+                argument_hint: item
+                    .get("argumentHint")
+                    .and_then(Value::as_str)
+                    .map(|hint| hint.trim().to_owned())
+                    .filter(|hint| !hint.is_empty()),
+                package_name: None,
+                package_version: None,
+            })
+        })
+        .collect()
+}
+
 async fn run_claude_turn(
     process: &mut JsonLineProcess,
     context: DriverContext,
     prompt: DriverPrompt,
     requested_session_id: String,
     sink: &DriverEventSink,
+    catalogs: &Mutex<HashMap<String, ProviderSessionCommands>>,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<DriverTurnResult, AppError> {
-    initialize_claude(process, cancel).await?;
+    let commands = initialize_claude(process, cancel).await?;
+    catalogs.lock().await.insert(
+        context.manifest.id.clone(),
+        ProviderSessionCommands {
+            commands,
+            runtime_id: requested_session_id.clone(),
+        },
+    );
     // The transcript exists once initialize succeeds; persist its id right
     // away so a failed or cancelled turn still resumes instead of hitting
     // "Session ID is already in use" on the next launch.
@@ -1203,6 +1377,27 @@ async fn run_claude_turn(
                     sink.emit(event, payload).await?;
                 }
                 if message.get("subtype").and_then(Value::as_str) == Some("init") {
+                    // `terminal_slash_commands` names the catalog entries bound
+                    // to the local terminal (e.g. a prompt-bar color picker);
+                    // remote clients are expected to hide them.
+                    if let Some(terminal_commands) = message
+                        .get("terminal_slash_commands")
+                        .and_then(Value::as_array)
+                    {
+                        let terminal_commands: HashSet<&str> = terminal_commands
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect();
+                        if !terminal_commands.is_empty() {
+                            if let Some(catalog) =
+                                catalogs.lock().await.get_mut(&context.manifest.id)
+                            {
+                                catalog.commands.retain(|command| {
+                                    !terminal_commands.contains(command.name.as_str())
+                                });
+                            }
+                        }
+                    }
                     if let Some(actual) = message.get("permissionMode").and_then(Value::as_str) {
                         if expected_mode.as_deref() != Some(actual) {
                             return Err(AppError::ProviderUnavailable(format!(
