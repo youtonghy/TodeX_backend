@@ -68,6 +68,12 @@ pub(crate) fn claude_live_env(key: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// The config directory a spawned `claude` resolves sessions under:
+/// `$CLAUDE_CONFIG_DIR` (forwarded to the child) or `~/.claude`.
+pub(crate) fn claude_config_dir() -> PathBuf {
+    AgentDirs::detect().claude_dir
+}
+
 pub fn supported_agent(value: &str) -> Result<ProviderKind, AppError> {
     let kind = ProviderKind::from_str(value).map_err(AppError::InvalidRequest)?;
     if SUPPORTED_AGENTS.contains(&kind) {

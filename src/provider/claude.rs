@@ -192,7 +192,13 @@ impl ProviderDriver for ClaudeDriver {
                 .provider_mode
                 .expect("Claude permission mode validated"),
         ];
-        if context.provider_state.native_session_id.is_some() {
+        if context.provider_state.native_session_id.is_some()
+            || claude_session_exists(&context.manifest.workspace, &requested_session_id).await
+        {
+            // A turn that dies after Claude creates its transcript but before
+            // the id reaches provider state (rate limit, crash, cancel) leaves
+            // no recorded session: `--session-id` would then deadlock on
+            // "Session ID is already in use", so resume the file instead.
             spec.args.push("--resume".to_owned());
         } else {
             spec.args.push("--session-id".to_owned());
@@ -220,6 +226,75 @@ impl ProviderDriver for ClaudeDriver {
         process.terminate().await;
         result
     }
+}
+
+/// Whether Claude already has a transcript for `session_id` in `workspace`.
+/// Claude stores sessions at `<config>/projects/<dir>/<id>.jsonl` and rejects
+/// `--session-id` for an id whose file exists, so a transcript on disk means
+/// the next launch must `--resume` instead.
+async fn claude_session_exists(workspace: &Path, session_id: &str) -> bool {
+    claude_session_exists_at(
+        &crate::agent_providers::claude_config_dir(),
+        workspace,
+        session_id,
+    )
+    .await
+}
+
+async fn claude_session_exists_at(config_dir: &Path, workspace: &Path, session_id: &str) -> bool {
+    let workspace = tokio::fs::canonicalize(workspace)
+        .await
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let file = config_dir
+        .join("projects")
+        .join(claude_project_dir_name(&workspace))
+        .join(format!("{session_id}.jsonl"));
+    tokio::fs::try_exists(file).await.unwrap_or(false)
+}
+
+/// The per-project directory name Claude Code derives from its cwd:
+/// `cwd.replace(/[^a-zA-Z0-9]/g, "-")` over UTF-16 code units, and when that
+/// exceeds 200 characters, `sanitized[..200] + "-" + abs(javaHash(cwd))` in
+/// base36 (`NY`/`Le`/`gT` in the bundled CLI).
+fn claude_project_dir_name(workspace: &Path) -> String {
+    const MAX_PROJECT_DIR_CHARS: usize = 200;
+    let raw = workspace.as_os_str().to_string_lossy();
+    let sanitized: String = raw
+        .encode_utf16()
+        .map(|unit| {
+            match u8::try_from(unit)
+                .ok()
+                .filter(|u| u.is_ascii_alphanumeric())
+            {
+                Some(u) => u as char,
+                None => '-',
+            }
+        })
+        .collect();
+    if sanitized.len() <= MAX_PROJECT_DIR_CHARS {
+        return sanitized;
+    }
+    let hash = raw.encode_utf16().fold(0_i32, |acc, unit| {
+        acc.wrapping_mul(31).wrapping_add(unit as i32)
+    });
+    format!(
+        "{}-{}",
+        &sanitized[..MAX_PROJECT_DIR_CHARS],
+        base36(hash.unsigned_abs() as u64)
+    )
+}
+
+fn base36(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_owned();
+    }
+    let mut out = Vec::new();
+    while value > 0 {
+        out.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+    }
+    out.iter().rev().map(|&b| b as char).collect()
 }
 
 fn claude_user_content(prompt: &DriverPrompt) -> Value {
@@ -255,6 +330,7 @@ fn claude_user_content(prompt: &DriverPrompt) -> Value {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::path::Path;
 
     use super::{
         claude_model_aliases, claude_question_details, claude_question_response,
@@ -447,6 +523,54 @@ mod tests {
             },
         );
         assert_eq!(skipped["behavior"], "deny");
+    }
+
+    #[test]
+    fn project_dir_name_matches_claude_transcript_layout() {
+        assert_eq!(
+            super::claude_project_dir_name(Path::new("/Volumes/BIGDISK/github/Nitrous")),
+            "-Volumes-BIGDISK-github-Nitrous"
+        );
+        // `.`, `_`, `-` are all non-alphanumeric in Claude's mapping.
+        assert_eq!(
+            super::claude_project_dir_name(Path::new("/Users/a.b_c/d-e")),
+            "-Users-a-b-c-d-e"
+        );
+    }
+
+    #[test]
+    fn project_dir_name_truncates_long_paths_with_hash_suffix() {
+        let long = format!("/{}", "a".repeat(300));
+        let name = super::claude_project_dir_name(Path::new(&long));
+        let (prefix, hash) = name.rsplit_once('-').unwrap();
+        assert_eq!(prefix.len(), 200);
+        // Pinned against Claude Code's `NY`/`Le` (Java string hash, base36).
+        assert_eq!(hash, "vtkmfl");
+        assert_eq!(
+            super::claude_project_dir_name(Path::new(&long)),
+            name,
+            "hash suffix must be deterministic"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_exists_detects_transcript_under_project_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-claude-session-lookup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let workspace = root.join("ws");
+        let session = "b88ca64f-3ff5-46a3-989b-ff8188fb2d8d";
+        let transcript = root
+            .join("projects")
+            .join(super::claude_project_dir_name(&workspace))
+            .join(format!("{session}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{}").unwrap();
+
+        assert!(super::claude_session_exists_at(&root, &workspace, session).await);
+        assert!(!super::claude_session_exists_at(&root, &workspace, "missing").await);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -746,6 +870,15 @@ async fn run_claude_turn(
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<DriverTurnResult, AppError> {
     initialize_claude(process, cancel).await?;
+    // The transcript exists once initialize succeeds; persist its id right
+    // away so a failed or cancelled turn still resumes instead of hitting
+    // "Session ID is already in use" on the next launch.
+    if context.provider_state.native_session_id.as_deref() != Some(requested_session_id.as_str()) {
+        let mut provider_state = context.provider_state.clone();
+        provider_state.native_session_id = Some(requested_session_id.clone());
+        provider_state.recoverable = true;
+        sink.save_provider_state(provider_state).await?;
+    }
     let expected_mode = super::types::resolve_execution_config(
         context.manifest.provider,
         prompt.permission_mode.as_deref(),
