@@ -287,7 +287,7 @@ DELETE /v2/workspaces/{workspaceId}
 }
 ```
 
-`PUT` 请求体使用同样的 `workspaces` 数组。后端会校验 `name`、`path`、路径存在性和根目录边界，按当前认证身份和规范化路径合并记录，并返回后端生成的稳定 ID。它不会接受客户端伪造的租户，也不会持久化设备本地的 `threadId` 和 `localAdapterState`。
+`PUT` 请求体使用同样的 `workspaces` 数组。后端会校验 `name`、`path`、路径存在性和根目录边界，按当前认证身份和规范化路径合并记录，并返回后端生成的稳定 ID。它不会接受客户端伪造的租户，也不会持久化设备本地的 `threadId` 和 `localAdapterState`。可选的 `icon`、`iconColor` 是客户端的侧栏展示偏好（图标键名与 `#rrggbb` 颜色），后端只做透传持久化，不校验取值。
 
 校验失败的记录（例如目录已被删除或位于 `workspace_roots` 之外）不再让整个请求报错：它们会被跳过并在响应的 `rejected` 数组中回报，每项包含客户端提交的 `id`、`name`、`path`、错误 `code`（如 `WORKSPACE_PATH_NOT_FOUND`）和 `message`；即使请求中所有记录都被拒绝也按同样方式返回 200。`GET` 和 `PUT` 响应都会重新校验已持久化的记录：目录后来被删除的存量记录同样只出现在 `rejected` 中，不再阻塞同步；客户端可据此把失效工作区灰显并在路径恢复后自动复原。加载已持久化的快照时同样跳过失效路径并记录告警，因此目录被删除后 daemon 仍可正常启动。要彻底移除一条失效工作区记录，需要显式调用 `DELETE /v2/workspaces/{workspaceId}`；该操作允许目录已不存在的记录被删除。
 

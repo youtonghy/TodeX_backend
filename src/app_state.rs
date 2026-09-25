@@ -294,6 +294,8 @@ mod tests {
             approvals_reviewer: Some("user".to_owned()),
             service_tier: None,
             local_adapter_state: None,
+            icon: None,
+            icon_color: None,
             created_at: 1,
             updated_at: 1,
             sort_order: None,

@@ -46,6 +46,12 @@ pub struct WorkspaceRecord {
     pub service_tier: Option<String>,
     #[serde(default)]
     pub local_adapter_state: Option<String>,
+    /// User-picked sidebar icon key; opaque to the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// User-picked sidebar icon tint as '#rrggbb'; opaque to the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_color: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -356,6 +362,8 @@ mod tests {
                     approvals_reviewer: Some("user".to_owned()),
                     service_tier: None,
                     local_adapter_state: Some("idle".to_owned()),
+                    icon: Some("rocket".to_owned()),
+                    icon_color: Some("#3b82f6".to_owned()),
                     created_at: 10,
                     updated_at: 20,
                     sort_order: Some(3),
@@ -384,6 +392,8 @@ mod tests {
                 .to_string()
         );
         assert_eq!(reloaded.workspaces[0].sort_order, Some(3));
+        assert_eq!(reloaded.workspaces[0].icon.as_deref(), Some("rocket"));
+        assert_eq!(reloaded.workspaces[0].icon_color.as_deref(), Some("#3b82f6"));
         assert!(reloaded.updated_at > 0);
 
         let _ = fs::remove_dir_all(root);
@@ -413,6 +423,8 @@ mod tests {
             approvals_reviewer: Some("user".to_owned()),
             service_tier: None,
             local_adapter_state: None,
+            icon: None,
+            icon_color: None,
             created_at: 10,
             updated_at: 20,
             sort_order: None,
@@ -557,6 +569,8 @@ mod tests {
             approvals_reviewer: None,
             service_tier: None,
             local_adapter_state: None,
+            icon: None,
+            icon_color: None,
             created_at: 10,
             updated_at: 20,
             sort_order: None,
