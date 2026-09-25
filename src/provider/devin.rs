@@ -12,8 +12,8 @@ use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{
-    run_acp_turn_controlled, select_auth_method, AcpConnectionState, AcpRuntimeOptions,
-    INTERACTIVE_AUTH_TIMEOUT,
+    declares_session_fork, run_acp_turn_controlled, select_auth_method, AcpConnectionState,
+    AcpRuntimeOptions, FORK_PROBE_TTL, INTERACTIVE_AUTH_TIMEOUT,
 };
 use super::process::{executable_available, redact_sensitive_text, CommandSpec, JsonLineProcess};
 use super::types::{
@@ -55,6 +55,10 @@ pub struct DevinDriver {
     env_allowlist: Vec<String>,
     sessions: Mutex<HashMap<String, DevinSessionHandle>>,
     discovery: Mutex<HashMap<PathBuf, DiscoverySnapshot>>,
+    /// Cached `sessionCapabilities.fork` probe: Devin exposes session forking
+    /// over ACP only once the installed CLI implements `session/fork`, so the
+    /// advertised capability tracks the installed binary.
+    fork_probe: std::sync::Mutex<Option<(bool, Instant)>>,
 }
 
 #[derive(Clone)]
@@ -85,6 +89,7 @@ impl DevinDriver {
             env_allowlist: config.devin_env_allowlist.clone(),
             sessions: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
+            fork_probe: std::sync::Mutex::new(None),
         }
     }
 
@@ -170,6 +175,33 @@ impl DevinDriver {
             .await?;
         }
         Ok(())
+    }
+
+    /// Whether the installed `devin acp` declares `sessionCapabilities.fork`.
+    /// Initialize needs no authentication, so the probe stays headless.
+    async fn probe_fork_capability(&self) -> bool {
+        let run = async {
+            let mut process =
+                JsonLineProcess::spawn(&self.command_spec(&std::env::temp_dir())).await?;
+            let result = async {
+                let initialize = initialize_process(&mut process).await?;
+                Ok::<_, AppError>(declares_session_fork(&initialize))
+            }
+            .await;
+            process.terminate().await;
+            result
+        };
+        match tokio::time::timeout(DIAGNOSTIC_TIMEOUT, run).await {
+            Ok(Ok(capable)) => capable,
+            Ok(Err(error)) => {
+                tracing::debug!(error = %error, "Devin fork capability probe failed");
+                false
+            }
+            Err(_) => {
+                tracing::debug!("Devin fork capability probe timed out");
+                false
+            }
+        }
     }
 
     /// Models and slash commands live behind `session/new`, which requires an
@@ -359,6 +391,93 @@ impl ProviderDriver for DevinDriver {
         }
     }
 
+    async fn refresh_control_capabilities(&self) {
+        let stale = self
+            .fork_probe
+            .lock()
+            .map(|entry| entry.is_none_or(|(_, at)| at.elapsed() >= FORK_PROBE_TTL))
+            .unwrap_or(true);
+        if !stale || !executable_available(&self.binary) {
+            return;
+        }
+        let capable = self.probe_fork_capability().await;
+        if let Ok(mut entry) = self.fork_probe.lock() {
+            *entry = Some((capable, Instant::now()));
+        }
+    }
+
+    fn supports_native_fork(&self) -> bool {
+        self.fork_probe
+            .lock()
+            .map(|entry| entry.is_some_and(|(capable, _)| capable))
+            .unwrap_or(false)
+    }
+
+    async fn fork_session(
+        &self,
+        context: DriverContext,
+        launch_permit: WorkspaceTrustPermit,
+    ) -> Result<crate::conversation::ProviderState, AppError> {
+        let source = context
+            .provider_state
+            .native_session_id
+            .as_deref()
+            .ok_or_else(|| {
+                AppError::Unsupported("conversation has no native Devin session to fork".to_owned())
+            })?
+            .to_owned();
+        let mut process = JsonLineProcess::spawn_trusted(
+            &self.command_spec(&context.manifest.workspace),
+            launch_permit,
+        )
+        .await?;
+        let result = async {
+            let initialize = initialize_process(&mut process).await?;
+            let capable = declares_session_fork(&initialize);
+            if let Ok(mut entry) = self.fork_probe.lock() {
+                *entry = Some((capable, Instant::now()));
+            }
+            if !capable {
+                return Err(AppError::Unsupported(
+                    "Devin does not declare sessionCapabilities.fork".to_owned(),
+                ));
+            }
+            // `session/fork` may require an authenticated agent; only the
+            // headless api-key path runs here — the interactive browser flow
+            // cannot prompt the user mid-fork.
+            if self.api_key()?.is_some() {
+                self.authenticate(&mut process, &initialize).await?;
+            }
+            let response = control_request(
+                &mut process,
+                "fork",
+                "session/fork",
+                json!({ "sessionId": source, "cwd": context.manifest.workspace }),
+                DIAGNOSTIC_TIMEOUT,
+            )
+            .await?;
+            let forked = response
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty() && *id != source)
+                .ok_or_else(|| {
+                    AppError::InvalidRequest(
+                        "invalid Devin fork response: missing distinct sessionId".to_owned(),
+                    )
+                })?;
+            let mut state = crate::conversation::ProviderState::new(ProviderKind::Devin);
+            state.native_session_id = Some(forked.to_owned());
+            state.recoverable = initialize
+                .pointer("/agentCapabilities/loadSession")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Ok(state)
+        }
+        .await;
+        process.terminate().await;
+        result
+    }
+
     fn descriptor(&self) -> ProviderDescriptor {
         let available = executable_available(&self.binary);
         ProviderDescriptor {
@@ -376,7 +495,7 @@ impl ProviderDriver for DevinDriver {
                 permission_config: super::types::permission_config_capabilities(
                     ProviderKind::Devin,
                 ),
-                native_fork: false,
+                native_fork: self.supports_native_fork(),
                 native_compact: false,
                 native_resume: true,
                 cancel: true,
@@ -1121,6 +1240,7 @@ mod tests {
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
+            fork_probe: std::sync::Mutex::new(None),
         };
         assert_eq!(driver.api_key().unwrap(), None);
 
@@ -1134,6 +1254,7 @@ mod tests {
                 env_allowlist: Vec::new(),
                 sessions: Mutex::new(HashMap::new()),
                 discovery: Mutex::new(HashMap::new()),
+                fork_probe: std::sync::Mutex::new(None),
             }
         };
         assert!(driver.api_key().is_err());
@@ -1156,6 +1277,7 @@ mod tests {
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
+            fork_probe: std::sync::Mutex::new(None),
         };
         assert_eq!(
             driver.auth_timeout().unwrap(),
@@ -1189,6 +1311,7 @@ mod tests {
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
+            fork_probe: std::sync::Mutex::new(None),
         };
         let workspace = PathBuf::from("/tmp/todex-devin-discovery-test");
         let snapshot = DiscoverySnapshot {
@@ -1268,6 +1391,7 @@ mod tests {
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
+            fork_probe: std::sync::Mutex::new(None),
         };
         (driver, root)
     }

@@ -3511,7 +3511,7 @@ mod tests {
             let id = provider["id"].as_str().unwrap();
             assert_eq!(
                 actions.iter().any(|value| value == "fork"),
-                matches!(id, "grok-build" | "pi" | "opencode")
+                matches!(id, "claude-code" | "grok-build" | "pi" | "opencode")
             );
             assert_eq!(actions.iter().any(|value| value == "compact"), id == "pi");
         }

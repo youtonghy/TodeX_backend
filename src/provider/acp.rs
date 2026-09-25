@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::{
     v1::{
@@ -14,6 +15,7 @@ use agent_client_protocol::schema::{
     ProtocolVersion,
 };
 use async_trait::async_trait;
+use dashmap::DashMap;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 
@@ -34,9 +36,19 @@ use super::types::{
 /// Interactive authentication methods (for example browser PKCE) need enough
 /// time for the user to approve the flow; key-based checks answer instantly.
 pub(super) const INTERACTIVE_AUTH_TIMEOUT: Duration = Duration::from_secs(300);
+/// Re-probe each ACP profile's `sessionCapabilities.fork` at most this often;
+/// an upgraded agent picks up the capability without a daemon restart.
+pub(super) const FORK_PROBE_TTL: Duration = Duration::from_secs(300);
+/// Capability probes run on `/v2/providers` reads, so a stuck agent must not
+/// stall the endpoint the way a normal control request may.
+const FORK_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct AcpDriver {
     profiles: BTreeMap<String, AcpProfileConfig>,
+    /// Per-profile `sessionCapabilities.fork` probe results: profile name →
+    /// (declared fork support, probed at). Populated by
+    /// `refresh_control_capabilities` and `fork_session`.
+    fork_probe: DashMap<String, (bool, Instant)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -58,6 +70,7 @@ impl AcpDriver {
     pub fn new(config: &AgentConfig) -> Self {
         Self {
             profiles: config.acp_profiles.clone(),
+            fork_probe: DashMap::new(),
         }
     }
 
@@ -109,7 +122,7 @@ impl ProviderDriver for AcpDriver {
             profiles,
             capabilities: ProviderCapabilities {
                 permission_config: super::types::permission_config_capabilities(ProviderKind::Acp),
-                native_fork: false,
+                native_fork: self.supports_native_fork(),
                 native_compact: false,
                 native_resume: true,
                 cancel: true,
@@ -126,20 +139,125 @@ impl ProviderDriver for AcpDriver {
         }
     }
 
+    async fn refresh_control_capabilities(&self) {
+        let now = Instant::now();
+        let mut probes = tokio::task::JoinSet::new();
+        for (name, profile) in &self.profiles {
+            let fresh = self
+                .fork_probe
+                .get(name)
+                .is_some_and(|entry| now.duration_since(entry.1) < FORK_PROBE_TTL);
+            if fresh || !executable_available(&profile.command) {
+                continue;
+            }
+            let name = name.clone();
+            let profile = profile.clone();
+            probes.spawn(async move { (name, probe_fork_capability(&profile).await) });
+        }
+        while let Some(result) = probes.join_next().await {
+            match result {
+                Ok((name, capable)) => {
+                    self.fork_probe.insert(name, (capable, Instant::now()));
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "ACP fork capability probe task failed");
+                }
+            }
+        }
+    }
+
+    fn supports_native_fork(&self) -> bool {
+        self.fork_probe
+            .iter()
+            .any(|entry| entry.value().0 && self.profiles.contains_key(entry.key()))
+    }
+
+    async fn fork_session(
+        &self,
+        context: DriverContext,
+        launch_permit: WorkspaceTrustPermit,
+    ) -> Result<crate::conversation::ProviderState, AppError> {
+        let profile_name = context.manifest.provider_profile.clone().ok_or_else(|| {
+            AppError::InvalidRequest("ACP conversation requires a profile".to_owned())
+        })?;
+        let profile = self.profile(&context)?.clone();
+        let source = context
+            .provider_state
+            .native_session_id
+            .as_deref()
+            .ok_or_else(|| {
+                AppError::Unsupported("conversation has no native ACP session to fork".to_owned())
+            })?
+            .to_owned();
+        let spec = acp_command_spec(&profile, &context.manifest.workspace);
+        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
+        let result = async {
+            let request_id = send_request(&mut process, "initialize", initialize_request()).await?;
+            let initialize = acp_control_response(&mut process, &request_id).await?;
+            let capable = declares_session_fork(&initialize);
+            self.fork_probe
+                .insert(profile_name.clone(), (capable, Instant::now()));
+            if !capable {
+                return Err(AppError::Unsupported(
+                    "ACP agent does not declare sessionCapabilities.fork".to_owned(),
+                ));
+            }
+            // Only headless api-key auth runs on the fork path; interactive
+            // methods cannot prompt the user here. Agents that need no
+            // `authenticate` simply proceed.
+            let options = profile_runtime_options(&profile)?;
+            if options.auth_meta.is_some() {
+                if let Some(method) = select_auth_method(
+                    &initialize,
+                    options.auth_method.as_deref(),
+                    ProviderKind::Acp,
+                )? {
+                    let request_id = send_request(
+                        &mut process,
+                        "authenticate",
+                        json!({ "methodId": method, "_meta": options.auth_meta }),
+                    )
+                    .await?;
+                    acp_control_response(&mut process, &request_id).await?;
+                }
+            }
+            let request_id = send_request(
+                &mut process,
+                "session/fork",
+                json!({ "sessionId": source, "cwd": context.manifest.workspace }),
+            )
+            .await?;
+            let response = acp_control_response(&mut process, &request_id).await?;
+            let forked = response
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty() && *id != source)
+                .ok_or_else(|| {
+                    AppError::InvalidRequest(
+                        "invalid ACP fork response: missing distinct sessionId".to_owned(),
+                    )
+                })?;
+            let mut state = context.provider_state.clone();
+            state.native_session_id = Some(forked.to_owned());
+            state.recoverable = initialize
+                .pointer("/agentCapabilities/loadSession")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            state.last_error = None;
+            Ok(state)
+        }
+        .await;
+        process.terminate().await;
+        result
+    }
+
     async fn discover_image_input(
         &self,
         workspace: &std::path::Path,
         profile: Option<&str>,
     ) -> Result<bool, AppError> {
         let profile = self.named_profile(profile)?;
-        let mut spec = CommandSpec::new(&profile.command, workspace);
-        spec.args = profile.args.clone();
-        spec.env = profile
-            .env
-            .iter()
-            .filter(|(key, _)| !key.starts_with("TODEX_AGENTD_"))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
+        let spec = acp_command_spec(profile, workspace);
         let mut process = JsonLineProcess::spawn(&spec).await?;
         let result = async {
             let request_id = send_request(&mut process, "initialize", initialize_request()).await?;
@@ -182,14 +300,7 @@ impl ProviderDriver for AcpDriver {
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         let profile = self.profile(&context)?;
-        let mut spec = CommandSpec::new(&profile.command, &context.manifest.workspace);
-        spec.args = profile.args.clone();
-        spec.env = profile
-            .env
-            .iter()
-            .filter(|(key, _)| !key.starts_with("TODEX_AGENTD_"))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
+        let spec = acp_command_spec(profile, &context.manifest.workspace);
         let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
         let result = run_acp_turn(
             &mut process,
@@ -231,6 +342,101 @@ fn profile_runtime_options(profile: &AcpProfileConfig) -> Result<AcpRuntimeOptio
         auth_timeout: interactive_auth.then_some(INTERACTIVE_AUTH_TIMEOUT),
         ..Default::default()
     })
+}
+
+/// Shared spawn spec for profile-driven `acp` processes; daemon-only
+/// `TODEX_AGENTD_*` variables never reach the agent.
+fn acp_command_spec(profile: &AcpProfileConfig, workspace: &Path) -> CommandSpec {
+    let mut spec = CommandSpec::new(&profile.command, workspace);
+    spec.args = profile.args.clone();
+    spec.env = profile
+        .env
+        .iter()
+        .filter(|(key, _)| !key.starts_with("TODEX_AGENTD_"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    spec
+}
+
+/// Whether the agent's initialize response declares `sessionCapabilities.fork`
+/// (the `session/fork` method OpenCode extended ACP with).
+pub(super) fn declares_session_fork(initialize: &Value) -> bool {
+    initialize
+        .pointer("/agentCapabilities/sessionCapabilities/fork")
+        .is_some()
+}
+
+/// Probe one profile's fork capability by completing `initialize` in a
+/// throwaway process. Failures map to `false` — the fork control stays hidden
+/// rather than offering an action that cannot succeed.
+async fn probe_fork_capability(profile: &AcpProfileConfig) -> bool {
+    let run = async {
+        let spec = acp_command_spec(profile, &std::env::temp_dir());
+        let mut process = JsonLineProcess::spawn(&spec).await?;
+        let result = async {
+            let request_id = send_request(&mut process, "initialize", initialize_request()).await?;
+            let initialize = acp_control_response(&mut process, &request_id).await?;
+            Ok::<_, AppError>(declares_session_fork(&initialize))
+        }
+        .await;
+        process.terminate().await;
+        result
+    };
+    match tokio::time::timeout(FORK_PROBE_TIMEOUT, run).await {
+        Ok(Ok(capable)) => capable,
+        Ok(Err(error)) => {
+            tracing::debug!(error = %error, "ACP fork capability probe failed");
+            false
+        }
+        Err(_) => {
+            tracing::debug!("ACP fork capability probe timed out");
+            false
+        }
+    }
+}
+
+/// Answer a control request outside a turn (capability probes, `session/fork`):
+/// notifications are dropped and agent→client requests are declined, since
+/// there is no event sink or permission broker to serve them.
+async fn acp_control_response(
+    process: &mut JsonLineProcess,
+    request_id: &str,
+) -> Result<Value, AppError> {
+    let deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
+    loop {
+        let Some(message) = process.read_control_until(deadline).await? else {
+            return Err(provider_exit_error(process, "ACP agent closed stdout").await);
+        };
+        if message.is_null() {
+            continue;
+        }
+        if jsonrpc_id(&message) == Some(request_id) {
+            if let Some(error) = message.get("error") {
+                let locked = error
+                    .pointer("/data/cognition.ai~1errorKind")
+                    .and_then(Value::as_str)
+                    == Some("session_locked");
+                if locked {
+                    return Err(AppError::Conflict(
+                        "ACP session is open in another process".to_owned(),
+                    ));
+                }
+                return Err(AppError::ProviderUnavailable(format!(
+                    "ACP request {request_id} failed: {}",
+                    safe_error_text(error)
+                )));
+            }
+            return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+        }
+        if let Some(id) = message
+            .get("id")
+            .filter(|_| message.get("method").is_some())
+        {
+            process
+                .send(&json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"client capability is not supported outside a turn"}}))
+                .await?;
+        }
+    }
 }
 
 fn initialize_request() -> InitializeRequest {

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 
 use crate::config::AgentConfig;
@@ -62,7 +62,7 @@ impl ProviderDriver for ClaudeDriver {
                 permission_config: super::types::permission_config_capabilities(
                     ProviderKind::ClaudeCode,
                 ),
-                native_fork: false,
+                native_fork: true,
                 native_compact: false,
                 native_resume: true,
                 cancel: true,
@@ -148,6 +148,42 @@ impl ProviderDriver for ClaudeDriver {
         } else {
             models
         })
+    }
+
+    fn supports_native_fork(&self) -> bool {
+        true
+    }
+
+    async fn fork_session(
+        &self,
+        context: DriverContext,
+        _launch_permit: WorkspaceTrustPermit,
+    ) -> Result<crate::conversation::ProviderState, AppError> {
+        let source = context
+            .provider_state
+            .native_session_id
+            .clone()
+            .unwrap_or_else(|| context.manifest.id.clone());
+        let config_dir = crate::agent_providers::claude_config_dir();
+        let source_path =
+            claude_session_path_at(&config_dir, &context.manifest.workspace, &source).await;
+        if !tokio::fs::try_exists(&source_path).await.unwrap_or(false) {
+            return Err(AppError::Unsupported(
+                "conversation has no Claude transcript to fork".to_owned(),
+            ));
+        }
+        let forked = uuid::Uuid::new_v4().to_string();
+        fork_claude_transcript(
+            &source_path,
+            &config_dir,
+            &context.manifest.workspace,
+            &forked,
+        )
+        .await?;
+        let mut state = crate::conversation::ProviderState::new(ProviderKind::ClaudeCode);
+        state.native_session_id = Some(forked);
+        state.recoverable = true;
+        Ok(state)
     }
 
     async fn run_turn(
@@ -242,14 +278,59 @@ async fn claude_session_exists(workspace: &Path, session_id: &str) -> bool {
 }
 
 async fn claude_session_exists_at(config_dir: &Path, workspace: &Path, session_id: &str) -> bool {
+    let file = claude_session_path_at(config_dir, workspace, session_id).await;
+    tokio::fs::try_exists(file).await.unwrap_or(false)
+}
+
+async fn claude_session_path_at(config_dir: &Path, workspace: &Path, session_id: &str) -> PathBuf {
     let workspace = tokio::fs::canonicalize(workspace)
         .await
         .unwrap_or_else(|_| workspace.to_path_buf());
-    let file = config_dir
+    config_dir
         .join("projects")
         .join(claude_project_dir_name(&workspace))
-        .join(format!("{session_id}.jsonl"));
-    tokio::fs::try_exists(file).await.unwrap_or(false)
+        .join(format!("{session_id}.jsonl"))
+}
+
+/// Fork a Claude session by copying its transcript under a fresh session id:
+/// every `sessionId` field is rewritten so `--resume <id>` loads the copy as
+/// its own session. `claude --resume --fork-session` achieves the same result
+/// but only by spending a turn on a throwaway prompt; the transcript rewrite
+/// keeps the fork free of side effects.
+async fn fork_claude_transcript(
+    source_path: &Path,
+    config_dir: &Path,
+    workspace: &Path,
+    forked_id: &str,
+) -> Result<(), AppError> {
+    let metadata = tokio::fs::metadata(source_path).await?;
+    let raw = tokio::fs::read(source_path).await?;
+    let text = String::from_utf8(raw)
+        .map_err(|_| AppError::InvalidRequest("Claude transcript is not UTF-8".to_owned()))?;
+    let mut lines = Vec::with_capacity(text.lines().count());
+    for line in text.lines() {
+        match serde_json::from_str::<Value>(line) {
+            Ok(mut value) => {
+                if let Some(object) = value.as_object_mut() {
+                    if object.get("sessionId").and_then(Value::as_str).is_some() {
+                        object.insert("sessionId".to_owned(), json!(forked_id));
+                    }
+                }
+                lines.push(serde_json::to_string(&value)?);
+            }
+            // Keep an unparseable line verbatim rather than corrupting the copy.
+            Err(_) => lines.push(line.to_owned()),
+        }
+    }
+    let destination = claude_session_path_at(config_dir, workspace, forked_id).await;
+    if tokio::fs::try_exists(&destination).await.unwrap_or(false) {
+        return Err(AppError::Conflict(
+            "Claude fork destination already exists".to_owned(),
+        ));
+    }
+    tokio::fs::write(&destination, format!("{}\n", lines.join("\n"))).await?;
+    tokio::fs::set_permissions(&destination, metadata.permissions()).await?;
+    Ok(())
 }
 
 /// The per-project directory name Claude Code derives from its cwd:
@@ -570,6 +651,70 @@ mod tests {
 
         assert!(super::claude_session_exists_at(&root, &workspace, session).await);
         assert!(!super::claude_session_exists_at(&root, &workspace, "missing").await);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn transcript_fork_rewrites_session_ids_and_keeps_unparseable_lines() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-claude-fork-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let workspace = root.join("ws");
+        let source = "05811362-61b5-4b88-adec-0c75b9603987";
+        let source_path = super::claude_session_path_at(&root, &workspace, source).await;
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source_path,
+            format!(
+                concat!(
+                    "{{\"type\":\"user\",\"sessionId\":\"{0}\",\"uuid\":\"u1\",\"parentUuid\":null,\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n",
+                    "{{\"type\":\"assistant\",\"sessionId\":\"{0}\",\"uuid\":\"u2\",\"parentUuid\":\"u1\"}}\n",
+                    "{{\"type\":\"summary\",\"summary\":\"half\"}}\n",
+                    "not-a-json-line\n"
+                ),
+                source
+            ),
+        )
+        .unwrap();
+
+        let forked = "3d6e6184-90a2-403c-9b10-8bcdfc46cbbe";
+        super::fork_claude_transcript(&source_path, &root, &workspace, forked)
+            .await
+            .unwrap();
+
+        let forked_path = super::claude_session_path_at(&root, &workspace, forked).await;
+        let copied = std::fs::read_to_string(&forked_path).unwrap();
+        let lines: Vec<&str> = copied.lines().collect();
+        assert_eq!(lines.len(), 4);
+        for line in &lines[..2] {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["sessionId"], json!(forked));
+        }
+        // Lines without a sessionId keep their payload; unparseable lines pass through.
+        let summary: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(summary["summary"], "half");
+        assert_eq!(lines[3], "not-a-json-line");
+        let user: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(user["message"]["content"], "hi");
+
+        // The source transcript is untouched and a second fork to the same id conflicts.
+        let original = std::fs::read_to_string(&source_path).unwrap();
+        assert!(original.contains(source));
+        assert!(matches!(
+            super::fork_claude_transcript(&source_path, &root, &workspace, forked).await,
+            Err(crate::error::AppError::Conflict(_))
+        ));
+        assert!(
+            super::fork_claude_transcript(
+                &root.join("missing.jsonl"),
+                &root,
+                &workspace,
+                "another-fork"
+            )
+            .await
+            .is_err()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

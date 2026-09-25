@@ -789,6 +789,10 @@ impl ConversationSupervisor {
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         let source = self.get_owned(owner_id, conversation_id).await?;
         let driver = self.registry.driver(source.provider)?;
+        // ACP-family drivers learn fork support by probing the installed
+        // agent; refresh so a direct conversation.fork does not fail on an
+        // empty cache when /v2/providers was never fetched.
+        driver.refresh_control_capabilities().await;
         if !driver.supports_native_fork() {
             return Err(AppError::Unsupported(
                 "Native conversation fork is not supported by this provider.".to_owned(),
@@ -2224,6 +2228,17 @@ mod tests {
     async fn control_fixture(
         label: &str,
     ) -> (PathBuf, ConversationStore, ConversationSupervisor, PathBuf) {
+        control_fixture_with(label, false, false).await
+    }
+
+    /// `fixture_acp_profile` registers a `"fixture"` ACP profile that runs the
+    /// shared provider script in `acp` mode; `fixture_devin` points the Devin
+    /// CLI at the same script (`devin acp` also reaches the `acp` branch).
+    async fn control_fixture_with(
+        label: &str,
+        fixture_acp_profile: bool,
+        fixture_devin: bool,
+    ) -> (PathBuf, ConversationStore, ConversationSupervisor, PathBuf) {
         let root = temp_dir(label);
         let workspace_root = root.join("workspaces");
         let workspace = workspace_root.join("project");
@@ -2231,6 +2246,19 @@ mod tests {
         let workspace_root = fs::canonicalize(workspace_root).unwrap();
         let workspace = fs::canonicalize(workspace).unwrap();
         let executable = write_provider_fixture(&root).to_string_lossy().to_string();
+        let mut acp_profiles = BTreeMap::new();
+        if fixture_acp_profile {
+            acp_profiles.insert(
+                "fixture".to_owned(),
+                AcpProfileConfig {
+                    command: executable.clone(),
+                    args: vec!["acp".to_owned()],
+                    env: BTreeMap::new(),
+                    auth_method: None,
+                    api_key_env: None,
+                },
+            );
+        }
         let config = Arc::new(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
@@ -2243,16 +2271,20 @@ mod tests {
                 codex_bin: executable.clone(),
                 claude_bin: executable.clone(),
                 pi_bin: executable.clone(),
-                grok_bin: executable,
+                grok_bin: executable.clone(),
                 grok_auth_method: None,
                 grok_env_allowlist: Vec::new(),
-                devin_bin: "devin".to_owned(),
+                devin_bin: if fixture_devin {
+                    executable.clone()
+                } else {
+                    "devin".to_owned()
+                },
                 devin_auth_method: None,
                 devin_api_key_env: None,
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
-                acp_profiles: BTreeMap::new(),
+                acp_profiles,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -2438,6 +2470,101 @@ mod tests {
             store.get(&manifest.id).await.unwrap().status,
             ConversationStatus::Idle
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_fork_acp_profile_uses_declared_session_capability() {
+        let (root, store, supervisor, workspace) =
+            control_fixture_with("todex-native-fork-acp", true, false).await;
+        let manifest = supervisor
+            .create(
+                ProviderKind::Acp,
+                workspace,
+                None,
+                Some("fixture".to_owned()),
+            )
+            .await
+            .unwrap();
+        let mut native = crate::conversation::ProviderState::new(ProviderKind::Acp);
+        native.native_session_id = Some("acp-native".to_owned());
+        store
+            .save_provider_state(&manifest.id, native)
+            .await
+            .unwrap();
+
+        let fork = supervisor
+            .fork_owned("local", &manifest.id, None)
+            .await
+            .unwrap();
+        assert_eq!(fork.provider_profile.as_deref(), Some("fixture"));
+        assert_eq!(
+            store
+                .provider_state(&fork.id)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("acp-fork-native")
+        );
+        let history = store.complete_history(&fork.id).await.unwrap();
+        assert_eq!(history.last().unwrap().event_type, "conversation.forked");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_fork_devin_follows_declared_acp_capability() {
+        let (root, store, supervisor, workspace) =
+            control_fixture_with("todex-native-fork-devin", false, true).await;
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Devin,
+                workspace,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let mut native = crate::conversation::ProviderState::new(ProviderKind::Devin);
+        native.native_session_id = Some("devin-native".to_owned());
+        store
+            .save_provider_state(&manifest.id, native)
+            .await
+            .unwrap();
+
+        let fork = supervisor
+            .fork_owned("local", &manifest.id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .provider_state(&fork.id)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("acp-fork-native")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_fork_devin_stays_unsupported_without_declared_capability() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-native-fork-devin-off").await;
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Devin,
+                workspace,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            supervisor.fork_owned("local", &manifest.id, None).await,
+            Err(AppError::Unsupported(_))
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3276,7 +3403,7 @@ elif [ "$mode" = "acp" ]; then
     case "$line" in
       *'"method":"initialize"'*)
         id=$(extract_id "$line")
-        printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[{"id":"fixture-key","name":"API key"}]}}\n' "$id"
+        printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"fork":{}}},"authMethods":[{"id":"fixture-key","name":"API key"}]}}\n' "$id"
         ;;
       *'"method":"authenticate"'*)
         id=$(extract_id "$line")
@@ -3293,6 +3420,10 @@ elif [ "$mode" = "acp" ]; then
       *'"method":"session/set_config_option"'*)
         id=$(extract_id "$line")
         printf '{"jsonrpc":"2.0","id":"%s","result":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"fixture-model","options":[{"value":"fixture-model","name":"Fixture"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"build","options":[{"value":"build","name":"build"},{"value":"plan","name":"plan"}]}]}}\n' "$id"
+        ;;
+      *'"method":"session/fork"'*)
+        id=$(extract_id "$line")
+        printf '{"jsonrpc":"2.0","id":"%s","result":{"sessionId":"acp-fork-native"}}\n' "$id"
         ;;
       *'"method":"session/prompt"'*)
         id=$(extract_id "$line")
