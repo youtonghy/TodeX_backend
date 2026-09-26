@@ -2749,17 +2749,21 @@ async fn dispatch_command_inner(
                     }
                 }
                 // A subscribe still backfilling gets an answer instead of
-                // leaving the client's request pending forever.
+                // leaving the client's request pending forever. Clients
+                // unsubscribe on purpose (e.g. evicting the least recently
+                // used subscription), so this is a result, not an error.
                 if !task.answered.load(std::sync::atomic::Ordering::Acquire) {
                     queue_frame(
                         outgoing,
-                        error_response(
-                            Some(task.request_id),
-                            AppError::Conflict(format!(
-                                "conversation {} was unsubscribed before its backfill completed",
-                                request.conversation_id
-                            )),
-                        ),
+                        json!({
+                            "id": task.request_id,
+                            "type": "server.result",
+                            "payload": {
+                                "conversationId": request.conversation_id,
+                                "subscribed": false,
+                                "cancelled": true,
+                            },
+                        }),
                     )
                     .await
                     .map_err(|_| AppError::StreamClosed)?;
@@ -6862,11 +6866,12 @@ mod tests {
         assert!(subscriptions.tasks.is_empty());
         assert!(!hub.has_channel(&manifest.id));
 
-        // The cancelled subscribe is answered exactly once, with an error.
+        // The cancelled subscribe is answered exactly once, as a result.
         let cancelled = events.try_recv().expect("pending subscribe is answered");
         assert_eq!(cancelled["id"], "sub");
-        assert_eq!(cancelled["type"], "server.error");
-        assert_eq!(cancelled["payload"]["code"], "CONFLICT");
+        assert_eq!(cancelled["type"], "server.result");
+        assert_eq!(cancelled["payload"]["subscribed"], false);
+        assert_eq!(cancelled["payload"]["cancelled"], true);
         assert!(events.try_recv().is_err());
         let _ = fs::remove_dir_all(root);
     }
