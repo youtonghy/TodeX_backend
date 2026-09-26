@@ -36,6 +36,9 @@ const JOURNAL_COMPACT_STRING_MAX: usize = 4 * 1024;
 const JOURNAL_COMPACT_STRING_KEEP: usize = 1024;
 /// Read buffer for the cold-index newline scan.
 const JOURNAL_SCAN_BUFFER_BYTES: usize = 256 * 1024;
+/// Appends that leave the status unchanged only mark the cached manifest
+/// dirty; it reaches `manifest.json` at most this often per conversation.
+const MANIFEST_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct ConversationStore {
@@ -48,6 +51,19 @@ pub struct ConversationStore {
     /// journal order matches emission order.
     pending_deltas: Arc<DashMap<String, StoreDelta>>,
     delta_generation: Arc<AtomicU64>,
+    /// Authoritative in-memory manifests. Every writer holds the
+    /// conversation lock; loads on a cache miss take it too, so a stale disk
+    /// read can never overwrite a newer entry or resurrect a deleted one.
+    manifests: Arc<DashMap<String, CachedManifest>>,
+}
+
+struct CachedManifest {
+    manifest: ConversationManifest,
+    /// The entry is newer than `manifest.json`. Only appends that keep the
+    /// status set this; see [`ConversationStore::append_locked`].
+    dirty: bool,
+    /// A debounced flush timer is pending for this conversation.
+    flush_scheduled: bool,
 }
 
 struct StoreDelta {
@@ -86,6 +102,7 @@ impl ConversationStore {
             tails: Arc::new(DashMap::new()),
             pending_deltas: Arc::new(DashMap::new()),
             delta_generation: Arc::new(AtomicU64::new(0)),
+            manifests: Arc::new(DashMap::new()),
         })
     }
 
@@ -170,17 +187,29 @@ impl ConversationStore {
             let _ = tokio::fs::remove_dir_all(&temporary).await;
             return Err(error);
         }
+        self.manifests.insert(
+            manifest.id.clone(),
+            CachedManifest {
+                manifest: manifest.clone(),
+                dirty: false,
+                flush_scheduled: false,
+            },
+        );
         Ok(manifest)
     }
 
     pub async fn get(&self, conversation_id: &str) -> Result<ConversationManifest, AppError> {
-        let directory = self.directory(conversation_id)?;
-        let manifest: ConversationManifest =
-            read_json(&directory.join(MANIFEST_FILE), "conversation manifest").await?;
-        validate_manifest(&manifest, conversation_id)?;
-        Ok(manifest)
+        validate_id(conversation_id)?;
+        if let Some(cached) = self.manifests.get(conversation_id) {
+            return Ok(cached.manifest.clone());
+        }
+        let _guard = self.lock(conversation_id).await;
+        self.get_unlocked(conversation_id).await
     }
 
+    /// The directory listing decides which conversations exist; only
+    /// manifests missing from the cache are read from disk, so a list costs
+    /// one `read_dir` instead of parsing every manifest.
     pub async fn list(&self) -> Result<Vec<ConversationManifest>, AppError> {
         let mut directory = tokio::fs::read_dir(&self.root).await?;
         let mut manifests = Vec::new();
@@ -210,7 +239,6 @@ impl ConversationStore {
         archived: Option<bool>,
     ) -> Result<ConversationManifest, AppError> {
         let _guard = self.lock(conversation_id).await;
-        let directory = self.directory(conversation_id)?;
         let mut manifest = self.get_unlocked(conversation_id).await?;
         if let Some(title) = title {
             manifest.title = title
@@ -221,12 +249,7 @@ impl ConversationStore {
             manifest.archived_at = archived.then(Utc::now);
         }
         manifest.updated_at = Utc::now();
-        write_atomic_json(&directory.join(MANIFEST_FILE), &manifest).await?;
-        write_atomic_json(
-            &directory.join(SNAPSHOT_FILE),
-            &ConversationSnapshot::from_manifest(&manifest),
-        )
-        .await?;
+        self.persist_manifest_locked(&manifest).await?;
         Ok(manifest)
     }
 
@@ -239,10 +262,17 @@ impl ConversationStore {
             )));
         }
         tokio::fs::remove_dir_all(directory).await?;
+        self.forget_locked(conversation_id);
+        Ok(())
+    }
+
+    /// Drop every cache entry of a removed conversation. Callers hold the
+    /// conversation lock.
+    fn forget_locked(&self, conversation_id: &str) {
         self.indexes.remove(conversation_id);
         self.tails.remove(conversation_id);
         self.pending_deltas.remove(conversation_id);
-        Ok(())
+        self.manifests.remove(conversation_id);
     }
 
     pub async fn cleanup_before(
@@ -278,9 +308,7 @@ impl ConversationStore {
                 )
             {
                 tokio::fs::remove_dir_all(self.directory(&id)?).await?;
-                self.indexes.remove(&id);
-                self.tails.remove(&id);
-                self.pending_deltas.remove(&id);
+                self.forget_locked(&id);
                 removed.push(current);
             }
         }
@@ -351,8 +379,9 @@ impl ConversationStore {
         Ok(())
     }
 
-    /// Journals every open merge window; called on shutdown so no streamed
-    /// text is lost with the flush timers.
+    /// Journals every open merge window, then writes every dirty cached
+    /// manifest; called on shutdown so nothing waiting on a flush timer is
+    /// lost with the runtime.
     pub async fn flush_pending_deltas(&self) {
         let conversation_ids: Vec<String> = self
             .pending_deltas
@@ -362,6 +391,16 @@ impl ConversationStore {
         for conversation_id in conversation_ids {
             let _guard = self.lock(&conversation_id).await;
             self.flush_pending_delta_logged(&conversation_id).await;
+        }
+        let dirty: Vec<String> = self
+            .manifests
+            .iter()
+            .filter(|entry| entry.dirty)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for conversation_id in dirty {
+            let _guard = self.lock(&conversation_id).await;
+            self.flush_manifest_logged(&conversation_id).await;
         }
     }
 
@@ -437,25 +476,33 @@ impl ConversationStore {
             )));
         }
         let directory = self.directory(conversation_id)?;
-        let mut manifest: ConversationManifest =
-            read_json(&directory.join(MANIFEST_FILE), "conversation manifest").await?;
-        validate_manifest(&manifest, conversation_id)?;
+        let mut manifest = self.get_unlocked(conversation_id).await?;
+        let persisted_status = manifest.status;
         let (last_event, terminated) = self.read_last_event(conversation_id).await?;
         let journal_sequence = last_event.as_ref().map_or(0, |event| event.sequence);
         if manifest.last_sequence != journal_sequence {
-            if journal_sequence != manifest.last_sequence.saturating_add(1) {
-                return Err(AppError::InvalidRequest(format!(
-                    "conversation {conversation_id} manifest and journal require recovery"
-                )));
+            // The journal is the commit point, so it wins in both directions.
+            // Behind: appends that keep the status only reach manifest.json
+            // through the debounced flush, so a crash can leave it any number
+            // of events behind. Its status is still right, because every
+            // status change is written before its append returns; only the
+            // newest event can have lost that write to a crash, so it alone
+            // is replayed onto the status. Ahead: tail recovery cut records
+            // off the journal.
+            tracing::warn!(
+                conversation_id,
+                manifest_sequence = manifest.last_sequence,
+                journal_sequence,
+                "conversation manifest disagrees with its journal; following the journal"
+            );
+            if let Some(last_event) = last_event
+                .as_ref()
+                .filter(|_| journal_sequence > manifest.last_sequence)
+            {
+                manifest.status = status_after_conversation_event(manifest.status, last_event);
+                manifest.updated_at = last_event.time;
             }
-            let last_event = last_event.ok_or_else(|| {
-                AppError::InvalidRequest(format!(
-                    "conversation {conversation_id} journal sequence is inconsistent"
-                ))
-            })?;
-            manifest.last_sequence = last_event.sequence;
-            manifest.status = status_after_conversation_event(manifest.status, &last_event);
-            manifest.updated_at = last_event.time;
+            manifest.last_sequence = journal_sequence;
         }
         let mut event = ConversationEvent::new(
             conversation_id,
@@ -484,12 +531,18 @@ impl ConversationStore {
                 )));
             }
         }
+        // `create` normally made the journal; only a missing one is created
+        // here, and only then do its permissions and directory entry need work.
+        let created = journal_bytes == 0 && journal_modified.is_none();
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&event_path)
             .await?;
-        set_owner_only(&event_path, false).await?;
+        if created {
+            set_owner_only(&event_path, false).await?;
+            sync_directory(&directory).await?;
+        }
         file.write_all(&line).await?;
         file.flush().await?;
         file.sync_data().await?;
@@ -513,15 +566,17 @@ impl ConversationStore {
             },
         );
 
+        // The synced journal line above is the commit point. The manifest only
+        // mirrors it: status changes are written now (recovery and clients
+        // key off them), everything else is flushed by the debounce timer.
         manifest.last_sequence = event.sequence;
         manifest.status = status_after_conversation_event(manifest.status, &event);
         manifest.updated_at = event.time;
-        write_atomic_json(&directory.join(MANIFEST_FILE), &manifest).await?;
-        write_atomic_json(
-            &directory.join(SNAPSHOT_FILE),
-            &ConversationSnapshot::from_manifest(&manifest),
-        )
-        .await?;
+        if manifest.status == persisted_status {
+            self.mark_manifest_dirty_locked(manifest);
+        } else {
+            self.persist_manifest_locked(&manifest).await?;
+        }
         if let Some(hub) = hub {
             hub.publish(event.clone());
         }
@@ -535,8 +590,7 @@ impl ConversationStore {
     ) -> Result<(), AppError> {
         let _guard = self.lock(conversation_id).await;
         let directory = self.directory(conversation_id)?;
-        read_json::<ConversationManifest>(&directory.join(MANIFEST_FILE), "conversation manifest")
-            .await?;
+        self.get_unlocked(conversation_id).await?;
         write_atomic_json(&directory.join("last-request.json"), request).await
     }
 
@@ -800,10 +854,7 @@ impl ConversationStore {
     ) -> Result<(ConversationManifest, Vec<ConversationEvent>), AppError> {
         let _guard = self.lock(conversation_id).await;
         self.flush_pending_delta_logged(conversation_id).await;
-        let directory = self.directory(conversation_id)?;
-        let mut manifest: ConversationManifest =
-            read_json(&directory.join(MANIFEST_FILE), "conversation manifest").await?;
-        validate_manifest(&manifest, conversation_id)?;
+        let mut manifest = self.get_unlocked(conversation_id).await?;
         let events = self.read_and_recover_events(conversation_id).await?;
         let last_sequence = events.last().map_or(0, |event| event.sequence);
         let mut status = super::ConversationStatus::Idle;
@@ -820,12 +871,7 @@ impl ConversationStore {
         manifest.updated_at = events
             .last()
             .map_or(manifest.updated_at, |event| event.time);
-        write_atomic_json(&directory.join(MANIFEST_FILE), &manifest).await?;
-        write_atomic_json(
-            &directory.join(SNAPSHOT_FILE),
-            &ConversationSnapshot::from_manifest(&manifest),
-        )
-        .await?;
+        self.persist_manifest_locked(&manifest).await?;
         Ok((manifest, events))
     }
 
@@ -851,11 +897,112 @@ impl ConversationStore {
         write_atomic_json(&directory.join(PROVIDER_STATE_FILE), &state).await
     }
 
+    /// Cached manifest, loaded from disk on a miss. Callers hold the
+    /// conversation lock.
     async fn get_unlocked(&self, conversation_id: &str) -> Result<ConversationManifest, AppError> {
+        if let Some(cached) = self.manifests.get(conversation_id) {
+            return Ok(cached.manifest.clone());
+        }
         let directory = self.directory(conversation_id)?;
-        let manifest = read_json(&directory.join(MANIFEST_FILE), "conversation manifest").await?;
+        let manifest: ConversationManifest =
+            read_json(&directory.join(MANIFEST_FILE), "conversation manifest").await?;
         validate_manifest(&manifest, conversation_id)?;
+        self.manifests.insert(
+            conversation_id.to_owned(),
+            CachedManifest {
+                manifest: manifest.clone(),
+                dirty: false,
+                flush_scheduled: false,
+            },
+        );
         Ok(manifest)
+    }
+
+    /// Write the manifest and its snapshot now. A failed write leaves the
+    /// cache authoritative and dirty so the debounce timer retries it.
+    /// Callers hold the conversation lock.
+    async fn persist_manifest_locked(
+        &self,
+        manifest: &ConversationManifest,
+    ) -> Result<(), AppError> {
+        let directory = self.directory(&manifest.id)?;
+        let written = async {
+            write_atomic_json(&directory.join(MANIFEST_FILE), manifest).await?;
+            write_atomic_json(
+                &directory.join(SNAPSHOT_FILE),
+                &ConversationSnapshot::from_manifest(manifest),
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = written {
+            self.mark_manifest_dirty_locked(manifest.clone());
+            return Err(error);
+        }
+        let mut cached = self
+            .manifests
+            .entry(manifest.id.clone())
+            .or_insert_with(|| CachedManifest {
+                manifest: manifest.clone(),
+                dirty: false,
+                flush_scheduled: false,
+            });
+        cached.manifest = manifest.clone();
+        cached.dirty = false;
+        Ok(())
+    }
+
+    /// Cache a manifest newer than `manifest.json` and make sure a flush is
+    /// pending. Callers hold the conversation lock.
+    fn mark_manifest_dirty_locked(&self, manifest: ConversationManifest) {
+        let conversation_id = manifest.id.clone();
+        let mut cached = self
+            .manifests
+            .entry(conversation_id.clone())
+            .or_insert_with(|| CachedManifest {
+                manifest: manifest.clone(),
+                dirty: true,
+                flush_scheduled: false,
+            });
+        cached.manifest = manifest;
+        cached.dirty = true;
+        if cached.flush_scheduled {
+            return;
+        }
+        cached.flush_scheduled = true;
+        // Release the shard lock before spawning.
+        drop(cached);
+        let store = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(MANIFEST_FLUSH_INTERVAL).await;
+            let _guard = store.lock(&conversation_id).await;
+            if let Some(mut cached) = store.manifests.get_mut(&conversation_id) {
+                cached.flush_scheduled = false;
+            }
+            store.flush_manifest_logged(&conversation_id).await;
+        });
+    }
+
+    /// For flushes without a caller to report to (timer, shutdown). The
+    /// entry stays dirty, so the next status change or flush retries.
+    async fn flush_manifest_logged(&self, conversation_id: &str) {
+        if let Err(error) = self.flush_manifest_locked(conversation_id).await {
+            tracing::error!(conversation_id, error = %error, "failed to persist conversation manifest");
+        }
+    }
+
+    /// Write a dirty cached manifest. Callers hold the conversation lock.
+    async fn flush_manifest_locked(&self, conversation_id: &str) -> Result<(), AppError> {
+        let manifest = match self.manifests.get(conversation_id) {
+            Some(cached) if cached.dirty => cached.manifest.clone(),
+            _ => return Ok(()),
+        };
+        let directory = self.directory(conversation_id)?;
+        write_atomic_json(&directory.join(MANIFEST_FILE), &manifest).await?;
+        if let Some(mut cached) = self.manifests.get_mut(conversation_id) {
+            cached.dirty = false;
+        }
+        Ok(())
     }
 
     async fn read_and_recover_events(
@@ -1441,11 +1588,12 @@ async fn read_json<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T, A
     }
 }
 
+/// Replace `path` atomically. The parent directory must already exist, so a
+/// late manifest flush can never resurrect a deleted conversation directory.
 async fn write_atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
     let parent = path
         .parent()
         .ok_or_else(|| AppError::InvalidRequest("persisted file has no parent".to_owned()))?;
-    tokio::fs::create_dir_all(parent).await?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1816,6 +1964,47 @@ mod tests {
             );
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    /// Per-append durable latency on a quiet conversation. Run with
+    /// `cargo test --release --locked -- --ignored measure_append_latency --nocapture`.
+    #[tokio::test]
+    #[ignore = "opt-in append latency measurement"]
+    async fn measure_append_latency_200() {
+        let root = temp_dir("todex-append-latency");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(&conversation.id, "turn.started", json!({ "turnId": "t" }))
+            .await
+            .unwrap();
+        let mut append_ms = Vec::with_capacity(200);
+        for index in 0..200 {
+            let start = std::time::Instant::now();
+            store
+                .append(
+                    &conversation.id,
+                    "message.delta",
+                    json!({ "turnId": "t", "index": index, "delta": "representative delta ".repeat(8) }),
+                )
+                .await
+                .unwrap();
+            append_ms.push(start.elapsed().as_secs_f64() * 1000.);
+        }
+        append_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "append_latency samples=200 p50_ms={:.2} p95_ms={:.2} max_ms={:.2}",
+            append_ms[99], append_ms[189], append_ms[199]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2527,6 +2716,245 @@ mod tests {
             json!({ "turnId": "t", "truncated": true, "originalBytes": original })
         );
         assert_eq!(bounded.original_bytes, Some(original));
+    }
+
+    fn manifest_path(root: &Path, id: &str) -> PathBuf {
+        root.join("conversations").join(id).join(MANIFEST_FILE)
+    }
+
+    fn disk_manifest(root: &Path, id: &str) -> Value {
+        serde_json::from_slice(&fs::read(manifest_path(root, id)).unwrap()).unwrap()
+    }
+
+    /// Rewrite manifest.json with `last_sequence`, as a crash between
+    /// debounced flushes (or before a tail repair) leaves it.
+    fn set_disk_last_sequence(root: &Path, id: &str, last_sequence: u64) {
+        let mut manifest = disk_manifest(root, id);
+        manifest["lastSequence"] = json!(last_sequence);
+        fs::write(
+            manifest_path(root, id),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn seed_turn(prefix: &str, count: u64) -> (PathBuf, String) {
+        let root = temp_dir(prefix);
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = ConversationManifest::new(ProviderKind::Codex, root.clone(), None, None);
+        let events = (1..=count)
+            .map(|sequence| {
+                let event_type = if sequence == 1 {
+                    "turn.started"
+                } else {
+                    "message.delta"
+                };
+                ConversationEvent::new(
+                    &conversation.id,
+                    sequence,
+                    event_type,
+                    json!({ "turnId": "t", "delta": format!("d{sequence}") }),
+                )
+            })
+            .collect();
+        store
+            .create_with_history(conversation.clone(), events, None, None)
+            .await
+            .unwrap();
+        (root, conversation.id)
+    }
+
+    #[tokio::test]
+    async fn recovery_follows_the_journal_when_the_manifest_lags_far_behind() {
+        let (root, id) = seed_turn("todex-manifest-behind-recover", 150).await;
+        set_disk_last_sequence(&root, &id, 50);
+
+        let restarted = ConversationStore::new(root.clone()).await.unwrap();
+        assert_eq!(restarted.list().await.unwrap()[0].last_sequence, 50);
+        let (recovered, history) = restarted.recover_with_history(&id).await.unwrap();
+        assert_eq!(history.len(), 150);
+        assert_eq!(recovered.last_sequence, 150);
+        assert_eq!(recovered.status, ConversationStatus::Interrupted);
+        assert_eq!(disk_manifest(&root, &id)["lastSequence"], 150);
+        let appended = restarted
+            .append(&id, "turn.started", json!({ "turnId": "t2" }))
+            .await
+            .unwrap();
+        assert_eq!(appended.sequence, 151);
+        assert_eq!(
+            restarted.get(&id).await.unwrap().status,
+            ConversationStatus::Running
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_follows_the_journal_when_the_manifest_is_behind_or_ahead() {
+        let (root, id) = seed_turn("todex-manifest-drift", 150).await;
+        set_disk_last_sequence(&root, &id, 50);
+        let restarted = ConversationStore::new(root.clone()).await.unwrap();
+        let appended = restarted
+            .append(&id, "message.delta", json!({ "turnId": "t" }))
+            .await
+            .unwrap();
+        assert_eq!(appended.sequence, 151);
+        let manifest = restarted.get(&id).await.unwrap();
+        assert_eq!(manifest.last_sequence, 151);
+        assert_eq!(manifest.status, ConversationStatus::Running);
+
+        // Ahead: the journal lost its newest records.
+        restarted.flush_pending_deltas().await;
+        let path = root.join("conversations").join(&id).join(EVENTS_FILE);
+        let raw = fs::read_to_string(&path).unwrap();
+        let kept: String = raw.split_inclusive('\n').take(140).collect();
+        fs::write(&path, kept).unwrap();
+        let restarted = ConversationStore::new(root.clone()).await.unwrap();
+        let appended = restarted
+            .append(&id, "turn.completed", json!({ "turnId": "t" }))
+            .await
+            .unwrap();
+        assert_eq!(appended.sequence, 141);
+        assert_eq!(disk_manifest(&root, &id)["lastSequence"], 141);
+        assert_eq!(disk_manifest(&root, &id)["status"], "idle");
+        let page = restarted.replay(&id, 0, 1000).await.unwrap();
+        assert_eq!(sequences(&page), (1..=141).collect::<Vec<_>>());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_changes_persist_immediately_and_other_appends_are_debounced() {
+        let root = temp_dir("todex-manifest-debounce");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let id = conversation.id.as_str();
+        let snapshot_path = root.join("conversations").join(id).join(SNAPSHOT_FILE);
+        store
+            .append(id, "turn.started", json!({ "turnId": "t" }))
+            .await
+            .unwrap();
+        assert_eq!(disk_manifest(&root, id)["status"], "running");
+        assert_eq!(disk_manifest(&root, id)["lastSequence"], 1);
+        let snapshot: Value = serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+        assert_eq!(snapshot["status"], "running");
+
+        for index in 0..5 {
+            store
+                .append(
+                    id,
+                    "message.delta",
+                    json!({ "turnId": "t", "index": index }),
+                )
+                .await
+                .unwrap();
+        }
+        // Readers see the cache; manifest.json waits for the debounce timer.
+        assert_eq!(store.get(id).await.unwrap().last_sequence, 6);
+        assert_eq!(disk_manifest(&root, id)["lastSequence"], 1);
+        tokio::time::sleep(MANIFEST_FLUSH_INTERVAL + Duration::from_millis(700)).await;
+        assert_eq!(disk_manifest(&root, id)["lastSequence"], 6);
+        assert!(!store.manifests.get(id).unwrap().dirty);
+
+        // A deleted conversation is never resurrected by a pending flush.
+        store
+            .append(id, "message.delta", json!({ "turnId": "t" }))
+            .await
+            .unwrap();
+        store.delete(id).await.unwrap();
+        store.flush_pending_deltas().await;
+        assert!(store.list().await.unwrap().is_empty());
+        assert!(matches!(store.get(id).await, Err(AppError::NotFound(_))));
+        assert!(!root.join("conversations").join(id).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cached_manifests_match_disk_after_a_flush_and_after_restart() {
+        let root = temp_dir("todex-manifest-consistency");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(
+                store
+                    .create(ConversationManifest::new(
+                        ProviderKind::Codex,
+                        root.clone(),
+                        None,
+                        None,
+                    ))
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        let operations = [
+            "message.delta",
+            "message.delta",
+            "tool.completed",
+            "turn.started",
+            "permission.requested",
+            "permission.resolved",
+            "turn.completed",
+            "turn.failed",
+            "metadata",
+        ];
+        // Deterministic LCG: reproducible "random" interleaving.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for step in 0..240u64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let id = &ids[(state >> 33) as usize % ids.len()];
+            match operations[(state >> 40) as usize % operations.len()] {
+                "metadata" => {
+                    store
+                        .update_metadata(
+                            id,
+                            Some(Some(format!("title {step}"))),
+                            Some(step % 2 == 0),
+                        )
+                        .await
+                        .unwrap();
+                }
+                event_type => {
+                    store
+                        .append(
+                            id,
+                            event_type,
+                            json!({ "turnId": "t", "permissionId": "p", "step": step }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        store.flush_pending_deltas().await;
+        let fresh = ConversationStore::new(root.clone()).await.unwrap();
+        let listed = fresh.list().await.unwrap();
+        assert_eq!(listed.len(), ids.len());
+        for id in &ids {
+            let cached = serde_json::to_value(store.get(id).await.unwrap()).unwrap();
+            assert_eq!(cached, disk_manifest(&root, id));
+            assert_eq!(
+                cached,
+                serde_json::to_value(fresh.get(id).await.unwrap()).unwrap()
+            );
+            let snapshot: Value = serde_json::from_slice(
+                &fs::read(root.join("conversations").join(id).join(SNAPSHOT_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(snapshot["status"], cached["status"]);
+            let history = fresh.complete_history(id).await.unwrap();
+            assert_eq!(cached["lastSequence"], history.len() as u64);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
