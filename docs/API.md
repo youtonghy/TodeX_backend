@@ -145,13 +145,19 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 `content` 可选，最多 16 项，支持 `text`、`localImage`、内联 `image`（`data` + `mimeType`）和 `file`。本地路径可相对 workspace，也可使用 workspace 内绝对路径；规范化后越界、符号链接逃逸和非普通文件都会拒绝。图片仅对 Codex 和 Pi 开放，允许 PNG/JPEG/GIF/WebP，解码后合计最多 10 MiB；不支持图片的 Provider 返回明确的 `UNSUPPORTED`。Codex 把文件映射为原生 mention，其他 Provider 使用 workspace 相对 `@` 引用。
 
-每个 conversation 同时只允许一个 mutating turn；并发 prompt 返回 `409 CONFLICT`，不会排队。daemon 重启会把未完成 turn 标记为 `interrupted`，不会通过重放 prompt 猜测恢复。原生会话 ID 由 `provider-state.json` 保存，Provider 支持时下一 turn 使用原生 resume。
+每个 conversation 同时只允许一个 mutating turn；并发 prompt 返回 `409 CONFLICT`，不会排队。daemon 重启按 journal（而非 manifest 状态）判断未完成 turn：仍打开的 turn 追加 `conversation.interrupted`（已知时携带该 turn 的 `turnId`），状态标记为 `interrupted`，不会通过重放 prompt 猜测恢复；journal 中已结束但 manifest 仍为 `running` 的会话只按 journal 修正状态，不追加事件。原生会话 ID 由 `provider-state.json` 保存，Provider 支持时下一 turn 使用原生 resume。
+
+每个已开始的 turn 都以一个终态事件结束：driver panic 产生 `turn.failed`（`code: "PROVIDER_PANIC"`，其他任务异常为 `PROVIDER_TASK_CANCELLED`）；终态事件写入失败时按 100 ms / 500 ms / 2 s 重试，每次重试前先查 journal 避免重复，全部失败则 manifest 状态置为 `failed`，重启恢复再在 journal 中关闭该 turn。`[agent].provider_idle_timeout_minutes`（默认 60，`0` 关闭）内 Provider 没有任何输出或事件的 turn 会被取消（有待答权限请求时不计时触发），30 秒内未结束则强制中止，最终以 `turn.failed`（`code: "PROVIDER_IDLE_TIMEOUT"`）结束。Provider stdout 中非 JSON 行或超过 4 MiB 的行不再使 turn 失败：每个 turn 最多 20 条记为 `provider.event`（`{ "kind": "invalid_line", "preview" }`，preview 已脱敏且不超过 512 字节；或 `{ "kind": "oversized_line", "bytes" }`），其余只写日志。
+
+journal 超过 63 MiB（64 MiB 上限预留 1 MiB）且压缩后仍超出时，新 prompt 返回 `JOURNAL_FULL`（HTTP 507），应新建会话；进行中的 turn 仍可追加到 64 MiB 上限。超过 1 MiB − 16 KiB 的事件 payload 在脱敏后截断而非拒绝：最大的字符串按 UTF-8 边界截断并追加 `…[truncated N bytes]`，对象 payload 顶层增加 `truncated`（该键已被占用时为 `_truncated`）映射，记录 JSON pointer → 原始字节数；仅截断字符串仍放不下时，payload 替换为 `{ "truncated": true, "originalBytes": N }` 加上较短的顶层标量字段。
 
 事件回放支持 `detail=summary`（默认 `full`）：summary 模式把只产生折叠过程行的事件（工具调用、思考、状态、进度）的 `payload` 替换为 `{ "detailStub": true, ... }` 占位对象，保留分类、turn 与流身份所需的元数据，因此事件 sequence 与投影出的时间线条目身份保持不变；结果输出、审批、权限、队列、配置、压缩、subagent、memory、extension 及携带用量数据的事件始终完整返回。客户端展开过程组时用同一接口按 `afterSequence`/`limit` 以 `detail=full` 拉取对应序列区间。
 
 HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB 时使用 gzip 压缩（图片、gRPC 与 SSE 除外）；压缩只作用于响应体，设备签名覆盖的请求方法、路径、查询与请求体不受影响，WebSocket 升级不压缩。
 
 `beforeSequence=N` 提供反向翻页（与 `afterSequence` 互斥，优先生效）：返回 `sequence <= N` 的最后 `limit` 条（升序），`hasMore` 表示是否还有更早的事件，下一页游标为本页首条 `sequence - 1`。用于长对话自下向上懒加载：首屏用 manifest 的 `lastSequence` 拉取尾页，滚动到顶部再继续向前翻页。
+
+两个方向的回放页（以及 WebSocket 订阅补放的每一页）都同时受 `limit`（上限 1000）与约 8 MiB journal 字节限制，先到先止，但每页至少返回一条事件；因此一页可能少于 `limit` 条，客户端应在 `hasMore` 为 `true` 时继续翻页，而不是按条数判断是否结束。
 
 ### v2 WebSocket
 
@@ -176,6 +182,10 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
 支持 `conversation.subscribe`、`conversation.unsubscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
 
 每条 socket 最多同时持有 128 个会话订阅，超出后 `conversation.subscribe` 返回 `INVALID_REQUEST`。`conversation.unsubscribe` 的 payload 为 `{ "conversationId": "..." }`，释放该订阅槽位并停止转发任务，幂等且返回 `{ "conversationId", "unsubscribed" }`；订阅任务因补放失败终止时发出的 `server.error` 在 `payload.conversationId` 中携带会话 ID，客户端可据此清理本地订阅记录并重订阅。删除会话（含过期清理）会关闭其广播通道，等同于终止该会话的全部订阅。
+
+订阅补放在该订阅自己的任务中执行，不阻塞读循环：同一订阅的帧顺序不变（补放帧 → 带请求 `id` 的订阅结果 → 实时事件），但其他命令的应答可能穿插其间。每条连接最多同时进行 4 个补放，其余排队。已订阅（含补放进行中）的会话再次 `conversation.subscribe` 立即返回 `{ "conversationId", "subscribed": true, "alreadySubscribed": true }`；补放期间 `conversation.unsubscribe` 会先以 `server.result` `{ "conversationId", "subscribed": false, "cancelled": true }` 应答那条挂起的订阅请求。广播通道只在有订阅者时存在（发布不会创建通道，最后一个订阅者离开即回收），容量 256，滞后部分从 journal 补放；滞后时发出的 `EVENT_STREAM_LAGGED` `server.error` 帧没有顶层 `id`，`payload.conversationId` 标明所属会话。
+
+发送侧有截止时间：单次 socket 发送超过 20 秒，或出站队列持续满 10 秒，连接即被关闭；关闭时最多等待 2 秒让发送任务排空，随后中止。
 
 MCP 真实调用只走 Backend：客户端只发送 `resourceId`、`toolName` 和对象类型的 `arguments`。Catalog JSON 不含 command、URL 或凭据。调用前必须通过权限 broker，默认拒绝；仅 `allow_once` / `allow_always` 会放行。Backend 使用标准 MCP SDK 连接 stdio JSONL 或 Streamable HTTP transport，并对初始化、调用和关闭分别设置时限。
 
@@ -211,7 +221,7 @@ $DATA_DIR/conversations/<uuid-v4>/
   provider-state.json
 ```
 
-`events.jsonl` 是规范事件日志，sequence 从 1 连续递增。daemon 就绪后会在后台复制迁移旧 `$DATA_DIR/codex_gateway/sessions`；旧文件不修改，迁移可重复执行，并会去除 approval response 和常见 secret 字段。迁移失败会记录日志并在下次启动时重试，不阻塞 API 可用性。
+`events.jsonl` 是规范事件日志，sequence 从 1 连续递增；每次追加以 fsync 后的 journal 行为唯一提交点。manifest 缓存在内存中：创建、状态变化、元数据更新、恢复与强制置状态时立即写 `manifest.json` 与 `snapshot.json`；仅 `lastSequence`、`updatedAt` 变化时最多延迟 2 秒写 `manifest.json`，关闭时刷盘，崩溃后从 journal 重建。journal 修复：末条记录缺少换行时恢复阶段补上；中间损坏时先整份备份为 `events.corrupt.<ts>.jsonl`，再原子重写，有效记录原样保留，每个丢失的 sequence 以 `journal.recordLost` 占位（payload `{ "reason": "corrupt", "runStart", "runLength", "backup" }`，同一段丢失共享 `runStart`/`runLength`，客户端可合并显示；普通追加无法伪造该事件类型）；末尾损坏仍隔离到备份文件后截断。daemon 就绪后会在后台复制迁移旧 `$DATA_DIR/codex_gateway/sessions`；旧文件不修改，迁移可重复执行，并会去除 approval response 和常见 secret 字段。迁移失败会记录日志并在下次启动时重试，不阻塞 API 可用性。
 
 Codex 的原生 `thread/tokenUsage/updated` 通知会在 Provider 边界规范化为 `usage.updated`，避免原生字段名与凭证脱敏规则冲突。`payload.usage.last` 是最近一次模型调用，`payload.usage.cumulative` 是当前原生 thread 的累计值；两者都使用 `total`、`input`、`output`、`cacheRead`、`cacheWrite` 和 `reasoningOutput` 数值字段，`payload.contextWindow` 是模型上下文窗口。Pi 的逐回复统计继续位于 assistant `message.completed` 的 `payload.message.usage`。
 
@@ -515,7 +525,7 @@ TUI 配对二维码只携带后端地址、当前首选加密方式和服务端�
 1. **v2 原生命令**：`conversation.*`、`server.ping`、`session.resume`，以 `server.result` / `server.error` envelope 应答。
 2. **本地控制命令**（原 `/v1/ws` 能力）：`terminal.*`、`codex.local.*`、`codex.gateway.control`、`codex.mcp.*`、`codex.cloudTask.*`。应答与事件通过按连接隔离的 ServerEvent 流返回（见「事件」一节），连接只会收到自己触碰过的 Codex session / 终端的事件。
 
-单帧上限 8 MiB（聊天附件以 base64 data URL 传输，无出站分片）。服务端每 30 秒发送 WebSocket Ping，90 秒无入站帧即关闭连接。
+单帧上限 8 MiB（聊天附件以 base64 data URL 传输，无出站分片），由 WebSocket 升级层强制：超限消息直接关闭连接，不再返回 `INVALID_REQUEST` 帧。服务端每 30 秒发送 WebSocket Ping，90 秒无入站帧即关闭连接。
 
 ### `session.resume`（断线恢复）
 
@@ -819,7 +829,8 @@ TUI 配对二维码只携带后端地址、当前首选加密方式和服务端�
 | `UNAUTHENTICATED` | `enable_auth` 开启时未提供有效设备签名（header 或 query 参数），或设备未注册/已吊销、时间戳超窗、nonce 重放。 |
 | `UNAUTHORIZED` | tenant 与认证上下文不匹配。 |
 | `UNSUPPORTED` | 请求能力不在当前后端支持范围。 |
-| `EVENT_STREAM_LAGGED` | WebSocket 事件接收端落后。 |
+| `JOURNAL_FULL` | 会话 journal 超过新 turn 上限（63 MiB）且压缩无法释放空间，HTTP 507；需新建会话。 |
+| `EVENT_STREAM_LAGGED` | WebSocket 事件接收端落后，服务端正从 journal 补放；帧无顶层 `id`，`payload.conversationId` 标明会话。 |
 | `EVENT_STREAM_CLOSED` | 事件流已关闭。 |
 | `SERIALIZATION_FAILED` | JSON 序列化失败。 |
 | `IO_ERROR` | 文件或进程 I/O 错误。 |
