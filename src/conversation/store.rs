@@ -51,6 +51,10 @@ pub(crate) const JOURNAL_RECORD_LOST_EVENT: &str = "journal.recordLost";
 /// so a record with a damaged sequence number cannot conjure a huge run of
 /// placeholders.
 const MIN_JOURNAL_RECORD_BYTES: usize = 128;
+/// Replay pages stop adding records once their journal bytes would exceed
+/// this (records reach ~1 MiB, so 1000 of them could otherwise approach the
+/// whole journal). A page always holds at least one record.
+const MAX_REPLAY_PAGE_BYTES: u64 = 8 * 1024 * 1024;
 /// Appends that leave the status unchanged only mark the cached manifest
 /// dirty; it reaches `manifest.json` at most this often per conversation.
 const MANIFEST_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -691,6 +695,10 @@ impl ConversationStore {
         }))
     }
 
+    /// Forward replay of events after `after_sequence`, at most `limit`
+    /// records and [`MAX_REPLAY_PAGE_BYTES`] of journal (never fewer than one
+    /// record). `has_more` reports whether later events remain; clients
+    /// continue from `next_sequence`.
     pub async fn replay(
         &self,
         conversation_id: &str,
@@ -703,7 +711,7 @@ impl ConversationStore {
         let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
         let event_path = self.replay_journal(conversation_id).await?;
         let (_, to, total, events) = self
-            .read_indexed_page(conversation_id, &event_path, |total| {
+            .read_indexed_page(conversation_id, &event_path, PageAnchor::Start, |total| {
                 let from = usize::try_from(after_sequence)
                     .unwrap_or(usize::MAX)
                     .min(total);
@@ -723,7 +731,9 @@ impl ConversationStore {
     /// Reverse replay for lazy history loading: returns the newest events with
     /// `sequence <= before_sequence` in ascending order. `has_more` reports
     /// whether earlier events remain, so clients page back with
-    /// `before_sequence = first_returned_sequence - 1`.
+    /// `before_sequence = first_returned_sequence - 1` (`from_sequence`). The
+    /// same byte budget as [`Self::replay`] applies, dropping the oldest
+    /// records of the window first.
     pub async fn replay_before(
         &self,
         conversation_id: &str,
@@ -736,7 +746,7 @@ impl ConversationStore {
         let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
         let event_path = self.replay_journal(conversation_id).await?;
         let (from, _, _, events) = self
-            .read_indexed_page(conversation_id, &event_path, |total| {
+            .read_indexed_page(conversation_id, &event_path, PageAnchor::End, |total| {
                 let to = usize::try_from(before_sequence)
                     .unwrap_or(usize::MAX)
                     .min(total);
@@ -823,19 +833,21 @@ impl ConversationStore {
         Ok(true)
     }
 
-    /// Read the page `window(total)` selects from the current index. When a
-    /// fast-built index meets a record that does not parse or validate, the
-    /// full scan runs so corruption is reported (or a tail repaired) exactly
-    /// as an eagerly validated index would, then the page is read again.
-    /// Returns `(from, to, total, events)`.
+    /// Read the page `window(total)` selects from the current index, cut to
+    /// [`MAX_REPLAY_PAGE_BYTES`] from its `anchor` end before any record is
+    /// read. When a fast-built index meets a record that does not parse or
+    /// validate, the full scan runs so corruption is reported (or salvaged)
+    /// exactly as an eagerly validated index would, then the page is read
+    /// again. Returns `(from, to, total, events)`.
     async fn read_indexed_page(
         &self,
         conversation_id: &str,
         event_path: &Path,
+        anchor: PageAnchor,
         window: impl Fn(usize) -> (usize, usize),
     ) -> Result<(usize, usize, usize, Vec<ConversationEvent>), AppError> {
         let total = self.journal_len(conversation_id);
-        let (from, to) = window(total);
+        let (from, to) = self.budgeted_window(conversation_id, window(total), anchor);
         let error = match self
             .read_replay_window(conversation_id, event_path, from, to)
             .await
@@ -853,11 +865,23 @@ impl ConversationStore {
         tracing::warn!(conversation_id, error = %error, "unreadable record behind the fast journal index; running full validation");
         self.read_and_recover_events(conversation_id).await?;
         let total = self.journal_len(conversation_id);
-        let (from, to) = window(total);
+        let (from, to) = self.budgeted_window(conversation_id, window(total), anchor);
         let events = self
             .read_replay_window(conversation_id, event_path, from, to)
             .await?;
         Ok((from, to, total, events))
+    }
+
+    fn budgeted_window(
+        &self,
+        conversation_id: &str,
+        window: (usize, usize),
+        anchor: PageAnchor,
+    ) -> (usize, usize) {
+        match self.indexes.get(conversation_id) {
+            Some(index) => budget_window(&index.offsets, window, anchor, MAX_REPLAY_PAGE_BYTES),
+            None => window,
+        }
     }
 
     fn journal_len(&self, conversation_id: &str) -> usize {
@@ -1952,6 +1976,48 @@ async fn rewrite_salvaged_journal(
     Ok((events, offsets))
 }
 
+/// Which end of a replay window the byte budget keeps.
+#[derive(Clone, Copy)]
+enum PageAnchor {
+    /// Forward replay: keep the oldest records, drop newer ones.
+    Start,
+    /// Reverse replay: keep the newest records, drop older ones.
+    End,
+}
+
+/// Shrink `from..to` from the end opposite `anchor` until its records span
+/// at most `budget` journal bytes, keeping at least one record.
+fn budget_window(
+    offsets: &[(u64, u64)],
+    (from, to): (usize, usize),
+    anchor: PageAnchor,
+    budget: u64,
+) -> (usize, usize) {
+    let to = to.min(offsets.len());
+    let from = from.min(to);
+    let size = |index: usize| offsets[index].1.saturating_sub(offsets[index].0);
+    let mut bytes = 0u64;
+    match anchor {
+        PageAnchor::Start => {
+            for index in from..to {
+                bytes = bytes.saturating_add(size(index));
+                if bytes > budget && index > from {
+                    return (from, index);
+                }
+            }
+        }
+        PageAnchor::End => {
+            for index in (from..to).rev() {
+                bytes = bytes.saturating_add(size(index));
+                if bytes > budget && index + 1 < to {
+                    return (index + 1, to);
+                }
+            }
+        }
+    }
+    (from, to)
+}
+
 /// Offset index produced by [`scan_journal_offsets`].
 struct ScannedJournal {
     bytes: u64,
@@ -2639,6 +2705,107 @@ mod tests {
         assert!(empty.events.is_empty());
         assert!(!empty.has_more);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_pages_stop_at_the_byte_budget_in_both_directions() {
+        let root = temp_dir("todex-replay-byte-budget");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = ConversationManifest::new(ProviderKind::Codex, root.clone(), None, None);
+        let bulk = "x".repeat(1000 * 1024);
+        let events = (1..=20)
+            .map(|sequence| {
+                ConversationEvent::new(
+                    &conversation.id,
+                    sequence,
+                    "tool.completed",
+                    json!({ "output": bulk, "index": sequence }),
+                )
+            })
+            .collect();
+        store
+            .create_with_history(conversation.clone(), events, None, None)
+            .await
+            .unwrap();
+        let id = conversation.id;
+        let page_bytes = |replay: &ConversationReplay| {
+            replay
+                .events
+                .iter()
+                .map(|event| serde_json::to_vec(event).unwrap().len() as u64)
+                .sum::<u64>()
+        };
+
+        let mut forward = Vec::new();
+        let mut cursor = 0;
+        let mut pages = 0;
+        loop {
+            let page = store.replay(&id, cursor, 1000).await.unwrap();
+            pages += 1;
+            assert!(!page.events.is_empty());
+            assert!(page_bytes(&page) <= MAX_REPLAY_PAGE_BYTES);
+            assert_eq!(page.from_sequence, cursor);
+            assert_eq!(page.next_sequence, page.events.last().unwrap().sequence);
+            forward.extend(sequences(&page));
+            cursor = page.next_sequence;
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(forward, (1..=20).collect::<Vec<_>>());
+        assert_eq!(pages, 3, "8 + 8 + 4 records of ~1 MiB");
+
+        let mut backward = Vec::new();
+        let mut before = u64::MAX;
+        let mut pages = 0;
+        loop {
+            let page = store.replay_before(&id, before, 1000).await.unwrap();
+            pages += 1;
+            assert!(!page.events.is_empty());
+            assert!(page_bytes(&page) <= MAX_REPLAY_PAGE_BYTES);
+            let first = page.events[0].sequence;
+            assert_eq!(page.from_sequence, first - 1);
+            assert_eq!(page.has_more, first > 1);
+            assert_eq!(page.next_sequence, page.events.last().unwrap().sequence);
+            let mut chunk = sequences(&page);
+            chunk.extend(backward);
+            backward = chunk;
+            if !page.has_more {
+                break;
+            }
+            before = page.from_sequence;
+        }
+        assert_eq!(backward, (1..=20).collect::<Vec<_>>());
+        assert_eq!(pages, 3);
+
+        // The record limit still applies below the byte budget.
+        let small = store.replay(&id, 4, 2).await.unwrap();
+        assert_eq!(sequences(&small), vec![5, 6]);
+        assert!(small.has_more);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn budget_window_keeps_one_record_even_above_the_budget() {
+        let offsets = vec![(0, 100), (101, 301), (302, 352), (353, 363)];
+        assert_eq!(
+            budget_window(&offsets, (0, 4), PageAnchor::Start, 10),
+            (0, 1)
+        );
+        assert_eq!(budget_window(&offsets, (0, 4), PageAnchor::End, 5), (3, 4));
+        assert_eq!(
+            budget_window(&offsets, (0, 4), PageAnchor::Start, 300),
+            (0, 2)
+        );
+        assert_eq!(
+            budget_window(&offsets, (0, 4), PageAnchor::End, 260),
+            (1, 4)
+        );
+        assert_eq!(
+            budget_window(&offsets, (1, 3), PageAnchor::Start, 1000),
+            (1, 3)
+        );
+        assert_eq!(budget_window(&offsets, (4, 9), PageAnchor::End, 1), (4, 4));
     }
 
     /// Seeds `count` events; the returned store has no replay index yet.
