@@ -79,6 +79,16 @@ const TERMINAL_EVENT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(2),
 ];
 
+/// Events that end the turn they name (or, without a turnId, any open turn).
+const TURN_TERMINAL_EVENTS: [&str; 4] = [
+    "turn.completed",
+    "turn.failed",
+    "turn.cancelled",
+    "turn.interrupted",
+];
+/// Conversation-level events that end whatever turn was open.
+const CONVERSATION_TERMINAL_EVENTS: [&str; 2] = ["conversation.interrupted", "conversation.failed"];
+
 /// The turn a crash left open: the last `turn.started` with no later terminal
 /// event for it. A turn terminal without a turnId, or a conversation-level
 /// interruption or failure, closes whatever turn was open.
@@ -86,15 +96,14 @@ fn open_turn_id(history: &[crate::conversation::ConversationEvent]) -> Option<St
     let mut open = None;
     for event in history {
         let turn_id = event.payload.get("turnId").and_then(Value::as_str);
-        match event.event_type.as_str() {
-            "turn.started" => open = turn_id.map(str::to_owned),
-            "turn.completed" | "turn.failed" | "turn.cancelled" | "turn.interrupted"
-                if turn_id.is_none() || turn_id == open.as_deref() =>
-            {
-                open = None;
-            }
-            "conversation.interrupted" | "conversation.failed" => open = None,
-            _ => {}
+        let event_type = event.event_type.as_str();
+        if event_type == "turn.started" {
+            open = turn_id.map(str::to_owned);
+        } else if CONVERSATION_TERMINAL_EVENTS.contains(&event_type)
+            || (TURN_TERMINAL_EVENTS.contains(&event_type)
+                && (turn_id.is_none() || turn_id == open.as_deref()))
+        {
+            open = None;
         }
     }
     open
@@ -363,10 +372,15 @@ impl ConversationSupervisor {
         let total = manifests.len();
         tracing::info!(conversations = total, "recovering conversation journals");
         let mut failed = 0usize;
+        let mut settled = 0usize;
         for (index, manifest) in manifests.into_iter().enumerate() {
-            // A single unreadable or exhausted journal must not keep the daemon
-            // from starting; recover the rest and report the failures.
-            if let Err(error) = self.recover_conversation(&manifest).await {
+            // `list` already cached the manifest; a settled journal needs no
+            // bookkeeping and is validated (and salvaged) on its first read.
+            // A single unreadable or exhausted journal must not keep the
+            // daemon from starting; recover the rest and report the failures.
+            if self.recovery_is_settled(&manifest).await {
+                settled += 1;
+            } else if let Err(error) = self.recover_conversation(&manifest).await {
                 failed += 1;
                 tracing::error!(
                     conversation_id = %manifest.id,
@@ -378,6 +392,7 @@ impl ConversationSupervisor {
                 tracing::info!(
                     recovered = index + 1,
                     total,
+                    settled,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "conversation recovery progress"
                 );
@@ -392,6 +407,41 @@ impl ConversationSupervisor {
         }
         self.permissions.expire_all();
         Ok(())
+    }
+
+    /// Whether startup can skip the full journal scan: the manifest claims no
+    /// work in flight, the journal ends cleanly on a turn- or
+    /// conversation-terminal event (or is empty), and the manifest was
+    /// written after that event (equal `last_sequence`; status changes are
+    /// persisted with the event that caused them). Pi is always scanned: its
+    /// resident runtimes and session-scoped dialogs outlive turns, so only
+    /// the whole journal shows whether one was left open. Any doubt, including
+    /// an unreadable tail, falls back to the full path, which reports it.
+    async fn recovery_is_settled(&self, manifest: &ConversationManifest) -> bool {
+        if manifest.provider == ProviderKind::Pi
+            || matches!(
+                manifest.status,
+                ConversationStatus::Running | ConversationStatus::WaitingPermission
+            )
+        {
+            return false;
+        }
+        let tail = match self.store.journal_tail(&manifest.id).await {
+            Ok((tail, true)) => tail,
+            Ok((_, false)) => return false,
+            Err(error) => {
+                tracing::debug!(conversation_id = %manifest.id, error = %error, "journal tail unreadable; running full recovery");
+                return false;
+            }
+        };
+        match tail {
+            None => manifest.last_sequence == 0,
+            Some(event) => {
+                event.sequence == manifest.last_sequence
+                    && (TURN_TERMINAL_EVENTS.contains(&event.event_type.as_str())
+                        || CONVERSATION_TERMINAL_EVENTS.contains(&event.event_type.as_str()))
+            }
+        }
     }
 
     async fn recover_conversation(&self, manifest: &ConversationManifest) -> Result<(), AppError> {
@@ -3503,6 +3553,153 @@ mod tests {
         supervisor.recover_all().await.unwrap();
         assert_eq!(
             store.complete_history(&open.id).await.unwrap().len(),
+            history.len()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn journal_path(root: &Path, conversation_id: &str) -> PathBuf {
+        root.join("data/conversations")
+            .join(conversation_id)
+            .join("events.jsonl")
+    }
+
+    fn corrupt_copies(root: &Path, conversation_id: &str) -> usize {
+        fs::read_dir(root.join("data/conversations").join(conversation_id))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("events.corrupt.")
+            })
+            .count()
+    }
+
+    /// Replace journal line `index` with bytes that do not parse.
+    fn corrupt_journal_line(root: &Path, conversation_id: &str, index: usize) -> Vec<u8> {
+        let path = journal_path(root, conversation_id);
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut lines = raw.lines().map(str::to_owned).collect::<Vec<_>>();
+        lines[index] = "{\"torn".to_owned();
+        let corrupt = format!("{}\n", lines.join("\n")).into_bytes();
+        fs::write(&path, &corrupt).unwrap();
+        corrupt
+    }
+
+    #[tokio::test]
+    async fn recover_all_leaves_settled_journals_to_their_first_read() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-recover-lazy").await;
+        let mut ids = Vec::new();
+        for last in ["turn.completed", "message.created"] {
+            let manifest = store
+                .create(ConversationManifest::new(
+                    ProviderKind::Codex,
+                    workspace.clone(),
+                    None,
+                    None,
+                ))
+                .await
+                .unwrap();
+            for event_type in ["message.created", "turn.started", "turn.completed", last] {
+                store
+                    .append(&manifest.id, event_type, json!({ "turnId": "t" }))
+                    .await
+                    .unwrap();
+            }
+            ids.push(manifest.id);
+        }
+        let (settled, unsettled) = (&ids[0], &ids[1]);
+        let settled_bytes = corrupt_journal_line(&root, settled, 1);
+        corrupt_journal_line(&root, unsettled, 1);
+
+        supervisor.recover_all().await.unwrap();
+
+        // Idle, terminal tail, manifest in step: startup never read the
+        // journal body, so the damage is still there untouched.
+        assert_eq!(
+            fs::read(journal_path(&root, settled)).unwrap(),
+            settled_bytes
+        );
+        assert_eq!(corrupt_copies(&root, settled), 0);
+        assert_eq!(
+            store.get(settled).await.unwrap().status,
+            ConversationStatus::Idle
+        );
+        // A non-terminal tail forces the full scan, which salvages at startup.
+        assert_eq!(corrupt_copies(&root, unsettled), 1);
+
+        // The first read of the settled conversation validates and salvages.
+        let replay = supervisor.replay(settled, 0, 100).await.unwrap();
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(replay.events[1].event_type, "journal.recordLost");
+        assert_eq!(corrupt_copies(&root, settled), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recover_all_fully_recovers_a_journal_ahead_of_its_manifest() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-recover-ahead").await;
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                workspace,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        for event_type in ["turn.started", "turn.completed"] {
+            store
+                .append(&manifest.id, event_type, json!({ "turnId": "a" }))
+                .await
+                .unwrap();
+        }
+        // Journal lines a crash kept while the manifest never saw them: turn b
+        // opens, then a late terminal for turn a leaves it open while the
+        // tail still looks terminal.
+        let mut raw = fs::read(journal_path(&root, &manifest.id)).unwrap();
+        for (sequence, event_type, turn_id) in
+            [(3, "turn.started", "b"), (4, "turn.completed", "a")]
+        {
+            let event = ConversationEvent::new(
+                &manifest.id,
+                sequence,
+                event_type,
+                json!({ "turnId": turn_id }),
+            );
+            raw.extend(serde_json::to_vec(&event).unwrap());
+            raw.push(b'\n');
+        }
+        fs::write(journal_path(&root, &manifest.id), raw).unwrap();
+        assert_eq!(store.get(&manifest.id).await.unwrap().last_sequence, 2);
+
+        supervisor.recover_all().await.unwrap();
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let interrupted = history
+            .iter()
+            .filter(|event| event.event_type == "conversation.interrupted")
+            .collect::<Vec<_>>();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].sequence, 5);
+        assert_eq!(interrupted[0].payload["turnId"], "b");
+        let recovered = store.get(&manifest.id).await.unwrap();
+        assert_eq!(recovered.last_sequence, 5);
+        assert_eq!(recovered.status, ConversationStatus::Interrupted);
+
+        // Now settled: a second startup appends nothing.
+        supervisor.recover_all().await.unwrap();
+        assert_eq!(
+            store.complete_history(&manifest.id).await.unwrap().len(),
             history.len()
         );
         fs::remove_dir_all(root).unwrap();

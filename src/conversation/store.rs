@@ -44,7 +44,7 @@ const JOURNAL_SCAN_BUFFER_BYTES: usize = 256 * 1024;
 /// lost. Its payload is `{reason, runStart, runLength, backup}`; clients show
 /// consecutive placeholders sharing `runStart` as one notice. Appends cannot
 /// forge it: [`validate_event_type`] rejects its upper-case letter.
-pub(crate) const JOURNAL_RECORD_LOST_EVENT: &str = "journal.recordLost";
+const JOURNAL_RECORD_LOST_EVENT: &str = "journal.recordLost";
 /// Lower bound on the serialized size of any journal record (each carries a
 /// 36-byte event id, a 36-byte conversation id and an RFC 3339 time). Salvage
 /// uses it to bound how many sequences a corrupt region can have swallowed,
@@ -926,6 +926,20 @@ impl ConversationStore {
             }
         }
         Ok(events)
+    }
+
+    /// The journal's newest record, read from the end of the file only, and
+    /// whether the journal ends with a newline (`false`: an interrupted write
+    /// left the final record unterminated). Startup uses it to skip the full
+    /// scan of settled conversations; it neither validates nor repairs the
+    /// rest of the journal, which the first full read does.
+    pub async fn journal_tail(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(Option<ConversationEvent>, bool), AppError> {
+        let _guard = self.lock(conversation_id).await;
+        self.flush_pending_delta_logged(conversation_id).await;
+        self.read_last_event(conversation_id).await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
