@@ -2530,13 +2530,7 @@ impl SubscriptionWorker {
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     if outgoing
-                        .send(json!({
-                            "type": "server.error",
-                            "payload": {
-                                "code": "EVENT_STREAM_LAGGED",
-                                "message": format!("conversation {conversation_id} stream lagged by {skipped} events; replaying persisted events"),
-                            }
-                        }))
+                        .send(stream_lagged_frame(conversation_id, skipped))
                         .await
                         .is_err()
                     {
@@ -2591,6 +2585,20 @@ impl SubscriptionWorker {
             }
         }
     }
+}
+
+/// Tells the client a subscription's live stream skipped events that are
+/// being replayed from the journal. It has no request id; `conversationId`
+/// scopes it so clients do not treat it as a connection-level error.
+fn stream_lagged_frame(conversation_id: &str, skipped: u64) -> Value {
+    json!({
+        "type": "server.error",
+        "payload": {
+            "code": "EVENT_STREAM_LAGGED",
+            "message": format!("conversation {conversation_id} stream lagged by {skipped} events; replaying persisted events"),
+            "conversationId": conversation_id,
+        }
+    })
 }
 
 async fn dispatch_command(
@@ -6843,6 +6851,59 @@ mod tests {
         assert_eq!(cancelled["type"], "server.error");
         assert_eq!(cancelled["payload"]["code"], "CONFLICT");
         assert!(events.try_recv().is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_lagged_subscription_sends_a_scoped_lag_frame_and_replays() {
+        let (root, state, store, hub, manifest) = subscription_fixture("lagged").await;
+        // A one-slot queue parks the task on its first live frame while the
+        // hub overruns the subscription's broadcast ring.
+        let (outgoing, mut events) = mpsc::channel(1);
+        let mut subscriptions = WsSubscriptions::new();
+        let (_, ack) = subscribe_and_collect(
+            &state,
+            &outgoing,
+            &mut events,
+            &mut subscriptions,
+            "sub",
+            json!({ "conversationId": manifest.id }),
+        )
+        .await;
+        assert_eq!(ack["type"], "server.result");
+        let published = 300;
+        for index in 0..published {
+            let event = store
+                .append(&manifest.id, "fixture.live", json!({ "index": index }))
+                .await
+                .unwrap();
+            hub.publish(event);
+        }
+        let last_sequence = 1 + published;
+
+        let mut lag_frame = None;
+        let mut delivered = Vec::new();
+        while delivered.last() != Some(&last_sequence) {
+            let frame = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("lagged subscription keeps delivering")
+                .unwrap();
+            if frame["type"] == "server.error" {
+                lag_frame = Some(frame);
+                continue;
+            }
+            delivered.push(frame["payload"]["sequence"].as_u64().unwrap());
+        }
+        let lag_frame = lag_frame.expect("lag is reported");
+        assert!(lag_frame.get("id").is_none());
+        assert_eq!(lag_frame["payload"]["code"], "EVENT_STREAM_LAGGED");
+        assert_eq!(lag_frame["payload"]["conversationId"], json!(manifest.id));
+        assert!(lag_frame["payload"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stream lagged"));
+        assert_eq!(delivered, (2..=last_sequence).collect::<Vec<_>>());
+        subscriptions.abort_all();
         let _ = fs::remove_dir_all(root);
     }
 
