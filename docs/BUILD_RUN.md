@@ -79,6 +79,7 @@ opencode --version
 | `TODEX_AGENTD_DEVIN_ENV_ALLOWLIST` | 允许传给 Devin 的逗号分隔环境变量名 |
 | `TODEX_AGENTD_OPENCODE_BIN` | `opencode` 命令路径 |
 | `TODEX_AGENTD_OPENCODE_ENV_ALLOWLIST` | 允许传给 OpenCode 的逗号分隔环境变量名 |
+| `TODEX_AGENTD_PROVIDER_IDLE_TIMEOUT_MINUTES` | Provider 空闲超时分钟数（默认 60，`0` 关闭） |
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
@@ -109,6 +110,7 @@ devin_bin = "devin"
 devin_env_allowlist = ["DEVIN_API_KEY", "DEVIN_MODEL", "WINDSURF_API_KEY"]
 opencode_bin = "opencode"
 opencode_env_allowlist = ["OPENCODE_CONFIG", "OPENCODE_API_KEY", "OPENCODE_PERMISSION"]
+provider_idle_timeout_minutes = 60   # Provider 连续无输出超过该分钟数时停止当前 turn（PROVIDER_IDLE_TIMEOUT）；0 关闭
 
 [agent.acp_profiles.example]
 command = "example-acp-agent"

@@ -203,6 +203,8 @@ default_agent = "codex"
 codex_bin = "codex"
 claude_bin = "claude"
 pi_bin = "pi"
+# Provider 连续无输出超过该分钟数时停止当前 turn（0 关闭）
+provider_idle_timeout_minutes = 60
 
 [agent.acp_profiles.default]
 command = "mcp-server"

@@ -211,6 +211,8 @@ default_agent = "codex"
 codex_bin = "codex"
 claude_bin = "claude"
 pi_bin = "pi"
+# Stop a turn whose provider produces no output for this many minutes (0 disables).
+provider_idle_timeout_minutes = 60
 
 [agent.acp_profiles.default]
 command = "mcp-server"
