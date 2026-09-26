@@ -17,8 +17,8 @@ use uuid::Uuid;
 use crate::catalog::CatalogService;
 use crate::config::Config;
 use crate::conversation::{
-    ConversationEventHub, ConversationManifest, ConversationReplay, ConversationStatus,
-    ConversationStore, ProviderKind, ProviderState,
+    status_after_conversation_event, ConversationEventHub, ConversationManifest,
+    ConversationReplay, ConversationStatus, ConversationStore, ProviderKind, ProviderState,
 };
 use crate::error::AppError;
 use crate::mcp;
@@ -74,6 +74,27 @@ const TERMINAL_EVENT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(500),
     Duration::from_secs(2),
 ];
+
+/// The turn a crash left open: the last `turn.started` with no later terminal
+/// event for it. A turn terminal without a turnId, or a conversation-level
+/// interruption or failure, closes whatever turn was open.
+fn open_turn_id(history: &[crate::conversation::ConversationEvent]) -> Option<String> {
+    let mut open = None;
+    for event in history {
+        let turn_id = event.payload.get("turnId").and_then(Value::as_str);
+        match event.event_type.as_str() {
+            "turn.started" => open = turn_id.map(str::to_owned),
+            "turn.completed" | "turn.failed" | "turn.cancelled" | "turn.interrupted"
+                if turn_id.is_none() || turn_id == open.as_deref() =>
+            {
+                open = None;
+            }
+            "conversation.interrupted" | "conversation.failed" => open = None,
+            _ => {}
+        }
+    }
+    open
+}
 
 /// Runs `attempt(0)`, then one retry per delay while it fails, and returns
 /// the last error once the delays are exhausted.
@@ -353,11 +374,19 @@ impl ConversationSupervisor {
     }
 
     async fn recover_conversation(&self, manifest: &ConversationManifest) -> Result<(), AppError> {
-        let was_active = matches!(
-            manifest.status,
-            ConversationStatus::Running | ConversationStatus::WaitingPermission
-        );
         let (recovered, history) = self.store.recover_with_history(&manifest.id).await?;
+        // Whether work was in flight comes from the journal, not the manifest:
+        // the manifest is written after the journal line, so a crash between
+        // the two leaves a stale status in either direction.
+        let open_turn = open_turn_id(&history);
+        let journal_status = history
+            .iter()
+            .fold(ConversationStatus::Idle, status_after_conversation_event);
+        let was_active = open_turn.is_some()
+            || matches!(
+                journal_status,
+                ConversationStatus::Running | ConversationStatus::WaitingPermission
+            );
         let mut expired = std::collections::BTreeMap::new();
         let mut resident_runtimes = std::collections::BTreeSet::new();
         for event in history {
@@ -405,15 +434,15 @@ impl ConversationSupervisor {
         }
 
         if was_active {
-            self.emit(
-                &recovered.id,
-                "conversation.interrupted",
-                json!({
-                    "reason": "daemon_restarted",
-                    "message": "The previous in-progress turn was interrupted; it was not replayed.",
-                }),
-            )
-            .await?;
+            let mut payload = json!({
+                "reason": "daemon_restarted",
+                "message": "The previous in-progress turn was interrupted; it was not replayed.",
+            });
+            if let Some(turn_id) = open_turn {
+                payload["turnId"] = json!(turn_id);
+            }
+            self.emit(&recovered.id, "conversation.interrupted", payload)
+                .await?;
         }
         Ok(())
     }
@@ -3058,6 +3087,117 @@ mod tests {
         assert_eq!(reports[1]["kind"], "oversized_line");
         assert_eq!(reports[1]["bytes"], 4_194_400);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Rewrites a manifest's status on disk, as a crash between the journal
+    /// append and the manifest write would leave it.
+    fn set_manifest_status(root: &Path, conversation_id: &str, status: &str) {
+        let path = root
+            .join("data/conversations")
+            .join(conversation_id)
+            .join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["status"] = json!(status);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_follows_the_journal_not_the_manifest_status() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-recover-journal").await;
+        let open = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                workspace.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(&open.id, "turn.started", json!({ "turnId": "turn-open" }))
+            .await
+            .unwrap();
+        set_manifest_status(&root, &open.id, "idle");
+        let closed = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                workspace,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        for event_type in ["turn.started", "turn.completed"] {
+            store
+                .append(&closed.id, event_type, json!({ "turnId": "turn-closed" }))
+                .await
+                .unwrap();
+        }
+        set_manifest_status(&root, &closed.id, "running");
+        let closed_events = store.complete_history(&closed.id).await.unwrap().len();
+
+        supervisor.recover_all().await.unwrap();
+
+        let history = store.complete_history(&open.id).await.unwrap();
+        let interrupted = history
+            .iter()
+            .filter(|event| event.event_type == "conversation.interrupted")
+            .collect::<Vec<_>>();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].payload["turnId"], "turn-open");
+        assert_eq!(interrupted[0].payload["reason"], "daemon_restarted");
+        assert_eq!(
+            store.get(&open.id).await.unwrap().status,
+            ConversationStatus::Interrupted
+        );
+        // The stale "running" manifest is rebuilt from the journal as idle and
+        // no interruption is invented for a turn that already completed.
+        assert_eq!(
+            store.complete_history(&closed.id).await.unwrap().len(),
+            closed_events
+        );
+        assert_eq!(
+            store.get(&closed.id).await.unwrap().status,
+            ConversationStatus::Idle
+        );
+
+        supervisor.recover_all().await.unwrap();
+        assert_eq!(
+            store.complete_history(&open.id).await.unwrap().len(),
+            history.len()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn open_turn_is_the_last_started_turn_without_its_own_terminal_event() {
+        let event = |event_type: &str, payload: Value| {
+            ConversationEvent::new("conversation", 1, event_type, payload)
+        };
+        assert_eq!(open_turn_id(&[]), None);
+        assert_eq!(
+            open_turn_id(&[
+                event("turn.started", json!({ "turnId": "a" })),
+                event("turn.completed", json!({ "turnId": "a" })),
+                event("turn.started", json!({ "turnId": "b" })),
+                event("turn.failed", json!({ "turnId": "a" })),
+            ]),
+            Some("b".to_owned())
+        );
+        for terminal in [
+            event("turn.cancelled", json!({ "turnId": "b" })),
+            event("turn.interrupted", json!({})),
+            event(
+                "conversation.interrupted",
+                json!({ "reason": "daemon_restarted" }),
+            ),
+            event("conversation.failed", json!({})),
+        ] {
+            assert_eq!(
+                open_turn_id(&[event("turn.started", json!({ "turnId": "b" })), terminal]),
+                None
+            );
+        }
     }
 
     #[tokio::test]
