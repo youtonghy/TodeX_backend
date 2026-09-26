@@ -6,7 +6,7 @@ mod store;
 mod summary;
 
 pub use coalesce::{DeltaFragment, PendingDelta};
-pub use hub::ConversationEventHub;
+pub use hub::{ConversationEventHub, ConversationSubscription};
 pub use migration::migrate_legacy_codex_sessions;
 pub use model::{
     redact_secrets, status_after_conversation_event, ConversationEvent, ConversationManifest,

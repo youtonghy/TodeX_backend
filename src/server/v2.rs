@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::warn;
 
 use crate::app_state::AppState;
-use crate::conversation::{ConversationEvent, ConversationManifest, ProviderKind};
+use crate::conversation::{ConversationManifest, ConversationSubscription, ProviderKind};
 use crate::device_auth;
 use crate::error::AppError;
 use crate::provider::{
@@ -2393,11 +2393,7 @@ struct SubscriptionWorker {
 }
 
 impl SubscriptionWorker {
-    async fn run(
-        self,
-        receiver: tokio::sync::broadcast::Receiver<ConversationEvent>,
-        backfill_permits: Arc<Semaphore>,
-    ) {
+    async fn run(self, subscription: ConversationSubscription, backfill_permits: Arc<Semaphore>) {
         let backfill = match backfill_permits.acquire_owned().await {
             Ok(_permit) => self.backfill().await,
             // The semaphore is never closed; treat it like a dead connection.
@@ -2424,7 +2420,9 @@ impl SubscriptionWorker {
         self.answered
             .store(true, std::sync::atomic::Ordering::Release);
         if let (true, Some(high_water)) = (delivered, live_after) {
-            self.forward_live(receiver, high_water).await;
+            self.forward_live(subscription, high_water).await;
+        } else {
+            drop(subscription);
         }
         self.active.lock().await.remove(&self.conversation_id);
     }
@@ -2487,11 +2485,7 @@ impl SubscriptionWorker {
         })
     }
 
-    async fn forward_live(
-        &self,
-        mut receiver: tokio::sync::broadcast::Receiver<ConversationEvent>,
-        high_water: u64,
-    ) {
+    async fn forward_live(&self, mut receiver: ConversationSubscription, high_water: u64) {
         let conversations = &self.conversations;
         let outgoing = &self.outgoing;
         let owner_id = &self.owner_id;
@@ -2675,7 +2669,10 @@ async fn start_subscription(
     }
     // Subscribe before the worker reads the high-water mark so no event
     // falls between backfill and live delivery.
-    let receiver = state.conversations.subscribe(&request.conversation_id);
+    let receiver = state.conversation_hub.track(
+        &request.conversation_id,
+        state.conversations.subscribe(&request.conversation_id),
+    );
     let answered = Arc::new(AtomicBool::new(false));
     let worker = SubscriptionWorker {
         conversations: state.conversations.clone(),
@@ -4098,6 +4095,7 @@ mod tests {
             hub.clone(),
             state.workspace_trust.clone(),
         );
+        state.conversation_hub = hub.clone();
         let manifest = state
             .conversations
             .create_owned(
@@ -4252,6 +4250,7 @@ mod tests {
             hub.clone(),
             state.workspace_trust.clone(),
         );
+        state.conversation_hub = hub.clone();
         let manifest = state
             .conversations
             .create_owned(
@@ -4547,6 +4546,7 @@ mod tests {
             hub.clone(),
             state.workspace_trust.clone(),
         );
+        state.conversation_hub = hub.clone();
         let manifest = state
             .conversations
             .create_owned(
@@ -4593,6 +4593,10 @@ mod tests {
         assert_eq!(result["unsubscribed"], true);
         assert!(subscriptions.active.lock().await.is_empty());
         assert!(subscriptions.tasks.is_empty());
+        assert!(
+            !hub.has_channel(&manifest.id),
+            "unsubscribe reclaims the channel"
+        );
 
         // Unsubscribing an absent conversation is idempotent, and the freed
         // slot accepts a fresh subscription.
@@ -4677,6 +4681,7 @@ mod tests {
             hub.clone(),
             state.workspace_trust.clone(),
         );
+        state.conversation_hub = hub.clone();
         let manifest = state
             .conversations
             .create_owned(
@@ -6639,6 +6644,7 @@ mod tests {
             hub.clone(),
             state.workspace_trust.clone(),
         );
+        state.conversation_hub = hub.clone();
         let manifest = state
             .conversations
             .create_owned(
@@ -6768,13 +6774,23 @@ mod tests {
             .unwrap();
         assert_eq!(received["delivery"], "live");
         assert_eq!(received["payload"]["sequence"], 22);
+
+        // Connection teardown aborts the task, which reclaims the channel.
+        assert!(hub.has_channel(&manifest.id));
         subscriptions.abort_all();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while hub.has_channel(&manifest.id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an aborted subscription reclaims its channel");
         let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn v2_unsubscribe_during_backfill_answers_the_pending_subscribe() {
-        let (root, state, _store, _hub, manifest) = subscription_fixture("unsub-bg").await;
+        let (root, state, _store, hub, manifest) = subscription_fixture("unsub-bg").await;
         let (outgoing, mut events) = mpsc::channel(16);
         let mut subscriptions = WsSubscriptions::new();
         let event_scope = Arc::new(tokio::sync::RwLock::new(
@@ -6819,6 +6835,7 @@ mod tests {
         assert_eq!(unsubscribed["payload"]["unsubscribed"], true);
         assert!(subscriptions.active.lock().await.is_empty());
         assert!(subscriptions.tasks.is_empty());
+        assert!(!hub.has_channel(&manifest.id));
 
         // The cancelled subscribe is answered exactly once, with an error.
         let cancelled = events.try_recv().expect("pending subscribe is answered");

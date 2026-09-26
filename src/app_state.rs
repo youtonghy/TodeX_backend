@@ -35,6 +35,9 @@ pub struct AppState {
     pub codex_gateway: CodexGatewayStore,
     pub codex_local_adapters: CodexLocalAdapterSupervisor,
     pub conversations: ConversationSupervisor,
+    /// The hub `conversations` publishes through; websocket subscriptions use
+    /// it to reclaim a channel once its last receiver is gone.
+    pub conversation_hub: ConversationEventHub,
     pub cli_manager: CliManager,
     pub(crate) cli_execution_gate: Arc<tokio::sync::RwLock<()>>,
     conversation_store: ConversationStore,
@@ -105,7 +108,7 @@ impl AppState {
         let conversations = ConversationSupervisor::new_with_execution_gate(
             config.clone(),
             conversation_store.clone(),
-            conversation_hub,
+            conversation_hub.clone(),
             workspace_trust.clone(),
             cli_execution_gate.clone(),
         );
@@ -127,6 +130,7 @@ impl AppState {
             codex_gateway,
             codex_local_adapters,
             conversations,
+            conversation_hub,
             cli_manager,
             cli_execution_gate,
             conversation_store,
