@@ -2399,9 +2399,9 @@ impl SubscriptionWorker {
             // The semaphore is never closed; treat it like a dead connection.
             Err(_) => Err(AppError::StreamClosed),
         };
-        let (response, live_after) = match backfill {
-            Ok(progress) => (
-                json!({
+        let terminal_frame = match backfill {
+            Ok(progress) => {
+                let ack = json!({
                     "id": self.request_id,
                     "type": "server.result",
                     "payload": {
@@ -2411,20 +2411,32 @@ impl SubscriptionWorker {
                         "hasMore": progress.next_sequence < progress.high_water,
                         "lastSequence": progress.high_water,
                     },
-                }),
-                Some(progress.high_water),
-            ),
-            Err(error) => (error_response(Some(self.request_id.clone()), error), None),
+                });
+                let delivered = queue_frame(&self.outgoing, ack).await.is_ok();
+                self.answered
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if delivered {
+                    self.forward_live(subscription, progress.high_water).await
+                } else {
+                    None
+                }
+            }
+            Err(error) => {
+                drop(subscription);
+                Some(error_response(Some(self.request_id.clone()), error))
+            }
         };
-        let delivered = queue_frame(&self.outgoing, response).await.is_ok();
+        // Free the slot before the client can see the failure, so an
+        // immediate retry starts a new subscription instead of being
+        // deduplicated against this one.
+        self.active.lock().await.remove(&self.conversation_id);
+        if let Some(frame) = terminal_frame {
+            // A failed delivery means the connection is going away.
+            let _ = queue_frame(&self.outgoing, frame).await;
+        }
+        // After a failed backfill the terminal frame was the request's answer.
         self.answered
             .store(true, std::sync::atomic::Ordering::Release);
-        if let (true, Some(high_water)) = (delivered, live_after) {
-            self.forward_live(subscription, high_water).await;
-        } else {
-            drop(subscription);
-        }
-        self.active.lock().await.remove(&self.conversation_id);
     }
 
     /// Replays the journal through the high-water mark read after the live
@@ -2485,7 +2497,13 @@ impl SubscriptionWorker {
         })
     }
 
-    async fn forward_live(&self, mut receiver: ConversationSubscription, high_water: u64) {
+    /// Forwards live events until the stream ends. Returns the conversation
+    /// scoped error frame to report when gap or lag recovery failed.
+    async fn forward_live(
+        &self,
+        mut receiver: ConversationSubscription,
+        high_water: u64,
+    ) -> Option<Value> {
         let conversations = &self.conversations;
         let outgoing = &self.outgoing;
         let owner_id = &self.owner_id;
@@ -2514,8 +2532,7 @@ impl SubscriptionWorker {
                         if let Err(error) = recovery {
                             let mut frame = error_response(None, error);
                             frame["payload"]["conversationId"] = json!(conversation_id);
-                            let _ = outgoing.send(frame).await;
-                            break;
+                            return Some(frame);
                         }
                     }
                     delivered_through = event.sequence;
@@ -2577,13 +2594,13 @@ impl SubscriptionWorker {
                     if let Err(error) = recovery {
                         let mut frame = error_response(None, error);
                         frame["payload"]["conversationId"] = json!(conversation_id);
-                        let _ = outgoing.send(frame).await;
-                        break;
+                        return Some(frame);
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
+        None
     }
 }
 
@@ -2701,9 +2718,9 @@ async fn start_subscription(
         request_id: command.id.clone(),
         answered,
     };
-    if let Some(previous) = subscriptions.tasks.insert(request.conversation_id, task) {
-        previous.handle.abort();
-    }
+    // A task still mapped to this id already released its slot and is only
+    // queueing its final frame; it finishes on its own.
+    subscriptions.tasks.insert(request.conversation_id, task);
     Ok(None)
 }
 
@@ -6904,6 +6921,72 @@ mod tests {
             .contains("stream lagged"));
         assert_eq!(delivered, (2..=last_sequence).collect::<Vec<_>>());
         subscriptions.abort_all();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_failed_backfill_frees_the_slot_before_reporting() {
+        let (root, state, store, hub, manifest) = subscription_fixture("backfill-fail").await;
+        // A full one-slot queue holds the failure frame back until drained.
+        let (outgoing, mut events) = mpsc::channel(1);
+        let mut subscriptions = WsSubscriptions::new();
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        let subscribe = || V2Command {
+            id: "sub".to_owned(),
+            command_type: "conversation.subscribe".to_owned(),
+            payload: json!({ "conversationId": manifest.id }),
+        };
+        let permits = subscriptions
+            .backfill_permits
+            .clone()
+            .acquire_many_owned(MAX_WS_CONCURRENT_BACKFILLS as u32)
+            .await
+            .unwrap();
+        let deferred = dispatch_command(
+            &state,
+            &outgoing,
+            &mut subscriptions,
+            &event_scope,
+            "local",
+            subscribe(),
+        )
+        .await;
+        assert!(deferred.is_none());
+        // The conversation disappears before its backfill starts.
+        store.delete(&manifest.id).await.unwrap();
+        outgoing.send(json!({ "type": "filler" })).await.unwrap();
+        drop(permits);
+
+        // The slot is free before the failure can reach the client.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !subscriptions.active.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a failed subscription releases its slot before reporting");
+        assert_eq!(events.recv().await.unwrap()["type"], "filler");
+        let failure = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure["id"], "sub");
+        assert_eq!(failure["type"], "server.error");
+        let retry = dispatch_command(
+            &state,
+            &outgoing,
+            &mut subscriptions,
+            &event_scope,
+            "local",
+            subscribe(),
+        )
+        .await
+        .expect("retry is answered inline");
+        assert_eq!(retry["type"], "server.error");
+        assert!(retry["payload"].get("alreadySubscribed").is_none());
+        assert!(!hub.has_channel(&manifest.id));
         let _ = fs::remove_dir_all(root);
     }
 
