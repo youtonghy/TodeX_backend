@@ -3,7 +3,9 @@
 //! While a server is active, every provider it spawns is recorded in
 //! `<data_dir>/provider_processes.json`; the next start kills each recorded
 //! group whose leader is still the recorded process, identified by PID *and*
-//! start time so a reused PID is never signalled.
+//! start time so a reused PID is never signalled. The file also names the
+//! server that owns it; while that server is still alive a second server on
+//! the same data directory neither reaps nor takes over its records.
 //!
 //! Unix only; elsewhere tracking and reaping are no-ops.
 
@@ -51,15 +53,27 @@ mod unix {
         pub(super) program: String,
     }
 
+    /// The server process that writes the registry, identified like a
+    /// provider by PID and start time.
+    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(super) struct RegistryOwner {
+        pub(super) pid: u32,
+        pub(super) start_time: String,
+    }
+
     #[derive(Debug, Default, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
     struct RegistryFile {
         schema_version: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<RegistryOwner>,
         processes: Vec<ProcessRecord>,
     }
 
     pub(super) struct ProcessRegistry {
         path: PathBuf,
+        owner: Option<RegistryOwner>,
         records: Mutex<Vec<ProcessRecord>>,
     }
 
@@ -81,15 +95,31 @@ mod unix {
     /// one's providers.
     pub(crate) async fn activate(data_dir: &Path) {
         let path = data_dir.join(REGISTRY_FILE);
-        let reaped = reap_orphans(&path).await;
+        let reaped = match reap_orphans(&path).await {
+            Ok(reaped) => reaped,
+            Err(owner) => {
+                tracing::warn!(
+                    owner_pid = owner.pid,
+                    "another running server owns this data directory's provider registry; provider crash cleanup is disabled for this server"
+                );
+                return;
+            }
+        };
         if reaped > 0 {
             tracing::warn!(
                 reaped,
                 "killed provider processes orphaned by a previous daemon run"
             );
         }
+        let owner = current_owner().await;
+        if owner.is_none() {
+            tracing::warn!(
+                "could not read this server's start time; another server could reap its providers"
+            );
+        }
         let registry = Arc::new(ProcessRegistry {
             path,
+            owner,
             records: Mutex::new(Vec::new()),
         });
         registry.persist(&[]);
@@ -109,9 +139,10 @@ mod unix {
 
     impl ProcessRegistry {
         #[cfg(test)]
-        pub(super) fn new(path: PathBuf) -> Arc<Self> {
+        pub(super) fn new(path: PathBuf, owner: Option<RegistryOwner>) -> Arc<Self> {
             Arc::new(Self {
                 path,
+                owner,
                 records: Mutex::new(Vec::new()),
             })
         }
@@ -165,6 +196,7 @@ mod unix {
         fn persist(&self, records: &[ProcessRecord]) {
             let file = RegistryFile {
                 schema_version: SCHEMA_VERSION,
+                owner: self.owner.clone(),
                 processes: records.to_vec(),
             };
             if let Err(error) = write_private_atomic(&self.path, &file) {
@@ -201,24 +233,41 @@ mod unix {
         result
     }
 
+    /// This server as a registry owner, or `None` if its start time can't be read.
+    async fn current_owner() -> Option<RegistryOwner> {
+        let pid = std::process::id();
+        let start_time = process_start_time(pid).await?;
+        Some(RegistryOwner { pid, start_time })
+    }
+
     /// Kills every recorded group whose leader still has the recorded start
     /// time, drops the other records, and returns how many groups were killed.
-    pub(super) async fn reap_orphans(path: &Path) -> usize {
+    /// Returns the owner instead when the server that wrote the registry is
+    /// still running: its providers are live, not orphaned.
+    pub(super) async fn reap_orphans(path: &Path) -> Result<usize, RegistryOwner> {
         let bytes = match tokio::fs::read(path).await {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(error) => {
                 tracing::warn!(path = %path.display(), error = %error, "failed to read the provider process registry");
-                return 0;
+                return Ok(0);
             }
         };
         let file: RegistryFile = match serde_json::from_slice(&bytes) {
             Ok(file) => file,
             Err(error) => {
                 tracing::warn!(path = %path.display(), error = %error, "ignoring an unreadable provider process registry");
-                return 0;
+                return Ok(0);
             }
         };
+        if let Some(owner) = file.owner {
+            let alive = owner.pid != std::process::id()
+                && process_start_time(owner.pid).await.as_deref()
+                    == Some(owner.start_time.as_str());
+            if alive {
+                return Err(owner);
+            }
+        }
         let mut reaped = 0;
         for record in file.processes {
             match process_start_time(record.pid).await {
@@ -243,7 +292,7 @@ mod unix {
                 ),
             }
         }
-        reaped
+        Ok(reaped)
     }
 
     /// The process's start time as printed by `ps`, or `None` if it does not
@@ -273,7 +322,9 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::time::Duration;
 
-    use super::unix::{process_start_time, reap_orphans, ProcessRecord, ProcessRegistry};
+    use super::unix::{
+        process_start_time, reap_orphans, ProcessRecord, ProcessRegistry, RegistryOwner,
+    };
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
@@ -335,7 +386,7 @@ mod tests {
             ],
         );
 
-        assert_eq!(reap_orphans(&path).await, 1);
+        assert_eq!(reap_orphans(&path).await, Ok(1));
         assert!(exited_within(&mut orphan, Duration::from_secs(5)).await);
         assert!(stranger.try_wait().unwrap().is_none());
 
@@ -348,7 +399,7 @@ mod tests {
     async fn tracked_processes_are_recorded_until_released() {
         let root = temp_dir("todex-provider-registry");
         let path = root.join("provider_processes.json");
-        let registry = ProcessRegistry::new(path.clone());
+        let registry = ProcessRegistry::new(path.clone(), None);
         let mut child = spawn_group_leader();
         let tracked = registry.clone().track(child.id(), "fixture").await.unwrap();
         let recorded: serde_json::Value =
@@ -366,6 +417,36 @@ mod tests {
 
         child.kill().unwrap();
         child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_live_owner_keeps_its_providers_from_a_second_server() {
+        let root = temp_dir("todex-provider-owner");
+        let path = root.join("provider_processes.json");
+        let mut owner_process = spawn_group_leader();
+        let mut provider = spawn_group_leader();
+        let owner = RegistryOwner {
+            pid: owner_process.id(),
+            start_time: process_start_time(owner_process.id()).await.unwrap(),
+        };
+        let registry = ProcessRegistry::new(path.clone(), Some(owner.clone()));
+        let tracked = registry
+            .clone()
+            .track(provider.id(), "fixture")
+            .await
+            .unwrap();
+
+        assert_eq!(reap_orphans(&path).await, Err(owner));
+        assert!(provider.try_wait().unwrap().is_none());
+
+        // Once the owning server is gone its providers are orphans again.
+        owner_process.kill().unwrap();
+        owner_process.wait().unwrap();
+        assert_eq!(reap_orphans(&path).await, Ok(1));
+        assert!(exited_within(&mut provider, Duration::from_secs(5)).await);
+
+        drop(tracked);
         let _ = std::fs::remove_dir_all(root);
     }
 }
