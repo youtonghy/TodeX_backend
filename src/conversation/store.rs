@@ -428,7 +428,7 @@ impl ConversationStore {
         let mut manifest: ConversationManifest =
             read_json(&directory.join(MANIFEST_FILE), "conversation manifest").await?;
         validate_manifest(&manifest, conversation_id)?;
-        let last_event = self.read_last_event(conversation_id).await?;
+        let (last_event, terminated) = self.read_last_event(conversation_id).await?;
         let journal_sequence = last_event.as_ref().map_or(0, |event| event.sequence);
         if manifest.last_sequence != journal_sequence {
             if journal_sequence != manifest.last_sequence.saturating_add(1) {
@@ -452,7 +452,14 @@ impl ConversationStore {
             payload,
         );
         event.provider = Some(manifest.provider);
-        let mut line = serde_json::to_vec(&event)?;
+        // An unterminated final record (a write interrupted before its
+        // newline) must not absorb this one; start a fresh line instead.
+        let separator = u64::from(!terminated);
+        let mut line = Vec::new();
+        if !terminated {
+            line.push(b'\n');
+        }
+        serde_json::to_writer(&mut line, &event)?;
         line.push(b'\n');
         let event_path = directory.join(EVENTS_FILE);
         let (mut journal_bytes, mut journal_modified) = journal_metadata(&event_path).await?;
@@ -477,9 +484,10 @@ impl ConversationStore {
         let metadata = file.metadata().await?;
         if let Some(mut index) = self.indexes.get_mut(conversation_id) {
             if index.bytes == journal_bytes && index.modified == journal_modified {
-                index
-                    .offsets
-                    .push((journal_bytes, journal_bytes + line.len() as u64 - 1));
+                index.offsets.push((
+                    journal_bytes + separator,
+                    journal_bytes + line.len() as u64 - 1,
+                ));
                 index.bytes = metadata.len();
                 index.modified = metadata.modified().ok();
             }
@@ -864,6 +872,7 @@ impl ConversationStore {
             .rposition(|(start, end)| !trim_ascii(&raw[*start..*end]).is_empty());
         let mut events = Vec::new();
         let mut offsets = Vec::new();
+        let mut tail_truncated = false;
         for (index, (start, end)) in ranges.iter().copied().enumerate() {
             let line = trim_ascii(&raw[start..end]);
             if line.is_empty() {
@@ -880,6 +889,7 @@ impl ConversationStore {
                     file.set_len(start as u64).await?;
                     file.sync_all().await?;
                     tracing::warn!(conversation_id, error = %error, "recovered invalid conversation journal tail");
+                    tail_truncated = true;
                     break;
                 }
                 Err(error) => {
@@ -892,6 +902,17 @@ impl ConversationStore {
             validate_event(&event, conversation_id, events.len() as u64 + 1)?;
             offsets.push((start as u64, end as u64));
             events.push(event);
+        }
+        // A complete record whose trailing newline never reached the disk
+        // parses fine, but the next O_APPEND write would glue its record onto
+        // it and a later scan would quarantine both. Terminate it now; the
+        // recorded offsets already end where the newline lands.
+        if !tail_truncated && raw.last().is_some_and(|byte| *byte != b'\n') {
+            terminate_journal(&path).await?;
+            tracing::warn!(
+                conversation_id,
+                "terminated conversation journal missing its final newline"
+            );
         }
         let metadata = tokio::fs::metadata(&path).await?;
         self.indexes.insert(
@@ -918,19 +939,24 @@ impl ConversationStore {
         Ok(events)
     }
 
+    /// The newest journal record plus whether the journal ends with a
+    /// newline. `false` means an interrupted write left the final record
+    /// unterminated, so the next append must start a new line first.
     async fn read_last_event(
         &self,
         conversation_id: &str,
-    ) -> Result<Option<ConversationEvent>, AppError> {
+    ) -> Result<(Option<ConversationEvent>, bool), AppError> {
         let path = self.directory(conversation_id)?.join(EVENTS_FILE);
         let metadata = match tokio::fs::metadata(&path).await {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, true)),
             Err(error) => return Err(error.into()),
         };
+        // Every writer that fills the tail cache leaves the journal
+        // newline-terminated (appends, recovery, the cold scan, compaction).
         if let Some(tail) = self.tails.get(conversation_id) {
             if tail.bytes == metadata.len() && tail.modified == metadata.modified().ok() {
-                return Ok(Some(tail.event.clone()));
+                return Ok((Some(tail.event.clone()), true));
             }
         }
         if metadata.len() > MAX_EVENTS_JOURNAL_BYTES {
@@ -939,7 +965,7 @@ impl ConversationStore {
             )));
         }
         if metadata.len() == 0 {
-            return Ok(None);
+            return Ok((None, true));
         }
 
         let window = (MAX_EVENT_PAYLOAD_BYTES as u64 + 64 * 1024).min(metadata.len());
@@ -947,6 +973,7 @@ impl ConversationStore {
         file.seek(std::io::SeekFrom::End(-(window as i64))).await?;
         let mut raw = Vec::with_capacity(window as usize);
         file.read_to_end(&mut raw).await?;
+        let terminated = raw.last().is_none_or(|byte| *byte == b'\n');
         if window < metadata.len() {
             let Some(first_newline) = raw.iter().position(|byte| *byte == b'\n') else {
                 return Err(AppError::InvalidRequest(
@@ -961,7 +988,7 @@ impl ConversationStore {
             .find(|line| !trim_ascii(line).is_empty())
             .map(trim_ascii);
         let Some(line) = line else {
-            return Ok(None);
+            return Ok((None, terminated));
         };
         let event: ConversationEvent = serde_json::from_slice(line).map_err(|error| {
             AppError::InvalidRequest(format!(
@@ -975,7 +1002,7 @@ impl ConversationStore {
                 "conversation {conversation_id} journal tail does not match its manifest"
             )));
         }
-        Ok(Some(event))
+        Ok((Some(event), terminated))
     }
 
     /// Free journal space without disturbing replay cursors: oversized payload
@@ -1261,6 +1288,18 @@ async fn write_atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), A
     tokio::fs::rename(&temporary, path).await?;
     set_owner_only(path, false).await?;
     sync_directory(parent).await
+}
+
+/// Append the newline an interrupted write left off the final record.
+async fn terminate_journal(path: &Path) -> Result<(), AppError> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(b"\n").await?;
+    file.flush().await?;
+    file.sync_data().await?;
+    Ok(())
 }
 
 async fn quarantine_tail(path: &Path, tail: &[u8]) -> Result<(), AppError> {
@@ -2080,6 +2119,122 @@ mod tests {
             result.map(|replay| sequences(&replay))
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn strip_final_newline(path: &Path) {
+        let mut raw = fs::read(path).unwrap();
+        assert_eq!(raw.pop(), Some(b'\n'));
+        fs::write(path, raw).unwrap();
+    }
+
+    fn quarantined(path: &Path) -> bool {
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("events.corrupt.")
+            })
+    }
+
+    #[tokio::test]
+    async fn append_after_restart_does_not_glue_onto_an_unterminated_record() {
+        let (root, id, path) = seed_journal("todex-unterminated-cold", 2).await;
+        strip_final_newline(&path);
+
+        // Restarted daemon: no caches, the tail is read from disk.
+        let restarted = ConversationStore::new(root.clone()).await.unwrap();
+        let appended = restarted
+            .append(&id, "turn.completed", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(appended.sequence, 3);
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 3);
+
+        let fresh = ConversationStore::new(root.clone()).await.unwrap();
+        let history = fresh.complete_history(&id).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let cold = ConversationStore::new(root.clone()).await.unwrap();
+        let page = cold.replay(&id, 0, 10).await.unwrap();
+        assert_eq!(sequences(&page), vec![1, 2, 3]);
+        assert!(!quarantined(&path));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_terminates_a_complete_record_missing_its_newline() {
+        let (root, id, path) = seed_journal("todex-unterminated-recover", 2).await;
+        strip_final_newline(&path);
+
+        let restarted = ConversationStore::new(root.clone()).await.unwrap();
+        let (manifest, history) = restarted.recover_with_history(&id).await.unwrap();
+        assert_eq!(manifest.last_sequence, 2);
+        assert_eq!(history.len(), 2);
+        assert!(fs::read(&path).unwrap().ends_with(b"\n"));
+        assert!(!quarantined(&path));
+
+        restarted
+            .append(&id, "turn.completed", json!({}))
+            .await
+            .unwrap();
+        let fresh = ConversationStore::new(root.clone()).await.unwrap();
+        let page = fresh.replay(&id, 0, 10).await.unwrap();
+        assert_eq!(sequences(&page), vec![1, 2, 3]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_append_does_not_glue_onto_an_unterminated_record() {
+        let root = temp_dir("todex-unterminated-warm");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        for index in 0..2 {
+            store
+                .append(
+                    &conversation.id,
+                    "provider.event",
+                    json!({ "index": index }),
+                )
+                .await
+                .unwrap();
+        }
+        // Warm the replay index before the journal loses its newline.
+        store.replay(&conversation.id, 0, 10).await.unwrap();
+        let path = root
+            .join("conversations")
+            .join(&conversation.id)
+            .join(EVENTS_FILE);
+        strip_final_newline(&path);
+
+        let appended = store
+            .append(&conversation.id, "provider.event", json!({ "index": 2 }))
+            .await
+            .unwrap();
+        assert_eq!(appended.sequence, 3);
+        let page = store.replay(&conversation.id, 0, 10).await.unwrap();
+        assert_eq!(sequences(&page), vec![1, 2, 3]);
+        let fresh = ConversationStore::new(root.clone()).await.unwrap();
+        let history = fresh.complete_history(&conversation.id).await.unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].payload["index"], 2);
+        assert!(!quarantined(&path));
         fs::remove_dir_all(root).unwrap();
     }
 
