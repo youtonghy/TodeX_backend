@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
 use crate::config::Config;
-use crate::server_runner::ManagedServer;
+use crate::server_runner::{ManagedServer, ProviderProcessTracking};
 use crate::transport_crypto::PairingKeys;
 
 const PID_FILE_NAME: &str = "daemon.json";
@@ -229,7 +229,7 @@ pub fn status(config: &Config) -> Result<Option<DaemonProcess>> {
 }
 
 pub async fn run(config: Config) -> Result<()> {
-    let server = ManagedServer::start(config).await?;
+    let server = ManagedServer::start(config, ProviderProcessTracking::Enabled).await?;
     let process = write_pid_file(server.config(), server.addr().port())?;
     let _guard = PidFileGuard {
         data_dir: server.config().data_dir.clone(),
@@ -930,6 +930,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: Default::default(),
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,

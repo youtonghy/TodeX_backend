@@ -1502,6 +1502,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: Default::default(),
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,

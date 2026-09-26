@@ -14,6 +14,8 @@ use tokio::time::{timeout, timeout_at, Duration, Instant};
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
+use super::process_registry::{self, TrackedProcess};
+
 const MAX_PROTOCOL_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// Bytes of an unparseable provider line kept for diagnostics.
 const UNPARSED_LINE_PREVIEW_BYTES: usize = 512;
@@ -130,6 +132,8 @@ pub struct JsonLineProcess {
     stderr: Arc<Mutex<Vec<u8>>>,
     stderr_task: JoinHandle<()>,
     pid: Option<u32>,
+    /// Crash-recovery record; dropped once the process group is gone.
+    tracked: Option<TrackedProcess>,
 }
 
 impl JsonLineProcess {
@@ -155,6 +159,22 @@ impl JsonLineProcess {
             use std::os::unix::process::CommandExt;
             command.as_std_mut().process_group(0);
         }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            // The kernel kills the provider if the daemon dies without running
+            // destructors. It fires when the spawning *thread* exits; tokio
+            // runtime worker threads live as long as the daemon.
+            // SAFETY: prctl is async-signal-safe and touches no parent state.
+            unsafe {
+                command.as_std_mut().pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
 
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -167,6 +187,10 @@ impl JsonLineProcess {
             }
         })?;
         let pid = child.id();
+        let tracked = match pid {
+            Some(pid) => process_registry::track(pid, &spec.program).await,
+            None => None,
+        };
         let stdin = child.stdin.take().ok_or_else(|| {
             AppError::ProviderUnavailable("provider process did not expose stdin".to_owned())
         })?;
@@ -188,6 +212,7 @@ impl JsonLineProcess {
             stderr,
             stderr_task,
             pid,
+            tracked,
         })
     }
 
@@ -298,6 +323,7 @@ impl JsonLineProcess {
             let _ = self.child.wait().await;
         }
         self.stderr_task.abort();
+        self.tracked = None;
     }
 }
 

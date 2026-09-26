@@ -66,6 +66,7 @@ impl Harness {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,

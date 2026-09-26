@@ -96,7 +96,12 @@ pub struct AgentConfig {
     pub opencode_bin: String,
     pub opencode_env_allowlist: Vec<String>,
     pub acp_profiles: BTreeMap<String, AcpProfileConfig>,
+    /// A running turn whose provider produces no output for this long is
+    /// stopped and failed. 0 disables the watchdog.
+    pub provider_idle_timeout_minutes: u64,
 }
+
+pub const DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES: u64 = 60;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AcpProfileConfig {
@@ -146,6 +151,7 @@ struct PartialAgentConfig {
     opencode_bin: Option<String>,
     opencode_env_allowlist: Option<Vec<String>>,
     acp_profiles: Option<BTreeMap<String, AcpProfileConfig>>,
+    provider_idle_timeout_minutes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -309,6 +315,14 @@ impl Config {
                 acp_profiles: agent_file
                     .acp_profiles
                     .unwrap_or(defaults.agent.acp_profiles),
+                provider_idle_timeout_minutes: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_PROVIDER_IDLE_TIMEOUT_MINUTES")
+                        .ok()
+                        .and_then(|value| value.trim().parse().ok()),
+                    agent_file.provider_idle_timeout_minutes,
+                    defaults.agent.provider_idle_timeout_minutes,
+                ),
             },
             security: SecurityConfig {
                 enable_auth,
@@ -407,6 +421,7 @@ impl Default for Config {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: default_opencode_env_allowlist(),
                 acp_profiles: BTreeMap::new(),
+                provider_idle_timeout_minutes: DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -517,6 +532,10 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
             overlay_agent.opencode_env_allowlist
         );
         replace_some!(base_agent.acp_profiles, overlay_agent.acp_profiles);
+        replace_some!(
+            base_agent.provider_idle_timeout_minutes,
+            overlay_agent.provider_idle_timeout_minutes
+        );
     }
     if let Some(overlay_security) = overlay.security {
         let base_security = base
@@ -753,7 +772,7 @@ mod tests {
 
     use super::{
         expand_home_with_home, load_file_config, optional_non_empty, Config, PairingEncryption,
-        ServeArgs,
+        ServeArgs, DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
     };
     use uuid::Uuid;
 
@@ -869,6 +888,36 @@ mod tests {
             Some("persisted")
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_idle_timeout_defaults_to_an_hour_and_can_be_disabled() {
+        assert_eq!(
+            Config::default().agent.provider_idle_timeout_minutes,
+            DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES
+        );
+        let root = env::temp_dir().join(format!(
+            "todex-config-idle-timeout-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("config.toml"),
+            "[agent]\nprovider_idle_timeout_minutes = 0\n",
+        )
+        .unwrap();
+        let config = Config::load_read_only(ServeArgs {
+            host: None,
+            port: None,
+            data_dir: Some(root.clone()),
+            workspace_root: Vec::new(),
+            history_retention_days: None,
+        })
+        .unwrap();
+        if env::var_os("TODEX_AGENTD_PROVIDER_IDLE_TIMEOUT_MINUTES").is_none() {
+            assert_eq!(config.agent.provider_idle_timeout_minutes, 0);
+        }
         let _ = fs::remove_dir_all(root);
     }
 

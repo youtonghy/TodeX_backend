@@ -29,7 +29,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
 use crate::config::{Config, ServeArgs};
-use crate::server_runner::ManagedServer;
+use crate::server_runner::{ManagedServer, ProviderProcessTracking};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -193,7 +193,10 @@ fn default_env_filter() -> tracing_subscriber::EnvFilter {
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let config = Config::load(args).context("failed to load configuration")?;
-    ManagedServer::start(config).await?.wait().await
+    ManagedServer::start(config, ProviderProcessTracking::Enabled)
+        .await?
+        .wait()
+        .await
 }
 
 async fn daemon_run(args: ServeArgs) -> anyhow::Result<()> {

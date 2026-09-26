@@ -22,8 +22,18 @@ pub struct ManagedServer {
     migration_task: Option<JoinHandle<()>>,
 }
 
+/// Whether the server records the provider processes it spawns and reaps the
+/// ones a crashed predecessor left behind. The registry is process-wide, so
+/// only the real daemon enables it; in-process test servers must not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderProcessTracking {
+    Enabled,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Disabled,
+}
+
 impl ManagedServer {
-    pub async fn start(config: Config) -> Result<Self> {
+    pub async fn start(config: Config, tracking: ProviderProcessTracking) -> Result<Self> {
         if config.security.enable_tls {
             anyhow::bail!(
                 "TLS is configured but this build has no certificate/key listener; terminate TLS at a trusted reverse proxy or disable enable_tls"
@@ -36,6 +46,12 @@ impl ManagedServer {
         let addr = listener
             .local_addr()
             .context("failed to read bound address")?;
+        // After the bind, so a second server on the same data directory that
+        // cannot listen never kills the running one's providers; before
+        // AppState::new, so conversation recovery sees no live orphans.
+        if tracking == ProviderProcessTracking::Enabled {
+            crate::provider::process_registry::activate(&config.data_dir).await;
+        }
         let state = AppState::new(config.clone()).await?;
         let retention_task = config.history_retention_days.map(|days| {
             let state = state.clone();
@@ -164,7 +180,7 @@ pub fn bind_addr(config: &Config) -> Result<SocketAddr> {
 mod tests {
     use std::{env, fs};
 
-    use super::ManagedServer;
+    use super::{ManagedServer, ProviderProcessTracking};
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
 
     #[tokio::test]
@@ -197,6 +213,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: Default::default(),
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -204,7 +221,9 @@ mod tests {
             },
         };
 
-        let server = ManagedServer::start(config).await.expect("start server");
+        let server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
+            .await
+            .expect("start server");
         assert!(server.addr().port() > 0);
         server.stop().await.expect("stop server");
 
@@ -251,6 +270,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: Default::default(),
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -258,7 +278,9 @@ mod tests {
             },
         };
 
-        let mut server = ManagedServer::start(config).await.expect("start server");
+        let mut server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
+            .await
+            .expect("start server");
         assert!(server.addr().port() > 0);
         server
             .migration_task
@@ -298,13 +320,18 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: Default::default(),
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,
                 enable_tls: true,
             },
         };
-        assert!(ManagedServer::start(config).await.is_err());
+        assert!(
+            ManagedServer::start(config, ProviderProcessTracking::Disabled)
+                .await
+                .is_err()
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

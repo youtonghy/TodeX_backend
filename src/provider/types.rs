@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant};
 use uuid::Uuid;
 
 use crate::conversation::{
@@ -490,6 +490,40 @@ impl PermissionOutcome {
     }
 }
 
+/// When a turn's provider last showed signs of life (an emitted event or a
+/// stdout frame), shared by every clone of the turn's sink.
+#[derive(Clone, Debug)]
+pub struct ProviderActivity {
+    origin: Instant,
+    last_millis: Arc<AtomicU64>,
+}
+
+impl ProviderActivity {
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            last_millis: Arc::default(),
+        }
+    }
+
+    pub fn touch(&self) {
+        let millis = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_millis.fetch_max(millis, Ordering::Relaxed);
+    }
+
+    pub fn idle_for(&self) -> Duration {
+        self.origin.elapsed().saturating_sub(Duration::from_millis(
+            self.last_millis.load(Ordering::Relaxed),
+        ))
+    }
+}
+
+impl Default for ProviderActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone)]
 pub struct DriverEventSink {
     store: ConversationStore,
@@ -501,6 +535,7 @@ pub struct DriverEventSink {
     scope: Option<&'static str>,
     /// Shared by the clones of one turn (or one runtime scope).
     unparsed_lines: Arc<AtomicUsize>,
+    activity: Option<ProviderActivity>,
 }
 
 impl DriverEventSink {
@@ -519,6 +554,20 @@ impl DriverEventSink {
             runtime_id: None,
             scope: None,
             unparsed_lines: Arc::default(),
+            activity: None,
+        }
+    }
+
+    /// Every event and stdout frame routed through this sink (and its clones,
+    /// including runtime-scoped ones) counts as provider activity.
+    pub fn with_activity(mut self, activity: ProviderActivity) -> Self {
+        self.activity = Some(activity);
+        self
+    }
+
+    fn touch(&self) {
+        if let Some(activity) = &self.activity {
+            activity.touch();
         }
     }
 
@@ -555,10 +604,15 @@ impl DriverEventSink {
         mut payload: Value,
     ) -> Result<ConversationEvent, AppError> {
         let event_type = event_type.into();
+        self.touch();
         self.decorate(&event_type, &mut payload);
-        self.store
+        let result = self
+            .store
             .append_and_publish(&self.conversation_id, event_type, payload, &self.hub)
-            .await
+            .await;
+        // Time spent journalling is the daemon's, not provider silence.
+        self.touch();
+        result
     }
 
     /// Streaming text fragment (`message.delta` / `thought.delta`). Adjacent
@@ -574,8 +628,9 @@ impl DriverEventSink {
         text_pointers: &'static [&'static str],
         extra: Option<&str>,
     ) -> Result<(), AppError> {
+        self.touch();
         self.decorate(event_type, &mut payload);
-        match DeltaFragment::from_payload(&payload, text_pointers, extra) {
+        let result = match DeltaFragment::from_payload(&payload, text_pointers, extra) {
             Some(fragment) => {
                 self.store
                     .append_delta_and_publish(
@@ -592,7 +647,9 @@ impl DriverEventSink {
                 .append_and_publish(&self.conversation_id, event_type, payload, &self.hub)
                 .await
                 .map(|_| ()),
-        }
+        };
+        self.touch();
+        result
     }
 
     /// The frame of a provider read. An unparseable line becomes
@@ -602,6 +659,7 @@ impl DriverEventSink {
         &self,
         read: Option<ProviderRead>,
     ) -> Result<Option<Value>, AppError> {
+        self.touch();
         let payload = match read {
             None => return Ok(None),
             Some(ProviderRead::Frame(value)) => return Ok(Some(value)),
@@ -975,6 +1033,14 @@ impl PermissionBroker {
             .sender
             .send(decision)
             .map_err(|_| AppError::Conflict("permission request is no longer active".to_owned()))
+    }
+
+    /// Whether a dialog for this conversation is waiting on the user; such a
+    /// wait is bounded by its own timeout, not the provider idle watchdog.
+    pub fn has_pending(&self, conversation_id: &str) -> bool {
+        self.pending
+            .iter()
+            .any(|entry| entry.value().conversation_id == conversation_id)
     }
 
     pub fn expire_all(&self) {

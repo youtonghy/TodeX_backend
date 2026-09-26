@@ -10,6 +10,7 @@ mod grok;
 mod opencode;
 mod pi;
 pub(crate) mod process;
+pub(crate) mod process_registry;
 mod supervisor;
 pub(crate) mod types;
 

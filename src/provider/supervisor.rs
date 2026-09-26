@@ -36,8 +36,8 @@ use super::process::same_executable;
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill,
     DriverTurnResult, ImageInputMode, PermissionBroker, PermissionDecision, PermissionOutcome,
-    ProviderCommandDescriptor, ProviderControl, ProviderDescriptor, ProviderDriver,
-    ProviderImageInputCapability, ProviderModelDescriptor,
+    ProviderActivity, ProviderCommandDescriptor, ProviderControl, ProviderDescriptor,
+    ProviderDriver, ProviderImageInputCapability, ProviderModelDescriptor,
 };
 
 fn prompt_fingerprint(prompt: &ConversationPrompt) -> Result<String, AppError> {
@@ -68,6 +68,10 @@ const MAX_PROMPT_BYTES: usize = 512 * 1024;
 const MAX_PROMPT_CONTENT_ITEMS: usize = 16;
 const MAX_PROMPT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often an idle turn with a pending permission dialog is rechecked.
+const IDLE_WATCHDOG_RECHECK: Duration = Duration::from_secs(5);
+/// How long an idle-stopped driver may take to honor cancellation.
+const IDLE_TURN_STOP_GRACE: Duration = Duration::from_secs(30);
 /// Backoff between attempts to journal a turn's terminal event.
 const TERMINAL_EVENT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(100),
@@ -116,6 +120,16 @@ where
         sleep(*delay).await;
         index += 1;
     }
+}
+
+fn idle_timeout_message(limit: Duration) -> String {
+    let seconds = limit.as_secs();
+    let span = if seconds >= 60 && seconds.is_multiple_of(60) {
+        format!("{} minutes", seconds / 60)
+    } else {
+        format!("{:.1} seconds", limit.as_secs_f64())
+    };
+    format!("The provider produced no output for {span}; the turn was stopped.")
 }
 
 /// The failure code and message for a driver task that did not return.
@@ -259,6 +273,8 @@ pub struct ConversationSupervisor {
     request_gates: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     cli_execution_gate: Arc<RwLock<()>>,
     workspace_trust: WorkspaceTrustStore,
+    /// `[agent].provider_idle_timeout_minutes`; `None` disables the watchdog.
+    provider_idle_timeout: Option<Duration>,
 }
 
 struct ActiveTurn {
@@ -322,8 +338,13 @@ impl ConversationSupervisor {
         workspace_trust: WorkspaceTrustStore,
         cli_execution_gate: Arc<RwLock<()>>,
     ) -> Self {
+        let provider_idle_timeout = match config.agent.provider_idle_timeout_minutes {
+            0 => None,
+            minutes => Some(Duration::from_secs(minutes.saturating_mul(60))),
+        };
         Self {
             registry: DriverRegistry::new(&config),
+            provider_idle_timeout,
             config,
             store,
             hub,
@@ -1559,13 +1580,15 @@ impl ConversationSupervisor {
         };
         tokio::spawn(async move {
             let _cleanup = cleanup;
+            let activity = ProviderActivity::new();
             let sink = DriverEventSink::new(
                 supervisor.store.clone(),
                 supervisor.hub.clone(),
                 supervisor.permissions.clone(),
                 conversation_id.clone(),
             )
-            .with_turn_id(spawned_turn_id.clone());
+            .with_turn_id(spawned_turn_id.clone())
+            .with_activity(activity.clone());
             let driver_context = DriverContext {
                 manifest,
                 provider_state: provider_state.clone(),
@@ -1585,7 +1608,7 @@ impl ConversationSupervisor {
             };
             // The driver runs in its own task so a panic surfaces as a
             // JoinError here and still produces a terminal event.
-            let outcome = tokio::spawn(async move {
+            let mut driver_task = tokio::spawn(async move {
                 driver
                     .run_turn(
                         driver_context,
@@ -1595,8 +1618,20 @@ impl ConversationSupervisor {
                         launch_permit,
                     )
                     .await
-            })
-            .await;
+            });
+            let mut idle_timeout = None;
+            let outcome = match supervisor.provider_idle_timeout {
+                None => (&mut driver_task).await,
+                Some(limit) => tokio::select! {
+                    outcome = &mut driver_task => outcome,
+                    () = supervisor.wait_for_provider_idle(&conversation_id, &activity, limit) => {
+                        idle_timeout = Some(limit);
+                        supervisor
+                            .stop_idle_turn(&conversation_id, &spawned_turn_id, limit, driver_task)
+                            .await
+                    }
+                },
+            };
             supervisor
                 .finish_turn(
                     &conversation_id,
@@ -1604,6 +1639,7 @@ impl ConversationSupervisor {
                     client_request_id,
                     provider_state,
                     outcome,
+                    idle_timeout,
                 )
                 .await;
         });
@@ -1619,9 +1655,34 @@ impl ConversationSupervisor {
         client_request_id: Option<String>,
         provider_state: ProviderState,
         outcome: Result<Result<DriverTurnResult, AppError>, tokio::task::JoinError>,
+        idle_timeout: Option<Duration>,
     ) {
-        let (event_type, payload) = match outcome {
-            Ok(Ok(result)) => (
+        let (event_type, payload) = match (outcome, idle_timeout) {
+            // However the driver wound down, the watchdog stopped this turn.
+            (outcome, Some(limit)) => {
+                match outcome {
+                    Ok(Ok(_)) | Ok(Err(AppError::TurnCancelled)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(conversation_id, turn_id, error = %error, "provider driver failed while stopping an idle turn")
+                    }
+                    Err(error) => {
+                        tracing::warn!(conversation_id, turn_id, error = %error, "provider driver task ended abnormally while stopping an idle turn")
+                    }
+                }
+                let message = idle_timeout_message(limit);
+                self.record_provider_error(conversation_id, provider_state, &message)
+                    .await;
+                (
+                    "turn.failed",
+                    json!({
+                        "turnId": turn_id,
+                        "clientRequestId": client_request_id,
+                        "code": "PROVIDER_IDLE_TIMEOUT",
+                        "message": message,
+                    }),
+                )
+            }
+            (Ok(Ok(result)), None) => (
                 if result.cancelled {
                     "turn.cancelled"
                 } else {
@@ -1634,7 +1695,7 @@ impl ConversationSupervisor {
                     "nativeSessionId": result.native_session_id,
                 }),
             ),
-            Ok(Err(AppError::TurnCancelled)) => (
+            (Ok(Err(AppError::TurnCancelled)), None) => (
                 "turn.cancelled",
                 json!({
                     "turnId": turn_id,
@@ -1643,7 +1704,7 @@ impl ConversationSupervisor {
                     "nativeSessionId": Value::Null,
                 }),
             ),
-            Ok(Err(error)) => {
+            (Ok(Err(error)), None) => {
                 let message = error.to_string();
                 self.record_provider_error(conversation_id, provider_state, &message)
                     .await;
@@ -1657,7 +1718,7 @@ impl ConversationSupervisor {
                     }),
                 )
             }
-            Err(error) => {
+            (Err(error), None) => {
                 let (code, message) = driver_task_failure(error);
                 tracing::error!(
                     conversation_id,
@@ -1681,6 +1742,68 @@ impl ConversationSupervisor {
         };
         self.emit_terminal(conversation_id, turn_id, event_type, payload)
             .await;
+    }
+
+    /// Resolves once the turn's provider has been silent for `limit` while no
+    /// permission dialog of this conversation is waiting on the user.
+    async fn wait_for_provider_idle(
+        &self,
+        conversation_id: &str,
+        activity: &ProviderActivity,
+        limit: Duration,
+    ) {
+        loop {
+            let idle = activity.idle_for();
+            if idle < limit {
+                sleep(limit - idle).await;
+                continue;
+            }
+            if !self.permissions.has_pending(conversation_id) {
+                return;
+            }
+            // Resolving the dialog emits permission.resolved, which restarts
+            // the idle clock; until then poll at a coarse interval.
+            sleep(limit.min(IDLE_WATCHDOG_RECHECK)).await;
+        }
+    }
+
+    /// Cancels an idle turn through its normal cancellation path and waits
+    /// for the driver, aborting it (which kills its process) if it does not
+    /// wind down in time.
+    async fn stop_idle_turn(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        limit: Duration,
+        mut driver_task: tokio::task::JoinHandle<Result<DriverTurnResult, AppError>>,
+    ) -> Result<Result<DriverTurnResult, AppError>, tokio::task::JoinError> {
+        tracing::warn!(
+            conversation_id,
+            turn_id,
+            idle_secs = limit.as_secs(),
+            "provider produced no output within the idle timeout; stopping the turn"
+        );
+        if let Some(active) = self
+            .active
+            .get(conversation_id)
+            .filter(|active| active.turn_id == turn_id)
+        {
+            // The receiver lives in the driver task; a closed channel means it
+            // is already finishing, which the join below observes.
+            let _ = active.cancel.send(true);
+        }
+        match tokio::time::timeout(IDLE_TURN_STOP_GRACE, &mut driver_task).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::error!(
+                    conversation_id,
+                    turn_id,
+                    "provider driver ignored cancellation after the idle timeout; aborting it"
+                );
+                driver_task.abort();
+                driver_task.await
+            }
+        }
     }
 
     async fn record_provider_error(
@@ -2443,6 +2566,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles,
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -2808,6 +2932,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -3024,6 +3149,172 @@ mod tests {
             .last_error
             .unwrap()
             .contains("fixture driver panic"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn turn_events(history: &[ConversationEvent], turn_id: &str) -> Vec<(String, Value)> {
+        history
+            .iter()
+            .filter(|event| {
+                event.event_type.starts_with("turn.") && event.payload["turnId"] == turn_id
+            })
+            .map(|event| (event.event_type.clone(), event.payload.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn silent_provider_is_stopped_by_the_idle_watchdog() {
+        let (root, store, mut supervisor, workspace) = control_fixture("todex-idle-watchdog").await;
+        supervisor.provider_idle_timeout = Some(Duration::from_millis(300));
+        fs::write(root.join("silent-turn"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let events = turn_events(
+            &store.complete_history(&manifest.id).await.unwrap(),
+            &turn_id,
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[1].0, "turn.failed");
+        assert_eq!(events[1].1["code"], "PROVIDER_IDLE_TIMEOUT");
+        assert_eq!(
+            store.get(&manifest.id).await.unwrap().status,
+            ConversationStatus::Failed
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Emits a provider event every 50 ms for half a second, then completes.
+    struct ChattyDriver(Arc<dyn ProviderDriver>);
+
+    #[async_trait::async_trait]
+    impl ProviderDriver for ChattyDriver {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn run_turn(
+            &self,
+            _context: DriverContext,
+            _prompt: DriverPrompt,
+            sink: DriverEventSink,
+            _cancel: watch::Receiver<bool>,
+            _launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
+        ) -> Result<DriverTurnResult, AppError> {
+            for index in 0..10 {
+                sleep(Duration::from_millis(50)).await;
+                sink.emit("provider.event", json!({ "index": index }))
+                    .await?;
+            }
+            Ok(DriverTurnResult {
+                native_session_id: None,
+                stop_reason: "end_turn".to_owned(),
+                cancelled: false,
+            })
+        }
+    }
+
+    /// Waits on a permission dialog until the turn is cancelled.
+    struct PermissionWaitingDriver(Arc<dyn ProviderDriver>);
+
+    #[async_trait::async_trait]
+    impl ProviderDriver for PermissionWaitingDriver {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn run_turn(
+            &self,
+            _context: DriverContext,
+            _prompt: DriverPrompt,
+            sink: DriverEventSink,
+            mut cancel: watch::Receiver<bool>,
+            _launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
+        ) -> Result<DriverTurnResult, AppError> {
+            sink.request_permission(
+                "fixture-request".to_owned(),
+                "tool",
+                "Run fixture tool",
+                json!({}),
+                Value::Null,
+                &mut cancel,
+            )
+            .await?;
+            Err(AppError::Conflict(
+                "permission should not resolve".to_owned(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_watchdog_spares_active_providers_and_pending_permissions() {
+        let (root, store, mut supervisor, workspace) =
+            control_fixture("todex-idle-watchdog-spared").await;
+        supervisor.provider_idle_timeout = Some(Duration::from_millis(400));
+        replace_driver(&mut supervisor, ProviderKind::ClaudeCode, |real| {
+            Arc::new(ChattyDriver(real))
+        });
+        replace_driver(&mut supervisor, ProviderKind::Pi, |real| {
+            Arc::new(PermissionWaitingDriver(real))
+        });
+        let chatty = supervisor
+            .create(ProviderKind::ClaudeCode, workspace.clone(), None, None)
+            .await
+            .unwrap();
+        let waiting = supervisor
+            .create(ProviderKind::Pi, workspace, None, None)
+            .await
+            .unwrap();
+        let chatty_turn = supervisor
+            .prompt(&chatty.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+        let waiting_turn = supervisor
+            .prompt(&waiting.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let events = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let events = turn_events(
+                    &store.complete_history(&chatty.id).await.unwrap(),
+                    &chatty_turn,
+                );
+                if events.len() > 1 {
+                    return events;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(events[1].0, "turn.completed", "{events:?}");
+        // The dialog has now been open for several idle windows.
+        sleep(Duration::from_millis(1200).saturating_sub(started.elapsed())).await;
+        let events = turn_events(
+            &store.complete_history(&waiting.id).await.unwrap(),
+            &waiting_turn,
+        );
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            store.get(&waiting.id).await.unwrap().status,
+            ConversationStatus::WaitingPermission
+        );
+
+        supervisor.cancel(&waiting.id).await.unwrap();
+        wait_until_idle(&supervisor).await;
+        let events = turn_events(
+            &store.complete_history(&waiting.id).await.unwrap(),
+            &waiting_turn,
+        );
+        assert_eq!(events.last().unwrap().0, "turn.cancelled", "{events:?}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3334,6 +3625,7 @@ mod tests {
                 opencode_bin: fixture_text,
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -3444,6 +3736,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -3664,6 +3957,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -3722,6 +4016,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -3891,6 +4186,9 @@ else
         continue
         ;;
     esac
+    if [ -f "$(dirname "$0")/silent-turn" ]; then
+      continue
+    fi
     if [ -f "$(dirname "$0")/noisy-stdout" ]; then
       printf 'provider banner: not json\n'
       head -c 4194400 /dev/zero | tr '\0' x
@@ -4088,6 +4386,7 @@ done
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
+                provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
                 enable_auth: true,
