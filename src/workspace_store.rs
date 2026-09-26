@@ -397,7 +397,10 @@ mod tests {
         );
         assert_eq!(reloaded.workspaces[0].sort_order, Some(3));
         assert_eq!(reloaded.workspaces[0].icon.as_deref(), Some("rocket"));
-        assert_eq!(reloaded.workspaces[0].icon_color.as_deref(), Some("#3b82f6"));
+        assert_eq!(
+            reloaded.workspaces[0].icon_color.as_deref(),
+            Some("#3b82f6")
+        );
         assert_eq!(reloaded.workspaces[0].ring_style.as_deref(), Some("beads"));
         assert!(reloaded.updated_at > 0);
 
