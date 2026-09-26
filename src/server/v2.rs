@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::FileType;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,12 +21,13 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::warn;
 
 use crate::app_state::AppState;
-use crate::conversation::{ConversationManifest, ProviderKind};
+use crate::conversation::{ConversationEvent, ConversationManifest, ProviderKind};
 use crate::device_auth;
 use crate::error::AppError;
 use crate::provider::{
     read_current_version, run_upgrade, CliUpgradeOperation, CliVersionsResponse,
-    ConversationPrompt, ManagedCli, PermissionDecision, PromptContentRef, PromptSkillRef,
+    ConversationPrompt, ConversationSupervisor, ManagedCli, PermissionDecision, PromptContentRef,
+    PromptSkillRef,
 };
 use crate::transport_crypto::TransportCryptoSession;
 use crate::workspace_paths::{
@@ -46,6 +48,9 @@ use super::websocket::{self, AuthContext};
 /// connection closes with a receive error instead.
 const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WS_SUBSCRIPTIONS: usize = 128;
+/// Subscription backfills run beside the read loop, at most this many at once
+/// per connection.
+const MAX_WS_CONCURRENT_BACKFILLS: usize = 4;
 const MAX_WS_IN_FLIGHT_OPERATIONS: usize = 16;
 /// Keep idle connections alive; mirrors the legacy `/v1/ws` socket so clients
 /// without an application-level heartbeat are not reaped. A Ping draws an
@@ -2151,8 +2156,7 @@ async fn handle_socket(
         }
     });
 
-    let subscriptions = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let mut subscription_tasks = HashMap::<String, tokio::task::JoinHandle<()>>::new();
+    let mut subscriptions = WsSubscriptions::new();
     let operation_limit = Arc::new(Semaphore::new(MAX_WS_IN_FLIGHT_OPERATIONS));
     let mut operation_tasks = Vec::new();
     let client_timeout = tokio::time::Duration::from_secs(WS_CLIENT_TIMEOUT_SECS);
@@ -2257,9 +2261,8 @@ async fn handle_socket(
                 let response = dispatch_command(
                     &state,
                     &outgoing_tx,
-                    &subscriptions,
+                    &mut subscriptions,
                     &event_scope,
-                    &mut subscription_tasks,
                     &auth.tenant_id,
                     command,
                 )
@@ -2291,9 +2294,7 @@ async fn handle_socket(
         }
     }
 
-    for (_, task) in subscription_tasks {
-        task.abort();
-    }
+    subscriptions.abort_all();
     for task in operation_tasks {
         task.abort();
         let _ = task.await;
@@ -2331,28 +2332,304 @@ async fn handle_socket(
         .await;
 }
 
+/// Per-connection `conversation.subscribe` bookkeeping.
+struct WsSubscriptions {
+    /// Conversation ids with a live or still-backfilling subscription. An id is
+    /// reserved before its backfill starts, so a duplicate subscribe arriving
+    /// during the backfill is deduplicated.
+    active: Arc<Mutex<HashSet<String>>>,
+    tasks: HashMap<String, SubscriptionTask>,
+    /// Bounds concurrent backfills so a reconnect burst does not page every
+    /// journal into memory at once.
+    backfill_permits: Arc<Semaphore>,
+}
+
+impl WsSubscriptions {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(Mutex::new(HashSet::new())),
+            tasks: HashMap::new(),
+            backfill_permits: Arc::new(Semaphore::new(MAX_WS_CONCURRENT_BACKFILLS)),
+        }
+    }
+
+    fn abort_all(self) {
+        for task in self.tasks.into_values() {
+            task.handle.abort();
+        }
+    }
+}
+
+struct SubscriptionTask {
+    handle: tokio::task::JoinHandle<()>,
+    /// Id of the `conversation.subscribe` request the task answers.
+    request_id: String,
+    /// Set once the task queued that request's ack or error response.
+    answered: Arc<AtomicBool>,
+}
+
+/// Where a finished backfill left the subscription.
+struct BackfillProgress {
+    /// Last replayed sequence (the high-water mark unless capped).
+    next_sequence: u64,
+    /// Live delivery continues after this sequence.
+    high_water: u64,
+}
+
+/// Runs one `conversation.subscribe` off the read loop: backfill, then the
+/// ack carrying the request id, then live events.
+struct SubscriptionWorker {
+    conversations: ConversationSupervisor,
+    outgoing: mpsc::Sender<Value>,
+    active: Arc<Mutex<HashSet<String>>>,
+    answered: Arc<AtomicBool>,
+    owner_id: String,
+    request_id: String,
+    conversation_id: String,
+    after_sequence: Option<u64>,
+    page_size: usize,
+    backfill_limit: Option<usize>,
+    summary: bool,
+}
+
+impl SubscriptionWorker {
+    async fn run(
+        self,
+        receiver: tokio::sync::broadcast::Receiver<ConversationEvent>,
+        backfill_permits: Arc<Semaphore>,
+    ) {
+        let backfill = match backfill_permits.acquire_owned().await {
+            Ok(_permit) => self.backfill().await,
+            // The semaphore is never closed; treat it like a dead connection.
+            Err(_) => Err(AppError::StreamClosed),
+        };
+        let (response, live_after) = match backfill {
+            Ok(progress) => (
+                json!({
+                    "id": self.request_id,
+                    "type": "server.result",
+                    "payload": {
+                        "conversationId": self.conversation_id,
+                        "subscribed": true,
+                        "nextSequence": progress.next_sequence,
+                        "hasMore": progress.next_sequence < progress.high_water,
+                        "lastSequence": progress.high_water,
+                    },
+                }),
+                Some(progress.high_water),
+            ),
+            Err(error) => (error_response(Some(self.request_id.clone()), error), None),
+        };
+        let delivered = queue_frame(&self.outgoing, response).await.is_ok();
+        self.answered
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let (true, Some(high_water)) = (delivered, live_after) {
+            self.forward_live(receiver, high_water).await;
+        }
+        self.active.lock().await.remove(&self.conversation_id);
+    }
+
+    /// Replays the journal through the high-water mark read after the live
+    /// receiver was created, so nothing falls between backfill and live.
+    async fn backfill(&self) -> Result<BackfillProgress, AppError> {
+        let high_water = self
+            .conversations
+            .get_owned(&self.owner_id, &self.conversation_id)
+            .await?
+            .last_sequence;
+        let mut replay_cursor = self.after_sequence.unwrap_or(0).min(high_water);
+        // Backfill stops at the cap; the client pages the rest of the
+        // backlog over HTTP from `nextSequence` (reported with `hasMore`).
+        let backfill_end = self.backfill_limit.map_or(high_water, |limit| {
+            replay_cursor
+                .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+                .min(high_water)
+        });
+        while replay_cursor < backfill_end {
+            let remaining = usize::try_from(backfill_end - replay_cursor).unwrap_or(usize::MAX);
+            let replay = self
+                .conversations
+                .replay_owned(
+                    &self.owner_id,
+                    &self.conversation_id,
+                    replay_cursor,
+                    self.page_size.min(remaining),
+                )
+                .await?;
+            let mut advanced = false;
+            for mut event in replay
+                .events
+                .into_iter()
+                .take_while(|event| event.sequence <= backfill_end)
+            {
+                replay_cursor = event.sequence;
+                advanced = true;
+                if self.summary {
+                    crate::conversation::summarize_event(&mut event);
+                }
+                queue_frame(
+                    &self.outgoing,
+                    json!({ "type": "conversation.event", "delivery": "replay", "payload": event }),
+                )
+                .await
+                .map_err(|_| AppError::StreamClosed)?;
+            }
+            if !advanced {
+                return Err(AppError::Conflict(format!(
+                    "conversation {} replay did not reach sequence {backfill_end}",
+                    self.conversation_id
+                )));
+            }
+        }
+        Ok(BackfillProgress {
+            next_sequence: replay_cursor,
+            high_water,
+        })
+    }
+
+    async fn forward_live(
+        &self,
+        mut receiver: tokio::sync::broadcast::Receiver<ConversationEvent>,
+        high_water: u64,
+    ) {
+        let conversations = &self.conversations;
+        let outgoing = &self.outgoing;
+        let owner_id = &self.owner_id;
+        let conversation_id = &self.conversation_id;
+        let page_size = self.page_size;
+        let mut delivered_through = high_water;
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event.sequence > delivered_through => {
+                    if event.sequence > delivered_through + 1 {
+                        let recovery = async {
+                            while delivered_through + 1 < event.sequence {
+                                let replay = conversations.replay_owned(owner_id, conversation_id, delivered_through, page_size).await?;
+                                let previous = delivered_through;
+                                for missing in replay.events.into_iter().take_while(|missing| missing.sequence < event.sequence) {
+                                    if missing.sequence != delivered_through + 1 {
+                                        return Err(AppError::Conflict("Conversation replay contains a sequence gap".to_owned()));
+                                    }
+                                    outgoing.send(json!({ "type": "conversation.event", "delivery": "replay", "payload": missing })).await.map_err(|_| AppError::StreamClosed)?;
+                                    delivered_through = missing.sequence;
+                                }
+                                if previous == delivered_through { return Err(AppError::Conflict("Conversation sequence gap could not be recovered".to_owned())); }
+                            }
+                            Ok::<(), AppError>(())
+                        }.await;
+                        if let Err(error) = recovery {
+                            let mut frame = error_response(None, error);
+                            frame["payload"]["conversationId"] = json!(conversation_id);
+                            let _ = outgoing.send(frame).await;
+                            break;
+                        }
+                    }
+                    delivered_through = event.sequence;
+                    if outgoing
+                        .send(json!({ "type": "conversation.event", "delivery": "live", "payload": event }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    if outgoing
+                        .send(json!({
+                            "type": "server.error",
+                            "payload": {
+                                "code": "EVENT_STREAM_LAGGED",
+                                "message": format!("conversation {conversation_id} stream lagged by {skipped} events; replaying persisted events"),
+                            }
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let recovery = async {
+                        let recovery_high_water = conversations
+                            .get_owned(owner_id, conversation_id)
+                            .await?
+                            .last_sequence;
+                        while delivered_through < recovery_high_water {
+                            let replay = conversations
+                                .replay_owned(
+                                    owner_id,
+                                    conversation_id,
+                                    delivered_through,
+                                    page_size,
+                                )
+                                .await?;
+                            let mut advanced = false;
+                            for event in replay.events.into_iter().take_while(|event| {
+                                event.sequence <= recovery_high_water
+                            }) {
+                                delivered_through = event.sequence;
+                                advanced = true;
+                                outgoing
+                                    .send(json!({
+                                        "type": "conversation.event",
+                                        "delivery": "replay",
+                                        "payload": event,
+                                    }))
+                                    .await
+                                    .map_err(|_| AppError::StreamClosed)?;
+                            }
+                            if !advanced {
+                                return Err(AppError::Conflict(format!(
+                                    "conversation {conversation_id} replay did not reach sequence {recovery_high_water}"
+                                )));
+                            }
+                        }
+                        Ok::<(), AppError>(())
+                    }
+                    .await;
+                    if let Err(error) = recovery {
+                        let mut frame = error_response(None, error);
+                        frame["payload"]["conversationId"] = json!(conversation_id);
+                        let _ = outgoing.send(frame).await;
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+}
+
 async fn dispatch_command(
     state: &AppState,
     outgoing: &mpsc::Sender<Value>,
-    subscriptions: &Arc<Mutex<HashSet<String>>>,
+    subscriptions: &mut WsSubscriptions,
     event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
-    subscription_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     owner_id: &str,
     command: V2Command,
 ) -> Option<Value> {
     // Reap forwarding tasks that exited on their own (channel closed, send
     // failure) so the map does not accumulate finished handles.
-    subscription_tasks.retain(|_, task| !task.is_finished());
-    let result = dispatch_command_inner(
-        state,
-        outgoing,
-        subscriptions,
-        event_scope,
-        subscription_tasks,
-        owner_id,
-        &command,
-    )
-    .await;
+    subscriptions
+        .tasks
+        .retain(|_, task| !task.handle.is_finished());
+    let result = if command.command_type == "conversation.subscribe" {
+        match start_subscription(state, outgoing, subscriptions, owner_id, &command).await {
+            // The subscription task answers after its backfill.
+            Ok(None) => return None,
+            Ok(Some(payload)) => Ok(payload),
+            Err(error) => Err(error),
+        }
+    } else {
+        dispatch_command_inner(
+            state,
+            outgoing,
+            subscriptions,
+            event_scope,
+            owner_id,
+            &command,
+        )
+        .await
+    };
     Some(match result {
         Ok(payload) => json!({
             "id": command.id,
@@ -2363,221 +2640,108 @@ async fn dispatch_command(
     })
 }
 
+/// Validates a `conversation.subscribe`, reserves its slot and creates the
+/// live receiver on the read loop, then hands the backfill and the ack to a
+/// subscription task so later commands are not queued behind the backfill.
+/// Returns an immediate payload only for a duplicate subscribe.
+async fn start_subscription(
+    state: &AppState,
+    outgoing: &mpsc::Sender<Value>,
+    subscriptions: &mut WsSubscriptions,
+    owner_id: &str,
+    command: &V2Command,
+) -> Result<Option<Value>, AppError> {
+    let request: SubscribeRequest = serde_json::from_value(command.payload.clone())?;
+    let summary = summary_detail(request.detail.as_deref())?;
+    state
+        .conversations
+        .get_owned(owner_id, &request.conversation_id)
+        .await?;
+    {
+        let mut active = subscriptions.active.lock().await;
+        if active.contains(&request.conversation_id) {
+            return Ok(Some(json!({
+                "conversationId": request.conversation_id,
+                "subscribed": true,
+                "alreadySubscribed": true,
+            })));
+        }
+        if active.len() >= MAX_WS_SUBSCRIPTIONS {
+            return Err(AppError::InvalidRequest(
+                "v2 websocket subscription limit reached".to_owned(),
+            ));
+        }
+        active.insert(request.conversation_id.clone());
+    }
+    // Subscribe before the worker reads the high-water mark so no event
+    // falls between backfill and live delivery.
+    let receiver = state.conversations.subscribe(&request.conversation_id);
+    let answered = Arc::new(AtomicBool::new(false));
+    let worker = SubscriptionWorker {
+        conversations: state.conversations.clone(),
+        outgoing: outgoing.clone(),
+        active: subscriptions.active.clone(),
+        answered: answered.clone(),
+        owner_id: owner_id.to_owned(),
+        request_id: command.id.clone(),
+        conversation_id: request.conversation_id.clone(),
+        after_sequence: request.after_sequence,
+        page_size: request.limit.unwrap_or(500),
+        backfill_limit: request.backfill_limit,
+        summary,
+    };
+    let handle = tokio::spawn(worker.run(receiver, subscriptions.backfill_permits.clone()));
+    let task = SubscriptionTask {
+        handle,
+        request_id: command.id.clone(),
+        answered,
+    };
+    if let Some(previous) = subscriptions.tasks.insert(request.conversation_id, task) {
+        previous.handle.abort();
+    }
+    Ok(None)
+}
+
 async fn dispatch_command_inner(
     state: &AppState,
     outgoing: &mpsc::Sender<Value>,
-    subscriptions: &Arc<Mutex<HashSet<String>>>,
+    subscriptions: &mut WsSubscriptions,
     event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
-    subscription_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     owner_id: &str,
     command: &V2Command,
 ) -> Result<Value, AppError> {
     match command.command_type.as_str() {
-        "conversation.subscribe" => {
-            let request: SubscribeRequest = serde_json::from_value(command.payload.clone())?;
-            let summary = summary_detail(request.detail.as_deref())?;
-            state
-                .conversations
-                .get_owned(owner_id, &request.conversation_id)
-                .await?;
-            let subscriptions_guard = subscriptions.lock().await;
-            if subscriptions_guard.contains(&request.conversation_id) {
-                return Ok(json!({
-                    "conversationId": request.conversation_id,
-                    "subscribed": true,
-                    "alreadySubscribed": true,
-                }));
-            }
-            if subscriptions_guard.len() >= MAX_WS_SUBSCRIPTIONS {
-                return Err(AppError::InvalidRequest(
-                    "v2 websocket subscription limit reached".to_owned(),
-                ));
-            }
-            drop(subscriptions_guard);
-
-            let mut receiver = state.conversations.subscribe(&request.conversation_id);
-            let high_water = state
-                .conversations
-                .get_owned(owner_id, &request.conversation_id)
-                .await?
-                .last_sequence;
-            let mut replay_cursor = request.after_sequence.unwrap_or(0).min(high_water);
-            let page_size = request.limit.unwrap_or(500);
-            // Backfill stops at the cap; the client pages the rest of the
-            // backlog over HTTP from `nextSequence` (reported with `hasMore`).
-            let backfill_end = request.backfill_limit.map_or(high_water, |limit| {
-                replay_cursor
-                    .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
-                    .min(high_water)
-            });
-            while replay_cursor < backfill_end {
-                let remaining = usize::try_from(backfill_end - replay_cursor).unwrap_or(usize::MAX);
-                let replay = state
-                    .conversations
-                    .replay_owned(
-                        owner_id,
-                        &request.conversation_id,
-                        replay_cursor,
-                        page_size.min(remaining),
-                    )
-                    .await?;
-                let mut advanced = false;
-                for mut event in replay
-                    .events
-                    .into_iter()
-                    .take_while(|event| event.sequence <= backfill_end)
-                {
-                    replay_cursor = event.sequence;
-                    advanced = true;
-                    if summary {
-                        crate::conversation::summarize_event(&mut event);
+        "conversation.unsubscribe" => {
+            let request: UnsubscribeRequest = serde_json::from_value(command.payload.clone())?;
+            let was_subscribed = subscriptions
+                .active
+                .lock()
+                .await
+                .remove(&request.conversation_id);
+            if let Some(task) = subscriptions.tasks.remove(&request.conversation_id) {
+                task.handle.abort();
+                // Wait for the abort so the task cannot answer concurrently.
+                if let Err(error) = task.handle.await {
+                    if error.is_panic() {
+                        warn!(error = %error, "v2 websocket subscription task panicked");
                     }
-                    // Backfill runs on the read loop; a queue that stays full
-                    // must not wedge it.
+                }
+                // A subscribe still backfilling gets an answer instead of
+                // leaving the client's request pending forever.
+                if !task.answered.load(std::sync::atomic::Ordering::Acquire) {
                     queue_frame(
                         outgoing,
-                        json!({ "type": "conversation.event", "delivery": "replay", "payload": event }),
+                        error_response(
+                            Some(task.request_id),
+                            AppError::Conflict(format!(
+                                "conversation {} was unsubscribed before its backfill completed",
+                                request.conversation_id
+                            )),
+                        ),
                     )
                     .await
                     .map_err(|_| AppError::StreamClosed)?;
                 }
-                if !advanced {
-                    return Err(AppError::Conflict(format!(
-                        "conversation {} replay did not reach sequence {backfill_end}",
-                        request.conversation_id
-                    )));
-                }
-            }
-            subscriptions
-                .lock()
-                .await
-                .insert(request.conversation_id.clone());
-            let outgoing = outgoing.clone();
-            let conversation_id = request.conversation_id.clone();
-            let owner_id = owner_id.to_owned();
-            let conversations = state.conversations.clone();
-            let active_subscriptions = subscriptions.clone();
-            let task = tokio::spawn(async move {
-                let mut delivered_through = high_water;
-                loop {
-                    match receiver.recv().await {
-                        Ok(event) if event.sequence > delivered_through => {
-                            if event.sequence > delivered_through + 1 {
-                                let recovery = async {
-                                    while delivered_through + 1 < event.sequence {
-                                        let replay = conversations.replay_owned(&owner_id, &conversation_id, delivered_through, page_size).await?;
-                                        let previous = delivered_through;
-                                        for missing in replay.events.into_iter().take_while(|missing| missing.sequence < event.sequence) {
-                                            if missing.sequence != delivered_through + 1 {
-                                                return Err(AppError::Conflict("Conversation replay contains a sequence gap".to_owned()));
-                                            }
-                                            outgoing.send(json!({ "type": "conversation.event", "delivery": "replay", "payload": missing })).await.map_err(|_| AppError::StreamClosed)?;
-                                            delivered_through = missing.sequence;
-                                        }
-                                        if previous == delivered_through { return Err(AppError::Conflict("Conversation sequence gap could not be recovered".to_owned())); }
-                                    }
-                                    Ok::<(), AppError>(())
-                                }.await;
-                                if let Err(error) = recovery {
-                                    let mut frame = error_response(None, error);
-                                    frame["payload"]["conversationId"] = json!(conversation_id);
-                                    let _ = outgoing.send(frame).await;
-                                    break;
-                                }
-                            }
-                            delivered_through = event.sequence;
-                            if outgoing
-                                .send(json!({ "type": "conversation.event", "delivery": "live", "payload": event }))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            if outgoing
-                                .send(json!({
-                                    "type": "server.error",
-                                    "payload": {
-                                        "code": "EVENT_STREAM_LAGGED",
-                                        "message": format!("conversation {conversation_id} stream lagged by {skipped} events; replaying persisted events"),
-                                    }
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            let recovery = async {
-                                let recovery_high_water = conversations
-                                    .get_owned(&owner_id, &conversation_id)
-                                    .await?
-                                    .last_sequence;
-                                while delivered_through < recovery_high_water {
-                                    let replay = conversations
-                                        .replay_owned(
-                                            &owner_id,
-                                            &conversation_id,
-                                            delivered_through,
-                                            page_size,
-                                        )
-                                        .await?;
-                                    let mut advanced = false;
-                                    for event in replay.events.into_iter().take_while(|event| {
-                                        event.sequence <= recovery_high_water
-                                    }) {
-                                        delivered_through = event.sequence;
-                                        advanced = true;
-                                        outgoing
-                                            .send(json!({
-                                                "type": "conversation.event",
-                                                "delivery": "replay",
-                                                "payload": event,
-                                            }))
-                                            .await
-                                            .map_err(|_| AppError::StreamClosed)?;
-                                    }
-                                    if !advanced {
-                                        return Err(AppError::Conflict(format!(
-                                            "conversation {conversation_id} replay did not reach sequence {recovery_high_water}"
-                                        )));
-                                    }
-                                }
-                                Ok::<(), AppError>(())
-                            }
-                            .await;
-                            if let Err(error) = recovery {
-                                let mut frame = error_response(None, error);
-                                frame["payload"]["conversationId"] = json!(conversation_id);
-                                let _ = outgoing.send(frame).await;
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-                active_subscriptions.lock().await.remove(&conversation_id);
-            });
-            if let Some(previous) = subscription_tasks.insert(request.conversation_id.clone(), task)
-            {
-                previous.abort();
-            }
-            Ok(json!({
-                "conversationId": request.conversation_id,
-                "subscribed": true,
-                // Last replayed sequence (the high-water mark unless capped).
-                "nextSequence": replay_cursor,
-                "hasMore": replay_cursor < high_water,
-                // Live delivery continues after this sequence.
-                "lastSequence": high_water,
-            }))
-        }
-        "conversation.unsubscribe" => {
-            let request: UnsubscribeRequest = serde_json::from_value(command.payload.clone())?;
-            let was_subscribed = subscriptions.lock().await.remove(&request.conversation_id);
-            if let Some(task) = subscription_tasks.remove(&request.conversation_id) {
-                task.abort();
             }
             Ok(json!({
                 "conversationId": request.conversation_id,
@@ -3251,7 +3415,6 @@ mod tests {
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use crate::conversation::{ConversationEventHub, ConversationStore};
     use crate::device_auth::test_support::TestDevice;
-    use crate::provider::ConversationSupervisor;
 
     /// A websocket half whose peer never drains: every send stays pending.
     struct StalledSink;
@@ -3954,69 +4117,48 @@ mod tests {
         }
 
         let (outgoing, mut events) = mpsc::channel(16);
-        let subscriptions = Arc::new(Mutex::new(HashSet::new()));
-        let event_scope = Arc::new(tokio::sync::RwLock::new(
-            websocket::LegacyEventScope::default(),
-        ));
-        let mut subscription_tasks = HashMap::new();
-        let result = dispatch_command_inner(
+        let mut subscriptions = WsSubscriptions::new();
+        let (replayed, ack) = subscribe_and_collect(
             &state,
             &outgoing,
-            &subscriptions,
-            &event_scope,
-            &mut subscription_tasks,
-            "local",
-            &V2Command {
-                id: "subscribe-1".to_owned(),
-                command_type: "conversation.subscribe".to_owned(),
-                payload: json!({
-                    "conversationId": manifest.id,
-                    "afterSequence": 0,
-                    "limit": 1,
-                }),
-            },
+            &mut events,
+            &mut subscriptions,
+            "subscribe-1",
+            json!({
+                "conversationId": manifest.id,
+                "afterSequence": 0,
+                "limit": 1,
+            }),
         )
-        .await
-        .unwrap();
-        assert_eq!(result["nextSequence"], 4);
-        assert_eq!(result["hasMore"], false);
+        .await;
+        assert_eq!(ack["type"], "server.result");
+        assert_eq!(ack["payload"]["nextSequence"], 4);
+        assert_eq!(ack["payload"]["hasMore"], false);
 
         let mut sequences = Vec::new();
-        for _ in 0..4 {
-            let event = events.recv().await.expect("replayed conversation event");
+        for event in &replayed {
             assert_eq!(event["delivery"], "replay");
             sequences.push(event["payload"]["sequence"].as_u64().unwrap());
         }
         assert_eq!(sequences, vec![1, 2, 3, 4]);
-        for (_, task) in subscription_tasks {
-            task.abort();
-        }
+        subscriptions.abort_all();
 
         let (future_outgoing, mut future_events) = mpsc::channel(16);
-        let future_subscriptions = Arc::new(Mutex::new(HashSet::new()));
-        let future_scope = Arc::new(tokio::sync::RwLock::new(
-            websocket::LegacyEventScope::default(),
-        ));
-        let mut future_tasks = HashMap::new();
-        let result = dispatch_command_inner(
+        let mut future_subscriptions = WsSubscriptions::new();
+        let (replayed, ack) = subscribe_and_collect(
             &state,
             &future_outgoing,
-            &future_subscriptions,
-            &future_scope,
-            &mut future_tasks,
-            "local",
-            &V2Command {
-                id: "subscribe-future".to_owned(),
-                command_type: "conversation.subscribe".to_owned(),
-                payload: json!({
-                    "conversationId": manifest.id,
-                    "afterSequence": 10_000,
-                }),
-            },
+            &mut future_events,
+            &mut future_subscriptions,
+            "subscribe-future",
+            json!({
+                "conversationId": manifest.id,
+                "afterSequence": 10_000,
+            }),
         )
-        .await
-        .unwrap();
-        assert_eq!(result["nextSequence"], 4);
+        .await;
+        assert!(replayed.is_empty());
+        assert_eq!(ack["payload"]["nextSequence"], 4);
         assert!(matches!(
             future_events.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -4055,9 +4197,7 @@ mod tests {
                 if expected == 6 { "replay" } else { "live" }
             );
         }
-        for (_, task) in future_tasks {
-            task.abort();
-        }
+        future_subscriptions.abort_all();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4137,59 +4277,43 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let subscribe = |id: &str, payload: Value| V2Command {
-            id: id.to_owned(),
-            command_type: "conversation.subscribe".to_owned(),
-            payload,
-        };
         let (outgoing, mut events) = mpsc::channel(16);
-        let subscriptions = Arc::new(Mutex::new(HashSet::new()));
-        let event_scope = Arc::new(tokio::sync::RwLock::new(
-            websocket::LegacyEventScope::default(),
-        ));
-        let mut tasks = HashMap::new();
+        let mut subscriptions = WsSubscriptions::new();
 
-        let invalid = dispatch_command_inner(
+        let (_, invalid) = subscribe_and_collect(
             &state,
             &outgoing,
-            &subscriptions,
-            &event_scope,
-            &mut tasks,
-            "local",
-            &subscribe(
-                "bad-detail",
-                json!({"conversationId": manifest.id, "detail": "compact"}),
-            ),
+            &mut events,
+            &mut subscriptions,
+            "bad-detail",
+            json!({"conversationId": manifest.id, "detail": "compact"}),
         )
         .await;
-        assert!(matches!(invalid, Err(AppError::InvalidRequest(_))));
+        assert_eq!(invalid["type"], "server.error");
+        assert_eq!(invalid["payload"]["code"], "INVALID_REQUEST");
 
-        let result = dispatch_command_inner(
+        let (replayed, ack) = subscribe_and_collect(
             &state,
             &outgoing,
-            &subscriptions,
-            &event_scope,
-            &mut tasks,
-            "local",
-            &subscribe(
-                "capped",
-                json!({
-                    "conversationId": manifest.id,
-                    // Sequence 1 is `conversation.created`.
-                    "afterSequence": 1,
-                    "limit": 2,
-                    "detail": "summary",
-                    "backfillLimit": 3,
-                }),
-            ),
+            &mut events,
+            &mut subscriptions,
+            "capped",
+            json!({
+                "conversationId": manifest.id,
+                // Sequence 1 is `conversation.created`.
+                "afterSequence": 1,
+                "limit": 2,
+                "detail": "summary",
+                "backfillLimit": 3,
+            }),
         )
-        .await
-        .unwrap();
+        .await;
+        let result = &ack["payload"];
         assert_eq!(result["nextSequence"], 4);
         assert_eq!(result["hasMore"], true);
         assert_eq!(result["lastSequence"], 6);
-        for expected in 2..=4 {
-            let event = events.try_recv().expect("capped backfill event");
+        assert_eq!(replayed.len(), 3);
+        for (event, expected) in replayed.iter().zip(2..=4) {
             assert_eq!(event["delivery"], "replay");
             assert_eq!(event["payload"]["sequence"], expected);
             assert_eq!(event["payload"]["payload"]["detailStub"], true);
@@ -4211,37 +4335,28 @@ mod tests {
         assert_eq!(received["delivery"], "live");
         assert_eq!(received["payload"]["sequence"], 7);
         assert_eq!(received["payload"]["payload"]["result"], "x".repeat(4096));
-        for (_, task) in tasks {
-            task.abort();
-        }
+        subscriptions.abort_all();
 
         // A cap covering the backlog behaves like an uncapped subscription.
         let (outgoing, mut events) = mpsc::channel(16);
-        let mut tasks = HashMap::new();
-        let result = dispatch_command_inner(
+        let mut subscriptions = WsSubscriptions::new();
+        let (replayed, ack) = subscribe_and_collect(
             &state,
             &outgoing,
-            &Arc::new(Mutex::new(HashSet::new())),
-            &event_scope,
-            &mut tasks,
-            "local",
-            &subscribe(
-                "covered",
-                json!({"conversationId": manifest.id, "afterSequence": 5, "backfillLimit": 10}),
-            ),
+            &mut events,
+            &mut subscriptions,
+            "covered",
+            json!({"conversationId": manifest.id, "afterSequence": 5, "backfillLimit": 10}),
         )
-        .await
-        .unwrap();
-        assert_eq!(result["nextSequence"], 7);
-        assert_eq!(result["hasMore"], false);
-        for expected in [6, 7] {
-            let event = events.try_recv().unwrap();
+        .await;
+        assert_eq!(ack["payload"]["nextSequence"], 7);
+        assert_eq!(ack["payload"]["hasMore"], false);
+        assert_eq!(replayed.len(), 2);
+        for (event, expected) in replayed.iter().zip([6, 7]) {
             assert_eq!(event["payload"]["sequence"], expected);
             assert_eq!(event["payload"]["payload"]["result"], "x".repeat(4096));
         }
-        for (_, task) in tasks {
-            task.abort();
-        }
+        subscriptions.abort_all();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4444,36 +4559,28 @@ mod tests {
             .await
             .unwrap();
 
-        let (outgoing, _events) = mpsc::channel(16);
-        let subscriptions = Arc::new(Mutex::new(HashSet::new()));
+        let (outgoing, mut events) = mpsc::channel(16);
+        let mut subscriptions = WsSubscriptions::new();
         let event_scope = Arc::new(tokio::sync::RwLock::new(
             websocket::LegacyEventScope::default(),
         ));
-        let mut subscription_tasks = HashMap::new();
-        let subscribed = dispatch_command_inner(
+        let (_, subscribed) = subscribe_and_collect(
             &state,
             &outgoing,
-            &subscriptions,
-            &event_scope,
-            &mut subscription_tasks,
-            "local",
-            &V2Command {
-                id: "sub".to_owned(),
-                command_type: "conversation.subscribe".to_owned(),
-                payload: json!({ "conversationId": manifest.id }),
-            },
+            &mut events,
+            &mut subscriptions,
+            "sub",
+            json!({ "conversationId": manifest.id }),
         )
-        .await
-        .unwrap();
-        assert_eq!(subscribed["subscribed"], true);
-        assert_eq!(subscription_tasks.len(), 1);
+        .await;
+        assert_eq!(subscribed["payload"]["subscribed"], true);
+        assert_eq!(subscriptions.tasks.len(), 1);
 
         let result = dispatch_command_inner(
             &state,
             &outgoing,
-            &subscriptions,
+            &mut subscriptions,
             &event_scope,
-            &mut subscription_tasks,
             "local",
             &V2Command {
                 id: "unsub".to_owned(),
@@ -4484,17 +4591,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result["unsubscribed"], true);
-        assert!(subscriptions.lock().await.is_empty());
-        assert!(subscription_tasks.is_empty());
+        assert!(subscriptions.active.lock().await.is_empty());
+        assert!(subscriptions.tasks.is_empty());
 
         // Unsubscribing an absent conversation is idempotent, and the freed
         // slot accepts a fresh subscription.
         let repeated = dispatch_command_inner(
             &state,
             &outgoing,
-            &subscriptions,
+            &mut subscriptions,
             &event_scope,
-            &mut subscription_tasks,
             "local",
             &V2Command {
                 id: "unsub-again".to_owned(),
@@ -4506,25 +4612,17 @@ mod tests {
         .unwrap();
         assert_eq!(repeated["unsubscribed"], false);
 
-        let resubscribed = dispatch_command_inner(
+        let (_, resubscribed) = subscribe_and_collect(
             &state,
             &outgoing,
-            &subscriptions,
-            &event_scope,
-            &mut subscription_tasks,
-            "local",
-            &V2Command {
-                id: "resub".to_owned(),
-                command_type: "conversation.subscribe".to_owned(),
-                payload: json!({ "conversationId": manifest.id }),
-            },
+            &mut events,
+            &mut subscriptions,
+            "resub",
+            json!({ "conversationId": manifest.id }),
         )
-        .await
-        .unwrap();
-        assert_eq!(resubscribed["subscribed"], true);
-        for (_, task) in subscription_tasks {
-            task.abort();
-        }
+        .await;
+        assert_eq!(resubscribed["payload"]["subscribed"], true);
+        subscriptions.abort_all();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4592,21 +4690,16 @@ mod tests {
             .unwrap();
 
         let (outgoing, _events) = mpsc::channel(16);
-        let subscriptions = Arc::new(Mutex::new(
-            (0..MAX_WS_SUBSCRIPTIONS)
-                .map(|index| format!("occupied-{index}"))
-                .collect::<HashSet<_>>(),
-        ));
-        let event_scope = Arc::new(tokio::sync::RwLock::new(
-            websocket::LegacyEventScope::default(),
-        ));
-        let mut subscription_tasks = HashMap::new();
-        let error = dispatch_command_inner(
+        let mut subscriptions = WsSubscriptions::new();
+        subscriptions
+            .active
+            .lock()
+            .await
+            .extend((0..MAX_WS_SUBSCRIPTIONS).map(|index| format!("occupied-{index}")));
+        let error = start_subscription(
             &state,
             &outgoing,
-            &subscriptions,
-            &event_scope,
-            &mut subscription_tasks,
+            &mut subscriptions,
             "local",
             &V2Command {
                 id: "over-limit".to_owned(),
@@ -6439,6 +6532,300 @@ mod tests {
         .await;
         assert_eq!(pong["payload"]["pong"], true);
         let _ = ws.close(None).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Dispatches a subscribe the way the read loop does. The subscription
+    /// task answers it, so the ack is collected from the outgoing queue with
+    /// the backfill frames queued before it.
+    async fn subscribe_and_collect(
+        state: &AppState,
+        outgoing: &mpsc::Sender<Value>,
+        events: &mut mpsc::Receiver<Value>,
+        subscriptions: &mut WsSubscriptions,
+        id: &str,
+        payload: Value,
+    ) -> (Vec<Value>, Value) {
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        let command = V2Command {
+            id: id.to_owned(),
+            command_type: "conversation.subscribe".to_owned(),
+            payload,
+        };
+        if let Some(response) = dispatch_command(
+            state,
+            outgoing,
+            subscriptions,
+            &event_scope,
+            "local",
+            command,
+        )
+        .await
+        {
+            return (Vec::new(), response);
+        }
+        let mut frames = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("subscribe response timeout")
+                .expect("outgoing queue open");
+            if frame["id"] == id {
+                return (frames, frame);
+            }
+            frames.push(frame);
+        }
+    }
+
+    /// App state whose supervisor publishes through a hub the test controls,
+    /// plus one conversation owned by `local`.
+    async fn subscription_fixture(
+        name: &str,
+    ) -> (
+        PathBuf,
+        AppState,
+        ConversationStore,
+        ConversationEventHub,
+        ConversationManifest,
+    ) {
+        let root = std::env::temp_dir().join(format!("todex-v2-{name}-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root],
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+                provider_idle_timeout_minutes: 0,
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+        })
+        .await
+        .unwrap();
+        let store = ConversationStore::new(state.config.data_dir.clone())
+            .await
+            .unwrap();
+        let hub = ConversationEventHub::default();
+        state.conversations = ConversationSupervisor::new(
+            state.config.clone(),
+            store.clone(),
+            hub.clone(),
+            state.workspace_trust.clone(),
+        );
+        let manifest = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::Codex,
+                workspace,
+                Some(format!("{name} fixture")),
+                None,
+            )
+            .await
+            .unwrap();
+        (root, state, store, hub, manifest)
+    }
+
+    #[tokio::test]
+    async fn v2_subscribe_backfill_does_not_block_later_commands() {
+        let (root, state, store, hub, manifest) = subscription_fixture("backfill-bg").await;
+        for index in 0..20 {
+            store
+                .append(&manifest.id, "fixture.event", json!({ "index": index }))
+                .await
+                .unwrap();
+        }
+        // A one-slot queue nobody drains yet: the backfill stalls on its
+        // second frame, like a slow peer behind a large journal.
+        let (outgoing, mut events) = mpsc::channel(1);
+        let mut subscriptions = WsSubscriptions::new();
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        let command = |id: &str, command_type: &str, payload: Value| V2Command {
+            id: id.to_owned(),
+            command_type: command_type.to_owned(),
+            payload,
+        };
+        let subscribe_payload = json!({ "conversationId": manifest.id, "limit": 1 });
+
+        let deferred = tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatch_command(
+                &state,
+                &outgoing,
+                &mut subscriptions,
+                &event_scope,
+                "local",
+                command("sub-1", "conversation.subscribe", subscribe_payload.clone()),
+            ),
+        )
+        .await
+        .expect("subscribe must return before its backfill finishes");
+        assert!(deferred.is_none(), "the subscription task sends the ack");
+
+        let pong = tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatch_command(
+                &state,
+                &outgoing,
+                &mut subscriptions,
+                &event_scope,
+                "local",
+                command("ping-1", "server.ping", json!({})),
+            ),
+        )
+        .await
+        .expect("ping must not wait behind the backfill")
+        .expect("ping is answered inline");
+        assert_eq!(pong["id"], "ping-1");
+        assert_eq!(pong["payload"]["pong"], true);
+
+        // The slot is reserved before the backfill, so a quick duplicate is
+        // deduplicated instead of starting a second backfill.
+        let duplicate = dispatch_command(
+            &state,
+            &outgoing,
+            &mut subscriptions,
+            &event_scope,
+            "local",
+            command("sub-2", "conversation.subscribe", subscribe_payload),
+        )
+        .await
+        .expect("duplicate subscribe is answered inline");
+        assert_eq!(duplicate["payload"]["alreadySubscribed"], true);
+        assert_eq!(subscriptions.tasks.len(), 1);
+        assert!(!subscriptions.tasks[&manifest.id]
+            .answered
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        // Backfill frames, then the ack with the request id, then live.
+        let mut frames = Vec::new();
+        let ack = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if frame["id"] == "sub-1" {
+                break frame;
+            }
+            frames.push(frame);
+        };
+        let sequences = frames
+            .iter()
+            .map(|frame| {
+                assert_eq!(frame["delivery"], "replay");
+                frame["payload"]["sequence"].as_u64().unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, (1..=21).collect::<Vec<_>>());
+        assert_eq!(ack["type"], "server.result");
+        assert_eq!(
+            ack["payload"],
+            json!({
+                "conversationId": manifest.id,
+                "subscribed": true,
+                "nextSequence": 21,
+                "hasMore": false,
+                "lastSequence": 21,
+            })
+        );
+        let live = store
+            .append(&manifest.id, "fixture.live", json!({}))
+            .await
+            .unwrap();
+        hub.publish(live);
+        let received = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received["delivery"], "live");
+        assert_eq!(received["payload"]["sequence"], 22);
+        subscriptions.abort_all();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_unsubscribe_during_backfill_answers_the_pending_subscribe() {
+        let (root, state, _store, _hub, manifest) = subscription_fixture("unsub-bg").await;
+        let (outgoing, mut events) = mpsc::channel(16);
+        let mut subscriptions = WsSubscriptions::new();
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        // Occupy every backfill slot so the subscription stays mid-backfill.
+        let _permits = subscriptions
+            .backfill_permits
+            .clone()
+            .acquire_many_owned(MAX_WS_CONCURRENT_BACKFILLS as u32)
+            .await
+            .unwrap();
+        let deferred = dispatch_command(
+            &state,
+            &outgoing,
+            &mut subscriptions,
+            &event_scope,
+            "local",
+            V2Command {
+                id: "sub".to_owned(),
+                command_type: "conversation.subscribe".to_owned(),
+                payload: json!({ "conversationId": manifest.id }),
+            },
+        )
+        .await;
+        assert!(deferred.is_none());
+
+        let unsubscribed = dispatch_command(
+            &state,
+            &outgoing,
+            &mut subscriptions,
+            &event_scope,
+            "local",
+            V2Command {
+                id: "unsub".to_owned(),
+                command_type: "conversation.unsubscribe".to_owned(),
+                payload: json!({ "conversationId": manifest.id }),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(unsubscribed["payload"]["unsubscribed"], true);
+        assert!(subscriptions.active.lock().await.is_empty());
+        assert!(subscriptions.tasks.is_empty());
+
+        // The cancelled subscribe is answered exactly once, with an error.
+        let cancelled = events.try_recv().expect("pending subscribe is answered");
+        assert_eq!(cancelled["id"], "sub");
+        assert_eq!(cancelled["type"], "server.error");
+        assert_eq!(cancelled["payload"]["code"], "CONFLICT");
+        assert!(events.try_recv().is_err());
         let _ = fs::remove_dir_all(root);
     }
 
