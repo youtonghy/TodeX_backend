@@ -42,6 +42,8 @@ use super::websocket::{self, AuthContext};
 /// data URLs (up to 8 MiB per image) and the legacy plane has no outbound
 /// chunking, so a tighter cap would reject source images the v1 plane accepted.
 /// Client v2.ts keeps a stricter 4MB guard for `conversation.*` commands.
+/// Enforced by the upgrade itself, so a larger message is never buffered; the
+/// connection closes with a receive error instead.
 const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WS_SUBSCRIPTIONS: usize = 128;
 const MAX_WS_IN_FLIGHT_OPERATIONS: usize = 16;
@@ -50,6 +52,14 @@ const MAX_WS_IN_FLIGHT_OPERATIONS: usize = 16;
 /// automatic Pong, which counts as receive activity below.
 const WS_PING_INTERVAL_SECS: u64 = 30;
 const WS_CLIENT_TIMEOUT_SECS: u64 = 90;
+/// A peer whose socket accepts no frame for this long is treated as gone, so a
+/// stalled client cannot hold the send task (and its queue) forever.
+const WS_SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(20);
+/// Commands and subscription backfill wait at most this long for room in the
+/// outgoing queue; a queue that stays full means the send side is stuck.
+const WS_QUEUE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Teardown lets queued frames drain for this long before aborting the send task.
+const WS_SEND_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const BROWSER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const BROWSER_FETCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
 const MAX_WORKSPACE_TEXT_BYTES: usize = 1024 * 1024;
@@ -1962,7 +1972,54 @@ async fn ws(
     // parameters) so the encrypted channel is bound to the device identity.
     let auth = require_auth(&state, &headers)?;
     let crypto = websocket::transport_crypto_from_handshake(&state, &headers, uri.query())?;
-    Ok(ws.on_upgrade(move |socket| handle_socket(state, socket, crypto, auth)))
+    Ok(ws
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(state, socket, crypto, auth)))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SendFailure {
+    /// The receiving side is gone.
+    Closed,
+    /// The receiving side did not accept the item before the deadline.
+    Stalled,
+}
+
+/// Bounds one send on the websocket or its outgoing queue. Either failure
+/// means the connection can no longer deliver and must be torn down.
+async fn send_with_deadline<E>(
+    deadline: Duration,
+    send: impl std::future::Future<Output = Result<(), E>>,
+) -> Result<(), SendFailure> {
+    match tokio::time::timeout(deadline, send).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(SendFailure::Closed),
+        Err(_) => Err(SendFailure::Stalled),
+    }
+}
+
+/// Queues a frame for the send task. The read loop tears the connection down
+/// on failure instead of blocking behind a peer that stopped reading.
+async fn queue_frame(outgoing: &mpsc::Sender<Value>, value: Value) -> Result<(), SendFailure> {
+    let result = send_with_deadline(WS_QUEUE_SEND_TIMEOUT, outgoing.send(value)).await;
+    if result == Err(SendFailure::Stalled) {
+        warn!(
+            timeout_secs = WS_QUEUE_SEND_TIMEOUT.as_secs(),
+            "v2 websocket outgoing queue stayed full, closing connection"
+        );
+    }
+    result
+}
+
+fn log_socket_send_failure(failure: SendFailure) {
+    match failure {
+        SendFailure::Closed => {}
+        SendFailure::Stalled => warn!(
+            timeout_secs = WS_SOCKET_SEND_TIMEOUT.as_secs(),
+            "v2 websocket peer stopped accepting frames, closing connection"
+        ),
+    }
 }
 
 async fn handle_socket(
@@ -2025,12 +2082,14 @@ async fn handle_socket(
                         },
                         None => text,
                     };
-                    if sender.send(Message::Text(text.into())).await.is_err() {
+                    if let Err(failure) = send_with_deadline(WS_SOCKET_SEND_TIMEOUT, sender.send(Message::Text(text.into()))).await {
+                        log_socket_send_failure(failure);
                         break;
                     }
                 }
                 _ = ping_interval.tick() => {
-                    if sender.send(Message::Ping(Default::default())).await.is_err() {
+                    if let Err(failure) = send_with_deadline(WS_SOCKET_SEND_TIMEOUT, sender.send(Message::Ping(Default::default()))).await {
+                        log_socket_send_failure(failure);
                         break;
                     }
                 }
@@ -2098,7 +2157,13 @@ async fn handle_socket(
     let mut operation_tasks = Vec::new();
     let client_timeout = tokio::time::Duration::from_secs(WS_CLIENT_TIMEOUT_SECS);
     loop {
-        let frame = match tokio::time::timeout(client_timeout, receiver.next()).await {
+        let frame = tokio::select! {
+            frame = tokio::time::timeout(client_timeout, receiver.next()) => frame,
+            // The send task stopped (socket error or send deadline): nothing
+            // queued from here on can reach the client.
+            _ = outgoing_tx.closed() => break,
+        };
+        let frame = match frame {
             Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(_) => {
@@ -2122,20 +2187,16 @@ async fn handle_socket(
             }
             continue;
         };
-        if text.len() > MAX_WS_MESSAGE_BYTES {
-            let _ = outgoing_tx
-                .send(error_response(
-                    None,
-                    AppError::InvalidRequest("websocket message is too large".to_owned()),
-                ))
-                .await;
-            continue;
-        }
         let text = match &crypto {
             Some(crypto) => match crypto.decrypt_client_text(&text) {
                 Ok(text) => text,
                 Err(error) => {
-                    let _ = outgoing_tx.send(error_response(None, error)).await;
+                    if queue_frame(&outgoing_tx, error_response(None, error))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                     continue;
                 }
             },
@@ -2149,14 +2210,15 @@ async fn handle_socket(
                 let command: V2Command = match serde_json::from_str(&text) {
                     Ok(command) => command,
                     Err(error) => {
-                        let _ = outgoing_tx
-                            .send(error_response(
-                                None,
-                                AppError::InvalidRequest(format!(
-                                    "invalid v2 websocket command: {error}"
-                                )),
-                            ))
-                            .await;
+                        let response = error_response(
+                            None,
+                            AppError::InvalidRequest(format!(
+                                "invalid v2 websocket command: {error}"
+                            )),
+                        );
+                        if queue_frame(&outgoing_tx, response).await.is_err() {
+                            break;
+                        }
                         continue;
                     }
                 };
@@ -2164,14 +2226,15 @@ async fn handle_socket(
                     let permit = match operation_limit.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
-                            let _ = outgoing_tx
-                                .send(error_response(
-                                    Some(command.id),
-                                    AppError::ResourceExhausted(format!(
-                                        "v2 websocket allows at most {MAX_WS_IN_FLIGHT_OPERATIONS} concurrent operations"
-                                    )),
-                                ))
-                                .await;
+                            let response = error_response(
+                                Some(command.id),
+                                AppError::ResourceExhausted(format!(
+                                    "v2 websocket allows at most {MAX_WS_IN_FLIGHT_OPERATIONS} concurrent operations"
+                                )),
+                            );
+                            if queue_frame(&outgoing_tx, response).await.is_err() {
+                                break;
+                            }
                             continue;
                         }
                     };
@@ -2185,7 +2248,9 @@ async fn handle_socket(
                         let response =
                             dispatch_mcp_command_response(&operation_state, &owner_id, command)
                                 .await;
-                        let _ = operation_outgoing.send(response).await;
+                        // A failed delivery also stops the read loop, which
+                        // aborts this task during teardown.
+                        let _ = queue_frame(&operation_outgoing, response).await;
                     }));
                     continue;
                 }
@@ -2200,7 +2265,9 @@ async fn handle_socket(
                 )
                 .await;
                 if let Some(response) = response {
-                    let _ = outgoing_tx.send(response).await;
+                    if queue_frame(&outgoing_tx, response).await.is_err() {
+                        break;
+                    }
                 }
             }
             _ => {
@@ -2215,7 +2282,9 @@ async fn handle_socket(
                 .await
                 {
                     if let Ok(value) = serde_json::to_value(websocket::direct_error_event(error)) {
-                        let _ = outgoing_tx.send(value).await;
+                        if queue_frame(&outgoing_tx, value).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -2231,7 +2300,17 @@ async fn handle_socket(
     }
     bus_task.abort();
     drop(outgoing_tx);
-    let _ = send_task.await;
+    let mut send_task = send_task;
+    if tokio::time::timeout(WS_SEND_DRAIN_TIMEOUT, &mut send_task)
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout_secs = WS_SEND_DRAIN_TIMEOUT.as_secs(),
+            "v2 websocket send task did not drain, aborting it"
+        );
+        send_task.abort();
+    }
 
     let active_connections = state.decrement_websocket_connections();
     state
@@ -2353,10 +2432,14 @@ async fn dispatch_command_inner(
                     if summary {
                         crate::conversation::summarize_event(&mut event);
                     }
-                    outgoing
-                        .send(json!({ "type": "conversation.event", "delivery": "replay", "payload": event }))
-                        .await
-                        .map_err(|_| AppError::StreamClosed)?;
+                    // Backfill runs on the read loop; a queue that stays full
+                    // must not wedge it.
+                    queue_frame(
+                        outgoing,
+                        json!({ "type": "conversation.event", "delivery": "replay", "payload": event }),
+                    )
+                    .await
+                    .map_err(|_| AppError::StreamClosed)?;
                 }
                 if !advanced {
                     return Err(AppError::Conflict(format!(
@@ -3169,6 +3252,62 @@ mod tests {
     use crate::conversation::{ConversationEventHub, ConversationStore};
     use crate::device_auth::test_support::TestDevice;
     use crate::provider::ConversationSupervisor;
+
+    /// A websocket half whose peer never drains: every send stays pending.
+    struct StalledSink;
+
+    impl futures_util::Sink<Message> for StalledSink {
+        type Error = axum::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+            unreachable!("poll_ready never admits an item")
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_send_to_a_stalled_peer_hits_the_deadline() {
+        let mut sink = StalledSink;
+        let result = send_with_deadline(
+            Duration::from_millis(20),
+            sink.send(Message::Ping(Default::default())),
+        )
+        .await;
+        assert_eq!(result, Err(SendFailure::Stalled));
+    }
+
+    #[tokio::test]
+    async fn queue_send_distinguishes_a_full_queue_from_a_closed_one() {
+        let (outgoing, receiver) = mpsc::channel::<Value>(1);
+        send_with_deadline(Duration::from_millis(20), outgoing.send(json!(1)))
+            .await
+            .unwrap();
+        let full = send_with_deadline(Duration::from_millis(20), outgoing.send(json!(2))).await;
+        assert_eq!(full, Err(SendFailure::Stalled));
+        drop(receiver);
+        let closed = send_with_deadline(Duration::from_millis(20), outgoing.send(json!(3))).await;
+        assert_eq!(closed, Err(SendFailure::Closed));
+    }
 
     /// Enroll a deterministic test device against the state's data directory.
     /// The authenticator reloads the registry file when it changes on disk, so
