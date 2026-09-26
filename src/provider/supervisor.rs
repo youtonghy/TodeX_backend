@@ -18,7 +18,7 @@ use crate::catalog::CatalogService;
 use crate::config::Config;
 use crate::conversation::{
     ConversationEventHub, ConversationManifest, ConversationReplay, ConversationStatus,
-    ConversationStore, ProviderKind,
+    ConversationStore, ProviderKind, ProviderState,
 };
 use crate::error::AppError;
 use crate::mcp;
@@ -34,10 +34,10 @@ use super::grok::GrokBuildDriver;
 use super::pi::PiDriver;
 use super::process::same_executable;
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill, ImageInputMode,
-    PermissionBroker, PermissionDecision, PermissionOutcome, ProviderCommandDescriptor,
-    ProviderControl, ProviderDescriptor, ProviderDriver, ProviderImageInputCapability,
-    ProviderModelDescriptor,
+    DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill,
+    DriverTurnResult, ImageInputMode, PermissionBroker, PermissionDecision, PermissionOutcome,
+    ProviderCommandDescriptor, ProviderControl, ProviderDescriptor, ProviderDriver,
+    ProviderImageInputCapability, ProviderModelDescriptor,
 };
 
 fn prompt_fingerprint(prompt: &ConversationPrompt) -> Result<String, AppError> {
@@ -68,6 +68,57 @@ const MAX_PROMPT_BYTES: usize = 512 * 1024;
 const MAX_PROMPT_CONTENT_ITEMS: usize = 16;
 const MAX_PROMPT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Backoff between attempts to journal a turn's terminal event.
+const TERMINAL_EVENT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+];
+
+/// Runs `attempt(0)`, then one retry per delay while it fails, and returns
+/// the last error once the delays are exhausted.
+async fn retry_with_backoff<F, Fut>(delays: &[Duration], mut attempt: F) -> Result<(), AppError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<(), AppError>>,
+{
+    let mut index = 0;
+    loop {
+        let error = match attempt(index).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let Some(delay) = delays.get(index) else {
+            return Err(error);
+        };
+        tracing::warn!(error = %error, attempt = index + 1, retry_in_ms = delay.as_millis() as u64, "retrying terminal turn event");
+        sleep(*delay).await;
+        index += 1;
+    }
+}
+
+/// The failure code and message for a driver task that did not return.
+fn driver_task_failure(error: tokio::task::JoinError) -> (&'static str, String) {
+    if !error.is_panic() {
+        return (
+            "PROVIDER_TASK_CANCELLED",
+            "The provider driver task was cancelled before it finished.".to_owned(),
+        );
+    }
+    let panic = error.into_panic();
+    let detail = panic
+        .downcast_ref::<&str>()
+        .map(|detail| (*detail).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no panic message".to_owned());
+    (
+        "PROVIDER_PANIC",
+        format!("The provider driver crashed: {detail}")
+            .chars()
+            .take(1000)
+            .collect(),
+    )
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1486,117 +1537,195 @@ impl ConversationSupervisor {
                 conversation_id.clone(),
             )
             .with_turn_id(spawned_turn_id.clone());
-            let result = driver
-                .run_turn(
-                    DriverContext {
-                        manifest,
-                        provider_state: provider_state.clone(),
-                    },
-                    DriverPrompt {
-                        turn_id: spawned_turn_id.clone(),
-                        text: provider_text,
-                        content: driver_content,
-                        skills: loaded_skills,
-                        model,
-                        reasoning_effort,
-                        permission_mode,
-                        work_mode,
-                        permission_profile,
-                        sandbox_mode,
-                        approval_policy,
-                    },
-                    sink,
-                    cancel_rx,
-                    launch_permit,
+            let driver_context = DriverContext {
+                manifest,
+                provider_state: provider_state.clone(),
+            };
+            let driver_prompt = DriverPrompt {
+                turn_id: spawned_turn_id.clone(),
+                text: provider_text,
+                content: driver_content,
+                skills: loaded_skills,
+                model,
+                reasoning_effort,
+                permission_mode,
+                work_mode,
+                permission_profile,
+                sandbox_mode,
+                approval_policy,
+            };
+            // The driver runs in its own task so a panic surfaces as a
+            // JoinError here and still produces a terminal event.
+            let outcome = tokio::spawn(async move {
+                driver
+                    .run_turn(
+                        driver_context,
+                        driver_prompt,
+                        sink,
+                        cancel_rx,
+                        launch_permit,
+                    )
+                    .await
+            })
+            .await;
+            supervisor
+                .finish_turn(
+                    &conversation_id,
+                    &spawned_turn_id,
+                    client_request_id,
+                    provider_state,
+                    outcome,
                 )
                 .await;
-            match result {
-                Ok(result) if result.cancelled => {
-                    if let Err(error) = supervisor
-                        .emit(
-                            &conversation_id,
-                            "turn.cancelled",
-                            json!({
-                                "turnId": spawned_turn_id,
-                                "clientRequestId": client_request_id,
-                                "stopReason": result.stop_reason,
-                                "nativeSessionId": result.native_session_id,
-                            }),
-                        )
-                        .await
-                    {
-                        tracing::error!(conversation_id, error = %error, "failed to persist cancelled turn");
-                    }
-                }
-                Ok(result) => {
-                    if let Err(error) = supervisor
-                        .emit(
-                            &conversation_id,
-                            "turn.completed",
-                            json!({
-                                "turnId": spawned_turn_id,
-                                "clientRequestId": client_request_id,
-                                "stopReason": result.stop_reason,
-                                "nativeSessionId": result.native_session_id,
-                            }),
-                        )
-                        .await
-                    {
-                        tracing::error!(conversation_id, error = %error, "failed to persist completed turn");
-                    }
-                }
-                Err(AppError::TurnCancelled) => {
-                    if let Err(error) = supervisor
-                        .emit(
-                            &conversation_id,
-                            "turn.cancelled",
-                            json!({
-                                "turnId": spawned_turn_id,
-                                "clientRequestId": client_request_id,
-                                "stopReason": "cancelled",
-                                "nativeSessionId": Value::Null,
-                            }),
-                        )
-                        .await
-                    {
-                        tracing::error!(conversation_id, error = %error, "failed to persist cancelled turn");
-                    }
-                }
-                Err(error) => {
-                    // A driver may have persisted a new native session or an
-                    // extension switch during this turn. Do not roll it back.
-                    let mut state = supervisor
-                        .store
-                        .provider_state(&conversation_id)
-                        .await
-                        .unwrap_or(provider_state);
-                    state.last_error = Some(error.to_string().chars().take(1000).collect());
-                    if let Err(save_error) = supervisor
-                        .store
-                        .save_provider_state(&conversation_id, state)
-                        .await
-                    {
-                        tracing::error!(conversation_id, error = %save_error, "failed to persist provider error state");
-                    }
-                    if let Err(save_error) = supervisor
-                        .emit(
-                            &conversation_id,
-                            "turn.failed",
-                            json!({
-                                "turnId": spawned_turn_id,
-                                "clientRequestId": client_request_id,
-                                "code": error.code(),
-                                "message": error.to_string(),
-                            }),
-                        )
-                        .await
-                    {
-                        tracing::error!(conversation_id, error = %save_error, "failed to persist failed turn");
-                    }
-                }
-            }
         });
         Ok(turn_id)
+    }
+
+    /// Journals exactly one terminal event for a turn whose driver task ended,
+    /// including a driver that panicked.
+    async fn finish_turn(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        client_request_id: Option<String>,
+        provider_state: ProviderState,
+        outcome: Result<Result<DriverTurnResult, AppError>, tokio::task::JoinError>,
+    ) {
+        let (event_type, payload) = match outcome {
+            Ok(Ok(result)) => (
+                if result.cancelled {
+                    "turn.cancelled"
+                } else {
+                    "turn.completed"
+                },
+                json!({
+                    "turnId": turn_id,
+                    "clientRequestId": client_request_id,
+                    "stopReason": result.stop_reason,
+                    "nativeSessionId": result.native_session_id,
+                }),
+            ),
+            Ok(Err(AppError::TurnCancelled)) => (
+                "turn.cancelled",
+                json!({
+                    "turnId": turn_id,
+                    "clientRequestId": client_request_id,
+                    "stopReason": "cancelled",
+                    "nativeSessionId": Value::Null,
+                }),
+            ),
+            Ok(Err(error)) => {
+                let message = error.to_string();
+                self.record_provider_error(conversation_id, provider_state, &message)
+                    .await;
+                (
+                    "turn.failed",
+                    json!({
+                        "turnId": turn_id,
+                        "clientRequestId": client_request_id,
+                        "code": error.code(),
+                        "message": message,
+                    }),
+                )
+            }
+            Err(error) => {
+                let (code, message) = driver_task_failure(error);
+                tracing::error!(
+                    conversation_id,
+                    turn_id,
+                    code,
+                    message,
+                    "provider driver task failed"
+                );
+                self.record_provider_error(conversation_id, provider_state, &message)
+                    .await;
+                (
+                    "turn.failed",
+                    json!({
+                        "turnId": turn_id,
+                        "clientRequestId": client_request_id,
+                        "code": code,
+                        "message": message,
+                    }),
+                )
+            }
+        };
+        self.emit_terminal(conversation_id, turn_id, event_type, payload)
+            .await;
+    }
+
+    async fn record_provider_error(
+        &self,
+        conversation_id: &str,
+        provider_state: ProviderState,
+        message: &str,
+    ) {
+        // A driver may have persisted a new native session or an extension
+        // switch during this turn. Do not roll it back.
+        let mut state = match self.store.provider_state(conversation_id).await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(conversation_id, error = %error, "failed to reload provider state; recording the error on the turn's snapshot");
+                provider_state
+            }
+        };
+        state.last_error = Some(message.chars().take(1000).collect());
+        if let Err(error) = self.store.save_provider_state(conversation_id, state).await {
+            tracing::error!(conversation_id, error = %error, "failed to persist provider error state");
+        }
+    }
+
+    /// A terminal event is what returns a conversation to idle, so a transient
+    /// store failure is retried. A retry first checks whether the previous
+    /// attempt reached the journal before failing, so it never duplicates.
+    async fn emit_terminal(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        event_type: &str,
+        payload: Value,
+    ) {
+        let result = retry_with_backoff(&TERMINAL_EVENT_RETRY_DELAYS, |attempt| {
+            let payload = payload.clone();
+            async move {
+                if attempt > 0
+                    && self
+                        .journal_has_turn_event(conversation_id, turn_id, event_type)
+                        .await
+                {
+                    return Ok(());
+                }
+                self.emit(conversation_id, event_type, payload).await
+            }
+        })
+        .await;
+        if let Err(error) = result {
+            tracing::error!(
+                conversation_id,
+                turn_id,
+                event_type,
+                error = %error,
+                "failed to persist terminal turn event; the conversation keeps its running status until restart recovery"
+            );
+        }
+    }
+
+    async fn journal_has_turn_event(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        event_type: &str,
+    ) -> bool {
+        match self.store.complete_history(conversation_id).await {
+            Ok(history) => history.iter().rev().any(|event| {
+                event.event_type == event_type
+                    && event.payload.get("turnId").and_then(Value::as_str) == Some(turn_id)
+            }),
+            Err(error) => {
+                tracing::warn!(conversation_id, error = %error, "failed to read the journal before retrying a terminal event");
+                false
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -2791,6 +2920,111 @@ mod tests {
             count
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Replaces the driver for `provider` so a test can script its behavior
+    /// while prompt validation still sees the real descriptor.
+    fn replace_driver(
+        supervisor: &mut ConversationSupervisor,
+        provider: ProviderKind,
+        driver: impl FnOnce(Arc<dyn ProviderDriver>) -> Arc<dyn ProviderDriver>,
+    ) {
+        let mut drivers = (*supervisor.registry.drivers).clone();
+        let real = drivers.remove(&provider).unwrap();
+        drivers.insert(provider, driver(real));
+        supervisor.registry = DriverRegistry {
+            drivers: Arc::new(drivers),
+        };
+    }
+
+    struct PanickingDriver(Arc<dyn ProviderDriver>);
+
+    #[async_trait::async_trait]
+    impl ProviderDriver for PanickingDriver {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn run_turn(
+            &self,
+            _context: DriverContext,
+            _prompt: DriverPrompt,
+            _sink: DriverEventSink,
+            _cancel: watch::Receiver<bool>,
+            _launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
+        ) -> Result<DriverTurnResult, AppError> {
+            panic!("fixture driver panic")
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_driver_still_fails_the_turn_and_frees_the_slot() {
+        let (root, store, mut supervisor, workspace) = control_fixture("todex-driver-panic").await;
+        replace_driver(&mut supervisor, ProviderKind::ClaudeCode, |real| {
+            Arc::new(PanickingDriver(real))
+        });
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let failed = history
+            .iter()
+            .filter(|event| event.event_type == "turn.failed")
+            .collect::<Vec<_>>();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].payload["turnId"], turn_id);
+        assert_eq!(failed[0].payload["code"], "PROVIDER_PANIC");
+        assert!(failed[0].payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("fixture driver panic"));
+        assert_eq!(
+            store.get(&manifest.id).await.unwrap().status,
+            ConversationStatus::Failed
+        );
+        assert!(store
+            .provider_state(&manifest.id)
+            .await
+            .unwrap()
+            .last_error
+            .unwrap()
+            .contains("fixture driver panic"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_event_retries_follow_the_backoff_and_report_the_last_error() {
+        let delays = [Duration::from_millis(1), Duration::from_millis(2)];
+        let mut attempts = Vec::new();
+        let recovered = retry_with_backoff(&delays, |attempt| {
+            attempts.push(attempt);
+            async move {
+                if attempt < 2 {
+                    Err(AppError::Conflict(format!("attempt {attempt}")))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(recovered.is_ok());
+        assert_eq!(attempts, [0, 1, 2]);
+
+        let mut calls = 0;
+        let exhausted = retry_with_backoff(&delays, |attempt| {
+            calls += 1;
+            async move { Err(AppError::Conflict(format!("attempt {attempt}"))) }
+        })
+        .await;
+        assert_eq!(calls, delays.len() + 1);
+        assert!(matches!(exhausted, Err(AppError::Conflict(message)) if message == "attempt 2"));
+        assert_eq!(TERMINAL_EVENT_RETRY_DELAYS.len(), 3);
     }
 
     #[tokio::test]
