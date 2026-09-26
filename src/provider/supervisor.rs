@@ -1857,8 +1857,19 @@ impl ConversationSupervisor {
                 turn_id,
                 event_type,
                 error = %error,
-                "failed to persist terminal turn event; the conversation keeps its running status until restart recovery"
+                "failed to persist terminal turn event; restart recovery closes the turn in the journal"
             );
+            if let Err(error) = self
+                .store
+                .set_status(conversation_id, ConversationStatus::Failed)
+                .await
+            {
+                tracing::error!(
+                    conversation_id,
+                    error = %error,
+                    "failed to mark the conversation failed after losing its terminal event"
+                );
+            }
         }
     }
 

@@ -261,6 +261,26 @@ impl ConversationStore {
         Ok(manifest)
     }
 
+    /// Force the stored status without a journal event. Only for the case
+    /// where the journal itself refused the terminal event: the manifest stops
+    /// claiming a turn that is no longer running, and restart recovery still
+    /// closes the turn in the journal.
+    pub async fn set_status(
+        &self,
+        conversation_id: &str,
+        status: super::ConversationStatus,
+    ) -> Result<ConversationManifest, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let mut manifest = self.get_unlocked(conversation_id).await?;
+        if manifest.status == status {
+            return Ok(manifest);
+        }
+        manifest.status = status;
+        manifest.updated_at = Utc::now();
+        self.persist_manifest_locked(&manifest).await?;
+        Ok(manifest)
+    }
+
     pub async fn delete(&self, conversation_id: &str) -> Result<(), AppError> {
         let _guard = self.lock(conversation_id).await;
         let directory = self.directory(conversation_id)?;
@@ -2781,6 +2801,21 @@ mod tests {
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_status_persists_without_a_journal_event() {
+        let (root, id) = seed_turn("todex-set-status", 3).await;
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let failed = store
+            .set_status(&id, super::super::ConversationStatus::Failed)
+            .await
+            .unwrap();
+        assert_eq!(failed.status, super::super::ConversationStatus::Failed);
+        assert_eq!(failed.last_sequence, 3);
+        assert_eq!(disk_manifest(&root, &id)["status"], json!("failed"));
+        assert_eq!(store.replay(&id, 0, 100).await.unwrap().events.len(), 3);
+        let _ = fs::remove_dir_all(root);
     }
 
     async fn seed_turn(prefix: &str, count: u64) -> (PathBuf, String) {
