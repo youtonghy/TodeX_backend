@@ -15,6 +15,8 @@ use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
 const MAX_PROTOCOL_LINE_BYTES: usize = 4 * 1024 * 1024;
+/// Bytes of an unparseable provider line kept for diagnostics.
+const UNPARSED_LINE_PREVIEW_BYTES: usize = 512;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 pub(super) fn control_timeout() -> Result<Duration, AppError> {
     configured_timeout("TODEX_AGENTD_PROVIDER_CONTROL_TIMEOUT_SECONDS", 30, 3600)
@@ -80,11 +82,51 @@ impl CommandSpec {
     }
 }
 
+/// One line of provider stdout.
+///
+/// Providers print banners, progress text and occasionally huge frames on the
+/// protocol stream. A line that cannot be decoded is reported instead of
+/// failing the exchange, so one stray print does not end a turn.
+#[derive(Debug)]
+pub enum ProviderRead {
+    /// A JSON frame; `Value::Null` for a blank line.
+    Frame(Value),
+    /// A line that is not JSON. `preview` is redacted and at most
+    /// UNPARSED_LINE_PREVIEW_BYTES long.
+    Invalid { preview: String },
+    /// A line above MAX_PROTOCOL_LINE_BYTES, discarded without buffering it.
+    Oversized { bytes: usize },
+}
+
+impl ProviderRead {
+    /// The frame, or `Value::Null` after logging a line nobody reports.
+    pub fn into_logged_frame(self) -> Value {
+        match self {
+            Self::Frame(value) => value,
+            Self::Invalid { preview } => {
+                tracing::warn!(preview = %preview, "skipping provider stdout line that is not JSON");
+                Value::Null
+            }
+            Self::Oversized { bytes } => {
+                tracing::warn!(bytes, "skipping oversized provider stdout line");
+                Value::Null
+            }
+        }
+    }
+}
+
+enum BoundedLine {
+    Line(Vec<u8>),
+    Oversized(usize),
+}
+
 pub struct JsonLineProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     stdout_pending: Vec<u8>,
+    /// Bytes skipped so far of an oversized line whose end has not arrived.
+    stdout_discarding: Option<usize>,
     stderr: Arc<Mutex<Vec<u8>>>,
     stderr_task: JoinHandle<()>,
     pid: Option<u32>,
@@ -142,6 +184,7 @@ impl JsonLineProcess {
             stdin,
             stdout: BufReader::new(stdout),
             stdout_pending: Vec::new(),
+            stdout_discarding: None,
             stderr,
             stderr_task,
             pid,
@@ -185,42 +228,52 @@ impl JsonLineProcess {
     }
 
     /// A single control exchange keeps the same deadline across unrelated notifications.
+    /// Unparseable lines are logged and surface as `Value::Null`.
     pub async fn read_control_until(
         &mut self,
         deadline: Instant,
     ) -> Result<Option<Value>, AppError> {
+        Ok(self
+            .read_frame_until(deadline)
+            .await?
+            .map(ProviderRead::into_logged_frame))
+    }
+
+    /// [`Self::read_control_until`] for loops that report unparseable lines.
+    pub async fn read_frame_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Option<ProviderRead>, AppError> {
         if Instant::now() >= deadline {
             return Err(AppError::ProviderUnavailable(
                 "provider control response timed out".to_owned(),
             ));
         }
-        timeout_at(deadline, self.read()).await.map_err(|_| {
+        timeout_at(deadline, self.read_frame()).await.map_err(|_| {
             AppError::ProviderUnavailable("provider control response timed out".to_owned())
         })?
     }
 
+    /// The next frame; unparseable lines are logged and surface as
+    /// `Value::Null`, which every reader already skips like a blank line.
     pub async fn read(&mut self) -> Result<Option<Value>, AppError> {
-        let Some(mut bytes) = read_bounded_line(
+        Ok(self
+            .read_frame()
+            .await?
+            .map(ProviderRead::into_logged_frame))
+    }
+
+    /// The next stdout line, classified. `None` is end of stream. Cancel-safe:
+    /// partial lines and oversized-line progress stay with the process.
+    pub async fn read_frame(&mut self) -> Result<Option<ProviderRead>, AppError> {
+        let line = read_bounded_line(
             &mut self.stdout,
             &mut self.stdout_pending,
+            &mut self.stdout_discarding,
             MAX_PROTOCOL_LINE_BYTES,
         )
-        .await?
-        else {
-            return Ok(None);
-        };
-        if bytes.last() == Some(&b'\n') {
-            bytes.pop();
-        }
-        if bytes.last() == Some(&b'\r') {
-            bytes.pop();
-        }
-        if bytes.iter().all(u8::is_ascii_whitespace) {
-            return Ok(Some(Value::Null));
-        }
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|error| AppError::InvalidRequest(format!("invalid provider JSON: {error}")))
+        .await?;
+        Ok(line.map(classify_line))
     }
 
     pub async fn terminate(&mut self) {
@@ -619,11 +672,51 @@ where
     Ok((output, exceeded))
 }
 
+fn classify_line(line: BoundedLine) -> ProviderRead {
+    let mut bytes = match line {
+        BoundedLine::Line(bytes) => bytes,
+        BoundedLine::Oversized(bytes) => return ProviderRead::Oversized { bytes },
+    };
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return ProviderRead::Frame(Value::Null);
+    }
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => ProviderRead::Frame(value),
+        Err(_) => ProviderRead::Invalid {
+            preview: unparsed_line_preview(&bytes),
+        },
+    }
+}
+
+/// A redacted, char-boundary-safe prefix of an unparseable line.
+fn unparsed_line_preview(bytes: &[u8]) -> String {
+    let head = &bytes[..bytes.len().min(UNPARSED_LINE_PREVIEW_BYTES)];
+    let mut preview = redact_sensitive_text(&String::from_utf8_lossy(head));
+    if preview.len() > UNPARSED_LINE_PREVIEW_BYTES {
+        let mut end = UNPARSED_LINE_PREVIEW_BYTES;
+        while !preview.is_char_boundary(end) {
+            end -= 1;
+        }
+        preview.truncate(end);
+    }
+    preview
+}
+
+/// Reads one newline-terminated line of at most `max_bytes` (plus the newline).
+/// A longer line is consumed to its end without being buffered and reported as
+/// `Oversized` with its length excluding the trailing newline.
 async fn read_bounded_line<R>(
     reader: &mut R,
     output: &mut Vec<u8>,
+    discarding: &mut Option<usize>,
     max_bytes: usize,
-) -> Result<Option<Vec<u8>>, AppError>
+) -> Result<Option<BoundedLine>, AppError>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -632,30 +725,37 @@ where
         let (consumed, found_newline) = {
             let available = reader.fill_buf().await?;
             if available.is_empty() {
+                if let Some(bytes) = discarding.take() {
+                    return Ok(Some(BoundedLine::Oversized(bytes)));
+                }
                 return if output.is_empty() {
                     Ok(None)
                 } else {
-                    Ok(Some(std::mem::take(output)))
+                    Ok(Some(BoundedLine::Line(std::mem::take(output))))
                 };
             }
             let consumed = available
                 .iter()
                 .position(|byte| *byte == b'\n')
                 .map_or(available.len(), |index| index + 1);
-            if output.len().saturating_add(consumed) > max_bytes.saturating_add(1) {
-                return Err(AppError::InvalidRequest(
-                    "provider protocol frame is too large".to_owned(),
-                ));
+            let found_newline = available.get(consumed.saturating_sub(1)) == Some(&b'\n');
+            if let Some(skipped) = discarding.as_mut() {
+                *skipped = skipped.saturating_add(consumed);
+            } else if output.len().saturating_add(consumed) > max_bytes.saturating_add(1) {
+                *discarding = Some(output.len().saturating_add(consumed));
+                // Release the partial frame's allocation, not just its length.
+                *output = Vec::new();
+            } else {
+                output.extend_from_slice(&available[..consumed]);
             }
-            output.extend_from_slice(&available[..consumed]);
-            (
-                consumed,
-                available.get(consumed.saturating_sub(1)) == Some(&b'\n'),
-            )
+            (consumed, found_newline)
         };
         reader.consume(consumed);
         if found_newline {
-            return Ok(Some(std::mem::take(output)));
+            if let Some(skipped) = discarding.take() {
+                return Ok(Some(BoundedLine::Oversized(skipped.saturating_sub(1))));
+            }
+            return Ok(Some(BoundedLine::Line(std::mem::take(output))));
         }
     }
 }
@@ -674,14 +774,79 @@ mod tests {
 
     use super::*;
 
+    async fn read_all(input: &[u8], capacity: usize, max_bytes: usize) -> Vec<ProviderRead> {
+        let mut reader = BufReader::with_capacity(capacity, input);
+        let (mut pending, mut discarding) = (Vec::new(), None);
+        let mut reads = Vec::new();
+        while let Some(line) =
+            read_bounded_line(&mut reader, &mut pending, &mut discarding, max_bytes)
+                .await
+                .unwrap()
+        {
+            reads.push(classify_line(line));
+        }
+        reads
+    }
+
     #[tokio::test]
-    async fn bounded_line_reader_rejects_an_oversized_provider_frame() {
-        let input = b"123456789\n".as_slice();
-        let mut reader = BufReader::new(input);
+    async fn oversized_provider_line_is_skipped_and_the_next_frame_still_parses() {
+        // An 8-byte buffer makes the 25-byte line span several fills, so the
+        // discard state has to survive between them.
+        let reads = read_all(b"123456789abcdefghijklmnop\n{\"ok\":1}\n", 8, 8).await;
+        assert!(matches!(reads[0], ProviderRead::Oversized { bytes: 25 }));
+        assert!(
+            matches!(&reads[1], ProviderRead::Frame(value) if value == &serde_json::json!({"ok": 1}))
+        );
+        assert_eq!(reads.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_provider_line_at_end_of_stream_is_reported() {
+        let reads = read_all(b"123456789", 4, 4).await;
+        assert!(matches!(reads[..], [ProviderRead::Oversized { bytes: 9 }]));
+    }
+
+    #[tokio::test]
+    async fn non_json_provider_line_is_reported_and_reading_continues() {
+        let reads = read_all(b"Welcome to provider v1\r\n  \n{\"ok\":true}\n", 64, 128).await;
+        assert!(
+            matches!(&reads[0], ProviderRead::Invalid { preview } if preview == "Welcome to provider v1")
+        );
+        assert!(matches!(&reads[1], ProviderRead::Frame(Value::Null)));
+        assert!(matches!(&reads[2], ProviderRead::Frame(value) if value["ok"] == true));
+    }
+
+    #[test]
+    fn unparsed_line_preview_is_bounded_redacted_and_char_safe() {
+        let line = format!("Bearer secret-token {}", "错".repeat(400));
+        let preview = unparsed_line_preview(line.as_bytes());
+        assert!(preview.len() <= UNPARSED_LINE_PREVIEW_BYTES);
+        assert!(preview.starts_with("[REDACTED] "));
+        assert!(!preview.contains("secret-token"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_read_skips_unparseable_lines_for_control_exchanges() {
+        let mut spec = CommandSpec::new("/bin/sh", std::env::temp_dir());
+        spec.args = vec![
+            "-c".to_owned(),
+            "echo banner; head -c 4194400 /dev/zero | tr '\\0' x; echo; echo '{\"id\":1}'"
+                .to_owned(),
+        ];
+        let mut process = JsonLineProcess::spawn(&spec).await.unwrap();
         assert!(matches!(
-            read_bounded_line(&mut reader, &mut Vec::new(), 4).await,
-            Err(AppError::InvalidRequest(message)) if message.contains("too large")
+            process.read_frame().await.unwrap(),
+            Some(ProviderRead::Invalid { .. })
         ));
+        assert_eq!(process.read().await.unwrap(), Some(Value::Null));
+        assert!(process.stdout_pending.capacity() <= MAX_PROTOCOL_LINE_BYTES + 1);
+        assert_eq!(
+            process.read().await.unwrap(),
+            Some(serde_json::json!({"id": 1}))
+        );
+        assert_eq!(process.read().await.unwrap(), None);
+        process.terminate().await;
     }
 
     #[test]
@@ -815,23 +980,23 @@ mod tests {
     async fn interrupted_read_preserves_the_partial_protocol_frame() {
         let (mut writer, reader) = tokio::io::duplex(128);
         let mut reader = BufReader::new(reader);
-        let mut pending = Vec::new();
+        let (mut pending, mut discarding) = (Vec::new(), None);
         writer.write_all(b"{\"part\":").await.unwrap();
         assert!(timeout(
             Duration::from_millis(10),
-            read_bounded_line(&mut reader, &mut pending, 128)
+            read_bounded_line(&mut reader, &mut pending, &mut discarding, 128)
         )
         .await
         .is_err());
         writer.write_all(b"true}\n").await.unwrap();
-        let frame = read_bounded_line(&mut reader, &mut pending, 128)
+        let frame = read_bounded_line(&mut reader, &mut pending, &mut discarding, 128)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&frame).unwrap(),
-            serde_json::json!({"part": true})
-        );
+        assert!(matches!(
+            classify_line(frame),
+            ProviderRead::Frame(value) if value == serde_json::json!({"part": true})
+        ));
         assert!(pending.is_empty());
     }
 }

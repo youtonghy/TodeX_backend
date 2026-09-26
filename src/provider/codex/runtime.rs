@@ -412,8 +412,8 @@ async fn active_turn(
                 let expired: Vec<_> = pending.iter().filter(|(_, p)| now >= p.deadline).map(|(id,_)|id.clone()).collect();
                 for id in expired { if let Some(p) = pending.remove(&id) { let _ = p.control.respond_to.send(Err(AppError::ProviderUnavailable("Codex control acknowledgement timed out; its outcome is unknown".to_owned()))); } }
             }
-            message = process.read() => {
-                let message = message?.ok_or_else(unavailable)?;
+            message = process.read_frame() => {
+                let message = sink.provider_frame(message?).await?.ok_or_else(unavailable)?;
                 if message.is_null() { continue; }
                 if let Some(id) = message.get("id").and_then(Value::as_str) {
                     if start_request.as_deref() == Some(id) {

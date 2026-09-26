@@ -2794,6 +2794,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unparseable_provider_lines_are_reported_without_failing_the_turn() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-noisy-stdout").await;
+        fs::write(root.join("noisy-stdout"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(history.iter().any(
+            |event| event.event_type == "turn.completed" && event.payload["turnId"] == turn_id
+        ));
+        let reports = history
+            .iter()
+            .filter(|event| {
+                event.event_type == "provider.event" && event.payload.get("kind").is_some()
+            })
+            .map(|event| &event.payload)
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert_eq!(reports[0]["kind"], "invalid_line");
+        assert_eq!(reports[0]["preview"], "provider banner: not json");
+        assert_eq!(reports[0]["turnId"], turn_id);
+        assert_eq!(reports[1]["kind"], "oversized_line");
+        assert_eq!(reports[1]["bytes"], 4_194_400);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn recover_all_skips_a_conversation_whose_journal_cannot_grow() {
         let (root, store, supervisor, workspace) =
             control_fixture("todex-recover-full-journal").await;
@@ -3484,6 +3517,11 @@ else
         continue
         ;;
     esac
+    if [ -f "$(dirname "$0")/noisy-stdout" ]; then
+      printf 'provider banner: not json\n'
+      head -c 4194400 /dev/zero | tr '\0' x
+      printf '\n'
+    fi
     printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"claude fixture"}}}\n'
     printf '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-native","result":"ok"}\n'
   done

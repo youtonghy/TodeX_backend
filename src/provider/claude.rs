@@ -758,16 +758,14 @@ mod tests {
             super::fork_claude_transcript(&source_path, &root, &workspace, forked).await,
             Err(crate::error::AppError::Conflict(_))
         ));
-        assert!(
-            super::fork_claude_transcript(
-                &root.join("missing.jsonl"),
-                &root,
-                &workspace,
-                "another-fork"
-            )
-            .await
-            .is_err()
-        );
+        assert!(super::fork_claude_transcript(
+            &root.join("missing.jsonl"),
+            &root,
+            &workspace,
+            "another-fork"
+        )
+        .await
+        .is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1229,7 +1227,7 @@ async fn run_claude_turn(
     let mut empty_results = 0_u32;
     loop {
         let message = tokio::select! {
-            message = process.read() => message?,
+            message = process.read_frame() => sink.provider_frame(message?).await?,
                 changed = cancel.changed() => {
                     let _ = changed;
                     return Ok(DriverTurnResult {
@@ -1384,10 +1382,8 @@ async fn run_claude_turn(
                         .get("terminal_slash_commands")
                         .and_then(Value::as_array)
                     {
-                        let terminal_commands: HashSet<&str> = terminal_commands
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect();
+                        let terminal_commands: HashSet<&str> =
+                            terminal_commands.iter().filter_map(Value::as_str).collect();
                         if !terminal_commands.is_empty() {
                             if let Some(catalog) =
                                 catalogs.lock().await.get_mut(&context.manifest.id)

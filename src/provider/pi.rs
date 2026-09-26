@@ -12,7 +12,9 @@ use crate::conversation::{DeltaFragment, PendingDelta, ProviderKind};
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
-use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
+use super::process::{
+    executable_available, provider_exit_error, CommandSpec, JsonLineProcess, ProviderRead,
+};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
     PendingProviderControl, PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor,
@@ -1788,13 +1790,13 @@ impl<'a> PiRpc<'a> {
                 }
                 value = async {
                     match read_deadline {
-                        Some(deadline) => self.process.read_control_until(deadline).await,
-                        None => self.process.read().await,
+                        Some(deadline) => self.process.read_frame_until(deadline).await,
+                        None => self.process.read_frame().await,
                     }
-                } => value.map_err(|error| match error {
-                    AppError::InvalidRequest(message) => AppError::ProviderUnavailable(format!("Pi protocol stream is invalid: {message}")),
-                    error => error,
-                })?,
+                } => match &self.sink {
+                    Some(sink) => sink.provider_frame(value?).await?,
+                    None => value?.map(ProviderRead::into_logged_frame),
+                },
                 _ = async {
                     match self.cancel.as_mut() {
                         Some(cancel) => { let _ = cancel.changed().await; }
@@ -3536,7 +3538,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn rpc_confirmed_abort_and_rejected_commands_keep_runtime_but_invalid_frames_close_it() {
+    async fn rpc_confirmed_abort_rejected_commands_and_invalid_frames_keep_runtime() {
         let fixture = Fixture::new().await;
         let (running, cancel) = fixture.start_cancellable("hold", "abort-me").await;
         fixture.running().await;
@@ -3563,16 +3565,27 @@ mod tests {
         assert!(fixture.run("rejected", "reject-me").await.is_err());
         fixture.run("pure", "after-reject").await.unwrap();
         assert_eq!(fixture.launches().await, 1);
-        let error = fixture.run("malformed", "invalid-frame").await.unwrap_err();
-        assert!(error.to_string().contains("protocol stream is invalid"));
-        fixture
+        // A stray non-JSON line is reported on the turn instead of failing it.
+        let (malformed, cancel) = fixture
+            .start_cancellable("malformed", "invalid-frame")
+            .await;
+        let report = fixture
             .wait_event(|event| {
-                event.event_type == "provider.runtime"
-                    && event.payload.get("status") == Some(&json!("stopped"))
+                event.event_type == "provider.event"
+                    && event.payload.get("kind") == Some(&json!("invalid_line"))
             })
             .await;
+        assert_eq!(report.payload["preview"], "not-json");
+        assert_eq!(report.payload["turnId"], "invalid-frame");
+        cancel.send_replace(true);
+        let result = tokio::time::timeout(Duration::from_secs(3), malformed)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.cancelled);
         fixture.run("pure", "after-invalid-frame").await.unwrap();
-        assert_eq!(fixture.launches().await, 2);
+        assert_eq!(fixture.launches().await, 1);
         let commands = tokio::fs::read_to_string(fixture.root.join("pi-commands"))
             .await
             .unwrap();

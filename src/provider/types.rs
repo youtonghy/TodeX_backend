@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,7 +17,11 @@ use crate::conversation::{
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
+use super::process::ProviderRead;
+
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Unparseable provider lines journalled per turn; later ones are only logged.
+const MAX_REPORTED_UNPARSED_LINES: usize = 20;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -494,6 +499,8 @@ pub struct DriverEventSink {
     current_turn_id: Option<String>,
     runtime_id: Option<String>,
     scope: Option<&'static str>,
+    /// Shared by the clones of one turn (or one runtime scope).
+    unparsed_lines: Arc<AtomicUsize>,
 }
 
 impl DriverEventSink {
@@ -511,11 +518,13 @@ impl DriverEventSink {
             current_turn_id: None,
             runtime_id: None,
             scope: None,
+            unparsed_lines: Arc::default(),
         }
     }
 
     pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
         self.current_turn_id = Some(turn_id.into());
+        self.unparsed_lines = Arc::default();
         if self.runtime_id.is_some() {
             self.scope = Some("turn");
         }
@@ -528,6 +537,7 @@ impl DriverEventSink {
         self.current_turn_id = None;
         self.runtime_id = Some(runtime_id.into());
         self.scope = Some("session");
+        self.unparsed_lines = Arc::default();
         self
     }
 
@@ -583,6 +593,36 @@ impl DriverEventSink {
                 .await
                 .map(|_| ()),
         }
+    }
+
+    /// The frame of a provider read. An unparseable line becomes
+    /// `Value::Null`, which readers skip like a blank line, after the first
+    /// MAX_REPORTED_UNPARSED_LINES per turn are journalled as `provider.event`.
+    pub async fn provider_frame(
+        &self,
+        read: Option<ProviderRead>,
+    ) -> Result<Option<Value>, AppError> {
+        let payload = match read {
+            None => return Ok(None),
+            Some(ProviderRead::Frame(value)) => return Ok(Some(value)),
+            Some(ProviderRead::Invalid { preview }) => {
+                json!({ "kind": "invalid_line", "preview": preview })
+            }
+            Some(ProviderRead::Oversized { bytes }) => {
+                json!({ "kind": "oversized_line", "bytes": bytes })
+            }
+        };
+        let reported = self.unparsed_lines.fetch_add(1, Ordering::Relaxed);
+        if reported < MAX_REPORTED_UNPARSED_LINES {
+            self.emit("provider.event", payload).await?;
+        } else {
+            tracing::warn!(
+                conversation_id = %self.conversation_id,
+                line = %payload,
+                "skipping unparseable provider line beyond the reporting limit"
+            );
+        }
+        Ok(Some(Value::Null))
     }
 
     /// Runtime, scope and turn attribution shared by every emitted event.

@@ -653,8 +653,8 @@ async fn wait_for_response(
                     deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
                 }
             }
-            message = process.read() => {
-                let Some(message) = message? else { return Err(provider_exit_error(process, "Codex app-server closed stdout").await); };
+            message = process.read_frame() => {
+                let Some(message) = sink.provider_frame(message?).await? else { return Err(provider_exit_error(process, "Codex app-server closed stdout").await); };
                 if message.is_null() { continue; }
                 if jsonrpc_id_matches(&message, request_id) {
                     if let Some(error) = message.get("error") { return Err(AppError::ProviderUnavailable(format!("Codex request {request_id} failed: {}",safe_error_text(error)))); }

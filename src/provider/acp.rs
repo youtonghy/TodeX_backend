@@ -841,7 +841,7 @@ async fn run_acp_turn_steps(
         let control_deadline = pending.values().map(|entry| entry.deadline).min();
         let tool_deadline = connection.tool_flush_deadline();
         let message = tokio::select! {
-            message = process.read() => message?,
+            message = process.read_frame() => sink.provider_frame(message?).await?,
             _ = async { if let Some(deadline) = tool_deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending::<()>().await } } => {
                 connection.flush_tool_updates(false).await?;
                 continue;
@@ -1448,7 +1448,7 @@ async fn drain_cancelled_turn(
         let (_cancel_tx, mut cancelled) = watch::channel(true);
         loop {
             let message = tokio::select! {
-                message = process.read() => message?,
+                message = process.read_frame() => sink.provider_frame(message?).await?,
                 response = client_requests.join_next(), if !client_requests.is_empty() => {
                     if let Some(Ok((responses, _))) = response { for response in responses { process.send(&response).await?; } }
                     continue;
@@ -1599,7 +1599,7 @@ async fn wait_for_response_with_timeout(
     loop {
         let tool_deadline = connection.tool_flush_deadline();
         let message = tokio::select! {
-            message = process.read_control_until(deadline) => message?,
+            message = process.read_frame_until(deadline) => sink.provider_frame(message?).await?,
             _ = async { if let Some(deadline) = tool_deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending::<()>().await } } => {
                 connection.flush_tool_updates(false).await?;
                 continue;
