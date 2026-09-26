@@ -50,6 +50,8 @@ pub enum AppError {
     TurnCancelled,
     #[error("resource capacity exhausted: {0}")]
     ResourceExhausted(String),
+    #[error("conversation history is full: {0}")]
+    JournalFull(String),
     #[error("provider unavailable: {0}")]
     ProviderUnavailable(String),
     #[error("event stream lagged by {0} messages")]
@@ -88,6 +90,7 @@ impl AppError {
             Self::Conflict(_) => "CONFLICT",
             Self::TurnCancelled => "TURN_CANCELLED",
             Self::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
+            Self::JournalFull(_) => "JOURNAL_FULL",
             Self::ProviderUnavailable(_) => "PROVIDER_UNAVAILABLE",
             Self::StreamLagged(_) => "EVENT_STREAM_LAGGED",
             Self::StreamClosed => "EVENT_STREAM_CLOSED",
@@ -121,6 +124,7 @@ impl IntoResponse for AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::TurnCancelled => StatusCode::CONFLICT,
             Self::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::JournalFull(_) => StatusCode::INSUFFICIENT_STORAGE,
             Self::ProviderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::StreamLagged(_) | Self::StreamClosed => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,

@@ -26,6 +26,10 @@ const SNAPSHOT_FILE: &str = "snapshot.json";
 const PROVIDER_STATE_FILE: &str = "provider-state.json";
 const MAX_REPLAY_LIMIT: usize = 1000;
 pub(crate) const MAX_EVENTS_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+/// New prompts are refused above this size so a started turn always has
+/// headroom to append its events, including the terminal one, before the
+/// hard cap.
+const JOURNAL_PROMPT_LIMIT_BYTES: u64 = MAX_EVENTS_JOURNAL_BYTES - 1024 * 1024;
 /// On overflow the journal is rewritten below this target so the next bursts
 /// of events fit without compacting again on every append.
 const JOURNAL_COMPACT_TARGET_BYTES: u64 = MAX_EVENTS_JOURNAL_BYTES * 3 / 4;
@@ -55,6 +59,9 @@ pub struct ConversationStore {
     /// conversation lock; loads on a cache miss take it too, so a stale disk
     /// read can never overwrite a newer entry or resurrect a deleted one.
     manifests: Arc<DashMap<String, CachedManifest>>,
+    /// `(bytes, modified)` of journals that compaction could not shrink, so
+    /// an unchanged full journal is not re-parsed on every overflowing append.
+    incompressible: Arc<DashMap<String, (u64, Option<std::time::SystemTime>)>>,
 }
 
 struct CachedManifest {
@@ -103,6 +110,7 @@ impl ConversationStore {
             pending_deltas: Arc::new(DashMap::new()),
             delta_generation: Arc::new(AtomicU64::new(0)),
             manifests: Arc::new(DashMap::new()),
+            incompressible: Arc::new(DashMap::new()),
         })
     }
 
@@ -273,6 +281,7 @@ impl ConversationStore {
         self.tails.remove(conversation_id);
         self.pending_deltas.remove(conversation_id);
         self.manifests.remove(conversation_id);
+        self.incompressible.remove(conversation_id);
     }
 
     pub async fn cleanup_before(
@@ -591,7 +600,30 @@ impl ConversationStore {
         let _guard = self.lock(conversation_id).await;
         let directory = self.directory(conversation_id)?;
         self.get_unlocked(conversation_id).await?;
+        // Every prompt saves its request before the turn starts, so this is
+        // where a nearly full history refuses new turns.
+        self.ensure_prompt_capacity_locked(conversation_id).await?;
         write_atomic_json(&directory.join("last-request.json"), request).await
+    }
+
+    /// Refuse a new turn once the journal is within
+    /// `MAX_EVENTS_JOURNAL_BYTES - JOURNAL_PROMPT_LIMIT_BYTES` of the hard
+    /// cap and compaction cannot free space. Running turns keep appending up
+    /// to the cap. Callers hold the conversation lock.
+    async fn ensure_prompt_capacity_locked(&self, conversation_id: &str) -> Result<(), AppError> {
+        let event_path = self.directory(conversation_id)?.join(EVENTS_FILE);
+        if journal_metadata(&event_path).await?.0 <= JOURNAL_PROMPT_LIMIT_BYTES {
+            return Ok(());
+        }
+        self.compact_journal(conversation_id).await?;
+        let (bytes, _) = journal_metadata(&event_path).await?;
+        if bytes <= JOURNAL_PROMPT_LIMIT_BYTES {
+            return Ok(());
+        }
+        Err(AppError::JournalFull(format!(
+            "conversation {conversation_id} holds {bytes} journal bytes, above the \
+             {JOURNAL_PROMPT_LIMIT_BYTES} byte limit for new turns; start a new conversation"
+        )))
     }
 
     pub async fn last_request(&self, conversation_id: &str) -> Result<Option<Value>, AppError> {
@@ -1172,6 +1204,14 @@ impl ConversationStore {
     async fn compact_journal(&self, conversation_id: &str) -> Result<(), AppError> {
         let directory = self.directory(conversation_id)?;
         let path = directory.join(EVENTS_FILE);
+        let journal = journal_metadata(&path).await?;
+        if self
+            .incompressible
+            .get(conversation_id)
+            .is_some_and(|known| *known == journal)
+        {
+            return Ok(());
+        }
         let raw = match tokio::fs::read(&path).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1201,6 +1241,8 @@ impl ConversationStore {
             lines.push(line);
         }
         if total <= JOURNAL_COMPACT_TARGET_BYTES {
+            self.incompressible
+                .insert(conversation_id.to_owned(), journal);
             return Ok(());
         }
         let mut protected = 0u64;
@@ -1228,8 +1270,11 @@ impl ConversationStore {
             truncated += 1;
         }
         if truncated == 0 {
+            self.incompressible
+                .insert(conversation_id.to_owned(), journal);
             return Ok(());
         }
+        self.incompressible.remove(conversation_id);
         let temporary = directory.join(format!(".events.{}.tmp", Uuid::new_v4().simple()));
         let mut file = tokio::fs::OpenOptions::new()
             .create_new(true)
@@ -3321,6 +3366,99 @@ mod tests {
         assert!(matches!(error, AppError::ResourceExhausted(_)));
         assert_eq!(error.code(), "RESOURCE_EXHAUSTED");
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Hand-write a journal just under the hard cap whose events carry
+    /// `payload`, then recover so the store indexes it.
+    async fn fill_journal(prefix: &str, payload: Value) -> (PathBuf, ConversationStore, String) {
+        use std::io::Write;
+        let root = temp_dir(prefix);
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let path = root
+            .join("conversations")
+            .join(&manifest.id)
+            .join(EVENTS_FILE);
+        let mut file = fs::File::create(&path).unwrap();
+        let mut sequence = 0u64;
+        let mut written = 0u64;
+        loop {
+            let mut line = serde_json::to_vec(&ConversationEvent::new(
+                &manifest.id,
+                sequence + 1,
+                "provider.event",
+                payload.clone(),
+            ))
+            .unwrap();
+            line.push(b'\n');
+            if written + line.len() as u64 > MAX_EVENTS_JOURNAL_BYTES - 256 * 1024 {
+                break;
+            }
+            file.write_all(&line).unwrap();
+            written += line.len() as u64;
+            sequence += 1;
+        }
+        drop(file);
+        assert!(written > JOURNAL_PROMPT_LIMIT_BYTES);
+        store.recover(&manifest.id).await.unwrap();
+        (root, store, manifest.id)
+    }
+
+    #[tokio::test]
+    async fn full_journal_refuses_new_prompts_but_running_turns_still_append() {
+        // Bulk made of many short strings leaves nothing to compact.
+        let items: Vec<String> = (0..3000).map(|index| format!("item-{index:05}")).collect();
+        let (root, store, id) = fill_journal("todex-journal-full", json!({ "items": items })).await;
+        let request = json!({ "turnId": "t" });
+
+        let error = store.save_request(&id, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::JournalFull(_)));
+        assert_eq!(error.code(), "JOURNAL_FULL");
+        assert_eq!(store.last_request(&id).await.unwrap(), None);
+        // The failed compaction is remembered for this exact journal.
+        let journal = journal_metadata(&root.join("conversations").join(&id).join(EVENTS_FILE))
+            .await
+            .unwrap();
+        assert_eq!(*store.incompressible.get(&id).unwrap(), journal);
+
+        // A turn that already started keeps journalling up to the hard cap.
+        let appended = store
+            .append(&id, "turn.completed", json!({ "turnId": "t" }))
+            .await
+            .unwrap();
+        assert!(appended.sequence > 1);
+        // The journal changed, so the next prompt re-checks it (and fails).
+        assert!(matches!(
+            store.save_request(&id, &request).await,
+            Err(AppError::JournalFull(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_on_a_full_but_compactable_journal_compacts_and_proceeds() {
+        let (root, store, id) = fill_journal(
+            "todex-journal-full-compactable",
+            json!({ "output": "x".repeat(256 * 1024) }),
+        )
+        .await;
+        let request = json!({ "turnId": "t" });
+        store.save_request(&id, &request).await.unwrap();
+        assert_eq!(store.last_request(&id).await.unwrap(), Some(request));
+        let bytes = fs::metadata(root.join("conversations").join(&id).join(EVENTS_FILE))
+            .unwrap()
+            .len();
+        assert!(bytes <= JOURNAL_COMPACT_TARGET_BYTES);
+        assert!(store.incompressible.get(&id).is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     async fn delta(
