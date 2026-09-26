@@ -419,7 +419,19 @@ impl ConversationStore {
         hub: Option<&ConversationEventHub>,
     ) -> Result<ConversationEvent, AppError> {
         redact_secrets(&mut payload);
-        if serde_json::to_vec(&payload)?.len() > MAX_EVENT_PAYLOAD_BYTES {
+        let bounded = bound_event_payload(&mut payload)?;
+        if let Some(original_bytes) = bounded.original_bytes {
+            tracing::warn!(
+                conversation_id,
+                event_type,
+                original_bytes,
+                bounded_bytes = bounded.bytes,
+                "oversized conversation event payload truncated"
+            );
+        }
+        // Safety net: bounding always lands under the budget, so this only
+        // trips if that invariant is ever broken.
+        if bounded.bytes > MAX_EVENT_PAYLOAD_BYTES {
             return Err(AppError::InvalidRequest(format!(
                 "conversation event payload exceeds {MAX_EVENT_PAYLOAD_BYTES} bytes"
             )));
@@ -1156,6 +1168,176 @@ async fn journal_metadata(path: &Path) -> Result<(u64, Option<std::time::SystemT
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((0, None)),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Serialized size an oversized payload is cut down to. The headroom below
+/// `MAX_EVENT_PAYLOAD_BYTES` absorbs the truncation bookkeeping, so the hard
+/// limit only rejects payloads that could not be bounded at all.
+const EVENT_PAYLOAD_BUDGET_BYTES: usize = MAX_EVENT_PAYLOAD_BYTES - 16 * 1024;
+/// Strings at or below this serialized size are never cut; trimming them
+/// frees too little to be worth losing their content.
+const BOUND_STRING_MIN_BYTES: usize = 512;
+/// Every cut string keeps at least this much serialized prefix.
+const BOUND_STRING_KEEP_BYTES: usize = 256;
+/// Short top-level scalars (ids such as `turnId`) survive a payload that has
+/// to be replaced wholesale, up to this many serialized bytes in total.
+const BOUND_PRESERVED_SCALAR_BYTES: usize = 4 * 1024;
+
+struct BoundedPayload {
+    /// Serialized size after bounding.
+    bytes: usize,
+    /// Serialized size before bounding, when the payload had to change.
+    original_bytes: Option<usize>,
+}
+
+/// Fit an oversized payload under [`EVENT_PAYLOAD_BUDGET_BYTES`] instead of
+/// rejecting the event: the largest strings are cut at a character boundary
+/// and end with `…[truncated N bytes]`, and the original byte length of each
+/// cut string is recorded by JSON pointer under a top-level `truncated` map
+/// (`_truncated` when the payload already uses that key; no map when the
+/// payload is not an object). When strings alone cannot make it fit (bulk
+/// made of many small values) the payload is replaced by
+/// `{"truncated": true, "originalBytes": N}` plus its short top-level scalars.
+/// Payloads within the budget are left byte-for-byte untouched.
+fn bound_event_payload(payload: &mut Value) -> Result<BoundedPayload, AppError> {
+    let original = serde_json::to_vec(payload)?.len();
+    if original <= EVENT_PAYLOAD_BUDGET_BYTES {
+        return Ok(BoundedPayload {
+            bytes: original,
+            original_bytes: None,
+        });
+    }
+    let record_key = payload.as_object().and_then(|map| {
+        ["truncated", "_truncated"]
+            .into_iter()
+            .find(|key| !map.contains_key(*key))
+    });
+    let mut leaves = Vec::new();
+    collect_string_leaves(payload, &mut String::new(), &mut leaves);
+    leaves.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+    let mut leaves = leaves.into_iter().peekable();
+    let mut records = serde_json::Map::new();
+    let mut size = original;
+    while size > EVENT_PAYLOAD_BUDGET_BYTES {
+        let mut excess = size - EVENT_PAYLOAD_BUDGET_BYTES;
+        let mut progressed = false;
+        while excess > 0 {
+            let Some((pointer, serialized)) =
+                leaves.next_if(|(_, bytes)| *bytes > BOUND_STRING_MIN_BYTES)
+            else {
+                break;
+            };
+            let Some(Value::String(text)) = payload.pointer_mut(&pointer) else {
+                continue;
+            };
+            // `"<pointer>":<bytes>,` in the record map plus the marker.
+            let overhead = if record_key.is_some() {
+                serialized_string_bytes(&pointer) + 24
+            } else {
+                0
+            } + 48;
+            let keep = serialized
+                .saturating_sub(excess + overhead)
+                .max(BOUND_STRING_KEEP_BYTES);
+            let original_bytes = text.len();
+            let cut = serialized_prefix_len(text, keep - 2);
+            text.truncate(cut);
+            text.push_str(&format!("…[truncated {} bytes]", original_bytes - cut));
+            let freed = serialized.saturating_sub(serialized_string_bytes(text) + overhead);
+            excess = excess.saturating_sub(freed);
+            records.insert(pointer, Value::from(original_bytes));
+            progressed = true;
+        }
+        if !progressed {
+            *payload = replacement_payload(payload, original);
+            return Ok(BoundedPayload {
+                bytes: serde_json::to_vec(payload)?.len(),
+                original_bytes: Some(original),
+            });
+        }
+        if let (Some(key), Value::Object(map)) = (record_key, &mut *payload) {
+            map.insert(key.to_owned(), Value::Object(records.clone()));
+        }
+        size = serde_json::to_vec(payload)?.len();
+    }
+    Ok(BoundedPayload {
+        bytes: size,
+        original_bytes: Some(original),
+    })
+}
+
+/// `(JSON pointer, serialized bytes)` of every string in `value`.
+fn collect_string_leaves(value: &Value, pointer: &mut String, leaves: &mut Vec<(String, usize)>) {
+    let parent = pointer.len();
+    match value {
+        Value::String(text) => leaves.push((pointer.clone(), serialized_string_bytes(text))),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                pointer.push('/');
+                pointer.push_str(&index.to_string());
+                collect_string_leaves(item, pointer, leaves);
+                pointer.truncate(parent);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                pointer.push('/');
+                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                collect_string_leaves(item, pointer, leaves);
+                pointer.truncate(parent);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replacement_payload(payload: &Value, original_bytes: usize) -> Value {
+    let mut replacement = serde_json::Map::new();
+    if let Value::Object(map) = payload {
+        let mut preserved = 0usize;
+        for (key, value) in map {
+            let bytes = match value {
+                Value::String(text) => serialized_string_bytes(text),
+                Value::Number(_) | Value::Bool(_) | Value::Null => 24,
+                Value::Array(_) | Value::Object(_) => continue,
+            };
+            preserved += bytes + serialized_string_bytes(key) + 2;
+            if bytes > BOUND_STRING_KEEP_BYTES || preserved > BOUND_PRESERVED_SCALAR_BYTES {
+                continue;
+            }
+            replacement.insert(key.clone(), value.clone());
+        }
+    }
+    replacement.insert("truncated".to_owned(), Value::Bool(true));
+    replacement.insert("originalBytes".to_owned(), Value::from(original_bytes));
+    Value::Object(replacement)
+}
+
+/// Bytes serde_json writes for one character inside a string literal.
+fn escaped_char_bytes(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+        '\u{00}'..='\u{1f}' => 6,
+        _ => ch.len_utf8(),
+    }
+}
+
+/// Serialized size of `text` as a JSON string literal, quotes included.
+fn serialized_string_bytes(text: &str) -> usize {
+    2 + text.chars().map(escaped_char_bytes).sum::<usize>()
+}
+
+/// Longest prefix of `text`, ending on a character boundary, whose escaped
+/// form fits in `limit` bytes. Returns its byte length.
+fn serialized_prefix_len(text: &str, limit: usize) -> usize {
+    let mut used = 0usize;
+    for (index, ch) in text.char_indices() {
+        used += escaped_char_bytes(ch);
+        if used > limit {
+            return index;
+        }
+    }
+    text.len()
 }
 
 /// Truncate oversized strings inside a journal payload. Returns whether any
@@ -2236,6 +2418,115 @@ mod tests {
         assert_eq!(history[2].payload["index"], 2);
         assert!(!quarantined(&path));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_payload_is_truncated_instead_of_rejected() {
+        let root = temp_dir("todex-bounded-payload");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let output = "x".repeat(2 * 1024 * 1024);
+        let appended = store
+            .append(
+                &conversation.id,
+                "tool.completed",
+                json!({ "turnId": "t", "itemId": "i", "output": output }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(appended.sequence, 1);
+
+        let fresh = ConversationStore::new(root.clone()).await.unwrap();
+        let stored = &fresh.complete_history(&conversation.id).await.unwrap()[0].payload;
+        assert!(serde_json::to_vec(stored).unwrap().len() <= MAX_EVENT_PAYLOAD_BYTES);
+        assert_eq!(stored["turnId"], "t");
+        assert_eq!(stored["itemId"], "i");
+        let kept = stored["output"].as_str().unwrap();
+        assert!(kept.starts_with("xxxx"));
+        let kept_bytes = kept.find('…').unwrap();
+        assert!(kept.ends_with(&format!("…[truncated {} bytes]", output.len() - kept_bytes)));
+        assert_eq!(stored["truncated"]["/output"], output.len());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_payload_cuts_multibyte_and_escaped_text_on_char_boundaries() {
+        let text = "中文🙂\"\n".repeat(200_000);
+        let mut payload = json!({ "turnId": "t", "text": text, "short": "kept" });
+        let bounded = bound_event_payload(&mut payload).unwrap();
+        let serialized = serde_json::to_vec(&payload).unwrap();
+        assert_eq!(bounded.bytes, serialized.len());
+        assert!(bounded.bytes <= EVENT_PAYLOAD_BUDGET_BYTES);
+        assert!(bounded.original_bytes.unwrap() > MAX_EVENT_PAYLOAD_BYTES);
+        let kept = payload["text"].as_str().unwrap();
+        let prefix = &kept[..kept.find('…').unwrap()];
+        assert!(text.starts_with(prefix));
+        assert!(prefix.len() > 512 * 1024);
+        assert_eq!(payload["short"], "kept");
+        assert_eq!(payload["truncated"]["/text"], text.len());
+    }
+
+    #[test]
+    fn bounded_payload_leaves_small_payloads_byte_identical() {
+        let original = json!({
+            "turnId": "t",
+            "content": "x".repeat(900 * 1024),
+            "nested": [{ "a/b~c": "value" }, 1, null, true],
+        });
+        let mut payload = original.clone();
+        let bounded = bound_event_payload(&mut payload).unwrap();
+        assert!(bounded.original_bytes.is_none());
+        assert_eq!(
+            serde_json::to_vec(&payload).unwrap(),
+            serde_json::to_vec(&original).unwrap()
+        );
+        assert_eq!(bounded.bytes, serde_json::to_vec(&original).unwrap().len());
+    }
+
+    #[test]
+    fn bounded_payload_records_under_an_alternate_key_and_escapes_pointers() {
+        let mut payload = json!({
+            "truncated": false,
+            "a/b~c": ["y".repeat(700 * 1024), "z".repeat(700 * 1024)],
+        });
+        bound_event_payload(&mut payload).unwrap();
+        assert!(serde_json::to_vec(&payload).unwrap().len() <= EVENT_PAYLOAD_BUDGET_BYTES);
+        assert_eq!(payload["truncated"], false);
+        let records = payload["_truncated"].as_object().unwrap();
+        assert!(!records.is_empty());
+        for (pointer, bytes) in records {
+            assert!(pointer.starts_with("/a~1b~0c/"));
+            assert_eq!(bytes, 700 * 1024);
+            assert!(payload
+                .pointer(pointer)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("…[truncated "));
+        }
+    }
+
+    #[test]
+    fn bounded_payload_replaces_bulk_made_of_small_values() {
+        let items: Vec<String> = (0..200_000)
+            .map(|index| format!("item-{index:06}"))
+            .collect();
+        let mut payload = json!({ "turnId": "t", "items": items });
+        let original = serde_json::to_vec(&payload).unwrap().len();
+        let bounded = bound_event_payload(&mut payload).unwrap();
+        assert_eq!(
+            payload,
+            json!({ "turnId": "t", "truncated": true, "originalBytes": original })
+        );
+        assert_eq!(bounded.original_bytes, Some(original));
     }
 
     #[tokio::test]
