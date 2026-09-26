@@ -3391,6 +3391,43 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn an_oversized_tool_result_is_truncated_and_the_turn_completes() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-big-tool-result").await;
+        fs::write(root.join("big-tool-result"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(history.iter().any(
+            |event| event.event_type == "turn.completed" && event.payload["turnId"] == turn_id
+        ));
+        let tool = history
+            .iter()
+            .find(|event| event.event_type == "tool.completed")
+            .expect("the tool result is stored");
+        let stored = serde_json::to_vec(&tool.payload).unwrap().len();
+        assert!(
+            stored <= crate::conversation::MAX_EVENT_PAYLOAD_BYTES,
+            "{stored}"
+        );
+        assert!(
+            tool.payload.get("truncated").is_some(),
+            "{:?}",
+            tool.payload.get("truncated")
+        );
+        assert!(serde_json::to_string(&tool.payload)
+            .unwrap()
+            .contains("[truncated "));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// Rewrites a manifest's status on disk, as a crash between the journal
     /// append and the manifest write would leave it.
     fn set_manifest_status(root: &Path, conversation_id: &str, status: &str) {
@@ -4204,6 +4241,12 @@ else
       printf 'provider banner: not json\n'
       head -c 4194400 /dev/zero | tr '\0' x
       printf '\n'
+    fi
+    if [ -f "$(dirname "$0")/big-tool-result" ]; then
+      printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_big","name":"Bash","input":{"command":"cat big.log"}}]}}\n'
+      printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_big","is_error":false,"content":[{"type":"text","text":"'
+      head -c 2097152 /dev/zero | tr '\0' y
+      printf '"}]}]}}\n'
     fi
     printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"claude fixture"}}}\n'
     printf '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-native","result":"ok"}\n'
