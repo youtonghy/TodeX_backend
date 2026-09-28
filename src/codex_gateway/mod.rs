@@ -1691,41 +1691,41 @@ impl LocalCodexAdapter {
         let mut child = match spawn_result {
             Ok(child) => child,
             Err(error) => {
-                let mut runtime = runtime.lock().await;
-                runtime.fail();
-                let process_error = spawn_error(&options, error);
-                append_local_error_event(&store, &runtime, &process_error.payload).await?;
-                return Err(process_error);
+                return Err(fail_local_start(&store, &runtime, spawn_error(&options, error)).await);
             }
         };
 
-        let mut stdin = child.stdin.take().ok_or_else(|| {
+        let startup_error = |message: String| {
             CodexLocalAdapterProcessError::new(
                 CodexLocalErrorCode::AdapterCrash,
-                "spawned Codex app-server did not expose stdin",
+                message,
                 &options.codex_session_id,
                 Some(&options.request_id),
                 "codex.local.start",
             )
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            CodexLocalAdapterProcessError::new(
-                CodexLocalErrorCode::AdapterCrash,
-                "spawned Codex app-server did not expose stdout",
-                &options.codex_session_id,
-                Some(&options.request_id),
-                "codex.local.start",
-            )
-        })?;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            let error = startup_error("spawned Codex app-server did not expose stdin".to_owned());
+            return Err(fail_local_start(&store, &runtime, error).await);
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let error = startup_error("spawned Codex app-server did not expose stdout".to_owned());
+            return Err(fail_local_start(&store, &runtime, error).await);
+        };
         let stderr_task = child.stderr.take().map(spawn_local_stderr_drain);
-        write_json_line_to_child_stdin(
+        // A binary that exits immediately closes its stdin before this write,
+        // so the broken pipe must still be journaled as a failed start.
+        if let Err(error) = write_json_line_to_child_stdin(
             &mut stdin,
             &codex_initialize_request(&options.request_id),
             &options.codex_session_id,
             Some(&options.request_id),
             "codex.local.start",
         )
-        .await?;
+        .await
+        {
+            return Err(fail_local_start(&store, &runtime, error).await);
+        }
 
         let pid = child.id().unwrap_or_default();
         let pending_server_requests = Arc::new(DashMap::new());
@@ -1756,7 +1756,7 @@ impl LocalCodexAdapter {
         };
         match startup_outcome {
             StartupOutcome::Ready(Ok(Ok(()))) => {
-                write_json_line_to_child_stdin(
+                if let Err(error) = write_json_line_to_child_stdin(
                     &mut stdin,
                     &json!({
                         "method": "initialized"
@@ -1765,19 +1765,26 @@ impl LocalCodexAdapter {
                     Some(&options.request_id),
                     "codex.local.start",
                 )
-                .await?;
+                .await
+                {
+                    let _ = child.kill().await;
+                    return Err(fail_local_start(&store, &runtime, error).await);
+                }
                 let mut runtime_guard = runtime.lock().await;
-                runtime_guard
-                    .attach_child_process(CodexLocalAdapterChildProcess { pid })
-                    .map_err(|error| {
-                        CodexLocalAdapterProcessError::new(
-                            CodexLocalErrorCode::UnsupportedAction,
-                            error.message,
-                            &options.codex_session_id,
-                            Some(&options.request_id),
-                            "codex.local.start",
-                        )
-                    })?;
+                if let Err(error) =
+                    runtime_guard.attach_child_process(CodexLocalAdapterChildProcess { pid })
+                {
+                    drop(runtime_guard);
+                    let _ = child.kill().await;
+                    let error = CodexLocalAdapterProcessError::new(
+                        CodexLocalErrorCode::UnsupportedAction,
+                        error.message,
+                        &options.codex_session_id,
+                        Some(&options.request_id),
+                        "codex.local.start",
+                    );
+                    return Err(fail_local_start(&store, &runtime, error).await);
+                }
                 append_local_lifecycle_event(
                     &store,
                     &runtime_guard,
@@ -1799,64 +1806,28 @@ impl LocalCodexAdapter {
                 })
             }
             StartupOutcome::Ready(Ok(Err(error))) => {
-                let mut runtime = runtime.lock().await;
-                runtime.fail();
                 let _ = child.kill().await;
-                let process_error = CodexLocalAdapterProcessError::new(
-                    CodexLocalErrorCode::AdapterCrash,
-                    error,
-                    &options.codex_session_id,
-                    Some(&options.request_id),
-                    "codex.local.start",
-                );
-                append_local_error_event(&store, &runtime, &process_error.payload).await?;
-                Err(process_error)
+                Err(fail_local_start(&store, &runtime, startup_error(error)).await)
             }
             StartupOutcome::Ready(Err(_)) => {
-                let mut runtime = runtime.lock().await;
-                runtime.fail();
                 let _ = child.kill().await;
-                let process_error = CodexLocalAdapterProcessError::new(
-                    CodexLocalErrorCode::AdapterCrash,
-                    "Codex app-server stdout reader stopped before ready",
-                    &options.codex_session_id,
-                    Some(&options.request_id),
-                    "codex.local.start",
-                );
-                append_local_error_event(&store, &runtime, &process_error.payload).await?;
-                Err(process_error)
+                let error =
+                    startup_error("Codex app-server stdout reader stopped before ready".to_owned());
+                Err(fail_local_start(&store, &runtime, error).await)
             }
             StartupOutcome::ChildExited(exit_status) => {
-                let mut runtime = runtime.lock().await;
-                runtime.fail();
-                let (code, message) = match exit_status {
-                    Ok(status) => (
-                        CodexLocalErrorCode::AdapterCrash,
-                        format!(
-                            "Codex app-server exited with status {status} before emitting structured codex.control.ready"
-                        ),
+                let message = match exit_status {
+                    Ok(status) => format!(
+                        "Codex app-server exited with status {status} before emitting structured codex.control.ready"
                     ),
-                    Err(error) => (
-                        CodexLocalErrorCode::AdapterCrash,
-                        format!(
-                            "failed to wait for Codex app-server during startup: {error}"
-                        ),
-                    ),
+                    Err(error) => {
+                        format!("failed to wait for Codex app-server during startup: {error}")
+                    }
                 };
-                let process_error = CodexLocalAdapterProcessError::new(
-                    code,
-                    message,
-                    &options.codex_session_id,
-                    Some(&options.request_id),
-                    "codex.local.start",
-                );
-                append_local_error_event(&store, &runtime, &process_error.payload).await?;
-                Err(process_error)
+                Err(fail_local_start(&store, &runtime, startup_error(message)).await)
             }
             StartupOutcome::TimedOut => {
                 let exit_status = child.try_wait().map_err(|error| error.to_string());
-                let mut runtime = runtime.lock().await;
-                runtime.fail();
                 if !matches!(exit_status, Ok(Some(_))) {
                     let _ = child.kill().await;
                 }
@@ -1886,8 +1857,7 @@ impl LocalCodexAdapter {
                     Some(&options.request_id),
                     "codex.local.start",
                 );
-                append_local_error_event(&store, &runtime, &process_error.payload).await?;
-                Err(process_error)
+                Err(fail_local_start(&store, &runtime, process_error).await)
             }
         }
     }
@@ -3027,6 +2997,21 @@ async fn append_local_lifecycle_event(
                 operation,
             )
         })
+}
+
+/// Marks a start attempt failed and journals its `codex.control.error`, so every
+/// startup failure after `codex.control.starting` is recoverable from storage.
+async fn fail_local_start(
+    store: &CodexGatewayStore,
+    runtime: &AsyncMutex<CodexLocalAdapterRuntime>,
+    process_error: CodexLocalAdapterProcessError,
+) -> CodexLocalAdapterProcessError {
+    let mut runtime = runtime.lock().await;
+    runtime.fail();
+    match append_local_error_event(store, &runtime, &process_error.payload).await {
+        Ok(()) => process_error,
+        Err(persist_error) => persist_error,
+    }
 }
 
 async fn append_local_error_event(
