@@ -1496,6 +1496,19 @@ mod tests {
             .status()
             .expect("git init");
         assert!(initialized.success());
+        // Git for Windows rejects these paths as too long (a different error
+        // than the output limit) unless long path support is enabled.
+        let configured = std::process::Command::new("git")
+            .args([
+                "-C",
+                repository.to_str().unwrap(),
+                "config",
+                "core.longpaths",
+                "true",
+            ])
+            .status()
+            .expect("git config");
+        assert!(configured.success());
 
         let response = scan(std::slice::from_ref(&root), &workspace)
             .await

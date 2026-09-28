@@ -4117,11 +4117,14 @@ mod tests {
             store.append(&id, "provider.event", payload).await,
             Err(AppError::ResourceExhausted(_))
         ));
+        // The fixture leaves less than one event line free below the cap; a
+        // close event longer than any such line cannot fit without the
+        // reserve, whatever the timestamp and id lengths are on this platform.
         let closed = store
             .append(
                 &id,
                 "conversation.interrupted",
-                json!({ "reason": "daemon_restarted" }),
+                json!({ "reason": "daemon_restarted", "detail": "x".repeat(1024) }),
             )
             .await
             .unwrap();
