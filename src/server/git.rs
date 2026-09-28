@@ -1520,10 +1520,14 @@ mod tests {
             .find(|summary| summary.path == repository.display().to_string())
             .expect("oversized repository summary");
         assert_eq!(summary.branch, "UNKNOWN");
-        assert!(summary
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("output")));
+        assert!(
+            summary
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("output")),
+            "expected the output limit error, got {:?}",
+            summary.error
+        );
         let _ = fs::remove_dir_all(root);
     }
 
