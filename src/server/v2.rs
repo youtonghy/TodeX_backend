@@ -25,9 +25,9 @@ use crate::conversation::{ConversationManifest, ConversationSubscription, Provid
 use crate::device_auth;
 use crate::error::AppError;
 use crate::provider::{
-    read_current_version, run_upgrade, CliUpgradeOperation, CliVersionsResponse,
-    ConversationPrompt, ConversationSupervisor, ManagedCli, PermissionDecision, PromptContentRef,
-    PromptSkillRef,
+    read_current_version, run_install, run_upgrade, CliOperationAction, CliUpgradeOperation,
+    CliVersionsResponse, ConversationPrompt, ConversationSupervisor, ManagedCli,
+    PermissionDecision, PromptContentRef, PromptSkillRef,
 };
 use crate::transport_crypto::TransportCryptoSession;
 use crate::workspace_paths::{
@@ -160,6 +160,10 @@ fn authenticated_routes() -> Router<AppState> {
         .route(
             "/v2/providers/{provider}/upgrade",
             post(upgrade_provider_cli),
+        )
+        .route(
+            "/v2/providers/{provider}/install",
+            post(install_provider_cli),
         )
         .route(
             "/v2/providers/upgrades/{operation_id}",
@@ -1492,10 +1496,29 @@ async fn upgrade_provider_cli(
     headers: HeaderMap,
     AxumPath(provider): AxumPath<ManagedCli>,
 ) -> Result<Json<CliUpgradeOperation>, AppError> {
+    start_cli_operation(state, headers, provider, CliOperationAction::Upgrade).await
+}
+
+async fn install_provider_cli(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(provider): AxumPath<ManagedCli>,
+) -> Result<Json<CliUpgradeOperation>, AppError> {
+    start_cli_operation(state, headers, provider, CliOperationAction::Install).await
+}
+
+/// Install and upgrade share the single-flight operation, the execution gate
+/// and the audit trail; they differ in the precondition and the command.
+async fn start_cli_operation(
+    state: AppState,
+    headers: HeaderMap,
+    provider: ManagedCli,
+    action: CliOperationAction,
+) -> Result<Json<CliUpgradeOperation>, AppError> {
     let auth = require_auth(&state, &headers)?;
     if !state.config.security.enable_auth {
         return Err(AppError::Unauthorized(
-            "CLI upgrades require device authentication".to_owned(),
+            "CLI installs and upgrades require device authentication".to_owned(),
         ));
     }
     let execution_guard = match state.cli_execution_gate.clone().try_write_owned() {
@@ -1505,6 +1528,7 @@ async fn upgrade_provider_cli(
                 &state,
                 &auth,
                 provider,
+                action,
                 None,
                 "deny",
                 Some("CLI_EXECUTION_BUSY"),
@@ -1518,19 +1542,47 @@ async fn upgrade_provider_cli(
     if state.conversations.has_active_turns_for_cli(provider)
         || (provider == ManagedCli::Codex && state.codex_local_adapters.has_active_adapters())
     {
-        append_cli_audit(&state, &auth, provider, None, "deny", Some("AGENT_ACTIVE")).await?;
+        append_cli_audit(
+            &state,
+            &auth,
+            provider,
+            action,
+            None,
+            "deny",
+            Some("AGENT_ACTIVE"),
+        )
+        .await?;
         return Err(AppError::Conflict(format!(
             "finish active {} tasks before upgrading it",
             provider.name()
         )));
     }
-    let previous_version = match read_current_version(&state.config, provider).await {
-        Ok(version) => version,
-        Err(error) => {
+    let current = read_current_version(&state.config, provider).await;
+    let previous_version = match (action, current) {
+        (CliOperationAction::Upgrade, Ok(version)) => version,
+        (CliOperationAction::Install, Err(_)) => None,
+        (CliOperationAction::Install, Ok(_)) => {
             append_cli_audit(
                 &state,
                 &auth,
                 provider,
+                action,
+                None,
+                "deny",
+                Some("CLI_ALREADY_INSTALLED"),
+            )
+            .await?;
+            return Err(AppError::Conflict(format!(
+                "{} is already installed",
+                provider.name()
+            )));
+        }
+        (CliOperationAction::Upgrade, Err(error)) => {
+            append_cli_audit(
+                &state,
+                &auth,
+                provider,
+                action,
                 None,
                 "deny",
                 Some("CLI_UNAVAILABLE"),
@@ -1541,7 +1593,7 @@ async fn upgrade_provider_cli(
     };
     let operation = match state
         .cli_manager
-        .begin_upgrade(provider, previous_version)
+        .begin_operation(provider, action, previous_version)
         .await
     {
         Ok(operation) => operation,
@@ -1550,6 +1602,7 @@ async fn upgrade_provider_cli(
                 &state,
                 &auth,
                 provider,
+                action,
                 None,
                 "deny",
                 Some("UPGRADE_IN_PROGRESS"),
@@ -1562,6 +1615,7 @@ async fn upgrade_provider_cli(
         &state,
         &auth,
         provider,
+        action,
         Some(&operation.id),
         "attempt",
         None,
@@ -1570,10 +1624,10 @@ async fn upgrade_provider_cli(
     {
         state
             .cli_manager
-            .complete_upgrade(
+            .complete_operation(
                 &operation.id,
                 Err(AppError::ProviderUnavailable(
-                    "CLI upgrade cancelled because the audit record could not be persisted"
+                    "CLI operation cancelled because the audit record could not be persisted"
                         .to_owned(),
                 )),
             )
@@ -1586,21 +1640,28 @@ async fn upgrade_provider_cli(
     let operation_id = operation.id.clone();
     tokio::spawn(async move {
         let _execution_guard = execution_guard;
-        let result = run_upgrade(&background_state.config, provider).await;
+        let result = match action {
+            CliOperationAction::Install => run_install(&background_state.config, provider).await,
+            CliOperationAction::Upgrade => run_upgrade(&background_state.config, provider).await,
+        };
         let decision = if result.is_ok() { "success" } else { "failure" };
         let reason = result.as_ref().err().map(ToString::to_string);
         if let Some(completed) = background_state
             .cli_manager
-            .complete_upgrade(&operation_id, result)
+            .complete_operation(&operation_id, result)
             .await
         {
             append_cli_audit(
                 &background_state,
                 &background_auth,
                 completed.provider,
+                completed.action,
                 Some(&completed.id),
                 decision,
-                reason.as_ref().map(|_| "CLI_UPGRADE_FAILED"),
+                reason.as_ref().map(|_| match completed.action {
+                    CliOperationAction::Install => "CLI_INSTALL_FAILED",
+                    CliOperationAction::Upgrade => "CLI_UPGRADE_FAILED",
+                }),
             )
             .await
             .unwrap_or_else(|error| {
@@ -1629,6 +1690,7 @@ async fn append_cli_audit(
     state: &AppState,
     auth: &AuthContext,
     provider: ManagedCli,
+    action: CliOperationAction,
     operation_id: Option<&str>,
     decision: &str,
     reason: Option<&str>,
@@ -1644,6 +1706,7 @@ async fn append_cli_audit(
             "token_id": auth.token_id,
             "operation_id": operation_id,
             "provider": provider,
+            "action": action,
             "decision": decision,
             "reason": reason,
         }),

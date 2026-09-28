@@ -71,6 +71,10 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
+    /// Start the child in a new session without a controlling terminal, so
+    /// installer scripts that prompt on `/dev/tty` fall back to their
+    /// non-interactive defaults. Honored by `run_bounded_command` on Unix.
+    pub detach_terminal: bool,
 }
 
 impl CommandSpec {
@@ -80,6 +84,7 @@ impl CommandSpec {
             args: Vec::new(),
             cwd: cwd.into(),
             env: BTreeMap::new(),
+            detach_terminal: false,
         }
     }
 }
@@ -364,7 +369,21 @@ pub async fn run_bounded_command(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.as_std_mut().process_group(0);
+        if spec.detach_terminal {
+            // setsid also makes the child its own process-group leader, so
+            // the timeout's group kill below still reaches its descendants.
+            // SAFETY: setsid is async-signal-safe and touches no parent state.
+            unsafe {
+                command.as_std_mut().pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        } else {
+            command.as_std_mut().process_group(0);
+        }
     }
 
     let mut child = command.spawn().map_err(|error| {
@@ -556,10 +575,39 @@ fn resolve_executable(program: &str) -> Option<PathBuf> {
         }
         return None;
     }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .find_map(|directory| executable_in_directory(&directory, program))
-    })
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .find_map(|directory| executable_in_directory(&directory, program))
+        })
+        .or_else(|| {
+            user_install_dirs()
+                .into_iter()
+                .find_map(|directory| executable_in_directory(&directory, program))
+        })
+}
+
+/// Per-user directories the official Agent CLI installers write to. A daemon
+/// started by launchd/systemd rarely has them on PATH, and the installers only
+/// add them to shell rc files, so they are searched after PATH.
+fn user_install_dirs() -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return Vec::new();
+        };
+        let home = PathBuf::from(home);
+        vec![
+            home.join(".local").join("bin"),
+            home.join(".grok").join("bin"),
+            home.join(".opencode").join("bin"),
+            home.join(".pi").join("agent").join("bin"),
+        ]
+    }
+    #[cfg(not(unix))]
+    {
+        Vec::new()
+    }
 }
 
 fn executable_in_directory(directory: &Path, program: &str) -> Option<PathBuf> {
@@ -812,6 +860,23 @@ mod tests {
             reads.push(classify_line(line));
         }
         reads
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_command_leads_its_own_process_group() {
+        let mut spec = CommandSpec::new("sh", std::env::temp_dir());
+        // setsid must not collide with process-group setup (EPERM for a group
+        // leader) and still leaves the child leading its own group for kills.
+        spec.args = vec!["-c".to_owned(), "echo $$; ps -o pgid= -p $$".to_owned()];
+        spec.detach_terminal = true;
+        let output = run_bounded_command(&spec, 1024, Duration::from_secs(10))
+            .await
+            .expect("detached command");
+        assert!(output.success);
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut lines = text.lines().map(str::trim);
+        assert_eq!(lines.next(), lines.next());
     }
 
     #[tokio::test]

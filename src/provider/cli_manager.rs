@@ -13,10 +13,11 @@ use crate::config::Config;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
 
-use super::process::{run_bounded_command, CommandSpec};
+use super::process::{executable_available, run_bounded_command, CommandSpec};
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(12);
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const VERSION_CACHE_TTL: Duration = Duration::from_secs(30);
 const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
@@ -87,6 +88,64 @@ impl ManagedCli {
             Self::Opencode => &["upgrade"],
         }
     }
+
+    /// The vendor's documented `curl | bash` installer. Each script installs
+    /// a native binary into a per-user directory (see
+    /// `process::user_install_dirs`); Pi's also needs Node.js >= 22 on PATH.
+    /// Windows installers are PowerShell-only and are not offered yet.
+    fn install_script(self) -> Option<InstallScript> {
+        if !cfg!(unix) {
+            return None;
+        }
+        Some(match self {
+            Self::Codex => InstallScript {
+                url: "https://chatgpt.com/codex/install.sh",
+                shell: "sh",
+                // Skips the "start Codex now?" and npm-cleanup prompts.
+                env: &[("CODEX_NON_INTERACTIVE", "1")],
+            },
+            Self::Pi => InstallScript {
+                url: "https://pi.dev/install.sh",
+                shell: "sh",
+                env: &[],
+            },
+            Self::ClaudeCode => InstallScript {
+                url: "https://claude.ai/install.sh",
+                shell: "bash",
+                env: &[],
+            },
+            Self::GrokBuild => InstallScript {
+                url: "https://x.ai/cli/install.sh",
+                shell: "bash",
+                env: &[],
+            },
+            Self::Devin => InstallScript {
+                url: "https://cli.devin.ai/install.sh",
+                shell: "bash",
+                env: &[],
+            },
+            Self::Opencode => InstallScript {
+                url: "https://opencode.ai/install",
+                shell: "bash",
+                env: &[],
+            },
+        })
+    }
+}
+
+/// A fixed installer invocation: `curl -fsSL <url> | <shell> -s`. Nothing in
+/// it comes from the request, so the shell never sees user input.
+struct InstallScript {
+    url: &'static str,
+    shell: &'static str,
+    env: &'static [(&'static str, &'static str)],
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum CliOperationAction {
+    Install,
+    Upgrade,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -102,6 +161,7 @@ pub struct CliVersionInfo {
     pub latest_version: Option<String>,
     pub status: String,
     pub upgrade_supported: bool,
+    pub install_supported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -120,6 +180,7 @@ pub struct CliVersionsResponse {
 pub struct CliUpgradeOperation {
     pub id: String,
     pub provider: ManagedCli,
+    pub action: CliOperationAction,
     pub status: String,
     pub started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,6 +243,7 @@ impl CliManager {
             latest_version: None,
             status: "external".to_owned(),
             upgrade_supported: false,
+            install_supported: false,
             error: None,
         }));
         let response = CliVersionsResponse {
@@ -225,9 +287,10 @@ impl CliManager {
         response
     }
 
-    pub async fn begin_upgrade(
+    pub async fn begin_operation(
         &self,
         provider: ManagedCli,
+        action: CliOperationAction,
         previous_version: Option<String>,
     ) -> Result<CliUpgradeOperation, AppError> {
         let mut state = self.upgrades.lock().await;
@@ -236,14 +299,19 @@ impl CliManager {
                 .operations
                 .get(id)
                 .expect("active CLI operation must exist");
+            let verb = match active.action {
+                CliOperationAction::Install => "install",
+                CliOperationAction::Upgrade => "upgrade",
+            };
             return Err(AppError::Conflict(format!(
-                "CLI upgrade {} is already running",
+                "CLI {verb} of {} is already running",
                 active.provider.id()
             )));
         }
         let operation = CliUpgradeOperation {
             id: format!("cliup_{}", Uuid::new_v4().simple()),
             provider,
+            action,
             status: "running".to_owned(),
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
@@ -271,7 +339,7 @@ impl CliManager {
         Ok(operation)
     }
 
-    pub async fn complete_upgrade(
+    pub async fn complete_operation(
         &self,
         operation_id: &str,
         result: Result<Option<String>, AppError>,
@@ -324,6 +392,95 @@ pub async fn run_upgrade(
     current_version(config, provider).await
 }
 
+/// Run the vendor installer, then confirm through the configured binary.
+///
+/// Success is judged by the result, not the script's exit status: Devin's
+/// installer ends with the interactive `devin setup`, which fails without a
+/// terminal after the binary is already in place.
+pub async fn run_install(
+    config: &Config,
+    provider: ManagedCli,
+) -> Result<Option<String>, AppError> {
+    let script = provider.install_script().ok_or_else(|| {
+        AppError::Unsupported(format!(
+            "{} cannot be installed from TodeX on this platform",
+            provider.name()
+        ))
+    })?;
+    let command = format!("curl -fsSL '{}' | {} -s", script.url, script.shell);
+    let mut spec = CommandSpec::new("bash", &config.data_dir);
+    // pipefail: a failed download must not look like an empty, successful script.
+    spec.args = vec![
+        "-o".to_owned(),
+        "pipefail".to_owned(),
+        "-c".to_owned(),
+        command,
+    ];
+    spec.env = script
+        .env
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+    spec.detach_terminal = true;
+    let script_error = match run_bounded_command(&spec, MAX_OUTPUT_BYTES, INSTALL_TIMEOUT).await {
+        Ok(output) if output.success => None,
+        Ok(output) => Some(install_failure(provider, &output.stderr, &output.stdout)),
+        Err(error) => Some(error),
+    };
+    match (current_version(config, provider).await, script_error) {
+        (Ok(version), None) => Ok(version),
+        (Ok(version), Some(error)) => {
+            tracing::warn!(provider = provider.id(), error = %error, "CLI installer exited with an error after installing");
+            Ok(version)
+        }
+        (Err(_), Some(error)) => Err(error),
+        (Err(_), None) => Err(AppError::ProviderUnavailable(format!(
+            "{} was installed but '{}' is still not found; set its path in the TodeX config",
+            provider.name(),
+            provider.binary(config)
+        ))),
+    }
+}
+
+/// The installer's last non-empty output line, which is where these scripts
+/// print their error (for example Pi's missing Node.js).
+fn install_failure(provider: ManagedCli, stderr: &[u8], stdout: &[u8]) -> AppError {
+    let last_line = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .rev()
+            .map(|line| strip_ansi(line).trim().to_owned())
+            .find(|line| !line.is_empty())
+    };
+    let detail = last_line(stderr).or_else(|| last_line(stdout));
+    let mut message = format!("{} installer failed", provider.name());
+    if let Some(detail) = detail {
+        message.push_str(": ");
+        message.extend(detail.chars().take(300));
+    }
+    AppError::ProviderUnavailable(message)
+}
+
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 pub async fn read_current_version(
     config: &Config,
     provider: ManagedCli,
@@ -332,6 +489,22 @@ pub async fn read_current_version(
 }
 
 async fn inspect_cli(config: &Config, provider: ManagedCli) -> CliVersionInfo {
+    // A missing binary is a normal state with an Install action, not an error.
+    if !executable_available(provider.binary(config)) {
+        let latest_version = latest_version(config, provider).await.ok().flatten();
+        return CliVersionInfo {
+            id: provider.id().to_owned(),
+            name: provider.name().to_owned(),
+            kind: "managed".to_owned(),
+            installed: false,
+            current_version: None,
+            latest_version,
+            status: "notInstalled".to_owned(),
+            upgrade_supported: false,
+            install_supported: config.security.enable_auth && provider.install_script().is_some(),
+            error: None,
+        };
+    }
     let current = current_version(config, provider).await;
     let latest = latest_version(config, provider).await;
     let installed = current.is_ok();
@@ -359,6 +532,7 @@ async fn inspect_cli(config: &Config, provider: ManagedCli) -> CliVersionInfo {
         latest_version,
         status: status.to_owned(),
         upgrade_supported: installed && config.security.enable_auth,
+        install_supported: false,
         error,
     }
 }
@@ -568,7 +742,9 @@ fn user_facing_error(error: &AppError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_versions, extract_version, CliManager, ManagedCli};
+    use super::{
+        compare_versions, extract_version, strip_ansi, CliManager, CliOperationAction, ManagedCli,
+    };
 
     #[test]
     fn extracts_versions_from_cli_output() {
@@ -593,20 +769,32 @@ mod tests {
     async fn upgrades_are_single_flight() {
         let manager = CliManager::default();
         let first = manager
-            .begin_upgrade(ManagedCli::Codex, Some("1.0.0".to_owned()))
+            .begin_operation(
+                ManagedCli::Codex,
+                CliOperationAction::Upgrade,
+                Some("1.0.0".to_owned()),
+            )
             .await
             .unwrap();
         assert!(manager
-            .begin_upgrade(ManagedCli::Pi, Some("1.0.0".to_owned()))
+            .begin_operation(ManagedCli::Pi, CliOperationAction::Install, None)
             .await
             .is_err());
         manager
-            .complete_upgrade(&first.id, Ok(Some("1.1.0".to_owned())))
+            .complete_operation(&first.id, Ok(Some("1.1.0".to_owned())))
             .await;
         assert!(manager
-            .begin_upgrade(ManagedCli::Pi, Some("1.0.0".to_owned()))
+            .begin_operation(ManagedCli::Pi, CliOperationAction::Install, None)
             .await
             .is_ok());
+    }
+
+    #[test]
+    fn strips_ansi_colors_from_installer_output() {
+        assert_eq!(
+            strip_ansi("\u{1b}[0;31mError:\u{1b}[0m Node.js 22 is required"),
+            "Error: Node.js 22 is required"
+        );
     }
 
     #[test]

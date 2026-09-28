@@ -74,6 +74,7 @@ OpenCode 通过 `opencode acp` 接入，每个对话对应一个常驻 ACP 进�
 GET /v2/providers
 GET /v2/providers/versions
 POST /v2/providers/{provider}/upgrade
+POST /v2/providers/{provider}/install
 GET /v2/providers/upgrades/{operationId}
 GET /v2/providers/models?provider=codex&workspace=/home/user/projects/demo
 GET /v2/providers/commands?conversationId={conversationId}
@@ -83,6 +84,8 @@ PUT /v2/agent-providers/{agent}/{id}
 DELETE /v2/agent-providers/{agent}/{id}
 POST /v2/agent-providers/{agent}/{id}/activate
 POST /v2/agent-providers/{agent}/import-live
+GET /v2/agent-providers/{agent}/export
+POST /v2/agent-providers/{agent}/import
 GET /v2/agent-providers/{agent}/{id}/models
 POST /v2/agent-providers/{agent}/{id}/models
 GET /v2/conversations
@@ -102,13 +105,17 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 `/v2/providers/models` 会实时向指定 Agent 查询模型目录，返回 `source` 与 `fetchedAt`。每个模型包含 `supportedReasoningEfforts`，并可通过 `defaultReasoningEffort` 声明后端当前默认强度。Codex 使用 app-server `model/list`，Pi 使用 RPC `get_available_models` 与 `get_state`，Claude Code 在配置了 `ANTHROPIC_BASE_URL` 时读取 `/v1/models`，Grok Build 从 ACP initialize 的原生模型状态读取。查询失败时客户端应保留上一次成功目录，并展示可恢复错误。
 
-`GET /v2/providers/versions` 在 daemon 所在主机读取配置的六个内建 CLI，并从各自官方发布源查询最新版（OpenCode 查询 GitHub `anomalyco/opencode` 最新 release tag）；Devin 没有只读的最新版本检查接口，`latestVersion` 会保持为空。结果会短时缓存，单个查询失败不会隐藏其他 CLI。ACP profile 作为外部管理项列出，不执行任意 profile 命令，也不提供升级。`POST /v2/providers/{provider}/upgrade` 仅接受 `codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode` 固定标识（OpenCode 执行 `opencode upgrade`），返回异步 operation；客户端使用 operation 查询接口轮询。升级命令不经过 shell、不读取工作区，并在升级后重新调用同一个配置 binary 验证版本。任一 Agent turn、本地 Codex adapter、Provider 发现或另一升级正在启动/运行时会返回 `409 CONFLICT`；升级中的版本查询只返回已有缓存，不会再启动 CLI。CLI 升级在 loopback 部署中也必须携带有效设备签名，以免网页通过跨域请求改变宿主机工具链；已认证的尝试及最终结果会写入审计日志，初始审计记录无法落盘时不会启动升级。
+`GET /v2/providers/versions` 在 daemon 所在主机读取配置的六个内建 CLI，并从各自官方发布源查询最新版（Codex、Claude Code、OpenCode 查询 npm registry，Pi 查询 `pi.dev`，Devin 读取其自更新 manifest，Grok Build 执行 `grok update --check --json`）。配置的 binary 在 PATH 与官方安装器使用的用户目录（`~/.local/bin`、`~/.grok/bin`、`~/.opencode/bin`、`~/.pi/agent/bin`，Unix）中都找不到时返回 `status: "notInstalled"`、`installed: false`，不带 `error`，`installSupported` 表示可一键安装。结果会短时缓存，单个查询失败不会隐藏其他 CLI。ACP profile 作为外部管理项列出，不执行任意 profile 命令，也不提供升级。`POST /v2/providers/{provider}/upgrade` 仅接受 `codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode` 固定标识（OpenCode 执行 `opencode upgrade`），返回异步 operation；客户端使用 operation 查询接口轮询。升级命令不经过 shell、不读取工作区，并在升级后重新调用同一个配置 binary 验证版本。任一 Agent turn、本地 Codex adapter、Provider 发现或另一升级正在启动/运行时会返回 `409 CONFLICT`；升级中的版本查询只返回已有缓存，不会再启动 CLI。CLI 升级在 loopback 部署中也必须携带有效设备签名，以免网页通过跨域请求改变宿主机工具链；已认证的尝试及最终结果会写入审计日志，初始审计记录无法落盘时不会启动升级。
+
+`POST /v2/providers/{provider}/install` 与升级共用 operation、并发闸门与审计（operation 带 `action: "install" | "upgrade"`，审计事件带 `action`），CLI 已安装时返回 `409 CONFLICT`。安装执行各厂商文档中的固定安装脚本（`curl -fsSL <官方 URL> | sh/bash`，URL 为常量，不含请求内容）：Codex `chatgpt.com/codex/install.sh`（`CODEX_NON_INTERACTIVE=1`）、Pi `pi.dev/install.sh`（需要主机已有 Node.js ≥ 22）、Claude Code `claude.ai/install.sh`、Grok Build `x.ai/cli/install.sh`、Devin `cli.devin.ai/install.sh`、OpenCode `opencode.ai/install`。脚本在无控制终端的新会话中运行，交互提示取默认值；部分脚本会按厂商默认行为在 shell rc 中加入 PATH。安装成功与否以脚本结束后配置 binary 能否输出版本为准（Devin 脚本末尾的交互式 `devin setup` 在无终端时失败不影响结果）。Windows 暂不提供一键安装（`installSupported: false`）。
 
 `GET /v2/providers/commands?provider=pi&workspace=/path` 会实时读取 Agent 命令目录。Pi 使用 RPC `get_commands` 返回扩展、Prompt Template 和 Skill；响应失败会作为 Provider 错误返回，成功结果中的 `sourceInfo` 会原样保留。Codex 返回与本机 CLI 版本同步的 TUI 命令适配目录。命令描述包含 `invocation`，客户端应据此选择原生 RPC、桌面动作或 Provider prompt，不要把所有 `/` 输入都当作普通 prompt。 已有会话应使用 `?conversationId=...`：后端先校验 owner，再从会话 manifest 确定 provider 与 workspace，忽略客户端同时提交的对应查询参数。Pi runtime 存在时由同一 worker 发送 `get_commands`，响应含 `catalogSource: "session"` 与 `runtimeId`；尚未启动时使用临时发现进程，返回 `catalogSource: "discovery"`。目录查询总时限为 8 秒。可验证的本地包会附带 `packageName` / `packageVersion`：版本取自实际资源附近的 `package.json`，显式加载的资源还会检查 manifest 的 Pi 入口；无法确认时省略，不从 npm spec 猜测。
 
 `/v2/agent-providers` 实现 cc-switch 同款的多供应商/账户管理，当前覆盖 `codex`、`claude-code`、`grok-build`、`pi`、`opencode`。档案库持久化在 `$TODEX_AGENTD_DATA_DIR/agent-providers.json`（owner-only 0600），`settingsConfig` 是不透明的按 Agent 配置：Claude Code 为完整 `settings.json` 对象（`env` 内含 `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL` 等），Codex 为 `{auth, config}`（分别对应 `~/.codex/auth.json` 与 `config.toml` 文本），Grok Build 同为 `{auth, config}`（`$GROK_HOME/auth.json`——设置 `GROK_AUTH_PATH` 时取该路径——与 `$GROK_HOME/config.toml`，`GROK_HOME` 缺省为 `~/.grok`）：官方订阅档案携带 `grok login` 写入 `auth.json` 的会话（通常经 `import-live` 捕获），API 档案不带 `auth`，由 `[models].default` 指向带 `api_key`（可选 `base_url`、`api_backend`）的 `[model.<id>]`，Grok 会优先使用该密钥而非会话。Pi/OpenCode 为各自 `models.json`/`opencode.json` 中的 provider 节点。
 
 激活（`activate`）改写该 Agent 的全局配置文件，对 TodeX 拉起的会话和终端里直接运行的 CLI 同时生效；运行中的会话不受影响。独占型 Agent（Claude Code、Codex、Grok Build）先把当前 live 配置回填进旧档案再写入新档案，外部编辑与凭据（含 Codex/Grok `auth.json`）因此被保留可恢复；`auth` 缺失的 Codex/Grok 档案仅在回填成功后删除 `auth.json`。Grok 会在后台刷新 `auth.json` 中的会话令牌：`matchesCurrent` 只比较登录账户（各 scope 的 `auth_mode`/`user_id`，API key scope 另比较密钥）与 `config.toml`，令牌刷新不算漂移；编辑或重新激活当前档案且 `auth` 未改动时，沿用 live 中同账户的新令牌，避免写回已轮换的旧令牌。叠加型 Agent（Pi、OpenCode）在保存时即把 provider 节点同步进 live 文件，`activate` 只移动原生默认选中（Pi 写 `settings.json` 的 `defaultProvider`/`defaultModel`；OpenCode 写顶层 `model`，可经请求体 `{"modelId": "..."}` 指定，缺省取首个声明模型）。删除叠加型档案同时移除 live 节点，并清理指向它的默认选中。
+
+`GET /v2/agent-providers/{agent}/export` 导出该 Agent 的全部档案，用于在多台主机间同步：`{format: "todex.agent-providers", version: 1, agent, exportedAt, providers: [{id, name, settingsConfig, websiteUrl?, category?, notes?, icon?, iconColor?, sortIndex?}]}`，**密钥为明文**（其余接口一律打码），不含时间戳与当前选中。`POST /v2/agent-providers/{agent}/import` 接受同一文件：按 `id` 覆盖同名档案、新增其余档案，文件中没有的档案保留，当前选中不变（导入与当前档案同 id 的内容会像编辑一样重写 live 配置；叠加型 Agent 的节点同步进 live 文件）。整份文件先校验（格式与版本、`agent` 与路径一致、id 唯一、名称与大小限制、不得含 `__TODEX_MASKED__`、导入后不超过 100 个档案）再写入。两者与 CLI 升级一样要求有效设备签名，并写入 `agent_providers.transfer.audit` 审计事件。
 
 `GET` 响应中按字段名模式（`api_key`/`token`/`secret`/`password`/`authorization`/`credential`/`bearer`，含 Codex/Grok `config` TOML 内的 `experimental_bearer_token`、`api_key`、Codex `http_headers` 与 Grok `extra_headers` 值及内联表中的同类字段，以及 Grok `auth.json` 各 scope 的 `key`）把密钥替换为 `__TODEX_MASKED__`；写回掩码值表示保留已存密钥，新档案不得携带掩码。`/{id}/models` 由后端携带档案凭据代理请求 `{base}/models`（Claude 为 `/v1/models`；Grok 取 `[models].default` 条目或其 `model_provider` 的 `base_url`/`api_key`，其次 `[endpoints].models_base_url` 与 `auth.json` 的 `xai::api_key`，仅有密钥时默认 `https://api.x.ai/v1`；订阅会话令牌不会被转发），客户端不经手真实密钥。`GET` 读取已存档案；`POST` 接受 `{"settingsConfig": {...}}` 用于保存前的预览拉取，掩码值按同 id 的已存档案或叠加型 live 节点还原。`import-live` 对独占型捕获当前 live 为新档案并记为当前；对叠加型把 live 中未托管节点按 `id` 收编。所有 live 写入为原子 owner-only 文件，叠加型编辑带内容 revision 校验——外部并发修改返回 `409 CONFLICT`，客户端应刷新后重试。
 

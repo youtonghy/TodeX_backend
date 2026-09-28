@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 
@@ -36,6 +36,14 @@ pub(crate) const MAX_PROVIDER_SETTINGS_BYTES: usize = 256 * 1024;
 const MAX_PROVIDERS_PER_AGENT: usize = 100;
 const MAX_PROVIDER_NAME_CHARS: usize = 120;
 const MAX_PROVIDER_ID_CHARS: usize = 64;
+/// `format` tag of an exported provider file; bumps to `version` mark
+/// incompatible layouts.
+pub const PROVIDER_TRANSFER_FORMAT: &str = "todex.agent-providers";
+const PROVIDER_TRANSFER_VERSION: u32 = 1;
+/// Request cap for an import: a full export of the largest bucket plus room
+/// for metadata and JSON escaping.
+pub const MAX_PROVIDER_TRANSFER_BYTES: usize =
+    MAX_PROVIDERS_PER_AGENT * (MAX_PROVIDER_SETTINGS_BYTES + 16 * 1024);
 
 /// Agents that support managed providers in this first pass.
 pub const SUPPORTED_AGENTS: [ProviderKind; 5] = [
@@ -162,6 +170,41 @@ pub struct ImportLiveInput {
     pub name: Option<String>,
 }
 
+/// One provider in an export file. Secrets are exported in clear so the file
+/// can seed another backend; timestamps belong to each store and stay local.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProviderTransferItem {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub settings_config: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_index: Option<i64>,
+}
+
+/// The per-agent export file, and the body `import` accepts.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProviderTransfer {
+    pub format: String,
+    pub version: u32,
+    pub agent: String,
+    #[serde(default)]
+    pub exported_at: u64,
+    pub providers: Vec<AgentProviderTransferItem>,
+}
+
 /// Provider store plus the live-file writes, serialized per agent.
 #[derive(Clone)]
 pub struct AgentProviderService {
@@ -225,15 +268,7 @@ impl AgentProviderService {
         agent: ProviderKind,
         bucket: &AgentProviderBucket,
     ) -> Result<Value, AppError> {
-        let mut providers: Vec<&AgentProviderProfile> = bucket.providers.values().collect();
-        providers.sort_by(|a, b| {
-            a.sort_index
-                .unwrap_or(i64::MAX)
-                .cmp(&b.sort_index.unwrap_or(i64::MAX))
-                .then_with(|| a.created_at.cmp(&b.created_at))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let providers: Vec<Value> = providers
+        let providers: Vec<Value> = sorted_profiles(bucket)
             .iter()
             .map(|profile| masked_profile(agent, profile))
             .collect();
@@ -311,23 +346,7 @@ impl AgentProviderService {
         input: AgentProviderInput,
     ) -> Result<Value, AppError> {
         validate_provider_id(id)?;
-        let name = input.name.trim();
-        if name.is_empty() || name.chars().count() > MAX_PROVIDER_NAME_CHARS {
-            return Err(AppError::InvalidRequest(format!(
-                "provider name must be 1-{MAX_PROVIDER_NAME_CHARS} characters"
-            )));
-        }
-        if !input.settings_config.is_object() {
-            return Err(AppError::InvalidRequest(
-                "settingsConfig must be a JSON object".to_owned(),
-            ));
-        }
-        if serde_json::to_vec(&input.settings_config)?.len() > MAX_PROVIDER_SETTINGS_BYTES {
-            return Err(AppError::InvalidRequest(format!(
-                "settingsConfig exceeds the {} byte limit",
-                MAX_PROVIDER_SETTINGS_BYTES
-            )));
-        }
+        let name = validate_provider_input(&input.name, &input.settings_config)?;
 
         let _guard = self.lock_for(agent).lock().await;
         let existing = self.store.profile(agent, id).await;
@@ -337,10 +356,7 @@ impl AgentProviderService {
             &mut settings_config,
             existing.as_ref().map(|p| &p.settings_config),
         );
-        if contains_masked(&settings_config)
-            || (toml_header_tables(agent).is_some()
-                && auth_config::config_text_has_mask(&settings_config))
-        {
+        if has_masked_secret(agent, &settings_config) {
             return Err(AppError::InvalidRequest(
                 "masked secret has no stored value to restore".to_owned(),
             ));
@@ -559,6 +575,104 @@ impl AgentProviderService {
             self.store.set_current(agent, Some(id.to_owned())).await?;
         }
         self.agent_block(&dirs, agent, &self.bucket(agent).await)
+    }
+
+    /// Every stored profile of one agent, unmasked, in display order.
+    pub async fn export(&self, agent: ProviderKind) -> AgentProviderTransfer {
+        let bucket = self.bucket(agent).await;
+        let providers = sorted_profiles(&bucket)
+            .into_iter()
+            .map(|profile| AgentProviderTransferItem {
+                id: profile.id.clone(),
+                name: profile.name.clone(),
+                settings_config: profile.settings_config.clone(),
+                website_url: profile.website_url.clone(),
+                category: profile.category.clone(),
+                notes: profile.notes.clone(),
+                icon: profile.icon.clone(),
+                icon_color: profile.icon_color.clone(),
+                sort_index: profile.sort_index,
+            })
+            .collect();
+        AgentProviderTransfer {
+            format: PROVIDER_TRANSFER_FORMAT.to_owned(),
+            version: PROVIDER_TRANSFER_VERSION,
+            agent: agent.as_str().to_owned(),
+            exported_at: now_millis(),
+            providers,
+        }
+    }
+
+    /// Upsert every profile of an export file by id: matching ids are
+    /// overwritten, others are added, and profiles missing from the file are
+    /// kept. The current provider is not switched; re-importing it rewrites
+    /// the live config like an edit would. The whole file is validated before
+    /// the first write.
+    pub async fn import(
+        &self,
+        agent: ProviderKind,
+        transfer: AgentProviderTransfer,
+    ) -> Result<Value, AppError> {
+        if transfer.format != PROVIDER_TRANSFER_FORMAT {
+            return Err(AppError::InvalidRequest(format!(
+                "file is not a {PROVIDER_TRANSFER_FORMAT} export"
+            )));
+        }
+        if transfer.version != PROVIDER_TRANSFER_VERSION {
+            return Err(AppError::Unsupported(format!(
+                "provider export version {} is not supported",
+                transfer.version
+            )));
+        }
+        if transfer.agent != agent.as_str() {
+            return Err(AppError::InvalidRequest(format!(
+                "file holds {} providers, not {}",
+                transfer.agent,
+                agent.as_str()
+            )));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for item in &transfer.providers {
+            validate_provider_id(&item.id)?;
+            if !ids.insert(item.id.as_str()) {
+                return Err(AppError::InvalidRequest(format!(
+                    "provider {} appears more than once",
+                    item.id
+                )));
+            }
+            validate_provider_input(&item.name, &item.settings_config)?;
+            if has_masked_secret(agent, &item.settings_config) {
+                return Err(AppError::InvalidRequest(format!(
+                    "provider {} carries a masked secret instead of its value",
+                    item.id
+                )));
+            }
+        }
+        let bucket = self.bucket(agent).await;
+        let added = ids
+            .iter()
+            .filter(|id| !bucket.providers.contains_key(**id))
+            .count();
+        if bucket.providers.len() + added > MAX_PROVIDERS_PER_AGENT {
+            return Err(AppError::ResourceExhausted(format!(
+                "{} provider limit of {MAX_PROVIDERS_PER_AGENT} reached",
+                agent.as_str()
+            )));
+        }
+        for item in transfer.providers {
+            let input = AgentProviderInput {
+                name: item.name,
+                settings_config: item.settings_config,
+                website_url: item.website_url,
+                category: item.category,
+                notes: item.notes,
+                icon: item.icon,
+                icon_color: item.icon_color,
+                sort_index: item.sort_index,
+            };
+            self.upsert(agent, &item.id, input).await?;
+        }
+        self.agent_block(&self.dirs(), agent, &self.bucket(agent).await)
     }
 
     /// Fetch the model catalog through the stored credentials (server-side).
@@ -911,6 +1025,50 @@ fn validate_provider_id(id: &str) -> Result<(), AppError> {
     }
 }
 
+/// The trimmed name, once name and settings pass the store limits.
+fn validate_provider_input<'a>(
+    name: &'a str,
+    settings_config: &Value,
+) -> Result<&'a str, AppError> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > MAX_PROVIDER_NAME_CHARS {
+        return Err(AppError::InvalidRequest(format!(
+            "provider name must be 1-{MAX_PROVIDER_NAME_CHARS} characters"
+        )));
+    }
+    if !settings_config.is_object() {
+        return Err(AppError::InvalidRequest(
+            "settingsConfig must be a JSON object".to_owned(),
+        ));
+    }
+    if serde_json::to_vec(settings_config)?.len() > MAX_PROVIDER_SETTINGS_BYTES {
+        return Err(AppError::InvalidRequest(format!(
+            "settingsConfig exceeds the {} byte limit",
+            MAX_PROVIDER_SETTINGS_BYTES
+        )));
+    }
+    Ok(name)
+}
+
+fn has_masked_secret(agent: ProviderKind, settings_config: &Value) -> bool {
+    contains_masked(settings_config)
+        || (toml_header_tables(agent).is_some()
+            && auth_config::config_text_has_mask(settings_config))
+}
+
+/// Display order: explicit `sortIndex`, then creation time, then id.
+fn sorted_profiles(bucket: &AgentProviderBucket) -> Vec<&AgentProviderProfile> {
+    let mut providers: Vec<&AgentProviderProfile> = bucket.providers.values().collect();
+    providers.sort_by(|a, b| {
+        a.sort_index
+            .unwrap_or(i64::MAX)
+            .cmp(&b.sort_index.unwrap_or(i64::MAX))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    providers
+}
+
 fn optional_trimmed(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
@@ -1006,6 +1164,133 @@ mod tests {
 
     fn providers_of(block: &Value) -> &Vec<Value> {
         block["providers"].as_array().expect("providers array")
+    }
+
+    #[tokio::test]
+    async fn export_import_round_trips_secrets_to_another_store() {
+        let source_root = TestRoot::new();
+        let source = service_in(source_root.path()).await;
+        source
+            .upsert(
+                ProviderKind::Codex,
+                "work",
+                input(
+                    "Work",
+                    codex_settings(Some("sk-work"), "https://work.example.com"),
+                ),
+            )
+            .await
+            .unwrap();
+        let exported = source.export(ProviderKind::Codex).await;
+        assert_eq!(exported.format, PROVIDER_TRANSFER_FORMAT);
+        assert_eq!(exported.agent, "codex");
+        assert_eq!(
+            exported.providers[0].settings_config["auth"]["OPENAI_API_KEY"],
+            "sk-work"
+        );
+        // The file is plain JSON: round-trip it through text like a download.
+        let text = serde_json::to_string(&exported).unwrap();
+
+        let target_root = TestRoot::new();
+        let target = service_in(target_root.path()).await;
+        target
+            .upsert(
+                ProviderKind::Codex,
+                "work",
+                input(
+                    "Old",
+                    codex_settings(Some("sk-old"), "https://old.example.com"),
+                ),
+            )
+            .await
+            .unwrap();
+        target
+            .upsert(
+                ProviderKind::Codex,
+                "local",
+                input(
+                    "Local",
+                    codex_settings(Some("sk-local"), "https://local.example.com"),
+                ),
+            )
+            .await
+            .unwrap();
+        target
+            .activate(ProviderKind::Codex, "local", None)
+            .await
+            .unwrap();
+
+        let block = target
+            .import(ProviderKind::Codex, serde_json::from_str(&text).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(providers_of(&block).len(), 2, "unlisted profiles are kept");
+        assert_eq!(
+            block["currentProviderId"], "local",
+            "import does not switch"
+        );
+        let work = target
+            .store
+            .profile(ProviderKind::Codex, "work")
+            .await
+            .unwrap();
+        assert_eq!(work.name, "Work");
+        assert_eq!(work.settings_config["auth"]["OPENAI_API_KEY"], "sk-work");
+    }
+
+    #[tokio::test]
+    async fn import_rejects_mismatched_or_masked_files_before_writing() {
+        let temp = TestRoot::new();
+        let service = service_in(temp.path()).await;
+        let transfer = |agent: &str, providers: Value| -> AgentProviderTransfer {
+            serde_json::from_value(json!({
+                "format": PROVIDER_TRANSFER_FORMAT,
+                "version": 1,
+                "agent": agent,
+                "providers": providers,
+            }))
+            .unwrap()
+        };
+        let good = json!({"id": "a", "name": "A", "settingsConfig": claude_settings("https://a.example.com", "key-a")});
+
+        let wrong_agent = service
+            .import(
+                ProviderKind::Codex,
+                transfer("claude-code", json!([good.clone()])),
+            )
+            .await;
+        assert!(matches!(wrong_agent, Err(AppError::InvalidRequest(_))));
+
+        let masked = json!({"id": "b", "name": "B", "settingsConfig": claude_settings("https://b.example.com", MASKED_SECRET)});
+        let with_masked = service
+            .import(
+                ProviderKind::ClaudeCode,
+                transfer("claude-code", json!([good.clone(), masked])),
+            )
+            .await;
+        assert!(matches!(with_masked, Err(AppError::InvalidRequest(_))));
+
+        let duplicated = service
+            .import(
+                ProviderKind::ClaudeCode,
+                transfer("claude-code", json!([good.clone(), good])),
+            )
+            .await;
+        assert!(matches!(duplicated, Err(AppError::InvalidRequest(_))));
+
+        let mut wrong_format = transfer("claude-code", json!([]));
+        wrong_format.format = "cc-switch".to_owned();
+        assert!(service
+            .import(ProviderKind::ClaudeCode, wrong_format)
+            .await
+            .is_err());
+
+        // Validation runs before the first write, so nothing was stored.
+        assert!(service
+            .export(ProviderKind::ClaudeCode)
+            .await
+            .providers
+            .is_empty());
     }
 
     #[tokio::test]

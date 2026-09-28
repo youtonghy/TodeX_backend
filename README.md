@@ -41,6 +41,7 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
   - `/v2/agent-providers` stores multiple provider/account profiles per agent (Codex, Claude Code, Grok Build, Pi, OpenCode) and activates one by rewriting the agent's native global config (`settings.json`, `config.toml`/`auth.json` for Codex and Grok Build, `models.json`, `opencode.json`) so both TodeX-launched and manually started CLI sessions pick it up.
   - Exclusive agents backfill the current live config into the outgoing profile before switching; additive agents merge managed nodes while leaving external provider entries untouched.
   - Secret values are masked in API responses and preserved on write-back; model lists are proxied server-side; additive edits carry a content-revision conflict check.
+  - `GET /v2/agent-providers/{agent}/export` and `POST /v2/agent-providers/{agent}/import` move one agent's profiles between hosts as a JSON file (secrets in clear, device-signed and audited); import upserts by id and keeps the current selection.
 - **Unified Multiplexed WebSocket (`/v2/ws`)**:
   - Single connection handling conversation streams, turn events, interactive permission requests, local terminal/PTY sessions, and runtime controls.
   - Heartbeat detection, sequence-based reconnection (`afterSequence`), and UTF-8 frame length enforcement.
@@ -245,7 +246,8 @@ enable_tls = false
 - `GET /v2/providers`: List available agent providers and their active states.
 - `GET /v2/providers/versions`: Inspect the configured backend host's Codex, Pi, Claude Code, Grok Build, Devin, OpenCode, and external ACP CLI versions.
 - `POST /v2/providers/{provider}/upgrade`: Start a single-flight self-update for a managed CLI; active Agent work blocks upgrades.
-- `GET /v2/providers/upgrades/{operationId}`: Read asynchronous CLI upgrade progress and the verified post-update version.
+- `POST /v2/providers/{provider}/install`: Install a missing managed CLI with the vendor's official install script (Unix); shares the upgrade operation, gate and audit trail.
+- `GET /v2/providers/upgrades/{operationId}`: Read asynchronous CLI install/upgrade progress and the verified resulting version.
 - `GET /v2/providers/models?provider=...&workspace=...`: Discover supported models for a provider.
 - `GET /v2/providers/commands?provider=...&workspace=...`: Query slash commands and extensions.
 - `GET /v2/conversations`: List persisted conversations for tenant.
