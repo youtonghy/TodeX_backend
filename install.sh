@@ -238,9 +238,12 @@ stop_daemon() {
 
 start_daemon() {
     info "Starting the daemon"
-    # The binary was just installed deliberately; skip the startup self-update
-    # so a pinned --version is not replaced by the latest release.
-    TODEX_AUTO_UPDATE=0 "$BIN_PATH" daemon start \
+    # The binary was just installed deliberately, so skip the startup self-update.
+    # A pinned --version also keeps the daemon from updating itself in the
+    # background; the latest release still updates once Agents are idle.
+    local skip_update="TODEX_UPDATE_RELAUNCHED=1"
+    if [[ -n "$PIN_VERSION" ]]; then skip_update="TODEX_AUTO_UPDATE=0"; fi
+    env "$skip_update" "$BIN_PATH" daemon start \
         || warn "daemon start failed; check $DATA_DIR/logs/todex-agentd-daemon.log"
 }
 

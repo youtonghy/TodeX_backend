@@ -127,7 +127,7 @@ The script installs `todex-agentd` to `~/.local/bin` (override with `--prefix DI
 ./install.sh uninstall --purge       # also remove the ~/.todex-agent data directory
 ```
 
-When piping from `curl`, pass arguments through `bash -s --`, for example `... | bash -s -- uninstall --purge --yes` (`--purge` needs `--yes` when there is no terminal to confirm). A pinned `--version` stays in place only with `TODEX_AUTO_UPDATE=0`; otherwise `serve`, `tui`, and `daemon start` update to the latest release on launch.
+When piping from `curl`, pass arguments through `bash -s --`, for example `... | bash -s -- uninstall --purge --yes` (`--purge` needs `--yes` when there is no terminal to confirm). A pinned `--version` stays in place only with `TODEX_AUTO_UPDATE=0`; otherwise `serve`, `tui`, and `daemon start` update to the latest release on launch, and a running daemon restarts into a new release once no Agent has run for 5 minutes. Rollback copies older than 30 days are removed automatically.
 
 ### 1. Build the Binary
 

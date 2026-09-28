@@ -436,9 +436,21 @@ curl http://127.0.0.1:7345/health
 Official release packages automatically check `youtonghy/TodeX_backend` on GitHub
 before `serve`, `tui`, or a new `daemon start`. `daemon restart` stops the old daemon
 first, then updates before starting the replacement. An already-running daemon
-returned by `daemon start` is left alone. Updates are installed at these launch
-boundaries; running servers are never periodically restarted and active agent
-turns are never stopped by an update timer.
+returned by `daemon start` is left alone. Updates are installed only at these launch
+boundaries.
+
+A running daemon also checks every 6 hours. When a newer release exists, it waits
+until no Agent has run for 5 continuous minutes: no conversation turn, no local
+Codex adapter, and no Agent start or CLI install/upgrade in progress. It then stops
+itself and launches `daemon start` with the same host, port, data directory, and
+workspace roots, which installs the update before starting the replacement.
+Clients reconnect during the gap, which includes the download. Only a turn started
+in the instant between the final idle check and shutdown can be interrupted, and it
+is recovered as interrupted like after any daemon stop. The handoff's output is appended to the daemon log. If the replacement
+comes back on the old version (for example, the release lacks this platform's
+asset), the daemon does not retry that version until a newer release appears or it
+is restarted manually. Foreground `serve` and `tui` servers are not restarted.
+`TODEX_AUTO_UPDATE=0` in the daemon's environment disables these checks as well.
 
 Eligibility requires **both** the release workflow's `TODEX_RELEASE_BUILD=1`
 compile-time marker and a strict stable `TODEX_BUILD_VERSION=X.Y.Z` other than
@@ -477,8 +489,11 @@ a 10-second deadline; each asset download has a 120-second timeout. Offline star
 may therefore wait up to the metadata timeout. Set the opt-out above when network
 checks must not delay service startup.
 
-The old executable is retained beside the installation as `*.previous-<uuid>`;
-its path is printed when an update installs. Replacement failures restore the old
+The old executable is retained beside the installation as
+`*.previous-<UTC timestamp>-<id>`; its path is printed when an update installs.
+Backups older than 30 days, dated by that timestamp (or by file modification time
+for earlier `*.previous-<uuid>` copies), are removed at each launch and each
+daemon update check. Other files are never touched. Replacement failures restore the old
 file, and immediate process-launch failures restore it as well. If a newer backend
 starts but later fails, stop it, restore that printed backup to the original
 executable filename, and launch with automatic updates disabled. This is a binary
@@ -496,8 +511,9 @@ to `~/.local/bin` (override with `--prefix` or `TODEX_INSTALL_DIR`), and restart
 a running managed daemon. The running daemon is stopped only after the new release
 is verified, the swap takes the same `*.update-lock` as the built-in updater, and
 one rollback copy is kept. The restart skips the startup self-update, but later
-launches still update to the latest release, so set `TODEX_AUTO_UPDATE=0` to stay
-on a version installed with `--version`. `update`, `status`, and `uninstall` cover
+launches and the running daemon still update to the latest release. A daemon the
+script restarts after a `--version` install has automatic updates disabled; set
+`TODEX_AUTO_UPDATE=0` to keep later launches on that version too. `update`, `status`, and `uninstall` cover
 the rest of the lifecycle; `uninstall --purge` also removes the data directory and
 needs `--yes` when no terminal is available to confirm (for example, when piped
 from `curl`). A `data_dir` redirect in that directory's `config.toml` is reported

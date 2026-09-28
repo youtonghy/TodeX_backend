@@ -141,6 +141,14 @@ impl ManagedServer {
         self.handle.is_finished()
     }
 
+    /// No Agent turn or local Codex adapter is running, and nothing holds the
+    /// CLI execution gate (an Agent start in progress or a CLI install/upgrade).
+    pub fn is_agent_idle(&self) -> bool {
+        self.state.cli_execution_gate.try_write().is_ok()
+            && !self.state.conversations.has_active_turns()
+            && !self.state.codex_local_adapters.has_active_adapters()
+    }
+
     pub async fn stop(mut self) -> Result<()> {
         if let Some(task) = self.migration_task.take() {
             task.abort();
@@ -225,6 +233,12 @@ mod tests {
             .await
             .expect("start server");
         assert!(server.addr().port() > 0);
+        assert!(server.is_agent_idle());
+        // An Agent start or CLI upgrade in progress holds the execution gate.
+        let starting = server.state.cli_execution_gate.clone().read_owned().await;
+        assert!(!server.is_agent_idle());
+        drop(starting);
+        assert!(server.is_agent_idle());
         server.stop().await.expect("stop server");
 
         let _ = fs::remove_dir_all(root);

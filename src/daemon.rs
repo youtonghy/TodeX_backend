@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
+use tokio::sync::watch;
+use tokio::time::{sleep, MissedTickBehavior};
 
 use crate::config::Config;
 use crate::server_runner::{ManagedServer, ProviderProcessTracking};
 use crate::transport_crypto::PairingKeys;
+use crate::update;
 
 const PID_FILE_NAME: &str = "daemon.json";
 const LOG_FILE_NAME: &str = "todex-agentd-daemon.log";
@@ -21,6 +23,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 const STOP_FORCE_AFTER: Duration = Duration::from_secs(8);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(200);
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// A found update restarts the daemon only after Agents were idle this long.
+const UPDATE_RESTART_IDLE_AFTER: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonProcess {
@@ -63,37 +68,10 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
     set_owner_only_directory(&log_dir(&config.data_dir))?;
 
     let log_path = log_file_path(&config.data_dir);
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open daemon log {}", log_path.display()))?;
-    set_owner_only_file(&log_path)?;
     let executable = std::env::current_exe().context("failed to resolve current executable")?;
     let mut command = Command::new(&executable);
-    command
-        .arg("daemon-run")
-        .arg("--host")
-        .arg(&config.host)
-        .arg("--port")
-        .arg(config.port.to_string())
-        .arg("--data-dir")
-        .arg(&config.data_dir);
-    for root in &config.workspace_roots {
-        command.arg("--workspace-root").arg(root);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone().with_context(|| {
-            format!("failed to clone daemon log {}", log_path.display())
-        })?))
-        .stderr(Stdio::from(log));
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    command.arg("daemon-run");
+    detach_with_config(&mut command, &config)?;
 
     let mut child = command
         .spawn()
@@ -124,6 +102,41 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
 
         sleep(STATUS_POLL_INTERVAL).await;
     }
+}
+
+/// Adds the resolved configuration, sends output to the daemon log, and puts
+/// the child in its own process group so it outlives its parent.
+fn detach_with_config(command: &mut Command, config: &Config) -> Result<()> {
+    let log_path = log_file_path(&config.data_dir);
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open daemon log {}", log_path.display()))?;
+    set_owner_only_file(&log_path)?;
+    command
+        .arg("--host")
+        .arg(&config.host)
+        .arg("--port")
+        .arg(config.port.to_string())
+        .arg("--data-dir")
+        .arg(&config.data_dir);
+    for root in &config.workspace_roots {
+        command.arg("--workspace-root").arg(root);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().with_context(|| {
+            format!("failed to clone daemon log {}", log_path.display())
+        })?))
+        .stderr(Stdio::from(log));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    Ok(())
 }
 
 fn reap_daemon_child(mut child: Child) {
@@ -231,10 +244,12 @@ pub fn status(config: &Config) -> Result<Option<DaemonProcess>> {
 pub async fn run(config: Config) -> Result<()> {
     let server = ManagedServer::start(config, ProviderProcessTracking::Enabled).await?;
     let process = write_pid_file(server.config(), server.addr().port())?;
-    let _guard = PidFileGuard {
+    let pid_file = PidFileGuard {
         data_dir: server.config().data_dir.clone(),
         pid: process.pid,
     };
+    let mut restart_config = server.config().clone();
+    restart_config.port = process.port;
 
     tracing::info!(
         pid = process.pid,
@@ -243,7 +258,75 @@ pub async fn run(config: Config) -> Result<()> {
         "todex-agentd daemon ready"
     );
 
-    wait_for_shutdown_or_server_exit(server).await
+    let (update_tx, update_rx) = watch::channel(None);
+    let update_checks = update::enabled().then(|| tokio::spawn(watch_for_updates(update_tx)));
+    let result = wait_for_shutdown_or_server_exit(server, update_rx).await;
+    if let Some(checks) = update_checks {
+        checks.abort();
+    }
+    let Some(version) = result? else {
+        return Ok(());
+    };
+    // Remove the pid file first, so the replacement's `daemon start` does not
+    // find this daemon and return it as already running.
+    drop(pid_file);
+    spawn_update_restart(&restart_config, &version)
+}
+
+async fn watch_for_updates(available: watch::Sender<Option<String>>) {
+    let mut checks = tokio::time::interval_at(
+        tokio::time::Instant::now() + UPDATE_CHECK_INTERVAL,
+        UPDATE_CHECK_INTERVAL,
+    );
+    // After sleep or suspend, check once instead of catching up.
+    checks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        checks.tick().await;
+        if let Some(version) = update::check_for_daemon().await {
+            tracing::info!(
+                version,
+                idle_minutes = UPDATE_RESTART_IDLE_AFTER.as_secs() / 60,
+                "backend update available; restarting once no Agent has run for the idle period"
+            );
+            available.send_replace(Some(version));
+        }
+    }
+}
+
+/// Starts the replacement through `daemon start`, which installs the update
+/// before launching it. Startup failures land in the daemon log.
+fn spawn_update_restart(config: &Config, version: &str) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to resolve current executable")?;
+    let mut command = Command::new(&executable);
+    command.arg("daemon").arg("start");
+    detach_with_config(&mut command, config)?;
+    update::prepare_handoff(&mut command, version);
+    let child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn update restart {}", executable.display()))?;
+    tracing::info!(
+        pid = child.id(),
+        version,
+        log = %log_file_path(&config.data_dir).display(),
+        "daemon stopped for update; replacement is starting"
+    );
+    Ok(())
+}
+
+/// Measures how long the daemon has continuously had no Agent work.
+#[derive(Debug, Default)]
+struct IdleTimer {
+    since: Option<Instant>,
+}
+
+impl IdleTimer {
+    fn observe(&mut self, idle: bool, now: Instant) -> Duration {
+        if !idle {
+            self.since = None;
+            return Duration::ZERO;
+        }
+        now.saturating_duration_since(*self.since.get_or_insert(now))
+    }
 }
 
 pub async fn pairing_qr_payloads(config: &Config, port: u16) -> Result<Vec<String>> {
@@ -357,19 +440,41 @@ fn set_owner_only_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn wait_for_shutdown_or_server_exit(server: ManagedServer) -> Result<()> {
+/// Serves until shutdown. Returns the release to restart into once one is
+/// available and no Agent has run for `UPDATE_RESTART_IDLE_AFTER`.
+async fn wait_for_shutdown_or_server_exit(
+    server: ManagedServer,
+    update: watch::Receiver<Option<String>>,
+) -> Result<Option<String>> {
+    let mut idle = IdleTimer::default();
     loop {
         if server.is_finished() {
-            return server.wait().await;
+            server.wait().await?;
+            return Ok(None);
         }
 
         tokio::select! {
             signal = shutdown_signal() => {
                 signal?;
-                return server.stop().await;
+                server.stop().await?;
+                return Ok(None);
             }
             _ = sleep(STATUS_POLL_INTERVAL) => {}
         }
+
+        let idle_for = idle.observe(server.is_agent_idle(), Instant::now());
+        if idle_for < UPDATE_RESTART_IDLE_AFTER {
+            continue;
+        }
+        let Some(version) = update.borrow().clone() else {
+            continue;
+        };
+        tracing::info!(
+            version,
+            "no Agent is running; stopping the daemon to install the update"
+        );
+        server.stop().await?;
+        return Ok(Some(version));
     }
 }
 
@@ -743,12 +848,34 @@ mod tests {
     use super::process_has_exited;
     use super::{
         pid_file_path, port_is_listening, process_is_running, process_matches_record, status,
-        DaemonProcess,
+        DaemonProcess, IdleTimer, UPDATE_RESTART_IDLE_AFTER,
     };
     #[cfg(unix)]
     use super::{process_liveness, ProcessLiveness};
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use chrono::Utc;
+    use std::time::Instant;
+
+    #[test]
+    fn idle_timer_restarts_whenever_an_agent_runs() {
+        let start = Instant::now();
+        let mut idle = IdleTimer::default();
+        assert_eq!(idle.observe(true, start), Duration::ZERO);
+        assert_eq!(
+            idle.observe(true, start + UPDATE_RESTART_IDLE_AFTER),
+            UPDATE_RESTART_IDLE_AFTER
+        );
+        assert_eq!(
+            idle.observe(false, start + Duration::from_secs(301)),
+            Duration::ZERO
+        );
+        let resumed = start + Duration::from_secs(302);
+        assert_eq!(idle.observe(true, resumed), Duration::ZERO);
+        assert_eq!(
+            idle.observe(true, resumed + Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+    }
 
     #[test]
     fn port_preflight_detects_an_existing_listener() {

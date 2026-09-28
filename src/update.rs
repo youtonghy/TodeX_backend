@@ -1,8 +1,9 @@
-//! Updates are performed before serving, so no in-flight agent work is interrupted.
+//! Updates are installed only at launch, so no in-flight agent work is interrupted.
+//! A running daemon checks periodically and restarts itself once Agents are idle.
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,12 @@ use sha2::{Digest, Sha256};
 
 const REPOSITORY: &str = "youtonghy/TodeX_backend";
 const MAX_BINARY: usize = 256 * 1024 * 1024;
+const RELAUNCHED_ENV: &str = "TODEX_UPDATE_RELAUNCHED";
+/// Set by an idle daemon on the launch that replaces it. The replacement
+/// inherits it, so it can tell that this version already failed to install.
+const HANDOFF_ENV: &str = "TODEX_UPDATE_HANDOFF_VERSION";
+/// Rollback copies are removed once they are older than this.
+const BACKUP_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 #[derive(Debug, Deserialize)]
 struct Release {
@@ -74,6 +81,11 @@ pub fn enabled() -> bool {
     option_env!("TODEX_RELEASE_BUILD") == Some("1")
         && eligible_version(crate::version::APP_VERSION)
         && platform().is_some()
+}
+
+/// Automatic updates at launch and in a running daemon; `update` stays manual.
+pub fn auto_update_enabled() -> bool {
+    enabled() && std::env::var("TODEX_AUTO_UPDATE").as_deref() != Ok("0")
 }
 
 fn asset_url<'a>(release: &'a Release, name: &str) -> Result<&'a str> {
@@ -165,7 +177,13 @@ async fn install(
             bail!("downloaded executable version validation failed");
         }
     }
-    let backup = executable.with_extension(format!("previous-{}", uuid::Uuid::new_v4()));
+    // Same `previous-<UTC timestamp>-<id>` form as install.sh, so pruning can
+    // date the copy by name; hard links and renames keep the old mtime.
+    let backup = executable.with_extension(format!(
+        "previous-{}-{}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S"),
+        uuid::Uuid::new_v4()
+    ));
     #[cfg(unix)]
     {
         // Preserve the old inode, then atomically replace the installed name.
@@ -258,12 +276,123 @@ fn restore_backup(backup: &Path, executable: &Path) -> Result<()> {
     fs::rename(backup, executable).context("cannot restore previous executable")
 }
 
+/// When the backup was made: from the timestamp in its name, or for the
+/// older `previous-<uuid>` form, its modification time. `None` for files this
+/// updater did not name, which are never removed.
+fn backup_created_at(suffix: &str, modified: Option<SystemTime>) -> Option<SystemTime> {
+    if let Some((stamp, id)) = suffix.split_once('-') {
+        if stamp.len() == 14 && !id.is_empty() && stamp.bytes().all(|c| c.is_ascii_digit()) {
+            let time = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d%H%M%S").ok()?;
+            return Some(time.and_utc().into());
+        }
+    }
+    uuid::Uuid::parse_str(suffix).ok().and(modified)
+}
+
+fn prune_backups_in(executable: &Path, now: SystemTime) -> Result<usize> {
+    let stem = executable
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .context("executable name is not valid UTF-8")?;
+    let prefix = format!("{stem}.previous-");
+    let directory = executable
+        .parent()
+        .context("executable has no parent directory")?;
+    let mut removed = 0;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+            continue;
+        };
+        // Symlinks and directories are never rollback copies.
+        let metadata = match entry.metadata() {
+            Ok(metadata) if metadata.is_file() && path != executable => metadata,
+            Ok(_) => continue,
+            Err(error) => {
+                eprintln!("Cannot inspect backend backup {}: {error}", path.display());
+                continue;
+            }
+        };
+        let Some(created) = backup_created_at(suffix, metadata.modified().ok()) else {
+            continue;
+        };
+        if now
+            .duration_since(created)
+            .is_ok_and(|age| age > BACKUP_RETENTION)
+        {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    eprintln!(
+                        "Removed backend backup older than 30 days: {}",
+                        path.display()
+                    );
+                    removed += 1;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Cannot remove old backend backup {}: {error}",
+                        path.display()
+                    )
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Removes rollback copies beside the executable once they exceed the
+/// retention period. Failures are reported and retried at the next pass.
+pub fn prune_backups() {
+    if !enabled() {
+        return;
+    }
+    let result = std::env::current_exe()
+        .context("cannot resolve the current executable")
+        .and_then(|executable| prune_backups_in(&executable, SystemTime::now()));
+    if let Err(error) = result {
+        eprintln!("Old backend backups were not pruned: {error:#}");
+    }
+}
+
+/// Periodic check from a running daemon: the release to restart into, or
+/// `None` when there is nothing new to install.
+pub async fn check_for_daemon() -> Option<String> {
+    prune_backups();
+    if !auto_update_enabled() {
+        return None;
+    }
+    let status = match run(true).await {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("Backend update check failed; retrying later: {error:#}");
+            return None;
+        }
+    };
+    let latest = status.latest_version.filter(|_| status.update_available)?;
+    if std::env::var(HANDOFF_ENV).as_deref() == Ok(latest.as_str()) {
+        // The restart meant to install this version came back unchanged
+        // (see its startup log); restarting again would fail the same way.
+        eprintln!(
+            "Backend {latest} did not install on the last restart; staying on {} until a newer release or a manual restart",
+            status.current_version
+        );
+        return None;
+    }
+    Some(latest)
+}
+
+/// Marks `command` as the fresh launch that replaces an idle daemon, so its
+/// startup update runs even if this daemon was itself a relaunch.
+pub fn prepare_handoff(command: &mut std::process::Command, version: &str) {
+    command.env_remove(RELAUNCHED_ENV).env(HANDOFF_ENV, version);
+}
+
 /// Called only at an explicit service launch, never from a running server.
 pub async fn before_start() -> Result<()> {
-    if !enabled()
-        || std::env::var("TODEX_AUTO_UPDATE").as_deref() == Ok("0")
-        || std::env::var_os("TODEX_UPDATE_RELAUNCHED").is_some()
-    {
+    prune_backups();
+    if !auto_update_enabled() || std::env::var_os(RELAUNCHED_ENV).is_some() {
         return Ok(());
     }
     match run(false).await {
@@ -271,7 +400,7 @@ pub async fn before_start() -> Result<()> {
             let mut command = std::process::Command::new(status.executable.as_deref().unwrap());
             command
                 .args(std::env::args_os().skip(1))
-                .env("TODEX_UPDATE_RELAUNCHED", "1");
+                .env(RELAUNCHED_ENV, "1");
             #[cfg(unix)]
             {
                 use std::os::unix::process::CommandExt;
@@ -354,6 +483,67 @@ mod tests {
         assert!(asset_url(&release, "binary").is_err());
     }
 
+    #[test]
+    fn backup_age_comes_from_its_name_or_legacy_mtime() {
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let stamped = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        // Built-in updater and install.sh (`<timestamp>-<pid>`) names.
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            backup_created_at(&format!("20260920T{id}"), Some(mtime)),
+            None
+        );
+        assert_eq!(
+            backup_created_at(&format!("20260921141320-{id}"), Some(mtime)),
+            Some(stamped)
+        );
+        assert_eq!(
+            backup_created_at("20260921141320-4242", None),
+            Some(stamped)
+        );
+        // Earlier builds named copies `previous-<uuid>` only.
+        assert_eq!(backup_created_at(&id.to_string(), Some(mtime)), Some(mtime));
+        assert_eq!(backup_created_at("manual-copy", Some(mtime)), None);
+        assert_eq!(backup_created_at("20269999999999-1", Some(mtime)), None);
+    }
+
+    #[test]
+    fn pruning_removes_only_expired_rollback_copies() {
+        let dir = std::env::temp_dir().join(format!("todex-prune-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let exe = dir.join("todex-agentd.exe");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let legacy_expired = dir.join(format!("todex-agentd.previous-{}", uuid::Uuid::new_v4()));
+        let kept = [
+            exe.clone(),
+            dir.join("todex-agentd.previous-20260901000000-1"),
+            dir.join("todex-agentd.previous-notes"),
+            dir.join("other.previous-20200101000000-1"),
+        ];
+        let expired = [
+            dir.join("todex-agentd.previous-20260801000000-1"),
+            legacy_expired.clone(),
+        ];
+        for path in kept.iter().chain(&expired) {
+            fs::write(path, b"binary").unwrap();
+        }
+        fs::create_dir(dir.join("todex-agentd.previous-20200101000000-dir")).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&legacy_expired)
+            .unwrap()
+            .set_modified(now - BACKUP_RETENTION - Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(prune_backups_in(&exe, now).unwrap(), 2);
+        assert!(kept.iter().all(|path| path.exists()));
+        assert!(expired.iter().all(|path| !path.exists()));
+        assert!(dir
+            .join("todex-agentd.previous-20200101000000-dir")
+            .is_dir());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn installation_preserves_backup_and_refuses_concurrent_update() {
         let dir = std::env::temp_dir().join(format!("todex-update-test-{}", uuid::Uuid::new_v4()));
@@ -361,6 +551,8 @@ mod tests {
         let exe = dir.join("agent");
         fs::write(&exe, b"old").unwrap();
         let backup = install(&exe, b"new", None).await.unwrap();
+        let suffix = backup.file_name().unwrap().to_str().unwrap();
+        assert!(backup_created_at(suffix.strip_prefix("agent.previous-").unwrap(), None).is_some());
         assert_eq!(fs::read(&exe).unwrap(), b"new");
         assert_eq!(fs::read(backup).unwrap(), b"old");
         assert!(install(&exe, b"not an executable", Some("1.2.3"))
