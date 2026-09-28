@@ -7,6 +7,7 @@ mod v2;
 pub(crate) mod websocket;
 
 use std::net::IpAddr;
+use std::time::Duration;
 
 use axum::Router;
 use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
@@ -43,11 +44,18 @@ fn compression_layer() -> CompressionLayer<impl Predicate> {
     )
 }
 
+/// Clients sign every request with custom `x-todex-*` headers, so each
+/// cross-origin call needs a preflight. Without a max-age browsers re-send the
+/// preflight almost every time (Chromium keeps it for 5s), doubling the load on
+/// their six-connection-per-host pool. Chromium caps the cache at two hours.
+const CORS_PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(2 * 60 * 60);
+
 fn cors_layer(host: &str) -> CorsLayer {
+    let layer = CorsLayer::permissive().max_age(CORS_PREFLIGHT_MAX_AGE);
     if is_loopback_host(host) {
-        CorsLayer::permissive().allow_private_network(true)
+        layer.allow_private_network(true)
     } else {
-        CorsLayer::permissive()
+        layer
     }
 }
 
@@ -62,7 +70,32 @@ fn is_loopback_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_host;
+    use super::{cors_layer, is_loopback_host};
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn signed_request_preflights_are_cacheable() {
+        let app = Router::new()
+            .route("/v2/providers/models", get(|| async { "ok" }))
+            .layer(cors_layer("127.0.0.1"));
+        let response = app
+            .oneshot(
+                Request::options("/v2/providers/models")
+                    .header("origin", "http://localhost:5173")
+                    .header("access-control-request-method", "GET")
+                    .header("access-control-request-headers", "x-todex-auth-sig")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()["access-control-max-age"],
+            "7200",
+            "preflights must not be re-sent for every signed request"
+        );
+    }
 
     #[test]
     fn recognizes_loopback_hosts_for_private_network_cors() {
