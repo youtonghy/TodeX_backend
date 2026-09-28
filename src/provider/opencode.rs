@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -12,6 +12,7 @@ use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{run_acp_turn_controlled, AcpConnectionState, AcpRuntimeOptions};
+use super::devin::DiscoverySnapshot;
 use super::process::{executable_available, redact_sensitive_text, CommandSpec, JsonLineProcess};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
@@ -24,11 +25,16 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_DRAIN: Duration = Duration::from_millis(1500);
+/// A cold probe spends ~0.5s spawning `opencode acp`, 3-6s in `session/new`
+/// (provider catalogs load there) and up to `COMMAND_DRAIN` waiting for the
+/// command list; the per-model effort sweep itself answers in milliseconds.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct OpencodeDriver {
     binary: String,
     env_allowlist: Vec<String>,
     sessions: Mutex<HashMap<String, OpencodeSessionHandle>>,
+    discovery: Mutex<HashMap<PathBuf, DiscoverySnapshot>>,
 }
 
 #[derive(Clone)]
@@ -55,6 +61,7 @@ impl OpencodeDriver {
             binary: config.opencode_bin.clone(),
             env_allowlist: config.opencode_env_allowlist.clone(),
             sessions: Mutex::new(HashMap::new()),
+            discovery: Mutex::new(HashMap::new()),
         }
     }
 
@@ -138,6 +145,100 @@ impl OpencodeDriver {
             }
         }
     }
+
+    /// One probe yields both catalogs. Clients ask for models and commands
+    /// together, so sharing a cached probe per workspace turns two 4-8s cold
+    /// spawns into one; the lock makes the second query wait for the first.
+    async fn discovery_snapshot(&self, workspace: &Path) -> Result<DiscoverySnapshot, AppError> {
+        let mut cache = self.discovery.lock().await;
+        if let Some(snapshot) = cache.get(workspace).filter(|snapshot| snapshot.is_fresh()) {
+            return Ok(snapshot.clone());
+        }
+        let (mut process, session, updates) = self.session_probe(workspace).await?;
+        let mut models = super::devin::parse_devin_models(&session);
+        let complete = probe_efforts(&mut process, &session, &mut models).await;
+        close_probe_session(&mut process, &session).await;
+        process.terminate().await;
+        let commands = updates
+            .iter()
+            .rev()
+            .find_map(|update| {
+                update
+                    .pointer("/update/availableCommands")
+                    .filter(|commands| commands.is_array())
+                    .cloned()
+            })
+            .map(|commands| {
+                super::grok::parse_commands(&json!({ "_meta": { "availableCommands": commands } }))
+            })
+            .unwrap_or_default();
+        let snapshot = DiscoverySnapshot {
+            fetched_at: Instant::now(),
+            models,
+            commands,
+            complete,
+        };
+        cache.insert(workspace.to_path_buf(), snapshot.clone());
+        Ok(snapshot)
+    }
+}
+
+/// OpenCode only exposes an `effort` config option for the currently selected
+/// model, so each model is selected once to learn its effort levels. Returns
+/// whether every model answered.
+async fn probe_efforts(
+    process: &mut JsonLineProcess,
+    session: &Value,
+    models: &mut [ProviderModelDescriptor],
+) -> bool {
+    let session_id = session
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut complete = true;
+    for model in models {
+        let response = control_request(
+            process,
+            "probe:model",
+            "session/set_config_option",
+            json!({"sessionId": session_id, "configId": "model", "value": model.id}),
+            CONTROL_TIMEOUT,
+        )
+        .await;
+        let Ok(response) = response else {
+            complete = false;
+            continue;
+        };
+        let Some(effort) = response
+            .get("configOptions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|option| option.get("id").and_then(Value::as_str) == Some("effort"))
+        else {
+            continue;
+        };
+        model.supported_reasoning_efforts = effort
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|option| {
+                        option
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        model.default_reasoning_effort = effort
+            .get("currentValue")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+    complete
 }
 
 /// Best-effort close for a probe session; failures are ignored because the
@@ -327,86 +428,22 @@ impl ProviderDriver for OpencodeDriver {
         result
     }
 
+    fn discovery_timeout(&self) -> Duration {
+        DISCOVERY_TIMEOUT
+    }
+
     async fn discover_models(
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
-        let (mut process, session, _updates) = self.session_probe(workspace).await?;
-        let result = async {
-            let mut models = super::devin::parse_devin_models(&session);
-            let session_id = session
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            // OpenCode only exposes an `effort` config option for the currently
-            // selected model, so probe each model to learn its effort levels.
-            for model in &mut models {
-                let response = control_request(
-                    &mut process,
-                    "probe:model",
-                    "session/set_config_option",
-                    json!({"sessionId": session_id, "configId": "model", "value": model.id}),
-                    CONTROL_TIMEOUT,
-                )
-                .await;
-                let Ok(response) = response else {
-                    continue;
-                };
-                let Some(effort) = response
-                    .get("configOptions")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .find(|option| option.get("id").and_then(Value::as_str) == Some("effort"))
-                else {
-                    continue;
-                };
-                model.supported_reasoning_efforts = effort
-                    .get("options")
-                    .and_then(Value::as_array)
-                    .map(|options| {
-                        options
-                            .iter()
-                            .filter_map(|option| {
-                                option
-                                    .get("value")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                model.default_reasoning_effort = effort
-                    .get("currentValue")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-            }
-            Ok(models)
-        }
-        .await;
-        close_probe_session(&mut process, &session).await;
-        process.terminate().await;
-        result
+        Ok(self.discovery_snapshot(workspace).await?.models)
     }
 
     async fn discover_commands(
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
-        let (mut process, session, updates) = self.session_probe(workspace).await?;
-        close_probe_session(&mut process, &session).await;
-        process.terminate().await;
-        let commands = updates.iter().rev().find_map(|update| {
-            update
-                .pointer("/update/availableCommands")
-                .filter(|commands| commands.is_array())
-                .cloned()
-        });
-        Ok(commands
-            .map(|commands| {
-                super::grok::parse_commands(&json!({ "_meta": { "availableCommands": commands } }))
-            })
-            .unwrap_or_default())
+        Ok(self.discovery_snapshot(workspace).await?.commands)
     }
 
     async fn run_turn(
@@ -733,6 +770,7 @@ mod tests {
                 binary: binary.to_string_lossy().to_string(),
                 env_allowlist: vec![],
                 sessions: Mutex::new(HashMap::new()),
+                discovery: Mutex::new(HashMap::new()),
             });
             let store = crate::conversation::ConversationStore::new(root.join("data"))
                 .await
@@ -1114,10 +1152,18 @@ mod tests {
             .unwrap();
         assert_eq!(commands[0].name, "project:review");
         assert_eq!(commands[0].description, "Project plugin");
-        assert!(fixture
-            .requests()
+        let requests = fixture.requests();
+        assert!(requests
             .iter()
             .any(|request| request["method"] == "session/close"));
+        // Both catalogs come from one cached probe process.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "initialize")
+                .count(),
+            1
+        );
         fixture.finish().await;
     }
 

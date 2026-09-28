@@ -30,6 +30,10 @@ const COMMAND_DRAIN: Duration = Duration::from_millis(1500);
 /// Model/command discovery spawns an authenticated probe process; cache it so
 /// routine client refreshes do not re-authenticate on every query.
 const DISCOVERY_TTL: Duration = Duration::from_secs(300);
+/// A sweep cut short by its budget is still cached briefly: re-probing on every
+/// query made each request pay the full ~17s probe under load, while a short
+/// lifetime still lets a later query fill in the missing thinking levels.
+const PARTIAL_DISCOVERY_TTL: Duration = Duration::from_secs(60);
 /// Concurrent probe sessions for the per-model `thought_level` sweep. `devin
 /// acp` serves config requests on different sessions in parallel: a 95-model
 /// catalog takes ~18s one model at a time and ~4s across eight sessions.
@@ -40,11 +44,26 @@ const THOUGHT_LEVEL_PROBE_BUDGET: Duration = Duration::from_secs(15);
 /// Probe sessions are deleted best-effort right before the process exits.
 const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// One ACP discovery probe yields both the model and the command catalog, so
+/// ACP drivers cache them together per workspace.
 #[derive(Clone)]
-struct DiscoverySnapshot {
-    fetched_at: Instant,
-    models: Vec<ProviderModelDescriptor>,
-    commands: Vec<ProviderCommandDescriptor>,
+pub(super) struct DiscoverySnapshot {
+    pub(super) fetched_at: Instant,
+    pub(super) models: Vec<ProviderModelDescriptor>,
+    pub(super) commands: Vec<ProviderCommandDescriptor>,
+    /// Whether every per-model option probe answered.
+    pub(super) complete: bool,
+}
+
+impl DiscoverySnapshot {
+    pub(super) fn is_fresh(&self) -> bool {
+        let ttl = if self.complete {
+            DISCOVERY_TTL
+        } else {
+            PARTIAL_DISCOVERY_TTL
+        };
+        self.fetched_at.elapsed() < ttl
+    }
 }
 
 pub struct DevinDriver {
@@ -275,10 +294,8 @@ impl DevinDriver {
     /// spawn (and a single interactive authentication when no key is set).
     async fn discovery_snapshot(&self, workspace: &Path) -> Result<DiscoverySnapshot, AppError> {
         let mut cache = self.discovery.lock().await;
-        if let Some(snapshot) = cache.get(workspace) {
-            if snapshot.fetched_at.elapsed() < DISCOVERY_TTL {
-                return Ok(snapshot.clone());
-            }
+        if let Some(snapshot) = cache.get(workspace).filter(|snapshot| snapshot.is_fresh()) {
+            return Ok(snapshot.clone());
         }
         let (mut process, session, updates) = self.session_probe(workspace).await?;
         let mut models = parse_devin_models(&session);
@@ -297,12 +314,9 @@ impl DevinDriver {
             fetched_at: Instant::now(),
             models,
             commands: parse_devin_commands(&updates),
+            complete,
         };
-        // A sweep cut short by its budget is served but not cached, so the next
-        // query fills in the missing thinking levels.
-        if complete {
-            cache.insert(workspace.to_path_buf(), snapshot.clone());
-        }
+        cache.insert(workspace.to_path_buf(), snapshot.clone());
         Ok(snapshot)
     }
 }
@@ -1327,6 +1341,7 @@ mod tests {
                 image_input: None,
             }],
             commands: Vec::new(),
+            complete: false,
         };
         driver
             .discovery
@@ -1336,6 +1351,21 @@ mod tests {
         let models = driver.discover_models(&workspace).await.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "swe-2-high");
+    }
+
+    #[test]
+    fn partial_discovery_expires_before_complete_discovery() {
+        let Some(fetched_at) = Instant::now().checked_sub(PARTIAL_DISCOVERY_TTL * 2) else {
+            return;
+        };
+        let snapshot = |complete| DiscoverySnapshot {
+            fetched_at,
+            models: Vec::new(),
+            commands: Vec::new(),
+            complete,
+        };
+        assert!(!snapshot(false).is_fresh());
+        assert!(snapshot(true).is_fresh());
     }
 
     #[test]
