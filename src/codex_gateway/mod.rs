@@ -3832,9 +3832,13 @@ impl CodexGatewayStore {
             .append(true)
             .open(dir.join("events.jsonl"))
             .await?;
-        let line = serde_json::to_string(&record)?;
-        file.write_all(line.as_bytes()).await?;
-        file.write_all(b"\n").await?;
+        let mut line = serde_json::to_vec(&record)?;
+        line.push(b'\n');
+        file.write_all(&line).await?;
+        // `tokio::fs::File` finishes writes on the blocking pool; without the
+        // flush a write could still be pending after the lock is released and
+        // the next append could land before it.
+        file.flush().await?;
         state.apply(&record);
         self.save_session_state(&state).await?;
         drop(lock);
