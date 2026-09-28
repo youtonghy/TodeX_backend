@@ -39,6 +39,8 @@ Reference: [Official model guidance — prompting best practices](https://develo
 
 ## Git delivery
 
+- Do every complex task (anything beyond a simple, localized fix) in a dedicated Git worktree on its own branch, not in the main checkout, which may hold the user's uncommitted work. Give the worktree its own `CARGO_TARGET_DIR`; seeding it with an APFS clone (`cp -cR target/debug <dir>/debug`) keeps the first build incremental.
+- Hand the result back locally: bring the branch into the main checkout (fast-forward or cherry-pick) without modifying the user's uncommitted changes, rerun the relevant checks there, then remove the worktree, its branch, and its target directory.
 - After completing each task, create one or more Git commits for the changes made in that task.
 - Group commits by change category or repository responsibility when the task includes unrelated changes.
 - Run the relevant validation commands before committing whenever practical, and mention any validation that could not be run.
