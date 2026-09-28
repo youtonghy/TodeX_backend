@@ -841,7 +841,7 @@ async fn repository_metadata_roots(
         {
             return Err(AppError::WorkspacePathOutsideRoot);
         }
-        if path != canonical {
+        if !is_canonical_git_path(&path, &canonical) {
             return Err(AppError::InvalidRequest(
                 "Git metadata paths cannot contain symbolic links".to_owned(),
             ));
@@ -1001,6 +1001,31 @@ fn parse_repository_root(
         return Err(AppError::GitRepositoryNotFound);
     }
     Ok(Some(canonical))
+}
+
+/// Whether a path Git printed is already `canonical`, i.e. resolving it
+/// followed no symbolic link.
+#[cfg(not(windows))]
+fn is_canonical_git_path(reported: &Path, canonical: &Path) -> bool {
+    reported == canonical
+}
+
+/// Windows canonical paths carry a `\\?\` verbatim prefix and Git prints
+/// `/` separators, so both are normalized before comparing. Nothing is
+/// resolved and case still matters: a path through a link still differs.
+#[cfg(windows)]
+fn is_canonical_git_path(reported: &Path, canonical: &Path) -> bool {
+    fn plain(path: &Path) -> Option<String> {
+        let path = path.to_str()?.replace('/', "\\");
+        Some(if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
+            format!("\\\\{rest}")
+        } else if let Some(rest) = path.strip_prefix("\\\\?\\") {
+            rest.to_owned()
+        } else {
+            path
+        })
+    }
+    matches!((plain(reported), plain(canonical)), (Some(a), Some(b)) if a == b)
 }
 
 fn parse_git_path_output(bytes: &[u8]) -> Result<PathBuf> {
@@ -1474,6 +1499,26 @@ mod tests {
         assert!(response.repositories[0].initial_eligible);
         assert_eq!(response.repositories[0].branch, "UNINITIALIZED");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_git_path_ignores_verbatim_prefix_and_separators() {
+        let canonical = Path::new(r"\\?\C:\Users\me\repo\.git");
+        assert!(is_canonical_git_path(
+            Path::new("C:/Users/me/repo/.git"),
+            canonical
+        ));
+        assert!(is_canonical_git_path(canonical, canonical));
+        assert!(is_canonical_git_path(
+            Path::new("//server/share/repo/.git"),
+            Path::new(r"\\?\UNC\server\share\repo\.git")
+        ));
+        // A reported path that only resolves to the canonical one via a link.
+        assert!(!is_canonical_git_path(
+            Path::new("C:/Users/me/link/.git"),
+            canonical
+        ));
     }
 
     #[tokio::test]
