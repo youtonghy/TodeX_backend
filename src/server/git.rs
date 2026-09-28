@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::{stream, StreamExt};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, Command},
@@ -37,6 +38,13 @@ pub(crate) const GIT_COMMAND_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
 const GIT_SCAN_DEPTH: usize = 2;
 const GIT_SCAN_CANDIDATE_LIMIT: usize = 512;
+/// Candidate `rev-parse` probes are independent and short, so a workspace with
+/// hundreds of directories resolves in parallel instead of one git spawn at a
+/// time.
+const GIT_SCAN_PROBE_CONCURRENCY: usize = 8;
+/// Repository summaries are independent read-only status/diff runs; a scan
+/// then waits for its slowest repository instead of the sum of all of them.
+const GIT_SCAN_SUMMARY_CONCURRENCY: usize = 4;
 const GIT_STATUS_FILE_LIMIT: usize = 2_000;
 const GIT_UNTRACKED_FILE_LIMIT: u64 = 4 * 1024 * 1024;
 const GIT_UNTRACKED_TOTAL_LIMIT: u64 = 32 * 1024 * 1024;
@@ -320,9 +328,21 @@ async fn scan_inner(
     let candidates = collect_candidates(&workspace).await?;
     let mut repository_roots = HashSet::new();
 
-    for candidate in candidates {
-        let args = git_args(&["rev-parse", "--show-toplevel"]);
-        let output = run_git_command(&candidate, &args, "git rev-parse --show-toplevel").await?;
+    // Probes own their inputs: borrowed async closures trip the higher-ranked
+    // `Send` check on the HTTP handler future.
+    let args = git_args(&["rev-parse", "--show-toplevel"]);
+    let mut probes = stream::iter(candidates)
+        .map(|candidate| {
+            let args = args.clone();
+            async move {
+                let output =
+                    run_git_command(&candidate, &args, "git rev-parse --show-toplevel").await;
+                (candidate, output)
+            }
+        })
+        .buffered(GIT_SCAN_PROBE_CONCURRENCY);
+    while let Some((candidate, output)) = probes.next().await {
+        let output = output?;
         if !output.status.success() {
             continue;
         }
@@ -336,8 +356,17 @@ async fn scan_inner(
     let mut repository_roots: Vec<_> = repository_roots.into_iter().collect();
     repository_roots.sort();
     let mut repositories = Vec::with_capacity(repository_roots.len() + 1);
-    for repository in repository_roots {
-        match summarize_repository(&configured_roots, &repository).await {
+    let mut summaries = stream::iter(repository_roots)
+        .map(|repository| {
+            let configured_roots = configured_roots.clone();
+            async move {
+                let summary = summarize_repository(&configured_roots, &repository).await;
+                (repository, summary)
+            }
+        })
+        .buffered(GIT_SCAN_SUMMARY_CONCURRENCY);
+    while let Some((repository, summary)) = summaries.next().await {
+        match summary {
             Ok(summary) => repositories.push(summary),
             Err(error) if should_propagate_scan_error(&error) => return Err(error),
             Err(error) => repositories.push(summary_error(&repository, error)),
@@ -1274,12 +1303,14 @@ async fn count_untracked_lines(repository: &Path, paths: &[PathBuf]) -> Result<u
     Ok(additions)
 }
 
+/// Output limits are a property of one repository (for example a nested
+/// Chromium checkout with millions of untracked paths), so they are reported
+/// on that repository's summary instead of failing the whole scan.
 fn should_propagate_scan_error(error: &AppError) -> bool {
     matches!(
         error,
         AppError::GitUnavailable
             | AppError::GitCommandTimedOut(_)
-            | AppError::GitOutputLimitExceeded(_)
             | AppError::GitProcess(_)
             | AppError::WorkspacePathOutsideRoot
     )
@@ -1442,6 +1473,44 @@ mod tests {
         assert_eq!(response.repositories.len(), 1);
         assert!(response.repositories[0].initial_eligible);
         assert_eq!(response.repositories[0].branch, "UNINITIALIZED");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn scan_reports_oversized_repository_without_failing() {
+        let root = temp_dir("todex-git-scan-oversized");
+        let workspace = root.join("workspace");
+        let repository = workspace.join("huge");
+        // ~700-byte relative paths make a few thousand untracked files exceed
+        // the 4 MiB status output limit without a slow fixture.
+        let mut nested = repository.clone();
+        for index in 0..7 {
+            nested = nested.join(format!("{index}{}", "d".repeat(98)));
+        }
+        fs::create_dir_all(&nested).expect("nested directories");
+        for index in 0..6_500 {
+            fs::write(nested.join(format!("f{index}")), "").expect("untracked file");
+        }
+        let initialized = std::process::Command::new("git")
+            .args(["-C", repository.to_str().unwrap(), "init", "-q"])
+            .status()
+            .expect("git init");
+        assert!(initialized.success());
+
+        let response = scan(std::slice::from_ref(&root), &workspace)
+            .await
+            .expect("an oversized repository must not fail the scan");
+        let repository = repository.canonicalize().expect("canonical repository");
+        let summary = response
+            .repositories
+            .iter()
+            .find(|summary| summary.path == repository.display().to_string())
+            .expect("oversized repository summary");
+        assert_eq!(summary.branch, "UNKNOWN");
+        assert!(summary
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("output")));
         let _ = fs::remove_dir_all(root);
     }
 
