@@ -26,6 +26,15 @@ const SNAPSHOT_FILE: &str = "snapshot.json";
 const PROVIDER_STATE_FILE: &str = "provider-state.json";
 const MAX_REPLAY_LIMIT: usize = 1000;
 pub(crate) const MAX_EVENTS_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Events that close a turn or record a restart may use this much beyond
+/// `MAX_EVENTS_JOURNAL_BYTES`. A turn made of many small streaming events can
+/// fill the journal without leaving anything for compaction to shrink; without
+/// the reserve its terminal event was refused, so the turn stayed open and
+/// every restart re-scanned and re-compacted the journal only to fail again.
+const JOURNAL_LIFECYCLE_RESERVE_BYTES: u64 = 64 * 1024;
+/// Readers accept a journal that used its lifecycle reserve.
+const MAX_EVENTS_JOURNAL_READ_BYTES: u64 =
+    MAX_EVENTS_JOURNAL_BYTES + JOURNAL_LIFECYCLE_RESERVE_BYTES;
 /// New prompts are refused above this size so a started turn always has
 /// headroom to append its events, including the terminal one, before the
 /// hard cap.
@@ -565,11 +574,16 @@ impl ConversationStore {
         serde_json::to_writer(&mut line, &event)?;
         line.push(b'\n');
         let event_path = directory.join(EVENTS_FILE);
+        let limit = if uses_lifecycle_reserve(&event) {
+            MAX_EVENTS_JOURNAL_READ_BYTES
+        } else {
+            MAX_EVENTS_JOURNAL_BYTES
+        };
         let (mut journal_bytes, mut journal_modified) = journal_metadata(&event_path).await?;
-        if journal_bytes.saturating_add(line.len() as u64) > MAX_EVENTS_JOURNAL_BYTES {
+        if journal_bytes.saturating_add(line.len() as u64) > limit {
             self.compact_journal(conversation_id).await?;
             (journal_bytes, journal_modified) = journal_metadata(&event_path).await?;
-            if journal_bytes.saturating_add(line.len() as u64) > MAX_EVENTS_JOURNAL_BYTES {
+            if journal_bytes.saturating_add(line.len() as u64) > limit {
                 return Err(AppError::ResourceExhausted(format!(
                     "conversation {conversation_id} journal reached its storage limit"
                 )));
@@ -967,12 +981,20 @@ impl ConversationStore {
         {
             status = super::ConversationStatus::Interrupted;
         }
-        manifest.last_sequence = last_sequence;
-        manifest.status = status;
-        manifest.updated_at = events
+        let updated_at = events
             .last()
             .map_or(manifest.updated_at, |event| event.time);
-        self.persist_manifest_locked(&manifest).await?;
+        // Most journals already match their manifest. Rewriting it anyway cost
+        // two atomic writes with full syncs per conversation on every start.
+        let unchanged = manifest.last_sequence == last_sequence
+            && manifest.status == status
+            && manifest.updated_at == updated_at;
+        manifest.last_sequence = last_sequence;
+        manifest.status = status;
+        manifest.updated_at = updated_at;
+        if !unchanged {
+            self.persist_manifest_locked(&manifest).await?;
+        }
         Ok((manifest, events))
     }
 
@@ -1116,9 +1138,9 @@ impl ConversationStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
-        if metadata.len() > MAX_EVENTS_JOURNAL_BYTES {
+        if metadata.len() > MAX_EVENTS_JOURNAL_READ_BYTES {
             return Err(AppError::InvalidRequest(format!(
-                "conversation {conversation_id} journal exceeds {MAX_EVENTS_JOURNAL_BYTES} bytes"
+                "conversation {conversation_id} journal exceeds {MAX_EVENTS_JOURNAL_READ_BYTES} bytes"
             )));
         }
         let raw = match tokio::fs::read(&path).await {
@@ -1242,9 +1264,9 @@ impl ConversationStore {
                 return Ok((Some(tail.event.clone()), true));
             }
         }
-        if metadata.len() > MAX_EVENTS_JOURNAL_BYTES {
+        if metadata.len() > MAX_EVENTS_JOURNAL_READ_BYTES {
             return Err(AppError::InvalidRequest(format!(
-                "conversation {conversation_id} journal exceeds {MAX_EVENTS_JOURNAL_BYTES} bytes"
+                "conversation {conversation_id} journal exceeds {MAX_EVENTS_JOURNAL_READ_BYTES} bytes"
             )));
         }
         if metadata.len() == 0 {
@@ -1410,6 +1432,24 @@ impl ConversationStore {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         lock.lock_owned().await
+    }
+}
+
+/// Events that may use the lifecycle reserve: anything that closes a turn,
+/// records a restart, or releases state the restart invalidated.
+fn uses_lifecycle_reserve(event: &ConversationEvent) -> bool {
+    match event.event_type.as_str() {
+        "turn.completed"
+        | "turn.failed"
+        | "turn.cancelled"
+        | "turn.interrupted"
+        | "conversation.interrupted"
+        | "conversation.failed"
+        | "permission.resolved" => true,
+        "provider.runtime" => {
+            event.payload.get("status").and_then(Value::as_str) == Some("stopped")
+        }
+        _ => false,
     }
 }
 
@@ -1917,7 +1957,7 @@ async fn rewrite_salvaged_journal(
     let too_large = || {
         AppError::InvalidRequest(format!(
             "conversation {conversation_id} journal is corrupt and its salvaged copy would \
-             exceed {MAX_EVENTS_JOURNAL_BYTES} bytes"
+             exceed {MAX_EVENTS_JOURNAL_READ_BYTES} bytes"
         ))
     };
     let backup = corrupt_copy_path(path);
@@ -1962,7 +2002,7 @@ async fn rewrite_salvaged_journal(
                     total += line.len() as u64 + 1;
                     // Checked per placeholder so a huge run fails before it
                     // is materialized.
-                    if total > MAX_EVENTS_JOURNAL_BYTES {
+                    if total > MAX_EVENTS_JOURNAL_READ_BYTES {
                         return Err(too_large());
                     }
                     lines.push(Cow::Owned(line));
@@ -1972,7 +2012,7 @@ async fn rewrite_salvaged_journal(
             }
         }
     }
-    if total > MAX_EVENTS_JOURNAL_BYTES {
+    if total > MAX_EVENTS_JOURNAL_READ_BYTES {
         return Err(too_large());
     }
     // The backup must be durable before the rewrite replaces the original.
@@ -2057,7 +2097,7 @@ fn scan_journal_offsets(
     let mut file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     let bytes = metadata.len();
-    if bytes == 0 || bytes > MAX_EVENTS_JOURNAL_BYTES {
+    if bytes == 0 || bytes > MAX_EVENTS_JOURNAL_READ_BYTES {
         return Ok(None);
     }
     let mut final_byte = [0u8; 1];
@@ -3985,9 +4025,13 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Hand-write a journal just under the hard cap whose events carry
-    /// `payload`, then recover so the store indexes it.
-    async fn fill_journal(prefix: &str, payload: Value) -> (PathBuf, ConversationStore, String) {
+    /// Hand-write a journal within `headroom` bytes of the hard cap whose
+    /// events carry `payload`, then recover so the store indexes it.
+    async fn fill_journal(
+        prefix: &str,
+        payload: Value,
+        headroom: u64,
+    ) -> (PathBuf, ConversationStore, String) {
         use std::io::Write;
         let root = temp_dir(prefix);
         let store = ConversationStore::new(root.clone()).await.unwrap();
@@ -4016,7 +4060,7 @@ mod tests {
             ))
             .unwrap();
             line.push(b'\n');
-            if written + line.len() as u64 > MAX_EVENTS_JOURNAL_BYTES - 256 * 1024 {
+            if written + line.len() as u64 > MAX_EVENTS_JOURNAL_BYTES - headroom {
                 break;
             }
             file.write_all(&line).unwrap();
@@ -4033,7 +4077,8 @@ mod tests {
     async fn full_journal_refuses_new_prompts_but_running_turns_still_append() {
         // Bulk made of many short strings leaves nothing to compact.
         let items: Vec<String> = (0..3000).map(|index| format!("item-{index:05}")).collect();
-        let (root, store, id) = fill_journal("todex-journal-full", json!({ "items": items })).await;
+        let (root, store, id) =
+            fill_journal("todex-journal-full", json!({ "items": items }), 256 * 1024).await;
         let request = json!({ "turnId": "t" });
 
         let error = store.save_request(&id, &request).await.unwrap_err();
@@ -4061,10 +4106,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn journal_at_the_cap_still_closes_its_turn_from_the_reserve() {
+        // Many small events: nothing for compaction to shrink.
+        let items: Vec<String> = (0..20).map(|index| format!("item-{index:02}")).collect();
+        let payload = json!({ "items": items });
+        let (root, store, id) = fill_journal("todex-journal-reserve", payload.clone(), 0).await;
+
+        // Ordinary events stay under the cap; closing the turn uses the reserve.
+        assert!(matches!(
+            store.append(&id, "provider.event", payload).await,
+            Err(AppError::ResourceExhausted(_))
+        ));
+        let closed = store
+            .append(
+                &id,
+                "conversation.interrupted",
+                json!({ "reason": "daemon_restarted" }),
+            )
+            .await
+            .unwrap();
+        let path = root.join("conversations").join(&id).join(EVENTS_FILE);
+        assert!(fs::metadata(&path).unwrap().len() > MAX_EVENTS_JOURNAL_BYTES);
+
+        // A restarted store reads the journal that used its reserve.
+        let restarted = ConversationStore::new(root.clone()).await.unwrap();
+        let (manifest, history) = restarted.recover_with_history(&id).await.unwrap();
+        assert_eq!(history.last().unwrap().sequence, closed.sequence);
+        assert_eq!(manifest.status, ConversationStatus::Interrupted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_rewrites_the_manifest_only_when_the_journal_changed_it() {
+        let root = temp_dir("todex-recover-no-rewrite");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        for event_type in ["turn.started", "turn.completed"] {
+            store
+                .append(&manifest.id, event_type, json!({ "turnId": "t" }))
+                .await
+                .unwrap();
+        }
+        let directory = root.join("conversations").join(&manifest.id);
+        fs::remove_file(directory.join(SNAPSHOT_FILE)).unwrap();
+
+        // In step with its journal: nothing is written.
+        let restarted = ConversationStore::new(root.clone()).await.unwrap();
+        restarted.recover_with_history(&manifest.id).await.unwrap();
+        assert!(!directory.join(SNAPSHOT_FILE).exists());
+
+        // Behind its journal: recovery persists both files again.
+        let mut stale: ConversationManifest =
+            serde_json::from_slice(&fs::read(directory.join(MANIFEST_FILE)).unwrap()).unwrap();
+        stale.last_sequence -= 1;
+        fs::write(
+            directory.join(MANIFEST_FILE),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        let restarted = ConversationStore::new(root.clone()).await.unwrap();
+        let (recovered, _) = restarted.recover_with_history(&manifest.id).await.unwrap();
+        assert_eq!(recovered.last_sequence, 2);
+        assert!(directory.join(SNAPSHOT_FILE).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn prompt_on_a_full_but_compactable_journal_compacts_and_proceeds() {
         let (root, store, id) = fill_journal(
             "todex-journal-full-compactable",
             json!({ "output": "x".repeat(256 * 1024) }),
+            256 * 1024,
         )
         .await;
         let request = json!({ "turnId": "t" });

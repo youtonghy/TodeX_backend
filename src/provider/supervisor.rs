@@ -410,13 +410,19 @@ impl ConversationSupervisor {
     }
 
     /// Whether startup can skip the full journal scan: the manifest claims no
-    /// work in flight, the journal ends cleanly on a turn- or
-    /// conversation-terminal event (or is empty), and the manifest was
-    /// written after that event (equal `last_sequence`; status changes are
-    /// persisted with the event that caused them). Pi is always scanned: its
-    /// resident runtimes and session-scoped dialogs outlive turns, so only
-    /// the whole journal shows whether one was left open. Any doubt, including
-    /// an unreadable tail, falls back to the full path, which reports it.
+    /// work in flight and was written after the journal's last event (equal
+    /// `last_sequence`; status changes are persisted with the event that
+    /// caused them), and either the manifest is `Idle` or the journal ends
+    /// cleanly on a turn- or conversation-terminal event (or is empty).
+    /// `Idle` alone is enough because `turn.started` persists `Running`
+    /// immediately and only a finished turn or operation returns to `Idle`,
+    /// so trailing informational events (imported Codex history, a provider's
+    /// command catalog after a turn) no longer force a full scan. `Failed`
+    /// and `Interrupted` still need the terminal tail: a paused workflow is
+    /// `Interrupted` with its turn open. Pi is always scanned: its resident
+    /// runtimes and session-scoped dialogs outlive turns, so only the whole
+    /// journal shows whether one was left open. Any doubt, including an
+    /// unreadable tail, falls back to the full path, which reports it.
     async fn recovery_is_settled(&self, manifest: &ConversationManifest) -> bool {
         if manifest.provider == ProviderKind::Pi
             || matches!(
@@ -438,7 +444,8 @@ impl ConversationSupervisor {
             None => manifest.last_sequence == 0,
             Some(event) => {
                 event.sequence == manifest.last_sequence
-                    && (TURN_TERMINAL_EVENTS.contains(&event.event_type.as_str())
+                    && (manifest.status == ConversationStatus::Idle
+                        || TURN_TERMINAL_EVENTS.contains(&event.event_type.as_str())
                         || CONVERSATION_TERMINAL_EVENTS.contains(&event.event_type.as_str()))
             }
         }
@@ -3592,7 +3599,13 @@ mod tests {
     async fn recover_all_leaves_settled_journals_to_their_first_read() {
         let (root, store, supervisor, workspace) = control_fixture("todex-recover-lazy").await;
         let mut ids = Vec::new();
-        for last in ["turn.completed", "message.created"] {
+        for (end, last) in [
+            ("turn.completed", "turn.completed"),
+            // Informational events after a finished turn (a provider's command
+            // catalog, imported history) leave the conversation Idle.
+            ("turn.completed", "provider.commands.updated"),
+            ("turn.failed", "message.created"),
+        ] {
             let manifest = store
                 .create(ConversationManifest::new(
                     ProviderKind::Codex,
@@ -3602,7 +3615,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            for event_type in ["message.created", "turn.started", "turn.completed", last] {
+            for event_type in ["message.created", "turn.started", end, last] {
                 store
                     .append(&manifest.id, event_type, json!({ "turnId": "t" }))
                     .await
@@ -3610,24 +3623,26 @@ mod tests {
             }
             ids.push(manifest.id);
         }
-        let (settled, unsettled) = (&ids[0], &ids[1]);
+        let (settled, settled_idle, unsettled) = (&ids[0], &ids[1], &ids[2]);
         let settled_bytes = corrupt_journal_line(&root, settled, 1);
+        let settled_idle_bytes = corrupt_journal_line(&root, settled_idle, 1);
         corrupt_journal_line(&root, unsettled, 1);
 
         supervisor.recover_all().await.unwrap();
 
-        // Idle, terminal tail, manifest in step: startup never read the
-        // journal body, so the damage is still there untouched.
-        assert_eq!(
-            fs::read(journal_path(&root, settled)).unwrap(),
-            settled_bytes
-        );
-        assert_eq!(corrupt_copies(&root, settled), 0);
-        assert_eq!(
-            store.get(settled).await.unwrap().status,
-            ConversationStatus::Idle
-        );
-        // A non-terminal tail forces the full scan, which salvages at startup.
+        // Idle with the manifest in step: startup never read the journal
+        // body, whether the tail is terminal or merely informational, so the
+        // damage is still there untouched.
+        for (id, bytes) in [(settled, settled_bytes), (settled_idle, settled_idle_bytes)] {
+            assert_eq!(fs::read(journal_path(&root, id)).unwrap(), bytes);
+            assert_eq!(corrupt_copies(&root, id), 0);
+            assert_eq!(
+                store.get(id).await.unwrap().status,
+                ConversationStatus::Idle
+            );
+        }
+        // A failed conversation needs a terminal tail; without one the full
+        // scan runs and salvages at startup.
         assert_eq!(corrupt_copies(&root, unsettled), 1);
 
         // The first read of the settled conversation validates and salvages.

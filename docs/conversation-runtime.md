@@ -100,7 +100,9 @@ the damage. A local release fixture measured the cold 50-event tail page at
 
 The synced journal line is the only per-append commit point. Manifests are
 cached in memory: `manifest.json` and `snapshot.json` are written at once on
-create, status change, metadata update, recovery and forced status; other
+create, status change, metadata update, forced status, and recovery that
+changes the manifest (a manifest already in step with its journal is left
+untouched, sparing two fully synced writes per conversation at startup); other
 fields (`lastSequence`, `updatedAt`) reach `manifest.json` through a flush
 debounced to 2 s and on shutdown, and are rebuilt from the journal after a
 crash. An append whose manifest is behind or ahead of the journal follows the
@@ -121,7 +123,11 @@ is bounded by the corrupt bytes, and clients cannot append that event type.
 
 A journal above 63 MiB (64 MiB cap − 1 MiB headroom) that compaction cannot
 shrink refuses new prompts with `JOURNAL_FULL` (HTTP 507); running turns still
-append up to the cap. Journals compaction could not shrink are remembered by
+append up to the cap. Events that close a turn or record a restart
+(`turn.*` terminals, `conversation.interrupted` / `failed`,
+`permission.resolved`, `provider.runtime` stopped) may use a further 64 KiB
+beyond it, and readers accept that reserve, so a turn whose many small events
+filled the journal can always be closed. Journals compaction could not shrink are remembered by
 (length, mtime) so they are not re-parsed on every attempt. Replay pages
 (`afterSequence`, `beforeSequence`, WebSocket subscribe backfill) stop at
 `limit` events or about 8 MiB of journal, whichever comes first, but always
@@ -141,10 +147,15 @@ runtimes stopped. Whether a turn was open comes from the journal (the last
 `turn.started` without a terminal event), not the manifest status: an open turn
 gets `conversation.interrupted` carrying its `turnId` when known, while a
 closed turn under a stale `running` manifest only has its status corrected,
-with no event. Settled conversations skip this scan: status not `running` /
-`waiting_permission`, journal empty or ending on a turn- or
-conversation-terminal event, manifest `lastSequence` equal to that tail, and
-provider not Pi. Corruption in a skipped journal surfaces on its first read.
+with no event. Settled conversations skip this scan: provider not Pi, status
+not `running` / `waiting_permission`, manifest `lastSequence` equal to the
+journal tail, and either status `idle` or a journal that is empty or ends on a
+turn- or conversation-terminal event. `idle` suffices because `turn.started`
+persists `running` at once and only a finished turn or operation returns to
+`idle`, so informational tails (imported Codex history, a provider command
+catalog after a turn) no longer force a scan; `failed` / `interrupted` still
+need the terminal tail, since a paused workflow is `interrupted` with its turn
+open. Corruption in a skipped journal surfaces on its first read.
 Recovery progress is logged every 25 conversations.
 Daemon startup waits up to 120 seconds for initialization; on timeout the
 spawned child is terminated and the daemon log identifies the last recovery
