@@ -842,7 +842,7 @@ mod tests {
     use std::{env, fs, net::TcpListener};
 
     #[cfg(unix)]
-    use std::{process::Command, thread, time::Duration};
+    use std::{process::Command, thread};
 
     #[cfg(target_os = "linux")]
     use super::process_has_exited;
@@ -854,7 +854,7 @@ mod tests {
     use super::{process_liveness, ProcessLiveness};
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
     use chrono::Utc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn idle_timer_restarts_whenever_an_agent_runs() {
