@@ -889,6 +889,7 @@ fn parse_pi_models(response: &Value, state: &Value) -> Vec<super::types::Provide
                 image_input: Some(item.get("input").and_then(Value::as_array).is_some_and(
                     |inputs| inputs.iter().any(|input| input.as_str() == Some("image")),
                 )),
+                family: None,
             })
         })
         .collect()

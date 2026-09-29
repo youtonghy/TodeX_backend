@@ -26,23 +26,254 @@ pub struct ClaudeDriver {
     catalogs: Mutex<HashMap<String, ProviderSessionCommands>>,
 }
 
-fn claude_model_aliases() -> Vec<super::types::ProviderModelDescriptor> {
-    ["default", "sonnet", "opus", "haiku"]
-        .into_iter()
-        .map(|id| super::types::ProviderModelDescriptor {
-            id: id.to_owned(),
-            display_name: id.to_owned(),
-            description: "Claude Code model alias".to_owned(),
-            is_default: id == "default",
-            supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"]
+/// Claude Code accepts both family aliases (`opus`) and concrete model ids
+/// (`claude-opus-4-6`) for `--model`. This catalog mirrors the list baked into
+/// the CLI so the picker can offer "latest" plus pinned versions per family.
+/// Models whose `effort` flag is false predate the CLI's effort option; they
+/// get an empty effort list, which disables the slider in clients.
+fn claude_model(
+    id: &str,
+    display_name: &str,
+    description: &str,
+    family: Option<&str>,
+    effort: bool,
+    default_effort: Option<&str>,
+    context_window: Option<u64>,
+) -> super::types::ProviderModelDescriptor {
+    super::types::ProviderModelDescriptor {
+        id: id.to_owned(),
+        display_name: display_name.to_owned(),
+        description: description.to_owned(),
+        is_default: false,
+        supported_reasoning_efforts: if effort {
+            ["low", "medium", "high", "xhigh", "max"]
                 .into_iter()
                 .map(str::to_owned)
-                .collect(),
-            default_reasoning_effort: None,
-            context_window: None,
-            image_input: Some(true),
-        })
-        .collect()
+                .collect()
+        } else {
+            Vec::new()
+        },
+        default_reasoning_effort: default_effort.map(str::to_owned),
+        context_window,
+        image_input: Some(true),
+        family: family.map(str::to_owned),
+    }
+}
+
+// (id, display name, family, effort capable, default effort, context window).
+// Newest first within each family.
+type ClaudeModelSpec = (
+    &'static str,
+    &'static str,
+    &'static str,
+    bool,
+    Option<&'static str>,
+    Option<u64>,
+);
+const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
+    (
+        "claude-opus-5-5",
+        "Opus 5.5",
+        "opus",
+        true,
+        Some("medium"),
+        Some(1_000_000),
+    ),
+    (
+        "claude-opus-5",
+        "Opus 5",
+        "opus",
+        true,
+        Some("high"),
+        Some(1_000_000),
+    ),
+    (
+        "claude-opus-4-8",
+        "Opus 4.8",
+        "opus",
+        true,
+        Some("high"),
+        Some(1_000_000),
+    ),
+    (
+        "claude-opus-4-7",
+        "Opus 4.7",
+        "opus",
+        true,
+        Some("xhigh"),
+        Some(1_000_000),
+    ),
+    (
+        "claude-opus-4-6",
+        "Opus 4.6",
+        "opus",
+        true,
+        None,
+        Some(200_000),
+    ),
+    (
+        "claude-opus-4-5-20251101",
+        "Opus 4.5",
+        "opus",
+        false,
+        None,
+        Some(200_000),
+    ),
+    (
+        "claude-opus-4-1-20250805",
+        "Opus 4.1",
+        "opus",
+        false,
+        None,
+        Some(200_000),
+    ),
+    (
+        "claude-opus-4-20250514",
+        "Opus 4",
+        "opus",
+        false,
+        None,
+        Some(200_000),
+    ),
+    (
+        "claude-sonnet-5-5",
+        "Sonnet 5.5",
+        "sonnet",
+        true,
+        Some("medium"),
+        Some(1_000_000),
+    ),
+    (
+        "claude-sonnet-5",
+        "Sonnet 5",
+        "sonnet",
+        true,
+        Some("high"),
+        Some(1_000_000),
+    ),
+    (
+        "claude-sonnet-4-6",
+        "Sonnet 4.6",
+        "sonnet",
+        true,
+        None,
+        Some(200_000),
+    ),
+    (
+        "claude-sonnet-4-5-20250929",
+        "Sonnet 4.5",
+        "sonnet",
+        false,
+        None,
+        Some(200_000),
+    ),
+    (
+        "claude-sonnet-4-20250514",
+        "Sonnet 4",
+        "sonnet",
+        false,
+        None,
+        Some(200_000),
+    ),
+    (
+        "claude-3-7-sonnet-20250219",
+        "Sonnet 3.7",
+        "sonnet",
+        false,
+        None,
+        None,
+    ),
+    (
+        "claude-3-5-sonnet-20241022",
+        "Sonnet 3.5",
+        "sonnet",
+        false,
+        None,
+        None,
+    ),
+    (
+        "claude-fable-5-1",
+        "Fable 5.1",
+        "fable",
+        true,
+        Some("high"),
+        Some(1_000_000),
+    ),
+    (
+        "claude-fable-5",
+        "Fable 5",
+        "fable",
+        true,
+        Some("high"),
+        Some(1_000_000),
+    ),
+    (
+        "claude-haiku-4-5-20251001",
+        "Haiku 4.5",
+        "haiku",
+        false,
+        None,
+        Some(200_000),
+    ),
+    (
+        "claude-3-5-haiku-20241022",
+        "Haiku 3.5",
+        "haiku",
+        false,
+        None,
+        None,
+    ),
+];
+
+// Family aliases resolve to the newest entry; clients render them as the
+// family's "latest" option. (alias id, resolved display name)
+const CLAUDE_FAMILY_ALIASES: &[(&str, &str)] = &[
+    ("opus", "Opus 5.5"),
+    ("sonnet", "Sonnet 5.5"),
+    ("fable", "Fable 5.1"),
+    ("haiku", "Haiku 4.5"),
+];
+
+fn claude_model_aliases() -> Vec<super::types::ProviderModelDescriptor> {
+    let mut models = vec![claude_model(
+        "default", "default", "Opus 5", None, true, None, None,
+    )];
+    models[0].is_default = true;
+    for (alias, resolves_to) in CLAUDE_FAMILY_ALIASES {
+        models.push(claude_model(
+            alias,
+            alias,
+            resolves_to,
+            Some(alias),
+            true,
+            None,
+            None,
+        ));
+        models.extend(CLAUDE_MODELS.iter().filter(|entry| entry.2 == *alias).map(
+            |(id, name, family, effort, default_effort, context_window)| {
+                claude_model(
+                    id,
+                    name,
+                    "",
+                    Some(*family),
+                    *effort,
+                    *default_effort,
+                    *context_window,
+                )
+            },
+        ));
+    }
+    models
+}
+
+/// Maps a Claude model id to its picker family so discovered catalogs (for
+/// example a gateway's `/v1/models`) group the same way the built-in list does.
+fn claude_model_family(id: &str) -> Option<String> {
+    let lower = id.to_ascii_lowercase();
+    ["sonnet", "opus", "haiku", "fable", "mythos"]
+        .into_iter()
+        .find(|family| lower.contains(family))
+        .map(str::to_owned)
 }
 
 impl ClaudeDriver {
@@ -127,6 +358,7 @@ impl ProviderDriver for ClaudeDriver {
             .flatten()
             .filter_map(|item| {
                 let id = item.get("id").and_then(Value::as_str)?.to_owned();
+                let family = claude_model_family(&id);
                 Some(super::types::ProviderModelDescriptor {
                     display_name: item
                         .get("display_name")
@@ -147,6 +379,7 @@ impl ProviderDriver for ClaudeDriver {
                         .or_else(|| item.get("contextWindow"))
                         .and_then(Value::as_u64),
                     image_input: Some(true),
+                    family,
                 })
             })
             .collect::<Vec<_>>();
@@ -467,7 +700,7 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        claude_command_catalog, claude_model_aliases, claude_question_details,
+        claude_command_catalog, claude_model_aliases, claude_model_family, claude_question_details,
         claude_question_response, claude_user_content, handle_stream_event, BackgroundTasks,
         ClaudeSubagents, ClaudeToolCalls,
     };
@@ -772,19 +1005,51 @@ mod tests {
     #[test]
     fn built_in_model_aliases_are_selectable_without_gateway_discovery() {
         let models = claude_model_aliases();
+        let ids = models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
 
-        assert_eq!(
-            models
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            ["default", "sonnet", "opus", "haiku"]
-        );
+        assert!(ids.contains(&"default"));
+        for family in ["opus", "sonnet", "haiku", "fable"] {
+            assert!(ids.contains(&family), "missing {family} alias");
+            assert!(
+                ids.iter()
+                    .any(|id| id.starts_with(&format!("claude-{family}"))),
+                "missing {family} versions"
+            );
+        }
         assert!(models[0].is_default);
+        assert_eq!(models[0].id, "default");
         assert_eq!(
             models[0].supported_reasoning_efforts,
             ["low", "medium", "high", "xhigh", "max"]
         );
+        // Versioned entries tag their family; aliases sit inside their own
+        // family so clients can render "latest" plus pinned versions.
+        let opus = models.iter().find(|model| model.id == "opus").unwrap();
+        assert_eq!(opus.family.as_deref(), Some("opus"));
+        let opus_45 = models
+            .iter()
+            .find(|model| model.id == "claude-opus-4-5-20251101")
+            .unwrap();
+        assert_eq!(opus_45.family.as_deref(), Some("opus"));
+        assert!(opus_45.supported_reasoning_efforts.is_empty());
+        let opus_55 = models
+            .iter()
+            .find(|model| model.id == "claude-opus-5-5")
+            .unwrap();
+        assert_eq!(opus_55.default_reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(opus_55.context_window, Some(1_000_000));
+        assert_eq!(
+            claude_model_family("us.anthropic.claude-sonnet-4-5").as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(
+            claude_model_family("claude-3-opus-20240229").as_deref(),
+            Some("opus")
+        );
+        assert_eq!(claude_model_family("gpt-5.5"), None);
     }
 
     #[test]

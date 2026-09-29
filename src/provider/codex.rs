@@ -318,6 +318,7 @@ impl ProviderDriver for CodexDriver {
                         .get("inputModalities")
                         .and_then(Value::as_array)
                         .map(|items| items.iter().any(|value| value.as_str() == Some("image"))),
+                    family: None,
                 })
             })
             .collect())

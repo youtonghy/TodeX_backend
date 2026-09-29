@@ -111,6 +111,10 @@ pub struct ProviderModelDescriptor {
     pub context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_input: Option<bool>,
+    /// Model family (e.g. "opus", "sonnet") used by clients to group versions
+    /// under one menu entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

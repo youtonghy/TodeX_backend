@@ -622,6 +622,7 @@ fn parse_models(initialize: &Value) -> Vec<ProviderModelDescriptor> {
                 id,
                 supported_reasoning_efforts: efforts,
                 image_input: Some(true),
+                family: None,
             })
         })
         .collect()

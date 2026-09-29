@@ -1069,6 +1069,7 @@ pub(super) fn parse_devin_models(session: &Value) -> Vec<ProviderModelDescriptor
                     .and_then(|meta| meta.get("cognition.ai/supportsImages"))
                     .and_then(Value::as_bool),
                 id,
+                family: None,
             })
         })
         .collect()
@@ -1339,6 +1340,7 @@ mod tests {
                 default_reasoning_effort: None,
                 context_window: None,
                 image_input: None,
+                family: None,
             }],
             commands: Vec::new(),
             complete: false,
