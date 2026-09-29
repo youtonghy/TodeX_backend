@@ -1068,11 +1068,19 @@ pub(super) fn parse_devin_models(session: &Value) -> Vec<ProviderModelDescriptor
                     .get("_meta")
                     .and_then(|meta| meta.get("cognition.ai/supportsImages"))
                     .and_then(Value::as_bool),
+                family: devin_model_family(&id),
                 id,
-                family: None,
             })
         })
         .collect()
+}
+
+/// Groups Devin catalog entries by their leading vendor token
+/// (`claude-opus-5-low` → `claude`, `swe-2-high` → `swe`). Single-token
+/// ids stay ungrouped so unknown shapes render as flat entries.
+fn devin_model_family(id: &str) -> Option<String> {
+    let vendor = id.split(['-', '/', '_']).next()?.trim();
+    (!vendor.is_empty() && vendor.len() < id.len()).then(|| vendor.to_lowercase())
 }
 
 /// `devin acp` ignores `devin auth login` credentials by design; TodeX opts
@@ -1188,6 +1196,8 @@ mod tests {
         assert_eq!(models.len(), 3);
         assert_eq!(models[0].id, "swe-2-high");
         assert!(models[0].is_default);
+        assert_eq!(models[0].family.as_deref(), Some("swe"));
+        assert_eq!(models[1].family.as_deref(), Some("claude"));
         assert_eq!(models[1].image_input, Some(true));
         assert_eq!(models[2].image_input, Some(false));
         assert!(!models.iter().any(|model| model.id == "accept-edits"));

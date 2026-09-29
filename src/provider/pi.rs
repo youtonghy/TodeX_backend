@@ -889,7 +889,12 @@ fn parse_pi_models(response: &Value, state: &Value) -> Vec<super::types::Provide
                 image_input: Some(item.get("input").and_then(Value::as_array).is_some_and(
                     |inputs| inputs.iter().any(|input| input.as_str() == Some("image")),
                 )),
-                family: None,
+                family: item
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|provider| !provider.is_empty())
+                    .map(str::to_lowercase),
             })
         })
         .collect()
@@ -2575,8 +2580,11 @@ mod tests {
         assert!(models[0].is_default);
         assert_eq!(models[0].default_reasoning_effort.as_deref(), Some("high"));
         assert_eq!(models[0].image_input, Some(true));
+        assert_eq!(models[0].family.as_deref(), Some("zai"));
         assert_eq!(models[1].image_input, Some(false));
+        assert_eq!(models[1].family.as_deref(), Some("retoo"));
         assert_eq!(models[1].supported_reasoning_efforts, ["max"]);
+        assert_eq!(models[2].family.as_deref(), Some("plain"));
         assert_eq!(models[2].supported_reasoning_efforts, ["off"]);
     }
 
