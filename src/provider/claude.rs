@@ -818,34 +818,84 @@ mod tests {
     fn tool_snapshots_accumulate_name_input_and_result_under_one_block() {
         let mut tools = ClaudeToolCalls::default();
         let id = tools
-            .record(&json!({ "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {} }))
+            .record(
+                &json!({ "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {} }),
+                None,
+            )
             .unwrap();
         let started = tools.payload(&id, "turn-1", "started");
         assert_eq!(started["toolName"], "Bash");
         assert_eq!(started["block"]["id"], "toolu_1");
         assert_eq!(started["block"]["category"], "tool");
+        assert!(started["subagentId"].is_null());
 
-        tools.record(&json!({
-            "type": "tool_use", "id": "toolu_1", "name": "Bash",
-            "input": { "command": "echo ok" }
-        }));
+        tools.record(
+            &json!({
+                "type": "tool_use", "id": "toolu_1", "name": "Bash",
+                "input": { "command": "echo ok" }
+            }),
+            None,
+        );
         // A late empty-input block never erases the complete arguments.
-        tools.record(&json!({ "type": "tool_use", "id": "toolu_1", "input": {} }));
+        tools.record(
+            &json!({ "type": "tool_use", "id": "toolu_1", "input": {} }),
+            None,
+        );
         assert_eq!(
             tools.payload(&id, "turn-1", "delta")["arguments"]["command"],
             "echo ok"
         );
 
-        tools.complete(&json!({
-            "type": "tool_result", "tool_use_id": "toolu_1",
-            "content": [{ "type": "text", "text": "ok" }], "is_error": false
-        }));
+        tools.complete(
+            &json!({
+                "type": "tool_result", "tool_use_id": "toolu_1",
+                "content": [{ "type": "text", "text": "ok" }], "is_error": false
+            }),
+            None,
+        );
         let completed = tools.payload(&id, "turn-1", "completed");
         assert_eq!(completed["toolName"], "Bash");
         assert_eq!(completed["arguments"]["command"], "echo ok");
         assert_eq!(completed["result"], "ok");
         assert_eq!(completed["isError"], false);
         assert_eq!(completed["block"]["phase"], "completed");
+    }
+
+    #[test]
+    fn tool_snapshots_tag_subagent_inner_calls_with_their_parent() {
+        let mut tools = ClaudeToolCalls::default();
+        let inner = tools
+            .record(
+                &json!({ "type": "tool_use", "id": "toolu_inner", "name": "Read", "input": { "file": "a" } }),
+                Some("toolu_task"),
+            )
+            .unwrap();
+        assert_eq!(
+            tools.payload(&inner, "turn-1", "started")["subagentId"],
+            "toolu_task"
+        );
+        tools.complete(
+            &json!({ "type": "tool_result", "tool_use_id": "toolu_inner", "content": "data" }),
+            Some("toolu_task"),
+        );
+        assert_eq!(
+            tools.payload(&inner, "turn-1", "completed")["subagentId"],
+            "toolu_task"
+        );
+        // A call first seen without a parent keeps the attribution a later
+        // frame supplies; the main thread's own calls stay untagged.
+        tools.name_if_unknown("toolu_late", None, Some("toolu_task"));
+        assert_eq!(
+            tools.payload("toolu_late", "turn-1", "delta")["subagentId"],
+            "toolu_task"
+        );
+        let main = tools
+            .record(
+                &json!({ "type": "tool_use", "id": "toolu_main", "name": "Bash" }),
+                None,
+            )
+            .unwrap();
+        assert!(tools.payload(&main, "turn-1", "started")["subagentId"].is_null());
     }
 
     #[test]
@@ -1583,15 +1633,16 @@ async fn run_claude_turn(
             }
             Some("assistant") => {
                 saw_output = true;
+                let subagent = message.get("parent_tool_use_id").and_then(Value::as_str);
                 sink.emit(
                     "message.completed",
-                    json!({ "provider": "claude-code", "message": message.get("message") }),
+                    json!({ "provider": "claude-code", "message": message.get("message"), "subagentId": subagent }),
                 )
                 .await?;
                 // The streamed `tool_use` start carries an empty input; the
                 // complete assistant message is the first with arguments.
                 for block in content_blocks(&message, "tool_use") {
-                    if let Some(id) = tools.record(block) {
+                    if let Some(id) = tools.record(block, subagent) {
                         if ClaudeSubagents::is_agent_tool(block.get("name")) {
                             if let Some(payload) = subagents.start_from_tool(block, &prompt.turn_id)
                             {
@@ -1604,8 +1655,9 @@ async fn run_claude_turn(
                 }
             }
             Some("user") => {
+                let subagent = message.get("parent_tool_use_id").and_then(Value::as_str);
                 for block in content_blocks(&message, "tool_result") {
-                    if let Some(id) = tools.complete(block) {
+                    if let Some(id) = tools.complete(block, subagent) {
                         let payload = tools.payload(&id, &prompt.turn_id, "completed");
                         sink.emit("tool.completed", payload.clone()).await?;
                         if let Some((event, subagent)) = subagents.finish_from_tool(
@@ -1625,8 +1677,9 @@ async fn run_claude_turn(
             }
             Some("tool_progress") => {
                 saw_output = true;
+                let subagent = message.get("parent_tool_use_id").and_then(Value::as_str);
                 if let Some(id) = message.get("tool_use_id").and_then(Value::as_str) {
-                    tools.name_if_unknown(id, message.get("tool_name"));
+                    tools.name_if_unknown(id, message.get("tool_name"), subagent);
                     sink.emit("tool.updated", tools.payload(id, &prompt.turn_id, "delta"))
                         .await?;
                 }
@@ -1981,6 +2034,10 @@ struct ClaudeToolCall {
     input: Value,
     result: Option<Value>,
     is_error: Option<bool>,
+    /// `parent_tool_use_id` of the frames the call was reported in; a
+    /// subagent's inner tools fold under its run instead of interrupting the
+    /// main assistant stream.
+    subagent_id: Option<String>,
 }
 
 /// Claude reports one tool call across several messages: the streamed
@@ -1993,9 +2050,12 @@ struct ClaudeToolCalls(HashMap<String, ClaudeToolCall>);
 impl ClaudeToolCalls {
     /// Record a `tool_use` block, keeping earlier non-empty input when a
     /// later block (the stream start) has none.
-    fn record(&mut self, block: &Value) -> Option<String> {
+    fn record(&mut self, block: &Value, subagent: Option<&str>) -> Option<String> {
         let id = block.get("id").and_then(Value::as_str)?.to_owned();
         let call = self.0.entry(id.clone()).or_default();
+        if let Some(subagent) = subagent {
+            call.subagent_id = Some(subagent.to_owned());
+        }
         if let Some(name) = block.get("name").filter(|name| name.is_string()) {
             call.name = name.clone();
         }
@@ -2008,8 +2068,11 @@ impl ClaudeToolCalls {
         Some(id)
     }
 
-    fn name_if_unknown(&mut self, id: &str, name: Option<&Value>) {
+    fn name_if_unknown(&mut self, id: &str, name: Option<&Value>, subagent: Option<&str>) {
         let call = self.0.entry(id.to_owned()).or_default();
+        if let Some(subagent) = subagent {
+            call.subagent_id = Some(subagent.to_owned());
+        }
         if call.name.is_null() {
             if let Some(name) = name.filter(|name| name.is_string()) {
                 call.name = name.clone();
@@ -2017,9 +2080,12 @@ impl ClaudeToolCalls {
         }
     }
 
-    fn complete(&mut self, block: &Value) -> Option<String> {
+    fn complete(&mut self, block: &Value, subagent: Option<&str>) -> Option<String> {
         let id = block.get("tool_use_id").and_then(Value::as_str)?.to_owned();
         let call = self.0.entry(id.clone()).or_default();
+        if let Some(subagent) = subagent {
+            call.subagent_id = Some(subagent.to_owned());
+        }
         call.result = Some(tool_result_text(block.get("content")));
         call.is_error = Some(
             block
@@ -2039,6 +2105,7 @@ impl ClaudeToolCalls {
             "arguments": call.map_or(&Value::Null, |call| &call.input),
             "result": call.and_then(|call| call.result.as_ref()),
             "isError": call.and_then(|call| call.is_error),
+            "subagentId": call.and_then(|call| call.subagent_id.as_ref()),
             "block": {
                 "category": "tool",
                 "id": id,
@@ -2087,7 +2154,8 @@ async fn handle_stream_event(
             } else {
                 "message.delta"
             };
-            let payload = json!({ "provider": "claude-code", "role": "assistant", "delta": delta });
+            let subagent = message.get("parent_tool_use_id").and_then(Value::as_str);
+            let payload = json!({ "provider": "claude-code", "role": "assistant", "delta": delta, "subagentId": subagent });
             // Only text and thinking merge; tool-argument JSON and signatures
             // stay one event per fragment.
             let text: Option<&'static [&'static str]> = match delta_type {
@@ -2111,7 +2179,8 @@ async fn handle_stream_event(
         "content_block_start" => {
             let content = event.get("content_block").cloned().unwrap_or(Value::Null);
             if content.get("type").and_then(Value::as_str) == Some("tool_use") {
-                if let Some(id) = tools.record(&content) {
+                let subagent = message.get("parent_tool_use_id").and_then(Value::as_str);
+                if let Some(id) = tools.record(&content, subagent) {
                     sink.emit("tool.started", tools.payload(&id, turn_id, "started"))
                         .await?;
                 }

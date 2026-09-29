@@ -31,6 +31,11 @@ optional and canonical aliases are recomputed when old journals are replayed.
   `task_progress`/`task_notification` frames; Codex uses `subAgentActivity` and
   `collabAgentToolCall` items; Grok Build maps `subagent_*` session updates.
   Providers without native subagent signals emit no `subagent.*` events.
+  Claude Code also stamps `subagentId` (the `parent_tool_use_id` of their
+  frames) on every event a subagent produces — `tool.*` snapshots,
+  `message.delta`/`thought.delta` chunks and `message.completed` envelopes.
+  Clients fold those rows into the run's trace detail instead of letting them
+  interrupt or replace the assistant stream they happen to interleave.
 - Memory configuration is separate from memory content; the panel explicitly
   reports when the provider has no readable content source.
 - Streaming is coalesced before it reaches the journal. Text fragments of one
@@ -50,6 +55,10 @@ optional and canonical aliases are recomputed when old journals are replayed.
   `assistant_progress` block ids its text was streamed under. Clients remove
   those progress entries so the answer is shown once. Pi sets it only on final
   (`stop`/`length`) messages; tool-use narration stays as progress.
+  Independently, a `message.completed` whose assistant text already contains
+  the joined text of earlier streamed segments supersedes them: Claude Code
+  emits one envelope per message after its deltas, so steps interleaved with
+  the stream must not leave each fragment beside the full text again.
 - A provider stdout line that is not JSON, or is longer than 4 MiB, does not
   fail the turn. Turn loops journal up to 20 such lines per turn (per session
   for a resident Pi runtime) as `provider.event` with `{kind: "invalid_line",
