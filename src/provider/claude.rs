@@ -3,7 +3,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
@@ -1540,9 +1540,26 @@ async fn run_claude_turn(
     // without answering it. The process stays alive on the open stream, so
     // resend the prompt instead of failing the turn.
     let mut empty_results = 0_u32;
+    // `can_use_tool` waits on the user for up to the permission timeout, so
+    // control requests are answered by detached tasks while this loop keeps
+    // draining stdout — awaiting a prompt inline would let the pipe fill and
+    // freeze the whole Claude process, async subagents included, until its
+    // own stall watchdog kills them. Responses come back through the channel
+    // so `process` stays single-owner. When the turn ends the cancel channel
+    // closes, which resolves any prompt still waiting, and the closed
+    // response channel drops the answer.
+    let (response_tx, mut response_rx) = mpsc::unbounded_channel::<Value>();
     loop {
         let message = tokio::select! {
             message = process.read_frame() => sink.provider_frame(message?).await?,
+            response = response_rx.recv() => {
+                // `response_tx` lives in this scope, so recv() cannot observe
+                // the channel closing while the loop runs.
+                if let Some(response) = response {
+                    process.send(&response).await?;
+                }
+                continue;
+            }
                 changed = cancel.changed() => {
                     let _ = changed;
                     return Ok(DriverTurnResult {
@@ -1685,7 +1702,7 @@ async fn run_claude_turn(
                 }
             }
             Some("control_request") => {
-                handle_control_request(process, message, sink, cancel).await?;
+                spawn_control_request(&response_tx, message, sink, cancel);
             }
             Some("system") => {
                 background_tasks.apply(&message);
@@ -2198,38 +2215,77 @@ async fn handle_stream_event(
     Ok(())
 }
 
-async fn handle_control_request(
-    process: &mut JsonLineProcess,
+/// Answers a control request from a detached task so the read loop keeps
+/// draining stdout while `can_use_tool` waits on the user. Claude matches the
+/// `control_response` by `request_id`, so reply order does not matter. If the
+/// turn ends first, the closed cancel channel resolves the prompt as
+/// cancelled; the closed response channel then drops the answer, which is
+/// safe because the turn's process is already being torn down.
+fn spawn_control_request(
+    responses: &mpsc::UnboundedSender<Value>,
     message: Value,
     sink: &DriverEventSink,
-    cancel: &mut watch::Receiver<bool>,
-) -> Result<(), AppError> {
+    cancel: &watch::Receiver<bool>,
+) {
     let request_id = message
         .get("request_id")
         .or_else(|| message.pointer("/request/request_id"))
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            AppError::InvalidRequest("Claude control request is missing request_id".to_owned())
-        })?;
+        .map(str::to_owned);
     let request = message.get("request").cloned().unwrap_or(Value::Null);
-    let subtype = request
-        .get("subtype")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    if subtype != "can_use_tool" {
-        process
-            .send(&json!({
-                "type": "control_response",
-                "response": {
-                    "subtype": "error",
-                    "request_id": request_id,
-                    "error": "control request is not supported by TodeX"
-                }
-            }))
-            .await?;
-        return Ok(());
-    }
+    let responses = responses.clone();
+    let sink = sink.clone();
+    let mut cancel = cancel.clone();
+    tokio::spawn(async move {
+        let Some(request_id) = request_id else {
+            // Without an id the request cannot be answered at all; keep the
+            // turn alive and log instead of failing it over a malformed frame.
+            tracing::warn!("Claude control request is missing request_id");
+            return;
+        };
+        let outcome = match request.get("subtype").and_then(Value::as_str) {
+            Some("can_use_tool") => {
+                tool_permission_response(&request_id, &request, &sink, &mut cancel).await
+            }
+            _ => Err(AppError::Unsupported(
+                "control request is not supported by TodeX".to_owned(),
+            )),
+        };
+        let response = match outcome {
+            Ok(response) => json!({
+                "subtype": "success",
+                "request_id": request_id,
+                "response": response,
+            }),
+            // A failed prompt still answers Claude with `subtype: "error"` or
+            // it would wait on the response forever.
+            Err(error) => json!({
+                "subtype": "error",
+                "request_id": request_id,
+                "error": error.to_string(),
+            }),
+        };
+        if responses
+            .send(json!({ "type": "control_response", "response": response }))
+            .is_err()
+        {
+            tracing::debug!(
+                request_id,
+                "turn ended before the control response was sent"
+            );
+        }
+    });
+}
 
+/// Waits for the user's decision and builds the `can_use_tool` response body.
+/// Errors mean the prompt itself failed (cancelled, expired, or journal
+/// write), not that the user denied the tool.
+async fn tool_permission_response(
+    request_id: &str,
+    request: &Value,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Value, AppError> {
     let tool_name = request
         .get("tool_name")
         .and_then(Value::as_str)
@@ -2250,12 +2306,7 @@ async fn handle_control_request(
                 )
                 .await?;
             let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
-            return send_permission_response(
-                process,
-                request_id,
-                claude_question_response(&input, &decision),
-            )
-            .await;
+            return Ok(claude_question_response(&input, &decision));
         }
     }
 
@@ -2272,7 +2323,7 @@ async fn handle_control_request(
             cancel,
         )
         .await?;
-    let response = match decision.outcome {
+    Ok(match decision.outcome {
         PermissionOutcome::AllowOnce | PermissionOutcome::AllowAlways => {
             json!({
                 "behavior": "allow",
@@ -2286,25 +2337,7 @@ async fn handle_control_request(
             "behavior": "deny",
             "message": "User rejected this tool request",
         }),
-    };
-    send_permission_response(process, request_id, response).await
-}
-
-async fn send_permission_response(
-    process: &mut JsonLineProcess,
-    request_id: &str,
-    response: Value,
-) -> Result<(), AppError> {
-    process
-        .send(&json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "success",
-                "request_id": request_id,
-                "response": response,
-            }
-        }))
-        .await
+    })
 }
 
 /// Claude's clarifying-question tool. It is answered rather than approved:

@@ -65,6 +65,11 @@ optional and canonical aliases are recomputed when old journals are replayed.
   preview}` (redacted, at most 512 bytes) or `{kind: "oversized_line", bytes}`
   and continue; further lines, and lines read outside a turn loop, are only
   logged. An oversized line is discarded up to its next newline unbuffered.
+- Claude Code control requests (tool permissions and `AskUserQuestion`) are
+  answered by detached tasks while the turn's read loop keeps draining
+  stdout, so an open prompt cannot fill the pipe and freeze the provider —
+  including its async subagents. `control_response` frames are matched by
+  `request_id`, and a turn that ends first resolves the prompt as cancelled.
 - Payloads larger than the append budget (1 MiB − 16 KiB serialized) are
   truncated, not rejected; redaction runs first. The largest strings (over
   512 bytes) are cut on a UTF-8 boundary and end with `…[truncated N bytes]`

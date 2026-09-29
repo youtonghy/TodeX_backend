@@ -2663,6 +2663,31 @@ mod tests {
         .expect("fixture operation should complete");
     }
 
+    /// Polls the journal until an event matches `predicate`; unlike
+    /// `wait_until_idle` this observes progress while a turn is still open.
+    async fn wait_for_journal_event(
+        store: &ConversationStore,
+        conversation_id: &str,
+        predicate: impl Fn(&ConversationEvent) -> bool,
+    ) -> ConversationEvent {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(event) = store
+                    .complete_history(conversation_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|event| predicate(event))
+                {
+                    break event;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expected journal event within the timeout")
+    }
+
     #[tokio::test]
     async fn retry_preserves_complete_request_after_first_page_and_rejects_changed_files() {
         let (root, store, supervisor, workspace) = control_fixture("todex-retry-snapshot").await;
@@ -3481,6 +3506,110 @@ mod tests {
         assert!(serde_json::to_string(&tool.payload)
             .unwrap()
             .contains("[truncated "));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pending_permission_keeps_the_claude_stream_draining() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-permission-drain").await;
+        fs::write(root.join("permission-drain"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+
+        // The fixture writes the marker frame after requesting the tool
+        // permission and only reads the control_response afterwards, so the
+        // marker reaching the journal while the prompt is still open proves
+        // the read loop kept draining stdout instead of blocking on it.
+        let request = wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "permission.requested"
+        })
+        .await;
+        wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "provider.event"
+                && event.payload["providerMethod"] == "fixture_marker"
+        })
+        .await;
+        assert!(supervisor.permissions.has_pending(&manifest.id));
+
+        supervisor
+            .resolve_permission(
+                &manifest.id,
+                request.payload["permissionId"].as_str().unwrap(),
+                PermissionDecision {
+                    outcome: PermissionOutcome::AllowOnce,
+                    option_id: Some("allow_once".to_owned()),
+                    data: None,
+                },
+            )
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(history.iter().any(
+            |event| event.event_type == "turn.completed" && event.payload["turnId"] == turn_id
+        ));
+        let position = |predicate: &dyn Fn(&ConversationEvent) -> bool| {
+            history.iter().position(predicate).unwrap()
+        };
+        let drained = position(&|event| {
+            event.event_type == "provider.event"
+                && event.payload["providerMethod"] == "fixture_marker"
+        });
+        let resolved = position(&|event| event.event_type == "permission.resolved");
+        // The prompt task may emit `permission.requested` after the marker —
+        // what matters is the marker was drained before the decision.
+        assert!(drained < resolved, "{history:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_turn_resolves_an_open_permission_prompt() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-permission-cancel").await;
+        fs::write(root.join("permission-drain"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+        let request = wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "permission.requested"
+        })
+        .await;
+
+        supervisor.cancel(&manifest.id).await.unwrap();
+        wait_until_idle(&supervisor).await;
+        // The detached prompt task is released by the closed cancel channel:
+        // it withdraws the dialog and drops its now-undeliverable response.
+        let resolved = wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "permission.resolved"
+                && event.payload["permissionId"] == request.payload["permissionId"]
+        })
+        .await;
+        assert_eq!(resolved.payload["outcome"], "cancelled");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while supervisor.permissions.has_pending(&manifest.id) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the pending permission is released when the turn ends");
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "turn.cancelled"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4458,6 +4587,23 @@ else
       printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_big","is_error":false,"content":[{"type":"text","text":"'
       head -c 2097152 /dev/zero | tr '\0' y
       printf '"}]}]}}\n'
+    fi
+    if [ -f "$(dirname "$0")/permission-drain" ]; then
+      printf '{"type":"control_request","request_id":"perm-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}\n'
+      # Written while the prompt is still open; the turn completes only if
+      # this frame was drained and the control_response arrives on stdin.
+      printf '{"type":"stream_event","event":{"type":"fixture_marker"}}\n'
+      IFS= read -r reply
+      case "$reply" in
+        *'"request_id":"perm-1"'*)
+          printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"claude fixture"}}}\n'
+          printf '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-native","result":"ok"}\n'
+          ;;
+        *)
+          printf '{"type":"result","subtype":"success","is_error":true,"session_id":"claude-native","result":"missing control response"}\n'
+          ;;
+      esac
+      continue
     fi
     printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"claude fixture"}}}\n'
     printf '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-native","result":"ok"}\n'
