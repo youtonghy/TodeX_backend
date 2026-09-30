@@ -29,14 +29,23 @@ pub struct ClaudeDriver {
 /// Claude Code accepts both family aliases (`opus`) and concrete model ids
 /// (`claude-opus-4-6`) for `--model`. This catalog mirrors the list baked into
 /// the CLI so the picker can offer "latest" plus pinned versions per family.
-/// Models whose `effort` flag is false predate the CLI's effort option; they
-/// get an empty effort list, which disables the slider in clients.
+/// Models with an empty `efforts` slice predate the CLI's effort option and
+/// disable the slider in clients.
+///
+/// `ultracode` is listed like an effort rung the way Claude's own `/effort`
+/// menu presents it; it activates xhigh plus dynamic-workflow orchestration and
+/// only engages when workflows are enabled on an xhigh-capable model. Lower
+/// rungs fall back to the model's ceiling, so gating it here (instead of the
+/// CLI) keeps the picker honest.
+const CLAUDE_EFFORTS_MAX: &[&str] = &["low", "medium", "high", "max"];
+const CLAUDE_EFFORTS_ULTRACODE: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultracode"];
+
 fn claude_model(
     id: &str,
     display_name: &str,
     description: &str,
     family: Option<&str>,
-    effort: bool,
+    efforts: &[&str],
     default_effort: Option<&str>,
     context_window: Option<u64>,
 ) -> super::types::ProviderModelDescriptor {
@@ -45,14 +54,7 @@ fn claude_model(
         display_name: display_name.to_owned(),
         description: description.to_owned(),
         is_default: false,
-        supported_reasoning_efforts: if effort {
-            ["low", "medium", "high", "xhigh", "max"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
-        } else {
-            Vec::new()
-        },
+        supported_reasoning_efforts: efforts.iter().map(|effort| effort.to_string()).collect(),
         default_reasoning_effort: default_effort.map(str::to_owned),
         context_window,
         image_input: Some(true),
@@ -60,13 +62,13 @@ fn claude_model(
     }
 }
 
-// (id, display name, family, effort capable, default effort, context window).
+// (id, display name, family, supported efforts, default effort, context window).
 // Newest first within each family.
 type ClaudeModelSpec = (
     &'static str,
     &'static str,
     &'static str,
-    bool,
+    &'static [&'static str],
     Option<&'static str>,
     Option<u64>,
 );
@@ -75,7 +77,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-opus-5-5",
         "Opus 5.5",
         "opus",
-        true,
+        CLAUDE_EFFORTS_ULTRACODE,
         Some("medium"),
         Some(1_000_000),
     ),
@@ -83,7 +85,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-opus-5",
         "Opus 5",
         "opus",
-        true,
+        CLAUDE_EFFORTS_ULTRACODE,
         Some("high"),
         Some(1_000_000),
     ),
@@ -91,7 +93,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-opus-4-8",
         "Opus 4.8",
         "opus",
-        true,
+        CLAUDE_EFFORTS_ULTRACODE,
         Some("high"),
         Some(1_000_000),
     ),
@@ -99,7 +101,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-opus-4-7",
         "Opus 4.7",
         "opus",
-        true,
+        CLAUDE_EFFORTS_ULTRACODE,
         Some("xhigh"),
         Some(1_000_000),
     ),
@@ -107,7 +109,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-opus-4-6",
         "Opus 4.6",
         "opus",
-        true,
+        CLAUDE_EFFORTS_MAX,
         None,
         Some(200_000),
     ),
@@ -115,7 +117,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-opus-4-5-20251101",
         "Opus 4.5",
         "opus",
-        false,
+        &[],
         None,
         Some(200_000),
     ),
@@ -123,7 +125,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-opus-4-1-20250805",
         "Opus 4.1",
         "opus",
-        false,
+        &[],
         None,
         Some(200_000),
     ),
@@ -131,7 +133,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-opus-4-20250514",
         "Opus 4",
         "opus",
-        false,
+        &[],
         None,
         Some(200_000),
     ),
@@ -139,7 +141,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-sonnet-5-5",
         "Sonnet 5.5",
         "sonnet",
-        true,
+        CLAUDE_EFFORTS_ULTRACODE,
         Some("medium"),
         Some(1_000_000),
     ),
@@ -147,7 +149,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-sonnet-5",
         "Sonnet 5",
         "sonnet",
-        true,
+        CLAUDE_EFFORTS_ULTRACODE,
         Some("high"),
         Some(1_000_000),
     ),
@@ -155,7 +157,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-sonnet-4-6",
         "Sonnet 4.6",
         "sonnet",
-        true,
+        CLAUDE_EFFORTS_MAX,
         None,
         Some(200_000),
     ),
@@ -163,7 +165,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-sonnet-4-5-20250929",
         "Sonnet 4.5",
         "sonnet",
-        false,
+        &[],
         None,
         Some(200_000),
     ),
@@ -171,7 +173,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-sonnet-4-20250514",
         "Sonnet 4",
         "sonnet",
-        false,
+        &[],
         None,
         Some(200_000),
     ),
@@ -179,7 +181,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-3-7-sonnet-20250219",
         "Sonnet 3.7",
         "sonnet",
-        false,
+        &[],
         None,
         None,
     ),
@@ -187,7 +189,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-3-5-sonnet-20241022",
         "Sonnet 3.5",
         "sonnet",
-        false,
+        &[],
         None,
         None,
     ),
@@ -195,7 +197,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-fable-5-1",
         "Fable 5.1",
         "fable",
-        true,
+        CLAUDE_EFFORTS_ULTRACODE,
         Some("high"),
         Some(1_000_000),
     ),
@@ -203,7 +205,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-fable-5",
         "Fable 5",
         "fable",
-        true,
+        CLAUDE_EFFORTS_ULTRACODE,
         Some("high"),
         Some(1_000_000),
     ),
@@ -211,7 +213,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-haiku-4-5-20251001",
         "Haiku 4.5",
         "haiku",
-        false,
+        &[],
         None,
         Some(200_000),
     ),
@@ -219,7 +221,7 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         "claude-3-5-haiku-20241022",
         "Haiku 3.5",
         "haiku",
-        false,
+        &[],
         None,
         None,
     ),
@@ -236,27 +238,40 @@ const CLAUDE_FAMILY_ALIASES: &[(&str, &str)] = &[
 
 fn claude_model_aliases() -> Vec<super::types::ProviderModelDescriptor> {
     let mut models = vec![claude_model(
-        "default", "default", "Opus 5", None, true, None, None,
+        "default",
+        "default",
+        "Opus 5",
+        None,
+        CLAUDE_EFFORTS_ULTRACODE,
+        None,
+        None,
     )];
     models[0].is_default = true;
     for (alias, resolves_to) in CLAUDE_FAMILY_ALIASES {
+        // Haiku tops out below xhigh; its alias keeps effort selection but not
+        // the tiers the family cannot run.
+        let alias_efforts = if *alias == "haiku" {
+            CLAUDE_EFFORTS_MAX
+        } else {
+            CLAUDE_EFFORTS_ULTRACODE
+        };
         models.push(claude_model(
             alias,
             alias,
             resolves_to,
             Some(alias),
-            true,
+            alias_efforts,
             None,
             None,
         ));
         models.extend(CLAUDE_MODELS.iter().filter(|entry| entry.2 == *alias).map(
-            |(id, name, family, effort, default_effort, context_window)| {
+            |(id, name, family, efforts, default_effort, context_window)| {
                 claude_model(
                     id,
                     name,
                     "",
                     Some(*family),
-                    *effort,
+                    efforts,
                     *default_effort,
                     *context_window,
                 )
@@ -264,6 +279,18 @@ fn claude_model_aliases() -> Vec<super::types::ProviderModelDescriptor> {
         ));
     }
     models
+}
+
+/// Effort rungs for a gateway-discovered id: pinned entries reuse their
+/// spec, and unknown ids in xhigh-capable families postdate the pinned list.
+fn claude_discovered_efforts(id: &str) -> &'static [&'static str] {
+    if let Some(spec) = CLAUDE_MODELS.iter().find(|entry| entry.0 == id) {
+        return spec.3;
+    }
+    match claude_model_family(id).as_deref() {
+        Some("opus") | Some("sonnet") | Some("fable") => CLAUDE_EFFORTS_ULTRACODE,
+        _ => CLAUDE_EFFORTS_MAX,
+    }
 }
 
 /// Maps a Claude model id to its picker family so discovered catalogs (for
@@ -359,6 +386,7 @@ impl ProviderDriver for ClaudeDriver {
             .filter_map(|item| {
                 let id = item.get("id").and_then(Value::as_str)?.to_owned();
                 let family = claude_model_family(&id);
+                let efforts = claude_discovered_efforts(&id);
                 Some(super::types::ProviderModelDescriptor {
                     display_name: item
                         .get("display_name")
@@ -369,9 +397,9 @@ impl ProviderDriver for ClaudeDriver {
                     id,
                     description: "Claude gateway model".to_owned(),
                     is_default: false,
-                    supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"]
-                        .into_iter()
-                        .map(str::to_owned)
+                    supported_reasoning_efforts: efforts
+                        .iter()
+                        .map(|effort| effort.to_string())
                         .collect(),
                     default_reasoning_effort: None,
                     context_window: item
@@ -1073,7 +1101,7 @@ mod tests {
         assert_eq!(models[0].id, "default");
         assert_eq!(
             models[0].supported_reasoning_efforts,
-            ["low", "medium", "high", "xhigh", "max"]
+            ["low", "medium", "high", "xhigh", "max", "ultracode"]
         );
         // Versioned entries tag their family; aliases sit inside their own
         // family so clients can render "latest" plus pinned versions.
@@ -1085,6 +1113,20 @@ mod tests {
             .unwrap();
         assert_eq!(opus_45.family.as_deref(), Some("opus"));
         assert!(opus_45.supported_reasoning_efforts.is_empty());
+        // ultracode needs xhigh: max-capped models stop below it.
+        let opus_46 = models
+            .iter()
+            .find(|model| model.id == "claude-opus-4-6")
+            .unwrap();
+        assert_eq!(
+            opus_46.supported_reasoning_efforts,
+            ["low", "medium", "high", "max"]
+        );
+        let haiku = models.iter().find(|model| model.id == "haiku").unwrap();
+        assert!(!haiku
+            .supported_reasoning_efforts
+            .iter()
+            .any(|effort| effort == "ultracode" || effort == "xhigh"));
         let opus_55 = models
             .iter()
             .find(|model| model.id == "claude-opus-5-5")
