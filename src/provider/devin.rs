@@ -720,7 +720,9 @@ async fn initialize_process(process: &mut JsonLineProcess) -> Result<Value, AppE
         "initialize",
         json!({
         "protocolVersion":1,
-        "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"configOptions":{}}},
+        // `cognition.ai/subagentSupport` opts this client into the
+        // `cognition.ai/subagent_*` `_meta` markers on `session/update`.
+        "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"configOptions":{}},"_meta":{"cognition.ai/subagentSupport":true}},
         "clientInfo":{"name":"todex-agentd","title":"TodeX 2.0","version":crate::version::APP_VERSION},
         }),
         DIAGNOSTIC_TIMEOUT,

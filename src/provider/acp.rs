@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -192,7 +192,12 @@ impl ProviderDriver for AcpDriver {
         let spec = acp_command_spec(&profile, &context.manifest.workspace);
         let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
         let result = async {
-            let request_id = send_request(&mut process, "initialize", initialize_request()).await?;
+            let request_id = send_request(
+                &mut process,
+                "initialize",
+                initialize_request(ProviderKind::Acp),
+            )
+            .await?;
             let initialize = acp_control_response(&mut process, &request_id).await?;
             let capable = declares_session_fork(&initialize);
             self.fork_probe
@@ -260,7 +265,12 @@ impl ProviderDriver for AcpDriver {
         let spec = acp_command_spec(profile, workspace);
         let mut process = JsonLineProcess::spawn(&spec).await?;
         let result = async {
-            let request_id = send_request(&mut process, "initialize", initialize_request()).await?;
+            let request_id = send_request(
+                &mut process,
+                "initialize",
+                initialize_request(ProviderKind::Acp),
+            )
+            .await?;
             loop {
                 let Some(message) = process.read().await? else {
                     break Err(
@@ -374,7 +384,12 @@ async fn probe_fork_capability(profile: &AcpProfileConfig) -> bool {
         let spec = acp_command_spec(profile, &std::env::temp_dir());
         let mut process = JsonLineProcess::spawn(&spec).await?;
         let result = async {
-            let request_id = send_request(&mut process, "initialize", initialize_request()).await?;
+            let request_id = send_request(
+                &mut process,
+                "initialize",
+                initialize_request(ProviderKind::Acp),
+            )
+            .await?;
             let initialize = acp_control_response(&mut process, &request_id).await?;
             Ok::<_, AppError>(declares_session_fork(&initialize))
         }
@@ -439,14 +454,22 @@ async fn acp_control_response(
     }
 }
 
-fn initialize_request() -> InitializeRequest {
+fn initialize_request(provider: ProviderKind) -> InitializeRequest {
+    let capabilities = ClientCapabilities::new().session(
+        ClientSessionCapabilities::new().config_options(SessionConfigOptionsCapabilities::new()),
+    );
     InitializeRequest::new(ProtocolVersion::V1)
-        .client_capabilities(
-            ClientCapabilities::new().session(
-                ClientSessionCapabilities::new()
-                    .config_options(SessionConfigOptionsCapabilities::new()),
-            ),
-        )
+        .client_capabilities(match provider {
+            // Devin only streams subagent lifecycle (`subagent_started` /
+            // `subagent_completed`) and ownership (`subagent_context`) markers
+            // to clients that opt in through `clientCapabilities._meta`.
+            ProviderKind::Devin => {
+                let mut meta = serde_json::Map::new();
+                meta.insert("cognition.ai/subagentSupport".to_owned(), Value::Bool(true));
+                capabilities.meta(meta)
+            }
+            _ => capabilities,
+        })
         .client_info(
             Implementation::new("todex-agentd", crate::version::APP_VERSION).title("TodeX 2.0"),
         )
@@ -470,6 +493,11 @@ pub(super) struct AcpConnectionState {
     /// terminal status replaces it.
     tool_pending: BTreeMap<String, (DriverEventSink, Value)>,
     tool_emitted_at: BTreeMap<String, tokio::time::Instant>,
+    /// Devin tracks each subagent on a pseudo `tool_call_update` whose
+    /// `toolCallId` equals the agent id: updates between the `subagent_started`
+    /// and `subagent_completed` `_meta` markers map to `subagent.updated`
+    /// instead of tool progress.
+    subagents: BTreeSet<String>,
 }
 
 /// Minimum spacing between in-progress snapshots of one tool call. Streaming
@@ -607,7 +635,7 @@ async fn run_acp_turn_steps(
     let initialize_value = if let Some(initialize) = &connection.initialize {
         initialize.clone()
     } else {
-        let request_id = send_request(process, "initialize", initialize_request()).await?;
+        let request_id = send_request(process, "initialize", initialize_request(provider)).await?;
         let initialize = wait_for_response(
             process,
             &request_id,
@@ -1787,8 +1815,16 @@ pub(super) async fn handle_acp_message(
         {
             return Ok(());
         }
+        if provider == ProviderKind::Devin {
+            if let Some((event_type, payload)) =
+                devin_subagent_update(update_type, &update, params.get("sessionId"), connection)
+            {
+                sink.emit(event_type, payload).await?;
+                return Ok(());
+            }
+        }
         let provider_id = provider.as_str();
-        let (event_type, payload) = match update_type {
+        let (event_type, mut payload) = match update_type {
             "agent_message_chunk" => (
                 "message.delta",
                 json!({ "provider": provider_id, "role": "assistant", "content": update.get("content") }),
@@ -1836,12 +1872,20 @@ pub(super) async fn handle_acp_message(
                     normalized["status"] = json!(status);
                     normalized["isError"] = json!(status == "failed");
                 }
+                normalized["provider"] = json!(provider_id);
+                // A subagent's own tool calls carry `subagent_context`; tag
+                // them before caching/throttling so queued snapshots keep
+                // ownership.
+                if provider == ProviderKind::Devin {
+                    if let Some(agent_id) = devin_subagent_context(&update) {
+                        normalized["subagentId"] = json!(agent_id);
+                    }
+                }
                 if !tool_id.is_empty() {
                     connection
                         .tools
                         .insert(tool_id.to_owned(), normalized.clone());
                 }
-                normalized["provider"] = json!(provider_id);
                 if update_type == "tool_call" {
                     // The raw call is only a preview fallback when there are no
                     // arguments; otherwise `rawInput`/`content` repeat them, and
@@ -1932,6 +1976,11 @@ pub(super) async fn handle_acp_message(
                 json!({ "provider": provider_id, "providerMethod": method, "metadata": update }),
             ),
         };
+        if provider == ProviderKind::Devin {
+            if let Some(agent_id) = devin_subagent_context(&update) {
+                payload["subagentId"] = json!(agent_id);
+            }
+        }
         if matches!(event_type, "message.delta" | "thought.delta")
             && payload.pointer("/content/type").and_then(Value::as_str) == Some("text")
         {
@@ -2170,6 +2219,133 @@ fn normalize_devin_usage(raw: &Value) -> Value {
         "contextWindow": pick(&["size", "contextWindow", "contextTokens"]),
         "raw": raw,
     })
+}
+
+/// `_meta` key Devin stamps on the pseudo tool call tracking a spawned
+/// subagent: `subagent_started` opens the run (`agentId`, `title`, `task`,
+/// `profile`, `model`, `isBackground`, `depth`) and `subagent_completed`
+/// closes it (`success`, `summary`). Between the markers the same
+/// `toolCallId` — equal to the agent id — reports bare status transitions.
+const DEVIN_SUBAGENT_STARTED: &str = "/_meta/cognition.ai~1subagent_started";
+const DEVIN_SUBAGENT_COMPLETED: &str = "/_meta/cognition.ai~1subagent_completed";
+/// `_meta` key naming the owning agent on every update a subagent produces;
+/// the root agent's own updates carry `"root"`.
+const DEVIN_SUBAGENT_CONTEXT: &str = "/_meta/cognition.ai~1subagent_context/parentAgentId";
+
+/// The agent a Devin update belongs to, or `None` for the root agent's own
+/// updates.
+fn devin_subagent_context(update: &Value) -> Option<&str> {
+    update
+        .pointer(DEVIN_SUBAGENT_CONTEXT)
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && *id != "root")
+}
+
+/// Maps a Devin subagent lifecycle update to a `subagent.*` event. Claims the
+/// lifecycle pseudo tool call and subagent-scoped `usage_update` snapshots;
+/// every other update (including the subagent's own real tool calls) returns
+/// `None` so the normal dispatch handles it.
+fn devin_subagent_update(
+    update_type: &str,
+    update: &Value,
+    session_id: Option<&Value>,
+    connection: &mut AcpConnectionState,
+) -> Option<(&'static str, Value)> {
+    let provider_id = ProviderKind::Devin.as_str();
+    if update_type == "usage_update" {
+        // A subagent's context usage belongs on its run, not the turn total.
+        return Some((
+            "subagent.updated",
+            json!({
+                "provider": provider_id, "source": "provider", "scope": "message",
+                "nativeSessionId": session_id, "subagentId": devin_subagent_context(update)?,
+                "usage": normalize_devin_usage(update), "metadata": update,
+            }),
+        ));
+    }
+    if !matches!(update_type, "tool_call" | "tool_call_update") {
+        return None;
+    }
+    let tool_id = update
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if let Some(started) = update.pointer(DEVIN_SUBAGENT_STARTED) {
+        let agent_id = started
+            .get("agentId")
+            .and_then(Value::as_str)
+            .unwrap_or(tool_id);
+        if agent_id.is_empty() {
+            return None;
+        }
+        connection.subagents.insert(agent_id.to_owned());
+        return Some((
+            "subagent.started",
+            json!({
+                "provider": provider_id, "source": "provider", "scope": "message",
+                "nativeSessionId": session_id,
+                "subagentId": agent_id, "providerItemId": tool_id, "agentId": agent_id,
+                "agentKind": started.get("profile"),
+                "title": started.get("title"), "task": started.get("task"),
+                "status": "running", "metadata": started,
+            }),
+        ));
+    }
+    if let Some(finished) = update.pointer(DEVIN_SUBAGENT_COMPLETED) {
+        let agent_id = finished
+            .get("agentId")
+            .and_then(Value::as_str)
+            .unwrap_or(tool_id);
+        if agent_id.is_empty() {
+            return None;
+        }
+        connection.subagents.remove(agent_id);
+        let success = finished
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let summary = finished.get("summary");
+        return Some((
+            if success {
+                "subagent.completed"
+            } else {
+                "subagent.failed"
+            },
+            json!({
+                "provider": provider_id, "source": "provider", "scope": "message",
+                "nativeSessionId": session_id,
+                "subagentId": agent_id, "providerItemId": tool_id, "agentId": agent_id,
+                "status": if success { "completed" } else { "failed" },
+                "result": success.then_some(summary),
+                "error": (!success).then_some(summary),
+                "metadata": finished,
+            }),
+        ));
+    }
+    if tool_id.is_empty() || !connection.subagents.contains(tool_id) {
+        return None;
+    }
+    let status = update.get("status").and_then(Value::as_str);
+    let event = match status {
+        Some("completed") => "subagent.completed",
+        Some("failed") => "subagent.failed",
+        Some("cancelled") => "subagent.cancelled",
+        _ => "subagent.updated",
+    };
+    if event != "subagent.updated" {
+        connection.subagents.remove(tool_id);
+    }
+    Some((
+        event,
+        json!({
+            "provider": provider_id, "source": "provider", "scope": "message",
+            "nativeSessionId": session_id,
+            "subagentId": tool_id, "providerItemId": tool_id,
+            "status": status,
+            "result": acp_tool_output_text(update),
+            "metadata": update,
+        }),
+    ))
 }
 
 fn grok_activity_event(params: &Value) -> Option<(&'static str, Value)> {
@@ -3372,6 +3548,136 @@ mod tests {
             types.push(event.event_type);
         }
         assert_eq!(types, ["provider.commands.updated"]);
+        process.terminate().await;
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn initialize_advertises_subagent_support_only_for_devin() {
+        let devin = serde_json::to_value(initialize_request(ProviderKind::Devin)).unwrap();
+        assert_eq!(
+            devin.pointer("/clientCapabilities/_meta/cognition.ai~1subagentSupport"),
+            Some(&json!(true))
+        );
+        for provider in [
+            ProviderKind::Acp,
+            ProviderKind::GrokBuild,
+            ProviderKind::Opencode,
+        ] {
+            let request = serde_json::to_value(initialize_request(provider)).unwrap();
+            assert!(request.pointer("/clientCapabilities/_meta").is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn devin_subagent_updates_emit_lifecycle_and_owned_events() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-acp-subagent-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = crate::conversation::ConversationStore::new(root.join("data"))
+            .await
+            .unwrap();
+        let manifest = store
+            .create(crate::conversation::ConversationManifest::new(
+                ProviderKind::Devin,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let sink = DriverEventSink::new(
+            store.clone(),
+            crate::conversation::ConversationEventHub::default(),
+            crate::provider::types::PermissionBroker::default(),
+            &manifest.id,
+        )
+        .with_turn_id("turn-1");
+        let mut process = JsonLineProcess::spawn(&CommandSpec::new("/bin/cat", &root))
+            .await
+            .unwrap();
+        let (_tx, mut cancel) = watch::channel(false);
+        let mut connection = AcpConnectionState::default();
+        let update = |update: Value| json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":update}});
+        for message in [
+            update(
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"a1","status":"in_progress",
+                "_meta":{"cognition.ai/subagent_started":{"agentId":"a1","title":"List files","task":"list files","profile":"Explore","isBackground":true,"model":"SWE-2 High","depth":1}}}),
+            ),
+            update(
+                json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"sub"},
+                "_meta":{"cognition.ai/subagent_context":{"parentAgentId":"a1"}}}),
+            ),
+            update(
+                json!({"sessionUpdate":"tool_call","toolCallId":"t9","title":"Ran ls","kind":"execute",
+                "_meta":{"cognition.ai/subagent_context":{"parentAgentId":"a1"}}}),
+            ),
+            update(json!({"sessionUpdate":"usage_update","used":10,"size":100,
+                "_meta":{"cognition.ai/subagent_context":{"parentAgentId":"a1"},"cognition.ai/inputTokens":10}})),
+            update(
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"a1","status":"in_progress"}),
+            ),
+            update(
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"a1","status":"completed",
+                "_meta":{"cognition.ai/subagent_completed":{"agentId":"a1","success":true,"summary":"done","depth":1}}}),
+            ),
+            // The root agent's own updates are tagged `root` and must not be
+            // attributed to a subagent.
+            update(
+                json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"root"},
+                "_meta":{"cognition.ai/subagent_context":{"parentAgentId":"root"}}}),
+            ),
+        ] {
+            handle_acp_message(
+                &mut process,
+                message,
+                &sink,
+                &mut cancel,
+                ProviderKind::Devin,
+                true,
+                AutoApprove::Mediate,
+                &mut connection,
+            )
+            .await
+            .unwrap();
+        }
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let events: Vec<_> = history
+            .iter()
+            .map(|event| (event.event_type.as_str(), event.payload.clone()))
+            .collect();
+        assert_eq!(
+            events.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            [
+                "subagent.started",
+                "message.delta",
+                "tool.started",
+                "subagent.updated",
+                "subagent.updated",
+                "subagent.completed",
+                "message.delta",
+            ]
+        );
+        let started = &events[0].1;
+        assert_eq!(started["subagentId"], "a1");
+        assert_eq!(started["title"], "List files");
+        assert_eq!(started["task"], "list files");
+        assert_eq!(started["agentKind"], "Explore");
+        assert_eq!(started["metadata"]["isBackground"], true);
+        assert_eq!(events[1].1["subagentId"], "a1");
+        assert_eq!(events[2].1["subagentId"], "a1");
+        assert_eq!(events[2].1["toolCallId"], "t9");
+        assert_eq!(events[3].1["subagentId"], "a1");
+        assert_eq!(events[3].1["usage"]["total"], 10);
+        assert_eq!(events[4].1["status"], "in_progress");
+        assert_eq!(events[5].1["result"], "done");
+        assert_eq!(events[5].1["status"], "completed");
+        assert!(events[6].1.get("subagentId").is_none());
+        assert!(connection.subagents.is_empty());
         process.terminate().await;
         std::fs::remove_dir_all(&root).unwrap();
     }

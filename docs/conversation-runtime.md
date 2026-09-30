@@ -29,11 +29,18 @@ optional and canonical aliases are recomputed when old journals are replayed.
   `providerItemId`, `agentKind`, `agentId`, `result`, `error` and `metadata`.
   Claude Code surfaces Task/Agent tool calls plus `task_started`/
   `task_progress`/`task_notification` frames; Codex uses `subAgentActivity` and
-  `collabAgentToolCall` items; Grok Build maps `subagent_*` session updates.
+  `collabAgentToolCall` items; Grok Build maps `subagent_*` session updates;
+  Devin (once the client advertises `cognition.ai/subagentSupport` in the ACP
+  `initialize` capabilities `_meta`) tracks each subagent on a pseudo
+  `tool_call_update` whose `toolCallId` is the agent id and whose `_meta`
+  carries `cognition.ai/subagent_started` / `subagent_completed` markers.
   Providers without native subagent signals emit no `subagent.*` events.
   Claude Code also stamps `subagentId` (the `parent_tool_use_id` of their
   frames) on every event a subagent produces — `tool.*` snapshots,
-  `message.delta`/`thought.delta` chunks and `message.completed` envelopes.
+  `message.delta`/`thought.delta` chunks and `message.completed` envelopes;
+  Devin does the same through each update's
+  `_meta["cognition.ai/subagent_context"].parentAgentId`, and a subagent's
+  `usage_update` lands on the run instead of the turn total.
   Clients fold those rows into the run's trace detail instead of letting them
   interrupt or replace the assistant stream they happen to interleave.
 - Memory configuration is separate from memory content; the panel explicitly
