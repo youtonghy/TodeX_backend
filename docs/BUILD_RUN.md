@@ -6,7 +6,7 @@
 
 - 包名：`todex-agentd`
 - 非交互运行入口：`cargo run -- serve`
-- 后台 daemon 控制入口：`cargo run -- daemon start|stop|restart|status`
+- 后台 daemon 控制入口：`cargo run -- daemon start|stop|restart|status|autostart`
 - 交互式 TUI 启动入口：`cargo run -- tui`
 - 默认监听：`127.0.0.1:7345`
 - 默认 WebSocket：`ws://127.0.0.1:7345/v2/ws`
@@ -284,6 +284,16 @@ cargo run -- daemon stop
 
 daemon 启动后会写入 `~/.todex-agent/daemon.json`，日志写入 `~/.todex-agent/logs/todex-agentd-daemon.log`。`daemon start`、`restart` 和 `status` 会在监听地址下方逐行列出客户端可用的连接地址（`connect: ws://<IP>:<端口>/v2/ws (<网卡>)`）。
 
+登录时自动启动 daemon（开机自启）：
+
+```bash
+cargo run -- daemon autostart enable    # 注册登录自启（可选 --host/--port/--data-dir 等覆盖）
+cargo run -- daemon autostart status    # 查看是否已注册
+cargo run -- daemon autostart disable   # 取消
+```
+
+macOS 注册 `~/Library/LaunchAgents/com.todex.agentd.plist`（launchd `RunAtLoad`），Linux 注册 `~/.config/systemd/user/todex-agentd.service` 并 `systemctl --user enable`（同时尝试 `loginctl enable-linger`，失败则只在登录时启动），Windows 写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\TodeXAgentd`。注册项都以前台 `daemon-run` 启动，参数与当时解析出的配置一致；`daemon stop`/`status` 对这种启动方式照常生效。修改配置后需要重新 `autostart enable` 让新参数生效。
+
 前台运行：
 
 ```bash
@@ -302,6 +312,7 @@ TUI 是 daemon 控制器，不再承载核心服务进程。可以在界面里�
 | --- | --- |
 | `s` | 启动或停止 daemon |
 | `r` | 重启 daemon |
+| `a` | 切换开机自启（登录时自动启动 daemon） |
 | `h` | 修改监听 IP |
 | `p` | 修改监听端口 |
 | `w` | 打开 workspace 根目录选择器，并保存到 `$TODEX_AGENTD_DATA_DIR/config.toml` |

@@ -5,6 +5,7 @@
 #   install.sh install        Same as above
 #   install.sh update         Update an existing install to the latest release
 #   install.sh uninstall      Stop the daemon and remove the installed binary
+#                             (its login autostart entry is removed too)
 #   install.sh status         Show installed version, latest release, and daemon state
 #
 # Options:
@@ -62,7 +63,8 @@ One-click manager for todex-agentd on macOS, Linux, and WSL.
   install.sh                Install the latest release (or update an existing install)
   install.sh install        Same as above
   install.sh update         Update an existing install to the latest release
-  install.sh uninstall      Stop the daemon and remove the installed binary
+  install.sh uninstall      Stop the daemon, remove the login autostart entry,
+                            and remove the installed binary
   install.sh status         Show installed version, latest release, and daemon state
 
 Options:
@@ -476,6 +478,8 @@ cmd_uninstall() {
     if [[ -e "$BIN_PATH" ]]; then
         found=1
         acquire_lock
+        # A leftover launchd/systemd entry would try to start a deleted binary.
+        "$BIN_PATH" daemon autostart disable >/dev/null 2>&1 || true
         if daemon_running; then
             stop_daemon || die "could not stop the running daemon; stop it manually, then retry"
         fi
@@ -522,6 +526,10 @@ cmd_status() {
         "$BIN_PATH" daemon status || true
     else
         printf 'Daemon      : not running\n'
+    fi
+    if [[ -x "$BIN_PATH" ]]; then
+        printf 'Autostart   : %s\n' \
+            "$("$BIN_PATH" daemon autostart status 2>/dev/null | sed -n 's/^Autostart //p' | head -n1 || true)"
     fi
     printf 'Data dir    : %s\n' "$DATA_DIR"
 }

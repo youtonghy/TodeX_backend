@@ -23,6 +23,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
+use crate::autostart;
 use crate::config::{Config, PairingEncryption, ServeArgs};
 use crate::daemon::{self, DaemonProcess};
 use crate::event::EventRecord;
@@ -30,7 +31,7 @@ use crate::listen_addrs::{self, ConnectAddress};
 use crate::transport_crypto::{render_qr_text_for_bounds, PairingKeys};
 use crate::workspace_paths::canonical_workspace_root;
 
-const ACTION_COUNT: usize = 12;
+const ACTION_COUNT: usize = 13;
 const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
@@ -353,6 +354,7 @@ struct TuiApp {
     daemon_op: Option<DaemonOpKind>,
     daemon_op_pending: Option<PendingDaemonOp>,
     daemon_op_failures: u32,
+    autostart_enabled: bool,
     daemon_status_refreshed_at: Option<Instant>,
     /// Client-reachable addresses for the listen host, or the enumeration error.
     connect_addresses: Result<Vec<ConnectAddress>, String>,
@@ -405,6 +407,9 @@ impl TuiApp {
             daemon_op: None,
             daemon_op_pending: None,
             daemon_op_failures: 0,
+            autostart_enabled: autostart::status()
+                .map(|registration| registration.enabled)
+                .unwrap_or(false),
             daemon_status_refreshed_at: None,
             connect_addresses: Ok(Vec::new()),
             connect_addresses_host: String::new(),
@@ -1223,6 +1228,7 @@ impl TuiApp {
             }
             KeyCode::Char('s') => self.toggle_daemon(),
             KeyCode::Char('r') => self.queue_daemon_op(DaemonOpKind::Restart),
+            KeyCode::Char('a') => self.toggle_autostart(),
             KeyCode::Char('h') => self.start_host_edit(),
             KeyCode::Char('p') => self.start_port_edit(),
             KeyCode::Char('w') => self.start_workspace_roots_manager(),
@@ -1353,16 +1359,17 @@ impl TuiApp {
         match self.selected_action {
             0 => self.toggle_daemon(),
             1 => self.queue_daemon_op(DaemonOpKind::Restart),
-            2 => self.start_host_edit(),
-            3 => self.start_port_edit(),
-            4 => self.start_workspace_roots_manager(),
-            5 => self.start_pairing_encryption_edit(),
-            6 => self.start_reset_edit(),
-            7 => self.show_pairing_qr().await,
-            8 => self.show_credentials().await,
-            9 => self.toggle_language(),
-            10 => self.open_device_pairing(),
-            11 => return Ok(true),
+            2 => self.toggle_autostart(),
+            3 => self.start_host_edit(),
+            4 => self.start_port_edit(),
+            5 => self.start_workspace_roots_manager(),
+            6 => self.start_pairing_encryption_edit(),
+            7 => self.start_reset_edit(),
+            8 => self.show_pairing_qr().await,
+            9 => self.show_credentials().await,
+            10 => self.toggle_language(),
+            11 => self.open_device_pairing(),
+            12 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -1373,6 +1380,38 @@ impl TuiApp {
             self.queue_daemon_op(DaemonOpKind::Stop);
         } else {
             self.queue_daemon_op(DaemonOpKind::Start);
+        }
+    }
+
+    fn toggle_autostart(&mut self) {
+        let result = if self.autostart_enabled {
+            autostart::disable()
+        } else {
+            autostart::enable(&self.config)
+        };
+        match result {
+            Ok(registration) => {
+                self.autostart_enabled = registration.enabled;
+                self.last_error = None;
+                self.notice = if registration.enabled {
+                    self.text(
+                        "The daemon will start automatically at login.",
+                        "已开启开机自启，daemon 将在登录后启动。",
+                    )
+                } else {
+                    self.text("Autostart at login is disabled.", "已关闭开机自启。")
+                }
+                .to_owned();
+                if let Some(note) = registration.note {
+                    self.push_log(format!("note: {note}"));
+                }
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                self.notice = self
+                    .text("Failed to change autostart.", "开机自启设置失败。")
+                    .to_owned();
+            }
         }
     }
 
@@ -1575,6 +1614,11 @@ impl TuiApp {
             return;
         }
         self.daemon_status_refreshed_at = Some(Instant::now());
+        // Cheap filesystem checks on Unix; pick up `autostart` changes made
+        // from the CLI or install.sh while the TUI is open.
+        if let Ok(registration) = autostart::status() {
+            self.autostart_enabled = registration.enabled;
+        }
         let previous_pid = self.daemon.as_ref().map(|process| process.pid);
         match daemon::status(&self.config) {
             Ok(next) => {
@@ -2477,9 +2521,15 @@ impl TuiApp {
         } else {
             self.text("Start daemon", "启动 daemon")
         };
+        let autostart = if self.autostart_enabled {
+            self.text("Launch at login: on", "开机自启：开")
+        } else {
+            self.text("Launch at login: off", "开机自启：关")
+        };
         let actions = [
             start_stop,
             self.text("Restart daemon", "重启 daemon"),
+            autostart,
             self.text("Edit listen IP", "编辑监听 IP"),
             self.text("Edit listen port", "编辑监听端口"),
             self.text("Manage workspace roots", "管理工作区根目录"),
@@ -2491,7 +2541,9 @@ impl TuiApp {
             self.text("Device verification", "设备验证"),
             self.text("Quit", "退出"),
         ];
-        let shortcuts = ["s", "r", "h", "p", "w", "e", "x", "g", "c", "l", "d", "q"];
+        let shortcuts = [
+            "s", "r", "a", "h", "p", "w", "e", "x", "g", "c", "l", "d", "q",
+        ];
         let items = actions
             .iter()
             .enumerate()
@@ -4201,8 +4253,9 @@ mod tests {
                         .iter()
                         .map(|cell| cell.symbol())
                         .collect::<String>();
-                    let shortcut =
-                        ["s", "r", "h", "p", "w", "e", "x", "g", "c", "l", "d", "q"][selected];
+                    let shortcut = [
+                        "s", "r", "a", "h", "p", "w", "e", "x", "g", "c", "l", "d", "q",
+                    ][selected];
                     assert!(
                         contents.contains(&format!("> [{shortcut}]")),
                         "selected {selected} missing at {width}x{height}"
@@ -4699,7 +4752,7 @@ mod tests {
         assert_eq!(TuiLanguage::parse("invalid"), None);
         assert_eq!(TuiLanguage::Chinese.as_str(), "zh-CN");
         assert_eq!(TuiLanguage::English.as_str(), "en");
-        assert_eq!(ACTION_COUNT, 12);
+        assert_eq!(ACTION_COUNT, 13);
     }
 
     #[test]

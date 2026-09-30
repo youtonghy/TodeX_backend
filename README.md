@@ -167,6 +167,9 @@ cargo run -- daemon restart
 
 # Stop daemon
 cargo run -- daemon stop
+
+# Start automatically at login (launchd/systemd user service/registry Run key)
+cargo run -- daemon autostart enable   # status / disable to query or remove
 ```
 
 ---

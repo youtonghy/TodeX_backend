@@ -160,6 +160,9 @@ cargo run -- daemon restart
 
 # 停止守护进程
 cargo run -- daemon stop
+
+# 开机自启（登录时自动启动；launchd/systemd 用户服务/注册表 Run 键）
+cargo run -- daemon autostart enable   # status / disable 查询或取消
 ```
 
 ---

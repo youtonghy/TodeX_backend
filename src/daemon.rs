@@ -104,6 +104,24 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
     }
 }
 
+/// The `daemon-run` arguments every supervised launch receives; `daemon
+/// start` and the `autostart` login registration must agree on them.
+pub fn daemon_run_args(config: &Config) -> Vec<std::ffi::OsString> {
+    let mut args = vec![
+        "--host".into(),
+        config.host.clone().into(),
+        "--port".into(),
+        config.port.to_string().into(),
+        "--data-dir".into(),
+        config.data_dir.clone().into_os_string(),
+    ];
+    for root in &config.workspace_roots {
+        args.push("--workspace-root".into());
+        args.push(root.clone().into_os_string());
+    }
+    args
+}
+
 /// Adds the resolved configuration, sends output to the daemon log, and puts
 /// the child in its own process group so it outlives its parent.
 fn detach_with_config(command: &mut Command, config: &Config) -> Result<()> {
@@ -114,16 +132,7 @@ fn detach_with_config(command: &mut Command, config: &Config) -> Result<()> {
         .open(&log_path)
         .with_context(|| format!("failed to open daemon log {}", log_path.display()))?;
     set_owner_only_file(&log_path)?;
-    command
-        .arg("--host")
-        .arg(&config.host)
-        .arg("--port")
-        .arg(config.port.to_string())
-        .arg("--data-dir")
-        .arg(&config.data_dir);
-    for root in &config.workspace_roots {
-        command.arg("--workspace-root").arg(root);
-    }
+    command.args(daemon_run_args(config));
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().with_context(|| {
@@ -242,6 +251,10 @@ pub fn status(config: &Config) -> Result<Option<DaemonProcess>> {
 }
 
 pub async fn run(config: Config) -> Result<()> {
+    // A supervisor (launchd/systemd) may restart this process after a crash
+    // that left the pid file behind; clear it when the recorded process is
+    // gone so the restart can claim it.
+    remove_stale_pid_file(&config.data_dir)?;
     let server = ManagedServer::start(config, ProviderProcessTracking::Enabled).await?;
     let process = write_pid_file(server.config(), server.addr().port())?;
     let pid_file = PidFileGuard {

@@ -1,5 +1,6 @@
 mod agent_providers;
 mod app_state;
+mod autostart;
 mod catalog;
 mod codex_gateway;
 mod config;
@@ -79,6 +80,21 @@ enum DaemonCommand {
     Restart(ServeArgs),
     #[command(about = "Show backend daemon status")]
     Status(ServeArgs),
+    #[command(about = "Manage launching the daemon automatically at login")]
+    Autostart {
+        #[command(subcommand)]
+        command: AutostartCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AutostartCommand {
+    #[command(about = "Start the daemon automatically when you log in")]
+    Enable(ServeArgs),
+    #[command(about = "Stop the daemon from launching at login")]
+    Disable,
+    #[command(about = "Show whether the daemon launches at login")]
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -255,8 +271,45 @@ async fn daemon_command(command: DaemonCommand) -> anyhow::Result<()> {
                 None => println!("Daemon stopped."),
             }
         }
+        DaemonCommand::Autostart { command } => autostart_command(command)?,
     }
 
+    Ok(())
+}
+
+fn autostart_command(command: AutostartCommand) -> anyhow::Result<()> {
+    fn print_note(registration: &autostart::Registration) {
+        if let Some(note) = &registration.note {
+            println!("note: {note}");
+        }
+    }
+
+    match command {
+        AutostartCommand::Enable(args) => {
+            let config = Config::load(args).context("failed to load configuration")?;
+            let registration = autostart::enable(&config)?;
+            println!("Autostart enabled: {}", registration.location);
+            println!("The daemon will launch at your next login.");
+            print_note(&registration);
+        }
+        AutostartCommand::Disable => {
+            let registration = autostart::disable()?;
+            if registration.enabled {
+                println!("Autostart is still enabled: {}", registration.location);
+            } else {
+                println!("Autostart disabled: {}", registration.location);
+            }
+            print_note(&registration);
+        }
+        AutostartCommand::Status => {
+            let registration = autostart::status()?;
+            if registration.enabled {
+                println!("Autostart enabled: {}", registration.location);
+            } else {
+                println!("Autostart disabled ({}).", registration.location);
+            }
+        }
+    }
     Ok(())
 }
 
