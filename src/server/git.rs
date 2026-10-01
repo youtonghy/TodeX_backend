@@ -659,7 +659,10 @@ async fn validate_mutation_execution_config(repository: &Path) -> Result<()> {
         "git config extensions.worktreeConfig",
     )
     .await?;
-    if extension.status.success() && extension.stdout.starts_with(b"true") {
+    if extension.status.success()
+        && extension.stdout.starts_with(b"true")
+        && worktree_config_exists(repository).await?
+    {
         let worktree = run_checked(
             repository,
             &git_args(&["config", "--worktree", "--includes", "--null", "--list"]),
@@ -673,6 +676,34 @@ async fn validate_mutation_execution_config(repository: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// `extensions.worktreeConfig` only enables the per-worktree config file; Git
+/// creates it lazily, and `git config --worktree --list` fails while it is
+/// absent. A missing file holds no settings, so there is nothing to inspect.
+async fn worktree_config_exists(repository: &Path) -> Result<bool> {
+    let output = run_checked(
+        repository,
+        &git_args(&["rev-parse", "--git-path", "config.worktree"]),
+        "git rev-parse --git-path config.worktree",
+    )
+    .await?;
+    let path = std::str::from_utf8(&output.stdout)
+        .map_err(|_| AppError::GitProcess("Cannot locate worktree configuration".to_owned()))?
+        .trim_end_matches(['\r', '\n']);
+    if path.is_empty() {
+        return Err(AppError::GitProcess(
+            "Cannot locate worktree configuration".to_owned(),
+        ));
+    }
+    // Relative paths from --git-path are relative to the command's directory.
+    match tokio::fs::symlink_metadata(repository.join(path)).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(AppError::GitProcess(format!(
+            "Cannot inspect worktree configuration: {error}"
+        ))),
+    }
 }
 
 fn validate_executable_config_entries(output: &[u8]) -> Result<()> {
@@ -1704,6 +1735,14 @@ mod tests {
             validate_mutation_execution_config(&repository).await,
             Err(AppError::InvalidRequest(_))
         ));
+        // Enabled but never written: Git has no config.worktree yet, which is
+        // a valid, empty scope rather than an error.
+        let config_worktree = repository.join(".git/config.worktree");
+        assert!(config_worktree.exists());
+        fs::remove_file(&config_worktree).expect("remove config.worktree");
+        validate_mutation_execution_config(&repository)
+            .await
+            .expect("missing config.worktree is empty");
         let _ = fs::remove_dir_all(root);
     }
 
