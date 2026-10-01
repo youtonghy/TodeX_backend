@@ -59,6 +59,20 @@ pub struct GitScanQuery {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GitLogQuery {
+    pub workspace_path: String,
+    #[serde(default)]
+    pub skip: u32,
+    #[serde(default = "default_git_log_limit")]
+    pub limit: u32,
+}
+
+fn default_git_log_limit() -> u32 {
+    5
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GitDiffQuery {
     pub workspace_path: String,
     pub path: String,
@@ -194,6 +208,36 @@ pub struct GitStatusResponse {
     pub additions: u64,
     pub deletions: u64,
     pub stats_truncated: bool,
+    /// Upstream of the current branch (e.g. `origin/main`); null when the
+    /// branch has none or HEAD is detached.
+    pub upstream: Option<String>,
+    /// Commits not on the upstream, or on no remote when there is no upstream;
+    /// null without remotes or before the first commit.
+    pub ahead: Option<u64>,
+    /// Upstream commits missing locally; null without an upstream.
+    pub behind: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitLogResponse {
+    pub repository_path: String,
+    pub initialized: bool,
+    pub commits: Vec<GitLogCommit>,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitLogCommit {
+    pub sha: String,
+    pub subject: String,
+    pub author_name: String,
+    /// Unix seconds.
+    pub authored_at: i64,
+    /// False when the commit is not on the push base yet; null when there is
+    /// no remote to compare with or the unpushed set was too large to list.
+    pub pushed: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

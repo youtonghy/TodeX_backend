@@ -432,6 +432,59 @@ GET /v2/git/diff?workspacePath=/home/user/projects/demo&path=src/main.rs
 
 `path` 为仓库相对路径，禁止绝对路径和 `..`。响应对照 `HEAD`（无首个提交时为空树）返回 `repositoryPath`、`path`、统一格式的 `diff` 文本与 `truncated`；未跟踪文件与 `/dev/null` 对比返回新增内容并标记 `untracked: true`，未变更的已跟踪文件返回空 `diff`。响应文本最多 1 MiB，超出时 `truncated` 为真。
 
+当前仓库的轻量状态摘要（客户端轮询用）：
+
+```http
+GET /v2/git/status?workspacePath=/home/user/projects/demo
+```
+
+与扫描不同，子目录会解析到其所在仓库，且不检查子仓库。响应：
+
+```json
+{
+  "repositoryPath": "/home/user/projects/demo",
+  "initialized": true,
+  "branch": "main",
+  "worktreeKind": "main",
+  "changedFiles": 2,
+  "additions": 3,
+  "deletions": 1,
+  "statsTruncated": false,
+  "upstream": "origin/main",
+  "ahead": 2,
+  "behind": 0
+}
+```
+
+`branch` 在分离 HEAD 时为 `null`；`worktreeKind` 为 `main` 或 `linked`。`upstream` 是当前分支的上游（无上游或分离 HEAD 时为 `null`）。有上游时 `ahead`/`behind` 为相对上游领先/落后的提交数；无上游时 `ahead` 为不在任何远端跟踪分支上的提交数、`behind` 为 `null`；仓库没有任何远端或尚无首个提交时三者都为 `null`。数字只反映本地已知的远端跟踪引用，服务端不会为此执行 fetch。
+
+当前分支的提交历史按页读取：
+
+```http
+GET /v2/git/log?workspacePath=/home/user/projects/demo&skip=0&limit=5
+```
+
+`skip` 缺省为 0、最大 100,000；`limit` 缺省为 5、取值 1–50，越界返回 `400`。子目录同样解析到所在仓库。响应按 `git log` 默认顺序（最新在前）：
+
+```json
+{
+  "repositoryPath": "/home/user/projects/demo",
+  "initialized": true,
+  "commits": [
+    {
+      "sha": "3f2a…（完整 40 或 64 位）",
+      "subject": "fix: 修复登录跳转",
+      "authorName": "Alice",
+      "authoredAt": 1727760000,
+      "pushed": false
+    }
+  ],
+  "hasMore": true
+}
+```
+
+`authoredAt` 为 Unix 秒；`subject` 最多 512 bytes、`authorName` 最多 256 bytes。`pushed` 与状态摘要使用同一比较基准（上游，或无上游时的任意远端）：`false` 表示尚未推送；仓库没有远端，或未推送提交超过 10,000 个而无法判定时为 `null`。尚无首个提交的仓库返回空 `commits`。状态、diff 与提交历史都是只读接口，与扫描共享 2 个并发名额（排队超过 2 秒返回 `409 CONFLICT`），单次请求超过 10 秒返回 `GIT_COMMAND_TIMED_OUT`，并执行与状态摘要相同的元数据与仓库级可执行配置检查。
+
 仓库变更只能通过固定动作执行，不能传递任意 Git 子命令或参数：
 
 ```http

@@ -33,6 +33,9 @@ async fn read_inner(roots: &[PathBuf], workspace: &Path) -> Result<GitStatusResp
         additions: 0,
         deletions: 0,
         stats_truncated: false,
+        upstream: None,
+        ahead: None,
+        behind: None,
     };
     let Some(repository) = resolve_repository(&roots, &workspace).await? else {
         return Ok(result);
@@ -76,6 +79,11 @@ async fn read_inner(roots: &[PathBuf], workspace: &Path) -> Result<GitStatusResp
     )
     .await?;
     let base = if head.status.success() {
+        let push_base = super::log::push_base(&repository).await?;
+        (result.ahead, result.behind) = super::log::divergence(&repository, &push_base).await?;
+        if let super::log::PushBase::Upstream(name) = push_base {
+            result.upstream = Some(name);
+        }
         head.stdout
     } else if head.status.code() == Some(1) {
         // Computing the empty-tree ID is read-only and respects the repository's

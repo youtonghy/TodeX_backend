@@ -152,6 +152,7 @@ fn authenticated_routes() -> Router<AppState> {
         .route("/v2/git/workspace", get(git_workspace))
         .route("/v2/git/pull-request", get(git_pull_request))
         .route("/v2/git/status", get(git_status))
+        .route("/v2/git/log", get(git_log))
         .route("/v2/git/diff", get(git_diff))
         .route("/v2/git/operation", post(git_operation))
         .route("/v2/browser/fetch", post(browser_fetch))
@@ -775,6 +776,36 @@ pub(super) async fn git_status(
         &state,
         &auth,
         "status",
+        &workspace,
+        None,
+        if result.is_ok() { "allow" } else { "deny" },
+        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
+        None,
+        None,
+    )
+    .await;
+    combine_git_result(result.map(Json), audit)
+}
+
+pub(super) async fn git_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<super::protocol::GitLogQuery>,
+) -> Result<Json<super::protocol::GitLogResponse>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let workspace =
+        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
+    let result = git::log::read(
+        &state.config.workspace_roots,
+        &workspace,
+        query.skip,
+        query.limit,
+    )
+    .await;
+    let audit = append_git_audit(
+        &state,
+        &auth,
+        "log",
         &workspace,
         None,
         if result.is_ok() { "allow" } else { "deny" },
@@ -3748,6 +3779,46 @@ mod tests {
         assert_eq!(status["additions"], 0);
         assert_eq!(status["deletions"], 0);
         assert_eq!(status["statsTruncated"], false);
+        assert_eq!(status["upstream"], Value::Null);
+        assert_eq!(status["ahead"], Value::Null);
+        assert_eq!(status["behind"], Value::Null);
+        let log_uri = format!(
+            "/v2/git/log?workspacePath={}&skip=0&limit=5",
+            workspace.display()
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&log_uri)
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let log = app
+            .clone()
+            .oneshot(signed_request(&device, "GET", &log_uri, ""))
+            .await
+            .unwrap();
+        assert_eq!(log.status(), StatusCode::OK);
+        let log: Value =
+            serde_json::from_slice(&to_bytes(log.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        assert_eq!(log["initialized"], true);
+        assert_eq!(log["commits"], json!([]));
+        assert_eq!(log["hasMore"], false);
+        let bad_limit = format!("/v2/git/log?workspacePath={}&limit=0", workspace.display());
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_request(&device, "GET", &bad_limit, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
 
         let mut manifest = crate::conversation::ConversationManifest::new(
             ProviderKind::Pi,
