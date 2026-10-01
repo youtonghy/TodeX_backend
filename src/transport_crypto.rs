@@ -448,7 +448,7 @@ impl TransportCryptoSession {
     fn encrypt_text(&self, direction: u8, plaintext: &str) -> Result<String, AppError> {
         let counter = self
             .send_counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |counter| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |counter| {
                 counter.checked_add(1)
             })
             .map_err(|_| {
