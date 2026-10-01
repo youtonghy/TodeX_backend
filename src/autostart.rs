@@ -397,7 +397,8 @@ mod platform {
         for arg in daemon_run_args(config) {
             command_line.push_str(&format!(" \"{arg}\""));
         }
-        let status = Command::new("reg")
+        // Not `status`: that would shadow this module's `status()` used below.
+        let reg = Command::new("reg")
             .args([
                 "add",
                 RUN_KEY,
@@ -411,18 +412,18 @@ mod platform {
             ])
             .status()
             .context("failed to run `reg add`")?;
-        if !status.success() {
+        if !reg.success() {
             bail!("`reg add` failed for {}", location());
         }
         status()
     }
 
     pub fn disable() -> Result<Registration> {
-        let status = Command::new("reg")
+        let reg = Command::new("reg")
             .args(["delete", RUN_KEY, "/v", VALUE_NAME, "/f"])
             .status()
             .context("failed to run `reg delete`")?;
-        if !status.success() && status()?.enabled {
+        if !reg.success() && status()?.enabled {
             bail!("`reg delete` failed for {}", location());
         }
         status()
