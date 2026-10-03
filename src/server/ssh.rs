@@ -11,11 +11,14 @@ use serde_json::{json, Value};
 
 use crate::app_state::AppState;
 use crate::error::AppError;
+use crate::ssh::keys::{KeyGenerateRequest, KeyImportRequest};
 use crate::ssh::{FtpSiteInput, ManagedHost};
 
 use super::v2::require_auth;
 
 const MAX_IMPORT_BYTES: usize = 256 * 1024;
+/// Real private keys are a few KiB; the body also carries a public key line.
+const MAX_KEY_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -42,6 +45,15 @@ pub(super) fn routes() -> Router<AppState> {
         )
         .route("/v2/ssh/hosts/{alias}/agent-access", put(set_agent_access))
         .route("/v2/ssh/hosts/{alias}/test", post(test_host))
+        .route("/v2/ssh/keys", get(list_keys))
+        .route(
+            "/v2/ssh/keys/import",
+            post(import_key).layer(DefaultBodyLimit::max(MAX_KEY_BODY_BYTES)),
+        )
+        .route(
+            "/v2/ssh/keys/generate",
+            post(generate_key).layer(DefaultBodyLimit::max(MAX_KEY_BODY_BYTES)),
+        )
         .route("/v2/ftp/sites", post(create_ftp_site))
         .route(
             "/v2/ftp/sites/{id}",
@@ -123,6 +135,34 @@ async fn test_host(
     Ok(Json(serde_json::to_value(
         state.ssh.test_connection(&alias).await?,
     )?))
+}
+
+async fn list_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    Ok(Json(serde_json::to_value(state.ssh.list_keys().await?)?))
+}
+
+async fn import_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<KeyImportRequest>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let key = state.ssh.import_key(request).await?;
+    Ok(Json(json!({ "key": key })))
+}
+
+async fn generate_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<KeyGenerateRequest>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let key = state.ssh.generate_key(request).await?;
+    Ok(Json(json!({ "key": key })))
 }
 
 async fn create_ftp_site(

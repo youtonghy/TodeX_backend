@@ -32,6 +32,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
+ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "rsa", "encryption", "getrandom"] }
 subtle = "2.6"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
@@ -42,6 +43,7 @@ tower-http = { version = "0.6", features = ["compression-gzip", "cors", "trace"]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ed25519-dalek = "2"
 
@@ -49,3 +51,11 @@ ed25519-dalek = "2"
 tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
 tungstenite = "0.29"
+
+# RSA key generation (`POST /v2/ssh/keys/generate`) takes minutes with
+# unoptimized bignum code; optimize just these crates in dev/test builds.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3

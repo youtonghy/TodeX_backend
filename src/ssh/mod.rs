@@ -7,6 +7,7 @@
 //! never stores passwords.
 
 pub(crate) mod config_file;
+pub(crate) mod keys;
 
 use std::{
     collections::{BTreeSet, HashMap},
