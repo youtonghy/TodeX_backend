@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const REPOSITORY: &str = "youtonghy/TodeX_backend";
+pub(crate) const REPOSITORY: &str = "youtonghy/TodeX_backend";
 const MAX_BINARY: usize = 256 * 1024 * 1024;
 const RELAUNCHED_ENV: &str = "TODEX_UPDATE_RELAUNCHED";
 /// Set by an idle daemon on the launch that replaces it. The replacement
@@ -30,6 +30,28 @@ struct Release {
 struct Asset {
     name: String,
     browser_download_url: String,
+}
+
+/// Repository, version, and update state shown by `about` and the TUI
+/// about panel.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct About {
+    pub name: &'static str,
+    pub repository: &'static str,
+    pub repository_url: String,
+    pub current_version: &'static str,
+    /// Whether this build can install updates at all (release build on a
+    /// supported platform).
+    pub update_enabled: bool,
+    /// Whether automatic checks run at launch and in a running daemon.
+    pub auto_update_enabled: bool,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    /// Why the latest-release lookup failed; absent before a check runs and
+    /// when it succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -206,6 +228,78 @@ async fn install(
     Ok(backup)
 }
 
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(format!("todex-agentd/{}", crate::version::APP_VERSION))
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(Into::into)
+}
+
+/// The newest published stable release and its `v`-stripped version tag.
+async fn latest_release(client: &reqwest::Client) -> Result<(Release, String)> {
+    let metadata = tokio::time::timeout(
+        Duration::from_secs(10),
+        download(
+            client,
+            &format!("https://api.github.com/repos/{REPOSITORY}/releases/latest"),
+            2 * 1024 * 1024,
+        ),
+    )
+    .await
+    .context("release check timed out")??;
+    let release: Release = serde_json::from_slice(&metadata)?;
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .context("release tag must start with v")?
+        .to_owned();
+    stable_version(&version).context("release is not a stable version")?;
+    if release.draft || release.prerelease {
+        bail!("release is not published and stable");
+    }
+    Ok((release, version))
+}
+
+/// About fields that are known without contacting GitHub.
+pub fn about_static() -> About {
+    About {
+        name: "todex-agentd",
+        repository: REPOSITORY,
+        repository_url: format!("https://github.com/{REPOSITORY}"),
+        current_version: crate::version::APP_VERSION,
+        update_enabled: enabled(),
+        auto_update_enabled: auto_update_enabled(),
+        latest_version: None,
+        update_available: false,
+        check_error: None,
+    }
+}
+
+/// `about_static` plus the latest published release. Lookup failures are
+/// recorded in `check_error` so the rest of the snapshot stays usable.
+pub async fn about() -> About {
+    let mut about = about_static();
+    let check = async {
+        let client = http_client()?;
+        latest_release(&client).await.map(|(_, version)| version)
+    }
+    .await;
+    match check {
+        Ok(version) => {
+            about.update_available = about.update_enabled
+                && stable_version(&version)
+                    .zip(stable_version(about.current_version))
+                    .is_some_and(|(latest, current)| latest > current);
+            about.latest_version = Some(version);
+        }
+        Err(error) => about.check_error = Some(format!("{error:#}")),
+    }
+    about
+}
+
 pub async fn run(check_only: bool) -> Result<UpdateStatus> {
     let mut status = UpdateStatus {
         enabled: enabled(),
@@ -219,32 +313,10 @@ pub async fn run(check_only: bool) -> Result<UpdateStatus> {
     if !status.enabled {
         return Ok(status);
     }
-    let client = reqwest::Client::builder()
-        .user_agent(format!("todex-agentd/{}", status.current_version))
-        .https_only(true)
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(120))
-        .build()?;
-    let metadata = tokio::time::timeout(
-        Duration::from_secs(10),
-        download(
-            &client,
-            &format!("https://api.github.com/repos/{REPOSITORY}/releases/latest"),
-            2 * 1024 * 1024,
-        ),
-    )
-    .await
-    .context("release check timed out")??;
-    let release: Release = serde_json::from_slice(&metadata)?;
-    let version = release
-        .tag_name
-        .strip_prefix('v')
-        .context("release tag must start with v")?;
-    let latest = stable_version(version).context("release is not a stable version")?;
-    if release.draft || release.prerelease {
-        bail!("release is not published and stable");
-    }
-    status.latest_version = Some(version.to_owned());
+    let client = http_client()?;
+    let (release, version) = latest_release(&client).await?;
+    let latest = stable_version(&version).unwrap();
+    status.latest_version = Some(version.clone());
     status.update_available = latest > stable_version(status.current_version).unwrap();
     if !status.update_available || check_only {
         return Ok(status);
@@ -260,7 +332,7 @@ pub async fn run(check_only: bool) -> Result<UpdateStatus> {
     let bytes = download(&client, url, MAX_BINARY).await?;
     verify_checksum(std::str::from_utf8(&manifest)?, &name, &bytes)?;
     let executable = std::env::current_exe()?;
-    let backup = install(&executable, &bytes, Some(version)).await?;
+    let backup = install(&executable, &bytes, Some(&version)).await?;
     eprintln!(
         "Installed backend {version}; previous executable: {}",
         backup.display()
@@ -454,6 +526,23 @@ mod tests {
         assert!(!eligible_version("0.0.0"));
         assert!(!eligible_version("DEV0.0.0"));
         assert!(eligible_version("0.0.1"));
+    }
+
+    #[test]
+    fn about_static_reports_repository_version_and_flags() {
+        let about = about_static();
+        assert_eq!(about.name, "todex-agentd");
+        assert_eq!(about.repository, REPOSITORY);
+        assert_eq!(
+            about.repository_url,
+            format!("https://github.com/{REPOSITORY}")
+        );
+        assert_eq!(about.current_version, crate::version::APP_VERSION);
+        assert_eq!(about.update_enabled, enabled());
+        assert_eq!(about.auto_update_enabled, auto_update_enabled());
+        assert!(about.latest_version.is_none());
+        assert!(!about.update_available);
+        assert!(about.check_error.is_none());
     }
 
     #[test]
