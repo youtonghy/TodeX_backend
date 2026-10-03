@@ -601,7 +601,7 @@ fn read_terminal_output(
     }
 }
 
-fn decode_terminal_output(pending: &mut Vec<u8>, chunk: &[u8], flush: bool) -> String {
+pub(crate) fn decode_terminal_output(pending: &mut Vec<u8>, chunk: &[u8], flush: bool) -> String {
     pending.extend_from_slice(chunk);
     let mut output = String::new();
 

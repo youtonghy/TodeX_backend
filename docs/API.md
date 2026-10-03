@@ -583,7 +583,11 @@ POST /v2/browser/fetch
 - 端点：`/internal/agent-mcp/ssh`（MCP Streamable HTTP）。不走设备签名，只接受回环地址、不带 `Origin` 头、携带会话级 `Authorization: Bearer <token>` 的请求；非回环或带 `Origin` 返回 403，令牌缺失或无效返回 401。令牌只存在内存，删除会话或重启 daemon 后失效。
 - `ssh_list_hosts {}` → `{ hosts: [{ alias, hostName?, user?, port? }] }`，只列出开启了 Agent access 的主机。
 - `ssh_exec { host, command, cwd?, stdin?, timeoutSec? }` → `{ stdout, stderr, exitCode, truncated, durationMs }`。**无需审批**；以 BatchMode、严格主机密钥校验运行；`cwd` 按 POSIX shell 引用后 `cd`；默认超时 60 秒，最长 600 秒；stdout/stderr 各最多 256 KiB，超出截断并置 `truncated: true`；同一主机最多 4 条并发命令。非零退出码是正常结果；ssh 失败（退出码 255）、超时或无法启动时返回 `isError: true`，带 `failure` 与处理提示。ACP 类 Agent 若自身处于“询问”权限模式，仍可能针对 MCP 工具弹出其原生权限请求。
-- 会话事件：每次执行追加 `ssh.exec.started { host, command, cwd?, turnId? }` 与 `ssh.exec.completed { host, exitCode?, durationMs, failure?, truncated, turnId? }`；客户端可作为工具活动展示，未知事件类型可直接忽略。
+- 会话事件（以 `execId` 关联同一次调用，并发调用互不混淆）：
+  - `ssh.exec.started { execId, host, command, cwd?, turnId? }`
+  - `ssh.exec.output { execId, stream: "stdout"|"stderr", data, turnId? }`：实时输出，按 100 ms 或 16 KiB 合并为一条事件，UTF-8 多字节字符不会被拆开；每次调用每个流最多记录 64 KiB（Agent 收到的结果仍最多 256 KiB），超出部分不再记录。
+  - `ssh.exec.completed { execId, host, exitCode?, durationMs, failure?, truncated, outputTruncated, turnId? }`：`truncated` 指返回给 Agent 的结果被截断，`outputTruncated` 指事件中记录的输出被截断。
+  - 桌面端与 Web 在当前会话中为每个 `execId` 打开一个只读侧边栏标签；其他客户端可忽略这些事件。
 
 ## WebSocket 协议
 

@@ -14,6 +14,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
+    sync::mpsc,
     time::timeout,
 };
 
@@ -82,7 +83,7 @@ pub(crate) struct CommandLimits {
     pub output_limit: usize,
 }
 
-/// Output of [`run_truncating`]: each stream holds at most the output limit.
+/// Output of [`run_streaming`]: each stream holds at most the output limit.
 #[derive(Debug)]
 pub(crate) struct TruncatedOutput {
     pub status: ExitStatus,
@@ -145,7 +146,7 @@ pub(crate) async fn run(
     stdin: Option<Vec<u8>>,
     limits: CommandLimits,
 ) -> Result<CommandOutput, ExternalCommandError> {
-    let output = run_with(command, stdin, limits, Overflow::Fail).await?;
+    let output = run_with(command, stdin, limits, Overflow::Fail, None).await?;
     Ok(CommandOutput {
         status: output.status,
         stdout: output.stdout,
@@ -155,12 +156,31 @@ pub(crate) async fn run(
 
 /// Like [`run`], but output beyond the limit is dropped instead of failing
 /// the run: the process keeps running until it exits or times out.
-pub(crate) async fn run_truncating(
+/// Which pipe an [`OutputChunk`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Bytes as they were read from the child, before any truncation.
+#[derive(Debug)]
+pub(crate) struct OutputChunk {
+    pub stream: OutputStream,
+    pub bytes: Vec<u8>,
+}
+
+/// Runs a command whose output beyond the limit is dropped (and reported as
+/// truncated) instead of failing the run, and sends every chunk read from
+/// stdout and stderr to `tap` as it arrives, before truncation. The tap is dropped when the run ends (or
+/// is cancelled), so a receiver loop ends with it.
+pub(crate) async fn run_streaming(
     command: Command,
     stdin: Option<Vec<u8>>,
     limits: CommandLimits,
+    tap: mpsc::UnboundedSender<OutputChunk>,
 ) -> Result<TruncatedOutput, ExternalCommandError> {
-    run_with(command, stdin, limits, Overflow::Truncate).await
+    run_with(command, stdin, limits, Overflow::Truncate, Some(tap)).await
 }
 
 async fn run_with(
@@ -168,6 +188,7 @@ async fn run_with(
     stdin: Option<Vec<u8>>,
     limits: CommandLimits,
     overflow: Overflow,
+    tap: Option<mpsc::UnboundedSender<OutputChunk>>,
 ) -> Result<TruncatedOutput, ExternalCommandError> {
     let mut child = command.spawn().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
@@ -205,8 +226,18 @@ async fn run_with(
         };
         let wait = async { child.wait().await.map_err(LimitedReadError::Io) };
         tokio::try_join!(
-            read_limited(stdout, limits.output_limit, overflow),
-            read_limited(stderr, limits.output_limit, overflow),
+            read_limited(
+                stdout,
+                limits.output_limit,
+                overflow,
+                tap.as_ref().map(|tap| (tap, OutputStream::Stdout)),
+            ),
+            read_limited(
+                stderr,
+                limits.output_limit,
+                overflow,
+                tap.as_ref().map(|tap| (tap, OutputStream::Stderr)),
+            ),
             feed,
             wait,
         )
@@ -288,6 +319,7 @@ async fn read_limited<R>(
     mut reader: R,
     limit: usize,
     overflow: Overflow,
+    tap: Option<(&mpsc::UnboundedSender<OutputChunk>, OutputStream)>,
 ) -> Result<(Vec<u8>, bool), LimitedReadError>
 where
     R: AsyncRead + Unpin,
@@ -301,6 +333,13 @@ where
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
+        }
+        if let Some((tap, stream)) = tap {
+            // A receiver that went away only stops observation, not the run.
+            let _ = tap.send(OutputChunk {
+                stream,
+                bytes: buffer[..read].to_vec(),
+            });
         }
         if output.len().saturating_add(read) > limit {
             if overflow == Overflow::Fail {
@@ -382,20 +421,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncating_run_keeps_the_prefix_and_reports_it() {
+    async fn streaming_run_truncates_the_result_but_taps_everything() {
         let mut command = secure_command("/bin/sh");
         command.args(["-c", "yes | head -c 100000; printf ab >&2; exit 4"]);
         prepare_captured(&mut command, false);
-        let output = run_truncating(command, None, limits(5, 16)).await.unwrap();
+        let (tap, mut chunks) = mpsc::unbounded_channel();
+        let output = run_streaming(command, None, limits(5, 16), tap)
+            .await
+            .unwrap();
         assert_eq!(output.stdout, b"y\ny\ny\ny\ny\ny\ny\ny\n");
         assert_eq!(output.stderr, b"ab");
         assert!(output.truncated);
         assert_eq!(output.status.code(), Some(4));
+        let (mut stdout, mut stderr) = (0, Vec::new());
+        while let Some(chunk) = chunks.recv().await {
+            match chunk.stream {
+                OutputStream::Stdout => stdout += chunk.bytes.len(),
+                OutputStream::Stderr => stderr.extend(chunk.bytes),
+            }
+        }
+        assert_eq!(stdout, 100_000, "the tap sees output past the limit");
+        assert_eq!(stderr, b"ab");
 
         let mut command = secure_command("/bin/sh");
         command.args(["-c", "printf ok"]);
         prepare_captured(&mut command, false);
-        let output = run_truncating(command, None, limits(5, 16)).await.unwrap();
+        let (tap, _chunks) = mpsc::unbounded_channel();
+        let output = run_streaming(command, None, limits(5, 16), tap)
+            .await
+            .unwrap();
         assert_eq!(output.stdout, b"ok");
         assert!(!output.truncated);
     }

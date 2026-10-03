@@ -33,12 +33,17 @@ use rmcp::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
+use uuid::Uuid;
 
 use super::{AgentMcp, ROUTE, SERVER_NAME};
 use crate::{
     app_state::AppState,
-    external_command::{self, bounded_text, prepare_captured, CommandLimits, ExternalCommandError},
+    external_command::{
+        self, bounded_text, prepare_captured, CommandLimits, ExternalCommandError, OutputChunk,
+        OutputStream,
+    },
+    local_terminal::decode_terminal_output,
     provider::ConversationSupervisor,
     ssh::{classify_failure, SshFailureKind, SshMode},
 };
@@ -53,6 +58,13 @@ const MAX_STDIN_BYTES: usize = 1024 * 1024;
 const PER_HOST_CONCURRENCY: usize = 4;
 /// Commands are journaled for the conversation; keep the event small.
 const EVENT_COMMAND_LIMIT: usize = 4096;
+/// Output recorded per stream and call in `ssh.exec.output` events, so many
+/// calls cannot fill the conversation journal. The agent still receives up
+/// to [`OUTPUT_LIMIT`].
+const EVENT_OUTPUT_LIMIT: usize = 64 * 1024;
+/// Live output is batched into events at this cadence or size.
+const OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+const OUTPUT_FLUSH_BYTES: usize = 16 * 1024;
 const ERROR_DETAIL_LIMIT: usize = 4096;
 
 /// The conversation a request was authenticated for.
@@ -274,7 +286,9 @@ impl SshTools {
             () = context.ct.cancelled() => return tool_error("cancelled".to_owned()),
         };
 
+        let exec_id = format!("sshx_{}", Uuid::new_v4().simple());
         let mut started = json!({
+            "execId": exec_id,
             "host": request.host,
             "command": bounded_text(request.command.as_bytes(), EVENT_COMMAND_LIMIT),
         });
@@ -292,13 +306,25 @@ impl SshTools {
         }
 
         let begun = Instant::now();
-        let outcome = tokio::select! {
-            outcome = self.run(&request) => outcome,
-            // Dropping the run kills ssh and its process group.
-            () = context.ct.cancelled() => ExecOutcome::Cancelled,
+        let (tap, chunks) = mpsc::unbounded_channel();
+        let run = async {
+            tokio::select! {
+                outcome = self.run(&request, tap) => outcome,
+                // Dropping the run kills ssh and its process group; it also
+                // drops the tap, which ends the recorder below.
+                () = context.ct.cancelled() => ExecOutcome::Cancelled,
+            }
         };
+        let recorder = OutputRecorder {
+            conversations: &self.conversations,
+            conversation_id: &caller.conversation_id,
+            exec_id: &exec_id,
+        };
+        let (outcome, output_truncated) = tokio::join!(run, recorder.record(chunks));
         let duration_ms = u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let (result, completed) = outcome.into_result(&request.host, duration_ms);
+        let (result, mut completed) = outcome.into_result(&request.host, duration_ms);
+        completed["execId"] = json!(exec_id);
+        completed["outputTruncated"] = json!(output_truncated);
         if let Err(error) = self
             .conversations
             .append_agent_event(&caller.conversation_id, "ssh.exec.completed", completed)
@@ -313,7 +339,11 @@ impl SshTools {
         result
     }
 
-    async fn run(&self, request: &ExecRequest) -> ExecOutcome {
+    async fn run(
+        &self,
+        request: &ExecRequest,
+        tap: mpsc::UnboundedSender<OutputChunk>,
+    ) -> ExecOutcome {
         let mut command = self.mcp.ssh().command(SshMode::Batch);
         command
             .arg("--")
@@ -324,10 +354,11 @@ impl SshTools {
             timeout: request.timeout,
             output_limit: OUTPUT_LIMIT,
         };
-        match external_command::run_truncating(
+        match external_command::run_streaming(
             command,
             request.stdin.clone().map(String::into_bytes),
             limits,
+            tap,
         )
         .await
         {
@@ -338,6 +369,113 @@ impl SshTools {
             }
             Err(error) => ExecOutcome::NotStarted(error.to_string()),
         }
+    }
+}
+
+/// Turns the live output of one `ssh_exec` into batched `ssh.exec.output`
+/// events so clients can follow each call in its own view.
+struct OutputRecorder<'a> {
+    conversations: &'a ConversationSupervisor,
+    conversation_id: &'a str,
+    exec_id: &'a str,
+}
+
+#[derive(Default)]
+struct RecordedStream {
+    /// Bytes of an incomplete UTF-8 sequence carried to the next chunk.
+    pending: Vec<u8>,
+    text: String,
+    recorded: usize,
+    truncated: bool,
+}
+
+impl RecordedStream {
+    fn accept(&mut self, bytes: &[u8]) {
+        let room = EVENT_OUTPUT_LIMIT - self.recorded;
+        let taken = bytes.len().min(room);
+        if taken < bytes.len() {
+            self.truncated = true;
+        }
+        if taken == 0 {
+            return;
+        }
+        self.recorded += taken;
+        let text = decode_terminal_output(&mut self.pending, &bytes[..taken], false);
+        self.text.push_str(&text);
+    }
+
+    fn finish(&mut self) {
+        let text = decode_terminal_output(&mut self.pending, &[], true);
+        self.text.push_str(&text);
+    }
+}
+
+impl OutputRecorder<'_> {
+    /// Records until the tap closes; returns whether any output was cut.
+    async fn record(self, mut chunks: mpsc::UnboundedReceiver<OutputChunk>) -> bool {
+        let mut streams = [RecordedStream::default(), RecordedStream::default()];
+        let mut writable = true;
+        let mut ticker = tokio::time::interval(OUTPUT_FLUSH_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                chunk = chunks.recv() => match chunk {
+                    Some(chunk) => {
+                        let index = stream_index(chunk.stream);
+                        streams[index].accept(&chunk.bytes);
+                        if streams[index].text.len() >= OUTPUT_FLUSH_BYTES {
+                            self.flush(&mut streams[index], index, &mut writable).await;
+                        }
+                    }
+                    None => break,
+                },
+                _ = ticker.tick() => {
+                    for (index, stream) in streams.iter_mut().enumerate() {
+                        self.flush(stream, index, &mut writable).await;
+                    }
+                }
+            }
+        }
+        for (index, stream) in streams.iter_mut().enumerate() {
+            stream.finish();
+            self.flush(stream, index, &mut writable).await;
+        }
+        streams.iter().any(|stream| stream.truncated)
+    }
+
+    async fn flush(&self, stream: &mut RecordedStream, index: usize, writable: &mut bool) {
+        if stream.text.is_empty() {
+            return;
+        }
+        let data = std::mem::take(&mut stream.text);
+        if !*writable {
+            return;
+        }
+        let payload = json!({
+            "execId": self.exec_id,
+            "stream": if index == 0 { "stdout" } else { "stderr" },
+            "data": data,
+        });
+        if let Err(error) = self
+            .conversations
+            .append_agent_event(self.conversation_id, "ssh.exec.output", payload)
+            .await
+        {
+            // The command keeps running for the agent; only the view stops.
+            tracing::warn!(
+                conversation_id = self.conversation_id,
+                %error,
+                "failed to record SSH command output"
+            );
+            *writable = false;
+        }
+    }
+}
+
+fn stream_index(stream: OutputStream) -> usize {
+    match stream {
+        OutputStream::Stdout => 0,
+        OutputStream::Stderr => 1,
     }
 }
 
@@ -525,6 +663,24 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use tower::ServiceExt;
+
+    #[test]
+    fn recorded_output_keeps_split_utf8_and_stops_at_the_limit() {
+        let mut stream = RecordedStream::default();
+        let text = "你好";
+        stream.accept(&text.as_bytes()[..2]);
+        assert_eq!(stream.text, "");
+        stream.accept(&text.as_bytes()[2..]);
+        assert_eq!(stream.text, "你好");
+
+        let mut stream = RecordedStream::default();
+        stream.accept(&vec![b'a'; EVENT_OUTPUT_LIMIT - 1]);
+        stream.accept(b"bc");
+        stream.finish();
+        assert!(stream.truncated);
+        assert_eq!(stream.recorded, EVENT_OUTPUT_LIMIT);
+        assert!(stream.text.ends_with("ab"));
+    }
 
     #[test]
     fn quotes_the_working_directory_for_posix_shells() {
@@ -883,10 +1039,49 @@ exit 3
             .collect();
         assert_eq!(started.len(), 4);
         assert_eq!(completed.len(), 4);
+        let exec_id = started[0]["execId"].as_str().unwrap().to_owned();
+        assert!(exec_id.starts_with("sshx_"));
         assert_eq!(
             started[0],
-            json!({ "host": "web", "command": "uname -a", "cwd": "/srv/a b" })
+            json!({ "execId": exec_id, "host": "web", "command": "uname -a", "cwd": "/srv/a b" })
         );
+        let ids: std::collections::HashSet<_> = started
+            .iter()
+            .map(|event| event["execId"].clone())
+            .collect();
+        assert_eq!(ids.len(), 4, "every call has its own id");
+        for (start, end) in started.iter().zip(&completed) {
+            assert_eq!(start["execId"], end["execId"]);
+        }
+
+        // Live output, per call and stream, in order and before completion.
+        let output = |id: &Value, stream: &str| -> String {
+            history
+                .iter()
+                .filter(|event| event.event_type == "ssh.exec.output")
+                .filter(|event| &event.payload["execId"] == id && event.payload["stream"] == stream)
+                .map(|event| event.payload["data"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            output(&started[0]["execId"], "stdout"),
+            "ran:cd '/srv/a b' || exit 1\nuname -a\ninput-data"
+        );
+        assert_eq!(output(&started[0]["execId"], "stderr"), "warn\n");
+        let first_completed = history
+            .iter()
+            .position(|event| event.event_type == "ssh.exec.completed")
+            .unwrap();
+        assert!(history[..first_completed]
+            .iter()
+            .any(|event| event.event_type == "ssh.exec.output"));
+        assert_eq!(completed[0]["outputTruncated"], false);
+        // The agent got 256 KiB; the recorded view stops at 64 KiB.
+        assert_eq!(
+            output(&started[1]["execId"], "stdout").len(),
+            EVENT_OUTPUT_LIMIT
+        );
+        assert_eq!(completed[1]["outputTruncated"], true);
         assert_eq!(completed[0]["exitCode"], 3);
         assert_eq!(completed[0]["truncated"], false);
         assert!(completed[0].get("failure").is_none());
