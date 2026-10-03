@@ -302,9 +302,11 @@ fn valid_key_name(name: &str) -> Result<(), AppError> {
 }
 
 fn is_reserved(name: &str) -> bool {
-    RESERVED_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
+    // `~/.ssh/rc` is executed by sshd at login.
+    name == "rc"
+        || RESERVED_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
 }
 
 /// An empty passphrase means "none"; oversized ones are rejected.

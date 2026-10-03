@@ -123,6 +123,9 @@ pub(crate) struct ResolvedHost {
     pub port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_jump: Option<String>,
+    /// Internal only: whether a proxy program runs (it inherits ssh's env).
+    #[serde(skip)]
+    pub proxy_command: Option<String>,
     pub identity_files: Vec<String>,
 }
 
@@ -378,6 +381,14 @@ impl SshService {
     }
 
     pub async fn list_hosts(&self) -> Result<Vec<SshHostView>, AppError> {
+        let mut views = self.host_views().await?;
+        self.resolve_views(&mut views).await;
+        Ok(views)
+    }
+
+    /// Managed hosts plus `~/.ssh/config` aliases, without running ssh. Only
+    /// config files are read, so this is cheap enough for every request.
+    async fn host_views(&self) -> Result<Vec<SshHostView>, AppError> {
         let (managed, agent_access) = {
             let store = self.inner.store.read().await;
             (store.managed_hosts.clone(), store.agent_access.clone())
@@ -415,6 +426,10 @@ impl SshService {
                 });
             }
         }
+        Ok(views)
+    }
+
+    async fn resolve_views(&self, views: &mut [SshHostView]) {
         let resolved: Vec<Result<ResolvedHost, String>> = stream::iter(
             views
                 .iter()
@@ -431,22 +446,33 @@ impl SshService {
                 Err(error) => view.resolve_error = Some(error),
             }
         }
-        Ok(views)
     }
 
     /// Fails unless `alias` is a known host. Every ssh entry point checks this
-    /// so clients and agents can only reach configured hosts.
-    pub(crate) async fn require_host(&self, alias: &str) -> Result<SshHostView, AppError> {
+    /// so clients and agents can only reach configured hosts. Does not run
+    /// `ssh -G`, so it never blocks on slow resolution.
+    pub(crate) async fn require_host(&self, alias: &str) -> Result<(), AppError> {
         if !config_file::valid_alias(alias) {
             return Err(AppError::InvalidRequest(format!(
                 "invalid ssh host: {alias}"
             )));
         }
-        self.list_hosts()
+        if self
+            .host_views()
             .await?
-            .into_iter()
-            .find(|view| view.alias == alias)
-            .ok_or_else(|| AppError::NotFound(format!("ssh host {alias}")))
+            .iter()
+            .any(|view| view.alias == alias)
+        {
+            Ok(())
+        } else {
+            Err(AppError::NotFound(format!("ssh host {alias}")))
+        }
+    }
+
+    /// Effective connection parameters for a known host (`ssh -G`).
+    pub(crate) async fn resolved_host(&self, alias: &str) -> Result<ResolvedHost, AppError> {
+        self.require_host(alias).await?;
+        self.resolve(alias).await.map_err(AppError::InvalidRequest)
     }
 
     async fn resolve(&self, alias: &str) -> Result<ResolvedHost, String> {
@@ -572,7 +598,11 @@ impl SshService {
     }
 
     pub async fn set_agent_access(&self, alias: &str, enabled: bool) -> Result<(), AppError> {
-        self.require_host(alias).await?;
+        // Revoking must work even after the alias left ~/.ssh/config, or a
+        // stale grant would come back when the alias is defined again.
+        if enabled {
+            self.require_host(alias).await?;
+        }
         let mut store = self.inner.store.write().await;
         let changed = if enabled {
             store.agent_access.insert(alias.to_owned())
@@ -585,18 +615,39 @@ impl SshService {
         Ok(())
     }
 
-    /// Aliases agents may use, restricted to hosts that still exist.
+    /// Agent-enabled hosts that still exist, with resolved parameters.
     pub async fn agent_hosts(&self) -> Result<Vec<SshHostView>, AppError> {
-        Ok(self
-            .list_hosts()
+        let mut views: Vec<SshHostView> = self
+            .host_views()
             .await?
             .into_iter()
             .filter(|view| view.agent_access)
-            .collect())
+            .collect();
+        self.resolve_views(&mut views).await;
+        Ok(views)
     }
 
+    /// Whether agents may use `alias` right now (granted and still defined).
+    pub async fn is_agent_host(&self, alias: &str) -> Result<bool, AppError> {
+        Ok(self
+            .host_views()
+            .await?
+            .iter()
+            .any(|view| view.alias == alias && view.agent_access))
+    }
+
+    /// Whether any existing host is granted to agents; decides MCP injection.
     pub async fn has_agent_hosts(&self) -> bool {
-        !self.inner.store.read().await.agent_access.is_empty()
+        if self.inner.store.read().await.agent_access.is_empty() {
+            return false;
+        }
+        match self.host_views().await {
+            Ok(views) => views.iter().any(|view| view.agent_access),
+            Err(error) => {
+                tracing::warn!(%error, "cannot read ssh hosts; agent ssh tools disabled");
+                false
+            }
+        }
     }
 
     pub async fn test_connection(&self, alias: &str) -> Result<ConnectionTestResult, AppError> {
@@ -756,6 +807,7 @@ fn parse_resolved(output: &str) -> ResolvedHost {
             "user" => resolved.user = Some(value.to_owned()),
             "port" => resolved.port = value.parse().ok(),
             "proxyjump" if value != "none" => resolved.proxy_jump = Some(value.to_owned()),
+            "proxycommand" if value != "none" => resolved.proxy_command = Some(value.to_owned()),
             "identityfile" => resolved.identity_files.push(value.to_owned()),
             _ => {}
         }
@@ -964,6 +1016,29 @@ exit 0
         .await
         .unwrap();
         assert!(reloaded.has_agent_hosts().await);
+    }
+
+    #[tokio::test]
+    async fn stale_agent_grants_are_revocable_and_ignored() {
+        let fixture = fixture("Host web\n").await;
+        fixture.service.set_agent_access("web", true).await.unwrap();
+        assert!(fixture.service.has_agent_hosts().await);
+        assert!(fixture.service.is_agent_host("web").await.unwrap());
+
+        // The alias disappears from ~/.ssh/config.
+        std::fs::write(fixture.root.join("home/.ssh/config"), "").unwrap();
+        assert!(!fixture.service.has_agent_hosts().await);
+        assert!(!fixture.service.is_agent_host("web").await.unwrap());
+        assert!(fixture.service.agent_hosts().await.unwrap().is_empty());
+        fixture
+            .service
+            .set_agent_access("web", false)
+            .await
+            .unwrap();
+
+        // Defining the alias again does not silently restore access.
+        std::fs::write(fixture.root.join("home/.ssh/config"), "Host web\n").unwrap();
+        assert!(!fixture.service.is_agent_host("web").await.unwrap());
     }
 
     #[tokio::test]

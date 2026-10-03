@@ -80,6 +80,9 @@ impl FtpFs {
             .await?;
         }
         stream.set_mode(Mode::Passive);
+        // Connect data channels to the control host, never to the address a
+        // PASV reply names: a hostile server could aim it at internal hosts.
+        stream.set_passive_nat_workaround(true);
         let (user, password) = match (&site.user, password) {
             (Some(user), password) => (
                 user.clone(),
@@ -376,11 +379,7 @@ impl RemoteFs for FtpFs {
                 break;
             }
             sent += read as u64;
-            if sink
-                .send(Ok(Bytes::copy_from_slice(&chunk[..read])))
-                .await
-                .is_err()
-            {
+            if !super::send_chunk(sink, Bytes::copy_from_slice(&chunk[..read])).await {
                 receiver_gone = true;
                 break;
             }

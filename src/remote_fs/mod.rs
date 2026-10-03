@@ -71,6 +71,19 @@ pub(crate) struct Listing {
 
 /// One authenticated remote file system connection. Calls are serialized by
 /// the session manager, so implementations may keep per-connection state.
+/// A download client that stops reading must not hold its session (and
+/// the session lock) forever.
+const CHUNK_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Queues one download chunk. False when the receiver is gone or has not
+/// accepted data for [`CHUNK_SEND_TIMEOUT`]; the transfer then stops.
+pub(crate) async fn send_chunk(sink: &mpsc::Sender<std::io::Result<Bytes>>, bytes: Bytes) -> bool {
+    matches!(
+        tokio::time::timeout(CHUNK_SEND_TIMEOUT, sink.send(Ok(bytes))).await,
+        Ok(Ok(()))
+    )
+}
+
 #[async_trait]
 pub(crate) trait RemoteFs: Send {
     /// Absolute directory the connection starts in.

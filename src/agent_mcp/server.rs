@@ -250,9 +250,9 @@ impl SshTools {
             Ok(request) => request,
             Err(message) => return tool_error(message),
         };
-        match self.mcp.ssh().agent_hosts().await {
-            Ok(hosts) if hosts.iter().any(|host| host.alias == request.host) => {}
-            Ok(_) => {
+        match self.mcp.ssh().is_agent_host(&request.host).await {
+            Ok(true) => {}
+            Ok(false) => {
                 return tool_error(format!(
                     "SSH host {} is not available to agents. Use a host from ssh_list_hosts; \
                      the user can grant access per host in TodeX SSH settings.",
@@ -396,12 +396,14 @@ fn validate(args: ExecArgs) -> Result<ExecRequest, String> {
     })
 }
 
-/// The remote shell line: `cd '<cwd>' && <command>`. The command is the
+/// The remote shell line: `cd '<cwd>' || exit 1` then `<command>`. The command is the
 /// agent's shell input by design; only the directory needs quoting. POSIX
 /// quoting, so `cwd` assumes a POSIX login shell on the remote side.
 fn remote_command(command: &str, cwd: Option<&str>) -> String {
     match cwd {
-        Some(cwd) => format!("cd {} && {command}", shell_quote(cwd)),
+        // `&&` would bind only to the first command of a list (`a; b`), so a
+        // failed `cd` must end the shell before any of the command runs.
+        Some(cwd) => format!("cd {} || exit 1\n{command}", shell_quote(cwd)),
         None => command.to_owned(),
     }
 }
@@ -529,11 +531,11 @@ mod tests {
         assert_eq!(remote_command("ls -la", None), "ls -la");
         assert_eq!(
             remote_command("make", Some("/srv/it's here")),
-            r"cd '/srv/it'\''s here' && make"
+            "cd '/srv/it'\\''s here' || exit 1\nmake"
         );
         assert_eq!(
             remote_command("pwd", Some("$(rm -rf /)")),
-            "cd '$(rm -rf /)' && pwd"
+            "cd '$(rm -rf /)' || exit 1\npwd"
         );
     }
 
@@ -806,14 +808,17 @@ exit 3
         assert_eq!(output["exitCode"], 3, "non-zero exit is a normal result");
         assert_eq!(
             output["stdout"],
-            "ran:cd '/srv/a b' && uname -a\ninput-data"
+            "ran:cd '/srv/a b' || exit 1\nuname -a\ninput-data"
         );
         assert_eq!(output["stderr"], "warn\n");
         assert_eq!(output["truncated"], false);
         let log = std::fs::read_to_string(harness.root.join("ssh.log")).unwrap();
-        let line = log.lines().find(|line| line.ends_with("uname -a")).unwrap();
+        let line = log
+            .lines()
+            .find(|line| line.ends_with("|| exit 1"))
+            .unwrap();
         assert!(line.contains("-o BatchMode=yes -o StrictHostKeyChecking=yes"));
-        assert!(line.contains("-- web cd '/srv/a b' && uname -a"));
+        assert!(log.contains("-- web cd '/srv/a b' || exit 1\nuname -a"));
 
         let big = call(
             &client,

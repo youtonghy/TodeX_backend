@@ -55,6 +55,19 @@ impl SftpFs {
         alias: &str,
         password: Option<Zeroizing<String>>,
     ) -> Result<Self, AppError> {
+        if password.is_some() {
+            // Jump hosts and proxy programs inherit ssh's environment, and a
+            // jump host's own password prompt would receive this secret.
+            let resolved = ssh.resolved_host(alias).await?;
+            if resolved.proxy_jump.is_some() || resolved.proxy_command.is_some() {
+                return Err(AppError::InvalidRequest(
+                    "password sign-in is not supported for hosts behind ProxyJump or \
+                     ProxyCommand; log in from the TodeX Terminal first and the file \
+                     session reuses that connection"
+                        .to_owned(),
+                ));
+            }
+        }
         let mut command = match &password {
             Some(password) => {
                 let program = std::env::current_exe().map_err(|error| {
@@ -407,11 +420,7 @@ impl RemoteFs for SftpFs {
             if read == 0 {
                 break;
             }
-            if sink
-                .send(Ok(Bytes::copy_from_slice(&buffer[..read])))
-                .await
-                .is_err()
-            {
+            if !super::send_chunk(sink, Bytes::copy_from_slice(&buffer[..read])).await {
                 break;
             }
         }

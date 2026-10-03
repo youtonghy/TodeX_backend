@@ -22,8 +22,10 @@ const MAX_ALIAS_LEN: usize = 64;
 const MAX_VALUE_LEN: usize = 1024;
 pub(crate) const MAX_MANAGED_HOSTS: usize = 512;
 
-/// Options that either define structure or run local commands; a managed host
-/// must not smuggle them in through the free-form option list.
+/// Options that define config structure or run commands on every connection
+/// setup outside ssh's own proxying; kept out of the free-form option list.
+/// (`ProxyCommand` and provider libraries stay allowed: they are ordinary
+/// connection settings, and only paired devices can edit hosts.)
 const FORBIDDEN_OPTIONS: &[&str] = &[
     "host",
     "match",
