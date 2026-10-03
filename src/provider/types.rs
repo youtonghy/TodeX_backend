@@ -759,6 +759,36 @@ impl DriverEventSink {
                 title.into(),
                 details,
                 options,
+                None,
+                cancel,
+            )
+            .await
+            .map(|(decision, _)| decision)
+    }
+
+    /// Like [`Self::request_permission`], but only the listed paired devices
+    /// may answer; clients see them as `allowedDeviceIds`. Returns the
+    /// device that answered with the decision.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_permission_on_devices(
+        &self,
+        provider_request_id: String,
+        kind: impl Into<String>,
+        title: impl Into<String>,
+        details: Value,
+        options: Value,
+        allowed_devices: Vec<String>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(PermissionDecision, String), AppError> {
+        self.permissions
+            .request(
+                self.clone(),
+                provider_request_id,
+                kind.into(),
+                title.into(),
+                details,
+                options,
+                Some(allowed_devices),
                 cancel,
             )
             .await
@@ -930,10 +960,13 @@ pub struct PermissionBroker {
 
 struct PendingPermission {
     conversation_id: String,
-    sender: oneshot::Sender<PermissionDecision>,
+    /// The decision and the device that sent it.
+    sender: oneshot::Sender<(PermissionDecision, String)>,
     kind: String,
     details: Value,
     options: Value,
+    /// Device ids allowed to answer; `None` lets any owner device answer.
+    allowed_devices: Option<Vec<String>>,
 }
 
 struct PendingPermissionCleanup {
@@ -948,6 +981,7 @@ impl Drop for PendingPermissionCleanup {
 }
 
 impl PermissionBroker {
+    #[allow(clippy::too_many_arguments)]
     async fn request(
         &self,
         sink: DriverEventSink,
@@ -956,8 +990,9 @@ impl PermissionBroker {
         title: String,
         details: Value,
         options: Value,
+        allowed_devices: Option<Vec<String>>,
         cancel: &mut watch::Receiver<bool>,
-    ) -> Result<PermissionDecision, AppError> {
+    ) -> Result<(PermissionDecision, String), AppError> {
         let options = normalize_permission_options(options)?;
         let permission_id = format!("perm_{}", Uuid::new_v4().simple());
         let (sender, receiver) = oneshot::channel();
@@ -969,26 +1004,25 @@ impl PermissionBroker {
                 kind: kind.clone(),
                 details: details.clone(),
                 options: options.clone(),
+                allowed_devices: allowed_devices.clone(),
             },
         );
         let _cleanup = PendingPermissionCleanup {
             pending: self.pending.clone(),
             permission_id: permission_id.clone(),
         };
-        if let Err(error) = sink
-            .emit(
-                "permission.requested",
-                json!({
-                    "permissionId": permission_id,
-                    "providerRequestId": provider_request_id,
-                    "kind": kind,
-                    "title": title,
-                    "details": details,
-                    "options": options,
-                }),
-            )
-            .await
-        {
+        let mut requested = json!({
+            "permissionId": permission_id,
+            "providerRequestId": provider_request_id,
+            "kind": kind,
+            "title": title,
+            "details": details,
+            "options": options,
+        });
+        if let Some(allowed_devices) = &allowed_devices {
+            requested["allowedDeviceIds"] = json!(allowed_devices);
+        }
+        if let Err(error) = sink.emit("permission.requested", requested).await {
             return Err(error);
         }
 
@@ -1005,8 +1039,8 @@ impl PermissionBroker {
                 Err(AppError::TurnCancelled)
             }
         };
-        let decision = match decision {
-            Ok(decision) => decision,
+        let (decision, device_id) = match decision {
+            Ok(answer) => answer,
             Err(error) => {
                 sink.emit(
                     "permission.resolved",
@@ -1029,13 +1063,16 @@ impl PermissionBroker {
             }),
         )
         .await?;
-        Ok(decision)
+        Ok((decision, device_id))
     }
 
+    /// Answers a pending request on behalf of `device_id`, the paired device
+    /// that sent the decision.
     pub async fn resolve(
         &self,
         conversation_id: &str,
         permission_id: &str,
+        device_id: &str,
         decision: PermissionDecision,
     ) -> Result<(), AppError> {
         let entry = match self.pending.entry(permission_id.to_owned()) {
@@ -1052,11 +1089,18 @@ impl PermissionBroker {
                 "permission belongs to another conversation".to_owned(),
             ));
         }
+        if let Some(allowed) = &pending.allowed_devices {
+            if !allowed.iter().any(|allowed| allowed == device_id) {
+                return Err(AppError::Unauthorized(
+                    "this request must be answered on the device it names".to_owned(),
+                ));
+            }
+        }
         validate_permission_decision(&pending.kind, &pending.details, &pending.options, &decision)?;
         let pending = entry.remove();
         pending
             .sender
-            .send(decision)
+            .send((decision, device_id.to_owned()))
             .map_err(|_| AppError::Conflict("permission request is no longer active".to_owned()))
     }
 
@@ -1434,6 +1478,7 @@ mod tests {
                 "Allow tool?".to_owned(),
                 Value::Null,
                 Value::Null,
+                None,
                 &mut cancel_rx,
             )
             .await
@@ -1582,6 +1627,7 @@ mod tests {
                     json!([{ "id": "allow", "kind": "allow_once", "name": "Allow" }]),
                 )
                 .unwrap(),
+                allowed_devices: None,
             },
         );
         let answer = PermissionDecision {
@@ -1589,18 +1635,22 @@ mod tests {
             option_id: None,
             data: Some(json!({"answers": {}})),
         };
-        assert!(broker.resolve("c", "p", answer).await.is_err());
+        assert!(broker.resolve("c", "p", "dev", answer).await.is_err());
         assert!(broker.pending.contains_key("p"));
         let valid = PermissionDecision {
             outcome: PermissionOutcome::AllowOnce,
             option_id: Some("allow".to_owned()),
             data: None,
         };
-        assert!(broker.resolve("other", "p", valid.clone()).await.is_err());
+        assert!(broker
+            .resolve("other", "p", "dev", valid.clone())
+            .await
+            .is_err());
         assert!(broker
             .resolve(
                 "c",
                 "p",
+                "dev",
                 PermissionDecision {
                     option_id: Some("forged".to_owned()),
                     ..valid.clone()
@@ -1608,12 +1658,89 @@ mod tests {
             )
             .await
             .is_err());
-        broker.resolve("c", "p", valid.clone()).await.unwrap();
+        broker
+            .resolve("c", "p", "dev", valid.clone())
+            .await
+            .unwrap();
         assert!(matches!(
-            receiver.await.unwrap().outcome,
+            receiver.await.unwrap().0.outcome,
             PermissionOutcome::AllowOnce
         ));
-        assert!(broker.resolve("c", "p", valid).await.is_err());
+        assert!(broker.resolve("c", "p", "dev", valid).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn device_restricted_permissions_reject_other_devices() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-permission-devices-{}",
+            Uuid::new_v4().simple()
+        ));
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let broker = PermissionBroker::default();
+        let sink = DriverEventSink::new(
+            store.clone(),
+            ConversationEventHub::default(),
+            broker.clone(),
+            &manifest.id,
+        );
+        let (_cancel, mut cancel_rx) = watch::channel(false);
+        let request = {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                sink.request_permission_on_devices(
+                    "r".to_owned(),
+                    "desktop_browser",
+                    "Allow?",
+                    Value::Null,
+                    json!([{ "id": "allow", "kind": "allow_always", "name": "Allow" }]),
+                    vec!["dev_desk".to_owned()],
+                    &mut cancel_rx,
+                )
+                .await
+            })
+        };
+        let permission_id = loop {
+            if let Some(entry) = broker.pending.iter().next() {
+                break entry.key().clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        let allow = PermissionDecision {
+            outcome: PermissionOutcome::AllowAlways,
+            option_id: Some("allow".to_owned()),
+            data: None,
+        };
+        assert!(matches!(
+            broker
+                .resolve(&manifest.id, &permission_id, "dev_phone", allow.clone())
+                .await,
+            Err(AppError::Unauthorized(_))
+        ));
+        assert!(broker.pending.contains_key(&permission_id));
+        broker
+            .resolve(&manifest.id, &permission_id, "dev_desk", allow)
+            .await
+            .unwrap();
+        let (decision, device) = request.await.unwrap().unwrap();
+        assert!(matches!(decision.outcome, PermissionOutcome::AllowAlways));
+        assert_eq!(device, "dev_desk");
+        let replay = store.replay(&manifest.id, 0, 100).await.unwrap();
+        let requested = replay
+            .events
+            .iter()
+            .find(|event| event.event_type == "permission.requested")
+            .unwrap();
+        assert_eq!(requested.payload["allowedDeviceIds"], json!(["dev_desk"]));
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[test]

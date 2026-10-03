@@ -69,8 +69,8 @@ const ERROR_DETAIL_LIMIT: usize = 4096;
 
 /// The conversation a request was authenticated for.
 #[derive(Clone, Debug)]
-struct Caller {
-    conversation_id: String,
+pub(super) struct Caller {
+    pub(super) conversation_id: String,
 }
 
 pub(crate) fn routes(state: &AppState) -> Router<AppState> {
@@ -94,7 +94,11 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
 /// Only local, non-browser callers holding a conversation token get through.
 /// This route deliberately sits outside device auth: the agents calling it
 /// run on this machine and never hold a device key.
-async fn guard(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
+pub(super) async fn guard(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let loopback = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -142,7 +146,7 @@ struct ExecArgs {
     timeout_sec: Option<u64>,
 }
 
-fn schema(value: Value) -> Arc<serde_json::Map<String, Value>> {
+pub(super) fn schema(value: Value) -> Arc<serde_json::Map<String, Value>> {
     match value {
         Value::Object(map) => Arc::new(map),
         _ => unreachable!("tool schemas are objects"),
@@ -649,7 +653,7 @@ fn failure_hint(failure: SshFailureKind) -> Option<&'static str> {
     }
 }
 
-fn tool_error(message: String) -> CallToolResult {
+pub(super) fn tool_error(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
 
@@ -1279,21 +1283,36 @@ exit 3
             .await
             .unwrap();
         });
+        // Both TodeX servers, to check the merged config and allow list.
+        harness
+            .state
+            .agent_mcp
+            .desktop()
+            .set_enabled(true)
+            .await
+            .unwrap();
         let mut launch = harness
             .state
             .agent_mcp
             .launch(&harness.conversation_id)
             .await
             .unwrap();
-        let server = &mut launch.servers[0];
-        server.command = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("todex-agentd");
-        server.env[0].1 = format!("http://{addr}{ROUTE}");
+        assert_eq!(launch.servers.len(), 2);
+        for server in &mut launch.servers {
+            server.command = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("todex-agentd");
+            let route = if server.name == SERVER_NAME {
+                ROUTE
+            } else {
+                super::super::DESKTOP_ROUTE
+            };
+            server.env[0].1 = format!("http://{addr}{route}");
+        }
         let output = tokio::process::Command::new("claude")
             .args([
                 "-p",
@@ -1327,5 +1346,16 @@ exit 3
         let tools = init["tools"].to_string();
         assert!(tools.contains("mcp__todex_ssh__ssh_exec"), "{tools}");
         assert!(tools.contains("mcp__todex_ssh__ssh_list_hosts"), "{tools}");
+        assert!(
+            tools.contains("mcp__todex_desktop__browser_snapshot"),
+            "{tools}"
+        );
+        let desktop = init["mcp_servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|server| server["name"] == "todex_desktop")
+            .cloned();
+        assert_eq!(desktop.unwrap()["status"], "connected");
     }
 }

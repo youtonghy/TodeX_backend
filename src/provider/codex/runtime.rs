@@ -869,6 +869,7 @@ done
             .resolve(
                 &manifest.id,
                 &permission_id,
+                "local",
                 super::super::super::types::PermissionDecision {
                     outcome: PermissionOutcome::Answer,
                     option_id: Some("answer".into()),

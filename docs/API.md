@@ -589,6 +589,19 @@ POST /v2/browser/fetch
   - `ssh.exec.completed { execId, host, exitCode?, durationMs, failure?, truncated, outputTruncated, turnId? }`：`truncated` 指返回给 Agent 的结果被截断，`outputTruncated` 指事件中记录的输出被截断。
   - 桌面端与 Web 在当前会话中为每个 `execId` 打开一个只读侧边栏标签；其他客户端可忽略这些事件。
 
+### Agent 桌面浏览器（MCP `todex_desktop`）
+
+Agent 运行在 daemon 所在机器，浏览器却属于用户的桌面端。桌面端以独立的 `/v2/ws` 连接登记为**执行端**，daemon 把工具调用转发过去。
+
+- 开关：`GET /v2/agent-desktop` → `{ enabled, executors: [{ executorId, deviceId, deviceName, platform, capabilities }] }`；`PUT /v2/agent-desktop { enabled }`。默认关闭，存于 `$DATA_DIR/agent-desktop.json`。打开后，会话启动时与 `todex_ssh` 一样注入 `todex_desktop`（端点 `/internal/agent-mcp/desktop`，同一会话令牌与鉴权规则，Codex `tool_timeout_sec` 与 Claude `timeout` 为 390 秒）。已运行的 Provider 要到下次启动才看到新工具；关闭立即生效（调用返回错误，并撤销所有会话授权）。旧 daemon 上此路由为 404，客户端据此隐藏设置。
+- 工具：`browser_open {url}`、`browser_navigate {url | action: back|forward|reload}`、`browser_snapshot {screenshot?}`（URL、标题与带 `[ref=eN]` 的无障碍树，可附 JPEG）、`browser_act {action: click|type|press|scroll|select|hover|wait, ref?, text?, key?, deltaY?, ms?}`、`browser_close {}`。顶层地址只允许 `localhost`、`127.0.0.0/8`、`[::1]` 的 http(s)（daemon 校验，桌面端对页面自身发起的导航同样拦截）；页面内部加载的外部子资源不受限。
+- 首次授权：会话第一次调用时发出 `permission.requested { kind: "desktop_browser", allowedDeviceIds, details: { executors } }`，只有列出的在线执行端设备能回答（其他设备提交返回 401 `Unauthorized`，请求保持挂起），与权限模式无关；最多等待 5 分钟。批准的设备成为该会话的执行端，授权只存在内存中，daemon 重启后重新询问。绑定的设备离线时调用直接报错，不会改绑。
+- 敏感操作：桌面端判定为敏感（如向密码框输入）时返回 `SENSITIVE_ACTION`，daemon 发出 `kind: "desktop_browser_action"` 的单次确认（任意设备可答），批准后带 `confirmed: true` 重试。Agent 不能自行传 `confirmed`。
+- `DELETE /v2/conversations/{id}/agent-desktop`：撤销会话授权（桌面端“停止”按钮），桌面端收到 `executor.release` 关闭标签。`GET /v2/conversations/{id}/agent-shots/{shotId}` → `{ shotId, mimeType, dataUrl }`。截图存于 `$DATA_DIR/agent-desktop/shots/`，每会话保留最新 200 张，会话删除时一并删除。
+- 会话事件：`desktop.browser.grant { status: "granted"|"revoked", deviceId?, deviceName?, reason? }`；`desktop.browser.action { actionId, tool, ok, summary, url?, title?, error?, shotId?, deviceId, deviceName }`。事件不含截图数据与输入的文字。
+- 执行端帧（`/v2/ws`，无对应命令时旧 daemon 不支持）：客户端 `{ id, type: "executor.register", payload: { capabilities: ["browser"], platform } }` → `server.result { executorId, deviceId }`；daemon 下发 `executor.invoke { invokeId, conversationId, workspace: { id?, path }, tool, args, timeoutMs }`、`executor.cancel { invokeId }`、`executor.release { conversationId }`；客户端回 `executor.result { invokeId, ok, result | error: { code, message } }`（无响应）。只接受发给本连接的调用结果；连接断开时其所有待返回调用立即失败。类型见 `TodeX_protocol/src/agentDesktop.ts`。
+- 设备限定的权限：任何 `permission.requested` 都可能带 `allowedDeviceIds`，客户端应在本机不在列表中时隐藏操作按钮。
+
 ## WebSocket 协议
 
 客户端发送文本帧，内容必须是 JSON。二进制帧会被忽略。默认仍支持明文 JSON；如果 WebSocket URL 带上加密握手参数，业务 JSON 会被包装在 `todex.crypto.v1` 加密帧中。

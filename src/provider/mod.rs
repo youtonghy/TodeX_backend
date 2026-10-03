@@ -24,6 +24,7 @@ pub use supervisor::{
     ConversationPrompt, ConversationSupervisor, PromptContentRef, PromptSkillRef,
 };
 pub use types::PermissionDecision;
+pub(crate) use types::PermissionOutcome;
 
 #[cfg(test)]
 mod control_tests;

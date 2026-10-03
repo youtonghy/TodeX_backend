@@ -10,10 +10,12 @@
 //! them.
 //!
 //! Each server is injected only while its feature is enabled (`todex_ssh`:
-//! at least one SSH host has agent access), so provider arguments stay
-//! unchanged for everyone who never enables one.
+//! at least one SSH host has agent access; `todex_desktop`: desktop tools
+//! are switched on), so provider arguments stay unchanged for everyone who
+//! never enables one.
 
 mod bridge;
+mod desktop_server;
 mod server;
 
 use std::{
@@ -28,10 +30,16 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::{error::AppError, secure_fs, ssh::SshService};
+use crate::{agent_desktop::AgentDesktop, error::AppError, secure_fs, ssh::SshService};
 
 pub(crate) use bridge::run_bridge;
-pub(crate) use server::routes;
+
+/// Every agent MCP endpoint, behind the same loopback + token guard.
+pub(crate) fn routes(
+    state: &crate::app_state::AppState,
+) -> axum::Router<crate::app_state::AppState> {
+    server::routes(state).merge(desktop_server::routes(state))
+}
 
 /// MCP server name the agents see; tools appear as e.g. `todex_ssh.ssh_exec`.
 pub(crate) const SSH_SERVER: &str = "todex_ssh";
@@ -49,6 +57,8 @@ pub(crate) const LEGACY_TOKEN_ENV: &str = "TODEX_SSH_MCP_TOKEN";
 /// Codex and Claude stop waiting for a tool call after their own timeout;
 /// leave room for the longest `ssh_exec` plus connection setup.
 const SSH_TOOL_TIMEOUT_SECONDS: u64 = server::MAX_TIMEOUT_SECONDS + 60;
+pub(crate) const DESKTOP_SERVER: &str = "todex_desktop";
+pub(crate) const DESKTOP_ROUTE: &str = "/internal/agent-mcp/desktop";
 const STATE_DIR: &str = "agent-mcp";
 
 /// Per-conversation tokens and the endpoint agents connect to.
@@ -59,6 +69,7 @@ pub struct AgentMcp {
 
 struct Inner {
     ssh: SshService,
+    desktop: AgentDesktop,
     /// conversation id → bearer token.
     tokens: Mutex<HashMap<String, String>>,
     /// `http://<loopback>:<port>`, set once bound.
@@ -69,7 +80,11 @@ struct Inner {
 }
 
 impl AgentMcp {
-    pub async fn new(data_dir: &std::path::Path, ssh: SshService) -> Result<Self, AppError> {
+    pub async fn new(
+        data_dir: &std::path::Path,
+        ssh: SshService,
+        desktop: AgentDesktop,
+    ) -> Result<Self, AppError> {
         let bridge_command = match std::env::current_exe() {
             Ok(path) => Some(path),
             Err(error) => {
@@ -77,12 +92,13 @@ impl AgentMcp {
                 None
             }
         };
-        Self::with_bridge_command(data_dir, ssh, bridge_command).await
+        Self::with_bridge_command(data_dir, ssh, desktop, bridge_command).await
     }
 
     pub(crate) async fn with_bridge_command(
         data_dir: &std::path::Path,
         ssh: SshService,
+        desktop: AgentDesktop,
         bridge_command: Option<PathBuf>,
     ) -> Result<Self, AppError> {
         let state_dir = data_dir.join(STATE_DIR);
@@ -101,6 +117,7 @@ impl AgentMcp {
         Ok(Self {
             inner: Arc::new(Inner {
                 ssh,
+                desktop,
                 tokens: Mutex::new(HashMap::new()),
                 endpoint: OnceLock::new(),
                 bridge_command,
@@ -111,6 +128,10 @@ impl AgentMcp {
 
     pub(crate) fn ssh(&self) -> &SshService {
         &self.inner.ssh
+    }
+
+    pub(crate) fn desktop(&self) -> &AgentDesktop {
+        &self.inner.desktop
     }
 
     /// Records the bound listener. Agents connect over loopback; a listener
@@ -138,6 +159,13 @@ impl AgentMcp {
         let mut enabled = Vec::new();
         if self.inner.ssh.has_agent_hosts().await {
             enabled.push((SSH_SERVER, SSH_ROUTE, SSH_TOOL_TIMEOUT_SECONDS));
+        }
+        if self.inner.desktop.enabled().await {
+            enabled.push((
+                DESKTOP_SERVER,
+                DESKTOP_ROUTE,
+                desktop_server::PROVIDER_TOOL_TIMEOUT_SECONDS,
+            ));
         }
         if enabled.is_empty() {
             return None;
@@ -189,8 +217,10 @@ impl AgentMcp {
         found
     }
 
-    /// Invalidates the conversation's token (conversation deleted/expired).
+    /// Invalidates the conversation's token and desktop grant (conversation
+    /// deleted/expired).
     pub(crate) async fn revoke(&self, conversation_id: &str) {
+        self.inner.desktop.forget(conversation_id).await;
         self.inner
             .tokens
             .lock()
@@ -353,9 +383,11 @@ pub(crate) mod tests {
 
     /// An `AgentMcp` on a fixture ssh service with a loopback endpoint.
     pub(crate) async fn registry(ssh: SshService, root: &std::path::Path) -> AgentMcp {
+        let desktop = AgentDesktop::load(&root.join("data")).await.unwrap();
         let mcp = AgentMcp::with_bridge_command(
             &root.join("data"),
             ssh,
+            desktop,
             Some(PathBuf::from("/opt/todex/todex-agentd")),
         )
         .await
@@ -474,7 +506,8 @@ pub(crate) mod tests {
         let ssh = SshService::with_home(&root.join("data"), "ssh".into(), None)
             .await
             .unwrap();
-        let mcp = AgentMcp::with_bridge_command(&root.join("data"), ssh, Some("x".into()))
+        let desktop = AgentDesktop::load(&root.join("data")).await.unwrap();
+        let mcp = AgentMcp::with_bridge_command(&root.join("data"), ssh, desktop, Some("x".into()))
             .await
             .unwrap();
         mcp.set_listen_addr("192.168.1.20:7345".parse().unwrap());

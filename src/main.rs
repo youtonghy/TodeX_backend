@@ -1,3 +1,4 @@
+mod agent_desktop;
 mod agent_mcp;
 mod agent_providers;
 mod app_state;

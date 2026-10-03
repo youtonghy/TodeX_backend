@@ -9,6 +9,7 @@ use std::{
 use tokio::task::JoinHandle;
 
 use crate::{
+    agent_desktop::AgentDesktop,
     agent_mcp::AgentMcp,
     agent_providers::AgentProviderService,
     catalog::CatalogService,
@@ -59,6 +60,8 @@ pub struct AppState {
     pub quota: QuotaStore,
     /// SSH tools for agents; see [`crate::agent_mcp`].
     pub agent_mcp: AgentMcp,
+    /// Desktop executors for agent tools; see [`crate::agent_desktop`].
+    pub agent_desktop: AgentDesktop,
     /// Open SFTP/FTP file sessions; in memory only.
     pub(crate) remote_files: RemoteSessions,
     pub(crate) audit_write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -116,7 +119,8 @@ impl AppState {
                 .await?;
         }
         let ssh = SshService::new(&config.data_dir, config.agent.ssh_bin.clone()).await?;
-        let agent_mcp = AgentMcp::new(&config.data_dir, ssh.clone()).await?;
+        let agent_desktop = AgentDesktop::load(&config.data_dir).await?;
+        let agent_mcp = AgentMcp::new(&config.data_dir, ssh.clone(), agent_desktop.clone()).await?;
         let conversation_store = ConversationStore::new(config.data_dir.clone()).await?;
         let conversation_hub = ConversationEventHub::default();
         let quota = QuotaStore::default();
@@ -162,6 +166,7 @@ impl AppState {
             ssh,
             quota,
             agent_mcp,
+            agent_desktop,
             remote_files: RemoteSessions::default(),
             audit_write_lock,
             websocket_connections,

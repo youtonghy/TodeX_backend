@@ -101,6 +101,12 @@ fn is_v2_native_command(command_type: &str) -> bool {
     )
 }
 
+/// Frames of a desktop acting as an agent tool executor; see
+/// [`crate::agent_desktop`].
+fn is_executor_frame(command_type: &str) -> bool {
+    matches!(command_type, "executor.register" | "executor.result")
+}
+
 fn is_v2_background_command(command_type: &str) -> bool {
     matches!(
         command_type,
@@ -176,6 +182,7 @@ fn authenticated_routes() -> Router<AppState> {
         .merge(agent_providers::routes())
         .merge(super::quota::routes())
         .merge(super::ssh::routes())
+        .merge(super::agent_desktop::routes())
         .merge(super::remote::routes())
         .route(
             "/v2/conversations/{conversation_id}/runtime/stop",
@@ -1046,7 +1053,9 @@ pub(super) async fn browser_fetch(
     }))
 }
 
-fn is_allowed_browser_target(url: &reqwest::Url) -> bool {
+/// Loopback http(s) without credentials: the only pages the browser
+/// preview and agent desktop browsers may load at the top level.
+pub(crate) fn is_allowed_browser_target(url: &reqwest::Url) -> bool {
     let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
     let is_loopback = host.eq_ignore_ascii_case("localhost")
         || host
@@ -1056,7 +1065,7 @@ fn is_allowed_browser_target(url: &reqwest::Url) -> bool {
     is_loopback && url.username().is_empty() && url.password().is_none()
 }
 
-fn validate_browser_url(raw: &str) -> Result<String, AppError> {
+pub(crate) fn validate_browser_url(raw: &str) -> Result<String, AppError> {
     let value = raw.trim();
     let Ok(mut parsed) = reqwest::Url::parse(value) else {
         return Err(AppError::InvalidRequest(
@@ -2054,7 +2063,13 @@ async fn resolve_permission(
     let auth = require_auth(&state, &headers)?;
     state
         .conversations
-        .resolve_permission_owned(&auth.tenant_id, &conversation_id, &permission_id, decision)
+        .resolve_permission_owned(
+            &auth.tenant_id,
+            &auth.principal_id,
+            &conversation_id,
+            &permission_id,
+            decision,
+        )
         .await?;
     Ok(Json(json!({
         "conversationId": conversation_id,
@@ -2254,6 +2269,7 @@ async fn handle_socket(
     });
 
     let mut subscriptions = WsSubscriptions::new();
+    let mut executor: Option<crate::agent_desktop::Registration> = None;
     let operation_limit = Arc::new(Semaphore::new(MAX_WS_IN_FLIGHT_OPERATIONS));
     let mut operation_tasks = Vec::new();
     let client_timeout = tokio::time::Duration::from_secs(WS_CLIENT_TIMEOUT_SECS);
@@ -2307,6 +2323,15 @@ async fn handle_socket(
             .ok()
             .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned));
         match command_type.as_deref() {
+            Some(command_type) if is_executor_frame(command_type) => {
+                let response =
+                    handle_executor_frame(&state, &auth, &outgoing_tx, &mut executor, &text);
+                if let Some(response) = response {
+                    if queue_frame(&outgoing_tx, response).await.is_err() {
+                        break;
+                    }
+                }
+            }
             Some(command_type) if is_v2_native_command(command_type) => {
                 let command: V2Command = match serde_json::from_str(&text) {
                     Ok(command) => command,
@@ -2361,6 +2386,7 @@ async fn handle_socket(
                     &mut subscriptions,
                     &event_scope,
                     &auth.tenant_id,
+                    &auth.principal_id,
                     command,
                 )
                 .await;
@@ -2391,6 +2417,8 @@ async fn handle_socket(
         }
     }
 
+    // Fails every agent tool call still waiting on this connection.
+    drop(executor);
     subscriptions.abort_all();
     for task in operation_tasks {
         task.abort();
@@ -2427,6 +2455,103 @@ async fn handle_socket(
             }),
         ))
         .await;
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecutorRegisterRequest {
+    capabilities: Vec<String>,
+    platform: String,
+}
+
+/// `executor.register` (re)registers this connection as a desktop executor
+/// for its device; `executor.result` answers an `executor.invoke`. Returns
+/// the frame to send back, if any.
+fn handle_executor_frame(
+    state: &AppState,
+    auth: &AuthContext,
+    outgoing: &mpsc::Sender<Value>,
+    executor: &mut Option<crate::agent_desktop::Registration>,
+    text: &str,
+) -> Option<Value> {
+    let frame: Value = match serde_json::from_str(text) {
+        Ok(frame) => frame,
+        Err(error) => {
+            return Some(error_response(
+                None,
+                AppError::InvalidRequest(format!("invalid executor frame: {error}")),
+            ))
+        }
+    };
+    let id = frame["id"].as_str().map(str::to_owned);
+    match frame["type"].as_str() {
+        Some("executor.register") => {
+            let Some(id) = id else {
+                return Some(error_response(
+                    None,
+                    AppError::InvalidRequest("executor.register needs an id".to_owned()),
+                ));
+            };
+            let request: ExecutorRegisterRequest =
+                match serde_json::from_value(frame["payload"].clone()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return Some(error_response(
+                            Some(id),
+                            AppError::InvalidRequest(format!(
+                                "invalid executor.register payload: {error}"
+                            )),
+                        ))
+                    }
+                };
+            let capabilities =
+                match crate::agent_desktop::executors::validate_capabilities(&request.capabilities)
+                {
+                    Ok(capabilities) => capabilities,
+                    Err(message) => {
+                        return Some(error_response(Some(id), AppError::InvalidRequest(message)))
+                    }
+                };
+            let platform: String = request.platform.chars().take(32).collect();
+            let device_name = state
+                .device_auth
+                .device_name(&auth.principal_id)
+                .unwrap_or_else(|| auth.principal_id.clone());
+            // Replacing the registration fails calls waiting on the old one.
+            *executor = None;
+            let registration = state.agent_desktop.executors().register(
+                auth.principal_id.clone(),
+                device_name,
+                platform,
+                capabilities,
+                outgoing.clone(),
+            );
+            let executor_id = registration.executor_id();
+            *executor = Some(registration);
+            Some(json!({
+                "id": id,
+                "type": "server.result",
+                "payload": { "executorId": executor_id, "deviceId": auth.principal_id },
+            }))
+        }
+        Some("executor.result") => {
+            let Some(registration) = executor.as_ref() else {
+                return Some(error_response(
+                    id,
+                    AppError::InvalidRequest("this connection is not an executor".to_owned()),
+                ));
+            };
+            match state
+                .agent_desktop
+                .executors()
+                .complete(registration.executor_id(), &frame["payload"])
+            {
+                Ok(()) => None,
+                Err(message) => Some(error_response(id, AppError::InvalidRequest(message))),
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Per-connection `conversation.subscribe` bookkeeping.
@@ -2721,6 +2846,7 @@ async fn dispatch_command(
     subscriptions: &mut WsSubscriptions,
     event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
     owner_id: &str,
+    device_id: &str,
     command: V2Command,
 ) -> Option<Value> {
     // Reap forwarding tasks that exited on their own (channel closed, send
@@ -2742,6 +2868,7 @@ async fn dispatch_command(
             subscriptions,
             event_scope,
             owner_id,
+            device_id,
             &command,
         )
         .await
@@ -2827,6 +2954,7 @@ async fn dispatch_command_inner(
     subscriptions: &mut WsSubscriptions,
     event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
     owner_id: &str,
+    device_id: &str,
     command: &V2Command,
 ) -> Result<Value, AppError> {
     match command.command_type.as_str() {
@@ -2983,6 +3111,7 @@ async fn dispatch_command_inner(
                 .conversations
                 .resolve_permission_owned(
                     owner_id,
+                    device_id,
                     &request.conversation_id,
                     &request.permission_id,
                     request.decision,
@@ -4774,6 +4903,7 @@ mod tests {
             &mut subscriptions,
             &event_scope,
             "local",
+            "local",
             &V2Command {
                 id: "unsub".to_owned(),
                 command_type: "conversation.unsubscribe".to_owned(),
@@ -4797,6 +4927,7 @@ mod tests {
             &outgoing,
             &mut subscriptions,
             &event_scope,
+            "local",
             "local",
             &V2Command {
                 id: "unsub-again".to_owned(),
@@ -6765,6 +6896,7 @@ mod tests {
             subscriptions,
             &event_scope,
             "local",
+            "local",
             command,
         )
         .await
@@ -6891,6 +7023,7 @@ mod tests {
                 &mut subscriptions,
                 &event_scope,
                 "local",
+                "local",
                 command("sub-1", "conversation.subscribe", subscribe_payload.clone()),
             ),
         )
@@ -6905,6 +7038,7 @@ mod tests {
                 &outgoing,
                 &mut subscriptions,
                 &event_scope,
+                "local",
                 "local",
                 command("ping-1", "server.ping", json!({})),
             ),
@@ -6922,6 +7056,7 @@ mod tests {
             &outgoing,
             &mut subscriptions,
             &event_scope,
+            "local",
             "local",
             command("sub-2", "conversation.subscribe", subscribe_payload),
         )
@@ -7010,6 +7145,7 @@ mod tests {
             &mut subscriptions,
             &event_scope,
             "local",
+            "local",
             V2Command {
                 id: "sub".to_owned(),
                 command_type: "conversation.subscribe".to_owned(),
@@ -7024,6 +7160,7 @@ mod tests {
             &outgoing,
             &mut subscriptions,
             &event_scope,
+            "local",
             "local",
             V2Command {
                 id: "unsub".to_owned(),
@@ -7127,6 +7264,7 @@ mod tests {
             &mut subscriptions,
             &event_scope,
             "local",
+            "local",
             subscribe(),
         )
         .await;
@@ -7157,6 +7295,7 @@ mod tests {
             &mut subscriptions,
             &event_scope,
             "local",
+            "local",
             subscribe(),
         )
         .await
@@ -7164,6 +7303,259 @@ mod tests {
         assert_eq!(retry["type"], "server.error");
         assert!(retry["payload"].get("alreadySubscribed").is_none());
         assert!(!hub.has_channel(&manifest.id));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An authenticated state with no real providers, for socket tests.
+    async fn auth_test_state(root: &Path) -> AppState {
+        let workspace_root = root.join("workspaces");
+        fs::create_dir_all(workspace_root.join("project")).unwrap();
+        AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root],
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: "codex".to_owned(),
+                claude_bin: "claude".to_owned(),
+                pi_bin: "pi".to_owned(),
+                grok_bin: "grok".to_owned(),
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+                ssh_bin: "ssh".to_owned(),
+                provider_idle_timeout_minutes: 0,
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_desktop_routes_toggle_revoke_and_serve_shots() {
+        let root = std::env::temp_dir().join(format!("todex-v2-agent-desktop-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let device = enroll(&root.join("data"));
+        let app = crate::server::router(state.clone());
+        let send = |request: Request<Body>| {
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+                )
+            }
+        };
+
+        let unsigned = Request::builder()
+            .uri("/v2/agent-desktop")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(unsigned).await.0, StatusCode::UNAUTHORIZED);
+        let (status, body) = send(signed_request(&device, "GET", "/v2/agent-desktop", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "enabled": false, "executors": [] }));
+        let (status, body) = send(signed_request(
+            &device,
+            "PUT",
+            "/v2/agent-desktop",
+            r#"{"enabled":true}"#,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["enabled"], true);
+        assert!(state.agent_desktop.enabled().await);
+        let (status, _) = send(signed_request(
+            &device,
+            "PUT",
+            "/v2/agent-desktop",
+            r#"{"enabled":true,"x":1}"#,
+        ))
+        .await;
+        assert!(status.is_client_error());
+
+        let manifest = state
+            .conversations
+            .create_for_tests(
+                ProviderKind::Codex,
+                std::fs::canonicalize(root.join("workspaces/project")).unwrap(),
+            )
+            .await
+            .unwrap();
+        let uri = format!("/v2/conversations/{}/agent-desktop", manifest.id);
+        let (_, body) = send(signed_request(&device, "DELETE", &uri, "")).await;
+        assert_eq!(body["revoked"], false);
+        state.agent_desktop.set_grant(
+            &manifest.id,
+            crate::agent_desktop::Grant {
+                device_id: "dev_x".into(),
+                device_name: "X".into(),
+            },
+        );
+        let (_, body) = send(signed_request(&device, "DELETE", &uri, "")).await;
+        assert_eq!(body["revoked"], true);
+        assert!(state.agent_desktop.grant(&manifest.id).is_none());
+        let history = state.conversations.history_for_tests(&manifest.id).await;
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "desktop.browser.grant"
+                && event.payload["status"] == "revoked"));
+
+        let shot = state
+            .agent_desktop
+            .shots()
+            .save(&manifest.id, b"jpeg".to_vec())
+            .await
+            .unwrap();
+        let (status, body) = send(signed_request(
+            &device,
+            "GET",
+            &format!("/v2/conversations/{}/agent-shots/{shot}", manifest.id),
+            "",
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["dataUrl"], "data:image/jpeg;base64,anBlZw==");
+        let (status, _) = send(signed_request(
+            &device,
+            "GET",
+            &format!("/v2/conversations/{}/agent-shots/..%2F..%2Fx", manifest.id),
+            "",
+        ))
+        .await;
+        assert!(status.is_client_error());
+        let (status, _) = send(signed_request(
+            &device,
+            "GET",
+            &format!("/v2/conversations/nope/agent-shots/{shot}"),
+            "",
+        ))
+        .await;
+        assert!(status.is_client_error());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_ws_executor_registers_answers_invokes_and_fails_calls_on_disconnect() {
+        let root = std::env::temp_dir().join(format!("todex-v2-executor-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let device = enroll(&root.join("data"));
+        let app = crate::server::router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let connect = || async {
+            tokio_tungstenite::connect_async(format!(
+                "ws://{addr}/v2/ws?{}",
+                device.sign_query("/v2/ws")
+            ))
+            .await
+            .unwrap()
+            .0
+        };
+        let send = |value: Value| WsMessage::Text(value.to_string().into());
+        let executors = state.agent_desktop.executors().clone();
+
+        let mut ws = connect().await;
+        // Only executors may answer invokes.
+        ws.send(send(json!({ "id": "r0", "type": "executor.result", "payload": { "invokeId": "x", "ok": true } })))
+            .await
+            .unwrap();
+        let refused = wait_for_ws_message(&mut ws, |m| m["id"] == "r0").await;
+        assert_eq!(refused["type"], "server.error");
+
+        ws.send(send(json!({ "id": "bad", "type": "executor.register", "payload": { "capabilities": ["screen"], "platform": "darwin" } })))
+            .await
+            .unwrap();
+        let bad = wait_for_ws_message(&mut ws, |m| m["id"] == "bad").await;
+        assert_eq!(bad["type"], "server.error");
+        assert!(executors.online("browser").is_empty());
+
+        ws.send(send(json!({ "id": "reg", "type": "executor.register", "payload": { "capabilities": ["browser"], "platform": "darwin" } })))
+            .await
+            .unwrap();
+        let registered = wait_for_ws_message(&mut ws, |m| m["id"] == "reg").await;
+        assert_eq!(registered["type"], "server.result");
+        assert_eq!(registered["payload"]["deviceId"], device.device_id);
+        let online = executors.online("browser");
+        assert_eq!(online.len(), 1);
+        assert_eq!(online[0].device_name, "test-device");
+        assert_eq!(online[0].platform, "darwin");
+        let executor_id = online[0].executor_id;
+
+        let call = {
+            let executors = executors.clone();
+            tokio::spawn(async move {
+                executors
+                    .invoke(
+                        executor_id,
+                        crate::agent_desktop::InvokeRequest {
+                            conversation_id: "conv_1".to_owned(),
+                            workspace: json!({ "path": "/w" }),
+                            tool: "browser_snapshot".to_owned(),
+                            args: json!({}),
+                        },
+                        Duration::from_secs(5),
+                        std::future::pending(),
+                    )
+                    .await
+            })
+        };
+        let invoke = wait_for_ws_message(&mut ws, |m| m["type"] == "executor.invoke").await;
+        assert_eq!(invoke["payload"]["conversationId"], "conv_1");
+        ws.send(send(json!({ "type": "executor.result", "payload": { "invokeId": invoke["payload"]["invokeId"], "ok": true, "result": { "tree": "button" } } })))
+            .await
+            .unwrap();
+        assert_eq!(call.await.unwrap().unwrap(), json!({ "tree": "button" }));
+
+        // A dropped connection fails the calls waiting on it and leaves the
+        // executor list.
+        let waiting = {
+            let executors = executors.clone();
+            tokio::spawn(async move {
+                executors
+                    .invoke(
+                        executor_id,
+                        crate::agent_desktop::InvokeRequest {
+                            conversation_id: "conv_1".to_owned(),
+                            workspace: json!({ "path": "/w" }),
+                            tool: "browser_snapshot".to_owned(),
+                            args: json!({}),
+                        },
+                        Duration::from_secs(5),
+                        std::future::pending(),
+                    )
+                    .await
+            })
+        };
+        wait_for_ws_message(&mut ws, |m| m["type"] == "executor.invoke").await;
+        drop(ws);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(crate::agent_desktop::ExecutorError::Gone)
+        );
+        assert!(executors.online("browser").is_empty());
         let _ = fs::remove_dir_all(root);
     }
 

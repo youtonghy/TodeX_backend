@@ -3401,6 +3401,7 @@ mod tests {
             .resolve(
                 &fixture.manifest.id,
                 id,
+                "local",
                 PermissionDecision {
                     outcome: PermissionOutcome::Answer,
                     option_id: Some("answer".to_owned()),

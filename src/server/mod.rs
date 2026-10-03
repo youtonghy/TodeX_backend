@@ -1,3 +1,4 @@
+mod agent_desktop;
 mod agent_providers;
 mod device_pairing;
 mod git;
@@ -8,6 +9,8 @@ mod routes;
 mod ssh;
 mod v2;
 pub(crate) mod websocket;
+
+pub(crate) use v2::{is_allowed_browser_target, validate_browser_url};
 
 use std::net::IpAddr;
 use std::time::Duration;

@@ -429,6 +429,88 @@ impl ConversationSupervisor {
         self.emit(conversation_id, event_type, payload).await
     }
 
+    /// Asks the user from inside an agent tool call (outside any provider
+    /// stream), tagged with the running turn. `allowed_devices` restricts who
+    /// may answer. The turn's cancellation, or `cancel`, ends the request.
+    /// Returns the decision and the device that answered.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_agent_permission(
+        &self,
+        conversation_id: &str,
+        request_id: String,
+        kind: &str,
+        title: String,
+        details: Value,
+        options: Value,
+        allowed_devices: Option<Vec<String>>,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<(PermissionDecision, String), AppError> {
+        let turn = self
+            .active
+            .get(conversation_id)
+            .map(|turn| (turn.turn_id.clone(), turn.cancel.subscribe()));
+        let mut sink = DriverEventSink::new(
+            self.store.clone(),
+            self.hub.clone(),
+            self.permissions.clone(),
+            conversation_id,
+        );
+        // Either the turn or the caller cancelling ends the request.
+        let (merged_tx, mut merged_rx) = watch::channel(false);
+        let forward = tokio::spawn({
+            let turn_cancel = turn.as_ref().map(|(_, cancel)| cancel.clone());
+            async move {
+                let turn_cancelled = async {
+                    match turn_cancel {
+                        Some(mut cancel) => {
+                            while !*cancel.borrow_and_update() {
+                                if cancel.changed().await.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
+                let caller_cancelled = async {
+                    while !*cancel.borrow_and_update() {
+                        if cancel.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                };
+                tokio::select! {
+                    _ = turn_cancelled => {}
+                    _ = caller_cancelled => {}
+                }
+                let _ = merged_tx.send(true);
+            }
+        });
+        if let Some((turn_id, _)) = turn {
+            sink = sink.with_turn_id(turn_id);
+        }
+        let result = match allowed_devices {
+            Some(devices) => {
+                sink.request_permission_on_devices(
+                    request_id,
+                    kind,
+                    title,
+                    details,
+                    options,
+                    devices,
+                    &mut merged_rx,
+                )
+                .await
+            }
+            None => sink
+                .request_permission(request_id, kind, title, details, options, &mut merged_rx)
+                .await
+                .map(|decision| (decision, String::new())),
+        };
+        forward.abort();
+        result
+    }
+
     /// Creates a conversation without the provider availability check.
     #[cfg(test)]
     pub(crate) async fn create_for_tests(
@@ -2089,20 +2171,23 @@ impl ConversationSupervisor {
         permission_id: &str,
         decision: PermissionDecision,
     ) -> Result<(), AppError> {
-        self.resolve_permission_owned("local", conversation_id, permission_id, decision)
+        self.resolve_permission_owned("local", "local", conversation_id, permission_id, decision)
             .await
     }
 
+    /// `device_id` is the paired device answering, checked against requests
+    /// that name the devices allowed to answer them.
     pub async fn resolve_permission_owned(
         &self,
         owner_id: &str,
+        device_id: &str,
         conversation_id: &str,
         permission_id: &str,
         decision: PermissionDecision,
     ) -> Result<(), AppError> {
         ensure_owner(&self.store.get(conversation_id).await?, owner_id)?;
         self.permissions
-            .resolve(conversation_id, permission_id, decision)
+            .resolve(conversation_id, permission_id, device_id, decision)
             .await
     }
 
