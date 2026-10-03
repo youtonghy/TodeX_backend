@@ -183,6 +183,9 @@ pub(crate) enum SshMode {
     Batch,
     /// Runs in a PTY: the user can answer host-key and password prompts.
     Interactive,
+    /// No terminal; a single password prompt is answered by the program the
+    /// caller sets as `SSH_ASKPASS`. Unknown host keys are still rejected.
+    Askpass,
 }
 
 /// When `ssh -G` ran for an alias, and its outcome.
@@ -283,6 +286,10 @@ impl SshService {
     pub(crate) fn command(&self, mode: SshMode) -> Command {
         let mut command = external_command::secure_command(&self.inner.ssh_bin);
         command.args(self.options(mode));
+        if mode == SshMode::Askpass {
+            // Use SSH_ASKPASS even without a display or with a tty.
+            command.env("SSH_ASKPASS_REQUIRE", "force");
+        }
         command
     }
 
@@ -310,29 +317,32 @@ impl SshService {
     fn options(&self, mode: SshMode) -> Vec<OsString> {
         let mut args: Vec<OsString> = vec!["-F".into(), self.wrapper_path().into()];
         if self.inner.multiplex {
-            args.extend(self.control_options());
+            args.extend(self.control_options(mode));
         }
-        if mode == SshMode::Batch {
-            args.extend(
-                [
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "StrictHostKeyChecking=yes",
-                    "-o",
-                    "ConnectTimeout=15",
-                ]
-                .map(OsString::from),
-            );
-        }
+        let mode_options: &[&str] = match mode {
+            SshMode::Batch => &["-o", "BatchMode=yes"],
+            SshMode::Askpass => &["-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1"],
+            SshMode::Interactive => return args,
+        };
+        args.extend(mode_options.iter().map(OsString::from));
+        args.extend(
+            ["-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15"].map(OsString::from),
+        );
         args
     }
 
-    fn control_options(&self) -> Vec<OsString> {
+    fn control_options(&self, mode: SshMode) -> Vec<OsString> {
         let control_path = self.inner.dir.join(CONTROL_DIR).join("%C");
+        // An askpass process carries a password in its environment; it may
+        // use an existing master but must not become a long-lived one.
+        let master = if mode == SshMode::Askpass {
+            "no"
+        } else {
+            "auto"
+        };
         vec![
             "-o".into(),
-            "ControlMaster=auto".into(),
+            format!("ControlMaster={master}").into(),
             "-o".into(),
             format!("ControlPath={}", control_path.display()).into(),
             "-o".into(),
@@ -351,7 +361,7 @@ impl SshService {
         command
             .arg("-F")
             .arg(self.wrapper_path())
-            .args(self.control_options())
+            .args(self.control_options(SshMode::Batch))
             .args(["-O", "exit", "--", alias]);
         prepare_captured(&mut command, false);
         match external_command::run(command, None, RESOLVE_LIMITS).await {
@@ -968,6 +978,25 @@ exit 0
         assert!(test_line.contains("-o BatchMode=yes -o StrictHostKeyChecking=yes"));
         assert!(test_line.contains("-F "));
         assert!(test_line.contains("-- good exit 0"));
+    }
+
+    #[tokio::test]
+    async fn askpass_mode_allows_one_password_prompt() {
+        let fixture = fixture("").await;
+        let command = fixture.service.command(SshMode::Askpass);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let args = args.join(" ");
+        assert!(args
+            .contains("-o BatchMode=no -o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=yes"));
+        assert!(!args.contains("ControlMaster=auto"));
+        assert!(command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "SSH_ASKPASS_REQUIRE" && value == Some("force".as_ref())));
     }
 
     #[tokio::test]

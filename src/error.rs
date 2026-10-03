@@ -54,6 +54,14 @@ pub enum AppError {
     JournalFull(String),
     #[error("provider unavailable: {0}")]
     ProviderUnavailable(String),
+    #[error("remote authentication failed: {0}")]
+    RemoteAuthFailed(String),
+    #[error("remote host key is not verified: {0}")]
+    RemoteHostKeyUnverified(String),
+    #[error("remote host is unreachable: {0}")]
+    RemoteUnreachable(String),
+    #[error("remote operation failed: {0}")]
+    RemoteFailed(String),
     #[error("event stream lagged by {0} messages")]
     StreamLagged(u64),
     #[error("event stream closed")]
@@ -92,6 +100,10 @@ impl AppError {
             Self::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
             Self::JournalFull(_) => "JOURNAL_FULL",
             Self::ProviderUnavailable(_) => "PROVIDER_UNAVAILABLE",
+            Self::RemoteAuthFailed(_) => "REMOTE_AUTH_FAILED",
+            Self::RemoteHostKeyUnverified(_) => "REMOTE_HOST_KEY_UNVERIFIED",
+            Self::RemoteUnreachable(_) => "REMOTE_UNREACHABLE",
+            Self::RemoteFailed(_) => "REMOTE_OPERATION_FAILED",
             Self::StreamLagged(_) => "EVENT_STREAM_LAGGED",
             Self::StreamClosed => "EVENT_STREAM_CLOSED",
             Self::Serialization(_) => "SERIALIZATION_FAILED",
@@ -126,6 +138,10 @@ impl IntoResponse for AppError {
             Self::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::JournalFull(_) => StatusCode::INSUFFICIENT_STORAGE,
             Self::ProviderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            // Not 401: clients treat that as a failed device signature.
+            Self::RemoteAuthFailed(_) | Self::RemoteHostKeyUnverified(_) => StatusCode::FORBIDDEN,
+            Self::RemoteUnreachable(_) => StatusCode::BAD_GATEWAY,
+            Self::RemoteFailed(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::StreamLagged(_) | Self::StreamClosed => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

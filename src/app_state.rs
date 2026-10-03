@@ -23,6 +23,7 @@ use crate::{
     kanban_store::KanbanTaskStore,
     local_terminal::LocalTerminalManager,
     provider::{CliManager, ConversationSupervisor},
+    remote_fs::RemoteSessions,
     ssh::SshService,
     transport_crypto::PairingKeys,
     workspace_store::WorkspaceStore,
@@ -54,6 +55,8 @@ pub struct AppState {
     pub ssh: SshService,
     /// SSH tools for agents; see [`crate::agent_mcp`].
     pub agent_mcp: AgentMcp,
+    /// Open SFTP/FTP file sessions; in memory only.
+    pub(crate) remote_files: RemoteSessions,
     pub(crate) audit_write_lock: Arc<tokio::sync::Mutex<()>>,
     websocket_connections: Arc<AtomicUsize>,
 }
@@ -152,6 +155,7 @@ impl AppState {
             workspace_trust,
             ssh,
             agent_mcp,
+            remote_files: RemoteSessions::default(),
             audit_write_lock,
             websocket_connections,
         })

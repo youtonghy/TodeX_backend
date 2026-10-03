@@ -18,6 +18,7 @@ mod listen_addrs;
 mod local_terminal;
 mod mcp;
 mod provider;
+mod remote_fs;
 mod secure_fs;
 mod server;
 mod server_runner;
@@ -75,6 +76,12 @@ enum Command {
     /// Stdio MCP bridge TodeX injects into agents for its SSH tools.
     #[command(name = "ssh-mcp-bridge", hide = true)]
     SshMcpBridge,
+    /// `SSH_ASKPASS` helper for password-authenticated SFTP sessions.
+    #[command(name = "ssh-askpass", hide = true)]
+    SshAskpass {
+        #[arg(allow_hyphen_values = true)]
+        prompt: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -124,7 +131,9 @@ struct ProviderDoctorArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(remote_fs::askpass::rewrite_args(
+        std::env::args_os().collect(),
+    ));
 
     match &cli.command {
         Command::Serve(args) | Command::Tui(args) => {
@@ -171,6 +180,9 @@ async fn main() -> anyhow::Result<()> {
         }
         // No logging: stdout carries the MCP protocol.
         Command::SshMcpBridge => agent_mcp::run_bridge().await,
+        Command::SshAskpass { prompt } => {
+            std::process::exit(remote_fs::askpass::run(prompt.as_deref()))
+        }
     }
 }
 

@@ -2,6 +2,7 @@ mod agent_providers;
 mod device_pairing;
 mod git;
 pub mod protocol;
+mod remote;
 mod routes;
 mod ssh;
 mod v2;
@@ -43,7 +44,9 @@ fn compression_layer() -> CompressionLayer<impl Predicate> {
         SizeAbove::new(MIN_COMPRESSED_RESPONSE_BYTES)
             .and(NotForContentType::GRPC)
             .and(NotForContentType::IMAGES)
-            .and(NotForContentType::SSE),
+            .and(NotForContentType::SSE)
+            // Remote file downloads: arbitrary bytes with an exact length.
+            .and(NotForContentType::const_new("application/octet-stream")),
     )
 }
 

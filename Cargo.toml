@@ -46,6 +46,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ed25519-dalek = "2"
+russh-sftp = "3.0.1"
+suppaftp = { version = "12", features = ["tokio-rustls-ring"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"
