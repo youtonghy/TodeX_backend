@@ -505,6 +505,7 @@ async fn operate_locked(
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Stdio;
 
     #[tokio::test]
     async fn create_pr_requires_pushed_upstream_without_mutating_checkout() {

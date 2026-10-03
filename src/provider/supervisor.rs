@@ -2633,6 +2633,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles,
+                ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
@@ -3024,6 +3025,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
+                ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
@@ -4013,6 +4015,7 @@ mod tests {
                 opencode_bin: fixture_text,
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
+                ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
@@ -4124,6 +4127,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
+                ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
@@ -4345,6 +4349,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
+                ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
@@ -4404,6 +4409,7 @@ mod tests {
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
+                ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {
@@ -4797,6 +4803,7 @@ done
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
+                ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
             },
             security: SecurityConfig {

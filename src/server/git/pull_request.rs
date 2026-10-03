@@ -84,16 +84,8 @@ async fn gh(cwd: &Path, args: &[String]) -> Result<Value> {
     command
         .args(args)
         .current_dir(cwd)
-        .env("GH_PROMPT_DISABLED", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.as_std_mut().process_group(0);
-    }
+        .env("GH_PROMPT_DISABLED", "1");
+    prepare_captured(&mut command, false);
     let result = run_external_command(command, "GitHub PR request").await?;
     if !result.status.success() {
         return Err(AppError::GitProcess(format!(

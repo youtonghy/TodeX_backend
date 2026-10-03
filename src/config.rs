@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use toml_edit::{value, DocumentMut, Item, Table};
-use uuid::Uuid;
+
+use crate::secure_fs;
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
@@ -96,6 +96,8 @@ pub struct AgentConfig {
     pub opencode_bin: String,
     pub opencode_env_allowlist: Vec<String>,
     pub acp_profiles: BTreeMap<String, AcpProfileConfig>,
+    /// OpenSSH client used for remote hosts; `ssh-add` is looked up next to it.
+    pub ssh_bin: String,
     /// A running turn whose provider produces no output for this long is
     /// stopped and failed. 0 disables the watchdog.
     pub provider_idle_timeout_minutes: u64,
@@ -151,6 +153,7 @@ struct PartialAgentConfig {
     opencode_bin: Option<String>,
     opencode_env_allowlist: Option<Vec<String>>,
     acp_profiles: Option<BTreeMap<String, AcpProfileConfig>>,
+    ssh_bin: Option<String>,
     provider_idle_timeout_minutes: Option<u64>,
 }
 
@@ -309,6 +312,12 @@ impl Config {
                     agent_file.opencode_bin,
                     defaults.agent.opencode_bin,
                 ),
+                ssh_bin: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_SSH_BIN").ok(),
+                    agent_file.ssh_bin,
+                    defaults.agent.ssh_bin,
+                ),
                 opencode_env_allowlist: env_list("TODEX_AGENTD_OPENCODE_ENV_ALLOWLIST")
                     .or(agent_file.opencode_env_allowlist)
                     .unwrap_or(defaults.agent.opencode_env_allowlist),
@@ -419,6 +428,7 @@ impl Default for Config {
                 devin_api_key_env: None,
                 devin_env_allowlist: default_devin_env_allowlist(),
                 opencode_bin: "opencode".to_owned(),
+                ssh_bin: "ssh".to_owned(),
                 opencode_env_allowlist: default_opencode_env_allowlist(),
                 acp_profiles: BTreeMap::new(),
                 provider_idle_timeout_minutes: DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
@@ -527,6 +537,7 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
             overlay_agent.devin_env_allowlist
         );
         replace_some!(base_agent.opencode_bin, overlay_agent.opencode_bin);
+        replace_some!(base_agent.ssh_bin, overlay_agent.ssh_bin);
         replace_some!(
             base_agent.opencode_env_allowlist,
             overlay_agent.opencode_env_allowlist
@@ -654,46 +665,11 @@ fn load_config_document(data_dir: &PathBuf) -> anyhow::Result<DocumentMut> {
 }
 
 fn write_config_document(data_dir: &PathBuf, document: &DocumentMut) -> anyhow::Result<()> {
-    fs::create_dir_all(data_dir)
+    secure_fs::ensure_owner_only_dir(data_dir)
         .with_context(|| format!("failed to create config directory {}", data_dir.display()))?;
-    set_owner_only(data_dir, true)?;
     let path = data_dir.join("config.toml");
-    let temporary = data_dir.join(format!(".config.{}.tmp", Uuid::new_v4().simple()));
-    let mut options = fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
-        .with_context(|| format!("failed to create {}", temporary.display()))?;
-    file.write_all(document.to_string().as_bytes())
-        .with_context(|| format!("failed to write {}", temporary.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync {}", temporary.display()))?;
-    drop(file);
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(&path).with_context(|| format!("failed to replace {}", path.display()))?;
-    }
-    fs::rename(&temporary, &path)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    set_owner_only(&path, false)?;
-    Ok(())
-}
-
-fn set_owner_only(path: &Path, directory: bool) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = if directory { 0o700 } else { 0o600 };
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    }
-    #[cfg(not(unix))]
-    let _ = (path, directory);
-    Ok(())
+    secure_fs::write_owner_only_atomic(&path, document.to_string().as_bytes())
+        .with_context(|| format!("failed to replace {}", path.display()))
 }
 
 fn env_workspace_roots() -> Vec<PathBuf> {

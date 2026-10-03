@@ -10,19 +10,18 @@ use std::{
     collections::{HashSet, VecDeque},
     io,
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
     time::Duration,
 };
 
 use futures_util::{stream, StreamExt};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    process::{Child, Command},
-    time::timeout,
-};
+use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
 use crate::{
     error::{AppError, Result},
+    external_command::{
+        self, bounded_text, prepare_captured, secure_command, CommandLimits, CommandOutput,
+        ExternalCommandError,
+    },
     server::protocol::{
         GitAction, GitFileChange, GitRepositorySummary, GitRunRequest, GitRunResponse,
         GitScanResponse,
@@ -62,51 +61,7 @@ const GIT_MUTATION_TIMEOUT: Duration = Duration::from_secs(120);
 static GIT_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static GIT_SCAN_SEMAPHORE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
-#[derive(Debug)]
-struct GitCommandOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-struct ProcessGroupGuard {
-    process_group_id: Option<u32>,
-}
-
-impl ProcessGroupGuard {
-    fn new(process_group_id: Option<u32>) -> Self {
-        Self { process_group_id }
-    }
-
-    fn disarm(&mut self) {
-        self.process_group_id = None;
-    }
-}
-
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.process_group_id {
-            // This guard also runs when an outer request deadline cancels the
-            // future before the normal async cleanup path can finish.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-enum LimitedReadError {
-    Limit,
-    Io(io::Error),
-}
-
-impl From<io::Error> for LimitedReadError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
+type GitCommandOutput = CommandOutput;
 
 /// Execute only the `git` binary with an explicit argument vector. No shell is
 /// involved, and stdin is closed so credential/editor prompts cannot block the
@@ -117,166 +72,41 @@ async fn run_git_command(cwd: &Path, args: &[String], operation: &str) -> Result
         .arg("-C")
         .arg(cwd)
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.as_std_mut().process_group(0);
-    }
+        .env("GIT_TERMINAL_PROMPT", "0");
+    prepare_captured(&mut command, false);
 
     run_external_command(command, operation).await
 }
 
-async fn run_external_command(mut command: Command, operation: &str) -> Result<GitCommandOutput> {
-    let mut child = command.spawn().map_err(map_spawn_error)?;
-    let process_group_id = child.id();
-    let mut process_group_guard = ProcessGroupGuard::new(process_group_id);
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::GitProcess("git stdout pipe was not available".to_owned()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::GitProcess("git stderr pipe was not available".to_owned()))?;
-
-    let command_result = timeout(GIT_COMMAND_TIMEOUT, async {
-        let wait = async { child.wait().await.map_err(LimitedReadError::Io) };
-        tokio::try_join!(
-            read_limited(stdout, GIT_COMMAND_OUTPUT_LIMIT),
-            read_limited(stderr, GIT_COMMAND_OUTPUT_LIMIT),
-            wait,
-        )
-    })
-    .await;
-
-    let (stdout, stderr, status) = match command_result {
-        Err(_elapsed) => {
-            terminate_child(&mut child, process_group_id).await;
-            process_group_guard.disarm();
-            return Err(AppError::GitCommandTimedOut(operation.to_owned()));
-        }
-        Ok(Err(LimitedReadError::Limit)) => {
-            terminate_child(&mut child, process_group_id).await;
-            process_group_guard.disarm();
-            return Err(AppError::GitOutputLimitExceeded(GIT_COMMAND_OUTPUT_LIMIT));
-        }
-        Ok(Err(LimitedReadError::Io(error))) => {
-            terminate_child(&mut child, process_group_id).await;
-            process_group_guard.disarm();
-            return Err(AppError::GitProcess(error.to_string()));
-        }
-        Ok(Ok((stdout, stderr, status))) => (stdout, stderr, status),
+async fn run_external_command(command: Command, operation: &str) -> Result<GitCommandOutput> {
+    let limits = CommandLimits {
+        timeout: GIT_COMMAND_TIMEOUT,
+        output_limit: GIT_COMMAND_OUTPUT_LIMIT,
     };
-    process_group_guard.disarm();
-
-    Ok(GitCommandOutput {
-        status,
-        stdout,
-        stderr,
-    })
+    external_command::run(command, None, limits)
+        .await
+        .map_err(|error| match error {
+            ExternalCommandError::NotFound => AppError::GitUnavailable,
+            ExternalCommandError::TimedOut => AppError::GitCommandTimedOut(operation.to_owned()),
+            ExternalCommandError::OutputLimit(limit) => AppError::GitOutputLimitExceeded(limit),
+            ExternalCommandError::Spawn(error) | ExternalCommandError::Io(error) => {
+                AppError::GitProcess(error.to_string())
+            }
+        })
 }
 
 fn secure_git_command() -> Command {
-    let mut command = Command::new("git");
-    command.env_clear().args([
+    // Keep the runtime environment Git needs for user configuration, locale,
+    // network certificates, and SSH agent access. In particular, do not pass
+    // daemon configuration or Git's path override variables to hooks/helpers.
+    let mut command = secure_command("git");
+    command.args([
         "-c",
         "core.fsmonitor=false",
         "-c",
         "core.untrackedCache=false",
     ]);
-    // Keep the runtime environment Git needs for user configuration, locale,
-    // network certificates, and SSH agent access. In particular, do not pass
-    // daemon configuration or Git's path override variables to hooks/helpers.
-    for key in [
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "SHELL",
-        "TERM",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "LANG",
-        "LC_ALL",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_RUNTIME_DIR",
-        "SSH_AUTH_SOCK",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "no_proxy",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "REQUESTS_CA_BUNDLE",
-        "NODE_EXTRA_CA_CERTS",
-        "USERPROFILE",
-        "APPDATA",
-        "LOCALAPPDATA",
-        "SYSTEMROOT",
-        "COMSPEC",
-        "PATHEXT",
-    ] {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
     command
-}
-
-async fn read_limited<R>(
-    mut reader: R,
-    limit: usize,
-) -> std::result::Result<Vec<u8>, LimitedReadError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut output = Vec::with_capacity(limit.min(8192));
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        if output.len().saturating_add(read) > limit {
-            return Err(LimitedReadError::Limit);
-        }
-        output.extend_from_slice(&buffer[..read]);
-    }
-    Ok(output)
-}
-
-async fn terminate_child(child: &mut Child, process_group_id: Option<u32>) {
-    // `Child::kill` waits for the process as well as sending SIGKILL, which
-    // avoids leaving a zombie after a timeout or output-limit violation.
-    #[cfg(unix)]
-    if let Some(pid) = process_group_id {
-        // Git hooks and credential helpers can inherit the pipes. The child
-        // is isolated in its own process group so they are terminated too.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = process_group_id;
-    let _ = child.kill().await;
-}
-
-fn map_spawn_error(error: io::Error) -> AppError {
-    if error.kind() == io::ErrorKind::NotFound {
-        AppError::GitUnavailable
-    } else {
-        AppError::GitProcess(error.to_string())
-    }
 }
 
 async fn run_checked(cwd: &Path, args: &[String], operation: &str) -> Result<GitCommandOutput> {
@@ -1418,10 +1248,6 @@ fn uninitialized_summary(workspace: &Path) -> GitRepositorySummary {
 
 fn git_args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
-}
-
-fn bounded_text(bytes: &[u8], limit: usize) -> String {
-    truncate_text(&String::from_utf8_lossy(bytes), limit)
 }
 
 fn truncate_text(text: &str, limit: usize) -> String {
