@@ -476,6 +476,8 @@ if the binary requires a newer glibc symbol.
 ```sh
 # Read-only JSON status (also reports enabled=false for development builds)
 todex-agentd update --check
+# Repository, current/latest version, and auto-update state as JSON
+todex-agentd about
 # Install now, without starting or stopping a service
 todex-agentd update
 # Disable automatic startup updates; manual update remains available

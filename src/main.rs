@@ -71,6 +71,8 @@ enum Command {
         #[command(flatten)]
         args: ServeArgs,
     },
+    #[command(about = "Show the backend repository, version, and update status")]
+    About,
     #[command(name = "daemon-run", hide = true)]
     DaemonRun(ServeArgs),
     /// Stdio MCP bridge TodeX injects into agents for its SSH tools.
@@ -172,6 +174,10 @@ async fn main() -> anyhow::Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&update::run(check).await?)?
             );
+            Ok(())
+        }
+        Command::About => {
+            println!("{}", serde_json::to_string_pretty(&update::about().await)?);
             Ok(())
         }
         Command::DaemonRun(args) => {

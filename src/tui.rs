@@ -29,9 +29,10 @@ use crate::daemon::{self, DaemonProcess};
 use crate::event::EventRecord;
 use crate::listen_addrs::{self, ConnectAddress};
 use crate::transport_crypto::{render_qr_text_for_bounds, PairingKeys};
+use crate::update;
 use crate::workspace_paths::canonical_workspace_root;
 
-const ACTION_COUNT: usize = 13;
+const ACTION_COUNT: usize = 14;
 const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
@@ -73,6 +74,9 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         app.refresh_device_pairing(false);
         while let Ok(result) = app.daemon_op_rx.try_recv() {
             app.apply_daemon_op_result(result);
+        }
+        while let Ok(info) = app.about_rx.try_recv() {
+            app.apply_about_result(info);
         }
         app.run_pending_daemon_op();
         terminal.draw(|frame| app.render(frame))?;
@@ -154,6 +158,12 @@ struct PairingQrPopup {
 struct CredentialsPopup {
     public_key: Option<String>,
     scroll: u16,
+}
+
+struct AboutPopup {
+    info: update::About,
+    /// A latest-release lookup is still in flight.
+    checking: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,6 +372,9 @@ struct TuiApp {
     connect_addresses_refreshed_at: Option<Instant>,
     daemon_op_tx: mpsc::UnboundedSender<DaemonOpResult>,
     daemon_op_rx: mpsc::UnboundedReceiver<DaemonOpResult>,
+    about: Option<AboutPopup>,
+    about_tx: mpsc::UnboundedSender<update::About>,
+    about_rx: mpsc::UnboundedReceiver<update::About>,
     language: TuiLanguage,
 }
 
@@ -379,6 +392,7 @@ impl TuiApp {
             .and_then(|value| TuiLanguage::parse(&value))
             .unwrap_or_else(TuiLanguage::detect);
         let (daemon_op_tx, daemon_op_rx) = mpsc::unbounded_channel();
+        let (about_tx, about_rx) = mpsc::unbounded_channel();
         Self {
             config,
             daemon: None,
@@ -416,6 +430,9 @@ impl TuiApp {
             connect_addresses_refreshed_at: None,
             daemon_op_tx,
             daemon_op_rx,
+            about: None,
+            about_tx,
+            about_rx,
             language,
         }
     }
@@ -605,6 +622,48 @@ impl TuiApp {
                     .to_owned();
                 self.last_error = Some(error.to_string());
             }
+        }
+    }
+
+    fn open_about(&mut self) {
+        self.about = Some(AboutPopup {
+            info: update::about_static(),
+            checking: false,
+        });
+        self.notice = self
+            .text(
+                "About panel opened; checking the latest release.",
+                "关于面板已打开，正在检查最新版本。",
+            )
+            .to_owned();
+        self.refresh_about();
+    }
+
+    /// Runs the release lookup off the UI task; the popup already shows the
+    /// fields known locally.
+    fn refresh_about(&mut self) {
+        let Some(about) = self.about.as_mut() else {
+            return;
+        };
+        about.checking = true;
+        let tx = self.about_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(update::about().await);
+        });
+    }
+
+    fn apply_about_result(&mut self, info: update::About) {
+        if let Some(about) = self.about.as_mut() {
+            about.info = info;
+            about.checking = false;
+        }
+    }
+
+    fn close_about(&mut self) {
+        if self.about.take().is_some() {
+            self.notice = self
+                .text("About panel closed.", "关于面板已关闭。")
+                .to_owned();
         }
     }
 
@@ -1161,6 +1220,15 @@ impl TuiApp {
             return Ok(false);
         }
 
+        if self.about.is_some() {
+            match key.code {
+                KeyCode::Char('u') | KeyCode::Enter => self.refresh_about(),
+                KeyCode::Esc | KeyCode::Char('q') => self.close_about(),
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         if self.folder_picker.is_some() {
             self.handle_folder_picker_key(key).await?;
             return Ok(false);
@@ -1238,6 +1306,7 @@ impl TuiApp {
             KeyCode::Char('c') => self.show_credentials().await,
             KeyCode::Char('d') => self.open_device_pairing(),
             KeyCode::Char('l') => self.toggle_language(),
+            KeyCode::Char('u') => self.open_about(),
             KeyCode::PageUp => self.scroll_logs_up(LOG_SCROLL_STEP),
             KeyCode::PageDown => self.scroll_logs_down(LOG_SCROLL_STEP),
             KeyCode::Home => self.scroll_logs_to_top(),
@@ -1369,7 +1438,8 @@ impl TuiApp {
             9 => self.show_credentials().await,
             10 => self.toggle_language(),
             11 => self.open_device_pairing(),
-            12 => return Ok(true),
+            12 => self.open_about(),
+            13 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -2223,12 +2293,18 @@ impl TuiApp {
         if self.device_pairing.open {
             self.render_device_pairing(frame);
         }
+        if let Some(about) = &self.about {
+            let area = centered_area(frame.area(), 76, 13);
+            frame.render_widget(Clear, area);
+            frame.render_widget(self.about_widget(about), area);
+        }
     }
 
     fn dim_popup_background(&self, frame: &mut Frame<'_>) {
         if self.pairing_qr.is_some()
             || self.credentials.is_some()
             || self.device_pairing.open
+            || self.about.is_some()
             || (self.view == TuiView::Control
                 && (self.edit.is_some()
                     || self.folder_picker.is_some()
@@ -2539,10 +2615,11 @@ impl TuiApp {
             self.text("Credentials & copy", "凭据与复制"),
             self.text("Language: English", "语言：中文"),
             self.text("Device verification", "设备验证"),
+            self.text("About & updates", "关于与更新"),
             self.text("Quit", "退出"),
         ];
         let shortcuts = [
-            "s", "r", "a", "h", "p", "w", "e", "x", "g", "c", "l", "d", "q",
+            "s", "r", "a", "h", "p", "w", "e", "x", "g", "c", "l", "d", "u", "q",
         ];
         let items = actions
             .iter()
@@ -2602,6 +2679,77 @@ impl TuiApp {
         Paragraph::new(lines).wrap(Wrap { trim: true }).block(
             panel_block()
                 .title(self.text("Messages", "消息"))
+                .borders(Borders::ALL),
+        )
+    }
+
+    fn about_widget(&self, about: &AboutPopup) -> Paragraph<'static> {
+        let info = &about.info;
+        let latest = if about.checking {
+            self.text("checking...", "正在检查...").to_owned()
+        } else if let Some(error) = &info.check_error {
+            match self.language {
+                TuiLanguage::English => format!("check failed: {error}"),
+                TuiLanguage::Chinese => format!("检查失败：{error}"),
+            }
+        } else {
+            info.latest_version
+                .clone()
+                .unwrap_or_else(|| self.text("unknown", "未知").to_owned())
+        };
+        let update_available = if info.update_available {
+            self.text("yes", "是")
+        } else {
+            self.text("no", "否")
+        };
+        let auto_update = if info.auto_update_enabled {
+            self.text("on (default)", "开（默认）")
+        } else if info.update_enabled {
+            self.text("off (TODEX_AUTO_UPDATE=0)", "关（TODEX_AUTO_UPDATE=0）")
+        } else {
+            self.text("unavailable (not a release build)", "不可用（非发布构建）")
+        };
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                self.text("TodeX Backend — todex-agentd", "TodeX 后端 — todex-agentd")
+                    .to_owned(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!(
+                "{}: {}",
+                self.text("Repository", "仓库"),
+                info.repository_url
+            )),
+            Line::from(format!(
+                "{}: {}",
+                self.text("Current version", "当前版本"),
+                info.current_version
+            )),
+            Line::from(format!(
+                "{}: {latest}",
+                self.text("Latest version", "最新版本")
+            )),
+            Line::from(format!(
+                "{}: {update_available}",
+                self.text("Update available", "有可用更新")
+            )),
+            Line::from(format!(
+                "{}: {auto_update}",
+                self.text("Auto-update", "自动更新")
+            )),
+            Line::from(""),
+            Line::from(
+                self.text(
+                    "u re-check · Esc/q close · `todex-agentd update` installs a release",
+                    "u 重新检查 · Esc/q 关闭 · `todex-agentd update` 安装新版本",
+                )
+                .to_owned(),
+            ),
+        ])
+        .wrap(Wrap { trim: true })
+        .block(
+            panel_block()
+                .title(self.text("About", "关于"))
                 .borders(Borders::ALL),
         )
     }
@@ -4254,7 +4402,7 @@ mod tests {
                         .map(|cell| cell.symbol())
                         .collect::<String>();
                     let shortcut = [
-                        "s", "r", "a", "h", "p", "w", "e", "x", "g", "c", "l", "d", "q",
+                        "s", "r", "a", "h", "p", "w", "e", "x", "g", "c", "l", "d", "u", "q",
                     ][selected];
                     assert!(
                         contents.contains(&format!("> [{shortcut}]")),
@@ -4266,9 +4414,16 @@ mod tests {
                         .chars()
                         .any(|ch| ('\u{2500}'..='\u{257f}').contains(&ch)));
                     assert!(contents.matches('+').count() >= 12);
+                    // The list scrolls to keep the selection visible, so the
+                    // first and last shortcuts are only on screen when the
+                    // selection is near that end.
                     if width >= 80 {
-                        assert!(contents.contains("[s]"));
-                        assert!(contents.contains("[q]"));
+                        if selected == 0 {
+                            assert!(contents.contains("[s]"));
+                        }
+                        if selected == ACTION_COUNT - 1 {
+                            assert!(contents.contains("[q]"));
+                        }
                     }
                 }
                 if std::env::var_os("TODEX_TUI_PREVIEW").is_some() {
@@ -4752,7 +4907,7 @@ mod tests {
         assert_eq!(TuiLanguage::parse("invalid"), None);
         assert_eq!(TuiLanguage::Chinese.as_str(), "zh-CN");
         assert_eq!(TuiLanguage::English.as_str(), "en");
-        assert_eq!(ACTION_COUNT, 13);
+        assert_eq!(ACTION_COUNT, 14);
     }
 
     #[test]
