@@ -184,6 +184,9 @@ pub(crate) enum SshMode {
     Interactive,
 }
 
+/// When `ssh -G` ran for an alias, and its outcome.
+type CachedResolution = (Instant, Result<ResolvedHost, String>);
+
 #[derive(Clone)]
 pub struct SshService {
     inner: Arc<Inner>,
@@ -195,7 +198,7 @@ struct Inner {
     home: Option<PathBuf>,
     multiplex: bool,
     store: RwLock<SshStore>,
-    resolve_cache: Mutex<HashMap<String, (Instant, Result<ResolvedHost, String>)>>,
+    resolve_cache: Mutex<HashMap<String, CachedResolution>>,
 }
 
 impl SshService {
