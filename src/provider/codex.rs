@@ -756,6 +756,15 @@ async fn handle_codex_message(
         return Ok(());
     }
 
+    if method == "account/rateLimits/updated" {
+        if let Some(quota) =
+            codex_quota_snapshot(params.get("rateLimits").unwrap_or(&params), &params)
+        {
+            sink.emit("quota.updated", quota).await?;
+        }
+        return Ok(());
+    }
+
     if method == "thread/tokenUsage/updated" {
         if let Some(mut payload) = codex_usage_event(&params) {
             payload["turnId"] = json!(turn_id);
@@ -863,6 +872,80 @@ fn codex_usage_event(params: &Value) -> Option<Value> {
         },
         "contextWindow": usage.get("modelContextWindow"),
     }))
+}
+
+/// Normalizes a Codex `RateLimitSnapshot` into the shared account-quota
+/// payload. `extra` carries the surrounding response/notification fields —
+/// `rateLimitsByLimitId`, `rateLimitResetCredits`, `accountId` — when present.
+fn codex_quota_snapshot(snapshot: &Value, extra: &Value) -> Option<Value> {
+    if !snapshot.is_object() {
+        return None;
+    }
+    let mut windows = Vec::new();
+    for id in ["primary", "secondary"] {
+        if let Some(window) = snapshot.get(id).filter(|window| window.is_object()) {
+            windows.push(json!({
+                "id": id,
+                "usedPercent": window.get("usedPercent"),
+                "resetsAt": window.get("resetsAt"),
+                "durationMins": window.get("windowDurationMins"),
+            }));
+        }
+    }
+    Some(json!({
+        "provider": "codex",
+        "scope": "account",
+        "planType": snapshot.get("planType"),
+        "windows": windows,
+        "credits": snapshot.get("credits"),
+        "buckets": extra.get("rateLimitsByLimitId"),
+        "resetCredits": extra.get("rateLimitResetCredits"),
+        "accountId": extra.get("accountId"),
+        "raw": { "snapshot": snapshot, "extra": extra },
+    }))
+}
+
+/// Reads the account rate limits on an ephemeral app-server, the same
+/// short-lived pattern `discover_models` uses. Unsupported (older or
+/// non-experimental) CLIs surface as an error the endpoint maps to
+/// `unavailable`.
+pub(crate) async fn fetch_codex_quota(binary: &str, workspace: &Path) -> Result<Value, AppError> {
+    let mut spec = CommandSpec::new(binary, workspace);
+    spec.args = vec![
+        "app-server".to_owned(),
+        "--listen".to_owned(),
+        "stdio://".to_owned(),
+    ];
+    let mut process = JsonLineProcess::spawn(&spec).await?;
+    let result = async {
+        process
+            .send(&json!({"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"todex-agentd","version":crate::version::APP_VERSION},"capabilities":{"experimentalApi":true}}}))
+            .await?;
+        read_rpc_response(&mut process, "initialize").await?;
+        process.send(&json!({"method":"initialized"})).await?;
+        process
+            .send(&json!({"id":"account","method":"account/read","params":{}}))
+            .await?;
+        let account = read_rpc_response(&mut process, "account").await.ok();
+        process
+            .send(&json!({"id":"rateLimits","method":"account/rateLimits/read","params":{}}))
+            .await?;
+        let rate_limits = read_rpc_response(&mut process, "rateLimits").await?;
+        let mut quota = codex_quota_snapshot(
+            rate_limits.get("rateLimits").unwrap_or(&rate_limits),
+            &rate_limits,
+        )
+        .ok_or_else(|| {
+            AppError::ProviderUnavailable("Codex returned no rate-limit snapshot".to_owned())
+        })?;
+        if let Some(account) = account {
+            quota["account"] = account.get("account").cloned().unwrap_or(Value::Null);
+        }
+        Ok::<_, AppError>(quota)
+    }
+    .await;
+    process.terminate().await;
+    result
 }
 
 fn codex_usage_breakdown(value: &Value) -> Option<Value> {
@@ -1443,6 +1526,40 @@ mod tests {
         assert_eq!(payload["usage"]["last"]["reasoningOutput"], 5);
         assert_eq!(payload["contextWindow"], 200000);
         assert!(!payload.to_string().to_ascii_lowercase().contains("token"));
+    }
+
+    #[test]
+    fn rate_limits_read_response_normalizes_to_quota() {
+        let response = json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": 2,
+                    "windowDurationMins": 43200,
+                    "resetsAt": 1792694011
+                },
+                "secondary": null,
+                "credits": { "hasCredits": false, "unlimited": false, "balance": null },
+                "planType": "pro"
+            },
+            "rateLimitsByLimitId": { "codex": { "limitId": "codex" } },
+            "accountId": "acct-1"
+        });
+
+        let quota = codex_quota_snapshot(&response["rateLimits"], &response).unwrap();
+        assert_eq!(quota["provider"], "codex");
+        assert_eq!(quota["scope"], "account");
+        assert_eq!(quota["planType"], "pro");
+        assert_eq!(quota["windows"].as_array().unwrap().len(), 1);
+        assert_eq!(quota["windows"][0]["usedPercent"], 2);
+        assert_eq!(quota["windows"][0]["durationMins"], 43200);
+        assert_eq!(quota["buckets"]["codex"]["limitId"], "codex");
+        assert_eq!(quota["accountId"], "acct-1");
+
+        // Notification params nest the snapshot under `rateLimits`.
+        let notification = codex_quota_snapshot(&response["rateLimits"], &json!({})).unwrap();
+        assert_eq!(notification["windows"][0]["resetsAt"], 1792694011);
+        assert!(codex_quota_snapshot(&json!(null), &json!({})).is_none());
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::{
     kanban_store::KanbanTaskStore,
     local_terminal::LocalTerminalManager,
     provider::{CliManager, ConversationSupervisor},
+    quota_store::QuotaStore,
     remote_fs::RemoteSessions,
     ssh::SshService,
     transport_crypto::PairingKeys,
@@ -53,6 +54,9 @@ pub struct AppState {
     pub agent_providers: AgentProviderService,
     pub workspace_trust: WorkspaceTrustStore,
     pub ssh: SshService,
+    /// Newest plan-quota snapshot per provider (`quota.updated` events plus
+    /// on-demand `/v2/providers/quota` refreshes).
+    pub quota: QuotaStore,
     /// SSH tools for agents; see [`crate::agent_mcp`].
     pub agent_mcp: AgentMcp,
     /// Open SFTP/FTP file sessions; in memory only.
@@ -115,6 +119,7 @@ impl AppState {
         let agent_mcp = AgentMcp::new(&config.data_dir, ssh.clone()).await?;
         let conversation_store = ConversationStore::new(config.data_dir.clone()).await?;
         let conversation_hub = ConversationEventHub::default();
+        let quota = QuotaStore::default();
         let conversations = ConversationSupervisor::new_with_execution_gate(
             config.clone(),
             conversation_store.clone(),
@@ -122,6 +127,7 @@ impl AppState {
             workspace_trust.clone(),
             cli_execution_gate.clone(),
         )
+        .with_quota(quota.clone())
         .with_agent_mcp(agent_mcp.clone());
         conversations.recover_all().await?;
         let local_terminals = LocalTerminalManager::new(events.clone());
@@ -154,6 +160,7 @@ impl AppState {
             agent_providers,
             workspace_trust,
             ssh,
+            quota,
             agent_mcp,
             remote_files: RemoteSessions::default(),
             audit_write_lock,

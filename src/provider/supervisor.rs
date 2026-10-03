@@ -287,6 +287,8 @@ pub struct ConversationSupervisor {
     provider_idle_timeout: Option<Duration>,
     /// SSH tools injected into provider sessions; `None` in bare test setups.
     agent_mcp: Option<AgentMcp>,
+    /// Account-level quota snapshots mirrored from `quota.updated` events.
+    quota: crate::quota_store::QuotaStore,
 }
 
 struct ActiveTurn {
@@ -367,11 +369,17 @@ impl ConversationSupervisor {
             workspace_trust,
             cli_execution_gate,
             agent_mcp: None,
+            quota: crate::quota_store::QuotaStore::default(),
         }
     }
 
     pub fn with_agent_mcp(mut self, agent_mcp: AgentMcp) -> Self {
         self.agent_mcp = Some(agent_mcp);
+        self
+    }
+
+    pub fn with_quota(mut self, quota: crate::quota_store::QuotaStore) -> Self {
+        self.quota = quota;
         self
     }
 
@@ -1724,7 +1732,8 @@ impl ConversationSupervisor {
                 conversation_id.clone(),
             )
             .with_turn_id(spawned_turn_id.clone())
-            .with_activity(activity.clone());
+            .with_activity(activity.clone())
+            .with_quota(supervisor.quota.clone());
             let driver_context = DriverContext {
                 manifest,
                 provider_state: provider_state.clone(),

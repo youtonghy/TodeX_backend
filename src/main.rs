@@ -18,6 +18,7 @@ mod listen_addrs;
 mod local_terminal;
 mod mcp;
 mod provider;
+mod quota_store;
 mod remote_fs;
 mod secure_fs;
 mod server;

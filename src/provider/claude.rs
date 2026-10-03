@@ -732,8 +732,8 @@ mod tests {
 
     use super::{
         claude_command_catalog, claude_model_aliases, claude_model_family, claude_question_details,
-        claude_question_response, claude_user_content, handle_stream_event, BackgroundTasks,
-        ClaudeSubagents, ClaudeToolCalls,
+        claude_question_response, claude_quota_event, claude_user_content, handle_stream_event,
+        BackgroundTasks, ClaudeSubagents, ClaudeToolCalls,
     };
     use crate::conversation::{
         ConversationEventHub, ConversationManifest, ConversationStore, ProviderKind,
@@ -1398,6 +1398,54 @@ mod tests {
 
         assert!(claude_command_catalog(&json!({"response": {"response": {}}})).is_empty());
     }
+
+    #[test]
+    fn rate_limit_event_normalizes_unified_windows() {
+        let message = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "rateLimitType": "five_hour",
+                "resetsAt": 1791034800,
+                "isUsingOverage": false,
+                "unifiedWindows": {
+                    "five_hour": { "utilization": 0.26, "resetsAt": 1791034800 },
+                    "seven_day": { "utilization": 0.11, "resetsAt": 1791493200 },
+                },
+            },
+        });
+
+        let quota = claude_quota_event(&message).expect("quota payload");
+        assert_eq!(quota["provider"], "claude-code");
+        assert_eq!(quota["scope"], "account");
+        assert_eq!(quota["windows"].as_array().unwrap().len(), 2);
+        let five_hour = &quota["windows"][0];
+        assert_eq!(five_hour["id"], "five_hour");
+        assert_eq!(five_hour["usedPercent"], 26.0);
+        assert_eq!(five_hour["resetsAt"], 1791034800);
+        assert_eq!(quota["windows"][1]["id"], "seven_day");
+    }
+
+    #[test]
+    fn rate_limit_event_without_windows_falls_back_to_top_level() {
+        let message = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "rateLimitType": "five_hour",
+                "resetsAt": 1791034800,
+            },
+        });
+
+        let quota = claude_quota_event(&message).expect("quota payload");
+        assert_eq!(quota["windows"][0]["id"], "five_hour");
+        assert_eq!(quota["windows"][0]["resetsAt"], 1791034800);
+        assert!(
+            quota["windows"][0].get("usedPercent").is_none()
+                || quota["windows"][0]["usedPercent"].is_null()
+        );
+        assert!(claude_quota_event(&json!({"type": "rate_limit_event"})).is_none());
+    }
 }
 
 // Protocol reference: anthropics/claude-agent-sdk-python, _internal/query.py.
@@ -1803,6 +1851,11 @@ async fn run_claude_turn(
                 .await?;
             }
             Some("control_response") => {}
+            Some("rate_limit_event") => {
+                if let Some(quota) = claude_quota_event(&message) {
+                    sink.emit("quota.updated", quota).await?;
+                }
+            }
             Some(event_type) => {
                 sink.emit(
                     "provider.event",
@@ -1813,6 +1866,42 @@ async fn run_claude_turn(
             None => {}
         }
     }
+}
+
+/// Normalizes a Claude Code `rate_limit_event` into the shared account-quota
+/// payload. `unifiedWindows` carries the 5-hour and 7-day subscription windows
+/// (`utilization` is a 0–1 fraction); a bare event still reports its top-level
+/// `rateLimitType`/`resetsAt` as a single window without a percentage.
+fn claude_quota_event(message: &Value) -> Option<Value> {
+    let info = message.get("rate_limit_info")?.as_object()?;
+    let mut windows = Vec::new();
+    if let Some(unified) = info.get("unifiedWindows").and_then(Value::as_object) {
+        let mut ordered: Vec<(&String, &Value)> = unified.iter().collect();
+        ordered.sort_by_key(|(id, _)| id.as_str());
+        for (id, window) in ordered {
+            windows.push(json!({
+                "id": id,
+                "usedPercent": window
+                    .get("utilization")
+                    .and_then(Value::as_f64)
+                    .map(|fraction| fraction * 100.0),
+                "resetsAt": window.get("resetsAt"),
+            }));
+        }
+    }
+    if windows.is_empty() {
+        if let Some(window_type) = info.get("rateLimitType").and_then(Value::as_str) {
+            windows.push(json!({ "id": window_type, "resetsAt": info.get("resetsAt") }));
+        }
+    }
+    Some(json!({
+        "provider": "claude-code",
+        "scope": "account",
+        "windows": windows,
+        "status": info.get("status"),
+        "isUsingOverage": info.get("isUsingOverage"),
+        "raw": info,
+    }))
 }
 
 fn content_blocks<'a>(message: &'a Value, kind: &'a str) -> impl Iterator<Item = &'a Value> {

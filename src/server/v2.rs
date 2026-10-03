@@ -174,6 +174,7 @@ fn authenticated_routes() -> Router<AppState> {
         .route("/v2/providers/image-input", get(provider_image_input))
         .route("/v2/providers/commands", get(provider_commands))
         .merge(agent_providers::routes())
+        .merge(super::quota::routes())
         .merge(super::ssh::routes())
         .merge(super::remote::routes())
         .route(

@@ -542,6 +542,9 @@ pub struct DriverEventSink {
     /// Shared by the clones of one turn (or one runtime scope).
     unparsed_lines: Arc<AtomicUsize>,
     activity: Option<ProviderActivity>,
+    /// Account-level quota snapshots (`quota.updated`) mirrored for
+    /// `/v2/providers/quota`.
+    quota: crate::quota_store::QuotaStore,
 }
 
 impl DriverEventSink {
@@ -561,6 +564,7 @@ impl DriverEventSink {
             scope: None,
             unparsed_lines: Arc::default(),
             activity: None,
+            quota: crate::quota_store::QuotaStore::default(),
         }
     }
 
@@ -575,6 +579,13 @@ impl DriverEventSink {
         if let Some(activity) = &self.activity {
             activity.touch();
         }
+    }
+
+    /// Shares the daemon-wide quota store so `quota.updated` events also
+    /// refresh the latest account-level snapshot per provider.
+    pub fn with_quota(mut self, quota: crate::quota_store::QuotaStore) -> Self {
+        self.quota = quota;
+        self
     }
 
     pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
@@ -612,6 +623,9 @@ impl DriverEventSink {
         let event_type = event_type.into();
         self.touch();
         self.decorate(&event_type, &mut payload);
+        if event_type == "quota.updated" {
+            self.quota.record(&payload);
+        }
         let result = self
             .store
             .append_and_publish(&self.conversation_id, event_type, payload, &self.hub)
@@ -696,8 +710,13 @@ impl DriverEventSink {
                 object.insert("runtimeId".to_owned(), json!(runtime_id));
             }
             if let Some(scope) = self.scope {
-                // Usage already defines scope=message for accounting identity.
-                if event_type != "usage.updated" || object.get("scope") != Some(&json!("message")) {
+                // Usage already defines scope=message for accounting identity;
+                // quota snapshots carry scope=account, not the turn scope.
+                let predefined = matches!(
+                    (event_type, object.get("scope").and_then(Value::as_str)),
+                    ("usage.updated", Some("message")) | ("quota.updated", Some("account"))
+                );
+                if !predefined {
                     object.insert("scope".to_owned(), json!(scope));
                 }
             }

@@ -3,7 +3,7 @@
 mod acp;
 mod claude;
 mod cli_manager;
-mod codex;
+pub(crate) mod codex;
 mod devin;
 mod doctor;
 mod grok;
