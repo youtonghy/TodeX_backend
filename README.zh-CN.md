@@ -51,6 +51,10 @@
   - 租户隔离（`tenant_id`），严格校验所有会话读取、订阅与变更入口。
   - 工作区根目录约束（`workspace_root`），强力防御未经授权的路径穿越。
   - 净化的子进程环境，只继承基础系统变量，避免泄露主机敏感凭据。
+- **SSH 主机与远程文件**：
+  - 自动读取后端用户 `~/.ssh/config` 中的 `Host`（跟随 `Include`），并调用系统 OpenSSH，密钥、ssh-agent、ProxyJump 与 `known_hosts` 的行为与用户终端一致；额外主机与 FTP 站点保存在 `$DATA_DIR/ssh`，从不写入 `~/.ssh/config`，也从不保存密码。
+  - SSH 密钥查看、导入与进程内生成；通过 `/v2/ws` 的交互式 SSH 终端；`/v2/remote/*` 下的 SFTP/FTP(S) 文件会话。
+  - 按主机手动开启的“Agent 访问”会向 Codex、Claude Code 与 ACP 类 Agent 暴露 `todex_ssh` MCP 服务器（`ssh_list_hosts`、`ssh_exec`）。详见 [API 文档](docs/API.md#ssh-主机与远程连接)。
 - **交互式 TUI 与守护进程管理**：
   - 基于 Ratatui 构建的交互式 TUI（`cargo run -- tui`）：查看运行状态、实时日志、启停守护进程，并自动探测局域网 IP 生成移动端配对二维码。
   - 基于 PID 文件管理的后台守护进程模式（`start`、`stop`、`restart`、`status`）。
@@ -247,6 +251,7 @@ enable_tls = false
 - `POST /v2/conversations/{id}/prompt`：发送 prompt（支持文本、类型化内容、模型覆盖、推理强度及 Skill resourceId）；本地文件只能来自受信任工作区。
 - `POST /v2/conversations/{id}/cancel`：取消当前正在执行的 turn。
 - `POST /v2/conversations/{id}/permissions/{permissionId}`：响应交互式权限审批请求。
+- `/v2/ssh/hosts*`、`/v2/ssh/keys*`、`/v2/ftp/sites*`、`/v2/remote/connections*`：后端主机上的 SSH 主机、密钥、FTP 站点与 SFTP/FTP 文件会话。
 
 ### WebSocket 统一接口 (`/v2/ws`)
 

@@ -50,6 +50,7 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 | Devin 环境白名单 | 无 | `TODEX_AGENTD_DEVIN_ENV_ALLOWLIST` | `DEVIN_API_KEY`、`DEVIN_MODEL`、`WINDSURF_API_KEY` 等 |
 | OpenCode 可执行文件 | 无 | `TODEX_AGENTD_OPENCODE_BIN` | `opencode` |
 | OpenCode 环境白名单 | 无 | `TODEX_AGENTD_OPENCODE_ENV_ALLOWLIST` | `OPENCODE_CONFIG*`、`OPENCODE_AUTH_CONTENT`、`OPENCODE_API_KEY` 等 |
+| OpenSSH 客户端 | 无 | `TODEX_AGENTD_SSH_BIN`（`[agent] ssh_bin`） | `ssh`（`ssh-add` 取同目录或 PATH） |
 | 默认 agent 名称 | 无 | `TODEX_AGENTD_DEFAULT_AGENT` | `codex` |
 | 是否开启认证 | 无 | `TODEX_AGENTD_ENABLE_AUTH` | `true` |
 | 历史保留天数 | `--history-retention-days` | `TODEX_AGENTD_HISTORY_RETENTION_DAYS` | 关闭 |
@@ -524,6 +525,66 @@ POST /v2/browser/fetch
 
 仅允许指向本后端 loopback 的 `http`/`https` URL；禁用系统代理，最多跟随 3 次且每一跳仍必须是 loopback。响应返回最终 `url`、实际 `status`、`contentType`、`body`（≤2 MiB）。
 
+## SSH 主机与远程连接
+
+管理**运行 todex-agentd 的机器**上的 SSH 主机、密钥与远程文件，并把选定主机开放给 Agent。所有 `/v2/ssh/*`、`/v2/ftp/*`、`/v2/remote/*` 接口都需要设备签名。TodeX 从不保存密码或密钥口令，从不写入 `~/.ssh/config`，私钥内容不会出现在任何响应或日志中。
+
+### 主机清单
+
+- 自动发现：递归解析 `~/.ssh/config`（跟随 `Include`，相对路径按 `~/.ssh` 解析、glob 按字典序展开），列出具体的 `Host` 别名；通配符、`!` 否定模式与 `Match` 块只参与连接参数解析，不单独列出。
+- TodeX 自管主机与 FTP 站点保存在 `$DATA_DIR/ssh/store.json`，SSH 主机渲染为 `$DATA_DIR/ssh/hosts.conf`（均为 0600）。
+- 所有 ssh 调用都使用生成的 `-F $DATA_DIR/ssh/ssh_config`，依次 `Include` 自管主机、`~/.ssh/config` 与系统 `ssh_config`，所以密钥、ssh-agent、ProxyJump、`known_hosts` 行为与用户 shell 中的 `ssh` 一致；有效参数由 `ssh -G` 解析（缓存 30 秒）。Unix 上同一主机的终端、SFTP 与 Agent 命令通过 `ControlMaster`（`$DATA_DIR/ssh/cm/%C`，空闲 5 分钟关闭）复用一次登录。
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /v2/ssh/hosts` | `{ hosts: SshHost[], ftpSites: FtpSite[] }`。`SshHost`：`alias`、`source`（`sshConfig` 只读 / `managed`）、`sourcePath?`、`agentAccess`、`resolved?`（`hostName`、`user`、`port`、`proxyJump`、`identityFiles`）、`resolveError?`、`managed?`（可编辑定义）。 |
+| `POST /v2/ssh/hosts` | 新建自管主机 `{ alias, hostName, user?, port?, identityFile?, proxyJump?, options?: [{key, value}] }`。别名已存在于 `~/.ssh/config` 或自管列表返回 409；拒绝换行、引号、以 `-` 开头的值以及 `Host`/`Match`/`Include`/`LocalCommand`/`PermitLocalCommand`/`KnownHostsCommand` 选项。 |
+| `POST /v2/ssh/hosts/import` | `{ text }` 粘贴 `ssh_config` 片段，返回 `{ hosts, errors }`；通配符、`Match`、`Include` 只报告不导入。 |
+| `PUT` / `DELETE /v2/ssh/hosts/{alias}` | 修改或删除自管主机（`~/.ssh/config` 中的主机只读）。 |
+| `PUT /v2/ssh/hosts/{alias}/agent-access` | `{ enabled }`，默认关闭，见「Agent SSH 工具」。 |
+| `POST /v2/ssh/hosts/{alias}/test` | 以 BatchMode、严格主机密钥校验执行一次 `exit 0`，返回 `{ ok, durationMs, failure?, detail? }`；`failure` 为 `hostKeyUnverified`、`hostKeyChanged`、`authenticationFailed`、`unreachable`、`timedOut`、`other`。 |
+| `POST /v2/ssh/hosts/{alias}/disconnect` | `ssh -O exit` 关闭共享 master，返回 `{ disconnected }`。 |
+| `POST /v2/ftp/sites`、`PUT` / `DELETE /v2/ftp/sites/{id}` | FTP 站点 `{ name, protocol: "ftp"|"ftps", host, port?（默认 21）, user?, initialDirectory? }`，不含密码。 |
+
+### SSH 密钥
+
+管理后端用户 `~/.ssh` 下的密钥。密钥解析、生成与加密均在进程内完成（不调用 `ssh-keygen`，口令不会出现在进程参数中）。
+
+- `GET /v2/ssh/keys` → `{ sshDirectory, agentAvailable, keys: SshKey[] }`
+  - 按内容识别私钥（OpenSSH / PEM），`<name>` 与 `<name>.pub` 配对；跳过 `config`、`known_hosts*`、`authorized_keys*`、目录、socket、超过 64 KiB 的文件及指向 `~/.ssh` 之外的符号链接。
+  - `SshKey`：`name`、`privateKeyPath?`、`publicKeyPath?`、`algorithm`（如 `ssh-ed25519`）、`bits?`、`fingerprint?`（`SHA256:…`；仅无 `.pub` 的旧式 PEM 私钥缺省）、`comment?`、`encrypted?`、`loadedInAgent`、`publicKey?`（完整 OpenSSH 公钥行）、`usedBy`（`IdentityFile` 指向该密钥的主机别名）。
+  - `agentAvailable`：Unix 上未设置 `SSH_AUTH_SOCK` 或 `ssh-add -L` 失败时为 `false`。
+- `POST /v2/ssh/keys/import` `{ name, privateKey, publicKey?, passphrase? }` → `{ key }`。仅支持 OpenSSH 格式私钥（PEM 需先 `ssh-keygen -p -f <file>` 转换）；`publicKey` 若提供必须匹配；`passphrase` 只用于临时校验加密私钥，不会保存。
+- `POST /v2/ssh/keys/generate` `{ name, algorithm?, comment?, passphrase? }` → `{ key }`。`algorithm`：`ed25519`（默认）、`rsa`（4096 位）、`ecdsa`（P-256）。
+- 名称为 `[A-Za-z0-9._-]{1,64}`，不得以 `.`/`-` 开头、以 `.pub` 结尾或与 OpenSSH 文件同名。写入 `~/.ssh/<name>`（0600）与 `<name>.pub`（0644），`~/.ssh` 不存在时以 0700 创建；任一文件已存在返回 409，从不覆盖。请求体上限 64 KiB。
+
+### SSH 终端
+
+`terminal.start`（见「统一 WebSocket 命令面」）可带 `ssh: { host }`：后端在 PTY 中运行 `ssh -tt <alias>`，工作目录为用户主目录，环境变量清空后只保留白名单（不继承 `TODEX_AGENTD_*`）。此时忽略 `cwd` 与 `workspaceId`，也不做 workspace 根目录与信任检查，只要求别名存在于主机清单。主机密钥确认与密码提示直接在终端里完成；登录后的共享连接可被 SFTP 与 Agent 命令复用。`terminal.started` 事件额外带 `ssh: { host }`，其余 `terminal.*` 命令与事件不变。
+
+### 远程文件（SFTP / FTP）
+
+内存会话：空闲 5 分钟自动关闭，最多 16 个，daemon 重启即失效；密码只用于本次连接，从不保存。
+
+- `GET /v2/remote/connections` → `{ connections: RemoteConnection[] }`（`id`、`kind`、`host?`、`siteId?`、`label`、`homeDirectory`、`openedAt`、`lastUsedAt`）。
+- `POST /v2/remote/connections`，`{ kind: "sftp", host, password? }` 或 `{ kind: "ftp", siteId, password? }` → `{ connection }`。SFTP 走系统 ssh（`ssh -s … sftp`，复用 TodeX 的 `-F` 配置与共享连接）；带密码时通过一次性的 `SSH_ASKPASS` 辅助进程（`todex-agentd ssh-askpass`，只回答密码/口令提示）登录，且不会成为长期 master。FTP 使用被动模式，`ftps` 为显式 TLS（系统 webpki 根证书）。
+- `DELETE /v2/remote/connections/{id}` → `{ closed: true }`。
+- `GET …/{id}/entries?path=<绝对路径>`（省略时为 home）→ `{ path, parent?, entries, truncated }`，目录在前，最多 5000 条；条目含 `name`、`path`、`kind`（`file`/`directory`/`symlink`）、`sizeBytes?`、`modifiedAt?`、`permissions?`。
+- `GET …/{id}/file?path=` 与 `/v2/workspace/file` 返回结构相同（文本 1 MiB / 图片 8 MiB）；`PUT …/{id}/file` `{ path, text, expectedText }`，内容不一致返回 409。SFTP 以临时文件加 rename 保存并保留权限，FTP 原地覆盖。
+- `POST …/{id}/mkdir` `{ path }`、`…/rename` `{ from, to }`（目标存在返回 409）、`…/delete` `{ path }`（仅文件、符号链接或空目录，从不递归）→ `{ ok: true }`。
+- 上传：`PUT …/{id}/upload?path=&offset=&overwrite=`，body 为原始字节（`application/octet-stream`，参与设备签名），每块 ≤ 8 MiB，单文件 ≤ 100 MiB；`offset=0` 新建（已存在且未带 `overwrite=true` 返回 409），其余块的 `offset` 必须等于远端当前大小，返回 `{ sizeBytes }`。中断的上传会留下部分文件。
+- 下载：`GET …/{id}/download?path=` 流式返回原始字节（带 `Content-Length` 与 `Content-Disposition`），≤ 100 MiB。
+- 路径必须是绝对 POSIX 路径，`.`/`..` 按字面规范化，禁止 NUL 与换行。
+
+### Agent SSH 工具（MCP）
+
+只要至少一台 SSH 主机开启了 Agent access，TodeX 就会在会话启动时为 Codex、Claude Code 与 ACP 系列（OpenCode/Devin/Grok/自定义 ACP）注入名为 `todex_ssh` 的 stdio MCP 服务器（`todex-agentd ssh-mcp-bridge`，环境变量 `TODEX_SSH_MCP_URL`、`TODEX_SSH_MCP_TOKEN`）；Claude Code 的配置写入 `$DATA_DIR/agent-mcp/` 下的 0600 文件，令牌不出现在命令行。没有开启的主机时，Provider 启动参数与以前完全一致；Pi 与旧 codex_gateway 不注入。已运行的 Codex/ACP 进程要到下一次会话启动才会看到新开启的工具；关闭 Agent access 立即生效。
+
+- 端点：`/internal/agent-mcp/ssh`（MCP Streamable HTTP）。不走设备签名，只接受回环地址、不带 `Origin` 头、携带会话级 `Authorization: Bearer <token>` 的请求；非回环或带 `Origin` 返回 403，令牌缺失或无效返回 401。令牌只存在内存，删除会话或重启 daemon 后失效。
+- `ssh_list_hosts {}` → `{ hosts: [{ alias, hostName?, user?, port? }] }`，只列出开启了 Agent access 的主机。
+- `ssh_exec { host, command, cwd?, stdin?, timeoutSec? }` → `{ stdout, stderr, exitCode, truncated, durationMs }`。**无需审批**；以 BatchMode、严格主机密钥校验运行；`cwd` 按 POSIX shell 引用后 `cd`；默认超时 60 秒，最长 600 秒；stdout/stderr 各最多 256 KiB，超出截断并置 `truncated: true`；同一主机最多 4 条并发命令。非零退出码是正常结果；ssh 失败（退出码 255）、超时或无法启动时返回 `isError: true`，带 `failure` 与处理提示。ACP 类 Agent 若自身处于“询问”权限模式，仍可能针对 MCP 工具弹出其原生权限请求。
+- 会话事件：每次执行追加 `ssh.exec.started { host, command, cwd?, turnId? }` 与 `ssh.exec.completed { host, exitCode?, durationMs, failure?, truncated, turnId? }`；客户端可作为工具活动展示，未知事件类型可直接忽略。
+
 ## WebSocket 协议
 
 客户端发送文本帧，内容必须是 JSON。二进制帧会被忽略。默认仍支持明文 JSON；如果 WebSocket URL 带上加密握手参数，业务 JSON 会被包装在 `todex.crypto.v1` 加密帧中。
@@ -583,7 +644,7 @@ TUI 配对二维码只携带后端地址、当前首选加密方式和服务端�
 `/v2/ws` 是唯一的 WebSocket 端点，同时承载两类命令，消息 envelope 一致（`{id, type, payload}`）：
 
 1. **v2 原生命令**：`conversation.*`、`server.ping`、`session.resume`，以 `server.result` / `server.error` envelope 应答。
-2. **本地控制命令**（原 `/v1/ws` 能力）：`terminal.*`、`codex.local.*`、`codex.gateway.control`、`codex.mcp.*`、`codex.cloudTask.*`。应答与事件通过按连接隔离的 ServerEvent 流返回（见「事件」一节），连接只会收到自己触碰过的 Codex session / 终端的事件。
+2. **本地控制命令**（原 `/v1/ws` 能力）：`terminal.*`（`terminal.start` 可带 `ssh: { host }`，见「SSH 终端」）、`codex.local.*`、`codex.gateway.control`、`codex.mcp.*`、`codex.cloudTask.*`。应答与事件通过按连接隔离的 ServerEvent 流返回（见「事件」一节），连接只会收到自己触碰过的 Codex session / 终端的事件。
 
 单帧上限 8 MiB（聊天附件以 base64 data URL 传输，无出站分片），由 WebSocket 升级层强制：超限消息直接关闭连接，不再返回 `INVALID_REQUEST` 帧。服务端每 30 秒发送 WebSocket Ping，90 秒无入站帧即关闭连接。
 
@@ -889,6 +950,11 @@ TUI 配对二维码只携带后端地址、当前首选加密方式和服务端�
 | `UNAUTHENTICATED` | `enable_auth` 开启时未提供有效设备签名（header 或 query 参数），或设备未注册/已吊销、时间戳超窗、nonce 重放。 |
 | `UNAUTHORIZED` | tenant 与认证上下文不匹配。 |
 | `UNSUPPORTED` | 请求能力不在当前后端支持范围。 |
+| `REMOTE_AUTH_FAILED` | SFTP/FTP 登录失败（HTTP 403）：提供密码，或先在终端登录以复用共享连接。 |
+| `REMOTE_HOST_KEY_UNVERIFIED` | 远程主机密钥未确认或已变化（HTTP 403）：先在 TodeX 终端中连接一次。 |
+| `REMOTE_UNREACHABLE` | 远程主机不可达或连接中断（HTTP 502），会话随之关闭。 |
+| `REMOTE_PERMISSION_DENIED` | 远程服务器拒绝该文件操作（HTTP 403）；与 TodeX 设备认证无关。 |
+| `REMOTE_OPERATION_FAILED` | 其他远程文件操作失败（HTTP 422）。 |
 | `JOURNAL_FULL` | 会话 journal 超过新 turn 上限（63 MiB）且压缩无法释放空间，HTTP 507；需新建会话。 |
 | `EVENT_STREAM_LAGGED` | WebSocket 事件接收端落后，服务端正从 journal 补放；帧无顶层 `id`，`payload.conversationId` 标明会话。 |
 | `EVENT_STREAM_CLOSED` | 事件流已关闭。 |

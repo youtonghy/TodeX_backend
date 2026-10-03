@@ -56,6 +56,10 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
   - Tenant isolation (`tenant_id`) enforced across all conversation queries, event journals, and subscriptions.
   - Workspace root boundary enforcement (`workspace_roots`) restricting client access to authorized filesystem scopes.
   - Sanitized subprocess environments preventing leak of administrative environment variables.
+- **SSH Hosts & Remote Files**:
+  - Discovers `Host` aliases from the backend user's `~/.ssh/config` (following `Include`) and runs the system OpenSSH client, so keys, ssh-agent, ProxyJump and `known_hosts` behave as in the user's shell. Extra hosts and FTP sites are managed in `$DATA_DIR/ssh`; `~/.ssh/config` is never written and passwords are never stored.
+  - SSH key listing, import and in-process generation; interactive SSH terminals over `/v2/ws`; SFTP/FTP(S) file sessions under `/v2/remote/*`.
+  - Opt-in per host "Agent access" exposes a `todex_ssh` MCP server (`ssh_list_hosts`, `ssh_exec`) to Codex, Claude Code and ACP agents. See [API docs](docs/API.md#ssh-主机与远程连接).
 - **Interactive TUI & Daemon Management**:
   - Interactive Terminal UI (`cargo run -- tui`) built with Ratatui to monitor status, inspect logs, control daemon lifecycle, and generate pairing QR codes with automatic LAN IP resolution.
   - Background daemon management (`start`, `stop`, `restart`, `status`) backed by a persistent PID file.
@@ -260,6 +264,7 @@ enable_tls = false
 - `POST /v2/conversations/{id}/prompt`: Dispatch a prompt turn with text, typed content, model, reasoning effort, and skill resource IDs. Local files remain confined to the trusted workspace.
 - `POST /v2/conversations/{id}/cancel`: Cancel active running turn.
 - `POST /v2/conversations/{id}/permissions/{permissionId}`: Resolve interactive approval request.
+- `/v2/ssh/hosts*`, `/v2/ssh/keys*`, `/v2/ftp/sites*`, `/v2/remote/connections*`: SSH hosts, keys, FTP sites and SFTP/FTP file sessions on the backend host.
 
 ### WebSocket Endpoint (`/v2/ws`)
 
