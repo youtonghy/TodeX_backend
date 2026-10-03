@@ -708,10 +708,13 @@ async fn run_acp_turn_steps(
                     let request_id = send_request(
                         process,
                         "session/resume",
-                        json!({
-                            "sessionId": session_id,
-                            "cwd": context.manifest.workspace,
-                        }),
+                        with_agent_mcp(
+                            json!({
+                                "sessionId": session_id,
+                                "cwd": context.manifest.workspace,
+                            }),
+                            &context,
+                        ),
                     )
                     .await?;
                     wait_for_response(
@@ -731,6 +734,7 @@ async fn run_acp_turn_steps(
                         context.manifest.workspace.clone(),
                     ))?;
                     apply_session_metadata(&mut request, &options, true);
+                    let request = with_agent_mcp(request, &context);
                     let request_id = send_request(process, "session/load", request).await?;
                     wait_for_response(
                         process,
@@ -1348,6 +1352,7 @@ async fn new_acp_session(
     let mut request =
         serde_json::to_value(NewSessionRequest::new(context.manifest.workspace.clone()))?;
     apply_session_metadata(&mut request, options, false);
+    let request = with_agent_mcp(request, context);
     let request_id = send_request(process, "session/new", request).await?;
     let response_value = wait_for_response(
         process,
@@ -1365,6 +1370,14 @@ async fn new_acp_session(
             AppError::InvalidRequest(format!("invalid ACP session/new response: {error}"))
         })?;
     Ok((response.session_id.0.to_string(), response_value))
+}
+
+/// Lists TodeX's MCP server in a `session/new|load|resume` request.
+fn with_agent_mcp(mut request: Value, context: &DriverContext) -> Value {
+    if let Some(server) = &context.agent_mcp {
+        request["mcpServers"] = json!([server.acp_server()]);
+    }
+    request
 }
 
 /// Text output carried by an ACP `tool_call_update`. `content` items wrap text

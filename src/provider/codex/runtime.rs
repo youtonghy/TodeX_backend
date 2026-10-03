@@ -798,6 +798,7 @@ done
         let context = DriverContext {
             manifest: manifest.clone(),
             provider_state: ProviderState::new(ProviderKind::Codex),
+            agent_mcp: None,
         };
         let permit = trust.acquire_owned("local", &root).await.unwrap();
         let runner = {

@@ -53,6 +53,7 @@ impl ManagedServer {
             crate::provider::process_registry::activate(&config.data_dir).await;
         }
         let state = AppState::new(config.clone()).await?;
+        state.agent_mcp.set_listen_addr(addr);
         let retention_task = config.history_retention_days.map(|days| {
             let state = state.clone();
             tokio::spawn(async move {
