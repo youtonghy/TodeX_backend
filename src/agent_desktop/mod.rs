@@ -9,11 +9,12 @@
 
 pub(crate) mod executors;
 mod shots;
+pub(crate) mod tunnel;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,11 @@ struct Inner {
     settings: RwLock<DesktopSettings>,
     executors: Executors,
     grants: Mutex<HashMap<String, Grant>>,
+    /// Conversation → loopback ports its agent opened; only these may be
+    /// tunnelled to its desktop.
+    ports: Mutex<HashMap<String, HashSet<u16>>>,
+    /// The daemon's own listener, never reachable through a tunnel.
+    daemon_port: OnceLock<u16>,
     shots: ShotStore,
 }
 
@@ -77,6 +83,8 @@ impl AgentDesktop {
                 settings: RwLock::new(settings),
                 executors: Executors::default(),
                 grants: Mutex::new(HashMap::new()),
+                ports: Mutex::new(HashMap::new()),
+                daemon_port: OnceLock::new(),
                 shots: ShotStore::new(data_dir.join(STATE_DIR).join("shots")),
             }),
         })
@@ -123,6 +131,43 @@ impl AgentDesktop {
         Ok(next)
     }
 
+    pub fn set_daemon_port(&self, port: u16) {
+        let _ = self.inner.daemon_port.set(port);
+    }
+
+    /// Records a loopback port the conversation's agent opened, so its
+    /// desktop may tunnel to it. The daemon's own port is refused.
+    pub(crate) fn allow_port(&self, conversation_id: &str, port: u16) -> Result<(), String> {
+        if self.inner.daemon_port.get() == Some(&port) {
+            return Err(format!(
+                "port {port} is the TodeX backend itself and cannot be opened in the browser"
+            ));
+        }
+        self.inner
+            .ports
+            .lock()
+            .expect("desktop port lock")
+            .entry(conversation_id.to_owned())
+            .or_default()
+            .insert(port);
+        Ok(())
+    }
+
+    /// Whether `device_id`'s executor may open a tunnel to `port` for the
+    /// conversation: it holds the grant and the agent opened that port.
+    pub(crate) fn may_tunnel(&self, conversation_id: &str, device_id: &str, port: u16) -> bool {
+        self.grant(conversation_id)
+            .is_some_and(|grant| grant.device_id == device_id)
+            && self.inner.daemon_port.get() != Some(&port)
+            && self
+                .inner
+                .ports
+                .lock()
+                .expect("desktop port lock")
+                .get(conversation_id)
+                .is_some_and(|ports| ports.contains(&port))
+    }
+
     pub(crate) fn grant(&self, conversation_id: &str) -> Option<Grant> {
         self.inner
             .grants
@@ -149,6 +194,11 @@ impl AgentDesktop {
             .lock()
             .expect("desktop grant lock")
             .remove(conversation_id)?;
+        self.inner
+            .ports
+            .lock()
+            .expect("desktop port lock")
+            .remove(conversation_id);
         for executor in self
             .inner
             .executors

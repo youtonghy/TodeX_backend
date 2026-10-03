@@ -127,6 +127,12 @@ struct Call {
     args: Value,
     timeout: Duration,
     summary: String,
+    /// Loopback port the call opens; a remote desktop tunnels to it.
+    port: Option<u16>,
+}
+
+fn url_port(url: &str) -> Option<u16> {
+    reqwest::Url::parse(url).ok()?.port_or_known_default()
 }
 
 fn loopback_url(raw: &str) -> Result<String, String> {
@@ -153,6 +159,7 @@ fn validate(name: &str, arguments: Value) -> Result<Call, String> {
             Ok(Call {
                 tool: "browser_open",
                 summary: format!("open {url}"),
+                port: url_port(&url),
                 args: json!({ "url": url }),
                 timeout: NAVIGATE_TIMEOUT,
             })
@@ -165,6 +172,7 @@ fn validate(name: &str, arguments: Value) -> Result<Call, String> {
                     Ok(Call {
                         tool: "browser_navigate",
                         summary: format!("navigate {url}"),
+                        port: url_port(&url),
                         args: json!({ "url": url }),
                         timeout: NAVIGATE_TIMEOUT,
                     })
@@ -174,6 +182,7 @@ fn validate(name: &str, arguments: Value) -> Result<Call, String> {
                 {
                     Ok(Call {
                         tool: "browser_navigate",
+                        port: None,
                         summary: action.clone(),
                         args: json!({ "action": action }),
                         timeout: NAVIGATE_TIMEOUT,
@@ -190,6 +199,7 @@ fn validate(name: &str, arguments: Value) -> Result<Call, String> {
             let screenshot = args.screenshot.unwrap_or(false);
             Ok(Call {
                 tool: "browser_snapshot",
+                port: None,
                 summary: if screenshot {
                     "snapshot with screenshot".to_owned()
                 } else {
@@ -250,6 +260,7 @@ fn validate(name: &str, arguments: Value) -> Result<Call, String> {
             }
             Ok(Call {
                 tool: "browser_act",
+                port: None,
                 summary,
                 args: payload,
                 timeout: ACT_TIMEOUT,
@@ -259,6 +270,7 @@ fn validate(name: &str, arguments: Value) -> Result<Call, String> {
             let _: CloseArgs = parse(name, arguments)?;
             Ok(Call {
                 tool: "browser_close",
+                port: None,
                 summary: "close".to_owned(),
                 args: json!({}),
                 timeout: CLOSE_TIMEOUT,
@@ -412,6 +424,11 @@ impl DesktopTools {
                 grant.device_name
             ));
         };
+        if let Some(port) = call.port {
+            if let Err(message) = desktop.allow_port(conversation_id, port) {
+                return tool_error(message);
+            }
+        }
         let workspace = match self.conversations.get(conversation_id).await {
             Ok(manifest) => json!({ "id": manifest.workspace_id, "path": manifest.workspace }),
             Err(error) => return tool_error(format!("cannot read the conversation: {error}")),

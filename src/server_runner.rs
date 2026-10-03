@@ -54,6 +54,7 @@ impl ManagedServer {
         }
         let state = AppState::new(config.clone()).await?;
         state.agent_mcp.set_listen_addr(addr);
+        state.agent_desktop.set_daemon_port(addr.port());
         let retention_task = config.history_retention_days.map(|days| {
             let state = state.clone();
             tokio::spawn(async move {

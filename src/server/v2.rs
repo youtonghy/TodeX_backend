@@ -104,7 +104,15 @@ fn is_v2_native_command(command_type: &str) -> bool {
 /// Frames of a desktop acting as an agent tool executor; see
 /// [`crate::agent_desktop`].
 fn is_executor_frame(command_type: &str) -> bool {
-    matches!(command_type, "executor.register" | "executor.result")
+    matches!(
+        command_type,
+        "executor.register"
+            | "executor.result"
+            | "tunnel.open"
+            | "tunnel.data"
+            | "tunnel.ack"
+            | "tunnel.close"
+    )
 }
 
 fn is_v2_background_command(command_type: &str) -> bool {
@@ -2269,7 +2277,7 @@ async fn handle_socket(
     });
 
     let mut subscriptions = WsSubscriptions::new();
-    let mut executor: Option<crate::agent_desktop::Registration> = None;
+    let mut executor: Option<ExecutorConnection> = None;
     let operation_limit = Arc::new(Semaphore::new(MAX_WS_IN_FLIGHT_OPERATIONS));
     let mut operation_tasks = Vec::new();
     let client_timeout = tokio::time::Duration::from_secs(WS_CLIENT_TIMEOUT_SECS);
@@ -2417,7 +2425,8 @@ async fn handle_socket(
         }
     }
 
-    // Fails every agent tool call still waiting on this connection.
+    // Closes its tunnels and fails every agent tool call still waiting on
+    // this connection.
     drop(executor);
     subscriptions.abort_all();
     for task in operation_tasks {
@@ -2467,11 +2476,17 @@ struct ExecutorRegisterRequest {
 /// `executor.register` (re)registers this connection as a desktop executor
 /// for its device; `executor.result` answers an `executor.invoke`. Returns
 /// the frame to send back, if any.
+/// A connection registered as a desktop executor.
+struct ExecutorConnection {
+    registration: crate::agent_desktop::Registration,
+    tunnels: crate::agent_desktop::tunnel::TunnelSet,
+}
+
 fn handle_executor_frame(
     state: &AppState,
     auth: &AuthContext,
     outgoing: &mpsc::Sender<Value>,
-    executor: &mut Option<crate::agent_desktop::Registration>,
+    executor: &mut Option<ExecutorConnection>,
     text: &str,
 ) -> Option<Value> {
     let frame: Value = match serde_json::from_str(text) {
@@ -2527,30 +2542,80 @@ fn handle_executor_frame(
                 outgoing.clone(),
             );
             let executor_id = registration.executor_id();
-            *executor = Some(registration);
+            *executor = Some(ExecutorConnection {
+                registration,
+                tunnels: crate::agent_desktop::tunnel::TunnelSet::new(outgoing.clone()),
+            });
             Some(json!({
                 "id": id,
                 "type": "server.result",
                 "payload": { "executorId": executor_id, "deviceId": auth.principal_id },
             }))
         }
-        Some("executor.result") => {
-            let Some(registration) = executor.as_ref() else {
+        Some(kind) => {
+            let Some(connection) = executor.as_mut() else {
                 return Some(error_response(
                     id,
                     AppError::InvalidRequest("this connection is not an executor".to_owned()),
                 ));
             };
-            match state
-                .agent_desktop
-                .executors()
-                .complete(registration.executor_id(), &frame["payload"])
-            {
+            let payload = &frame["payload"];
+            let stream_id = payload["streamId"].as_str().unwrap_or_default();
+            let result = match kind {
+                "executor.result" => state
+                    .agent_desktop
+                    .executors()
+                    .complete(connection.registration.executor_id(), payload),
+                "tunnel.open" => {
+                    let conversation_id = payload["conversationId"].as_str().unwrap_or_default();
+                    let port = payload["port"]
+                        .as_u64()
+                        .and_then(|port| u16::try_from(port).ok());
+                    match port {
+                        Some(port)
+                            if state.agent_desktop.may_tunnel(
+                                conversation_id,
+                                &auth.principal_id,
+                                port,
+                            ) =>
+                        {
+                            connection.tunnels.open(stream_id.to_owned(), port)
+                        }
+                        _ => {
+                            // Refusals close the stream, so the desktop's
+                            // local socket ends instead of hanging.
+                            return Some(json!({
+                                "type": "tunnel.close",
+                                "payload": {
+                                    "streamId": stream_id,
+                                    "error": "this conversation has not opened that port",
+                                },
+                            }));
+                        }
+                    }
+                }
+                "tunnel.data" => connection
+                    .tunnels
+                    .data(stream_id, payload["data"].as_str().unwrap_or_default()),
+                "tunnel.ack" => {
+                    let bytes = payload["bytes"].as_u64().unwrap_or(0);
+                    connection
+                        .tunnels
+                        .ack(stream_id, usize::try_from(bytes).unwrap_or(usize::MAX));
+                    Ok(())
+                }
+                "tunnel.close" => {
+                    connection.tunnels.close(stream_id);
+                    Ok(())
+                }
+                _ => Ok(()),
+            };
+            match result {
                 Ok(()) => None,
                 Err(message) => Some(error_response(id, AppError::InvalidRequest(message))),
             }
         }
-        _ => None,
+        None => None,
     }
 }
 
@@ -7342,6 +7407,97 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_ws_tunnels_only_to_ports_the_granted_conversation_opened() {
+        use base64::Engine as _;
+        let root = std::env::temp_dir().join(format!("todex-v2-tunnel-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let device = enroll(&root.join("data"));
+        let app = crate::server::router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        state.agent_desktop.set_daemon_port(addr.port());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // A dev server on this machine's loopback.
+        let dev = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dev_port = dev.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = dev.accept().await.unwrap();
+            let mut buffer = [0_u8; 64];
+            let read = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut socket, &buffer[..read])
+                .await
+                .unwrap();
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/v2/ws?{}",
+            device.sign_query("/v2/ws")
+        ))
+        .await
+        .unwrap();
+        let send = |value: Value| WsMessage::Text(value.to_string().into());
+        ws.send(send(json!({ "id": "reg", "type": "executor.register", "payload": { "capabilities": ["browser"], "platform": "darwin" } })))
+            .await
+            .unwrap();
+        wait_for_ws_message(&mut ws, |m| m["id"] == "reg").await;
+
+        let open = |stream: &str, port: u16| {
+            send(
+                json!({ "type": "tunnel.open", "payload": { "streamId": stream, "conversationId": "conv", "port": port } }),
+            )
+        };
+        // No grant yet: refused.
+        ws.send(open("a", dev_port)).await.unwrap();
+        let refused = wait_for_ws_message(&mut ws, |m| {
+            m["type"] == "tunnel.close" && m["payload"]["streamId"] == "a"
+        })
+        .await;
+        assert!(refused["payload"]["error"].is_string());
+        state.agent_desktop.set_grant(
+            "conv",
+            crate::agent_desktop::Grant {
+                device_id: device.device_id.clone(),
+                device_name: "d".into(),
+            },
+        );
+        // Granted, but the agent never opened this port.
+        ws.send(open("b", dev_port)).await.unwrap();
+        wait_for_ws_message(&mut ws, |m| {
+            m["type"] == "tunnel.close" && m["payload"]["streamId"] == "b"
+        })
+        .await;
+        // The daemon's own port can never be allowed.
+        assert!(state.agent_desktop.allow_port("conv", addr.port()).is_err());
+        ws.send(open("own", addr.port())).await.unwrap();
+        wait_for_ws_message(&mut ws, |m| {
+            m["type"] == "tunnel.close" && m["payload"]["streamId"] == "own"
+        })
+        .await;
+
+        state.agent_desktop.allow_port("conv", dev_port).unwrap();
+        ws.send(open("c", dev_port)).await.unwrap();
+        wait_for_ws_message(&mut ws, |m| {
+            m["type"] == "tunnel.opened" && m["payload"]["streamId"] == "c"
+        })
+        .await;
+        let data = base64::engine::general_purpose::STANDARD.encode(b"GET / HTTP/1.1");
+        ws.send(send(
+            json!({ "type": "tunnel.data", "payload": { "streamId": "c", "data": data } }),
+        ))
+        .await
+        .unwrap();
+        let echoed = wait_for_ws_message(&mut ws, |m| {
+            m["type"] == "tunnel.data" && m["payload"]["streamId"] == "c"
+        })
+        .await;
+        assert_eq!(echoed["payload"]["data"], data);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
