@@ -211,9 +211,7 @@ fn map_error(path: &str, error: SftpError) -> AppError {
     match error {
         SftpError::Status(status) => match status.status_code {
             StatusCode::NoSuchFile => AppError::NotFound(path.to_owned()),
-            StatusCode::PermissionDenied => {
-                AppError::Unauthorized(format!("permission denied: {path}"))
-            }
+            StatusCode::PermissionDenied => AppError::RemotePermissionDenied(path.to_owned()),
             StatusCode::NoConnection | StatusCode::ConnectionLost => {
                 AppError::RemoteUnreachable(status.error_message)
             }
@@ -522,7 +520,7 @@ mod tests {
         ));
         assert!(matches!(
             map_error("/x", status(StatusCode::PermissionDenied)),
-            AppError::Unauthorized(_)
+            AppError::RemotePermissionDenied(_)
         ));
         assert!(matches!(
             map_error("/x", status(StatusCode::Failure)),

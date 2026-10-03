@@ -100,7 +100,7 @@ impl FtpFs {
         if let Err(error) = login {
             let _ = tokio::time::timeout(QUIT_TIMEOUT, stream.quit()).await;
             return Err(match error {
-                AppError::RemoteFailed(_) | AppError::Unauthorized(_) => {
+                AppError::RemoteFailed(_) | AppError::RemotePermissionDenied(_) => {
                     AppError::RemoteAuthFailed(format!(
                         "{}: login failed; check the user name and password",
                         site.host
@@ -238,7 +238,7 @@ fn map_error(what: &str, error: FtpError) -> AppError {
                 Status::NotAvailable | Status::RequestedActionNotTaken
                     if message.to_lowercase().contains("permission") =>
                 {
-                    AppError::Unauthorized(format!("{what}: {message}"))
+                    AppError::RemotePermissionDenied(format!("{what}: {message}"))
                 }
                 Status::BadFilename => AppError::InvalidRequest(format!("{what}: {message}")),
                 _ => AppError::RemoteFailed(format!("{what}: {message}")),

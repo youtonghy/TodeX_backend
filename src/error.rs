@@ -62,6 +62,10 @@ pub enum AppError {
     RemoteUnreachable(String),
     #[error("remote operation failed: {0}")]
     RemoteFailed(String),
+    /// The remote server refused a file operation. Distinct from
+    /// `Unauthorized`, which clients treat as a TodeX device-auth failure.
+    #[error("remote permission denied: {0}")]
+    RemotePermissionDenied(String),
     #[error("event stream lagged by {0} messages")]
     StreamLagged(u64),
     #[error("event stream closed")]
@@ -104,6 +108,7 @@ impl AppError {
             Self::RemoteHostKeyUnverified(_) => "REMOTE_HOST_KEY_UNVERIFIED",
             Self::RemoteUnreachable(_) => "REMOTE_UNREACHABLE",
             Self::RemoteFailed(_) => "REMOTE_OPERATION_FAILED",
+            Self::RemotePermissionDenied(_) => "REMOTE_PERMISSION_DENIED",
             Self::StreamLagged(_) => "EVENT_STREAM_LAGGED",
             Self::StreamClosed => "EVENT_STREAM_CLOSED",
             Self::Serialization(_) => "SERIALIZATION_FAILED",
@@ -142,6 +147,7 @@ impl IntoResponse for AppError {
             Self::RemoteAuthFailed(_) | Self::RemoteHostKeyUnverified(_) => StatusCode::FORBIDDEN,
             Self::RemoteUnreachable(_) => StatusCode::BAD_GATEWAY,
             Self::RemoteFailed(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::RemotePermissionDenied(_) => StatusCode::FORBIDDEN,
             Self::StreamLagged(_) | Self::StreamClosed => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
