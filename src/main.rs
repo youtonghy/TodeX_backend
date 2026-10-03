@@ -76,9 +76,13 @@ enum Command {
     About,
     #[command(name = "daemon-run", hide = true)]
     DaemonRun(ServeArgs),
-    /// Stdio MCP bridge TodeX injects into agents for its SSH tools.
-    #[command(name = "ssh-mcp-bridge", hide = true)]
-    SshMcpBridge,
+    /// Stdio MCP bridge TodeX injects into agents for its tools.
+    #[command(
+        name = agent_mcp::BRIDGE_SUBCOMMAND,
+        alias = agent_mcp::LEGACY_BRIDGE_SUBCOMMAND,
+        hide = true
+    )]
+    AgentMcpBridge,
     /// `SSH_ASKPASS` helper for password-authenticated SFTP sessions.
     #[command(name = "ssh-askpass", hide = true)]
     SshAskpass {
@@ -186,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
             daemon_run(args).await
         }
         // No logging: stdout carries the MCP protocol.
-        Command::SshMcpBridge => agent_mcp::run_bridge().await,
+        Command::AgentMcpBridge => agent_mcp::run_bridge().await,
         Command::SshAskpass { prompt } => {
             std::process::exit(remote_fs::askpass::run(prompt.as_deref()))
         }

@@ -1,6 +1,6 @@
-//! `todex-agentd ssh-mcp-bridge`: a stdio MCP server for agents that relays
-//! every JSON-RPC message, unchanged, to the daemon's Streamable HTTP
-//! endpoint and back. Tools live only in the daemon.
+//! `todex-agentd agent-mcp-bridge`: a stdio MCP server for agents that
+//! relays every JSON-RPC message, unchanged, to one of the daemon's
+//! Streamable HTTP endpoints and back. Tools live only in the daemon.
 
 use rmcp::{
     transport::{
@@ -14,16 +14,24 @@ use tokio::{
     sync::mpsc,
 };
 
-use super::{TOKEN_ENV, URL_ENV};
+use super::{LEGACY_TOKEN_ENV, LEGACY_URL_ENV, TOKEN_ENV, URL_ENV};
 
 /// Runs the bridge on stdin/stdout. stdout carries the protocol, so errors
 /// are returned for `main` to print on stderr with a non-zero exit status.
 pub(crate) async fn run_bridge() -> anyhow::Result<()> {
-    let (url, token) = match (std::env::var(URL_ENV), std::env::var(TOKEN_ENV)) {
-        (Ok(url), Ok(token)) if !url.is_empty() && !token.is_empty() => (url, token),
-        _ => anyhow::bail!(
+    let var = |name: &str, legacy: &str| {
+        std::env::var(name)
+            .or_else(|_| std::env::var(legacy))
+            .ok()
+            .filter(|value| !value.is_empty())
+    };
+    let (Some(url), Some(token)) = (
+        var(URL_ENV, LEGACY_URL_ENV),
+        var(TOKEN_ENV, LEGACY_TOKEN_ENV),
+    ) else {
+        anyhow::bail!(
             "{URL_ENV} and {TOKEN_ENV} must be set; TodeX starts this command for its agents"
-        ),
+        );
     };
     proxy(&url, &token, tokio::io::stdin(), tokio::io::stdout()).await?;
     Ok(())
@@ -32,7 +40,7 @@ pub(crate) async fn run_bridge() -> anyhow::Result<()> {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BridgeError {
     #[error(
-        "the TodeX SSH tool endpoint {url} refused or dropped the connection ({detail}); \
+        "the TodeX agent tool endpoint {url} refused or dropped the connection ({detail}); \
          its token is reset when todex-agentd restarts, so start a new agent turn"
     )]
     Endpoint { url: String, detail: String },
@@ -109,7 +117,7 @@ where
     drop(pending_tx);
     sender.abort();
     if let Err(error) = daemon.close().await {
-        tracing::debug!(%error, "closing the TodeX SSH tool session failed");
+        tracing::debug!(%error, "closing the TodeX agent tool session failed");
     }
     let _ = agent.close().await;
     outcome

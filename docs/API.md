@@ -578,7 +578,7 @@ POST /v2/browser/fetch
 
 ### Agent SSH 工具（MCP）
 
-只要至少一台 SSH 主机开启了 Agent access，TodeX 就会在会话启动时为 Codex、Claude Code 与 ACP 系列（OpenCode/Devin/Grok/自定义 ACP）注入名为 `todex_ssh` 的 stdio MCP 服务器（`todex-agentd ssh-mcp-bridge`，环境变量 `TODEX_SSH_MCP_URL`、`TODEX_SSH_MCP_TOKEN`）；Claude Code 的配置写入 `$DATA_DIR/agent-mcp/` 下的 0600 文件，令牌不出现在命令行。没有开启的主机时，Provider 启动参数与以前完全一致；Pi 与旧 codex_gateway 不注入。已运行的 Codex/ACP 进程要到下一次会话启动才会看到新开启的工具；关闭 Agent access 立即生效。
+只要至少一台 SSH 主机开启了 Agent access，TodeX 就会在会话启动时为 Codex、Claude Code 与 ACP 系列（OpenCode/Devin/Grok/自定义 ACP）注入名为 `todex_ssh` 的 stdio MCP 服务器（`todex-agentd agent-mcp-bridge`，旧名 `ssh-mcp-bridge` 仍可用；环境变量 `TODEX_AGENT_MCP_URL`、`TODEX_AGENT_MCP_TOKEN`，桥也接受旧名 `TODEX_SSH_MCP_*`）；Claude Code 的配置写入 `$DATA_DIR/agent-mcp/` 下的 0600 文件，令牌不出现在命令行。同一会话注入多个 TodeX MCP 服务器时，它们共用一个会话令牌，各自走自己的端点；Codex 每个服务器一个 `mcp_servers.<name>` 覆盖，Claude Code 写入同一个配置文件（每个服务器带 `timeout`）并以逗号分隔列在 `--allowedTools`，ACP 列在同一个 `mcpServers` 数组。没有开启的主机时，Provider 启动参数与以前完全一致；Pi 与旧 codex_gateway 不注入。已运行的 Codex/ACP 进程要到下一次会话启动才会看到新开启的工具；关闭 Agent access 立即生效。
 
 - 端点：`/internal/agent-mcp/ssh`（MCP Streamable HTTP）。不走设备签名，只接受回环地址、不带 `Origin` 头、携带会话级 `Authorization: Bearer <token>` 的请求；非回环或带 `Origin` 返回 403，令牌缺失或无效返回 401。令牌只存在内存，删除会话或重启 daemon 后失效。
 - `ssh_list_hosts {}` → `{ hosts: [{ alias, hostName?, user?, port? }] }`，只列出开启了 Agent access 的主机。

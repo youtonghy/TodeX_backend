@@ -171,7 +171,7 @@ pub struct DriverContext {
     pub manifest: ConversationManifest,
     pub provider_state: ProviderState,
     /// TodeX's own MCP server to load into the session, when enabled.
-    pub agent_mcp: Option<crate::agent_mcp::AgentMcpServer>,
+    pub agent_mcp: Option<crate::agent_mcp::AgentMcpLaunch>,
 }
 
 #[derive(Clone, Debug)]

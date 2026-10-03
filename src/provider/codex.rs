@@ -548,16 +548,17 @@ async fn prepare_codex_thread(
     Ok((native_session_id, effective_model))
 }
 
-/// Adds TodeX's MCP server to a `thread/start|resume` `config` override.
+/// Adds TodeX's MCP servers to a `thread/start|resume` `config` override.
 fn add_agent_mcp_config(params: &mut Value, context: &DriverContext) {
-    let Some(server) = &context.agent_mcp else {
+    let Some(launch) = &context.agent_mcp else {
         return;
     };
-    let (key, value) = server.codex_config();
     if !params["config"].is_object() {
         params["config"] = json!({});
     }
-    params["config"][key] = value;
+    for (key, value) in launch.codex_configs() {
+        params["config"][key] = value;
+    }
 }
 
 fn codex_configuration_event(response: &Value, prompt: &DriverPrompt) -> Option<Value> {

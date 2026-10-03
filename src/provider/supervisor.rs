@@ -14,7 +14,7 @@ use tokio::sync::{watch, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
-use crate::agent_mcp::{AgentMcp, AgentMcpServer};
+use crate::agent_mcp::{AgentMcp, AgentMcpLaunch};
 use crate::catalog::CatalogService;
 use crate::config::Config;
 use crate::conversation::{
@@ -383,13 +383,13 @@ impl ConversationSupervisor {
         self
     }
 
-    /// The `todex_ssh` MCP server for a turn, when any SSH host has agent
-    /// access and the provider can load MCP servers TodeX supplies.
+    /// TodeX's MCP servers for a turn, when any is enabled and the provider
+    /// can load MCP servers TodeX supplies.
     async fn agent_mcp_for(
         &self,
         provider: ProviderKind,
         conversation_id: &str,
-    ) -> Option<AgentMcpServer> {
+    ) -> Option<AgentMcpLaunch> {
         let supported = match provider {
             ProviderKind::Codex
             | ProviderKind::ClaudeCode
@@ -4295,13 +4295,16 @@ mod tests {
 
         let codex = &request("thread/start")["params"]["config"]["mcp_servers.todex_ssh"];
         assert_eq!(codex["command"], "/opt/todex/todex-agentd");
-        assert_eq!(codex["args"], json!(["ssh-mcp-bridge"]));
+        assert_eq!(codex["args"], json!(["agent-mcp-bridge"]));
         assert_eq!(
-            codex["env"]["TODEX_SSH_MCP_URL"],
+            codex["env"]["TODEX_AGENT_MCP_URL"],
             "http://127.0.0.1:7345/internal/agent-mcp/ssh"
         );
         assert_eq!(
-            codex["env"]["TODEX_SSH_MCP_TOKEN"].as_str().unwrap().len(),
+            codex["env"]["TODEX_AGENT_MCP_TOKEN"]
+                .as_str()
+                .unwrap()
+                .len(),
             64
         );
         assert_eq!(codex["default_tools_approval_mode"], "approve");
@@ -4320,8 +4323,8 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
         let entry = &config["mcpServers"]["todex_ssh"];
         assert_eq!(entry["type"], "stdio");
-        assert_eq!(entry["args"], json!(["ssh-mcp-bridge"]));
-        assert!(entry["env"]["TODEX_SSH_MCP_TOKEN"].is_string());
+        assert_eq!(entry["args"], json!(["agent-mcp-bridge"]));
+        assert!(entry["env"]["TODEX_AGENT_MCP_TOKEN"].is_string());
         assert_eq!(
             fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -4330,7 +4333,7 @@ mod tests {
         let acp = &request("session/new")["params"]["mcpServers"];
         assert_eq!(acp[0]["name"], "todex_ssh");
         assert_eq!(acp[0]["command"], "/opt/todex/todex-agentd");
-        assert_eq!(acp[0]["env"][1]["name"], "TODEX_SSH_MCP_TOKEN");
+        assert_eq!(acp[0]["env"][1]["name"], "TODEX_AGENT_MCP_TOKEN");
 
         let _ = fs::remove_dir_all(root);
     }

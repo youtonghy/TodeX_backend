@@ -561,8 +561,8 @@ impl ProviderDriver for ClaudeDriver {
             spec.args.push("--effort".to_owned());
             spec.args.push(effort.clone());
         }
-        if let Some(server) = &context.agent_mcp {
-            spec.args.extend(server.claude_args().await?);
+        if let Some(launch) = &context.agent_mcp {
+            spec.args.extend(launch.claude_args().await?);
         }
 
         let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;

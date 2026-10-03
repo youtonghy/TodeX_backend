@@ -1372,10 +1372,10 @@ async fn new_acp_session(
     Ok((response.session_id.0.to_string(), response_value))
 }
 
-/// Lists TodeX's MCP server in a `session/new|load|resume` request.
+/// Lists TodeX's MCP servers in a `session/new|load|resume` request.
 fn with_agent_mcp(mut request: Value, context: &DriverContext) -> Value {
-    if let Some(server) = &context.agent_mcp {
-        request["mcpServers"] = json!([server.acp_server()]);
+    if let Some(launch) = &context.agent_mcp {
+        request["mcpServers"] = launch.acp_servers();
     }
     request
 }

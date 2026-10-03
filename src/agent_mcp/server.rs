@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Semaphore};
 use uuid::Uuid;
 
-use super::{AgentMcp, ROUTE, SERVER_NAME};
+use super::{AgentMcp, SSH_ROUTE as ROUTE, SSH_SERVER as SERVER_NAME};
 use crate::{
     app_state::AppState,
     external_command::{
@@ -795,6 +795,8 @@ exit 3
             .launch(&manifest.id)
             .await
             .unwrap()
+            .servers
+            .remove(0)
             .env
             .into_iter()
             .find(|(name, _)| name == super::super::TOKEN_ENV)
@@ -1162,7 +1164,9 @@ exit 3
             .agent_mcp
             .launch(&harness.conversation_id)
             .await
-            .unwrap();
+            .unwrap()
+            .servers
+            .remove(0);
         // target/debug/deps/<test> → target/debug/todex-agentd
         server.command = std::env::current_exe()
             .unwrap()
@@ -1275,12 +1279,13 @@ exit 3
             .await
             .unwrap();
         });
-        let mut server = harness
+        let mut launch = harness
             .state
             .agent_mcp
             .launch(&harness.conversation_id)
             .await
             .unwrap();
+        let server = &mut launch.servers[0];
         server.command = std::env::current_exe()
             .unwrap()
             .parent()
@@ -1299,7 +1304,7 @@ exit 3
                 "--model",
                 "todex-nonexistent-model",
             ])
-            .args(server.claude_args().await.unwrap())
+            .args(launch.claude_args().await.unwrap())
             .arg("hi")
             .current_dir(&harness.root)
             .output()

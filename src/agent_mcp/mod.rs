@@ -1,15 +1,17 @@
 //! MCP tools the daemon hosts for the agents it launches.
 //!
-//! The daemon serves a Streamable HTTP MCP endpoint on its own listener
-//! ([`ROUTE`], outside device auth). Providers reach it through a tiny stdio
-//! bridge (`todex-agentd ssh-mcp-bridge`) injected into their MCP config. The
-//! endpoint only accepts loopback peers presenting a per-conversation bearer
-//! token, so every tool call is attributed to one conversation. Tokens live in
-//! memory only: a daemon restart invalidates them along with every provider
-//! process that carried them.
+//! The daemon serves Streamable HTTP MCP endpoints on its own listener (one
+//! route per server, outside device auth). Providers reach them through a
+//! tiny stdio bridge (`todex-agentd agent-mcp-bridge`) injected into their
+//! MCP config, once per server. The endpoints only accept loopback peers
+//! presenting a per-conversation bearer token, so every tool call is
+//! attributed to one conversation. Tokens live in memory only: a daemon
+//! restart invalidates them along with every provider process that carried
+//! them.
 //!
-//! Injection happens only while at least one SSH host has agent access, so
-//! provider arguments stay unchanged for everyone who never enables it.
+//! Each server is injected only while its feature is enabled (`todex_ssh`:
+//! at least one SSH host has agent access), so provider arguments stay
+//! unchanged for everyone who never enables one.
 
 mod bridge;
 mod server;
@@ -32,16 +34,21 @@ pub(crate) use bridge::run_bridge;
 pub(crate) use server::routes;
 
 /// MCP server name the agents see; tools appear as e.g. `todex_ssh.ssh_exec`.
-pub(crate) const SERVER_NAME: &str = "todex_ssh";
-pub(crate) const ROUTE: &str = "/internal/agent-mcp/ssh";
-/// Hidden subcommand that bridges stdio MCP to [`ROUTE`].
-pub(crate) const BRIDGE_SUBCOMMAND: &str = "ssh-mcp-bridge";
+pub(crate) const SSH_SERVER: &str = "todex_ssh";
+pub(crate) const SSH_ROUTE: &str = "/internal/agent-mcp/ssh";
+/// Hidden subcommand that bridges stdio MCP to one server's route.
+pub(crate) const BRIDGE_SUBCOMMAND: &str = "agent-mcp-bridge";
+/// Earlier name of [`BRIDGE_SUBCOMMAND`], kept as an alias.
+pub(crate) const LEGACY_BRIDGE_SUBCOMMAND: &str = "ssh-mcp-bridge";
 /// Not `TODEX_AGENTD_*`: provider launches strip that prefix from their env.
-pub(crate) const URL_ENV: &str = "TODEX_SSH_MCP_URL";
-pub(crate) const TOKEN_ENV: &str = "TODEX_SSH_MCP_TOKEN";
+pub(crate) const URL_ENV: &str = "TODEX_AGENT_MCP_URL";
+pub(crate) const TOKEN_ENV: &str = "TODEX_AGENT_MCP_TOKEN";
+/// Names [`LEGACY_BRIDGE_SUBCOMMAND`] was launched with.
+pub(crate) const LEGACY_URL_ENV: &str = "TODEX_SSH_MCP_URL";
+pub(crate) const LEGACY_TOKEN_ENV: &str = "TODEX_SSH_MCP_TOKEN";
 /// Codex and Claude stop waiting for a tool call after their own timeout;
 /// leave room for the longest `ssh_exec` plus connection setup.
-const PROVIDER_TOOL_TIMEOUT_SECONDS: u64 = server::MAX_TIMEOUT_SECONDS + 60;
+const SSH_TOOL_TIMEOUT_SECONDS: u64 = server::MAX_TIMEOUT_SECONDS + 60;
 const STATE_DIR: &str = "agent-mcp";
 
 /// Per-conversation tokens and the endpoint agents connect to.
@@ -54,7 +61,7 @@ struct Inner {
     ssh: SshService,
     /// conversation id → bearer token.
     tokens: Mutex<HashMap<String, String>>,
-    /// `http://<loopback>:<port>/internal/agent-mcp/ssh`, set once bound.
+    /// `http://<loopback>:<port>`, set once bound.
     endpoint: OnceLock<String>,
     /// The bridge binary; `None` disables injection.
     bridge_command: Option<PathBuf>,
@@ -119,27 +126,38 @@ impl AgentMcp {
                 return;
             }
         };
-        let endpoint = format!("http://{}{ROUTE}", SocketAddr::new(ip, addr.port()));
+        let endpoint = format!("http://{}", SocketAddr::new(ip, addr.port()));
         if self.inner.endpoint.set(endpoint).is_err() {
             tracing::warn!("agent MCP listen address was already set");
         }
     }
 
-    /// The MCP server to inject for `conversation_id`, or `None` when no host
-    /// has agent access (or the endpoint is unavailable).
-    pub(crate) async fn launch(&self, conversation_id: &str) -> Option<AgentMcpServer> {
-        if !self.inner.ssh.has_agent_hosts().await {
+    /// The MCP servers to inject for `conversation_id`, or `None` when no
+    /// server is enabled (or the endpoint is unavailable).
+    pub(crate) async fn launch(&self, conversation_id: &str) -> Option<AgentMcpLaunch> {
+        let mut enabled = Vec::new();
+        if self.inner.ssh.has_agent_hosts().await {
+            enabled.push((SSH_SERVER, SSH_ROUTE, SSH_TOOL_TIMEOUT_SECONDS));
+        }
+        if enabled.is_empty() {
             return None;
         }
         let endpoint = self.inner.endpoint.get()?;
         let command = self.inner.bridge_command.clone()?;
         let token = self.token_for(conversation_id);
-        Some(AgentMcpServer {
-            command,
-            env: vec![
-                (URL_ENV.to_owned(), endpoint.clone()),
-                (TOKEN_ENV.to_owned(), token),
-            ],
+        Some(AgentMcpLaunch {
+            servers: enabled
+                .into_iter()
+                .map(|(name, route, tool_timeout_seconds)| AgentMcpServer {
+                    name,
+                    command: command.clone(),
+                    env: vec![
+                        (URL_ENV.to_owned(), format!("{endpoint}{route}")),
+                        (TOKEN_ENV.to_owned(), token.clone()),
+                    ],
+                    tool_timeout_seconds,
+                })
+                .collect(),
             claude_config_path: self
                 .inner
                 .state_dir
@@ -207,12 +225,14 @@ fn file_key(conversation_id: &str) -> String {
     hex(&Sha256::digest(conversation_id.as_bytes())[..16])
 }
 
-/// How a provider launches the `todex_ssh` stdio bridge.
+/// How a provider launches one server's stdio bridge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentMcpServer {
+    pub name: &'static str,
     pub command: PathBuf,
     pub env: Vec<(String, String)>,
-    claude_config_path: PathBuf,
+    /// How long the provider waits for one tool call.
+    tool_timeout_seconds: u64,
 }
 
 impl AgentMcpServer {
@@ -220,64 +240,34 @@ impl AgentMcpServer {
         vec![BRIDGE_SUBCOMMAND.to_owned()]
     }
 
-    /// Codex `config` override (dotted key, so the user's own
-    /// `mcp_servers` table is merged rather than replaced). Tools are
-    /// pre-approved: SSH access is granted per host in TodeX instead.
-    pub(crate) fn codex_config(&self) -> (String, Value) {
-        let env: serde_json::Map<String, Value> = self
-            .env
+    fn env_map(&self) -> serde_json::Map<String, Value> {
+        self.env
             .iter()
             .map(|(name, value)| (name.clone(), Value::String(value.clone())))
-            .collect();
+            .collect()
+    }
+
+    /// Codex `config` override (dotted key, so the user's own
+    /// `mcp_servers` table is merged rather than replaced). Tools are
+    /// pre-approved: TodeX grants access itself (per SSH host, or through
+    /// its own permission prompts).
+    pub(crate) fn codex_config(&self) -> (String, Value) {
         (
-            format!("mcp_servers.{SERVER_NAME}"),
+            format!("mcp_servers.{}", self.name),
             json!({
                 "command": self.command,
                 "args": self.args(),
-                "env": env,
+                "env": self.env_map(),
                 "default_tools_approval_mode": "approve",
-                "tool_timeout_sec": PROVIDER_TOOL_TIMEOUT_SECONDS,
+                "tool_timeout_sec": self.tool_timeout_seconds,
             }),
         )
-    }
-
-    /// Claude Code arguments. The config goes to an owner-only file rather
-    /// than the command line, where other local users could read the token.
-    pub(crate) async fn claude_args(&self) -> Result<Vec<String>, AppError> {
-        let env: serde_json::Map<String, Value> = self
-            .env
-            .iter()
-            .map(|(name, value)| (name.clone(), Value::String(value.clone())))
-            .collect();
-        let config = serde_json::to_vec(&json!({
-            "mcpServers": {
-                SERVER_NAME: {
-                    "type": "stdio",
-                    "command": self.command,
-                    "args": self.args(),
-                    "env": env,
-                }
-            }
-        }))?;
-        let path = self.claude_config_path.clone();
-        let written = path.clone();
-        tokio::task::spawn_blocking(move || secure_fs::write_owner_only_atomic(&written, &config))
-            .await
-            .map_err(|error| AppError::Anyhow(error.into()))??;
-        // `=` form: both options are variadic and would otherwise swallow
-        // any argument that follows them.
-        Ok(vec![
-            format!("--mcp-config={}", path.display()),
-            // A server-level permission rule: every todex_ssh tool runs
-            // without a prompt.
-            format!("--allowedTools=mcp__{SERVER_NAME}"),
-        ])
     }
 
     /// ACP `McpServerStdio` entry for `session/new|load|resume`.
     pub(crate) fn acp_server(&self) -> Value {
         json!({
-            "name": SERVER_NAME,
+            "name": self.name,
             "command": self.command,
             "args": self.args(),
             "env": self
@@ -286,6 +276,74 @@ impl AgentMcpServer {
                 .map(|(name, value)| json!({ "name": name, "value": value }))
                 .collect::<Vec<_>>(),
         })
+    }
+}
+
+/// Every server injected into one conversation's provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMcpLaunch {
+    pub servers: Vec<AgentMcpServer>,
+    claude_config_path: PathBuf,
+}
+
+impl AgentMcpLaunch {
+    /// Codex `config` overrides, one dotted key per server.
+    pub(crate) fn codex_configs(&self) -> Vec<(String, Value)> {
+        self.servers
+            .iter()
+            .map(AgentMcpServer::codex_config)
+            .collect()
+    }
+
+    /// ACP `mcpServers` for `session/new|load|resume`.
+    pub(crate) fn acp_servers(&self) -> Value {
+        Value::Array(
+            self.servers
+                .iter()
+                .map(AgentMcpServer::acp_server)
+                .collect(),
+        )
+    }
+
+    /// Claude Code arguments. The config goes to an owner-only file rather
+    /// than the command line, where other local users could read the token.
+    pub(crate) async fn claude_args(&self) -> Result<Vec<String>, AppError> {
+        let servers: serde_json::Map<String, Value> = self
+            .servers
+            .iter()
+            .map(|server| {
+                (
+                    server.name.to_owned(),
+                    json!({
+                        "type": "stdio",
+                        "command": server.command,
+                        "args": server.args(),
+                        "env": server.env_map(),
+                        "timeout": server.tool_timeout_seconds * 1000,
+                    }),
+                )
+            })
+            .collect();
+        let config = serde_json::to_vec(&json!({ "mcpServers": servers }))?;
+        let path = self.claude_config_path.clone();
+        let written = path.clone();
+        tokio::task::spawn_blocking(move || secure_fs::write_owner_only_atomic(&written, &config))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
+        let allowed = self
+            .servers
+            .iter()
+            .map(|server| format!("mcp__{}", server.name))
+            .collect::<Vec<_>>()
+            .join(",");
+        // `=` form: both options are variadic and would otherwise swallow
+        // any argument that follows them.
+        Ok(vec![
+            format!("--mcp-config={}", path.display()),
+            // Server-level permission rules: these tools run without a
+            // Claude prompt.
+            format!("--allowedTools={allowed}"),
+        ])
     }
 }
 
@@ -317,17 +375,21 @@ pub(crate) mod tests {
 
         let a = mcp.launch("conv_a").await.unwrap();
         let b = mcp.launch("conv_b").await.unwrap();
+        assert_eq!(a.servers.len(), 1);
         assert_eq!(
-            a.env[0],
+            a.servers[0].env[0],
             (
                 URL_ENV.to_owned(),
                 "http://127.0.0.1:7345/internal/agent-mcp/ssh".to_owned()
             )
         );
-        let token_a = a.env[1].1.clone();
+        let token_a = a.servers[0].env[1].1.clone();
         assert_eq!(token_a.len(), 64);
-        assert_ne!(token_a, b.env[1].1);
-        assert_eq!(mcp.launch("conv_a").await.unwrap().env[1].1, token_a);
+        assert_ne!(token_a, b.servers[0].env[1].1);
+        assert_eq!(
+            mcp.launch("conv_a").await.unwrap().servers[0].env[1].1,
+            token_a
+        );
 
         assert_eq!(mcp.authenticate(&token_a).as_deref(), Some("conv_a"));
         assert_eq!(mcp.authenticate(""), None);
@@ -340,34 +402,70 @@ pub(crate) mod tests {
         mcp.revoke("conv_a").await;
         assert_eq!(mcp.authenticate(&token_a), None);
         assert!(!config_path.exists());
-        assert!(mcp.authenticate(&b.env[1].1).is_some());
+        assert!(mcp.authenticate(&b.servers[0].env[1].1).is_some());
     }
 
-    #[test]
-    fn launch_formats_match_each_provider_schema() {
-        let server = AgentMcpServer {
+    fn server(name: &'static str, url: &str) -> AgentMcpServer {
+        AgentMcpServer {
+            name,
             command: PathBuf::from("/opt/todex/todex-agentd"),
             env: vec![
-                (URL_ENV.to_owned(), "http://127.0.0.1:1/x".to_owned()),
+                (URL_ENV.to_owned(), url.to_owned()),
                 (TOKEN_ENV.to_owned(), "t".to_owned()),
             ],
-            claude_config_path: PathBuf::from("/tmp/x.json"),
+            tool_timeout_seconds: 660,
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_formats_match_each_provider_schema() {
+        let root = std::env::temp_dir().join(format!("todex-agent-mcp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let launch = AgentMcpLaunch {
+            servers: vec![
+                server("todex_ssh", "http://127.0.0.1:1/ssh"),
+                server("todex_other", "http://127.0.0.1:1/other"),
+            ],
+            claude_config_path: root.join("claude.json"),
         };
-        let (key, codex) = server.codex_config();
-        assert_eq!(key, "mcp_servers.todex_ssh");
-        assert_eq!(codex["args"], json!(["ssh-mcp-bridge"]));
-        assert_eq!(codex["env"][TOKEN_ENV], "t");
-        assert_eq!(codex["default_tools_approval_mode"], "approve");
-        let acp = server.acp_server();
-        assert_eq!(acp["name"], "todex_ssh");
-        assert_eq!(acp["env"][1], json!({ "name": TOKEN_ENV, "value": "t" }));
-        // The typed ACP schema accepts the entry as a stdio server.
-        let parsed: agent_client_protocol::schema::v1::McpServer =
-            serde_json::from_value(acp).unwrap();
-        assert!(matches!(
-            parsed,
-            agent_client_protocol::schema::v1::McpServer::Stdio(_)
-        ));
+
+        let codex = launch.codex_configs();
+        assert_eq!(codex.len(), 2);
+        assert_eq!(codex[0].0, "mcp_servers.todex_ssh");
+        assert_eq!(codex[1].0, "mcp_servers.todex_other");
+        assert_eq!(codex[0].1["args"], json!(["agent-mcp-bridge"]));
+        assert_eq!(codex[0].1["env"][TOKEN_ENV], "t");
+        assert_eq!(codex[1].1["env"][URL_ENV], "http://127.0.0.1:1/other");
+        assert_eq!(codex[0].1["default_tools_approval_mode"], "approve");
+        assert_eq!(codex[0].1["tool_timeout_sec"], 660);
+
+        let acp = launch.acp_servers();
+        assert_eq!(acp[0]["name"], "todex_ssh");
+        assert_eq!(acp[1]["name"], "todex_other");
+        assert_eq!(acp[0]["env"][1], json!({ "name": TOKEN_ENV, "value": "t" }));
+        // The typed ACP schema accepts every entry as a stdio server.
+        for entry in acp.as_array().unwrap() {
+            let parsed: agent_client_protocol::schema::v1::McpServer =
+                serde_json::from_value(entry.clone()).unwrap();
+            assert!(matches!(
+                parsed,
+                agent_client_protocol::schema::v1::McpServer::Stdio(_)
+            ));
+        }
+
+        let args = launch.claude_args().await.unwrap();
+        assert_eq!(args[1], "--allowedTools=mcp__todex_ssh,mcp__todex_other");
+        let config: Value = serde_json::from_slice(
+            &std::fs::read(args[0].strip_prefix("--mcp-config=").unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["mcpServers"]["todex_ssh"]["type"], "stdio");
+        assert_eq!(config["mcpServers"]["todex_ssh"]["timeout"], 660_000);
+        assert_eq!(
+            config["mcpServers"]["todex_other"]["env"][URL_ENV],
+            "http://127.0.0.1:1/other"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -382,10 +480,7 @@ pub(crate) mod tests {
         mcp.set_listen_addr("192.168.1.20:7345".parse().unwrap());
         assert!(mcp.inner.endpoint.get().is_none());
         mcp.set_listen_addr("[::]:7345".parse().unwrap());
-        assert_eq!(
-            mcp.inner.endpoint.get().unwrap(),
-            "http://[::1]:7345/internal/agent-mcp/ssh"
-        );
+        assert_eq!(mcp.inner.endpoint.get().unwrap(), "http://[::1]:7345");
         let _ = std::fs::remove_dir_all(root);
     }
 }
