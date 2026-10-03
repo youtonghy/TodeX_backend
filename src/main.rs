@@ -20,6 +20,7 @@ mod provider;
 mod secure_fs;
 mod server;
 mod server_runner;
+mod ssh;
 mod transport_crypto;
 mod tui;
 mod update;

@@ -3,6 +3,7 @@ mod device_pairing;
 mod git;
 pub mod protocol;
 mod routes;
+mod ssh;
 mod v2;
 pub(crate) mod websocket;
 

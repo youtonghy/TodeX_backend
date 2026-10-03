@@ -22,6 +22,7 @@ use crate::{
     kanban_store::KanbanTaskStore,
     local_terminal::LocalTerminalManager,
     provider::{CliManager, ConversationSupervisor},
+    ssh::SshService,
     transport_crypto::PairingKeys,
     workspace_store::WorkspaceStore,
     workspace_trust::WorkspaceTrustStore,
@@ -49,6 +50,7 @@ pub struct AppState {
     pub kanban_tasks: KanbanTaskStore,
     pub agent_providers: AgentProviderService,
     pub workspace_trust: WorkspaceTrustStore,
+    pub ssh: SshService,
     pub(crate) audit_write_lock: Arc<tokio::sync::Mutex<()>>,
     websocket_connections: Arc<AtomicUsize>,
 }
@@ -123,6 +125,7 @@ impl AppState {
         let websocket_connections = Arc::new(AtomicUsize::new(0));
         let audit_write_lock = Arc::new(tokio::sync::Mutex::new(()));
 
+        let ssh = SshService::new(&config.data_dir, config.agent.ssh_bin.clone()).await?;
         Ok(Self {
             config,
             catalog,
@@ -142,6 +145,7 @@ impl AppState {
             kanban_tasks,
             agent_providers,
             workspace_trust,
+            ssh,
             audit_write_lock,
             websocket_connections,
         })

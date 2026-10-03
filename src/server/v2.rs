@@ -174,6 +174,7 @@ fn authenticated_routes() -> Router<AppState> {
         .route("/v2/providers/image-input", get(provider_image_input))
         .route("/v2/providers/commands", get(provider_commands))
         .merge(agent_providers::routes())
+        .merge(super::ssh::routes())
         .route(
             "/v2/conversations/{conversation_id}/runtime/stop",
             post(stop_provider_runtime),
@@ -3937,6 +3938,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        for (method, uri) in [
+            ("GET", "/v2/ssh/hosts"),
+            ("POST", "/v2/ssh/hosts/web/test"),
+            ("PUT", "/v2/ssh/hosts/web/agent-access"),
+            ("POST", "/v2/ftp/sites"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
 
         let providers = app
             .clone()
