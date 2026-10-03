@@ -1042,23 +1042,43 @@ async fn dispatch(
                 state,
             )
             .await?;
-            let cwd =
-                validate_workspace_directory_text(&state.config.workspace_roots, &payload.cwd)?;
-            state
-                .workspace_trust
-                .ensure_trusted(&payload.tenant_id, &cwd)
-                .await?;
+            // An SSH terminal only reaches a host from the inventory; it is
+            // not tied to a workspace, so workspace roots and trust do not
+            // apply. Local shells keep both checks.
+            let (cwd, command) = match &payload.ssh {
+                Some(target) => {
+                    state.ssh.require_host(&target.host).await?;
+                    let command = state.ssh.terminal_command(&target.host);
+                    (command.cwd.display().to_string(), Some(command))
+                }
+                None => {
+                    let cwd = validate_workspace_directory_text(
+                        &state.config.workspace_roots,
+                        &payload.cwd,
+                    )?;
+                    state
+                        .workspace_trust
+                        .ensure_trusted(&payload.tenant_id, &cwd)
+                        .await?;
+                    (cwd.display().to_string(), None)
+                }
+            };
             state
                 .local_terminals
                 .start(TerminalStartOptions {
                     request_id: message.id,
                     terminal_id: payload.terminal_id,
                     tenant_id: payload.tenant_id,
-                    workspace_id: payload.workspace_id,
-                    cwd: cwd.display().to_string(),
+                    workspace_id: payload
+                        .ssh
+                        .is_none()
+                        .then_some(payload.workspace_id)
+                        .flatten(),
+                    cwd,
                     shell: payload.shell,
                     rows: payload.rows,
                     cols: payload.cols,
+                    command,
                 })
                 .await?;
         }

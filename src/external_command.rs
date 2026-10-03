@@ -5,7 +5,7 @@
 //! `ProxyCommand`s) are killed with it on timeout, overflow, or cancellation.
 
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io,
     process::{ExitStatus, Stdio},
     time::Duration,
@@ -86,12 +86,17 @@ pub(crate) struct CommandLimits {
 pub(crate) fn secure_command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
     command.env_clear();
-    for key in INHERITED_ENV {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
+    command.envs(inherited_env());
     command
+}
+
+/// The daemon's values for [`INHERITED_ENV`], for launchers other than
+/// `tokio::process::Command` (for example PTY command builders).
+pub(crate) fn inherited_env() -> Vec<(&'static str, OsString)> {
+    INHERITED_ENV
+        .iter()
+        .filter_map(|key| std::env::var_os(key).map(|value| (*key, value)))
+        .collect()
 }
 
 /// Pipes stdout/stderr, enables `kill_on_drop`, and isolates the child in its

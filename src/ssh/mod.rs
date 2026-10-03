@@ -10,6 +10,7 @@ pub(crate) mod config_file;
 
 use std::{
     collections::{BTreeSet, HashMap},
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -163,6 +164,17 @@ pub(crate) enum SshFailureKind {
     Other,
 }
 
+/// A PTY launch of `ssh` (see [`SshService::terminal_command`]).
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalCommand {
+    pub program: String,
+    pub args: Vec<OsString>,
+    /// Complete environment; the daemon's own environment is not inherited.
+    pub env: Vec<(String, OsString)>,
+    pub cwd: PathBuf,
+    pub ssh_host: String,
+}
+
 /// How an ssh process may interact with the user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SshMode {
@@ -266,28 +278,85 @@ impl SshService {
     /// `--`, the alias, and an optional remote command.
     pub(crate) fn command(&self, mode: SshMode) -> Command {
         let mut command = external_command::secure_command(&self.inner.ssh_bin);
-        command.arg("-F").arg(self.wrapper_path());
+        command.args(self.options(mode));
+        command
+    }
+
+    /// `ssh -tt <alias>` for a PTY, with the same sanitized environment as
+    /// [`Self::command`]. Host-key and password prompts reach the user.
+    pub(crate) fn terminal_command(&self, alias: &str) -> TerminalCommand {
+        let mut args = self.options(SshMode::Interactive);
+        args.extend(["-tt".into(), "--".into(), alias.into()]);
+        TerminalCommand {
+            program: self.inner.ssh_bin.clone(),
+            args,
+            env: external_command::inherited_env()
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect(),
+            cwd: self
+                .inner
+                .home
+                .clone()
+                .unwrap_or_else(|| self.inner.dir.clone()),
+            ssh_host: alias.to_owned(),
+        }
+    }
+
+    fn options(&self, mode: SshMode) -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec!["-F".into(), self.wrapper_path().into()];
         if self.inner.multiplex {
-            let control_path = self.inner.dir.join(CONTROL_DIR).join("%C");
-            command
-                .arg("-o")
-                .arg("ControlMaster=auto")
-                .arg("-o")
-                .arg(format!("ControlPath={}", control_path.display()))
-                .arg("-o")
-                .arg(format!("ControlPersist={CONTROL_PERSIST_SECONDS}"));
+            args.extend(self.control_options());
         }
         if mode == SshMode::Batch {
-            command.args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                "-o",
-                "ConnectTimeout=15",
-            ]);
+            args.extend(
+                [
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                    "-o",
+                    "ConnectTimeout=15",
+                ]
+                .map(OsString::from),
+            );
         }
+        args
+    }
+
+    fn control_options(&self) -> Vec<OsString> {
+        let control_path = self.inner.dir.join(CONTROL_DIR).join("%C");
+        vec![
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!("ControlPath={}", control_path.display()).into(),
+            "-o".into(),
+            format!("ControlPersist={CONTROL_PERSIST_SECONDS}").into(),
+        ]
+    }
+
+    /// Closes the shared master connection for `alias`, ending reuse by later
+    /// commands. Returns false when no master was running.
+    pub async fn disconnect(&self, alias: &str) -> Result<bool, AppError> {
+        self.require_host(alias).await?;
+        if !self.inner.multiplex {
+            return Ok(false);
+        }
+        let mut command = external_command::secure_command(&self.inner.ssh_bin);
         command
+            .arg("-F")
+            .arg(self.wrapper_path())
+            .args(self.control_options())
+            .args(["-O", "exit", "--", alias]);
+        prepare_captured(&mut command, false);
+        match external_command::run(command, None, RESOLVE_LIMITS).await {
+            Ok(output) => Ok(output.status.success()),
+            Err(ExternalCommandError::NotFound) => {
+                Err(AppError::Unsupported("ssh executable not found".to_owned()))
+            }
+            Err(error) => Err(AppError::Anyhow(anyhow::anyhow!("ssh -O exit: {error}"))),
+        }
     }
 
     pub async fn list_hosts(&self) -> Result<Vec<SshHostView>, AppError> {

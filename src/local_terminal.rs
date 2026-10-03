@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     event::{EventBus, EventRecord},
+    ssh::TerminalCommand,
 };
 
 const TERMINAL_OUTPUT_BUFFER_SIZE: usize = 8192;
@@ -35,6 +36,7 @@ struct TerminalHandle {
     workspace_id: Option<String>,
     cwd: String,
     shell: String,
+    ssh_host: Option<String>,
     pid: Option<u32>,
     started_at: i64,
     input_tx: mpsc::Sender<String>,
@@ -72,6 +74,9 @@ pub struct TerminalStartOptions {
     pub shell: Option<String>,
     pub rows: Option<u16>,
     pub cols: Option<u16>,
+    /// Runs this program (with its own complete environment) instead of a
+    /// shell; `cwd` is then ignored in favour of the command's directory.
+    pub command: Option<TerminalCommand>,
 }
 
 #[derive(Clone, Debug)]
@@ -149,7 +154,10 @@ impl LocalTerminalManager {
             )));
         }
 
-        let cwd = PathBuf::from(options.cwd.trim());
+        let cwd = match &options.command {
+            Some(command) => command.cwd.clone(),
+            None => PathBuf::from(options.cwd.trim()),
+        };
         let metadata = tokio::fs::metadata(&cwd).await.map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 AppError::WorkspacePathNotFound
@@ -163,13 +171,16 @@ impl LocalTerminalManager {
             ));
         }
 
-        let shell = options
-            .shell
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(default_shell);
+        let shell = match &options.command {
+            Some(command) => command.program.clone(),
+            None => options
+                .shell
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(default_shell),
+        };
         let size = TerminalSize {
             rows: options.rows.unwrap_or(DEFAULT_TERMINAL_ROWS).clamp(8, 200),
             cols: options.cols.unwrap_or(DEFAULT_TERMINAL_COLS).clamp(20, 400),
@@ -180,6 +191,13 @@ impl LocalTerminalManager {
             .openpty(size.into())
             .map_err(pty_error("failed to open terminal PTY"))?;
         let mut command = CommandBuilder::new(&shell);
+        if let Some(launch) = &options.command {
+            command.args(&launch.args);
+            command.env_clear();
+            for (key, value) in &launch.env {
+                command.env(key, value);
+            }
+        }
         command.cwd(&cwd);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -210,6 +228,10 @@ impl LocalTerminalManager {
             workspace_id: options.workspace_id.clone(),
             cwd: cwd.display().to_string(),
             shell: shell.clone(),
+            ssh_host: options
+                .command
+                .as_ref()
+                .map(|command| command.ssh_host.clone()),
             pid,
             started_at: chrono::Utc::now().timestamp_millis(),
             input_tx,
@@ -310,6 +332,7 @@ impl LocalTerminalManager {
                     "rows": size.rows,
                     "cols": size.cols,
                     "lifecycleState": "running",
+                    "ssh": handle.ssh_host.as_ref().map(|host| json!({ "host": host })),
                 }),
             ))
             .await;
@@ -744,6 +767,7 @@ mod tests {
                 shell: Some("/bin/sh".to_string()),
                 rows: Some(31),
                 cols: Some(97),
+                command: None,
             })
             .await
             .unwrap();
@@ -795,6 +819,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_terminal_uses_its_own_args_env_and_directory() {
+        std::env::set_var("TODEX_AGENTD_TERMINAL_LEAK_TEST", "leak");
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+        let manager = LocalTerminalManager::new(events);
+        let cwd = make_temp_workspace("terminal-command");
+
+        manager
+            .start(TerminalStartOptions {
+                request_id: "terminal-command-test".to_string(),
+                terminal_id: Some("term-command".to_string()),
+                tenant_id: "local".to_string(),
+                workspace_id: None,
+                cwd: "/definitely/not/used".to_string(),
+                shell: Some("/bin/bash".to_string()),
+                rows: None,
+                cols: None,
+                command: Some(TerminalCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec![
+                        "-c".into(),
+                        "printf '[%s|%s|%s]' \"$1\" \"$KEPT\" \"$TODEX_AGENTD_TERMINAL_LEAK_TEST\"; pwd"
+                            .into(),
+                        "sh".into(),
+                        "arg-one".into(),
+                    ],
+                    env: vec![("KEPT".to_string(), "yes".into())],
+                    cwd: cwd.clone(),
+                    ssh_host: "web".to_string(),
+                }),
+            })
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(deadline);
+        let mut output = String::new();
+        let mut started_host = None;
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                event = rx.recv() => {
+                    let event = event.unwrap();
+                    match event.event_type.as_str() {
+                        "terminal.started" => started_host = event.payload["ssh"]["host"].as_str().map(str::to_owned),
+                        "terminal.output" => output.push_str(&payload_text(&event.payload, "data")),
+                        "terminal.exited" => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert!(output.contains("[arg-one|yes|]"), "{output:?}");
+        let cwd_name = cwd.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(output.contains(&cwd_name), "{output:?}");
+        assert_eq!(started_host.as_deref(), Some("web"));
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
     async fn terminal_resize_updates_the_pty_window() {
         let events = EventBus::new(64);
         let mut rx = events.subscribe();
@@ -812,6 +897,7 @@ mod tests {
                 shell: Some("/bin/sh".to_string()),
                 rows: Some(24),
                 cols: Some(80),
+                command: None,
             })
             .await
             .unwrap();

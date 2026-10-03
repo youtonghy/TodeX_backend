@@ -595,6 +595,8 @@ pub struct TerminalStartRequest {
     pub tenant_id: String,
     #[serde(default)]
     pub workspace_id: Option<String>,
+    /// Required for local shells; ignored when `ssh` is set.
+    #[serde(default)]
     pub cwd: String,
     #[serde(default)]
     pub shell: Option<String>,
@@ -602,6 +604,15 @@ pub struct TerminalStartRequest {
     pub rows: Option<u16>,
     #[serde(default)]
     pub cols: Option<u16>,
+    /// Connect to a configured SSH host instead of starting a local shell.
+    #[serde(default)]
+    pub ssh: Option<TerminalSshTarget>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalSshTarget {
+    pub host: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -42,6 +42,7 @@ pub(super) fn routes() -> Router<AppState> {
         )
         .route("/v2/ssh/hosts/{alias}/agent-access", put(set_agent_access))
         .route("/v2/ssh/hosts/{alias}/test", post(test_host))
+        .route("/v2/ssh/hosts/{alias}/disconnect", post(disconnect_host))
         .route("/v2/ftp/sites", post(create_ftp_site))
         .route(
             "/v2/ftp/sites/{id}",
@@ -123,6 +124,16 @@ async fn test_host(
     Ok(Json(serde_json::to_value(
         state.ssh.test_connection(&alias).await?,
     )?))
+}
+
+async fn disconnect_host(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(alias): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let disconnected = state.ssh.disconnect(&alias).await?;
+    Ok(Json(json!({ "disconnected": disconnected })))
 }
 
 async fn create_ftp_site(
