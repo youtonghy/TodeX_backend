@@ -22,6 +22,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::routes(&state))
         .merge(device_pairing::routes())
+        // Loopback + per-conversation token; deliberately outside device auth.
+        .merge(crate::agent_mcp::routes(&state))
         .layer(compression_layer())
         .layer(cors_layer(&state.config.host))
         .layer(TraceLayer::new_for_http())

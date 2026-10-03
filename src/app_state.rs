@@ -9,6 +9,7 @@ use std::{
 use tokio::task::JoinHandle;
 
 use crate::{
+    agent_mcp::AgentMcp,
     agent_providers::AgentProviderService,
     catalog::CatalogService,
     codex_gateway::{CodexGatewayStore, CodexLocalAdapterSupervisor},
@@ -51,6 +52,8 @@ pub struct AppState {
     pub agent_providers: AgentProviderService,
     pub workspace_trust: WorkspaceTrustStore,
     pub ssh: SshService,
+    /// SSH tools for agents; see [`crate::agent_mcp`].
+    pub agent_mcp: AgentMcp,
     pub(crate) audit_write_lock: Arc<tokio::sync::Mutex<()>>,
     websocket_connections: Arc<AtomicUsize>,
 }
@@ -105,6 +108,8 @@ impl AppState {
                 .auto_trust_undecided_owned(&owner_id, &workspace_paths)
                 .await?;
         }
+        let ssh = SshService::new(&config.data_dir, config.agent.ssh_bin.clone()).await?;
+        let agent_mcp = AgentMcp::new(&config.data_dir, ssh.clone()).await?;
         let conversation_store = ConversationStore::new(config.data_dir.clone()).await?;
         let conversation_hub = ConversationEventHub::default();
         let conversations = ConversationSupervisor::new_with_execution_gate(
@@ -113,7 +118,8 @@ impl AppState {
             conversation_hub.clone(),
             workspace_trust.clone(),
             cli_execution_gate.clone(),
-        );
+        )
+        .with_agent_mcp(agent_mcp.clone());
         conversations.recover_all().await?;
         let local_terminals = LocalTerminalManager::new(events.clone());
         let cli_manager = CliManager::default();
@@ -125,7 +131,6 @@ impl AppState {
         let websocket_connections = Arc::new(AtomicUsize::new(0));
         let audit_write_lock = Arc::new(tokio::sync::Mutex::new(()));
 
-        let ssh = SshService::new(&config.data_dir, config.agent.ssh_bin.clone()).await?;
         Ok(Self {
             config,
             catalog,
@@ -146,6 +151,7 @@ impl AppState {
             agent_providers,
             workspace_trust,
             ssh,
+            agent_mcp,
             audit_write_lock,
             websocket_connections,
         })

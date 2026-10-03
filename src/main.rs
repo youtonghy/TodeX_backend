@@ -1,3 +1,4 @@
+mod agent_mcp;
 mod agent_providers;
 mod app_state;
 mod autostart;
@@ -71,6 +72,9 @@ enum Command {
     },
     #[command(name = "daemon-run", hide = true)]
     DaemonRun(ServeArgs),
+    /// Stdio MCP bridge TodeX injects into agents for its SSH tools.
+    #[command(name = "ssh-mcp-bridge", hide = true)]
+    SshMcpBridge,
 }
 
 #[derive(Debug, Subcommand)]
@@ -165,6 +169,8 @@ async fn main() -> anyhow::Result<()> {
             init_serve_logging();
             daemon_run(args).await
         }
+        // No logging: stdout carries the MCP protocol.
+        Command::SshMcpBridge => agent_mcp::run_bridge().await,
     }
 }
 

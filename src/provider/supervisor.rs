@@ -14,6 +14,7 @@ use tokio::sync::{watch, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
+use crate::agent_mcp::{AgentMcp, AgentMcpServer};
 use crate::catalog::CatalogService;
 use crate::config::Config;
 use crate::conversation::{
@@ -284,6 +285,8 @@ pub struct ConversationSupervisor {
     workspace_trust: WorkspaceTrustStore,
     /// `[agent].provider_idle_timeout_minutes`; `None` disables the watchdog.
     provider_idle_timeout: Option<Duration>,
+    /// SSH tools injected into provider sessions; `None` in bare test setups.
+    agent_mcp: Option<AgentMcp>,
 }
 
 struct ActiveTurn {
@@ -363,7 +366,79 @@ impl ConversationSupervisor {
             request_gates: Arc::new(DashMap::new()),
             workspace_trust,
             cli_execution_gate,
+            agent_mcp: None,
         }
+    }
+
+    pub fn with_agent_mcp(mut self, agent_mcp: AgentMcp) -> Self {
+        self.agent_mcp = Some(agent_mcp);
+        self
+    }
+
+    /// The `todex_ssh` MCP server for a turn, when any SSH host has agent
+    /// access and the provider can load MCP servers TodeX supplies.
+    async fn agent_mcp_for(
+        &self,
+        provider: ProviderKind,
+        conversation_id: &str,
+    ) -> Option<AgentMcpServer> {
+        let supported = match provider {
+            ProviderKind::Codex
+            | ProviderKind::ClaudeCode
+            | ProviderKind::Acp
+            | ProviderKind::GrokBuild
+            | ProviderKind::Devin
+            | ProviderKind::Opencode => true,
+            ProviderKind::Pi => false,
+        };
+        if !supported {
+            return None;
+        }
+        self.agent_mcp.as_ref()?.launch(conversation_id).await
+    }
+
+    async fn revoke_agent_mcp(&self, conversation_id: &str) {
+        if let Some(agent_mcp) = &self.agent_mcp {
+            agent_mcp.revoke(conversation_id).await;
+        }
+    }
+
+    /// Journals an event raised outside a provider stream (agent SSH tools),
+    /// tagged with the running turn when there is one.
+    pub(crate) async fn append_agent_event(
+        &self,
+        conversation_id: &str,
+        event_type: &str,
+        mut payload: Value,
+    ) -> Result<(), AppError> {
+        let turn_id = self
+            .active
+            .get(conversation_id)
+            .map(|turn| turn.turn_id.clone());
+        if let (Some(turn_id), Some(object)) = (turn_id, payload.as_object_mut()) {
+            object.insert("turnId".to_owned(), Value::String(turn_id));
+        }
+        self.emit(conversation_id, event_type, payload).await
+    }
+
+    /// Creates a conversation without the provider availability check.
+    #[cfg(test)]
+    pub(crate) async fn create_for_tests(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+    ) -> Result<ConversationManifest, AppError> {
+        self.store
+            .create(ConversationManifest::new(provider, workspace, None, None))
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn history_for_tests(
+        &self,
+        conversation_id: &str,
+    ) -> Vec<crate::conversation::ConversationEvent> {
+        self.store.complete_history(conversation_id).await.unwrap()
     }
 
     pub async fn recover_all(&self) -> Result<(), AppError> {
@@ -840,6 +915,7 @@ impl ConversationSupervisor {
             .shutdown_session_with_reason(&manifest.id, "conversation_deleted")
             .await;
         self.store.delete(&manifest.id).await?;
+        self.revoke_agent_mcp(&manifest.id).await;
         // Close the broadcast channel so live websocket subscriptions exit
         // instead of holding their per-connection slot forever.
         self.hub.remove(&manifest.id);
@@ -863,6 +939,7 @@ impl ConversationSupervisor {
                 .driver(manifest.provider)?
                 .shutdown_session_with_reason(&manifest.id, "conversation_expired")
                 .await;
+            self.revoke_agent_mcp(&manifest.id).await;
             self.hub.remove(&manifest.id);
         }
         Ok(removed)
@@ -988,6 +1065,7 @@ impl ConversationSupervisor {
                 DriverContext {
                     manifest: source.clone(),
                     provider_state,
+                    agent_mcp: None,
                 },
                 launch_permit,
             )
@@ -1088,6 +1166,7 @@ impl ConversationSupervisor {
                     DriverContext {
                         manifest,
                         provider_state,
+                        agent_mcp: None,
                     },
                     cancel_rx,
                     launch_permit,
@@ -1517,6 +1596,7 @@ impl ConversationSupervisor {
             ));
         }
         let provider_state = self.store.provider_state(conversation_id).await?;
+        let agent_mcp = self.agent_mcp_for(manifest.provider, conversation_id).await;
 
         let mut snapshot_files = Vec::new();
         for item in &driver_content {
@@ -1648,6 +1728,7 @@ impl ConversationSupervisor {
             let driver_context = DriverContext {
                 manifest,
                 provider_state: provider_state.clone(),
+                agent_mcp,
             };
             let driver_prompt = DriverPrompt {
                 turn_id: spawned_turn_id.clone(),
@@ -4090,6 +4171,158 @@ mod tests {
         }
 
         supervisor.shutdown_all().await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Runs one fixture turn per provider through a wrapper that logs argv
+    /// and stdin, and returns both logs.
+    #[cfg(unix)]
+    async fn logged_fixture_turns(
+        supervisor: &ConversationSupervisor,
+        workspace: &Path,
+        root: &Path,
+    ) -> (String, String) {
+        let _ = fs::remove_file(root.join("argv.log"));
+        let _ = fs::remove_file(root.join("stdin.log"));
+        for provider in [
+            ProviderKind::Codex,
+            ProviderKind::ClaudeCode,
+            ProviderKind::Acp,
+        ] {
+            let profile = (provider == ProviderKind::Acp).then(|| "fixture".to_owned());
+            let manifest = supervisor
+                .create(provider, workspace.to_path_buf(), None, profile)
+                .await
+                .unwrap();
+            supervisor
+                .prompt(&manifest.id, "hello".to_owned(), None)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let replay = supervisor.replay(&manifest.id, 0, 100).await.unwrap();
+                    if let Some(event) = replay.events.iter().find(|event| {
+                        matches!(event.event_type.as_str(), "turn.completed" | "turn.failed")
+                    }) {
+                        assert_eq!(
+                            event.event_type,
+                            "turn.completed",
+                            "{}: {:?}",
+                            provider.as_str(),
+                            event.payload
+                        );
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fixture provider turn should finish");
+        }
+        supervisor.shutdown_all().await;
+        (
+            fs::read_to_string(root.join("argv.log")).unwrap(),
+            fs::read_to_string(root.join("stdin.log")).unwrap(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_ssh_tools_are_injected_only_while_a_host_is_enabled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, _store, supervisor, workspace) =
+            control_fixture_with("todex-agent-mcp-injection", true, false).await;
+        let fixture = root.join("provider-fixture.sh");
+        let wrapper = root.join("logging-provider.sh");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{root}/argv.log'\ntee -a '{root}/stdin.log' | '{fixture}' \"$@\"\n",
+                root = root.display(),
+                fixture = fixture.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = (*supervisor.config).clone();
+        let wrapper_text = wrapper.display().to_string();
+        config.agent.codex_bin = wrapper_text.clone();
+        config.agent.claude_bin = wrapper_text.clone();
+        config
+            .agent
+            .acp_profiles
+            .get_mut("fixture")
+            .unwrap()
+            .command = wrapper_text;
+        let ssh = crate::ssh::tests::fixture("Host web\n").await;
+        let agent_mcp = crate::agent_mcp::tests::registry(ssh.service.clone(), &root).await;
+        let supervisor = ConversationSupervisor::new(
+            Arc::new(config),
+            supervisor.store.clone(),
+            ConversationEventHub::default(),
+            supervisor.workspace_trust.clone(),
+        )
+        .with_agent_mcp(agent_mcp);
+
+        // Without an agent-enabled host the launches are exactly as before.
+        let (argv, stdin) = logged_fixture_turns(&supervisor, &workspace, &root).await;
+        assert!(!argv.contains("--mcp-config"), "{argv}");
+        assert!(!stdin.contains("todex_ssh"), "{stdin}");
+        assert!(stdin.contains(r#""mcpServers":[]"#), "{stdin}");
+
+        ssh.service.set_agent_access("web", true).await.unwrap();
+        let (argv, stdin) = logged_fixture_turns(&supervisor, &workspace, &root).await;
+        let lines: Vec<Value> = stdin
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let request = |method: &str| {
+            lines
+                .iter()
+                .find(|line| line["method"] == method)
+                .unwrap_or_else(|| panic!("no {method} in {stdin}"))
+        };
+
+        let codex = &request("thread/start")["params"]["config"]["mcp_servers.todex_ssh"];
+        assert_eq!(codex["command"], "/opt/todex/todex-agentd");
+        assert_eq!(codex["args"], json!(["ssh-mcp-bridge"]));
+        assert_eq!(
+            codex["env"]["TODEX_SSH_MCP_URL"],
+            "http://127.0.0.1:7345/internal/agent-mcp/ssh"
+        );
+        assert_eq!(
+            codex["env"]["TODEX_SSH_MCP_TOKEN"].as_str().unwrap().len(),
+            64
+        );
+        assert_eq!(codex["default_tools_approval_mode"], "approve");
+
+        let claude = argv
+            .lines()
+            .find(|line| line.starts_with("-p "))
+            .unwrap_or_else(|| panic!("no claude launch in {argv}"));
+        assert!(claude.contains("--allowedTools=mcp__todex_ssh"), "{claude}");
+        let config_path = claude
+            .split("--mcp-config=")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap();
+        let config: Value =
+            serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+        let entry = &config["mcpServers"]["todex_ssh"];
+        assert_eq!(entry["type"], "stdio");
+        assert_eq!(entry["args"], json!(["ssh-mcp-bridge"]));
+        assert!(entry["env"]["TODEX_SSH_MCP_TOKEN"].is_string());
+        assert_eq!(
+            fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let acp = &request("session/new")["params"]["mcpServers"];
+        assert_eq!(acp[0]["name"], "todex_ssh");
+        assert_eq!(acp[0]["command"], "/opt/todex/todex-agentd");
+        assert_eq!(acp[0]["env"][1]["name"], "TODEX_SSH_MCP_TOKEN");
+
         let _ = fs::remove_dir_all(root);
     }
 

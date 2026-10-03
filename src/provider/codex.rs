@@ -478,6 +478,7 @@ async fn prepare_codex_thread(
             if let Some(effort) = &prompt.reasoning_effort {
                 resume_params["config"] = json!({ "model_reasoning_effort": effort });
             }
+            add_agent_mcp_config(&mut resume_params, &context);
             process
                 .send(&json!({
                     "id": "thread",
@@ -509,6 +510,7 @@ async fn prepare_codex_thread(
             if let Some(effort) = &prompt.reasoning_effort {
                 params["config"] = json!({ "model_reasoning_effort": effort });
             }
+            add_agent_mcp_config(&mut params, &context);
             process
                 .send(&json!({
                     "id": "thread",
@@ -544,6 +546,18 @@ async fn prepare_codex_thread(
     sink.save_provider_state(provider_state).await?;
 
     Ok((native_session_id, effective_model))
+}
+
+/// Adds TodeX's MCP server to a `thread/start|resume` `config` override.
+fn add_agent_mcp_config(params: &mut Value, context: &DriverContext) {
+    let Some(server) = &context.agent_mcp else {
+        return;
+    };
+    let (key, value) = server.codex_config();
+    if !params["config"].is_object() {
+        params["config"] = json!({});
+    }
+    params["config"][key] = value;
 }
 
 fn codex_configuration_event(response: &Value, prompt: &DriverPrompt) -> Option<Value> {
@@ -1694,6 +1708,7 @@ done
                     DriverContext {
                         manifest: manifest.clone(),
                         provider_state: provider_state.clone(),
+                        agent_mcp: None,
                     },
                     DriverPrompt {
                         turn_id: "turn".to_owned(),
@@ -1719,6 +1734,7 @@ done
         let context = DriverContext {
             manifest,
             provider_state,
+            agent_mcp: None,
         };
         let fork = driver
             .fork_session(

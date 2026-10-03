@@ -82,6 +82,25 @@ pub(crate) struct CommandLimits {
     pub output_limit: usize,
 }
 
+/// Output of [`run_truncating`]: each stream holds at most the output limit.
+#[derive(Debug)]
+pub(crate) struct TruncatedOutput {
+    pub status: ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// Whether stdout or stderr produced more than the output limit.
+    pub truncated: bool,
+}
+
+/// What happens when a stream exceeds [`CommandLimits::output_limit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Overflow {
+    /// Kill the process and fail with [`ExternalCommandError::OutputLimit`].
+    Fail,
+    /// Keep the first `output_limit` bytes, drain and discard the rest.
+    Truncate,
+}
+
 /// A `Command` for `program` with a cleared environment plus [`INHERITED_ENV`].
 pub(crate) fn secure_command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
@@ -120,11 +139,36 @@ pub(crate) fn prepare_captured(command: &mut Command, piped_stdin: bool) {
 
 /// Runs a command prepared with [`prepare_captured`]. `stdin`, when given, is
 /// written and closed before waiting; it requires `piped_stdin = true`.
+/// Output beyond the limit kills the process and fails the run.
 pub(crate) async fn run(
-    mut command: Command,
+    command: Command,
     stdin: Option<Vec<u8>>,
     limits: CommandLimits,
 ) -> Result<CommandOutput, ExternalCommandError> {
+    let output = run_with(command, stdin, limits, Overflow::Fail).await?;
+    Ok(CommandOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+/// Like [`run`], but output beyond the limit is dropped instead of failing
+/// the run: the process keeps running until it exits or times out.
+pub(crate) async fn run_truncating(
+    command: Command,
+    stdin: Option<Vec<u8>>,
+    limits: CommandLimits,
+) -> Result<TruncatedOutput, ExternalCommandError> {
+    run_with(command, stdin, limits, Overflow::Truncate).await
+}
+
+async fn run_with(
+    mut command: Command,
+    stdin: Option<Vec<u8>>,
+    limits: CommandLimits,
+    overflow: Overflow,
+) -> Result<TruncatedOutput, ExternalCommandError> {
     let mut child = command.spawn().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             ExternalCommandError::NotFound
@@ -161,8 +205,8 @@ pub(crate) async fn run(
         };
         let wait = async { child.wait().await.map_err(LimitedReadError::Io) };
         tokio::try_join!(
-            read_limited(stdout, limits.output_limit),
-            read_limited(stderr, limits.output_limit),
+            read_limited(stdout, limits.output_limit, overflow),
+            read_limited(stderr, limits.output_limit, overflow),
             feed,
             wait,
         )
@@ -170,12 +214,13 @@ pub(crate) async fn run(
     .await;
 
     let failure = match result {
-        Ok(Ok((stdout, stderr, (), status))) => {
+        Ok(Ok(((stdout, stdout_cut), (stderr, stderr_cut), (), status))) => {
             process_group_guard.disarm();
-            return Ok(CommandOutput {
+            return Ok(TruncatedOutput {
                 status,
                 stdout,
                 stderr,
+                truncated: stdout_cut || stderr_cut,
             });
         }
         Err(_elapsed) => ExternalCommandError::TimedOut,
@@ -238,11 +283,17 @@ impl From<io::Error> for LimitedReadError {
     }
 }
 
-async fn read_limited<R>(mut reader: R, limit: usize) -> Result<Vec<u8>, LimitedReadError>
+/// Reads a stream to its end, returning the bytes and whether any were cut.
+async fn read_limited<R>(
+    mut reader: R,
+    limit: usize,
+    overflow: Overflow,
+) -> Result<(Vec<u8>, bool), LimitedReadError>
 where
     R: AsyncRead + Unpin,
 {
     let mut output = Vec::with_capacity(limit.min(8192));
+    let mut truncated = false;
     // Heap buffer: an inline array would make every future that awaits a run
     // (and every caller's future in turn) 16 KiB larger.
     let mut buffer = vec![0_u8; 8192];
@@ -252,11 +303,18 @@ where
             break;
         }
         if output.len().saturating_add(read) > limit {
-            return Err(LimitedReadError::Limit);
+            if overflow == Overflow::Fail {
+                return Err(LimitedReadError::Limit);
+            }
+            // Keep draining so the child never blocks on a full pipe.
+            let room = limit - output.len();
+            output.extend_from_slice(&buffer[..room]);
+            truncated = true;
+            continue;
         }
         output.extend_from_slice(&buffer[..read]);
     }
-    Ok(output)
+    Ok((output, truncated))
 }
 
 async fn terminate_child(child: &mut Child, process_group_id: Option<u32>) {
@@ -321,6 +379,25 @@ mod tests {
         prepare_captured(&mut command, false);
         let error = run(command, None, limits(5, 16)).await.unwrap_err();
         assert!(matches!(error, ExternalCommandError::OutputLimit(16)));
+    }
+
+    #[tokio::test]
+    async fn truncating_run_keeps_the_prefix_and_reports_it() {
+        let mut command = secure_command("/bin/sh");
+        command.args(["-c", "yes | head -c 100000; printf ab >&2; exit 4"]);
+        prepare_captured(&mut command, false);
+        let output = run_truncating(command, None, limits(5, 16)).await.unwrap();
+        assert_eq!(output.stdout, b"y\ny\ny\ny\ny\ny\ny\ny\n");
+        assert_eq!(output.stderr, b"ab");
+        assert!(output.truncated);
+        assert_eq!(output.status.code(), Some(4));
+
+        let mut command = secure_command("/bin/sh");
+        command.args(["-c", "printf ok"]);
+        prepare_captured(&mut command, false);
+        let output = run_truncating(command, None, limits(5, 16)).await.unwrap();
+        assert_eq!(output.stdout, b"ok");
+        assert!(!output.truncated);
     }
 
     #[tokio::test]

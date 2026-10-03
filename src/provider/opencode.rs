@@ -826,6 +826,7 @@ mod tests {
             let context = DriverContext {
                 manifest: self.manifest.clone(),
                 provider_state: self.store.provider_state(&self.manifest.id).await.unwrap(),
+                agent_mcp: None,
             };
             let prompt = DriverPrompt {
                 turn_id: turn_id.to_owned(),
@@ -1323,6 +1324,7 @@ mod tests {
                 .provider_state(&fixture.manifest.id)
                 .await
                 .unwrap(),
+            agent_mcp: None,
         };
         let permit = fixture
             .trust
