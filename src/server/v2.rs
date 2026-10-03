@@ -175,6 +175,7 @@ fn authenticated_routes() -> Router<AppState> {
         .route("/v2/providers/commands", get(provider_commands))
         .merge(agent_providers::routes())
         .merge(super::ssh::routes())
+        .merge(super::remote::routes())
         .route(
             "/v2/conversations/{conversation_id}/runtime/stop",
             post(stop_provider_runtime),
@@ -1075,7 +1076,7 @@ fn validate_browser_url(raw: &str) -> Result<String, AppError> {
     Ok(parsed.to_string())
 }
 
-fn mime_for_name(name: &str) -> String {
+pub(super) fn mime_for_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     if lower.ends_with(".png") {
         "image/png"

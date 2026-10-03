@@ -170,6 +170,9 @@ pub(crate) enum SshMode {
     Batch,
     /// Runs in a PTY: the user can answer host-key and password prompts.
     Interactive,
+    /// No terminal; a single password prompt is answered by the program the
+    /// caller sets as `SSH_ASKPASS`. Unknown host keys are still rejected.
+    Askpass,
 }
 
 #[derive(Clone)]
@@ -269,24 +272,34 @@ impl SshService {
         command.arg("-F").arg(self.wrapper_path());
         if self.inner.multiplex {
             let control_path = self.inner.dir.join(CONTROL_DIR).join("%C");
+            // An askpass process carries a password in its environment; it may
+            // use an existing master but must not become a long-lived one.
+            let master = if mode == SshMode::Askpass {
+                "no"
+            } else {
+                "auto"
+            };
             command
                 .arg("-o")
-                .arg("ControlMaster=auto")
+                .arg(format!("ControlMaster={master}"))
                 .arg("-o")
                 .arg(format!("ControlPath={}", control_path.display()))
                 .arg("-o")
                 .arg(format!("ControlPersist={CONTROL_PERSIST_SECONDS}"));
         }
-        if mode == SshMode::Batch {
-            command.args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                "-o",
-                "ConnectTimeout=15",
-            ]);
+        match mode {
+            SshMode::Batch => {
+                command.args(["-o", "BatchMode=yes"]);
+            }
+            SshMode::Askpass => {
+                command
+                    .args(["-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1"])
+                    // Use SSH_ASKPASS even without a display or with a tty.
+                    .env("SSH_ASKPASS_REQUIRE", "force");
+            }
+            SshMode::Interactive => return command,
         }
+        command.args(["-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15"]);
         command
     }
 
@@ -895,6 +908,25 @@ exit 0
         assert!(test_line.contains("-o BatchMode=yes -o StrictHostKeyChecking=yes"));
         assert!(test_line.contains("-F "));
         assert!(test_line.contains("-- good exit 0"));
+    }
+
+    #[tokio::test]
+    async fn askpass_mode_allows_one_password_prompt() {
+        let fixture = fixture("").await;
+        let command = fixture.service.command(SshMode::Askpass);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let args = args.join(" ");
+        assert!(args
+            .contains("-o BatchMode=no -o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=yes"));
+        assert!(!args.contains("ControlMaster=auto"));
+        assert!(command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "SSH_ASKPASS_REQUIRE" && value == Some("force".as_ref())));
     }
 
     #[tokio::test]
