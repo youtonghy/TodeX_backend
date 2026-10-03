@@ -115,9 +115,13 @@ pub(crate) enum HostSource {
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResolvedHost {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_jump: Option<String>,
     pub identity_files: Vec<String>,
 }
