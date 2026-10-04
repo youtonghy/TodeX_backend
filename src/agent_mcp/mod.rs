@@ -15,6 +15,7 @@
 //! never enables one.
 
 mod bridge;
+mod desktop_computer;
 mod desktop_server;
 mod server;
 

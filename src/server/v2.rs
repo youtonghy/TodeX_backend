@@ -7526,7 +7526,10 @@ mod tests {
         assert_eq!(send(unsigned).await.0, StatusCode::UNAUTHORIZED);
         let (status, body) = send(signed_request(&device, "GET", "/v2/agent-desktop", "")).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, json!({ "enabled": false, "executors": [] }));
+        assert_eq!(
+            body,
+            json!({ "enabled": false, "computerEnabled": false, "executors": [] })
+        );
         let (status, body) = send(signed_request(
             &device,
             "PUT",
@@ -7545,6 +7548,19 @@ mod tests {
         ))
         .await;
         assert!(status.is_client_error());
+        let (status, _) = send(signed_request(&device, "PUT", "/v2/agent-desktop", "{}")).await;
+        assert!(status.is_client_error());
+        let (_, body) = send(signed_request(
+            &device,
+            "PUT",
+            "/v2/agent-desktop",
+            r#"{"computerEnabled":true}"#,
+        ))
+        .await;
+        assert_eq!(
+            (body["enabled"].clone(), body["computerEnabled"].clone()),
+            (json!(true), json!(true))
+        );
 
         let manifest = state
             .conversations
@@ -7567,6 +7583,39 @@ mod tests {
         let (_, body) = send(signed_request(&device, "DELETE", &uri, "")).await;
         assert_eq!(body["revoked"], true);
         assert!(state.agent_desktop.grant(&manifest.id).is_none());
+        // Stopping only Computer Use keeps the browser grant.
+        let x = || crate::agent_desktop::Grant {
+            device_id: "dev_x".into(),
+            device_name: "X".into(),
+        };
+        state.agent_desktop.set_grant(&manifest.id, x());
+        state.agent_desktop.set_computer_grant(&manifest.id, x());
+        state
+            .agent_desktop
+            .claim_screen("dev_x", &manifest.id)
+            .unwrap();
+        let (_, body) = send(signed_request(
+            &device,
+            "DELETE",
+            &format!("{uri}?capability=screen"),
+            "",
+        ))
+        .await;
+        assert_eq!(body["revoked"], true);
+        assert!(state.agent_desktop.computer_grant(&manifest.id).is_none());
+        assert!(state.agent_desktop.grant(&manifest.id).is_some());
+        assert!(state
+            .agent_desktop
+            .claim_screen("dev_x", "someone-else")
+            .is_ok());
+        let (status, _) = send(signed_request(
+            &device,
+            "DELETE",
+            &format!("{uri}?capability=disk"),
+            "",
+        ))
+        .await;
+        assert!(status.is_client_error());
         let history = state.conversations.history_for_tests(&manifest.id).await;
         assert!(history
             .iter()
@@ -7638,7 +7687,7 @@ mod tests {
         let refused = wait_for_ws_message(&mut ws, |m| m["id"] == "r0").await;
         assert_eq!(refused["type"], "server.error");
 
-        ws.send(send(json!({ "id": "bad", "type": "executor.register", "payload": { "capabilities": ["screen"], "platform": "darwin" } })))
+        ws.send(send(json!({ "id": "bad", "type": "executor.register", "payload": { "capabilities": ["camera"], "platform": "darwin" } })))
             .await
             .unwrap();
         let bad = wait_for_ws_message(&mut ws, |m| m["id"] == "bad").await;

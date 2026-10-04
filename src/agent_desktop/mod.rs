@@ -6,6 +6,10 @@
 //! tool call to the desktop a conversation is bound to. A conversation is
 //! bound by its first grant, which only an online executor device may
 //! answer. Grants live in memory: a daemon restart asks again.
+//!
+//! Computer Use (`computer_*`, capability `screen`) has its own switch and
+//! grant. A device's screen is leased to one conversation at a time; the
+//! lease ends with `computer_done`, a stop, a revoke, or [`SCREEN_IDLE`].
 
 pub(crate) mod executors;
 mod shots;
@@ -15,6 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +31,8 @@ pub(crate) use executors::{ExecutorError, Executors, InvokeRequest, Registration
 pub(crate) use shots::ShotStore;
 
 const SETTINGS_FILE: &str = "agent-desktop.json";
+/// A screen lease nobody used for this long may be taken over.
+pub(crate) const SCREEN_IDLE: Duration = Duration::from_secs(120);
 const STATE_DIR: &str = "agent-desktop";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -34,6 +41,33 @@ pub(crate) struct DesktopSettings {
     /// Agents get the `todex_desktop` MCP server. Off by default.
     #[serde(default)]
     pub enabled: bool,
+    /// Agents also get the `computer_*` tools. Off by default; only
+    /// effective while `enabled`.
+    #[serde(default)]
+    pub computer_enabled: bool,
+}
+
+/// What a revoke ended for a conversation.
+#[derive(Debug, Default)]
+pub(crate) struct Revoked {
+    pub browser: Option<Grant>,
+    pub computer: Option<Grant>,
+    /// It held a screen lease, now released.
+    pub screen_ended: bool,
+}
+
+/// Result of taking a device's screen for a conversation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ScreenClaim {
+    /// The conversation already held it.
+    Continued,
+    /// Newly taken; `displaced` held it before but had gone idle.
+    Started { displaced: Option<String> },
+}
+
+struct Lease {
+    conversation_id: String,
+    last_used: Instant,
 }
 
 /// The desktop a conversation may drive.
@@ -54,6 +88,11 @@ struct Inner {
     settings: RwLock<DesktopSettings>,
     executors: Executors,
     grants: Mutex<HashMap<String, Grant>>,
+    computer_grants: Mutex<HashMap<String, Grant>>,
+    /// Device id → the conversation controlling its screen.
+    leases: Mutex<HashMap<String, Lease>>,
+    /// Conversation → bundle ids the user let its agent control.
+    approved_apps: Mutex<HashMap<String, HashSet<String>>>,
     /// Conversation → loopback ports its agent opened; only these may be
     /// tunnelled to its desktop.
     ports: Mutex<HashMap<String, HashSet<u16>>>,
@@ -83,6 +122,9 @@ impl AgentDesktop {
                 settings: RwLock::new(settings),
                 executors: Executors::default(),
                 grants: Mutex::new(HashMap::new()),
+                computer_grants: Mutex::new(HashMap::new()),
+                leases: Mutex::new(HashMap::new()),
+                approved_apps: Mutex::new(HashMap::new()),
                 ports: Mutex::new(HashMap::new()),
                 daemon_port: OnceLock::new(),
                 shots: ShotStore::new(data_dir.join(STATE_DIR).join("shots")),
@@ -102,12 +144,35 @@ impl AgentDesktop {
         self.inner.settings.read().await.enabled
     }
 
-    /// Persists the switch. Disabling revokes every grant so open tabs close;
-    /// providers already running keep the server until their next start, and
-    /// their calls fail while it is off.
+    pub(crate) async fn settings(&self) -> DesktopSettings {
+        *self.inner.settings.read().await
+    }
+
+    /// Computer Use is on: both switches.
+    pub(crate) async fn computer_enabled(&self) -> bool {
+        let settings = self.inner.settings.read().await;
+        settings.enabled && settings.computer_enabled
+    }
+
+    #[cfg(test)]
     pub(crate) async fn set_enabled(&self, enabled: bool) -> Result<DesktopSettings, AppError> {
+        Ok(self.update_settings(Some(enabled), None).await?.0)
+    }
+
+    /// Persists the switches. Turning tools off revokes the affected grants
+    /// so tabs close and screens are released; providers already running
+    /// keep the server until their next start, and their calls fail while
+    /// off. Returns the conversations whose screen session ended.
+    pub(crate) async fn update_settings(
+        &self,
+        enabled: Option<bool>,
+        computer_enabled: Option<bool>,
+    ) -> Result<(DesktopSettings, Vec<String>), AppError> {
         let mut settings = self.inner.settings.write().await;
-        let next = DesktopSettings { enabled };
+        let next = DesktopSettings {
+            enabled: enabled.unwrap_or(settings.enabled),
+            computer_enabled: computer_enabled.unwrap_or(settings.computer_enabled),
+        };
         let bytes = serde_json::to_vec_pretty(&next)?;
         let path = self.inner.settings_path.clone();
         tokio::task::spawn_blocking(move || secure_fs::write_owner_only_atomic(&path, &bytes))
@@ -115,8 +180,9 @@ impl AgentDesktop {
             .map_err(|error| AppError::Anyhow(error.into()))??;
         *settings = next;
         drop(settings);
-        if !enabled {
-            let conversations: Vec<String> = self
+        let mut ended = Vec::new();
+        if !next.enabled {
+            let mut conversations: HashSet<String> = self
                 .inner
                 .grants
                 .lock()
@@ -124,11 +190,30 @@ impl AgentDesktop {
                 .keys()
                 .cloned()
                 .collect();
+            conversations.extend(self.computer_conversations());
             for conversation_id in conversations {
-                self.revoke(&conversation_id);
+                if self.revoke(&conversation_id).screen_ended {
+                    ended.push(conversation_id);
+                }
+            }
+        } else if !next.computer_enabled {
+            for conversation_id in self.computer_conversations() {
+                if self.revoke_computer(&conversation_id).1 {
+                    ended.push(conversation_id);
+                }
             }
         }
-        Ok(next)
+        Ok((next, ended))
+    }
+
+    fn computer_conversations(&self) -> Vec<String> {
+        self.inner
+            .computer_grants
+            .lock()
+            .expect("desktop grant lock")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     pub fn set_daemon_port(&self, port: u16) {
@@ -185,9 +270,165 @@ impl AgentDesktop {
             .insert(conversation_id.to_owned(), grant);
     }
 
-    /// Drops the conversation's grant and tells its desktop to close what it
-    /// opened. Returns the revoked grant.
-    pub(crate) fn revoke(&self, conversation_id: &str) -> Option<Grant> {
+    pub(crate) fn computer_grant(&self, conversation_id: &str) -> Option<Grant> {
+        self.inner
+            .computer_grants
+            .lock()
+            .expect("desktop grant lock")
+            .get(conversation_id)
+            .cloned()
+    }
+
+    pub(crate) fn set_computer_grant(&self, conversation_id: &str, grant: Grant) {
+        self.inner
+            .computer_grants
+            .lock()
+            .expect("desktop grant lock")
+            .insert(conversation_id.to_owned(), grant);
+    }
+
+    /// Takes `device_id`'s screen for the conversation, unless another
+    /// conversation used it within [`SCREEN_IDLE`] (returned as `Err`).
+    pub(crate) fn claim_screen(
+        &self,
+        device_id: &str,
+        conversation_id: &str,
+    ) -> Result<ScreenClaim, String> {
+        let mut leases = self.inner.leases.lock().expect("desktop lease lock");
+        match leases.get_mut(device_id) {
+            Some(lease) if lease.conversation_id == conversation_id => {
+                lease.last_used = Instant::now();
+                return Ok(ScreenClaim::Continued);
+            }
+            Some(lease) if lease.last_used.elapsed() < SCREEN_IDLE => {
+                return Err(lease.conversation_id.clone());
+            }
+            _ => {}
+        }
+        let displaced = leases
+            .insert(
+                device_id.to_owned(),
+                Lease {
+                    conversation_id: conversation_id.to_owned(),
+                    last_used: Instant::now(),
+                },
+            )
+            .map(|lease| lease.conversation_id);
+        drop(leases);
+        if let Some(previous) = &displaced {
+            self.release_executors(device_id, previous, Some(executors::CAPABILITY_SCREEN));
+        }
+        Ok(ScreenClaim::Started { displaced })
+    }
+
+    /// Ends the conversation's screen lease. Returns the device it held.
+    pub(crate) fn release_screen(&self, conversation_id: &str) -> Option<String> {
+        let device_id = {
+            let mut leases = self.inner.leases.lock().expect("desktop lease lock");
+            let device_id = leases
+                .iter()
+                .find(|(_, lease)| lease.conversation_id == conversation_id)
+                .map(|(device, _)| device.clone())?;
+            leases.remove(&device_id);
+            device_id
+        };
+        self.release_executors(
+            &device_id,
+            conversation_id,
+            Some(executors::CAPABILITY_SCREEN),
+        );
+        Some(device_id)
+    }
+
+    /// Ends leases idle for [`SCREEN_IDLE`]; returns their conversations.
+    pub(crate) fn expire_screens(&self) -> Vec<String> {
+        let expired: Vec<(String, String)> = {
+            let mut leases = self.inner.leases.lock().expect("desktop lease lock");
+            let idle: Vec<String> = leases
+                .iter()
+                .filter(|(_, lease)| lease.last_used.elapsed() >= SCREEN_IDLE)
+                .map(|(device, _)| device.clone())
+                .collect();
+            idle.into_iter()
+                .filter_map(|device| {
+                    leases
+                        .remove(&device)
+                        .map(|lease| (device, lease.conversation_id))
+                })
+                .collect()
+        };
+        for (device_id, conversation_id) in &expired {
+            self.release_executors(
+                device_id,
+                conversation_id,
+                Some(executors::CAPABILITY_SCREEN),
+            );
+        }
+        expired
+            .into_iter()
+            .map(|(_, conversation_id)| conversation_id)
+            .collect()
+    }
+
+    pub(crate) fn approved_apps(&self, conversation_id: &str) -> Vec<String> {
+        let mut apps: Vec<String> = self
+            .inner
+            .approved_apps
+            .lock()
+            .expect("desktop app lock")
+            .get(conversation_id)
+            .map(|apps| apps.iter().cloned().collect())
+            .unwrap_or_default();
+        apps.sort();
+        apps
+    }
+
+    pub(crate) fn approve_app(&self, conversation_id: &str, bundle_id: &str) {
+        self.inner
+            .approved_apps
+            .lock()
+            .expect("desktop app lock")
+            .entry(conversation_id.to_owned())
+            .or_default()
+            .insert(bundle_id.to_owned());
+    }
+
+    /// Tells `device_id`'s executors the conversation lost `capability`
+    /// (all of it when `None`).
+    fn release_executors(&self, device_id: &str, conversation_id: &str, capability: Option<&str>) {
+        let mut seen = HashSet::new();
+        for capability_name in [executors::CAPABILITY_BROWSER, executors::CAPABILITY_SCREEN] {
+            for executor in self.inner.executors.online(capability_name) {
+                if executor.device_id == device_id && seen.insert(executor.executor_id) {
+                    self.inner
+                        .executors
+                        .release(executor.executor_id, conversation_id, capability);
+                }
+            }
+        }
+    }
+
+    /// Drops the conversation's Computer Use grant, approved apps and screen
+    /// lease. Returns the grant and whether a screen session ended.
+    pub(crate) fn revoke_computer(&self, conversation_id: &str) -> (Option<Grant>, bool) {
+        let grant = self
+            .inner
+            .computer_grants
+            .lock()
+            .expect("desktop grant lock")
+            .remove(conversation_id);
+        self.inner
+            .approved_apps
+            .lock()
+            .expect("desktop app lock")
+            .remove(conversation_id);
+        let screen_ended = self.release_screen(conversation_id).is_some();
+        (grant, screen_ended)
+    }
+
+    /// Drops the conversation's browser grant and tells its desktop to close
+    /// the tab it opened.
+    pub(crate) fn revoke_browser(&self, conversation_id: &str) -> Option<Grant> {
         let grant = self
             .inner
             .grants
@@ -199,18 +440,23 @@ impl AgentDesktop {
             .lock()
             .expect("desktop port lock")
             .remove(conversation_id);
-        for executor in self
-            .inner
-            .executors
-            .online(executors::CAPABILITY_BROWSER)
-            .into_iter()
-            .filter(|executor| executor.device_id == grant.device_id)
-        {
-            self.inner
-                .executors
-                .release(executor.executor_id, conversation_id);
-        }
+        self.release_executors(
+            &grant.device_id,
+            conversation_id,
+            Some(executors::CAPABILITY_BROWSER),
+        );
         Some(grant)
+    }
+
+    /// Drops everything the conversation was granted.
+    pub(crate) fn revoke(&self, conversation_id: &str) -> Revoked {
+        let browser = self.revoke_browser(conversation_id);
+        let (computer, screen_ended) = self.revoke_computer(conversation_id);
+        Revoked {
+            browser,
+            computer,
+            screen_ended,
+        }
     }
 
     /// Conversation deleted or expired: forget its grant and screenshots.

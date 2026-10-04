@@ -604,6 +604,16 @@ Agent 运行在 daemon 所在机器，浏览器却属于用户的桌面端。桌
 - 截图交给模型：2026-10 实测 Codex、Claude Code、Grok、Devin 都能把 `browser_snapshot` 的图片交给模型；OpenCode 当次改用 `curl` 读取页面源码，图片可能没有传给模型，此时只能依赖无障碍树文本。ACP 类 Agent 处于询问模式时，仍可能对这些 MCP 工具弹出原生权限请求。
 - 设备限定的权限：任何 `permission.requested` 都可能带 `allowedDeviceIds`，客户端应在本机不在列表中时隐藏操作按钮。
 
+### Computer Use（`todex_desktop` 的 `computer_*` 工具）
+
+- 开关：`PUT /v2/agent-desktop` 也接受 `{ computerEnabled }`（字段都可选，至少给一个），`GET` 返回 `computerEnabled`；默认关闭，只有 `enabled` 也打开时生效。打开后工具列表多出 `computer_observe`、`computer_act`、`computer_done`（已运行的 Provider 要到下次启动才看到；关闭立即生效，并结束所有屏幕会话）。执行端以能力 `screen` 登记（桌面端仅在 macOS 14+、本机开关打开、屏幕录制与辅助功能已授权时登记）。
+- 首次授权：`permission.requested { kind: "desktop_computer", allowedDeviceIds }`，只有提供 `screen` 能力的在线设备能回答，与浏览器授权相互独立。
+- 屏幕租约：一台设备同一时间只服务一个会话，其他会话调用返回 `SCREEN_BUSY`；`computer_done`、停止、撤销或闲置 120 秒后释放（daemon 每 15 秒清理一次），释放时向执行端发 `executor.release { conversationId, capability: "screen" }`。
+- 按应用批准：执行端对本会话首次操作的应用返回 `APP_CONFIRM`（`error.detail { bundleId, name }`），daemon 发 `permission.requested { kind: "desktop_computer_app" }`（任意设备可答），批准后把 bundle id 放入 `args.allowedApps` 重试；向密码框输入时执行端返回 `SENSITIVE_ACTION`，daemon 发 `kind: "desktop_computer_action"` 单次确认后带 `confirmed: true` 重试。Agent 不能自行传 `allowedApps`/`confirmed`。禁止操作的应用（TodeX 自身、系统认证窗口、钥匙串、系统设置、密码管理器）由执行端以 `TARGET_BLOCKED` 拒绝。
+- `computer_observe { app?, window?, display?, screenshot?=true }` → 前台（或指定）应用、窗口列表、带 `[ref=eN]` 的无障碍树、显示器、窗口（或整屏）截图；`computer_act { action: click|double_click|right_click|hover|drag|scroll|type|key|wait|open_app|focus_window, ref?, x?, y?, toX?, toY?, text?, keys?, app?, window?, deltaX?, deltaY?, ms? }`，有 `ref` 时后台送达元素（`path: "background"`，不动指针），只给坐标时移动指针（`path: "pointer"`，用户正在操作时返回 `USER_ACTIVE`）。
+- 会话事件：`desktop.computer.session { status: "started"|"ended", deviceId?, deviceName?, reason? }`（reason：`done`、`idle`、`user`、`revoked`）；`desktop.computer.action { actionId, tool, ok, summary, app?, windowTitle?, path?, error?, shotId?, deviceId, deviceName }`；`desktop.computer.grant { status: "granted"|"revoked" }`。事件不含截图数据与输入的文字。
+- `DELETE /v2/conversations/{id}/agent-desktop?capability=screen|browser` 只撤销其中一项；不带参数撤销两项。
+
 ## WebSocket 协议
 
 客户端发送文本帧，内容必须是 JSON。二进制帧会被忽略。默认仍支持明文 JSON；如果 WebSocket URL 带上加密握手参数，业务 JSON 会被包装在 `todex.crypto.v1` 加密帧中。

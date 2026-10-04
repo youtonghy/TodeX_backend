@@ -30,24 +30,31 @@ use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
 
 use super::{
+    desktop_computer,
     server::{guard, schema, tool_error, Caller},
     AgentMcp, DESKTOP_ROUTE, DESKTOP_SERVER,
 };
 use crate::{
-    agent_desktop::{executors::CAPABILITY_BROWSER, ExecutorError, Grant, InvokeRequest},
+    agent_desktop::{
+        executors::{CAPABILITY_BROWSER, CAPABILITY_SCREEN},
+        ExecutorError, Grant, InvokeRequest,
+    },
     app_state::AppState,
     provider::{ConversationSupervisor, PermissionOutcome},
 };
 
 /// How long the first grant and sensitive confirmations wait for the user.
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(300);
+pub(super) const CONFIRM_TIMEOUT: Duration = Duration::from_secs(300);
 const NAVIGATE_TIMEOUT: Duration = Duration::from_secs(45);
 const ACT_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Providers wait this long for one call: a confirmation, its retry, and
+/// Providers wait this long for one call: up to two confirmations (a
+/// Computer Use app approval, then a sensitive action), their retries, and
 /// the slowest tool.
 pub(super) const PROVIDER_TOOL_TIMEOUT_SECONDS: u64 =
-    CONFIRM_TIMEOUT.as_secs() + 2 * NAVIGATE_TIMEOUT.as_secs();
+    2 * CONFIRM_TIMEOUT.as_secs() + 3 * NAVIGATE_TIMEOUT.as_secs();
+/// How often idle screen leases are ended.
+const SCREEN_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_TEXT_CHARS: usize = 4096;
 const MAX_WAIT_MS: u64 = 10_000;
 const GRANT_KIND: &str = "desktop_browser";
@@ -59,6 +66,7 @@ pub(super) fn routes(state: &AppState) -> Router<AppState> {
         conversations: state.conversations.clone(),
         granting: Arc::new(Mutex::new(HashMap::new())),
     };
+    spawn_screen_sweeper(&tools);
     let service = StreamableHttpService::new(
         move || Ok(tools.clone()),
         Arc::new(LocalSessionManager::default()),
@@ -69,12 +77,40 @@ pub(super) fn routes(state: &AppState) -> Router<AppState> {
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), guard))
 }
 
+/// Ends screen leases nobody used for a while, so the live view and the
+/// desktop's overlay go away. Stops once the server is gone.
+fn spawn_screen_sweeper(tools: &DesktopTools) {
+    let weak = Arc::downgrade(&tools.granting);
+    let desktop = tools.mcp.desktop().clone();
+    let conversations = tools.conversations.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SCREEN_SWEEP_INTERVAL);
+        loop {
+            interval.tick().await;
+            if weak.upgrade().is_none() {
+                break;
+            }
+            for conversation_id in desktop.expire_screens() {
+                desktop_computer::journal_session_end(&conversations, &conversation_id, "idle")
+                    .await;
+            }
+        }
+    });
+}
+
 #[derive(Clone)]
-struct DesktopTools {
-    mcp: AgentMcp,
-    conversations: ConversationSupervisor,
+pub(super) struct DesktopTools {
+    pub(super) mcp: AgentMcp,
+    pub(super) conversations: ConversationSupervisor,
     /// Conversation → lock, so concurrent first calls ask only once.
-    granting: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pub(super) granting: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+/// Which grant a tool needs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum GrantFor {
+    Browser,
+    Computer,
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,7 +409,11 @@ impl ServerHandler for DesktopTools {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools()))
+        let mut all = tools();
+        if self.mcp.desktop().computer_enabled().await {
+            all.extend(desktop_computer::tools());
+        }
+        Ok(ListToolsResult::with_all_items(all))
     }
 
     async fn call_tool(
@@ -388,6 +428,13 @@ impl ServerHandler for DesktopTools {
             .cloned()
             .ok_or_else(|| ErrorData::internal_error("request is not authenticated", None))?;
         let arguments = Value::Object(request.arguments.unwrap_or_default());
+        if request.name.starts_with("computer_") {
+            let call = match desktop_computer::validate(request.name.as_ref(), arguments) {
+                Ok(call) => call,
+                Err(message) => return Ok(tool_error(message).into()),
+            };
+            return Ok(self.run_computer(&caller, call, &context).await.into());
+        }
         let call = match validate(request.name.as_ref(), arguments) {
             Ok(call) => call,
             Err(message) => return Ok(tool_error(message).into()),
@@ -410,7 +457,10 @@ impl DesktopTools {
                 "TodeX desktop tools are turned off in the backend settings.".to_owned(),
             );
         }
-        let grant = match self.ensure_grant(conversation_id, context).await {
+        let grant = match self
+            .ensure_grant(conversation_id, GrantFor::Browser, context)
+            .await
+        {
             Ok(grant) => grant,
             Err(message) => return tool_error(message),
         };
@@ -448,7 +498,7 @@ impl DesktopTools {
                 context.ct.cancelled(),
             )
             .await;
-        if let Err(ExecutorError::Failed { code, message }) = &outcome {
+        if let Err(ExecutorError::Failed { code, message, .. }) = &outcome {
             if code == "SENSITIVE_ACTION" {
                 outcome = match self
                     .confirm_sensitive(conversation_id, &call, message, context)
@@ -470,6 +520,7 @@ impl DesktopTools {
                     Err(message) => Err(ExecutorError::Failed {
                         code: "DECLINED".to_owned(),
                         message,
+                        detail: None,
                     }),
                 };
             }
@@ -513,7 +564,7 @@ impl DesktopTools {
 
     /// Text (and an optional image) for the agent; the screenshot is stored
     /// and referenced from the event.
-    async fn success(
+    pub(super) async fn success(
         &self,
         conversation_id: &str,
         tool: &str,
@@ -524,7 +575,9 @@ impl DesktopTools {
             .as_object_mut()
             .and_then(|object| object.remove("screenshot"));
         let mut content = Vec::new();
-        let text = if tool == "browser_snapshot" {
+        let text = if tool == "computer_observe" {
+            desktop_computer::observation_text(&result)
+        } else if tool == "browser_snapshot" {
             let mut text = format!(
                 "URL: {}\nTitle: {}\n",
                 result["url"].as_str().unwrap_or_default(),
@@ -559,15 +612,20 @@ impl DesktopTools {
         CallToolResult::success(content)
     }
 
-    /// The conversation's grant, asking the user (on an executor device)
-    /// the first time.
-    async fn ensure_grant(
+    /// The conversation's grant for `which`, asking the user (on an executor
+    /// device offering that capability) the first time.
+    pub(super) async fn ensure_grant(
         &self,
         conversation_id: &str,
+        which: GrantFor,
         context: &RequestContext<RoleServer>,
     ) -> Result<Grant, String> {
         let desktop = self.mcp.desktop();
-        if let Some(grant) = desktop.grant(conversation_id) {
+        let current = |desktop: &crate::agent_desktop::AgentDesktop| match which {
+            GrantFor::Browser => desktop.grant(conversation_id),
+            GrantFor::Computer => desktop.computer_grant(conversation_id),
+        };
+        if let Some(grant) = current(desktop) {
             return Ok(grant);
         }
         let lock = self
@@ -578,17 +636,37 @@ impl DesktopTools {
             .or_default()
             .clone();
         let _asking = lock.lock().await;
-        if let Some(grant) = desktop.grant(conversation_id) {
+        if let Some(grant) = current(desktop) {
             return Ok(grant);
         }
-        let mut executors = desktop.executors().online(CAPABILITY_BROWSER);
+        let (capability, kind, title, declined, event_type) = match which {
+            GrantFor::Browser => (
+                CAPABILITY_BROWSER,
+                GRANT_KIND,
+                "Allow the agent to use a browser on your desktop?",
+                "The user declined desktop browser access for this conversation.",
+                "desktop.browser.grant",
+            ),
+            GrantFor::Computer => (
+                CAPABILITY_SCREEN,
+                desktop_computer::GRANT_KIND,
+                "Allow the agent to control apps on your Mac (screen, pointer and keyboard)?",
+                "The user declined Computer Use for this conversation.",
+                "desktop.computer.grant",
+            ),
+        };
+        let mut executors = desktop.executors().online(capability);
         executors.dedup_by(|a, b| a.device_id == b.device_id);
         if executors.is_empty() {
-            return Err(
-                "No TodeX desktop is connected to this backend as an executor. Ask the user to open \
-                 the TodeX desktop app with desktop tools on, then try again."
+            return Err(match which {
+                GrantFor::Browser => "No TodeX desktop is connected to this backend as an executor. \
+                     Ask the user to open the TodeX desktop app with desktop tools on, then try again."
                     .to_owned(),
-            );
+                GrantFor::Computer => "No Mac is available for Computer Use. Ask the user to open TodeX \
+                     desktop on macOS 14 or later with \"This Mac allows Computer Use\" on and Screen \
+                     Recording and Accessibility granted."
+                    .to_owned(),
+            });
         }
         let devices: Vec<String> = executors
             .iter()
@@ -604,8 +682,8 @@ impl DesktopTools {
         let answer = self
             .ask(
                 conversation_id,
-                GRANT_KIND,
-                "Allow the agent to use a browser on your desktop?".to_owned(),
+                kind,
+                title.to_owned(),
                 details,
                 json!([
                     { "id": "allow", "kind": "allow_always", "name": "Allow for this conversation" },
@@ -620,9 +698,7 @@ impl DesktopTools {
             decision.outcome,
             PermissionOutcome::AllowAlways | PermissionOutcome::AllowOnce
         ) {
-            return Err(
-                "The user declined desktop browser access for this conversation.".to_owned(),
-            );
+            return Err(declined.to_owned());
         }
         let device_name = executors
             .iter()
@@ -633,17 +709,20 @@ impl DesktopTools {
             device_id,
             device_name,
         };
-        desktop.set_grant(conversation_id, grant.clone());
+        match which {
+            GrantFor::Browser => desktop.set_grant(conversation_id, grant.clone()),
+            GrantFor::Computer => desktop.set_computer_grant(conversation_id, grant.clone()),
+        }
         if let Err(error) = self
             .conversations
             .append_agent_event(
                 conversation_id,
-                "desktop.browser.grant",
+                event_type,
                 json!({ "status": "granted", "deviceId": grant.device_id, "deviceName": grant.device_name }),
             )
             .await
         {
-            tracing::warn!(%error, "failed to journal a desktop browser grant");
+            tracing::warn!(%error, "failed to journal a desktop grant");
         }
         Ok(grant)
     }
@@ -685,7 +764,7 @@ impl DesktopTools {
     /// A permission request that ends after [`CONFIRM_TIMEOUT`] or when the
     /// agent abandons the call.
     #[allow(clippy::too_many_arguments)]
-    async fn ask(
+    pub(super) async fn ask(
         &self,
         conversation_id: &str,
         kind: &str,
@@ -739,7 +818,6 @@ mod tests {
     /// A daemon with desktop tools on, one conversation, and an MCP client
     /// bridged to its `todex_desktop` endpoint.
     async fn harness() -> (std::path::PathBuf, AppState, String, Client) {
-        use rmcp::ServiceExt;
         let root = std::env::temp_dir().join(format!("todex-desktop-mcp-{}", Uuid::new_v4()));
         std::fs::create_dir_all(root.join("workspaces/project")).unwrap();
         let state = AppState::new(Config {
@@ -761,7 +839,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let launch = state.agent_mcp.launch(&manifest.id).await.unwrap();
+        let client = client_for(&state, &manifest.id).await;
+        (root, state, manifest.id, client)
+    }
+
+    /// An MCP client bridged to `todex_desktop` with the conversation's token.
+    async fn client_for(state: &AppState, conversation_id: &str) -> Client {
+        use rmcp::ServiceExt;
+        let launch = state.agent_mcp.launch(conversation_id).await.unwrap();
         let server = launch
             .servers
             .iter()
@@ -787,11 +872,10 @@ mod tests {
             let _ = super::super::bridge::proxy(&url, &token, bridge_read, bridge_write).await;
         });
         let (read, write) = tokio::io::split(client_side);
-        let client = rmcp::model::ClientInfo::default()
+        rmcp::model::ClientInfo::default()
             .serve((read, write))
             .await
-            .unwrap();
-        (root, state, manifest.id, client)
+            .unwrap()
     }
 
     async fn call(
@@ -831,7 +915,7 @@ mod tests {
             device.to_owned(),
             format!("{device} Mac"),
             "darwin".to_owned(),
-            vec![CAPABILITY_BROWSER.to_owned()],
+            vec![CAPABILITY_BROWSER.to_owned(), CAPABILITY_SCREEN.to_owned()],
             tx,
         );
         let executor_id = registration.executor_id();
@@ -839,11 +923,15 @@ mod tests {
         let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
+                if frame["type"] == "executor.release" {
+                    let _ = seen_tx.send(frame);
+                    continue;
+                }
                 if frame["type"] != "executor.invoke" {
                     continue;
                 }
                 let payload = frame["payload"].clone();
-                let _ = seen_tx.send(payload.clone());
+                let _ = seen_tx.send(frame.clone());
                 let reply = match payload["tool"].as_str().unwrap() {
                     "browser_open" => {
                         json!({ "ok": true, "result": { "url": payload["args"]["url"], "title": "Dev" } })
@@ -861,6 +949,31 @@ mod tests {
                             "ok": false, "error": { "code": "SENSITIVE_ACTION", "message": "typing into a password field" }
                         })
                     }
+                    "computer_observe" => json!({ "ok": true, "result": {
+                        "app": { "name": "TextEdit", "bundleId": "com.apple.TextEdit", "pid": 7 },
+                        "windows": [], "displays": [],
+                        "tree": "- textArea \"Body\" [ref=e1]\n- secureTextField \"Password\" [ref=e2]", "truncated": false,
+                        "screenshot": { "mimeType": "image/jpeg", "data": BASE64.encode(b"screen"), "width": 1, "height": 1, "originX": 0, "originY": 0, "pointsPerPixel": 1 }
+                    } }),
+                    "computer_act"
+                        if !payload["args"]["allowedApps"]
+                            .as_array()
+                            .is_some_and(|apps| {
+                                apps.iter().any(|app| app == "com.apple.TextEdit")
+                            }) =>
+                    {
+                        json!({ "ok": false, "error": { "code": "APP_CONFIRM", "message": "first action in TextEdit",
+                            "detail": { "bundleId": "com.apple.TextEdit", "name": "TextEdit" } } })
+                    }
+                    "computer_act"
+                        if payload["args"]["ref"] == "e2"
+                            && payload["args"]["confirmed"] != true =>
+                    {
+                        json!({ "ok": false, "error": { "code": "SENSITIVE_ACTION", "message": "typing into a password field" } })
+                    }
+                    "computer_act" => json!({ "ok": true, "result": {
+                        "app": { "name": "TextEdit", "bundleId": "com.apple.TextEdit", "pid": 7 }, "path": "background"
+                    } }),
                     _ => {
                         json!({ "ok": true, "result": { "url": "http://localhost:5173/", "title": "Dev" } })
                     }
@@ -967,7 +1080,7 @@ mod tests {
         let opened = open.await.unwrap();
         assert_ne!(opened.is_error, Some(true), "{}", text(&opened));
         assert!(text(&opened).contains("http://localhost:5173/"));
-        let invoke = seen.recv().await.unwrap();
+        let invoke = seen.recv().await.unwrap()["payload"].clone();
         assert_eq!(invoke["tool"], "browser_open");
         assert!(invoke["workspace"]["path"]
             .as_str()
@@ -1012,8 +1125,14 @@ mod tests {
         let typed = typed.await.unwrap();
         assert_ne!(typed.is_error, Some(true), "{}", text(&typed));
         seen.recv().await.unwrap(); // snapshot
-        assert_eq!(seen.recv().await.unwrap()["args"]["confirmed"], Value::Null);
-        assert_eq!(seen.recv().await.unwrap()["args"]["confirmed"], true);
+        assert_eq!(
+            seen.recv().await.unwrap()["payload"]["args"]["confirmed"],
+            Value::Null
+        );
+        assert_eq!(
+            seen.recv().await.unwrap()["payload"]["args"]["confirmed"],
+            true
+        );
 
         let events = state
             .conversations
@@ -1052,6 +1171,223 @@ mod tests {
         let off = call(&client, "browser_snapshot", json!({})).await;
         assert!(text(&off).contains("turned off"));
         let _ = client.cancel().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn computer_use_needs_its_switch_grant_lease_and_app_approval() {
+        let (root, state, conversation_id, client) = harness().await;
+        let names = |tools: Vec<rmcp::model::Tool>| {
+            tools
+                .into_iter()
+                .map(|tool| tool.name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(!names(client.list_tools(None).await.unwrap().tools)
+            .iter()
+            .any(|name| name.starts_with("computer_")));
+        let off = call(&client, "computer_observe", json!({})).await;
+        assert!(
+            text(&off).contains("Computer Use is turned off"),
+            "{}",
+            text(&off)
+        );
+
+        state
+            .agent_desktop
+            .update_settings(None, Some(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            names(client.list_tools(None).await.unwrap().tools)
+                .iter()
+                .filter(|name| name.starts_with("computer_"))
+                .count(),
+            3
+        );
+        let (_executor, mut seen) = fake_executor(&state, "dev_mac");
+
+        // First use: a separate grant only the Mac can answer.
+        let observe = {
+            let client = client.clone();
+            tokio::spawn(async move { call(&client, "computer_observe", json!({})).await })
+        };
+        let grant =
+            pending_permission(&state, &conversation_id, desktop_computer::GRANT_KIND).await;
+        assert_eq!(grant["allowedDeviceIds"], json!(["dev_mac"]));
+        let grant_id = grant["permissionId"].as_str().unwrap();
+        assert!(state
+            .conversations
+            .resolve_permission_owned(
+                "local",
+                "dev_phone",
+                &conversation_id,
+                grant_id,
+                allow("allow", PermissionOutcome::AllowAlways)
+            )
+            .await
+            .is_err());
+        state
+            .conversations
+            .resolve_permission_owned(
+                "local",
+                "dev_mac",
+                &conversation_id,
+                grant_id,
+                allow("allow", PermissionOutcome::AllowAlways),
+            )
+            .await
+            .unwrap();
+        let observed = observe.await.unwrap();
+        assert!(
+            text(&observed).contains("App: TextEdit"),
+            "{}",
+            text(&observed)
+        );
+        assert!(observed
+            .content
+            .iter()
+            .any(|block| block.as_image().is_some()));
+        // The browser grant is separate and still absent.
+        assert!(state.agent_desktop.grant(&conversation_id).is_none());
+
+        // Another conversation cannot take the screen while it is in use.
+        let other = state
+            .conversations
+            .create_for_tests(
+                ProviderKind::Codex,
+                std::fs::canonicalize(root.join("workspaces/project")).unwrap(),
+            )
+            .await
+            .unwrap();
+        state.agent_desktop.set_computer_grant(
+            &other.id,
+            Grant {
+                device_id: "dev_mac".into(),
+                device_name: "dev_mac Mac".into(),
+            },
+        );
+        let other_client = client_for(&state, &other.id).await;
+        let busy = call(&other_client, "computer_observe", json!({})).await;
+        assert!(text(&busy).contains("SCREEN_BUSY"), "{}", text(&busy));
+
+        // The first action in an app asks once (any device), then not again.
+        let click = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                call(
+                    &client,
+                    "computer_act",
+                    json!({ "action": "click", "ref": "e1" }),
+                )
+                .await
+            })
+        };
+        let app = pending_permission(&state, &conversation_id, "desktop_computer_app").await;
+        assert_eq!(app["details"]["bundleId"], "com.apple.TextEdit");
+        state
+            .conversations
+            .resolve_permission_owned(
+                "local",
+                "dev_phone",
+                &conversation_id,
+                app["permissionId"].as_str().unwrap(),
+                allow("allow", PermissionOutcome::AllowAlways),
+            )
+            .await
+            .unwrap();
+        let clicked = click.await.unwrap();
+        assert_ne!(clicked.is_error, Some(true), "{}", text(&clicked));
+        assert_eq!(
+            state.agent_desktop.approved_apps(&conversation_id),
+            vec!["com.apple.TextEdit".to_owned()]
+        );
+        let again = call(
+            &client,
+            "computer_act",
+            json!({ "action": "click", "ref": "e1" }),
+        )
+        .await;
+        assert_ne!(again.is_error, Some(true), "{}", text(&again));
+
+        // A password field asks every time, then retries confirmed.
+        let typed = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                call(
+                    &client,
+                    "computer_act",
+                    json!({ "action": "type", "ref": "e2", "text": "hunter2" }),
+                )
+                .await
+            })
+        };
+        let sensitive =
+            pending_permission(&state, &conversation_id, "desktop_computer_action").await;
+        state
+            .conversations
+            .resolve_permission_owned(
+                "local",
+                "dev_phone",
+                &conversation_id,
+                sensitive["permissionId"].as_str().unwrap(),
+                allow("allow", PermissionOutcome::AllowOnce),
+            )
+            .await
+            .unwrap();
+        assert_ne!(typed.await.unwrap().is_error, Some(true));
+
+        // Done releases the screen: the Mac hears about it, the other
+        // conversation may now take it.
+        let done = call(&client, "computer_done", json!({})).await;
+        assert!(text(&done).contains("returned"));
+        let mut released = false;
+        while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(2), seen.recv()).await
+        {
+            if frame["type"] == "executor.release" && frame["payload"]["capability"] == "screen" {
+                released = true;
+                break;
+            }
+        }
+        assert!(released);
+        let now_free = call(&other_client, "computer_observe", json!({})).await;
+        assert!(
+            text(&now_free).contains("App: TextEdit"),
+            "{}",
+            text(&now_free)
+        );
+
+        let events = state
+            .conversations
+            .history_for_tests(&conversation_id)
+            .await;
+        let sessions: Vec<&str> = events
+            .iter()
+            .filter(|event| event.event_type == "desktop.computer.session")
+            .map(|event| event.payload["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(sessions, ["started", "ended"]);
+        let actions: Vec<&Value> = events
+            .iter()
+            .filter(|event| event.event_type == "desktop.computer.action")
+            .map(|event| &event.payload)
+            .collect();
+        assert_eq!(actions.len(), 4);
+        assert!(actions[0]["shotId"].is_string());
+        assert_eq!(actions[1]["path"], "background");
+        assert!(!events
+            .iter()
+            .any(|event| event.payload.to_string().contains("hunter2")));
+
+        // Turning Computer Use off ends the other conversation's session.
+        let (_, ended) = state
+            .agent_desktop
+            .update_settings(None, Some(false))
+            .await
+            .unwrap();
+        assert_eq!(ended, vec![other.id.clone()]);
+        let _ = client.cancel().await;
+        let _ = other_client.cancel().await;
         let _ = std::fs::remove_dir_all(root);
     }
 

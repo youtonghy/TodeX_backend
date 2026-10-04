@@ -26,7 +26,9 @@ use uuid::Uuid;
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Capability names an executor may announce.
 pub(crate) const CAPABILITY_BROWSER: &str = "browser";
-const KNOWN_CAPABILITIES: &[&str] = &[CAPABILITY_BROWSER];
+/// Computer Use: the desktop's screen, pointer and keyboard.
+pub(crate) const CAPABILITY_SCREEN: &str = "screen";
+const KNOWN_CAPABILITIES: &[&str] = &[CAPABILITY_BROWSER, CAPABILITY_SCREEN];
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -68,9 +70,14 @@ pub(crate) enum ExecutorError {
     Cancelled,
     #[error("the desktop executor is not reading its connection")]
     Stalled,
-    /// Reported by the executor itself.
+    /// Reported by the executor itself; `detail` is structured context
+    /// (e.g. the app awaiting approval).
     #[error("{message}")]
-    Failed { code: String, message: String },
+    Failed {
+        code: String,
+        message: String,
+        detail: Option<Value>,
+    },
 }
 
 impl ExecutorError {
@@ -180,6 +187,20 @@ impl Executors {
         }
     }
 
+    /// Every online executor, newest first.
+    pub(crate) fn all(&self) -> Vec<ExecutorInfo> {
+        let mut online: Vec<ExecutorInfo> = self
+            .inner
+            .executors
+            .lock()
+            .expect("executor lock")
+            .values()
+            .map(|executor| executor.info.clone())
+            .collect();
+        online.sort_by_key(|executor| std::cmp::Reverse(executor.executor_id));
+        online
+    }
+
     /// Online executors offering `capability`, newest first.
     pub(crate) fn online(&self, capability: &str) -> Vec<ExecutorInfo> {
         let mut online: Vec<ExecutorInfo> = self
@@ -274,7 +295,13 @@ impl Executors {
 
     /// Tells an executor that a conversation no longer has access, so it
     /// can close what it opened for it.
-    pub(crate) fn release(&self, executor_id: u64, conversation_id: &str) {
+    /// `capability`: only that part (tab or screen control); `None`: all.
+    pub(crate) fn release(
+        &self,
+        executor_id: u64,
+        conversation_id: &str,
+        capability: Option<&str>,
+    ) {
         let outgoing = self
             .inner
             .executors
@@ -283,10 +310,11 @@ impl Executors {
             .get(&executor_id)
             .map(|executor| executor.outgoing.clone());
         if let Some(outgoing) = outgoing {
-            let frame = json!({
-                "type": "executor.release",
-                "payload": { "conversationId": conversation_id },
-            });
+            let mut payload = json!({ "conversationId": conversation_id });
+            if let Some(capability) = capability {
+                payload["capability"] = Value::from(capability);
+            }
+            let frame = json!({ "type": "executor.release", "payload": payload });
             if outgoing.try_send(frame).is_err() {
                 tracing::warn!(
                     executor_id,
@@ -317,6 +345,10 @@ impl Executors {
                     .chars()
                     .take(4096)
                     .collect(),
+                detail: payload["error"]
+                    .get("detail")
+                    .filter(|detail| detail.is_object())
+                    .cloned(),
             }),
             None => return Err("executor.result needs ok".to_owned()),
         };
@@ -521,6 +553,7 @@ mod tests {
             validate_capabilities(&["browser".into(), "browser".into()]).unwrap(),
             vec!["browser".to_owned()]
         );
-        assert!(validate_capabilities(&["screen".into()]).is_err());
+        assert!(validate_capabilities(&["screen".into()]).is_ok());
+        assert!(validate_capabilities(&["camera".into()]).is_err());
     }
 }
