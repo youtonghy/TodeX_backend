@@ -574,6 +574,12 @@ impl DesktopTools {
         let screenshot = result
             .as_object_mut()
             .and_then(|object| object.remove("screenshot"));
+        // The text still states the screenshot size (computer_act's x/y
+        // are its pixels); only the image data leaves the result.
+        if let Some(screenshot) = &screenshot {
+            result["screenshot"] =
+                json!({ "width": screenshot["width"], "height": screenshot["height"] });
+        }
         let mut content = Vec::new();
         let text = if tool == "computer_observe" {
             desktop_computer::observation_text(&result)
