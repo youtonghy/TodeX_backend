@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use super::{
     desktop_computer,
-    server::{guard, schema, tool_error, Caller},
+    server::{guard, schema, tool_error, tool_list, Caller},
     AgentMcp, DESKTOP_ROUTE, DESKTOP_SERVER,
 };
 use crate::{
@@ -413,7 +413,7 @@ impl ServerHandler for DesktopTools {
         if self.mcp.desktop().computer_enabled().await {
             all.extend(desktop_computer::tools());
         }
-        Ok(ListToolsResult::with_all_items(all))
+        Ok(tool_list(all))
     }
 
     async fn call_tool(
@@ -1026,6 +1026,9 @@ mod tests {
         let (root, state, conversation_id, client) = harness().await;
         let tools = client.list_tools(None).await.unwrap();
         assert_eq!(tools.tools.len(), 5);
+        // MCP 2026-07-28 clients reject a list without its cache hints.
+        assert_eq!(tools.ttl_ms, Some(0));
+        assert_eq!(tools.cache_scope, Some(rmcp::model::CacheScope::Private));
 
         // No desktop online: an immediate, explanatory error.
         let offline = call(

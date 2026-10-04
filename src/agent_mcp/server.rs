@@ -20,9 +20,9 @@ use axum::{
 use dashmap::DashMap;
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        InitializeResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities, Tool,
-        ToolAnnotations,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        Implementation, InitializeResult, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, Tool, ToolAnnotations,
     },
     service::RequestContext,
     transport::{
@@ -206,7 +206,7 @@ impl ServerHandler for SshTools {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools()))
+        Ok(tool_list(tools()))
     }
 
     async fn call_tool(
@@ -653,6 +653,15 @@ fn failure_hint(failure: SshFailureKind) -> Option<&'static str> {
     }
 }
 
+/// A complete `tools/list` result. MCP 2026-07-28 requires the cache hints
+/// (clients reject the list without them); lists are never cached because
+/// they follow settings and belong to one conversation's token.
+pub(super) fn tool_list(tools: Vec<Tool>) -> ListToolsResult {
+    ListToolsResult::with_all_items(tools)
+        .with_ttl_ms(0)
+        .with_cache_scope(CacheScope::Private)
+}
+
 pub(super) fn tool_error(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
@@ -946,8 +955,11 @@ exit 3
         let harness = harness().await;
         let client = bridged_client(&harness).await;
 
-        let tools = client.list_tools(None).await.unwrap().tools;
-        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        let listed = client.list_tools(None).await.unwrap();
+        // MCP 2026-07-28 clients reject a list without its cache hints.
+        assert_eq!(listed.ttl_ms, Some(0));
+        assert_eq!(listed.cache_scope, Some(CacheScope::Private));
+        let names: Vec<_> = listed.tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert_eq!(names, ["ssh_list_hosts", "ssh_exec"]);
 
         let hosts = call(&client, "ssh_list_hosts", json!({})).await;
