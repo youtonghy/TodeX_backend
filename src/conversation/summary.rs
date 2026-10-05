@@ -21,7 +21,7 @@ const BLOCK_PHASES: [&str; 4] = ["started", "delta", "completed", "failed"];
 /// Canonical type prefixes that drive control state, permissions, auxiliary
 /// panels or visible output. `provider.event` is the generic provider wrapper
 /// and is judged by its payload instead of this list.
-const PROTECTED_TYPE_PREFIXES: [&str; 15] = [
+const PROTECTED_TYPE_PREFIXES: [&str; 16] = [
     "turn.",
     "permission.",
     "queue.",
@@ -37,6 +37,9 @@ const PROTECTED_TYPE_PREFIXES: [&str; 15] = [
     "mcp.",
     "skill.",
     "kanban.",
+    // Agent desktop journal (browser / Computer Use actions, grants,
+    // sessions): small, image-free, and the source of the live panels.
+    "desktop.",
 ];
 const PROTECTED_TYPES: [&str; 1] = ["tool.awaitingApproval"];
 
@@ -463,6 +466,8 @@ mod tests {
             "provider.runtime",
             "provider.commands.updated",
             "conversation.interrupted",
+            "desktop.computer.action",
+            "desktop.browser.action",
         ] {
             let payload = json!({"toolCall": {"id": "c1"}, "thinking": "x"});
             assert_eq!(
