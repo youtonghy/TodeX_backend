@@ -1,10 +1,13 @@
-//! Linux (X11 sessions; KDE Plasma is the tested desktop): AT-SPI over the
-//! session bus, EWMH window lookups and activation through x11rb, and
-//! `.desktop` files for installed apps. Wayland sessions are reported as
-//! unsupported for now.
+//! Linux (KDE Plasma is the tested desktop): AT-SPI over the session bus
+//! and `.desktop` files for installed apps everywhere; on X11, EWMH window
+//! lookups and activation through x11rb; on KDE Plasma 6.6+ Wayland, KWin
+//! and the portals through [`super::kde_wayland`]. Other Wayland desktops
+//! are reported as unsupported.
 //!
-//! Coordinates follow xa11y-linux: X pixels divided by its integer
-//! `Xft.dpi` scale (1 unless the session uses integer HiDPI scaling).
+//! Coordinates follow xa11y-linux: on X11, X pixels divided by its integer
+//! `Xft.dpi` scale (1 unless the session uses integer HiDPI scaling); on
+//! Wayland, logical pixels, with each window's AT-SPI subtree moved from
+//! surface-local to global coordinates by [`window_offsets`].
 //!
 //! An app's identity is its executable's file name (`dolphin`,
 //! `keepassxc`), read from `/proc`, never from inherited launch hints:
@@ -35,16 +38,18 @@ use x11rb::{
     },
     rust_connection::RustConnection,
 };
-use xa11y::ElementData;
+use xa11y::{ElementData, InputProvider, ScreenshotProvider};
 use zbus::{
     blocking::{Connection as Bus, Proxy},
     proxy::CacheProperties,
 };
 
 use super::{
+    kde_desktop::{match_window, offset_rect, version_problem, window_at, window_offset},
+    kde_wayland,
     linux_desktop::{
         desktop_id, exe_name, names_app, parse_desktop_entry, parse_xft_dpi, scale_from_dpi,
-        session_problem, DesktopEntry,
+        session_kind, session_problem, DesktopEntry, Session,
     },
     Display, Permissions, Typed,
 };
@@ -60,33 +65,93 @@ const SOURCE_PAGER: u32 = 2;
 
 pub(crate) fn adopt_own_permission_identity() {}
 
-/// Why Computer Use cannot run here: Wayland sessions and processes
-/// without an X display.
-pub(crate) fn unsupported_reason() -> Option<String> {
-    session_problem(
+fn session() -> Session {
+    session_kind(
         std::env::var_os("WAYLAND_DISPLAY").is_some(),
         std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
         std::env::var_os("DISPLAY").is_some(),
+        std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
     )
 }
 
-/// X11 needs no screen-capture grant. Accessibility means the AT-SPI bus
-/// is up and enabled: Qt, Chromium and Electron apps only publish their
-/// trees while `org.a11y.Status.IsEnabled` is true.
+/// Whether this is a KDE Plasma Wayland session (any version).
+fn kde_wayland_session() -> bool {
+    session() == Session::KdeWayland
+}
+
+/// Why Computer Use cannot run here: Wayland desktops other than KDE
+/// Plasma 6.6 or later, and processes without a display.
+pub(crate) fn unsupported_reason() -> Option<String> {
+    let session = session();
+    if let Some(problem) = session_problem(session) {
+        return Some(problem);
+    }
+    if session != Session::KdeWayland {
+        return None;
+    }
+    match kde_wayland::plasma_version() {
+        Ok(version) => version_problem(version),
+        Err(error) => Some(format!(
+            "Computer Use could not read the KDE Plasma version from KWin ({error}). It needs \
+             KDE Plasma 6.6 or later; start the TodeX backend inside the Plasma session."
+        )),
+    }
+}
+
+/// Accessibility means the AT-SPI bus is up and enabled: Qt, Chromium and
+/// Electron apps only publish their trees while `org.a11y.Status.IsEnabled`
+/// is true. X11 needs no screen-capture grant; KDE Wayland needs KWin's
+/// screenshot authorization or the Screenshot portal.
 pub(crate) fn permissions() -> Permissions {
+    if kde_wayland_session() {
+        // Idle notifications need two seconds before the first answer.
+        kde_wayland::start_idle_watch();
+        return Permissions {
+            screen: kde_wayland::screen_capture_available(),
+            accessibility: accessibility_enabled(),
+        };
+    }
     Permissions {
         screen: true,
         accessibility: accessibility_enabled(),
     }
 }
 
+/// What the settings screen should tell the user is missing.
+pub(crate) fn missing_permissions_reason(permissions: Permissions) -> String {
+    let mut missing = Vec::new();
+    if !permissions.accessibility {
+        missing.push(
+            "accessibility (AT-SPI) is off for this session; Request access in TodeX Settings → \
+             Computer Use turns it on (Chromium and Electron apps may need a restart)",
+        );
+    }
+    if !permissions.screen {
+        missing.push(
+            "screen capture is unavailable: neither KWin's screenshot authorization for the \
+             TodeX backend nor the Screenshot portal (xdg-desktop-portal-kde) is present; \
+             Request access installs the authorization",
+        );
+    }
+    format!("Computer Use needs: {}.", missing.join("; "))
+}
+
 /// Turns AT-SPI on for the session (as a screen reader would). Running Qt
 /// apps follow the switch; Chromium and Electron apps may need a restart.
+/// On KDE Wayland also installs the screenshot authorization and asks for
+/// remote control of the pointer and keyboard (KDE's consent dialog), so
+/// later sessions start without prompts.
 pub(crate) fn request_permissions() -> Permissions {
     if let Some(proxy) = a11y_status_proxy() {
         if let Err(error) = proxy.set_property("IsEnabled", true) {
             eprintln!("todex-agentd: could not enable AT-SPI: {error}");
         }
+    }
+    if kde_wayland_session() {
+        if let Err(error) = kde_wayland::ensure_identity() {
+            eprintln!("todex-agentd: could not install the KDE screenshot authorization: {error}");
+        }
+        kde_wayland::begin_remote_session();
     }
     permissions()
 }
@@ -142,9 +207,13 @@ pub(crate) fn plain_proxy(
         .ok()
 }
 
-/// Seconds since the last X input (the screensaver extension's counter),
-/// excluding input Computer Use injected itself (XTest counts there).
+/// Seconds since the last X input (the screensaver extension's counter;
+/// on KDE Wayland, `ext-idle-notify-v1`), excluding input Computer Use
+/// injected itself (XTest and the RemoteDesktop portal count there).
 pub(crate) fn idle_seconds() -> f64 {
+    if kde_wayland_session() {
+        return super::injected::user_idle(kde_wayland::idle_seconds());
+    }
     let raw = with_x11(|conn, root| {
         Ok(f64::from(
             conn.screensaver_query_info(root)?
@@ -172,10 +241,7 @@ pub(crate) fn app_identity(pid: u32) -> Target {
 /// A running app with a window, by executable, desktop id or name.
 pub(crate) fn running_app(identifier: &str) -> Option<Target> {
     let mut seen = Vec::new();
-    for window in client_windows_top_down().unwrap_or_default() {
-        let Some(pid) = window_pid(window) else {
-            continue;
-        };
+    for pid in window_pids_top_down() {
         if seen.contains(&pid) {
             continue;
         }
@@ -224,8 +290,35 @@ pub(crate) fn open_app(identifier: &str) -> Result<(), String> {
     }
 }
 
+/// Processes owning windows, top-most window first.
+fn window_pids_top_down() -> Vec<u32> {
+    if kde_wayland_session() {
+        return match kde_wayland::snapshot() {
+            Ok(snapshot) => snapshot
+                .windows
+                .iter()
+                .rev()
+                .map(|window| window.pid)
+                .filter(|pid| *pid != 0)
+                .collect(),
+            Err(error) => {
+                eprintln!("todex-agentd: cannot list KWin windows: {error}");
+                Vec::new()
+            }
+        };
+    }
+    client_windows_top_down()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(window_pid)
+        .collect()
+}
+
 /// Raises and focuses `pid`'s top-most window through the window manager.
 pub(crate) fn activate(pid: u32) -> Result<(), String> {
+    if kde_wayland_session() {
+        return kde_wayland::activate(pid);
+    }
     let window = client_windows_top_down()
         .map_err(|error| format!("cannot list windows: {error}"))?
         .into_iter()
@@ -259,6 +352,14 @@ pub(crate) fn activate(pid: u32) -> Result<(), String> {
 /// The process owning the top-most visible window (frame included) at a
 /// point.
 pub(crate) fn app_at(x: f64, y: f64) -> Option<u32> {
+    if kde_wayland_session() {
+        let snapshot = kde_wayland::snapshot()
+            .map_err(|error| eprintln!("todex-agentd: cannot list KWin windows: {error}"))
+            .ok()?;
+        return window_at(&snapshot, x, y)
+            .map(|window| window.pid)
+            .filter(|pid| *pid != 0);
+    }
     let scale = coordinate_scale();
     let (px, py) = ((x * scale).round() as i32, (y * scale).round() as i32);
     for window in client_windows_top_down().ok()? {
@@ -273,8 +374,12 @@ pub(crate) fn app_at(x: f64, y: f64) -> Option<u32> {
     None
 }
 
-/// RandR monitors (else the whole root window), the primary first.
+/// RandR monitors (else the whole root window), the primary first; KWin's
+/// outputs on Wayland.
 pub(crate) fn displays() -> Vec<Display> {
+    if kde_wayland_session() {
+        return kde_wayland::displays();
+    }
     let scale = coordinate_scale();
     let monitors = with_x11(|conn, root| {
         let mut monitors: Vec<(bool, i32, i32, u32, u32)> = conn
@@ -336,6 +441,82 @@ pub(crate) fn type_into_focused(_pid: u32, _text: &str, _confirmed: bool) -> Typ
 /// activates the app and uses XTest.
 pub(crate) fn post_chord(_pid: u32, _chord: &Chord) -> Result<bool, String> {
     Ok(false)
+}
+
+// ---- Wayland hooks -----------------------------------------------------------
+
+/// Offsets that move each AT-SPI top-level window's subtree into global
+/// coordinates (see [`window_offset`]); zeros on X11, where AT-SPI already
+/// reports global coordinates.
+pub(crate) fn window_offsets(windows: &[ElementData]) -> Vec<(i32, i32)> {
+    if !kde_wayland_session() || windows.is_empty() {
+        return vec![(0, 0); windows.len()];
+    }
+    let snapshot = match kde_wayland::snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("todex-agentd: cannot place windows on screen: {error}");
+            return vec![(0, 0); windows.len()];
+        }
+    };
+    windows
+        .iter()
+        .map(|window| {
+            let matched = window.pid.and_then(|pid| {
+                match_window(
+                    &snapshot.windows,
+                    pid,
+                    window.name.as_deref(),
+                    window.bounds,
+                )
+            });
+            window_offset(matched, window.bounds)
+        })
+        .collect()
+}
+
+/// Moves an element's bounds by a window offset.
+pub(crate) fn globalize(element: &mut ElementData, offset: (i32, i32)) {
+    if offset != (0, 0) {
+        element.bounds = element.bounds.map(|bounds| offset_rect(bounds, offset));
+    }
+}
+
+/// KDE Wayland input; `None` on X11, where xa11y's XTest input serves.
+pub(crate) fn wayland_input() -> Option<std::sync::Arc<dyn InputProvider>> {
+    kde_wayland_session().then(|| std::sync::Arc::new(kde_wayland::KdeInput) as _)
+}
+
+/// KDE Wayland screenshots; `None` on X11.
+pub(crate) fn wayland_screenshots() -> Option<std::sync::Arc<dyn ScreenshotProvider>> {
+    kde_wayland_session().then(|| std::sync::Arc::new(kde_wayland::KdeScreenshot) as _)
+}
+
+/// A Computer Use session started: on KDE Wayland, open the remote
+/// control session now, so KDE's consent dialog (first time only) appears
+/// while the person who granted access is still at the computer.
+pub(crate) fn begin_session() {
+    if kde_wayland_session() {
+        kde_wayland::begin_remote_session();
+    }
+}
+
+/// A Computer Use session ended: give the pointer and keyboard back.
+pub(crate) fn end_session() {
+    if kde_wayland_session() {
+        kde_wayland::end_remote_session();
+    }
+}
+
+/// Pastes text that keystrokes cannot type into `pid`'s focused field (KDE
+/// Wayland before Plasma 6.8; see [`kde_wayland::paste_text`]). The caller
+/// guarantees the field is not a password field.
+pub(crate) fn paste_text(pid: u32, text: &str) -> Result<bool, String> {
+    if !kde_wayland_session() {
+        return Ok(false);
+    }
+    let exe = process_exe(pid).unwrap_or_default();
+    kde_wayland::paste_text(pid, &exe, text)
 }
 
 // ---- X11 ----------------------------------------------------------------

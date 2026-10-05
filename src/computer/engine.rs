@@ -31,7 +31,11 @@ struct WindowEntry {
     id: u64,
     app: Target,
     title: String,
+    /// Bounds in global coordinates.
     element: ElementData,
+    /// What moves its subtree's AT-SPI bounds into global coordinates
+    /// (KDE Wayland; zero elsewhere).
+    offset: (i32, i32),
 }
 
 #[derive(Default)]
@@ -129,8 +133,9 @@ impl Engine {
                 .app_by_pid(app.pid)
                 .map_err(ComputerError::platform)?,
         };
+        let offset = window_index.map_or((0, 0), |index| self.windows[index].offset);
         let mut budget = MAX_NODES;
-        let node = self.read_tree(&provider, root.clone(), 0, &mut budget);
+        let node = self.read_tree(&provider, root.clone(), 0, offset, &mut budget);
         let formatted = tree::format(&node);
         self.refs = formatted.refs;
 
@@ -208,19 +213,34 @@ impl Engine {
                     app: identity.clone(),
                     title: window.name.clone().unwrap_or_default(),
                     element: window,
+                    offset: (0, 0),
                 });
             }
+        }
+        let elements: Vec<ElementData> = windows
+            .iter()
+            .map(|window| window.element.clone())
+            .collect();
+        for (window, offset) in windows.iter_mut().zip(platform::window_offsets(&elements)) {
+            window.offset = offset;
+            platform::globalize(&mut window.element, offset);
         }
         self.windows = windows;
     }
 
+    /// Reads a subtree; `offset` moves descendants' bounds into global
+    /// coordinates (the root's are already).
     fn read_tree(
         &mut self,
         provider: &Arc<dyn Provider>,
-        element: ElementData,
+        mut element: ElementData,
         depth: usize,
+        offset: (i32, i32),
         budget: &mut usize,
     ) -> tree::Node {
+        if depth > 0 {
+            platform::globalize(&mut element, offset);
+        }
         *budget = budget.saturating_sub(1);
         let handle = self.elements.len();
         let mut node = tree::Node {
@@ -241,7 +261,7 @@ impl Engine {
                 if *budget == 0 {
                     break;
                 }
-                let child = self.read_tree(provider, child, depth + 1, budget);
+                let child = self.read_tree(provider, child, depth + 1, offset, budget);
                 node.children.push(child);
             }
         }
@@ -633,9 +653,17 @@ impl Engine {
             if (platform::is_secure(element) || is_secure_role(element)) && !confirmed {
                 return Err(sensitive());
             }
-            let _ = provider.focus(element);
+            let focused = provider.focus(element).is_ok();
             if provider.type_text(element, text).is_ok() {
                 return Ok("background");
+            }
+            // A focused field known not to be a password field: the
+            // platform may paste text its keystrokes cannot type.
+            let secure = platform::is_secure(element) || is_secure_role(element);
+            if let (true, false, Some(pid)) = (focused, secure, element.pid) {
+                if platform::paste_text(pid, text).map_err(ComputerError::platform)? {
+                    return Ok("keyboard");
+                }
             }
         }
         let pid = match (
@@ -804,12 +832,22 @@ fn native_input() -> xa11y::Result<InputSim> {
 fn native_provider() -> xa11y::Result<Arc<dyn Provider>> {
     Ok(Arc::new(xa11y_linux::LinuxProvider::new()?))
 }
+/// KDE Wayland captures through KWin (xa11y would use the portal for the
+/// whole screen); X11 through xa11y.
 #[cfg(target_os = "linux")]
 fn native_screenshots() -> xa11y::Result<Arc<dyn ScreenshotProvider>> {
+    if let Some(screenshots) = platform::wayland_screenshots() {
+        return Ok(screenshots);
+    }
     Ok(Arc::new(xa11y_linux::LinuxScreenshot::new()?))
 }
+/// KDE Wayland input goes through the RemoteDesktop portal (xa11y would
+/// need `/dev/uinput`); X11 through XTest.
 #[cfg(target_os = "linux")]
 fn native_input() -> xa11y::Result<InputSim> {
+    if let Some(input) = platform::wayland_input() {
+        return Ok(InputSim::new(input));
+    }
     Ok(InputSim::new(Arc::new(
         xa11y_linux::LinuxInputProvider::new()?,
     )))

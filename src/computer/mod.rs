@@ -163,7 +163,7 @@ impl ComputerHost for NativeComputer {
         };
         let reason = unsupported.clone().or_else(|| {
             if !permissions.all() {
-                Some("Screen Recording and Accessibility must be granted to the TodeX backend on this computer.".to_owned())
+                Some(platform::missing_permissions_reason(permissions))
             } else if !host_ui::available() {
                 Some("Run the TodeX backend as a service or with `todex-agentd serve` on this computer's desktop session.".to_owned())
             } else {
@@ -224,9 +224,13 @@ impl ComputerHost for NativeComputer {
 
     fn session(&self, summary: Option<&str>) {
         match summary {
-            Some(summary) => host_ui::show_status(summary),
+            Some(summary) => {
+                host_ui::show_status(summary);
+                platform::begin_session();
+            }
             None => {
                 host_ui::hide_status();
+                platform::end_session();
                 // The next conversation starts from a fresh observation.
                 if let Ok(mut engine) = self.engine.try_lock() {
                     engine.reset();

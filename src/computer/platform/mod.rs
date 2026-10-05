@@ -14,6 +14,8 @@ mod windows;
 pub(crate) use self::windows::*;
 
 #[cfg(target_os = "linux")]
+mod kde_wayland;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::*;
@@ -26,11 +28,47 @@ pub(crate) use other::*;
 // Pure helpers of the Windows and Linux layers, built on every host for
 // their unit tests.
 #[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod kde_desktop;
+#[cfg(any(target_os = "linux", test))]
 mod linux_desktop;
 #[cfg(any(target_os = "windows", test))]
 mod windows_names;
 
 use serde::Serialize;
+
+// Hooks only the Linux layer needs (KDE Wayland); no-ops elsewhere.
+
+/// Offsets that move AT-SPI top-level windows' subtrees into global
+/// coordinates; elsewhere bounds are global already.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn window_offsets(windows: &[xa11y::ElementData]) -> Vec<(i32, i32)> {
+    vec![(0, 0); windows.len()]
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn globalize(_element: &mut xa11y::ElementData, _offset: (i32, i32)) {}
+
+/// A Computer Use session started.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn begin_session() {}
+
+/// A Computer Use session ended.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn end_session() {}
+
+/// Pastes text keystrokes cannot type; `Ok(false)` to type instead.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn paste_text(_pid: u32, _text: &str) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// What the settings screen says when permissions are missing.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn missing_permissions_reason(_permissions: Permissions) -> String {
+    "Screen Recording and Accessibility must be granted to the TodeX backend on this computer."
+        .to_owned()
+}
 
 /// OS permissions Computer Use needs on this host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]

@@ -1,31 +1,65 @@
-//! Pure parts of the Linux layer: session checks, `.desktop` entries, the
+//! Pure parts of the Linux layer: session classification, `.desktop` entries, the
 //! X11 HiDPI scale. Kept apart from `linux.rs` so they are unit-tested on
 //! every host.
 
-/// Why this Linux session cannot run Computer Use, from its environment.
-pub(super) fn session_problem(
+/// The kind of desktop session this process runs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Session {
+    X11,
+    /// KDE Plasma on Wayland (version checked separately).
+    KdeWayland,
+    /// Any other Wayland desktop.
+    OtherWayland,
+    /// Neither a Wayland nor an X11 display.
+    NoDisplay,
+}
+
+/// Classifies the session from its environment. A Wayland session wins
+/// over `DISPLAY`, which there only names XWayland.
+pub(super) fn session_kind(
     wayland_display: bool,
     session_type: Option<&str>,
     display: bool,
-) -> Option<String> {
+    current_desktop: Option<&str>,
+) -> Session {
     let wayland = wayland_display
         || session_type.is_some_and(|session| session.eq_ignore_ascii_case("wayland"));
     if wayland {
-        return Some(
-            "Computer Use on Linux needs an X11 session; Wayland support arrives in a later \
-             release. Log into the KDE Plasma (X11) session and restart the TodeX backend there."
-                .to_owned(),
-        );
+        let kde = current_desktop.is_some_and(|desktops| {
+            desktops
+                .split(':')
+                .any(|desktop| desktop.trim().eq_ignore_ascii_case("kde"))
+        });
+        return if kde {
+            Session::KdeWayland
+        } else {
+            Session::OtherWayland
+        };
     }
-    if !display {
-        return Some(
-            "The TodeX backend has no X11 display (DISPLAY is not set). Start it from your \
-             desktop session, or import DISPLAY into its service environment \
-             (`systemctl --user import-environment DISPLAY`)."
-                .to_owned(),
-        );
+    if display {
+        Session::X11
+    } else {
+        Session::NoDisplay
     }
-    None
+}
+
+/// Why a session cannot run Computer Use, apart from the Plasma version.
+pub(super) fn session_problem(session: Session) -> Option<String> {
+    match session {
+        Session::X11 | Session::KdeWayland => None,
+        Session::OtherWayland => Some(
+            "Computer Use does not support this Wayland desktop. Use KDE Plasma 6.6 or later, \
+             or log into an X11 session, and restart the TodeX backend there."
+                .to_owned(),
+        ),
+        Session::NoDisplay => Some(
+            "The TodeX backend has no display (neither WAYLAND_DISPLAY nor DISPLAY is set). \
+             Start it from your desktop session, or import the session variables into its \
+             service environment (`systemctl --user import-environment WAYLAND_DISPLAY \
+             DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE`)."
+                .to_owned(),
+        ),
+    }
 }
 
 /// An installed application from a `.desktop` file.
@@ -195,16 +229,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wayland_and_missing_displays_are_unsupported() {
-        assert!(session_problem(true, None, true)
+    fn sessions_classify_from_the_environment() {
+        assert_eq!(
+            session_kind(true, None, true, Some("KDE")),
+            Session::KdeWayland
+        );
+        assert_eq!(
+            session_kind(false, Some("Wayland"), false, Some("ubuntu:GNOME")),
+            Session::OtherWayland
+        );
+        assert_eq!(
+            session_kind(false, Some("x11"), true, Some("KDE")),
+            Session::X11
+        );
+        assert_eq!(session_kind(false, None, false, None), Session::NoDisplay);
+        assert!(session_problem(Session::OtherWayland)
             .unwrap()
-            .contains("Plasma (X11)"));
-        assert!(session_problem(false, Some("Wayland"), true).is_some());
-        assert!(session_problem(false, Some("x11"), false)
+            .contains("KDE Plasma 6.6"));
+        assert!(session_problem(Session::NoDisplay)
             .unwrap()
-            .contains("DISPLAY"));
-        assert_eq!(session_problem(false, Some("x11"), true), None);
-        assert_eq!(session_problem(false, None, true), None);
+            .contains("WAYLAND_DISPLAY"));
+        assert_eq!(session_problem(Session::X11), None);
+        assert_eq!(session_problem(Session::KdeWayland), None);
     }
 
     #[test]
