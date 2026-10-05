@@ -1,11 +1,9 @@
-//! Agent tools that run on a user's desktop rather than in the daemon.
+//! Agent desktop tools (the `todex_desktop` MCP server), run by the daemon
+//! on its own host; clients only watch and answer prompts.
 //!
-//! The daemon may be remote; the browser the agent drives belongs to a
-//! desktop client. Desktops register as executors on a dedicated `/v2/ws`
-//! connection ([`executors`]); the `todex_desktop` MCP server forwards each
-//! tool call to the desktop a conversation is bound to. A conversation is
-//! bound by its first grant, which only an online executor device may
-//! answer. Grants live in memory: a daemon restart asks again.
+//! The agent browser ([`crate::agent_browser`]) needs a per-conversation
+//! grant any paired device may give. Grants live in memory: a daemon
+//! restart asks again.
 //!
 //! Computer Use (`computer_*`) runs on the daemon's own host
 //! ([`crate::computer`]) behind its own switch and grant, which the person
@@ -13,14 +11,12 @@
 //! a time; the lease ends with `computer_done`, a stop, a revoke, or
 //! [`SCREEN_IDLE`].
 
-pub(crate) mod executors;
 mod shots;
-pub(crate) mod tunnel;
 
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -28,12 +24,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
+    agent_browser::AgentBrowser,
     computer::{Computer, ComputerError},
     error::AppError,
     secure_fs,
 };
 
-pub(crate) use executors::{ExecutorError, Executors, InvokeRequest, Registration};
 pub(crate) use shots::ShotStore;
 
 const SETTINGS_FILE: &str = "agent-desktop.json";
@@ -99,18 +95,13 @@ pub struct AgentDesktop {
 struct Inner {
     settings_path: PathBuf,
     settings: RwLock<DesktopSettings>,
-    executors: Executors,
+    browser: AgentBrowser,
     grants: Mutex<HashMap<String, Grant>>,
     computer_grants: Mutex<HashMap<String, Grant>>,
     /// The conversation controlling the host's screen.
     lease: Mutex<Option<Lease>>,
     /// Conversation → bundle ids the user let its agent control.
     approved_apps: Mutex<HashMap<String, HashSet<String>>>,
-    /// Conversation → loopback ports its agent opened; only these may be
-    /// tunnelled to its desktop.
-    ports: Mutex<HashMap<String, HashSet<u16>>>,
-    /// The daemon's own listener, never reachable through a tunnel.
-    daemon_port: OnceLock<u16>,
     shots: ShotStore,
     computer: std::sync::RwLock<Computer>,
     /// The latest live frame, shared by concurrent viewers.
@@ -136,13 +127,11 @@ impl AgentDesktop {
             inner: Arc::new(Inner {
                 settings_path,
                 settings: RwLock::new(settings),
-                executors: Executors::default(),
+                browser: AgentBrowser::load(data_dir)?,
                 grants: Mutex::new(HashMap::new()),
                 computer_grants: Mutex::new(HashMap::new()),
                 lease: Mutex::new(None),
                 approved_apps: Mutex::new(HashMap::new()),
-                ports: Mutex::new(HashMap::new()),
-                daemon_port: OnceLock::new(),
                 shots: ShotStore::new(data_dir.join(STATE_DIR).join("shots")),
                 computer: std::sync::RwLock::new(Computer::native()),
                 frame: tokio::sync::Mutex::new(None),
@@ -150,8 +139,8 @@ impl AgentDesktop {
         })
     }
 
-    pub(crate) fn executors(&self) -> &Executors {
-        &self.inner.executors
+    pub(crate) fn browser(&self) -> &AgentBrowser {
+        &self.inner.browser
     }
 
     pub(crate) fn shots(&self) -> &ShotStore {
@@ -215,6 +204,10 @@ impl AgentDesktop {
             .map_err(|error| AppError::Anyhow(error.into()))??;
         *settings = next;
         drop(settings);
+        if next.enabled {
+            // The agent browser's Chromium downloads in the background.
+            self.inner.browser.start_install();
+        }
         let mut ended = Vec::new();
         if !next.enabled {
             let mut conversations: HashSet<String> = self
@@ -251,41 +244,9 @@ impl AgentDesktop {
             .collect()
     }
 
+    /// The daemon's own listener: the agent browser never opens it.
     pub fn set_daemon_port(&self, port: u16) {
-        let _ = self.inner.daemon_port.set(port);
-    }
-
-    /// Records a loopback port the conversation's agent opened, so its
-    /// desktop may tunnel to it. The daemon's own port is refused.
-    pub(crate) fn allow_port(&self, conversation_id: &str, port: u16) -> Result<(), String> {
-        if self.inner.daemon_port.get() == Some(&port) {
-            return Err(format!(
-                "port {port} is the TodeX backend itself and cannot be opened in the browser"
-            ));
-        }
-        self.inner
-            .ports
-            .lock()
-            .expect("desktop port lock")
-            .entry(conversation_id.to_owned())
-            .or_default()
-            .insert(port);
-        Ok(())
-    }
-
-    /// Whether `device_id`'s executor may open a tunnel to `port` for the
-    /// conversation: it holds the grant and the agent opened that port.
-    pub(crate) fn may_tunnel(&self, conversation_id: &str, device_id: &str, port: u16) -> bool {
-        self.grant(conversation_id)
-            .is_some_and(|grant| grant.device_id == device_id)
-            && self.inner.daemon_port.get() != Some(&port)
-            && self
-                .inner
-                .ports
-                .lock()
-                .expect("desktop port lock")
-                .get(conversation_id)
-                .is_some_and(|ports| ports.contains(&port))
+        crate::agent_browser::set_daemon_port(port);
     }
 
     pub(crate) fn grant(&self, conversation_id: &str) -> Option<Grant> {
@@ -448,20 +409,6 @@ impl AgentDesktop {
             .insert(bundle_id.to_owned());
     }
 
-    /// Tells `device_id`'s browser executors the conversation lost its
-    /// browser.
-    fn release_browser_executors(&self, device_id: &str, conversation_id: &str) {
-        for executor in self.inner.executors.online(executors::CAPABILITY_BROWSER) {
-            if executor.device_id == device_id {
-                self.inner.executors.release(
-                    executor.executor_id,
-                    conversation_id,
-                    Some(executors::CAPABILITY_BROWSER),
-                );
-            }
-        }
-    }
-
     /// Drops the conversation's Computer Use grant, approved apps and screen
     /// lease. Returns the grant and whether a screen session ended.
     pub(crate) fn revoke_computer(&self, conversation_id: &str) -> (Option<Grant>, bool) {
@@ -480,8 +427,7 @@ impl AgentDesktop {
         (grant, screen_ended)
     }
 
-    /// Drops the conversation's browser grant and tells its desktop to close
-    /// the tab it opened.
+    /// Drops the conversation's browser grant and closes its tab.
     pub(crate) fn revoke_browser(&self, conversation_id: &str) -> Option<Grant> {
         let grant = self
             .inner
@@ -489,12 +435,11 @@ impl AgentDesktop {
             .lock()
             .expect("desktop grant lock")
             .remove(conversation_id)?;
-        self.inner
-            .ports
-            .lock()
-            .expect("desktop port lock")
-            .remove(conversation_id);
-        self.release_browser_executors(&grant.device_id, conversation_id);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let browser = self.inner.browser.clone();
+            let conversation_id = conversation_id.to_owned();
+            runtime.spawn(async move { browser.close_conversation(&conversation_id).await });
+        }
         Some(grant)
     }
 
@@ -530,14 +475,6 @@ pub(crate) mod tests {
         desktop.set_enabled(true).await.unwrap();
         assert!(AgentDesktop::load(&root).await.unwrap().enabled().await);
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let _registration = desktop.executors().register(
-            "dev_desk".into(),
-            "Desk".into(),
-            "darwin".into(),
-            vec![executors::CAPABILITY_BROWSER.into()],
-            tx,
-        );
         let grant = Grant {
             device_id: "dev_desk".into(),
             device_name: "Desk".into(),
@@ -546,9 +483,6 @@ pub(crate) mod tests {
         assert_eq!(desktop.grant("conv"), Some(grant));
         desktop.set_enabled(false).await.unwrap();
         assert_eq!(desktop.grant("conv"), None);
-        let release = rx.recv().await.unwrap();
-        assert_eq!(release["type"], "executor.release");
-        assert_eq!(release["payload"]["conversationId"], "conv");
         assert!(!AgentDesktop::load(&root).await.unwrap().enabled().await);
 
         std::fs::write(root.join(SETTINGS_FILE), b"{\"enabled\":1}").unwrap();

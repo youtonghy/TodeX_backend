@@ -53,6 +53,9 @@ webpki-roots = "1"
 # Pinned exactly: a 0.x API behind our own `computer` module.
 xa11y = "=0.15.2"
 jpeg-encoder = "0.7"
+# Agent browser: the DevTools socket on Windows, and unpacking Chromium.
+tokio-tungstenite = "0.29"
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 xa11y-macos = "=0.15.2"

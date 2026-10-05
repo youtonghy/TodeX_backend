@@ -1,3 +1,4 @@
+mod agent_browser;
 mod agent_desktop;
 mod agent_mcp;
 mod agent_providers;

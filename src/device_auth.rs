@@ -78,17 +78,6 @@ impl DeviceAuthenticator {
         }
     }
 
-    /// The paired name of `device_id`, if it is still paired.
-    pub(crate) fn device_name(&self, device_id: &str) -> Option<String> {
-        match self.registry.get(device_id) {
-            Ok(record) => record.map(|record| record.name),
-            Err(error) => {
-                tracing::warn!(%error, "could not read the device registry");
-                None
-            }
-        }
-    }
-
     fn authenticate(
         &self,
         method: &Method,

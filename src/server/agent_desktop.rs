@@ -4,7 +4,7 @@
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::HeaderMap;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Deserialize;
@@ -32,8 +32,48 @@ struct RevokeQuery {
     capability: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FrameQuery {
+    /// `screen` (Computer Use, default) or `browser`.
+    #[serde(default)]
+    capability: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProfileRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AssignRequest {
+    /// Workspace id (or path for workspaces without one).
+    workspace: String,
+    profile_id: String,
+}
+
+fn browser_error(error: crate::agent_browser::BrowserError) -> AppError {
+    match error.code.as_str() {
+        "INVALID_ARGUMENT" => AppError::InvalidRequest(error.message),
+        "NO_TAB" => AppError::NotFound(error.message),
+        _ => AppError::Conflict(error.to_string()),
+    }
+}
+
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/v2/agent-browser/profiles",
+            get(list_profiles).post(create_profile),
+        )
+        .route(
+            "/v2/agent-browser/profiles/{id}",
+            put(rename_profile).delete(delete_profile),
+        )
+        .route("/v2/agent-browser/workspaces", put(assign_profile))
+        .route("/v2/agent-browser/install", post(install_browser))
         .route("/v2/agent-desktop", get(settings).put(set_settings))
         .route(
             "/v2/agent-desktop/computer/permissions",
@@ -58,7 +98,9 @@ async fn settings_view(state: &AppState) -> Value {
     json!({
         "enabled": settings.enabled,
         "computerEnabled": settings.computer_enabled,
-        "executors": state.agent_desktop.executors().all(),
+        // Retired: browsers no longer run on desktops.
+        "executors": [],
+        "browser": state.agent_desktop.browser().status(),
         "computer": state.agent_desktop.computer().host().status(),
     })
 }
@@ -128,12 +170,33 @@ async fn read_frame(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(conversation_id): AxumPath<String>,
+    Query(query): Query<FrameQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
     state
         .conversations
         .get_owned(&auth.tenant_id, &conversation_id)
         .await?;
+    match query.capability.as_deref() {
+        None | Some("screen") => {}
+        Some("browser") => {
+            let jpeg = state
+                .agent_desktop
+                .browser()
+                .frame(&conversation_id)
+                .await
+                .map_err(browser_error)?;
+            return Ok(Json(json!({
+                "mimeType": "image/jpeg",
+                "dataUrl": format!("data:image/jpeg;base64,{}", BASE64.encode(jpeg)),
+            })));
+        }
+        Some(other) => {
+            return Err(AppError::InvalidRequest(format!(
+                "unknown capability {other}; use screen or browser"
+            )))
+        }
+    }
     let jpeg = state
         .agent_desktop
         .live_frame(&conversation_id)
@@ -224,4 +287,80 @@ async fn read_shot(
         "mimeType": "image/jpeg",
         "dataUrl": format!("data:image/jpeg;base64,{}", BASE64.encode(jpeg)),
     })))
+}
+
+// ---- Agent browser profiles ------------------------------------------------
+
+async fn list_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    Ok(Json(serde_json::to_value(
+        state.agent_desktop.browser().profiles(),
+    )?))
+}
+
+async fn create_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProfileRequest>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let record = state
+        .agent_desktop
+        .browser()
+        .create_profile(&request.name)
+        .map_err(browser_error)?;
+    Ok(Json(serde_json::to_value(record)?))
+}
+
+async fn rename_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ProfileRequest>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let browser = state.agent_desktop.browser();
+    browser
+        .rename_profile(&id, &request.name)
+        .map_err(browser_error)?;
+    Ok(Json(serde_json::to_value(browser.profiles())?))
+}
+
+/// Deletes the profile and its cookies, storage and cache.
+async fn delete_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let browser = state.agent_desktop.browser();
+    browser.delete_profile(&id).await.map_err(browser_error)?;
+    Ok(Json(serde_json::to_value(browser.profiles())?))
+}
+
+async fn assign_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AssignRequest>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let browser = state.agent_desktop.browser();
+    browser
+        .assign_profile(&request.workspace, &request.profile_id)
+        .await
+        .map_err(browser_error)?;
+    Ok(Json(serde_json::to_value(browser.profiles())?))
+}
+
+/// Starts downloading the pinned Chromium (progress shows in settings).
+async fn install_browser(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    state.agent_desktop.browser().start_install();
+    Ok(Json(settings_view(&state).await))
 }

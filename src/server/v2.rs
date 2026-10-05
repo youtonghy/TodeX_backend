@@ -101,12 +101,14 @@ fn is_v2_native_command(command_type: &str) -> bool {
     )
 }
 
-/// Frames of a desktop acting as an agent tool executor; see
-/// [`crate::agent_desktop`].
-fn is_executor_frame(command_type: &str) -> bool {
+/// Agent desktop frames: watching the agent browser live, and the retired
+/// desktop executor protocol (older desktops still send it).
+fn is_agent_desktop_frame(command_type: &str) -> bool {
     matches!(
         command_type,
-        "executor.register"
+        "agentBrowser.watch"
+            | "agentBrowser.unwatch"
+            | "executor.register"
             | "executor.result"
             | "tunnel.open"
             | "tunnel.data"
@@ -114,6 +116,9 @@ fn is_executor_frame(command_type: &str) -> bool {
             | "tunnel.close"
     )
 }
+
+/// Live agent browser views one connection may hold.
+const MAX_BROWSER_WATCHES: usize = 8;
 
 fn is_v2_background_command(command_type: &str) -> bool {
     matches!(
@@ -2277,7 +2282,7 @@ async fn handle_socket(
     });
 
     let mut subscriptions = WsSubscriptions::new();
-    let mut executor: Option<ExecutorConnection> = None;
+    let mut browser_watches: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let operation_limit = Arc::new(Semaphore::new(MAX_WS_IN_FLIGHT_OPERATIONS));
     let mut operation_tasks = Vec::new();
     let client_timeout = tokio::time::Duration::from_secs(WS_CLIENT_TIMEOUT_SECS);
@@ -2331,9 +2336,15 @@ async fn handle_socket(
             .ok()
             .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned));
         match command_type.as_deref() {
-            Some(command_type) if is_executor_frame(command_type) => {
-                let response =
-                    handle_executor_frame(&state, &auth, &outgoing_tx, &mut executor, &text);
+            Some(command_type) if is_agent_desktop_frame(command_type) => {
+                let response = handle_agent_desktop_frame(
+                    &state,
+                    &auth,
+                    &outgoing_tx,
+                    &mut browser_watches,
+                    &text,
+                )
+                .await;
                 if let Some(response) = response {
                     if queue_frame(&outgoing_tx, response).await.is_err() {
                         break;
@@ -2425,9 +2436,11 @@ async fn handle_socket(
         }
     }
 
-    // Closes its tunnels and fails every agent tool call still waiting on
-    // this connection.
-    drop(executor);
+    // Ends this connection's live browser views (their screencasts stop
+    // when nobody else watches).
+    for (_, watch) in browser_watches.drain() {
+        watch.abort();
+    }
     subscriptions.abort_all();
     for task in operation_tasks {
         task.abort();
@@ -2466,27 +2479,16 @@ async fn handle_socket(
         .await;
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ExecutorRegisterRequest {
-    capabilities: Vec<String>,
-    platform: String,
-}
-
-/// `executor.register` (re)registers this connection as a desktop executor
-/// for its device; `executor.result` answers an `executor.invoke`. Returns
-/// the frame to send back, if any.
-/// A connection registered as a desktop executor.
-struct ExecutorConnection {
-    registration: crate::agent_desktop::Registration,
-    tunnels: crate::agent_desktop::tunnel::TunnelSet,
-}
-
-fn handle_executor_frame(
+/// `agentBrowser.watch { conversationId }` streams the conversation's
+/// agent browser tab as `agentBrowser.frame` (latest frame wins: frames
+/// that do not fit in the outgoing queue are dropped); `agentBrowser.unwatch`
+/// stops it. The executor frames of older desktops are answered without
+/// effect: the browser runs in the daemon now.
+async fn handle_agent_desktop_frame(
     state: &AppState,
     auth: &AuthContext,
     outgoing: &mpsc::Sender<Value>,
-    executor: &mut Option<ExecutorConnection>,
+    watches: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     text: &str,
 ) -> Option<Value> {
     let frame: Value = match serde_json::from_str(text) {
@@ -2494,128 +2496,98 @@ fn handle_executor_frame(
         Err(error) => {
             return Some(error_response(
                 None,
-                AppError::InvalidRequest(format!("invalid executor frame: {error}")),
+                AppError::InvalidRequest(format!("invalid frame: {error}")),
             ))
         }
     };
     let id = frame["id"].as_str().map(str::to_owned);
-    match frame["type"].as_str() {
-        Some("executor.register") => {
-            let Some(id) = id else {
-                return Some(error_response(
-                    None,
-                    AppError::InvalidRequest("executor.register needs an id".to_owned()),
-                ));
-            };
-            let request: ExecutorRegisterRequest =
-                match serde_json::from_value(frame["payload"].clone()) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return Some(error_response(
-                            Some(id),
-                            AppError::InvalidRequest(format!(
-                                "invalid executor.register payload: {error}"
-                            )),
-                        ))
-                    }
-                };
-            let capabilities =
-                match crate::agent_desktop::executors::validate_capabilities(&request.capabilities)
-                {
-                    Ok(capabilities) => capabilities,
-                    Err(message) => {
-                        return Some(error_response(Some(id), AppError::InvalidRequest(message)))
-                    }
-                };
-            let platform: String = request.platform.chars().take(32).collect();
-            let device_name = state
-                .device_auth
-                .device_name(&auth.principal_id)
-                .unwrap_or_else(|| auth.principal_id.clone());
-            // Replacing the registration fails calls waiting on the old one.
-            *executor = None;
-            let registration = state.agent_desktop.executors().register(
-                auth.principal_id.clone(),
-                device_name,
-                platform,
-                capabilities,
-                outgoing.clone(),
-            );
-            let executor_id = registration.executor_id();
-            *executor = Some(ExecutorConnection {
-                registration,
-                tunnels: crate::agent_desktop::tunnel::TunnelSet::new(outgoing.clone()),
-            });
-            Some(json!({
-                "id": id,
-                "type": "server.result",
-                "payload": { "executorId": executor_id, "deviceId": auth.principal_id },
-            }))
-        }
-        Some(kind) => {
-            let Some(connection) = executor.as_mut() else {
+    let payload = &frame["payload"];
+    match frame["type"].as_str().unwrap_or_default() {
+        kind @ ("agentBrowser.watch" | "agentBrowser.unwatch") => {
+            let Some(conversation_id) = payload["conversationId"].as_str().map(str::to_owned)
+            else {
                 return Some(error_response(
                     id,
-                    AppError::InvalidRequest("this connection is not an executor".to_owned()),
+                    AppError::InvalidRequest(format!("{kind} needs conversationId")),
                 ));
             };
-            let payload = &frame["payload"];
-            let stream_id = payload["streamId"].as_str().unwrap_or_default();
-            let result = match kind {
-                "executor.result" => state
-                    .agent_desktop
-                    .executors()
-                    .complete(connection.registration.executor_id(), payload),
-                "tunnel.open" => {
-                    let conversation_id = payload["conversationId"].as_str().unwrap_or_default();
-                    let port = payload["port"]
-                        .as_u64()
-                        .and_then(|port| u16::try_from(port).ok());
-                    match port {
-                        Some(port)
-                            if state.agent_desktop.may_tunnel(
-                                conversation_id,
-                                &auth.principal_id,
-                                port,
-                            ) =>
-                        {
-                            connection.tunnels.open(stream_id.to_owned(), port)
-                        }
-                        _ => {
-                            // Refusals close the stream, so the desktop's
-                            // local socket ends instead of hanging.
-                            return Some(json!({
-                                "type": "tunnel.close",
+            if kind == "agentBrowser.unwatch" {
+                if let Some(watch) = watches.remove(&conversation_id) {
+                    watch.abort();
+                }
+                return id.map(|id| json!({ "id": id, "type": "server.result", "payload": { "watching": false } }));
+            }
+            if let Err(error) = state
+                .conversations
+                .get_owned(&auth.tenant_id, &conversation_id)
+                .await
+            {
+                return Some(error_response(id, error));
+            }
+            watches.retain(|_, watch| !watch.is_finished());
+            if !watches.contains_key(&conversation_id) {
+                if watches.len() >= MAX_BROWSER_WATCHES {
+                    return Some(error_response(
+                        id,
+                        AppError::ResourceExhausted(format!(
+                            "at most {MAX_BROWSER_WATCHES} live browser views per connection"
+                        )),
+                    ));
+                }
+                let browser = state.agent_desktop.browser().clone();
+                let outgoing = outgoing.clone();
+                let watched = conversation_id.clone();
+                let task = tokio::spawn(async move {
+                    let mut watch = browser.watch(&watched).await;
+                    loop {
+                        let current = watch.frames.borrow_and_update().clone();
+                        let message = match current {
+                            Some(frame) => json!({
+                                "type": "agentBrowser.frame",
                                 "payload": {
-                                    "streamId": stream_id,
-                                    "error": "this conversation has not opened that port",
+                                    "conversationId": watched,
+                                    "seq": frame.seq,
+                                    "mimeType": "image/jpeg",
+                                    "data": frame.data,
+                                    "width": frame.width,
+                                    "height": frame.height,
                                 },
-                            }));
+                            }),
+                            None => json!({
+                                "type": "agentBrowser.frame",
+                                "payload": { "conversationId": watched, "closed": true },
+                            }),
+                        };
+                        match outgoing.try_send(message) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                        if watch.frames.changed().await.is_err() {
+                            break;
                         }
                     }
-                }
-                "tunnel.data" => connection
-                    .tunnels
-                    .data(stream_id, payload["data"].as_str().unwrap_or_default()),
-                "tunnel.ack" => {
-                    let bytes = payload["bytes"].as_u64().unwrap_or(0);
-                    connection
-                        .tunnels
-                        .ack(stream_id, usize::try_from(bytes).unwrap_or(usize::MAX));
-                    Ok(())
-                }
-                "tunnel.close" => {
-                    connection.tunnels.close(stream_id);
-                    Ok(())
-                }
-                _ => Ok(()),
-            };
-            match result {
-                Ok(()) => None,
-                Err(message) => Some(error_response(id, AppError::InvalidRequest(message))),
+                });
+                watches.insert(conversation_id, task);
             }
+            id.map(
+                |id| json!({ "id": id, "type": "server.result", "payload": { "watching": true } }),
+            )
         }
-        None => None,
+        "executor.register" => id.map(|id| {
+            json!({
+                "id": id,
+                "type": "server.result",
+                "payload": { "executorId": 0, "deviceId": auth.principal_id, "retired": true },
+            })
+        }),
+        "tunnel.open" => Some(json!({
+            "type": "tunnel.close",
+            "payload": {
+                "streamId": payload["streamId"],
+                "error": "the agent browser runs on the backend now; tunnels are retired",
+            },
+        })),
+        _ => None,
     }
 }
 
@@ -7410,30 +7382,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn v2_ws_tunnels_only_to_ports_the_granted_conversation_opened() {
-        use base64::Engine as _;
-        let root = std::env::temp_dir().join(format!("todex-v2-tunnel-{}", Uuid::new_v4()));
+    async fn v2_ws_agent_browser_watch_is_owner_only_and_executor_frames_are_retired() {
+        let root = std::env::temp_dir().join(format!("todex-v2-browser-watch-{}", Uuid::new_v4()));
         let state = auth_test_state(&root).await;
         let device = enroll(&root.join("data"));
         let app = crate::server::router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        state.agent_desktop.set_daemon_port(addr.port());
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
-        });
-        // A dev server on this machine's loopback.
-        let dev = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dev_port = dev.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (mut socket, _) = dev.accept().await.unwrap();
-            let mut buffer = [0_u8; 64];
-            let read = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer)
-                .await
-                .unwrap();
-            tokio::io::AsyncWriteExt::write_all(&mut socket, &buffer[..read])
-                .await
-                .unwrap();
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(format!(
             "ws://{addr}/v2/ws?{}",
@@ -7442,61 +7399,52 @@ mod tests {
         .await
         .unwrap();
         let send = |value: Value| WsMessage::Text(value.to_string().into());
-        ws.send(send(json!({ "id": "reg", "type": "executor.register", "payload": { "capabilities": ["browser"], "platform": "darwin" } })))
+
+        // Older desktops still register; nothing happens.
+        ws.send(send(json!({ "id": "reg", "type": "executor.register", "payload": { "capabilities": ["browser", "screen"], "platform": "darwin" } })))
             .await
             .unwrap();
-        wait_for_ws_message(&mut ws, |m| m["id"] == "reg").await;
+        let registered = wait_for_ws_message(&mut ws, |m| m["id"] == "reg").await;
+        assert_eq!(registered["type"], "server.result");
+        assert_eq!(registered["payload"]["retired"], true);
+        ws.send(send(json!({ "type": "tunnel.open", "payload": { "streamId": "s", "conversationId": "c", "port": 5173 } })))
+            .await
+            .unwrap();
+        let closed = wait_for_ws_message(&mut ws, |m| m["type"] == "tunnel.close").await;
+        assert_eq!(closed["payload"]["streamId"], "s");
 
-        let open = |stream: &str, port: u16| {
-            send(
-                json!({ "type": "tunnel.open", "payload": { "streamId": stream, "conversationId": "conv", "port": port } }),
-            )
-        };
-        // No grant yet: refused.
-        ws.send(open("a", dev_port)).await.unwrap();
-        let refused = wait_for_ws_message(&mut ws, |m| {
-            m["type"] == "tunnel.close" && m["payload"]["streamId"] == "a"
-        })
-        .await;
-        assert!(refused["payload"]["error"].is_string());
-        state.agent_desktop.set_grant(
-            "conv",
-            crate::agent_desktop::Grant {
-                device_id: device.device_id.clone(),
-                device_name: "d".into(),
-            },
+        // Only conversations the device may read can be watched.
+        ws.send(send(json!({ "id": "w0", "type": "agentBrowser.watch", "payload": { "conversationId": "nope" } })))
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_ws_message(&mut ws, |m| m["id"] == "w0").await["type"],
+            "server.error"
         );
-        // Granted, but the agent never opened this port.
-        ws.send(open("b", dev_port)).await.unwrap();
-        wait_for_ws_message(&mut ws, |m| {
-            m["type"] == "tunnel.close" && m["payload"]["streamId"] == "b"
-        })
-        .await;
-        // The daemon's own port can never be allowed.
-        assert!(state.agent_desktop.allow_port("conv", addr.port()).is_err());
-        ws.send(open("own", addr.port())).await.unwrap();
-        wait_for_ws_message(&mut ws, |m| {
-            m["type"] == "tunnel.close" && m["payload"]["streamId"] == "own"
-        })
-        .await;
-
-        state.agent_desktop.allow_port("conv", dev_port).unwrap();
-        ws.send(open("c", dev_port)).await.unwrap();
-        wait_for_ws_message(&mut ws, |m| {
-            m["type"] == "tunnel.opened" && m["payload"]["streamId"] == "c"
-        })
-        .await;
-        let data = base64::engine::general_purpose::STANDARD.encode(b"GET / HTTP/1.1");
-        ws.send(send(
-            json!({ "type": "tunnel.data", "payload": { "streamId": "c", "data": data } }),
-        ))
-        .await
-        .unwrap();
-        let echoed = wait_for_ws_message(&mut ws, |m| {
-            m["type"] == "tunnel.data" && m["payload"]["streamId"] == "c"
-        })
-        .await;
-        assert_eq!(echoed["payload"]["data"], data);
+        let manifest = state
+            .conversations
+            .create_for_tests(
+                ProviderKind::Codex,
+                std::fs::canonicalize(root.join("workspaces/project")).unwrap(),
+            )
+            .await
+            .unwrap();
+        ws.send(send(json!({ "id": "w1", "type": "agentBrowser.watch", "payload": { "conversationId": manifest.id } })))
+            .await
+            .unwrap();
+        let watching = wait_for_ws_message(&mut ws, |m| m["id"] == "w1").await;
+        assert_eq!(watching["payload"]["watching"], true);
+        // No tab yet: the stream says so instead of staying silent.
+        let first = wait_for_ws_message(&mut ws, |m| m["type"] == "agentBrowser.frame").await;
+        assert_eq!(first["payload"]["conversationId"], manifest.id);
+        assert_eq!(first["payload"]["closed"], true);
+        ws.send(send(json!({ "id": "u1", "type": "agentBrowser.unwatch", "payload": { "conversationId": manifest.id } })))
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_ws_message(&mut ws, |m| m["id"] == "u1").await["payload"]["watching"],
+            false
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7664,114 +7612,6 @@ mod tests {
         ))
         .await;
         assert!(status.is_client_error());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn v2_ws_executor_registers_answers_invokes_and_fails_calls_on_disconnect() {
-        let root = std::env::temp_dir().join(format!("todex-v2-executor-{}", Uuid::new_v4()));
-        let state = auth_test_state(&root).await;
-        let device = enroll(&root.join("data"));
-        let app = crate::server::router(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        let connect = || async {
-            tokio_tungstenite::connect_async(format!(
-                "ws://{addr}/v2/ws?{}",
-                device.sign_query("/v2/ws")
-            ))
-            .await
-            .unwrap()
-            .0
-        };
-        let send = |value: Value| WsMessage::Text(value.to_string().into());
-        let executors = state.agent_desktop.executors().clone();
-
-        let mut ws = connect().await;
-        // Only executors may answer invokes.
-        ws.send(send(json!({ "id": "r0", "type": "executor.result", "payload": { "invokeId": "x", "ok": true } })))
-            .await
-            .unwrap();
-        let refused = wait_for_ws_message(&mut ws, |m| m["id"] == "r0").await;
-        assert_eq!(refused["type"], "server.error");
-
-        ws.send(send(json!({ "id": "bad", "type": "executor.register", "payload": { "capabilities": ["camera"], "platform": "darwin" } })))
-            .await
-            .unwrap();
-        let bad = wait_for_ws_message(&mut ws, |m| m["id"] == "bad").await;
-        assert_eq!(bad["type"], "server.error");
-        assert!(executors.online("browser").is_empty());
-
-        ws.send(send(json!({ "id": "reg", "type": "executor.register", "payload": { "capabilities": ["browser"], "platform": "darwin" } })))
-            .await
-            .unwrap();
-        let registered = wait_for_ws_message(&mut ws, |m| m["id"] == "reg").await;
-        assert_eq!(registered["type"], "server.result");
-        assert_eq!(registered["payload"]["deviceId"], device.device_id);
-        let online = executors.online("browser");
-        assert_eq!(online.len(), 1);
-        assert_eq!(online[0].device_name, "test-device");
-        assert_eq!(online[0].platform, "darwin");
-        let executor_id = online[0].executor_id;
-
-        let call = {
-            let executors = executors.clone();
-            tokio::spawn(async move {
-                executors
-                    .invoke(
-                        executor_id,
-                        crate::agent_desktop::InvokeRequest {
-                            conversation_id: "conv_1".to_owned(),
-                            workspace: json!({ "path": "/w" }),
-                            tool: "browser_snapshot".to_owned(),
-                            args: json!({}),
-                        },
-                        Duration::from_secs(5),
-                        std::future::pending(),
-                    )
-                    .await
-            })
-        };
-        let invoke = wait_for_ws_message(&mut ws, |m| m["type"] == "executor.invoke").await;
-        assert_eq!(invoke["payload"]["conversationId"], "conv_1");
-        ws.send(send(json!({ "type": "executor.result", "payload": { "invokeId": invoke["payload"]["invokeId"], "ok": true, "result": { "tree": "button" } } })))
-            .await
-            .unwrap();
-        assert_eq!(call.await.unwrap().unwrap(), json!({ "tree": "button" }));
-
-        // A dropped connection fails the calls waiting on it and leaves the
-        // executor list.
-        let waiting = {
-            let executors = executors.clone();
-            tokio::spawn(async move {
-                executors
-                    .invoke(
-                        executor_id,
-                        crate::agent_desktop::InvokeRequest {
-                            conversation_id: "conv_1".to_owned(),
-                            workspace: json!({ "path": "/w" }),
-                            tool: "browser_snapshot".to_owned(),
-                            args: json!({}),
-                        },
-                        Duration::from_secs(5),
-                        std::future::pending(),
-                    )
-                    .await
-            })
-        };
-        wait_for_ws_message(&mut ws, |m| m["type"] == "executor.invoke").await;
-        drop(ws);
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), waiting)
-                .await
-                .unwrap()
-                .unwrap(),
-            Err(crate::agent_desktop::ExecutorError::Gone)
-        );
-        assert!(executors.online("browser").is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
