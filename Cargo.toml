@@ -49,6 +49,25 @@ ed25519-dalek = "2"
 russh-sftp = "3.0.1"
 suppaftp = { version = "12", features = ["tokio-rustls-ring"] }
 webpki-roots = "1"
+# Computer Use: accessibility trees, input and screenshots on every desktop.
+# Pinned exactly: a 0.x API behind our own `computer` module.
+xa11y = "=0.15.2"
+jpeg-encoder = "0.7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+xa11y-macos = "=0.15.2"
+core-foundation = "0.10"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = ["NSAlert", "NSApplication", "NSButton", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSPanel", "NSResponder", "NSRunningApplication", "NSScreen", "NSText", "NSTextField", "NSView", "NSWindow", "NSWorkspace"] }
+global-hotkey = "0.8"
+dispatch2 = "0.3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+xa11y-windows = "=0.15.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+xa11y-linux = "=0.15.2"
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"

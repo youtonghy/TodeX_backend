@@ -5,6 +5,7 @@ mod app_state;
 mod autostart;
 mod catalog;
 mod codex_gateway;
+mod computer;
 mod config;
 mod conversation;
 mod daemon;
@@ -137,12 +138,30 @@ struct ProviderDoctorArgs {
     format: String,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_from(remote_fs::askpass::rewrite_args(
         std::env::args_os().collect(),
     ));
+    // Processes that serve agents host Computer Use: they take their own
+    // macOS permission identity (before any thread exists) and leave the
+    // main thread to the host UI.
+    let hosts_computer_use = matches!(
+        cli.command,
+        Command::Serve(_) | Command::Tui(_) | Command::DaemonRun(_)
+    );
+    if hosts_computer_use {
+        computer::platform::adopt_own_permission_identity();
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    if hosts_computer_use {
+        computer::host_ui::run_with_main_loop(move || runtime.block_on(run(cli)));
+    }
+    runtime.block_on(run(cli))
+}
 
+async fn run(cli: Cli) -> anyhow::Result<()> {
     match &cli.command {
         Command::Serve(args) | Command::Tui(args) => {
             let config = Config::load_read_only(args.clone())?;

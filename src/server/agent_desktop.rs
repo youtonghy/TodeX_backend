@@ -1,9 +1,10 @@
-//! `/v2/agent-desktop` — the switch for agent desktop tools, plus
-//! per-conversation access and screenshots. See [`crate::agent_desktop`].
+//! `/v2/agent-desktop` — the switch for agent desktop tools, Computer Use
+//! on this host, plus per-conversation access, screenshots and the live
+//! frame. See [`crate::agent_desktop`] and [`crate::computer`].
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::HeaderMap;
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Deserialize;
@@ -35,6 +36,14 @@ pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v2/agent-desktop", get(settings).put(set_settings))
         .route(
+            "/v2/agent-desktop/computer/permissions",
+            post(request_computer_permissions),
+        )
+        .route(
+            "/v2/conversations/{id}/agent-desktop/frame",
+            get(read_frame),
+        )
+        .route(
             "/v2/conversations/{id}/agent-desktop",
             delete(revoke_conversation),
         )
@@ -50,6 +59,7 @@ async fn settings_view(state: &AppState) -> Value {
         "enabled": settings.enabled,
         "computerEnabled": settings.computer_enabled,
         "executors": state.agent_desktop.executors().all(),
+        "computer": state.agent_desktop.computer().host().status(),
     })
 }
 
@@ -94,6 +104,48 @@ async fn set_settings(
         journal_screen_end(&state, &conversation_id, "revoked").await;
     }
     Ok(Json(settings_view(&state).await))
+}
+
+/// Shows the OS permission prompts on this host (Screen Recording,
+/// Accessibility) for what is missing.
+async fn request_computer_permissions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    state
+        .agent_desktop
+        .computer()
+        .host()
+        .request_permissions()
+        .await;
+    Ok(Json(settings_view(&state).await))
+}
+
+/// The host's screen right now, for a live view of the conversation that
+/// controls it. Clients poll while the view is visible.
+async fn read_frame(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(conversation_id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    state
+        .conversations
+        .get_owned(&auth.tenant_id, &conversation_id)
+        .await?;
+    let jpeg = state
+        .agent_desktop
+        .live_frame(&conversation_id)
+        .await
+        .map_err(|error| match error.code.as_str() {
+            "NOT_CONTROLLING" => AppError::NotFound(error.message),
+            _ => AppError::InvalidRequest(error.to_string()),
+        })?;
+    Ok(Json(json!({
+        "mimeType": "image/jpeg",
+        "dataUrl": format!("data:image/jpeg;base64,{}", BASE64.encode(jpeg.as_slice())),
+    })))
 }
 
 /// The user stopped the agent's browser and/or Computer Use for this

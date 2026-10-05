@@ -7,9 +7,11 @@
 //! bound by its first grant, which only an online executor device may
 //! answer. Grants live in memory: a daemon restart asks again.
 //!
-//! Computer Use (`computer_*`, capability `screen`) has its own switch and
-//! grant. A device's screen is leased to one conversation at a time; the
-//! lease ends with `computer_done`, a stop, a revoke, or [`SCREEN_IDLE`].
+//! Computer Use (`computer_*`) runs on the daemon's own host
+//! ([`crate::computer`]) behind its own switch and grant, which the person
+//! at the host confirms there. The screen is leased to one conversation at
+//! a time; the lease ends with `computer_done`, a stop, a revoke, or
+//! [`SCREEN_IDLE`].
 
 pub(crate) mod executors;
 mod shots;
@@ -25,7 +27,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::{error::AppError, secure_fs};
+use crate::{
+    computer::{Computer, ComputerError},
+    error::AppError,
+    secure_fs,
+};
 
 pub(crate) use executors::{ExecutorError, Executors, InvokeRequest, Registration};
 pub(crate) use shots::ShotStore;
@@ -34,6 +40,12 @@ const SETTINGS_FILE: &str = "agent-desktop.json";
 /// A screen lease nobody used for this long may be taken over.
 pub(crate) const SCREEN_IDLE: Duration = Duration::from_secs(120);
 const STATE_DIR: &str = "agent-desktop";
+/// Live frames: at most one capture this often, this wide, this quality.
+const FRAME_INTERVAL: Duration = Duration::from_millis(300);
+const FRAME_MAX_WIDTH: u32 = 960;
+const FRAME_QUALITY: u8 = 60;
+/// Device id of the daemon's own host in Computer Use grants and events.
+pub(crate) const HOST_DEVICE_ID: &str = "host";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -56,7 +68,7 @@ pub(crate) struct Revoked {
     pub screen_ended: bool,
 }
 
-/// Result of taking a device's screen for a conversation.
+/// Result of taking the host's screen for a conversation.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ScreenClaim {
     /// The conversation already held it.
@@ -70,7 +82,8 @@ struct Lease {
     last_used: Instant,
 }
 
-/// The desktop a conversation may drive.
+/// The desktop a conversation may drive. For Computer Use this is the
+/// daemon's host (`device_id` [`HOST_DEVICE_ID`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Grant {
     pub device_id: String,
@@ -89,8 +102,8 @@ struct Inner {
     executors: Executors,
     grants: Mutex<HashMap<String, Grant>>,
     computer_grants: Mutex<HashMap<String, Grant>>,
-    /// Device id → the conversation controlling its screen.
-    leases: Mutex<HashMap<String, Lease>>,
+    /// The conversation controlling the host's screen.
+    lease: Mutex<Option<Lease>>,
     /// Conversation → bundle ids the user let its agent control.
     approved_apps: Mutex<HashMap<String, HashSet<String>>>,
     /// Conversation → loopback ports its agent opened; only these may be
@@ -99,6 +112,9 @@ struct Inner {
     /// The daemon's own listener, never reachable through a tunnel.
     daemon_port: OnceLock<u16>,
     shots: ShotStore,
+    computer: std::sync::RwLock<Computer>,
+    /// The latest live frame, shared by concurrent viewers.
+    frame: tokio::sync::Mutex<Option<(Instant, Arc<Vec<u8>>)>>,
 }
 
 impl AgentDesktop {
@@ -123,11 +139,13 @@ impl AgentDesktop {
                 executors: Executors::default(),
                 grants: Mutex::new(HashMap::new()),
                 computer_grants: Mutex::new(HashMap::new()),
-                leases: Mutex::new(HashMap::new()),
+                lease: Mutex::new(None),
                 approved_apps: Mutex::new(HashMap::new()),
                 ports: Mutex::new(HashMap::new()),
                 daemon_port: OnceLock::new(),
                 shots: ShotStore::new(data_dir.join(STATE_DIR).join("shots")),
+                computer: std::sync::RwLock::new(Computer::native()),
+                frame: tokio::sync::Mutex::new(None),
             }),
         })
     }
@@ -138,6 +156,23 @@ impl AgentDesktop {
 
     pub(crate) fn shots(&self) -> &ShotStore {
         &self.inner.shots
+    }
+
+    pub(crate) fn computer(&self) -> Computer {
+        self.inner
+            .computer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_computer(&self, computer: Computer) {
+        *self
+            .inner
+            .computer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = computer;
     }
 
     pub(crate) async fn enabled(&self) -> bool {
@@ -287,87 +322,107 @@ impl AgentDesktop {
             .insert(conversation_id.to_owned(), grant);
     }
 
-    /// Takes `device_id`'s screen for the conversation, unless another
+    /// Takes the host's screen for the conversation, unless another
     /// conversation used it within [`SCREEN_IDLE`] (returned as `Err`).
-    pub(crate) fn claim_screen(
-        &self,
-        device_id: &str,
-        conversation_id: &str,
-    ) -> Result<ScreenClaim, String> {
-        let mut leases = self.inner.leases.lock().expect("desktop lease lock");
-        match leases.get_mut(device_id) {
-            Some(lease) if lease.conversation_id == conversation_id => {
-                lease.last_used = Instant::now();
-                return Ok(ScreenClaim::Continued);
+    pub(crate) fn claim_screen(&self, conversation_id: &str) -> Result<ScreenClaim, String> {
+        let displaced = {
+            let mut lease = self.inner.lease.lock().expect("desktop lease lock");
+            match lease.as_mut() {
+                Some(current) if current.conversation_id == conversation_id => {
+                    current.last_used = Instant::now();
+                    return Ok(ScreenClaim::Continued);
+                }
+                Some(current) if current.last_used.elapsed() < SCREEN_IDLE => {
+                    return Err(current.conversation_id.clone());
+                }
+                _ => {}
             }
-            Some(lease) if lease.last_used.elapsed() < SCREEN_IDLE => {
-                return Err(lease.conversation_id.clone());
-            }
-            _ => {}
-        }
-        let displaced = leases
-            .insert(
-                device_id.to_owned(),
-                Lease {
+            lease
+                .replace(Lease {
                     conversation_id: conversation_id.to_owned(),
                     last_used: Instant::now(),
-                },
-            )
-            .map(|lease| lease.conversation_id);
-        drop(leases);
-        if let Some(previous) = &displaced {
-            self.release_executors(device_id, previous, Some(executors::CAPABILITY_SCREEN));
-        }
+                })
+                .map(|previous| previous.conversation_id)
+        };
+        self.computer().host().session(Some(""));
         Ok(ScreenClaim::Started { displaced })
     }
 
-    /// Ends the conversation's screen lease. Returns the device it held.
-    pub(crate) fn release_screen(&self, conversation_id: &str) -> Option<String> {
-        let device_id = {
-            let mut leases = self.inner.leases.lock().expect("desktop lease lock");
-            let device_id = leases
-                .iter()
-                .find(|(_, lease)| lease.conversation_id == conversation_id)
-                .map(|(device, _)| device.clone())?;
-            leases.remove(&device_id);
-            device_id
-        };
-        self.release_executors(
-            &device_id,
-            conversation_id,
-            Some(executors::CAPABILITY_SCREEN),
+    /// A JPEG of the host's screen for viewers of the conversation that
+    /// controls it; captures at most every [`FRAME_INTERVAL`].
+    pub(crate) async fn live_frame(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Arc<Vec<u8>>, ComputerError> {
+        if self.screen_holder().as_deref() != Some(conversation_id) {
+            return Err(ComputerError::new(
+                "NOT_CONTROLLING",
+                "this conversation is not controlling the computer",
+            ));
+        }
+        let mut frame = self.inner.frame.lock().await;
+        if let Some((taken, jpeg)) = frame.as_ref() {
+            if taken.elapsed() < FRAME_INTERVAL {
+                return Ok(jpeg.clone());
+            }
+        }
+        let jpeg = Arc::new(
+            self.computer()
+                .host()
+                .frame(FRAME_MAX_WIDTH, FRAME_QUALITY)
+                .await?,
         );
-        Some(device_id)
+        *frame = Some((Instant::now(), jpeg.clone()));
+        Ok(jpeg)
     }
 
-    /// Ends leases idle for [`SCREEN_IDLE`]; returns their conversations.
-    pub(crate) fn expire_screens(&self) -> Vec<String> {
-        let expired: Vec<(String, String)> = {
-            let mut leases = self.inner.leases.lock().expect("desktop lease lock");
-            let idle: Vec<String> = leases
-                .iter()
-                .filter(|(_, lease)| lease.last_used.elapsed() >= SCREEN_IDLE)
-                .map(|(device, _)| device.clone())
-                .collect();
-            idle.into_iter()
-                .filter_map(|device| {
-                    leases
-                        .remove(&device)
-                        .map(|lease| (device, lease.conversation_id))
-                })
-                .collect()
+    /// The conversation controlling the host's screen, if any.
+    pub(crate) fn screen_holder(&self) -> Option<String> {
+        self.inner
+            .lease
+            .lock()
+            .expect("desktop lease lock")
+            .as_ref()
+            .map(|lease| lease.conversation_id.clone())
+    }
+
+    /// Ends the conversation's screen lease. Returns whether it held one.
+    pub(crate) fn release_screen(&self, conversation_id: &str) -> bool {
+        let released = {
+            let mut lease = self.inner.lease.lock().expect("desktop lease lock");
+            if lease
+                .as_ref()
+                .is_some_and(|lease| lease.conversation_id == conversation_id)
+            {
+                lease.take();
+                true
+            } else {
+                false
+            }
         };
-        for (device_id, conversation_id) in &expired {
-            self.release_executors(
-                device_id,
-                conversation_id,
-                Some(executors::CAPABILITY_SCREEN),
-            );
+        if released {
+            self.computer().host().session(None);
         }
-        expired
-            .into_iter()
-            .map(|(_, conversation_id)| conversation_id)
-            .collect()
+        released
+    }
+
+    /// Ends a lease idle for [`SCREEN_IDLE`]; returns its conversation.
+    pub(crate) fn expire_screens(&self) -> Vec<String> {
+        let expired = {
+            let mut lease = self.inner.lease.lock().expect("desktop lease lock");
+            if lease
+                .as_ref()
+                .is_some_and(|lease| lease.last_used.elapsed() >= SCREEN_IDLE)
+            {
+                lease.take().map(|lease| lease.conversation_id)
+            } else {
+                None
+            }
+        };
+        if expired.is_some() {
+            self.computer().host().session(None);
+        }
+        expired.into_iter().collect()
     }
 
     pub(crate) fn approved_apps(&self, conversation_id: &str) -> Vec<String> {
@@ -393,17 +448,16 @@ impl AgentDesktop {
             .insert(bundle_id.to_owned());
     }
 
-    /// Tells `device_id`'s executors the conversation lost `capability`
-    /// (all of it when `None`).
-    fn release_executors(&self, device_id: &str, conversation_id: &str, capability: Option<&str>) {
-        let mut seen = HashSet::new();
-        for capability_name in [executors::CAPABILITY_BROWSER, executors::CAPABILITY_SCREEN] {
-            for executor in self.inner.executors.online(capability_name) {
-                if executor.device_id == device_id && seen.insert(executor.executor_id) {
-                    self.inner
-                        .executors
-                        .release(executor.executor_id, conversation_id, capability);
-                }
+    /// Tells `device_id`'s browser executors the conversation lost its
+    /// browser.
+    fn release_browser_executors(&self, device_id: &str, conversation_id: &str) {
+        for executor in self.inner.executors.online(executors::CAPABILITY_BROWSER) {
+            if executor.device_id == device_id {
+                self.inner.executors.release(
+                    executor.executor_id,
+                    conversation_id,
+                    Some(executors::CAPABILITY_BROWSER),
+                );
             }
         }
     }
@@ -422,7 +476,7 @@ impl AgentDesktop {
             .lock()
             .expect("desktop app lock")
             .remove(conversation_id);
-        let screen_ended = self.release_screen(conversation_id).is_some();
+        let screen_ended = self.release_screen(conversation_id);
         (grant, screen_ended)
     }
 
@@ -440,11 +494,7 @@ impl AgentDesktop {
             .lock()
             .expect("desktop port lock")
             .remove(conversation_id);
-        self.release_executors(
-            &grant.device_id,
-            conversation_id,
-            Some(executors::CAPABILITY_BROWSER),
-        );
+        self.release_browser_executors(&grant.device_id, conversation_id);
         Some(grant)
     }
 

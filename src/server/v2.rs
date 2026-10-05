@@ -7527,8 +7527,12 @@ mod tests {
         let (status, body) = send(signed_request(&device, "GET", "/v2/agent-desktop", "")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            body,
-            json!({ "enabled": false, "computerEnabled": false, "executors": [] })
+            (
+                body["enabled"].clone(),
+                body["computerEnabled"].clone(),
+                body["executors"].clone()
+            ),
+            (json!(false), json!(false), json!([]))
         );
         let (status, body) = send(signed_request(
             &device,
@@ -7561,6 +7565,9 @@ mod tests {
             (body["enabled"].clone(), body["computerEnabled"].clone()),
             (json!(true), json!(true))
         );
+        // Computer Use runs on this host; tests have no host UI to confirm.
+        assert!(body["computer"]["host"].is_string());
+        assert_eq!(body["computer"]["available"], false);
 
         let manifest = state
             .conversations
@@ -7590,10 +7597,7 @@ mod tests {
         };
         state.agent_desktop.set_grant(&manifest.id, x());
         state.agent_desktop.set_computer_grant(&manifest.id, x());
-        state
-            .agent_desktop
-            .claim_screen("dev_x", &manifest.id)
-            .unwrap();
+        state.agent_desktop.claim_screen(&manifest.id).unwrap();
         let (_, body) = send(signed_request(
             &device,
             "DELETE",
@@ -7604,10 +7608,7 @@ mod tests {
         assert_eq!(body["revoked"], true);
         assert!(state.agent_desktop.computer_grant(&manifest.id).is_none());
         assert!(state.agent_desktop.grant(&manifest.id).is_some());
-        assert!(state
-            .agent_desktop
-            .claim_screen("dev_x", "someone-else")
-            .is_ok());
+        assert!(state.agent_desktop.claim_screen("someone-else").is_ok());
         let (status, _) = send(signed_request(
             &device,
             "DELETE",
@@ -7621,6 +7622,16 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "desktop.browser.grant"
                 && event.payload["status"] == "revoked"));
+
+        // No live frame for a conversation not controlling the screen.
+        let (status, _) = send(signed_request(
+            &device,
+            "GET",
+            &format!("/v2/conversations/{}/agent-desktop/frame", manifest.id),
+            "",
+        ))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         let shot = state
             .agent_desktop

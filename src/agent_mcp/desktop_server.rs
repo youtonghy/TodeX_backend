@@ -35,10 +35,7 @@ use super::{
     AgentMcp, DESKTOP_ROUTE, DESKTOP_SERVER,
 };
 use crate::{
-    agent_desktop::{
-        executors::{CAPABILITY_BROWSER, CAPABILITY_SCREEN},
-        ExecutorError, Grant, InvokeRequest,
-    },
+    agent_desktop::{executors::CAPABILITY_BROWSER, ExecutorError, Grant, InvokeRequest},
     app_state::AppState,
     provider::{ConversationSupervisor, PermissionOutcome},
 };
@@ -77,18 +74,43 @@ pub(super) fn routes(state: &AppState) -> Router<AppState> {
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), guard))
 }
 
-/// Ends screen leases nobody used for a while, so the live view and the
-/// desktop's overlay go away. Stops once the server is gone.
+/// Ends screen leases nobody used for a while, and the one the person at
+/// the host stopped (pill or shortcut): that conversation also loses its
+/// grant, so its next call asks again. Stops once the server is gone.
 fn spawn_screen_sweeper(tools: &DesktopTools) {
     let weak = Arc::downgrade(&tools.granting);
     let desktop = tools.mcp.desktop().clone();
     let conversations = tools.conversations.clone();
+    let mut stops = crate::computer::host_ui::stop_requests();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(SCREEN_SWEEP_INTERVAL);
         loop {
-            interval.tick().await;
+            let stopped = tokio::select! {
+                _ = interval.tick() => false,
+                received = stops.recv() => !matches!(received, Err(tokio::sync::broadcast::error::RecvError::Closed)),
+            };
             if weak.upgrade().is_none() {
                 break;
+            }
+            if stopped {
+                if let Some(conversation_id) = desktop.screen_holder() {
+                    let (grant, _) = desktop.revoke_computer(&conversation_id);
+                    if grant.is_some() {
+                        if let Err(error) = conversations
+                            .append_agent_event(
+                                &conversation_id,
+                                "desktop.computer.grant",
+                                json!({ "status": "revoked", "reason": "user" }),
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error, "failed to journal a Computer Use stop");
+                        }
+                    }
+                    desktop_computer::journal_session_end(&conversations, &conversation_id, "user")
+                        .await;
+                }
+                continue;
             }
             for conversation_id in desktop.expire_screens() {
                 desktop_computer::journal_session_end(&conversations, &conversation_id, "idle")
@@ -104,13 +126,6 @@ pub(super) struct DesktopTools {
     pub(super) conversations: ConversationSupervisor,
     /// Conversation → lock, so concurrent first calls ask only once.
     pub(super) granting: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-}
-
-/// Which grant a tool needs.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum GrantFor {
-    Browser,
-    Computer,
 }
 
 #[derive(Debug, Deserialize)]
@@ -457,10 +472,7 @@ impl DesktopTools {
                 "TodeX desktop tools are turned off in the backend settings.".to_owned(),
             );
         }
-        let grant = match self
-            .ensure_grant(conversation_id, GrantFor::Browser, context)
-            .await
-        {
+        let grant = match self.ensure_grant(conversation_id, context).await {
             Ok(grant) => grant,
             Err(message) => return tool_error(message),
         };
@@ -618,61 +630,30 @@ impl DesktopTools {
         CallToolResult::success(content)
     }
 
-    /// The conversation's grant for `which`, asking the user (on an executor
-    /// device offering that capability) the first time.
+    /// The conversation's browser grant, asking the user (on an executor
+    /// device offering a browser) the first time.
     pub(super) async fn ensure_grant(
         &self,
         conversation_id: &str,
-        which: GrantFor,
         context: &RequestContext<RoleServer>,
     ) -> Result<Grant, String> {
         let desktop = self.mcp.desktop();
-        let current = |desktop: &crate::agent_desktop::AgentDesktop| match which {
-            GrantFor::Browser => desktop.grant(conversation_id),
-            GrantFor::Computer => desktop.computer_grant(conversation_id),
-        };
-        if let Some(grant) = current(desktop) {
+        if let Some(grant) = desktop.grant(conversation_id) {
             return Ok(grant);
         }
-        let lock = self
-            .granting
-            .lock()
-            .await
-            .entry(conversation_id.to_owned())
-            .or_default()
-            .clone();
-        let _asking = lock.lock().await;
-        if let Some(grant) = current(desktop) {
+        let _asking = self.granting_lock(conversation_id).await;
+        let _asking = _asking.lock().await;
+        if let Some(grant) = desktop.grant(conversation_id) {
             return Ok(grant);
         }
-        let (capability, kind, title, declined, event_type) = match which {
-            GrantFor::Browser => (
-                CAPABILITY_BROWSER,
-                GRANT_KIND,
-                "Allow the agent to use a browser on your desktop?",
-                "The user declined desktop browser access for this conversation.",
-                "desktop.browser.grant",
-            ),
-            GrantFor::Computer => (
-                CAPABILITY_SCREEN,
-                desktop_computer::GRANT_KIND,
-                "Allow the agent to control apps on your Mac (screen, pointer and keyboard)?",
-                "The user declined Computer Use for this conversation.",
-                "desktop.computer.grant",
-            ),
-        };
-        let mut executors = desktop.executors().online(capability);
+        let mut executors = desktop.executors().online(CAPABILITY_BROWSER);
         executors.dedup_by(|a, b| a.device_id == b.device_id);
         if executors.is_empty() {
-            return Err(match which {
-                GrantFor::Browser => "No TodeX desktop is connected to this backend as an executor. \
-                     Ask the user to open the TodeX desktop app with desktop tools on, then try again."
+            return Err(
+                "No TodeX desktop is connected to this backend as an executor. \
+                 Ask the user to open the TodeX desktop app with desktop tools on, then try again."
                     .to_owned(),
-                GrantFor::Computer => "No Mac is available for Computer Use. Ask the user to open TodeX \
-                     desktop on macOS 14 or later with \"This Mac allows Computer Use\" on and Screen \
-                     Recording and Accessibility granted."
-                    .to_owned(),
-            });
+            );
         }
         let devices: Vec<String> = executors
             .iter()
@@ -688,8 +669,8 @@ impl DesktopTools {
         let answer = self
             .ask(
                 conversation_id,
-                kind,
-                title.to_owned(),
+                GRANT_KIND,
+                "Allow the agent to use a browser on your desktop?".to_owned(),
                 details,
                 json!([
                     { "id": "allow", "kind": "allow_always", "name": "Allow for this conversation" },
@@ -704,7 +685,9 @@ impl DesktopTools {
             decision.outcome,
             PermissionOutcome::AllowAlways | PermissionOutcome::AllowOnce
         ) {
-            return Err(declined.to_owned());
+            return Err(
+                "The user declined desktop browser access for this conversation.".to_owned(),
+            );
         }
         let device_name = executors
             .iter()
@@ -715,15 +698,12 @@ impl DesktopTools {
             device_id,
             device_name,
         };
-        match which {
-            GrantFor::Browser => desktop.set_grant(conversation_id, grant.clone()),
-            GrantFor::Computer => desktop.set_computer_grant(conversation_id, grant.clone()),
-        }
+        desktop.set_grant(conversation_id, grant.clone());
         if let Err(error) = self
             .conversations
             .append_agent_event(
                 conversation_id,
-                event_type,
+                "desktop.browser.grant",
                 json!({ "status": "granted", "deviceId": grant.device_id, "deviceName": grant.device_name }),
             )
             .await
@@ -731,6 +711,16 @@ impl DesktopTools {
             tracing::warn!(%error, "failed to journal a desktop grant");
         }
         Ok(grant)
+    }
+
+    /// Per-conversation lock so concurrent first calls ask only once.
+    pub(super) async fn granting_lock(&self, conversation_id: &str) -> Arc<Mutex<()>> {
+        self.granting
+            .lock()
+            .await
+            .entry(conversation_id.to_owned())
+            .or_default()
+            .clone()
     }
 
     async fn confirm_sensitive(
@@ -921,7 +911,7 @@ mod tests {
             device.to_owned(),
             format!("{device} Mac"),
             "darwin".to_owned(),
-            vec![CAPABILITY_BROWSER.to_owned(), CAPABILITY_SCREEN.to_owned()],
+            vec![CAPABILITY_BROWSER.to_owned()],
             tx,
         );
         let executor_id = registration.executor_id();
@@ -955,31 +945,6 @@ mod tests {
                             "ok": false, "error": { "code": "SENSITIVE_ACTION", "message": "typing into a password field" }
                         })
                     }
-                    "computer_observe" => json!({ "ok": true, "result": {
-                        "app": { "name": "TextEdit", "bundleId": "com.apple.TextEdit", "pid": 7 },
-                        "windows": [], "displays": [],
-                        "tree": "- textArea \"Body\" [ref=e1]\n- secureTextField \"Password\" [ref=e2]", "truncated": false,
-                        "screenshot": { "mimeType": "image/jpeg", "data": BASE64.encode(b"screen"), "width": 1, "height": 1, "originX": 0, "originY": 0, "pointsPerPixel": 1 }
-                    } }),
-                    "computer_act"
-                        if !payload["args"]["allowedApps"]
-                            .as_array()
-                            .is_some_and(|apps| {
-                                apps.iter().any(|app| app == "com.apple.TextEdit")
-                            }) =>
-                    {
-                        json!({ "ok": false, "error": { "code": "APP_CONFIRM", "message": "first action in TextEdit",
-                            "detail": { "bundleId": "com.apple.TextEdit", "name": "TextEdit" } } })
-                    }
-                    "computer_act"
-                        if payload["args"]["ref"] == "e2"
-                            && payload["args"]["confirmed"] != true =>
-                    {
-                        json!({ "ok": false, "error": { "code": "SENSITIVE_ACTION", "message": "typing into a password field" } })
-                    }
-                    "computer_act" => json!({ "ok": true, "result": {
-                        "app": { "name": "TextEdit", "bundleId": "com.apple.TextEdit", "pid": 7 }, "path": "background"
-                    } }),
                     _ => {
                         json!({ "ok": true, "result": { "url": "http://localhost:5173/", "title": "Dev" } })
                     }
@@ -1183,9 +1148,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The host's Computer Use, scripted: answers confirmations from a
+    /// queue and acts like TextEdit with a password field.
+    #[derive(Default)]
+    struct FakeComputer {
+        answers: std::sync::Mutex<std::collections::VecDeque<Option<bool>>>,
+        confirmations: std::sync::Mutex<Vec<String>>,
+        sessions: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::computer::ComputerHost for FakeComputer {
+        fn status(&self) -> crate::computer::ComputerStatus {
+            crate::computer::ComputerStatus {
+                supported: true,
+                available: true,
+                reason: None,
+                host: "test-host".into(),
+                platform: "macos",
+                permissions: crate::computer::platform::Permissions {
+                    screen: true,
+                    accessibility: true,
+                },
+            }
+        }
+
+        async fn request_permissions(&self) -> crate::computer::ComputerStatus {
+            self.status()
+        }
+
+        async fn confirm(
+            &self,
+            title: String,
+            _message: String,
+            _timeout: Duration,
+        ) -> Option<bool> {
+            self.confirmations.lock().unwrap().push(title);
+            self.answers.lock().unwrap().pop_front().flatten()
+        }
+
+        async fn observe(&self, _args: Value) -> Result<Value, crate::computer::ComputerError> {
+            Ok(json!({
+                "app": { "name": "TextEdit", "bundleId": "com.apple.TextEdit", "pid": 7 },
+                "windows": [], "displays": [],
+                "tree": "- text_area \"Body\" [ref=e1]\n- text_field (password) \"Password\" [ref=e2]", "truncated": false,
+                "screenshot": { "mimeType": "image/jpeg", "data": BASE64.encode(b"screen"), "width": 1, "height": 1, "originX": 0, "originY": 0, "pointsPerPixel": 1 }
+            }))
+        }
+
+        async fn act(
+            &self,
+            args: Value,
+            allowed_apps: Vec<String>,
+            confirmed: bool,
+        ) -> Result<Value, crate::computer::ComputerError> {
+            if !allowed_apps.iter().any(|app| app == "com.apple.TextEdit") {
+                return Err(crate::computer::ComputerError {
+                    code: "APP_CONFIRM".into(),
+                    message: "first action in TextEdit".into(),
+                    detail: Some(json!({ "bundleId": "com.apple.TextEdit", "name": "TextEdit" })),
+                });
+            }
+            if args["ref"] == "e2" && !confirmed {
+                return Err(crate::computer::ComputerError::new(
+                    "SENSITIVE_ACTION",
+                    "typing into a password field",
+                ));
+            }
+            Ok(
+                json!({ "app": { "name": "TextEdit", "bundleId": "com.apple.TextEdit", "pid": 7 }, "path": "background" }),
+            )
+        }
+
+        async fn frame(
+            &self,
+            _max_width: u32,
+            _quality: u8,
+        ) -> Result<Vec<u8>, crate::computer::ComputerError> {
+            Ok(b"frame".to_vec())
+        }
+
+        fn session(&self, summary: Option<&str>) {
+            self.sessions
+                .lock()
+                .unwrap()
+                .push(summary.map(str::to_owned));
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn computer_use_needs_its_switch_grant_lease_and_app_approval() {
+    async fn computer_use_needs_its_switch_a_host_confirmed_grant_the_lease_and_app_approval() {
         let (root, state, conversation_id, client) = harness().await;
+        let fake = Arc::new(FakeComputer::default());
+        state
+            .agent_desktop
+            .set_computer(crate::computer::Computer::with_host(fake.clone()));
         let names = |tools: Vec<rmcp::model::Tool>| {
             tools
                 .into_iter()
@@ -1214,40 +1271,11 @@ mod tests {
                 .count(),
             3
         );
-        let (_executor, mut seen) = fake_executor(&state, "dev_mac");
 
-        // First use: a separate grant only the Mac can answer.
-        let observe = {
-            let client = client.clone();
-            tokio::spawn(async move { call(&client, "computer_observe", json!({})).await })
-        };
-        let grant =
-            pending_permission(&state, &conversation_id, desktop_computer::GRANT_KIND).await;
-        assert_eq!(grant["allowedDeviceIds"], json!(["dev_mac"]));
-        let grant_id = grant["permissionId"].as_str().unwrap();
-        assert!(state
-            .conversations
-            .resolve_permission_owned(
-                "local",
-                "dev_phone",
-                &conversation_id,
-                grant_id,
-                allow("allow", PermissionOutcome::AllowAlways)
-            )
-            .await
-            .is_err());
-        state
-            .conversations
-            .resolve_permission_owned(
-                "local",
-                "dev_mac",
-                &conversation_id,
-                grant_id,
-                allow("allow", PermissionOutcome::AllowAlways),
-            )
-            .await
-            .unwrap();
-        let observed = observe.await.unwrap();
+        // First use: the person at the host confirms there; no device
+        // prompt exists for it.
+        fake.answers.lock().unwrap().push_back(Some(true));
+        let observed = call(&client, "computer_observe", json!({})).await;
         assert!(
             text(&observed).contains("App: TextEdit"),
             "{}",
@@ -1257,10 +1285,35 @@ mod tests {
             .content
             .iter()
             .any(|block| block.as_image().is_some()));
+        assert_eq!(fake.confirmations.lock().unwrap().len(), 1);
+        assert_eq!(
+            state.agent_desktop.computer_grant(&conversation_id),
+            Some(Grant {
+                device_id: crate::agent_desktop::HOST_DEVICE_ID.into(),
+                device_name: "test-host".into()
+            })
+        );
+        assert!(!state
+            .conversations
+            .history_for_tests(&conversation_id)
+            .await
+            .iter()
+            .any(|event| event.event_type == "permission.requested"));
         // The browser grant is separate and still absent.
         assert!(state.agent_desktop.grant(&conversation_id).is_none());
+        // Live frames go to the controlling conversation only.
+        assert_eq!(
+            state
+                .agent_desktop
+                .live_frame(&conversation_id)
+                .await
+                .unwrap()
+                .as_slice(),
+            b"frame"
+        );
 
-        // Another conversation cannot take the screen while it is in use.
+        // Another conversation: the host declines, then (granted) it waits
+        // for the screen.
         let other = state
             .conversations
             .create_for_tests(
@@ -1269,14 +1322,12 @@ mod tests {
             )
             .await
             .unwrap();
-        state.agent_desktop.set_computer_grant(
-            &other.id,
-            Grant {
-                device_id: "dev_mac".into(),
-                device_name: "dev_mac Mac".into(),
-            },
-        );
         let other_client = client_for(&state, &other.id).await;
+        fake.answers.lock().unwrap().push_back(Some(false));
+        let declined = call(&other_client, "computer_observe", json!({})).await;
+        assert!(text(&declined).contains("DECLINED"), "{}", text(&declined));
+        assert!(state.agent_desktop.live_frame(&other.id).await.is_err());
+        fake.answers.lock().unwrap().push_back(Some(true));
         let busy = call(&other_client, "computer_observe", json!({})).await;
         assert!(text(&busy).contains("SCREEN_BUSY"), "{}", text(&busy));
 
@@ -1346,19 +1397,11 @@ mod tests {
             .unwrap();
         assert_ne!(typed.await.unwrap().is_error, Some(true));
 
-        // Done releases the screen: the Mac hears about it, the other
+        // Done releases the screen (the host hides its pill); the other
         // conversation may now take it.
         let done = call(&client, "computer_done", json!({})).await;
         assert!(text(&done).contains("returned"));
-        let mut released = false;
-        while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(2), seen.recv()).await
-        {
-            if frame["type"] == "executor.release" && frame["payload"]["capability"] == "screen" {
-                released = true;
-                break;
-            }
-        }
-        assert!(released);
+        assert_eq!(fake.sessions.lock().unwrap().last(), Some(&None));
         let now_free = call(&other_client, "computer_observe", json!({})).await;
         assert!(
             text(&now_free).contains("App: TextEdit"),
@@ -1370,12 +1413,15 @@ mod tests {
             .conversations
             .history_for_tests(&conversation_id)
             .await;
-        let sessions: Vec<&str> = events
-            .iter()
-            .filter(|event| event.event_type == "desktop.computer.session")
-            .map(|event| event.payload["status"].as_str().unwrap())
-            .collect();
-        assert_eq!(sessions, ["started", "ended"]);
+        let of = |kind: &str| -> Vec<String> {
+            events
+                .iter()
+                .filter(|event| event.event_type == kind)
+                .map(|event| event.payload["status"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(of("desktop.computer.grant"), ["requested", "granted"]);
+        assert_eq!(of("desktop.computer.session"), ["started", "ended"]);
         let actions: Vec<&Value> = events
             .iter()
             .filter(|event| event.event_type == "desktop.computer.action")
@@ -1383,18 +1429,22 @@ mod tests {
             .collect();
         assert_eq!(actions.len(), 4);
         assert!(actions[0]["shotId"].is_string());
+        assert_eq!(actions[0]["deviceName"], "test-host");
         assert_eq!(actions[1]["path"], "background");
         assert!(!events
             .iter()
             .any(|event| event.payload.to_string().contains("hunter2")));
 
-        // Turning Computer Use off ends the other conversation's session.
-        let (_, ended) = state
-            .agent_desktop
-            .update_settings(None, Some(false))
-            .await
-            .unwrap();
-        assert_eq!(ended, vec![other.id.clone()]);
+        // Stop on the host ends the holder's session and its grant.
+        crate::computer::host_ui::request_stop();
+        for _ in 0..100 {
+            if state.agent_desktop.screen_holder().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(state.agent_desktop.screen_holder(), None);
+        assert_eq!(state.agent_desktop.computer_grant(&other.id), None);
         let _ = client.cancel().await;
         let _ = other_client.cancel().await;
         let _ = std::fs::remove_dir_all(root);

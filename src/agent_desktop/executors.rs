@@ -26,9 +26,10 @@ use uuid::Uuid;
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Capability names an executor may announce.
 pub(crate) const CAPABILITY_BROWSER: &str = "browser";
-/// Computer Use: the desktop's screen, pointer and keyboard.
-pub(crate) const CAPABILITY_SCREEN: &str = "screen";
-const KNOWN_CAPABILITIES: &[&str] = &[CAPABILITY_BROWSER, CAPABILITY_SCREEN];
+const KNOWN_CAPABILITIES: &[&str] = &[CAPABILITY_BROWSER];
+/// Announced by desktops from before Computer Use moved into the daemon;
+/// accepted so their browser keeps working, and ignored.
+const RETIRED_CAPABILITIES: &[&str] = &["screen"];
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -126,6 +127,9 @@ impl Drop for Registration {
 pub(crate) fn validate_capabilities(capabilities: &[String]) -> Result<Vec<String>, String> {
     let mut accepted = Vec::new();
     for capability in capabilities {
+        if RETIRED_CAPABILITIES.contains(&capability.as_str()) {
+            continue;
+        }
         if !KNOWN_CAPABILITIES.contains(&capability.as_str()) {
             return Err(format!("unknown executor capability: {capability}"));
         }
@@ -553,7 +557,10 @@ mod tests {
             validate_capabilities(&["browser".into(), "browser".into()]).unwrap(),
             vec!["browser".to_owned()]
         );
-        assert!(validate_capabilities(&["screen".into()]).is_ok());
+        assert_eq!(
+            validate_capabilities(&["browser".into(), "screen".into()]).unwrap(),
+            vec!["browser".to_owned()]
+        );
         assert!(validate_capabilities(&["camera".into()]).is_err());
     }
 }
