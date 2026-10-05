@@ -64,6 +64,8 @@ const CONSENT_TIMEOUT: Duration = Duration::from_secs(120);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a window snapshot answers repeated lookups.
 const SNAPSHOT_TTL: Duration = Duration::from_millis(300);
+/// How long the output list answers repeated lookups.
+const DISPLAYS_TTL: Duration = Duration::from_secs(2);
 /// How long screenshots skip KWin after it refused one.
 const KWIN_RETRY: Duration = Duration::from_secs(30);
 /// How long Klipper keeps pasted text before the previous clipboard returns.
@@ -610,9 +612,24 @@ pub(super) fn snapshot() -> Result<Arc<KwinSnapshot>, String> {
     Ok(snapshot)
 }
 
+/// KWin's outputs, reused for [`DISPLAYS_TTL`]: live frames ask several
+/// times a second and outputs rarely change.
 pub(super) fn displays() -> Vec<Display> {
+    static DISPLAYS: Mutex<Option<(Instant, Vec<Display>)>> = Mutex::new(None);
+    let mut cached = DISPLAYS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, displays)) = cached.as_ref() {
+        if at.elapsed() < DISPLAYS_TTL {
+            return displays.clone();
+        }
+    }
     match snapshot() {
-        Ok(snapshot) => kde_desktop::displays(&snapshot),
+        Ok(snapshot) => {
+            let displays = kde_desktop::displays(&snapshot);
+            *cached = Some((Instant::now(), displays.clone()));
+            displays
+        }
         Err(error) => {
             eprintln!("todex-agentd: cannot list KWin outputs: {error}");
             Vec::new()
