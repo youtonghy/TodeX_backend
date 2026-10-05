@@ -35,10 +35,16 @@ const JOURNAL_LIFECYCLE_RESERVE_BYTES: u64 = 64 * 1024;
 /// Readers accept a journal that used its lifecycle reserve.
 const MAX_EVENTS_JOURNAL_READ_BYTES: u64 =
     MAX_EVENTS_JOURNAL_BYTES + JOURNAL_LIFECYCLE_RESERVE_BYTES;
-/// New prompts are refused above this size so a started turn always has
-/// headroom to append its events, including the terminal one, before the
-/// hard cap.
-const JOURNAL_PROMPT_LIMIT_BYTES: u64 = MAX_EVENTS_JOURNAL_BYTES - 1024 * 1024;
+/// Headroom a started turn may need before the hard cap, measured on real
+/// journals: the median turn writes ~0.5 MiB, p90 ~6 MiB, and the heaviest
+/// observed turn ~19 MiB of coalesced stream events. A 1 MiB reserve let
+/// such turns run into the cap mid-flight.
+const JOURNAL_TURN_HEADROOM_BYTES: u64 = 8 * 1024 * 1024;
+/// New prompts are refused above this size so a started turn keeps
+/// `JOURNAL_TURN_HEADROOM_BYTES` to append its events — including the
+/// terminal one — before the hard cap. Turns larger than the headroom rely
+/// on [`ConversationStore::compact_journal`] freeing space.
+const JOURNAL_PROMPT_LIMIT_BYTES: u64 = MAX_EVENTS_JOURNAL_BYTES - JOURNAL_TURN_HEADROOM_BYTES;
 /// On overflow the journal is rewritten below this target so the next bursts
 /// of events fit without compacting again on every append.
 const JOURNAL_COMPACT_TARGET_BYTES: u64 = MAX_EVENTS_JOURNAL_BYTES * 3 / 4;
@@ -54,6 +60,24 @@ const JOURNAL_SCAN_BUFFER_BYTES: usize = 256 * 1024;
 /// consecutive placeholders sharing `runStart` as one notice. Appends cannot
 /// forge it: [`validate_event_type`] rejects its upper-case letter.
 const JOURNAL_RECORD_LOST_EVENT: &str = "journal.recordLost";
+/// Marker written in place of each sequence whose record compaction stripped:
+/// it keeps the original sequence, event id, time and provider so line `N`
+/// still carries sequence `N` and no client ever waits on a gap. Its payload
+/// is `{reason, originalType, runStart, runLength}`; consecutive markers
+/// sharing `runStart` describe one stripped run. Appends cannot forge it:
+/// [`validate_event_type`] rejects the `journal.` prefix, and clients
+/// classify the type as unknown so the markers render nothing.
+const JOURNAL_COMPACTED_EVENT: &str = "journal.compacted";
+/// Streaming progress records whose content is durably repeated by the
+/// stream's terminal record (`*.completed`); compaction replaces them with
+/// [`JOURNAL_COMPACTED_EVENT`] markers since their payloads are dead weight
+/// in old history and rarely contain strings large enough to truncate.
+const JOURNAL_COMPACT_STRIP_TYPES: &[&str] = &[
+    "message.delta",
+    "thought.delta",
+    "tool.updated",
+    "subagent.updated",
+];
 /// Lower bound on the serialized size of any journal record (each carries a
 /// 36-byte event id, a 36-byte conversation id and an RFC 3339 time). Salvage
 /// uses it to bound how many sequences a corrupt region can have swallowed,
@@ -1310,11 +1334,13 @@ impl ConversationStore {
         Ok((Some(event), terminated))
     }
 
-    /// Free journal space without disturbing replay cursors: oversized payload
-    /// strings in older events are truncated in place while every event keeps
-    /// its sequence. The newest `JOURNAL_COMPACT_PROTECTED_BYTES` of events
-    /// stay byte-identical so recent history retains full fidelity. Callers
-    /// must hold the conversation lock.
+    /// Free journal space without disturbing replay cursors: every event
+    /// keeps its sequence. Older streaming records superseded by a terminal
+    /// record are replaced by [`JOURNAL_COMPACTED_EVENT`] markers, and
+    /// oversized payload strings in the rest are truncated in place. The
+    /// newest `JOURNAL_COMPACT_PROTECTED_BYTES` of events stay byte-identical
+    /// so recent history retains full fidelity. Callers must hold the
+    /// conversation lock.
     async fn compact_journal(&self, conversation_id: &str) -> Result<(), AppError> {
         let directory = self.directory(conversation_id)?;
         let path = directory.join(EVENTS_FILE);
@@ -1365,6 +1391,50 @@ impl ConversationStore {
             protected_from -= 1;
             protected += lines[protected_from].len() as u64 + 1;
         }
+        // Streaming progress records are dead weight once their stream's
+        // terminal record exists, and a journal built from them has no
+        // truncatable bulk: replace each unprotected one with a minimal
+        // `journal.compacted` marker that keeps its sequence position.
+        let mut compacted = 0usize;
+        let mut index = 0usize;
+        while index < protected_from {
+            if !JOURNAL_COMPACT_STRIP_TYPES.contains(&events[index].event_type.as_str()) {
+                index += 1;
+                continue;
+            }
+            let run_start = events[index].sequence;
+            let mut run_end = index + 1;
+            while run_end < protected_from
+                && JOURNAL_COMPACT_STRIP_TYPES.contains(&events[run_end].event_type.as_str())
+            {
+                run_end += 1;
+            }
+            let run_length = run_end - index;
+            for slot in index..run_end {
+                let original = &events[slot];
+                let mut marker = ConversationEvent::new(
+                    conversation_id,
+                    original.sequence,
+                    JOURNAL_COMPACTED_EVENT,
+                    serde_json::json!({
+                        "reason": "compacted",
+                        "originalType": original.event_type.as_str(),
+                        "runStart": run_start,
+                        "runLength": run_length,
+                    }),
+                );
+                marker.event_id.clone_from(&original.event_id);
+                marker.time = original.time;
+                marker.provider = original.provider;
+                marker.raw_type.clone_from(&original.raw_type);
+                let line = serde_json::to_vec(&marker)?;
+                total = total - lines[slot].len() as u64 + line.len() as u64;
+                events[slot] = marker;
+                lines[slot] = line;
+                compacted += 1;
+            }
+            index = run_end;
+        }
         // Truncate the bulkiest unprotected events first: the fewest possible
         // events lose payload fidelity before the journal fits again.
         let mut candidates: Vec<usize> = (0..protected_from).collect();
@@ -1382,7 +1452,7 @@ impl ConversationStore {
             lines[index] = line;
             truncated += 1;
         }
-        if truncated == 0 {
+        if compacted + truncated == 0 {
             self.incompressible
                 .insert(conversation_id.to_owned(), journal);
             return Ok(());
@@ -1411,9 +1481,10 @@ impl ConversationStore {
         }
         tracing::warn!(
             conversation_id,
+            compacted_events = compacted,
             truncated_events = truncated,
             journal_bytes = metadata.len(),
-            "conversation journal compacted: oversized payloads truncated"
+            "conversation journal compacted"
         );
         Ok(())
     }
@@ -1703,15 +1774,21 @@ fn validate_event(
             "conversation {conversation_id} journal continuity check failed at sequence {expected_sequence}"
         )));
     }
-    if event.event_type == JOURNAL_RECORD_LOST_EVENT {
+    if matches!(
+        event.event_type.as_str(),
+        JOURNAL_RECORD_LOST_EVENT | JOURNAL_COMPACTED_EVENT
+    ) {
         return Ok(());
     }
     validate_event_type(&event.event_type)
 }
 
 fn validate_event_type(event_type: &str) -> Result<(), AppError> {
+    // `journal.` is the store's internal namespace: markers it writes itself
+    // (record-loss placeholders, compaction markers) must not be appendable.
     let valid = !event_type.is_empty()
         && event_type.len() <= 96
+        && !event_type.starts_with("journal.")
         && event_type.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
         });
@@ -4026,9 +4103,11 @@ mod tests {
     }
 
     /// Hand-write a journal within `headroom` bytes of the hard cap whose
-    /// events carry `payload`, then recover so the store indexes it.
+    /// `event_type` records carry `payload`, then recover so the store
+    /// indexes it.
     async fn fill_journal(
         prefix: &str,
+        event_type: &str,
         payload: Value,
         headroom: u64,
     ) -> (PathBuf, ConversationStore, String) {
@@ -4055,7 +4134,7 @@ mod tests {
             let mut line = serde_json::to_vec(&ConversationEvent::new(
                 &manifest.id,
                 sequence + 1,
-                "provider.event",
+                event_type,
                 payload.clone(),
             ))
             .unwrap();
@@ -4077,8 +4156,13 @@ mod tests {
     async fn full_journal_refuses_new_prompts_but_running_turns_still_append() {
         // Bulk made of many short strings leaves nothing to compact.
         let items: Vec<String> = (0..3000).map(|index| format!("item-{index:05}")).collect();
-        let (root, store, id) =
-            fill_journal("todex-journal-full", json!({ "items": items }), 256 * 1024).await;
+        let (root, store, id) = fill_journal(
+            "todex-journal-full",
+            "provider.event",
+            json!({ "items": items }),
+            256 * 1024,
+        )
+        .await;
         let request = json!({ "turnId": "t" });
 
         let error = store.save_request(&id, &request).await.unwrap_err();
@@ -4110,7 +4194,13 @@ mod tests {
         // Many small events: nothing for compaction to shrink.
         let items: Vec<String> = (0..20).map(|index| format!("item-{index:02}")).collect();
         let payload = json!({ "items": items });
-        let (root, store, id) = fill_journal("todex-journal-reserve", payload.clone(), 0).await;
+        let (root, store, id) = fill_journal(
+            "todex-journal-reserve",
+            "provider.event",
+            payload.clone(),
+            0,
+        )
+        .await;
 
         // Ordinary events stay under the cap; closing the turn uses the reserve.
         assert!(matches!(
@@ -4186,6 +4276,7 @@ mod tests {
     async fn prompt_on_a_full_but_compactable_journal_compacts_and_proceeds() {
         let (root, store, id) = fill_journal(
             "todex-journal-full-compactable",
+            "provider.event",
             json!({ "output": "x".repeat(256 * 1024) }),
             256 * 1024,
         )
@@ -4198,6 +4289,100 @@ mod tests {
             .len();
         assert!(bytes <= JOURNAL_COMPACT_TARGET_BYTES);
         assert!(store.incompressible.get(&id).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_compacts_a_delta_filled_journal_into_markers() {
+        // A journal of small coalesced stream events has no truncatable
+        // strings; compaction must swap them for markers instead.
+        let (root, store, id) = fill_journal(
+            "todex-journal-delta-compact",
+            "message.delta",
+            json!({ "delta": "x".repeat(600), "turnId": "t" }),
+            256 * 1024,
+        )
+        .await;
+        let path = root.join("conversations").join(&id).join(EVENTS_FILE);
+        let last = store.get(&id).await.unwrap().last_sequence;
+
+        // A payload larger than the remaining headroom forces compaction.
+        let appended = store
+            .append(
+                &id,
+                "provider.event",
+                json!({ "output": "y".repeat(300 * 1024) }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(appended.sequence, last + 1);
+
+        let compacted = fs::metadata(&path).unwrap().len();
+        assert!(compacted <= JOURNAL_COMPACT_TARGET_BYTES);
+        assert!(store.incompressible.get(&id).is_none());
+
+        // Every sequence still occupies its line: stripped records became
+        // `journal.compacted` markers, the protected tail kept full fidelity.
+        let events = store.complete_history(&id).await.unwrap();
+        assert_eq!(events.len() as u64, last + 1);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.sequence, index as u64 + 1);
+        }
+        let markers = events[..last as usize]
+            .iter()
+            .filter(|event| event.event_type == JOURNAL_COMPACTED_EVENT)
+            .count();
+        let kept_deltas = events[..last as usize]
+            .iter()
+            .filter(|event| event.event_type == "message.delta")
+            .count();
+        assert_eq!(markers + kept_deltas, last as usize);
+        assert!(markers > 0 && kept_deltas > 0);
+        let marker = events[..last as usize]
+            .iter()
+            .find(|event| event.event_type == JOURNAL_COMPACTED_EVENT)
+            .unwrap();
+        assert_eq!(marker.payload["originalType"], "message.delta");
+        assert_eq!(marker.payload["reason"], "compacted");
+        let tail = &events[last as usize - 1];
+        assert_eq!(tail.event_type, "message.delta");
+        assert_eq!(tail.payload["delta"].as_str().unwrap().len(), 600);
+
+        // Markers are ordinary history for replay and stay on their sequence.
+        let page = store.replay(&id, marker.sequence - 1, 2).await.unwrap();
+        assert_eq!(page.events[0].sequence, marker.sequence);
+        assert_eq!(page.events[0].event_type, JOURNAL_COMPACTED_EVENT);
+
+        // A compacted journal validates cleanly on a cold open.
+        let restarted = ConversationStore::new(root.clone()).await.unwrap();
+        let (manifest, _) = restarted.recover_with_history(&id).await.unwrap();
+        assert_eq!(manifest.last_sequence, last + 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn journal_namespace_events_cannot_be_appended() {
+        let root = temp_dir("todex-journal-namespace");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        for event_type in [
+            JOURNAL_RECORD_LOST_EVENT,
+            JOURNAL_COMPACTED_EVENT,
+            "journal.anything",
+        ] {
+            assert!(matches!(
+                store.append(&manifest.id, event_type, json!({})).await,
+                Err(AppError::InvalidRequest(_))
+            ));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

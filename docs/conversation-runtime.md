@@ -142,13 +142,23 @@ rewritten with valid records unchanged and each lost sequence replaced by a
 `runStart`/`runLength` and take the previous valid event's time; their count
 is bounded by the corrupt bytes, and clients cannot append that event type.
 
-A journal above 63 MiB (64 MiB cap − 1 MiB headroom) that compaction cannot
-shrink refuses new prompts with `JOURNAL_FULL` (HTTP 507); running turns still
-append up to the cap. Events that close a turn or record a restart
-(`turn.*` terminals, `conversation.interrupted` / `failed`,
-`permission.resolved`, `provider.runtime` stopped) may use a further 64 KiB
-beyond it, and readers accept that reserve, so a turn whose many small events
-filled the journal can always be closed. Journals compaction could not shrink are remembered by
+On overflow the journal is compacted toward 75% of the cap. Older streaming
+progress records that a terminal record already covers (`message.delta`,
+`thought.delta`, `tool.updated`, `subagent.updated` — everything but the
+newest 16 MiB) are replaced by `journal.compacted` markers: minimal records
+keeping the original sequence, event id, time and provider with payload
+`{"reason": "compacted", "originalType", "runStart", "runLength"}` where one
+run shares `runStart`/`runLength`. Each sequence still occupies its line, so
+the cold index and replay cursors stay valid; clients classify the marker as
+an unknown type and render nothing. Any remaining oversized payload strings
+are then truncated largest-first as before. A journal above 56 MiB (64 MiB
+cap − 8 MiB headroom) that compaction cannot shrink refuses new prompts with
+`JOURNAL_FULL` (HTTP 507); running turns still append up to the cap. Events
+that close a turn or record a restart (`turn.*` terminals,
+`conversation.interrupted` / `failed`, `permission.resolved`,
+`provider.runtime` stopped) may use a further 64 KiB beyond it, and readers
+accept that reserve, so a turn whose many small events filled the journal can
+always be closed. Journals compaction could not shrink are remembered by
 (length, mtime) so they are not re-parsed on every attempt. Replay pages
 (`afterSequence`, `beforeSequence`, WebSocket subscribe backfill) stop at
 `limit` events or about 8 MiB of journal, whichever comes first, but always
