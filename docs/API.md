@@ -617,6 +617,7 @@ Computer Use 由 daemon 在**自己所在的主机**上执行（`src/computer`�
 - 实时画面：`GET /v2/conversations/{id}/agent-desktop/frame` → `{ mimeType, dataUrl }`，仅返回给当前持有屏幕租约的会话（否则 404）；最多每 300ms 截一次（宽 960、JPEG），多个观看者共享。客户端在预览可见时轮询，没有观看者时不截图。
 - 会话事件：`desktop.computer.session { status: "started"|"ended", deviceId?, deviceName?, reason? }`（reason：`done`、`idle`、`user`、`revoked`；`deviceId` 为 `host`，`deviceName` 为主机名）；`desktop.computer.action { actionId, tool, ok, summary, app?, windowTitle?, path?, error?, shotId?, deviceId, deviceName }`。事件不含截图数据与输入的文字。
 - `DELETE /v2/conversations/{id}/agent-desktop?capability=screen|browser` 只撤销其中一项；不带参数撤销两项。
+- 受控主机（daemon 所在电脑，`GET /v2/agent-desktop` 返回的 `computer { supported, available, reason, platform, permissions }` 反映这些条件）：macOS 14+（需屏幕录制与辅助功能授权；浮条 + ⌘⇧⎋ 停止）；Windows 需在已登录用户的交互式桌面运行（作为服务在 session 0 或桌面锁定时不可用；无需授权；置顶状态窗 + Ctrl+Alt+Shift+Esc 停止；坐标为物理像素，进程按 Per-Monitor-V2 DPI 感知；应用标识为小写可执行文件名，如 `notepad.exe`）；Linux 仅支持 X11 会话（KDE Plasma (X11) 实测目标，Wayland 后续版本支持；需 `DISPLAY`，辅助功能指 AT-SPI 的 `org.a11y.Status.IsEnabled`，请求授权时由 daemon 打开；状态与授权确认用桌面通知的“停止”/“允许”/“拒绝”按钮，无通知服务时退回 `kdialog`/`zenity`，没有全局停止快捷键；应用标识为小写可执行文件名）。Windows 与 Linux 上无元素的 `type` 与 `key` 会先把目标应用切到前台再模拟按键。
 
 ## WebSocket 协议
 
