@@ -28,6 +28,8 @@ use objc2_foundation::{NSLocale, NSObject, NSPoint, NSRect, NSSize, NSString};
 
 use super::Strings;
 
+pub(super) const STOP_SHORTCUT: Option<&str> = Some("⌘⇧⎋");
+
 /// `kCGStatusWindowLevel`: above normal and floating windows.
 const STATUS_LEVEL: isize = 25;
 const PILL_WIDTH: f64 = 380.0;

@@ -10,9 +10,19 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as native;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+use self::windows as native;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as native;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 mod other;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 use other as native;
 
 use std::{
@@ -24,6 +34,11 @@ use std::{
 };
 
 use tokio::sync::broadcast;
+
+/// The global shortcut that stops a session on this OS, as shown to
+/// people; `None` where the only stop control is the status
+/// notification's Stop action (Linux).
+pub(crate) const STOP_SHORTCUT: Option<&str> = native::STOP_SHORTCUT;
 
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
 static STOPS: OnceLock<broadcast::Sender<()>> = OnceLock::new();
@@ -99,7 +114,10 @@ pub(crate) fn confirm(title: &str, message: &str, timeout: Duration) -> Option<b
 pub(crate) struct Strings {
     pub controlling: &'static str,
     pub stop: &'static str,
+    // Windows message boxes label their buttons in the system language.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub allow: &'static str,
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub deny: &'static str,
 }
 

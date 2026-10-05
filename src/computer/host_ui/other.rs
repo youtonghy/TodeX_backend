@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use super::Strings;
 
+pub(super) const STOP_SHORTCUT: Option<&str> = None;
+
 pub(super) fn run_with_main_loop(body: impl FnOnce()) -> ! {
     body();
     unreachable!("the body exits the process")

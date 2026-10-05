@@ -4213,11 +4213,14 @@ dependencies = [
  "tungstenite",
  "uuid",
  "webpki-roots",
+ "windows",
+ "x11rb 0.14.0",
  "x25519-dalek",
  "xa11y",
  "xa11y-linux",
  "xa11y-macos",
  "xa11y-windows",
+ "zbus",
  "zeroize",
 ]
 

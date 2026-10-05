@@ -369,6 +369,8 @@ impl Engine {
             });
         let pointer_at = point.or(center);
 
+        let _injecting = (!matches!(action.as_str(), "wait" | "open_app" | "focus_window"))
+            .then(platform::injecting);
         let path = match action.as_str() {
             "click" | "right_click" => {
                 let background = point.is_none()
