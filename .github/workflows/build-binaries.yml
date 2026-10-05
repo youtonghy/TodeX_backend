@@ -140,6 +140,20 @@ jobs:
         with:
           ref: ${{ needs.source.outputs.sha }}
 
+      # macOS TCC keys Screen Recording and Accessibility grants for a bare binary
+      # to its code signature, so every release must be signed with the same
+      # identity or each auto-update silently drops the Computer Use permissions.
+      - name: Require macOS signing certificate
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+        run: |
+          if [[ -z "${CSC_LINK}" ]]; then
+            echo "MAC_CSC_LINK must contain a code signing certificate (Developer ID Application or self-signed) so macOS Computer Use permissions survive auto-updates." >&2
+            exit 1
+          fi
+
       - name: Setup Rust
         shell: bash
         run: |
@@ -169,6 +183,140 @@ jobs:
             objcopy --strip-debug "target/${CARGO_TARGET}/release/todex-agentd"
           else
             cargo build --release --locked
+          fi
+
+      - name: Import macOS signing certificate
+        id: signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          KEYCHAIN_PATH: ${{ runner.temp }}/todex-signing.keychain-db
+        run: |
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "${workdir}"' EXIT
+          printf '%s' "${CSC_LINK}" | base64 --decode > "${workdir}/signing.p12"
+
+          keychain_password="$(openssl rand -base64 32)"
+          echo "::add-mask::${keychain_password}"
+          security create-keychain -p "${keychain_password}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${keychain_password}" "${KEYCHAIN_PATH}"
+          # Prepend to the user search list so codesign can find the identity.
+          search_list=("${KEYCHAIN_PATH}")
+          while IFS= read -r keychain; do
+            keychain="${keychain//\"/}"
+            keychain="${keychain#"${keychain%%[![:space:]]*}"}"
+            if [[ -n "${keychain}" ]]; then
+              search_list+=("${keychain}")
+            fi
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "${search_list[@]}"
+          security import "${workdir}/signing.p12" -k "${KEYCHAIN_PATH}" -f pkcs12 \
+            -P "${CSC_KEY_PASSWORD}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "${keychain_password}" "${KEYCHAIN_PATH}" >/dev/null
+
+          # Without -v so an untrusted self-signed identity is listed too; such lines
+          # end with a trust error such as (CSSMERR_TP_NOT_TRUSTED).
+          identities="$(security find-identity -p codesigning "${KEYCHAIN_PATH}" \
+            | sed -nE 's/^ *[0-9]+\) ([0-9A-F]{40}) "([^"]*)".*$/\1 \2/p' | sort -u)"
+          identity_count="$(grep -c . <<<"${identities}" || true)"
+          if [[ "${identity_count}" -ne 1 ]]; then
+            echo "MAC_CSC_LINK must contain exactly one code signing identity; found ${identity_count}." >&2
+            exit 1
+          fi
+          identity_hash="${identities%% *}"
+          identity_name="${identities#* }"
+
+          developer_id=false
+          if [[ "${identity_name}" == "Developer ID Application:"* ]]; then
+            developer_id=true
+          else
+            # codesign rejects an untrusted certificate, so trust the self-signed
+            # one for code signing on this ephemeral runner, like the desktop release.
+            security find-certificate -c "${identity_name}" -p "${KEYCHAIN_PATH}" > "${workdir}/signing.pem"
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign "${workdir}/signing.pem"
+          fi
+          if ! security find-identity -v -p codesigning "${KEYCHAIN_PATH}" | grep -q "${identity_hash}"; then
+            echo "Signing identity ${identity_name} is not valid for code signing." >&2
+            exit 1
+          fi
+
+          echo "Signing identity: ${identity_name} (${identity_hash}); Developer ID: ${developer_id}"
+          echo "identity=${identity_hash}" >> "${GITHUB_OUTPUT}"
+          echo "developer_id=${developer_id}" >> "${GITHUB_OUTPUT}"
+
+      # Signs in place before packaging, so the archive, the raw update asset, and
+      # SHA256SUMS (computed in the release job) all cover the signed binary.
+      - name: Sign macOS binary
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SIGNING_IDENTITY: ${{ steps.signing.outputs.identity }}
+          DEVELOPER_ID: ${{ steps.signing.outputs.developer_id }}
+          KEYCHAIN_PATH: ${{ runner.temp }}/todex-signing.keychain-db
+          BINARY_PATH: target/release/todex-agentd
+          SIGNING_IDENTIFIER: com.unbaked0692.todex.agentd
+        run: |
+          sign() {
+            codesign --force --options runtime "$1" --identifier "${SIGNING_IDENTIFIER}" \
+              --keychain "${KEYCHAIN_PATH}" --sign "${SIGNING_IDENTITY}" "${BINARY_PATH}"
+          }
+          # A secure timestamp needs Apple's timestamp server and is mandatory for
+          # notarization. TCC grants do not depend on it, so a self-signed build
+          # falls back to no timestamp when the server rejects or cannot be reached.
+          if ! sign --timestamp; then
+            if [[ "${DEVELOPER_ID}" == "true" ]]; then
+              echo "Timestamped signing failed; Developer ID builds require a secure timestamp." >&2
+              exit 1
+            fi
+            echo "::warning::Timestamped signing failed; signing the self-signed build without a timestamp."
+            sign --timestamp=none
+          fi
+
+          codesign --verify --strict --verbose=2 "${BINARY_PATH}"
+          details="$(codesign -dv --verbose=2 "${BINARY_PATH}" 2>&1)"
+          echo "${details}"
+          if ! grep -qx "Identifier=${SIGNING_IDENTIFIER}" <<<"${details}" \
+            || ! grep -q '(runtime)' <<<"${details}" \
+            || grep -q '^Signature=adhoc' <<<"${details}"; then
+            echo "Signed binary lacks the expected identifier, hardened runtime, or certificate." >&2
+            exit 1
+          fi
+
+      # Bare executables cannot be stapled; Gatekeeper looks the ticket up online.
+      - name: Notarize macOS binary
+        if: runner.os == 'macOS' && steps.signing.outputs.developer_id == 'true'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          BINARY_PATH: target/release/todex-agentd
+        run: |
+          if [[ -z "${APPLE_ID}" || -z "${APPLE_APP_SPECIFIC_PASSWORD}" || -z "${APPLE_TEAM_ID}" ]]; then
+            echo "::warning::APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, or APPLE_TEAM_ID is missing; skipping notarization."
+            exit 0
+          fi
+
+          archive="${RUNNER_TEMP}/todex-agentd-notarize.zip"
+          ditto -c -k --keepParent "${BINARY_PATH}" "${archive}"
+          credentials=(--apple-id "${APPLE_ID}" --password "${APPLE_APP_SPECIFIC_PASSWORD}" --team-id "${APPLE_TEAM_ID}")
+          submit_status=0
+          result="$(xcrun notarytool submit "${archive}" "${credentials[@]}" --wait --output-format json)" || submit_status=$?
+          rm -f "${archive}"
+          echo "${result}"
+          submission_id="$(jq -r '.id // empty' <<<"${result}" 2>/dev/null || true)"
+          status="$(jq -r '.status // empty' <<<"${result}" 2>/dev/null || true)"
+          if [[ "${submit_status}" -ne 0 || "${status}" != "Accepted" ]]; then
+            echo "Notarization failed (exit ${submit_status}, status ${status:-unknown})." >&2
+            if [[ -n "${submission_id}" ]]; then
+              xcrun notarytool log "${submission_id}" "${credentials[@]}" \
+                || echo "Could not fetch the notarization log for ${submission_id}." >&2
+            fi
+            exit 1
           fi
 
       - name: Verify glibc compatibility
@@ -244,6 +392,16 @@ jobs:
             ${{ steps.package.outputs.update_path }}
           if-no-files-found: error
           retention-days: 7
+
+      - name: Delete macOS signing keychain
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        env:
+          KEYCHAIN_PATH: ${{ runner.temp }}/todex-signing.keychain-db
+        run: |
+          if [[ -f "${KEYCHAIN_PATH}" ]]; then
+            security delete-keychain "${KEYCHAIN_PATH}"
+          fi
 
   release:
     name: Publish GitHub Release
