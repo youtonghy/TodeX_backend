@@ -35,6 +35,46 @@ use self::{
 };
 use crate::error::AppError;
 
+/// `todex-agentd browser install`: downloads the pinned Chromium now,
+/// printing progress.
+pub(crate) async fn install_cli(data_dir: &Path) -> anyhow::Result<()> {
+    let installer = Installer::new(data_dir);
+    if let Some(path) = installer.executable() {
+        println!(
+            "Chromium {} is installed: {}",
+            install::CHROMIUM_VERSION,
+            path.display()
+        );
+        return Ok(());
+    }
+    let watcher = installer.clone();
+    let progress = tokio::spawn(async move {
+        let mut last = -1i64;
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if let Some(progress) = watcher.state().progress {
+                let percent = (progress * 100.0) as i64;
+                if percent != last {
+                    println!(
+                        "Downloading Chromium {}: {percent}%",
+                        install::CHROMIUM_VERSION
+                    );
+                    last = percent;
+                }
+            }
+        }
+    });
+    let result = installer.install().await;
+    progress.abort();
+    let path = result.map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    println!(
+        "Chromium {} installed: {}",
+        install::CHROMIUM_VERSION,
+        path.display()
+    );
+    Ok(())
+}
+
 /// The daemon's own port: never opened in the agent browser.
 static DAEMON_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
 

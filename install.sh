@@ -12,6 +12,7 @@
 #   --version X.Y.Z   Install a specific release instead of the latest
 #   --prefix DIR      Install directory (default: ~/.local/bin, or $TODEX_INSTALL_DIR)
 #   --purge           With uninstall: also remove the data directory (~/.todex-agent)
+#   --with-browser    With install/update: also download the agent browser's Chromium now
 #   --yes             Skip confirmations (required for --purge without a terminal)
 #   --help            Show this help
 #
@@ -33,6 +34,7 @@ COMMAND=""
 PIN_VERSION=""
 PURGE=0
 ASSUME_YES=0
+WITH_BROWSER=0
 INSTALL_DIR=""
 DATA_DIR=""
 BIN_PATH=""
@@ -71,6 +73,8 @@ Options:
   --version X.Y.Z   Install a specific release instead of the latest
   --prefix DIR      Install directory (default: ~/.local/bin, or $TODEX_INSTALL_DIR)
   --purge           With uninstall: also remove the data directory (~/.todex-agent)
+  --with-browser    With install/update: also download the agent browser's
+                    Chromium now (otherwise it downloads on first use)
   --yes             Skip confirmations (required for --purge without a terminal)
   --help            Show this help
 
@@ -102,6 +106,7 @@ parse_args() {
                 INSTALL_DIR="${1#--prefix=}"
                 [[ -n "$INSTALL_DIR" ]] || die "--prefix requires a value" ;;
             --purge) PURGE=1 ;;
+            --with-browser) WITH_BROWSER=1 ;;
             --yes|-y) ASSUME_YES=1 ;;
             --help|-h) usage; exit 0 ;;
             *) die "unknown argument: $1 (try --help)" ;;
@@ -113,6 +118,9 @@ parse_args() {
 
     if [[ "$PURGE" == 1 && "$COMMAND" != "uninstall" ]]; then
         die "--purge is only valid with uninstall"
+    fi
+    if [[ "$WITH_BROWSER" == 1 && "$COMMAND" != "install" && "$COMMAND" != "update" ]]; then
+        die "--with-browser is only valid with install or update"
     fi
     [[ -z "$PIN_VERSION" ]] || [[ "$PIN_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
         || die "--version must be a stable version like 1.2.3"
@@ -534,6 +542,14 @@ cmd_status() {
     printf 'Data dir    : %s\n' "$DATA_DIR"
 }
 
+# The agent browser's pinned Chromium (verified by the daemon binary).
+install_browser() {
+    [[ "$WITH_BROWSER" == 1 ]] || return 0
+    info "Downloading the agent browser (Chromium)"
+    "$BIN_PATH" browser install --data-dir "$DATA_DIR" \
+        || warn "Chromium could not be installed now; it downloads on first use"
+}
+
 main() {
     parse_args "$@"
     : "${HOME:?HOME must be set}"
@@ -554,8 +570,8 @@ main() {
     fi
 
     case "$COMMAND" in
-        install)   cmd_install ;;
-        update)    cmd_update ;;
+        install)   cmd_install; install_browser ;;
+        update)    cmd_update; install_browser ;;
         uninstall) cmd_uninstall ;;
         status)    cmd_status ;;
     esac

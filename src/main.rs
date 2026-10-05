@@ -77,6 +77,11 @@ enum Command {
     },
     #[command(about = "Show the backend repository, version, and update status")]
     About,
+    #[command(about = "Manage the agent browser's Chromium")]
+    Browser {
+        #[command(subcommand)]
+        command: BrowserCommand,
+    },
     #[command(name = "daemon-run", hide = true)]
     DaemonRun(ServeArgs),
     /// Stdio MCP bridge TodeX injects into agents for its tools.
@@ -119,6 +124,15 @@ enum AutostartCommand {
     Disable,
     #[command(about = "Show whether the daemon launches at login")]
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum BrowserCommand {
+    #[command(about = "Download and verify the Chromium this release pins")]
+    Install {
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -187,6 +201,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             daemon_command(command).await
         }
         Command::Doctor { command } => doctor_command(command).await,
+        Command::Browser {
+            command: BrowserCommand::Install { data_dir },
+        } => {
+            let config = Config::load_read_only(ServeArgs {
+                host: None,
+                port: None,
+                data_dir,
+                workspace_root: Vec::new(),
+                history_retention_days: None,
+            })?;
+            agent_browser::install_cli(&config.data_dir).await
+        }
         Command::Update { check, args } => {
             if !check && update::enabled() {
                 let config = Config::load_read_only(args)?;
