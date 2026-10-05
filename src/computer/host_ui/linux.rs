@@ -2,13 +2,18 @@
 //! (KDE Plasma shows them with action buttons): a persistent notification
 //! with a Stop action while an agent is in control, and a notification with
 //! Allow/Deny for confirmations, falling back to `kdialog` or `zenity`
-//! when no notification server offers actions. There is no overlay, no
-//! pointer marker and no global stop shortcut.
+//! when no notification server offers actions. There is no overlay and no
+//! pointer marker. On KDE Plasma Wayland, Ctrl+Alt+Shift+Esc registered
+//! with KGlobalAccel also stops a session; elsewhere there is no global
+//! stop shortcut.
 
 use std::{
     collections::HashMap,
     process::{Command, Stdio},
-    sync::{mpsc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -22,7 +27,14 @@ use zbus::{
 use super::Strings;
 use crate::computer::platform::{plain_proxy, session_bus};
 
-pub(super) const STOP_SHORTCUT: Option<&str> = None;
+/// Whether KGlobalAccel took the stop shortcut.
+static SHORTCUT_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn stop_shortcut() -> Option<&'static str> {
+    SHORTCUT_REGISTERED
+        .load(Ordering::SeqCst)
+        .then_some(kglobalaccel::SHORTCUT_LABEL)
+}
 
 const SERVICE: &str = "org.freedesktop.Notifications";
 const PATH: &str = "/org/freedesktop/Notifications";
@@ -44,10 +56,21 @@ static WAITERS: Mutex<Option<HashMap<u32, mpsc::Sender<Event>>>> = Mutex::new(No
 static CONFIRMING: Mutex<()> = Mutex::new(());
 
 pub(super) fn run_with_main_loop(body: impl FnOnce()) -> ! {
-    if std::env::var_os("DISPLAY").is_some() {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if wayland || std::env::var_os("DISPLAY").is_some() {
         match session_bus() {
             Some(bus) => match listen(bus) {
-                Ok(()) => super::mark_available(),
+                Ok(()) => {
+                    super::mark_available();
+                    if wayland && kglobalaccel::kde_desktop() {
+                        match kglobalaccel::register() {
+                            Ok(()) => SHORTCUT_REGISTERED.store(true, Ordering::SeqCst),
+                            Err(error) => eprintln!(
+                                "todex-agentd: no Computer Use stop shortcut (KGlobalAccel): {error}"
+                            ),
+                        }
+                    }
+                }
                 Err(error) => {
                     eprintln!("todex-agentd: Computer Use host UI unavailable: {error}");
                 }
@@ -345,4 +368,114 @@ fn confirm_by_dialog(strings: &Strings, title: &str, message: &str, timeout: Dur
         "todex-agentd: no notification server with actions, kdialog or zenity to confirm Computer Use"
     );
     false
+}
+
+/// The stop shortcut through KDE's global shortcut service, which Wayland
+/// clients cannot grab keys without.
+mod kglobalaccel {
+    use std::time::Duration;
+
+    use zbus::{
+        blocking::{Connection as Bus, MessageIterator},
+        message::Type as MessageType,
+        MatchRule,
+    };
+
+    pub(super) const SHORTCUT_LABEL: &str = "Ctrl+Alt+Shift+Esc";
+
+    const SERVICE: &str = "org.kde.kglobalaccel";
+    const INTERFACE: &str = "org.kde.KGlobalAccel";
+    const COMPONENT: &str = "todex-agentd";
+    const ACTION: &str = "stop-computer-use";
+    /// Qt::ControlModifier | Qt::AltModifier | Qt::ShiftModifier | Qt::Key_Escape.
+    const STOP_KEYS: i32 = 0x0400_0000 | 0x0800_0000 | 0x0200_0000 | 0x0100_0000;
+    /// KGlobalAccel's setter flags.
+    const IS_DEFAULT: u32 = 1;
+    const SET_PRESENT: u32 = 2;
+
+    pub(super) fn kde_desktop() -> bool {
+        std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktops| {
+            desktops
+                .split(':')
+                .any(|desktop| desktop.trim().eq_ignore_ascii_case("kde"))
+        })
+    }
+
+    /// Registers the action and its default keys (a shortcut the user
+    /// re-bound in System Settings is kept), then forwards presses to
+    /// [`super::super::request_stop`].
+    pub(super) fn register() -> Result<(), String> {
+        let bus = zbus::blocking::connection::Builder::session()
+            .and_then(|builder| builder.method_timeout(Duration::from_secs(5)).build())
+            .map_err(|error| error.to_string())?;
+        let id = [COMPONENT, ACTION, "TodeX", "Stop Computer Use"];
+        call::<_, ()>(&bus, "doRegister", &(id,))?;
+        // QKeySequence travels as `(ai)`: up to four combined key codes.
+        let keys = vec![(vec![STOP_KEYS, 0, 0, 0],)];
+        let assigned = match call::<_, Vec<(Vec<i32>,)>>(
+            &bus,
+            "setShortcutKeys",
+            &(id, keys.clone(), SET_PRESENT),
+        ) {
+            Ok(assigned) => {
+                call::<_, Vec<(Vec<i32>,)>>(&bus, "setShortcutKeys", &(id, keys, IS_DEFAULT))?;
+                assigned
+                    .iter()
+                    .any(|(sequence,)| sequence.iter().any(|key| *key != 0))
+            }
+            // KGlobalAccel before KF 5.90 only knows plain key codes.
+            Err(_) => {
+                let assigned =
+                    call::<_, Vec<i32>>(&bus, "setShortcut", &(id, vec![STOP_KEYS], SET_PRESENT))?;
+                call::<_, Vec<i32>>(&bus, "setShortcut", &(id, vec![STOP_KEYS], IS_DEFAULT))?;
+                assigned.iter().any(|key| *key != 0)
+            }
+        };
+        if !assigned {
+            return Err(format!("{SHORTCUT_LABEL} is taken by another action"));
+        }
+        let rule = MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .interface("org.kde.kglobalaccel.Component")
+            .and_then(|rule| rule.member("globalShortcutPressed"))
+            .map_err(|error| error.to_string())?
+            .build();
+        let presses =
+            MessageIterator::for_match_rule(rule, &bus, None).map_err(|error| error.to_string())?;
+        std::thread::Builder::new()
+            .name("todex-stop-shortcut".to_owned())
+            .spawn(move || {
+                for message in presses.flatten() {
+                    let Ok((component, action, _timestamp)) =
+                        message.body().deserialize::<(String, String, i64)>()
+                    else {
+                        continue;
+                    };
+                    if component == COMPONENT && action == ACTION {
+                        super::super::request_stop();
+                    }
+                }
+                eprintln!("todex-agentd: the Computer Use stop shortcut stopped listening");
+            })
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn call<B, R>(bus: &Bus, method: &str, body: &B) -> Result<R, String>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+        R: serde::de::DeserializeOwned + zbus::zvariant::Type,
+    {
+        bus.call_method(
+            Some(SERVICE),
+            "/kglobalaccel",
+            Some(INTERFACE),
+            method,
+            body,
+        )
+        .map_err(|error| format!("{method}: {error}"))?
+        .body()
+        .deserialize::<R>()
+        .map_err(|error| format!("{method} replied unexpectedly: {error}"))
+    }
 }

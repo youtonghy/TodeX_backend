@@ -37,8 +37,18 @@ use tokio::sync::broadcast;
 
 /// The global shortcut that stops a session on this OS, as shown to
 /// people; `None` where the only stop control is the status
-/// notification's Stop action (Linux).
-pub(crate) const STOP_SHORTCUT: Option<&str> = native::STOP_SHORTCUT;
+/// notification's Stop action (Linux outside KDE Plasma Wayland, or when
+/// KDE refused the shortcut).
+pub(crate) fn stop_shortcut() -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        native::stop_shortcut()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        native::STOP_SHORTCUT
+    }
+}
 
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
 static STOPS: OnceLock<broadcast::Sender<()>> = OnceLock::new();

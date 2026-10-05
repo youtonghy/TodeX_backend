@@ -690,7 +690,7 @@ fn grant_prompt(conversation_title: Option<&str>) -> (String, String) {
         };
         (
             "允许 Agent 控制这台电脑？".to_owned(),
-            format!("{subject}请求使用这台电脑的屏幕、鼠标和键盘。它看不到也碰不到 TodeX、钥匙串与密码管理器；{}", match host_ui::STOP_SHORTCUT {
+            format!("{subject}请求使用这台电脑的屏幕、鼠标和键盘。它看不到也碰不到 TodeX、钥匙串与密码管理器；{}", match host_ui::stop_shortcut() {
                 Some(shortcut) => format!("你可以随时用浮条上的“停止”或 {shortcut} 收回控制。"),
                 None => "你可以随时用通知里的“停止”收回控制。".to_owned(),
             }),
@@ -703,7 +703,7 @@ fn grant_prompt(conversation_title: Option<&str>) -> (String, String) {
         };
         (
             "Allow an agent to control this computer?".to_owned(),
-            format!("{subject} asks to use this computer's screen, pointer and keyboard. It can never touch TodeX, credential stores or password managers; {}", match host_ui::STOP_SHORTCUT {
+            format!("{subject} asks to use this computer's screen, pointer and keyboard. It can never touch TodeX, credential stores or password managers; {}", match host_ui::stop_shortcut() {
                 Some(shortcut) => format!("Stop on the pill or {shortcut} takes control back at any time."),
                 None => "Stop in the notification takes control back at any time.".to_owned(),
             }),
