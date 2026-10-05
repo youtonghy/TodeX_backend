@@ -115,9 +115,11 @@ journal ending in a sealed segment, which the next append recreates the active
 file for. Sequence `N` is still global journal line `N` across all files, so
 replay cursors, the cold index and `journal.*` placeholder semantics are
 unchanged; a legacy single `events.jsonl` is simply a journal of one active
-segment. Compaction and salvage rewrites collapse the journal back into one
-`events.jsonl` and unlink the sealed files. Its in-memory sequence/offset
-index is rebuildable and records `(segment, start, end)` per record. A local
+segment. Salvage rewrites collapse the journal back into one `events.jsonl`
+and unlink the sealed files; compaction instead rewrites each segment in
+place and merges adjacent sealed segments that fit one target size, keeping
+the file count bounded. Its in-memory sequence/offset index is rebuildable
+and records `(segment, start, end)` per record. A local
 debug fixture with 200 events per page measured
 1,000 events at 66.09 ms for repeated full parsing versus 22.12 ms cold / 8.49 ms
 warm indexing; 10,000 events measured 6084.97 ms versus 199.97 / 78.05 ms. These
@@ -156,7 +158,10 @@ A corrupt tail may span several trailing segments: wholly corrupt sealed files
 are deleted, the file containing the last valid record is truncated, and an
 empty `events.jsonl` is kept so the journal still ends in its active file.
 
-On overflow the journal is compacted toward 75% of the cap. Older streaming
+The journal has no total capacity limit: every append lands, so a running
+turn can always finish, and forks can carry histories of any size. The only
+gate is on new prompts. Once an append or a prompt would push the journal
+past 56 MiB, a compaction pass runs segment by segment: older streaming
 progress records that a terminal record already covers (`message.delta`,
 `thought.delta`, `tool.updated`, `subagent.updated` — everything but the
 newest 16 MiB) are replaced by `journal.compacted` markers: minimal records
@@ -165,16 +170,14 @@ keeping the original sequence, event id, time and provider with payload
 run shares `runStart`/`runLength`. Each sequence still occupies its line, so
 the cold index and replay cursors stay valid; clients classify the marker as
 an unknown type and render nothing. Any remaining oversized payload strings
-are then truncated largest-first as before. A journal above 56 MiB (64 MiB
-cap − 8 MiB headroom) that compaction cannot shrink refuses new prompts with
-`JOURNAL_FULL` (HTTP 507); running turns still append up to the cap. Events
-that close a turn or record a restart (`turn.*` terminals,
-`conversation.interrupted` / `failed`, `permission.resolved`,
-`provider.runtime` stopped) may use a further 64 KiB beyond it, and readers
-accept that reserve, so a turn whose many small events filled the journal can
-always be closed. Journals compaction could not shrink are remembered by
-their ordered file fingerprint `(name, length, mtime)` so they are not
-re-parsed on every attempt. Replay pages
+are then truncated largest-first, oldest files first, until the journal fits
+48 MiB or nothing more can shrink. Only files that actually change are
+rewritten, in place and atomically; adjacent sealed segments that fit one
+8 MiB target are concatenated so the file count stays bounded, and a
+sealed segment processed in full is remembered by its `(name, length,
+mtime)` fingerprint so later passes skip it. A journal still above 56 MiB
+after compaction refuses new prompts with `JOURNAL_FULL` (HTTP 507) — start
+a new conversation — while appends keep landing regardless. Replay pages
 (`afterSequence`, `beforeSequence`, WebSocket subscribe backfill) stop at
 `limit` events or about 8 MiB of journal, whichever comes first, but always
 hold at least one event; clients keep paging while `hasMore`.

@@ -2729,9 +2729,7 @@ mod tests {
 
     use super::*;
     use crate::config::{AcpProfileConfig, AgentConfig, PairingEncryption, SecurityConfig};
-    use crate::conversation::{
-        ConversationEvent, ConversationEventHub, ConversationStore, MAX_EVENTS_JOURNAL_BYTES,
-    };
+    use crate::conversation::{ConversationEvent, ConversationEventHub, ConversationStore};
 
     async fn trust_store(
         config: &Config,
@@ -4057,9 +4055,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_all_skips_a_conversation_whose_journal_cannot_grow() {
+    async fn recover_all_recovers_a_journal_past_the_prompt_limit() {
         let (root, store, supervisor, workspace) =
-            control_fixture("todex-recover-full-journal").await;
+            control_fixture("todex-recover-big-journal").await;
         let healthy = store
             .create(ConversationManifest::new(
                 ProviderKind::Codex,
@@ -4075,54 +4073,28 @@ mod tests {
             .unwrap();
 
         // A journal packed with small strings has nothing compaction can
-        // truncate; once it reaches the cap, recovery bookkeeping cannot be
-        // appended but startup must still recover the other journals.
+        // shrink. Over the prompt limit it refuses new turns, but recovery
+        // bookkeeping still appends and startup recovers every journal.
         let wedged = ConversationManifest::new(ProviderKind::Codex, workspace, None, None);
         let wedged_id = wedged.id.clone();
         let chunk = "x".repeat(3900);
-        let mut events = Vec::new();
-        let mut bytes = 0u64;
-        loop {
+        let mut events = vec![ConversationEvent::new(
+            &wedged_id,
+            1,
+            "permission.requested",
+            json!({ "permissionId": "stuck" }),
+        )];
+        let mut bytes = serde_json::to_vec(&events[0]).unwrap().len() as u64 + 1;
+        while bytes <= 60 * 1024 * 1024 {
             let event = ConversationEvent::new(
                 &wedged_id,
                 events.len() as u64 + 1,
                 "provider.event",
                 json!({ "items": vec![chunk.clone(); 16] }),
             );
-            let len = serde_json::to_vec(&event).unwrap().len() as u64 + 1;
-            if bytes + len > MAX_EVENTS_JOURNAL_BYTES - 4096 {
-                break;
-            }
-            bytes += len;
+            bytes += serde_json::to_vec(&event).unwrap().len() as u64 + 1;
             events.push(event);
         }
-        // An unresolved permission request sized to leave less headroom than
-        // the resolution event recovery tries to append.
-        let probe = ConversationEvent::new(
-            &wedged_id,
-            events.len() as u64 + 1,
-            "permission.requested",
-            json!({ "permissionId": "stuck", "items": [] }),
-        );
-        let base = serde_json::to_vec(&probe).unwrap().len() as u64 + 1;
-        let mut count = (MAX_EVENTS_JOURNAL_BYTES - bytes - 96 - base) / 13;
-        let event = loop {
-            let event = ConversationEvent::new(
-                &wedged_id,
-                events.len() as u64 + 1,
-                "permission.requested",
-                json!({
-                    "permissionId": "stuck",
-                    "items": (0..count).map(|index| format!("pad-{index:06}")).collect::<Vec<_>>(),
-                }),
-            );
-            let len = serde_json::to_vec(&event).unwrap().len() as u64 + 1;
-            if bytes + len <= MAX_EVENTS_JOURNAL_BYTES - 32 {
-                break event;
-            }
-            count -= 1;
-        };
-        events.push(event);
         store
             .create_with_history(wedged, events, None, None)
             .await

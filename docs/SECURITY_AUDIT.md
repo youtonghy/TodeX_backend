@@ -15,7 +15,7 @@
 - Unix 上已启动的 Provider 以 pid、pgid 与启动时间记录在 `<data_dir>/provider_processes.json`（0600、原子写入，另记录所属 server 的 pid 与启动时间）；server 启动时只 kill 首进程启动时间仍匹配的进程组，避免误杀复用 PID；所属 server 仍存活时第二个 server 既不回收也不接管。Linux 另设 `PR_SET_PDEATHSIG`；Windows 不做回收。
 - Provider 在信任读许可仍有效时完成子进程 spawn；撤销工作区信任取得写锁后会阻止后续启动，并取消已登记的活动 turn。信任状态只有在快照成功落盘后才更新内存。
 - Pi 在工作区获得 TodeX 信任后固定使用 `--approve` 全自动运行；TodeX 不为 Pi 声明逐工具审批或 OS sandbox，`permissions` capability 保持 `false`。
-- conversation event payload 上限 1 MiB：超过 1 MiB − 16 KiB 的 payload 在脱敏之后截断（最大字符串截断并记录原长度，必要时整体替换为 `{"truncated": true, "originalBytes": N}`），1 MiB 检查保留为最后防线。journal 上限 64 MiB：超过 56 MiB 且压缩无效时新 prompt 返回 `JOURNAL_FULL`（HTTP 507），进行中的 turn 仍可写到上限；写满时先自动压缩（旧流式进度记录替换为 `journal.compacted` 占位标记、其余旧事件超长 payload 就地截断、sequence 均不变），仍超限才返回 `RESOURCE_EXHAUSTED`；结束 turn 或记录重启的事件可额外使用 64 KiB 预留（读取上限相应为 64 MiB + 64 KiB），保证轮次总能被关闭。replay limit 上限 1000，且每页不超过约 8 MiB journal。v2 WebSocket 单消息上限 8 MiB（升级层强制，超限关闭连接）、单连接订阅上限 128、并发补放上限 4；socket 发送超过 20 秒或出站队列阻塞超过 10 秒即断开连接。
+- conversation event payload 上限 1 MiB：超过 1 MiB − 16 KiB 的 payload 在脱敏之后截断（最大字符串截断并记录原长度，必要时整体替换为 `{"truncated": true, "originalBytes": N}`），1 MiB 检查保留为最后防线。journal 不设总量上限：追加永不拒绝，进行中的 turn 总能写完；只有新 prompt 有闸门——journal 超过 56 MiB 时先逐段压缩（最新 16 MiB 之外的旧流式进度记录替换为 `journal.compacted` 占位标记、其余事件超长 payload 就地截断、sequence 均不变；只重写有变化的段并把相邻小段合并），压缩后仍超限才返回 `JOURNAL_FULL`（HTTP 507），提示新建会话。已完全处理的封存段按 `(name, length, mtime)` 指纹缓存，不在每次追加时重复解析。replay limit 上限 1000，且每页不超过约 8 MiB journal。v2 WebSocket 单消息上限 8 MiB（升级层强制，超限关闭连接）、单连接订阅上限 128、并发补放上限 4；socket 发送超过 20 秒或出站队列阻塞超过 10 秒即断开连接。
 - MCP/Skill catalog 只读取配置，跳过 symlink，限制扫描深度、文件数和文件大小；响应不包含 command、args、env、URL 或凭据；现有测试验证输入文件未被修改。
 - 旧 Codex session migration 是 copy-only、redacted、idempotent，并保留原始文件。
 

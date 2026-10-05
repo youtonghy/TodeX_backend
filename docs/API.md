@@ -157,7 +157,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 每个已开始的 turn 都以一个终态事件结束：driver panic 产生 `turn.failed`（`code: "PROVIDER_PANIC"`，其他任务异常为 `PROVIDER_TASK_CANCELLED`）；终态事件写入失败时按 100 ms / 500 ms / 2 s 重试，每次重试前先查 journal 避免重复，全部失败则 manifest 状态置为 `failed`，重启恢复再在 journal 中关闭该 turn。`[agent].provider_idle_timeout_minutes`（默认 60，`0` 关闭）内 Provider 没有任何输出或事件的 turn 会被取消（有待答权限请求时不计时触发），30 秒内未结束则强制中止，最终以 `turn.failed`（`code: "PROVIDER_IDLE_TIMEOUT"`）结束。Provider stdout 中非 JSON 行或超过 4 MiB 的行不再使 turn 失败：每个 turn 最多 20 条记为 `provider.event`（`{ "kind": "invalid_line", "preview" }`，preview 已脱敏且不超过 512 字节；或 `{ "kind": "oversized_line", "bytes" }`），其余只写日志。
 
-journal 超过 56 MiB（64 MiB 上限预留 8 MiB）且压缩后仍超出时，新 prompt 返回 `JOURNAL_FULL`（HTTP 507），应新建会话；进行中的 turn 仍可追加到 64 MiB 上限。超过 1 MiB − 16 KiB 的事件 payload 在脱敏后截断而非拒绝：最大的字符串按 UTF-8 边界截断并追加 `…[truncated N bytes]`，对象 payload 顶层增加 `truncated`（该键已被占用时为 `_truncated`）映射，记录 JSON pointer → 原始字节数；仅截断字符串仍放不下时，payload 替换为 `{ "truncated": true, "originalBytes": N }` 加上较短的顶层标量字段。
+journal 不设总容量上限：追加永不因体积被拒绝，进行中的 turn 总能写完。journal 超过 56 MiB 且逐段压缩后仍超出时，新 prompt 返回 `JOURNAL_FULL`（HTTP 507），应新建会话。超过 1 MiB − 16 KiB 的事件 payload 在脱敏后截断而非拒绝：最大的字符串按 UTF-8 边界截断并追加 `…[truncated N bytes]`，对象 payload 顶层增加 `truncated`（该键已被占用时为 `_truncated`）映射，记录 JSON pointer → 原始字节数；仅截断字符串仍放不下时，payload 替换为 `{ "truncated": true, "originalBytes": N }` 加上较短的顶层标量字段。
 
 事件回放支持 `detail=summary`（默认 `full`）：summary 模式把只产生折叠过程行的事件（工具调用、思考、状态、进度）的 `payload` 替换为 `{ "detailStub": true, ... }` 占位对象，保留分类、turn 与流身份所需的元数据，因此事件 sequence 与投影出的时间线条目身份保持不变；结果输出、审批、权限、队列、配置、压缩、subagent、memory、extension 及携带用量数据的事件始终完整返回。客户端展开过程组时用同一接口按 `afterSequence`/`limit` 以 `detail=full` 拉取对应序列区间。
 
@@ -230,7 +230,7 @@ $DATA_DIR/conversations/<uuid-v4>/
   provider-state.json
 ```
 
-journal 是一个有序文件序列：已封存的 `events.NNNNNN.jsonl` 段按编号排列，随后是唯一可写的 `events.jsonl`；`events.jsonl` 超过 8 MiB 后在下一次追加前被改名为下一个段号并新建空的活动文件。sequence 从 1 连续递增，即跨越所有文件的全局行号；段中间的损坏按 `journal.recordLost` 占位处理。压缩或打捞重写会把整段历史坍缩回单个 `events.jsonl`，旧段随之删除。
+journal 是一个有序文件序列：已封存的 `events.NNNNNN.jsonl` 段按编号排列，随后是唯一可写的 `events.jsonl`；`events.jsonl` 超过 8 MiB 后在下一次追加前被改名为下一个段号并新建空的活动文件。sequence 从 1 连续递增，即跨越所有文件的全局行号；段中间的损坏按 `journal.recordLost` 占位处理。压缩逐段就地重写并合并相邻小段；打捞重写会把整段历史坍缩回单个 `events.jsonl`，旧段随之删除。
 
 `events.jsonl` 是规范事件日志，sequence 从 1 连续递增；每次追加以 fsync 后的 journal 行为唯一提交点。manifest 缓存在内存中：创建、状态变化、元数据更新、强制置状态，以及会改变 manifest 的恢复时立即写 `manifest.json` 与 `snapshot.json`（与 journal 一致的 manifest 在启动恢复时不重写）；仅 `lastSequence`、`updatedAt` 变化时最多延迟 2 秒写 `manifest.json`，关闭时刷盘，崩溃后从 journal 重建。journal 修复：末条记录缺少换行时恢复阶段补上；中间损坏时先整份备份为 `events.corrupt.<ts>.jsonl`，再原子重写，有效记录原样保留，每个丢失的 sequence 以 `journal.recordLost` 占位（payload `{ "reason": "corrupt", "runStart", "runLength", "backup" }`，同一段丢失共享 `runStart`/`runLength`，客户端可合并显示；普通追加无法伪造该事件类型）；末尾损坏仍隔离到备份文件后截断。journal 超限时自动压缩：最新 16 MiB 之外的流式进度记录（`message.delta`、`thought.delta`、`tool.updated`、`subagent.updated`——内容已被对应终态记录覆盖）原位替换为 `journal.compacted` 标记（保留原 sequence、eventId、time 与 provider，payload 为 `{ "reason": "compacted", "originalType", "runStart", "runLength" }`，同一剥离段共享 `runStart`/`runLength`），其余事件的超长字符串再按既有截断规则收缩；sequence 与行号一一对应的关系不变，客户端把该类型按未知事件处理、不产生时间线条目。daemon 就绪后会在后台复制迁移旧 `$DATA_DIR/codex_gateway/sessions`；旧文件不修改，迁移可重复执行，并会去除 approval response 和常见 secret 字段。迁移失败会记录日志并在下次启动时重试，不阻塞 API 可用性。
 
