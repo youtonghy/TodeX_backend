@@ -3,6 +3,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::config::AgentConfig;
@@ -541,15 +542,38 @@ impl ProviderDriver for ClaudeDriver {
                 .provider_mode
                 .expect("Claude permission mode validated"),
         ];
-        if context.provider_state.native_session_id.is_some()
-            || claude_session_exists(&context.manifest.workspace, &requested_session_id).await
-        {
+        // `--resume` replays a transcript Claude already wrote; it fails
+        // initialization outright ("No conversation found") when the file is
+        // missing or unloadable — transcript cleanup, manual deletion, or a
+        // `CLAUDE_CONFIG_DIR` change all orphan a recorded `native_session_id`
+        // this way, and retrying the same `--resume` can never recover. Only a
+        // transcript that exists and parses justifies `--resume`.
+        let session_path = claude_session_path_at(
+            &crate::agent_providers::claude_config_dir(),
+            &context.manifest.workspace,
+            &requested_session_id,
+        )
+        .await;
+        if claude_transcript_loadable(&session_path).await {
             // A turn that dies after Claude creates its transcript but before
             // the id reaches provider state (rate limit, crash, cancel) leaves
             // no recorded session: `--session-id` would then deadlock on
             // "Session ID is already in use", so resume the file instead.
             spec.args.push("--resume".to_owned());
         } else {
+            // A transcript file that fails to load still blocks `--session-id`
+            // ("already in use"), so move it aside rather than deleting it and
+            // start a fresh transcript under the same id.
+            if tokio::fs::try_exists(&session_path).await.unwrap_or(false) {
+                let stale = session_path.with_extension("jsonl.todex-stale");
+                if let Err(error) = tokio::fs::rename(&session_path, &stale).await {
+                    tracing::warn!(
+                        path = %session_path.display(),
+                        %error,
+                        "could not move aside unloadable Claude transcript"
+                    );
+                }
+            }
             spec.args.push("--session-id".to_owned());
         }
         spec.args.push(requested_session_id.clone());
@@ -581,22 +605,23 @@ impl ProviderDriver for ClaudeDriver {
     }
 }
 
-/// Whether Claude already has a transcript for `session_id` in `workspace`.
-/// Claude stores sessions at `<config>/projects/<dir>/<id>.jsonl` and rejects
-/// `--session-id` for an id whose file exists, so a transcript on disk means
-/// the next launch must `--resume` instead.
-async fn claude_session_exists(workspace: &Path, session_id: &str) -> bool {
-    claude_session_exists_at(
-        &crate::agent_providers::claude_config_dir(),
-        workspace,
-        session_id,
-    )
-    .await
-}
-
-async fn claude_session_exists_at(config_dir: &Path, workspace: &Path, session_id: &str) -> bool {
-    let file = claude_session_path_at(config_dir, workspace, session_id).await;
-    tokio::fs::try_exists(file).await.unwrap_or(false)
+/// Whether the transcript at `path` can back a `--resume`: the file must
+/// exist and open with a JSON object on its first line. Claude stores
+/// sessions at `<config>/projects/<dir>/<id>.jsonl` and answers `--resume`
+/// for a missing or truncated file with a hard "No conversation found"
+/// initialization error, so existence alone is not enough.
+async fn claude_transcript_loadable(path: &Path) -> bool {
+    let Ok(file) = tokio::fs::File::open(path).await else {
+        return false;
+    };
+    let mut first_line = String::new();
+    let Ok(read) = tokio::io::BufReader::new(file)
+        .read_line(&mut first_line)
+        .await
+    else {
+        return false;
+    };
+    read > 0 && serde_json::from_str::<Value>(first_line.trim()).is_ok_and(|line| line.is_object())
 }
 
 async fn claude_session_path_at(config_dir: &Path, workspace: &Path, session_id: &str) -> PathBuf {
@@ -732,8 +757,9 @@ mod tests {
 
     use super::{
         claude_command_catalog, claude_model_aliases, claude_model_family, claude_question_details,
-        claude_question_response, claude_quota_event, claude_user_content, handle_stream_event,
-        BackgroundTasks, ClaudeSubagents, ClaudeToolCalls,
+        claude_question_response, claude_quota_event, claude_result_error,
+        claude_transcript_loadable, claude_user_content, handle_stream_event, BackgroundTasks,
+        ClaudeSubagents, ClaudeToolCalls,
     };
     use crate::conversation::{
         ConversationEventHub, ConversationManifest, ConversationStore, ProviderKind,
@@ -1002,7 +1028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_exists_detects_transcript_under_project_dir() {
+    async fn session_lookup_resolves_transcript_under_project_dir() {
         let root = std::env::temp_dir().join(format!(
             "todex-claude-session-lookup-{}",
             uuid::Uuid::new_v4().simple()
@@ -1016,8 +1042,14 @@ mod tests {
         std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
         std::fs::write(&transcript, "{}").unwrap();
 
-        assert!(super::claude_session_exists_at(&root, &workspace, session).await);
-        assert!(!super::claude_session_exists_at(&root, &workspace, "missing").await);
+        assert_eq!(
+            super::claude_session_path_at(&root, &workspace, session).await,
+            transcript
+        );
+        assert!(super::claude_transcript_loadable(&transcript).await);
+        assert!(
+            !super::claude_transcript_loadable(&root.join("projects").join("missing.jsonl")).await
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1427,6 +1459,67 @@ mod tests {
     }
 
     #[test]
+    fn result_error_reads_errors_array_when_result_is_absent() {
+        // Claude ≥2.x reports a failed `--resume` with `errors[]` and no
+        // `result` string; surfacing that text is what makes a stale
+        // transcript diagnosable.
+        let missing_session = json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": true,
+            "errors": ["No conversation found with session ID: 11111111-1111-1111-1111-111111111111"],
+        });
+        assert_eq!(
+            claude_result_error(&missing_session).as_deref(),
+            Some("No conversation found with session ID: 11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(
+            claude_result_error(&json!({
+                "result": "Invalid API key · Please run /login",
+                "errors": ["ignored"],
+            }))
+            .as_deref(),
+            Some("Invalid API key · Please run /login")
+        );
+        assert_eq!(
+            claude_result_error(&json!({"result": " ", "errors": ["a", "b"]})).as_deref(),
+            Some("a; b")
+        );
+        assert!(claude_result_error(&json!({"errors": []})).is_none());
+        assert!(claude_result_error(&json!({"errors": [1, null]})).is_none());
+        assert!(claude_result_error(&json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn transcript_loadable_requires_a_parseable_first_line() {
+        let root = std::env::temp_dir().join(format!(
+            "todex-claude-transcript-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("session.jsonl");
+        assert!(!claude_transcript_loadable(&path).await);
+
+        tokio::fs::write(&path, "").await.unwrap();
+        assert!(!claude_transcript_loadable(&path).await);
+
+        tokio::fs::write(&path, "not json\n").await.unwrap();
+        assert!(!claude_transcript_loadable(&path).await);
+
+        tokio::fs::write(&path, "[1, 2]\n").await.unwrap();
+        assert!(!claude_transcript_loadable(&path).await);
+
+        tokio::fs::write(
+            &path,
+            "{\"type\":\"system\",\"subtype\":\"init\"}\nnot-json-later-lines-do-not-matter\n",
+        )
+        .await
+        .unwrap();
+        assert!(claude_transcript_loadable(&path).await);
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[test]
     fn rate_limit_event_without_windows_falls_back_to_top_level() {
         let message = json!({
             "type": "rate_limit_event",
@@ -1446,6 +1539,30 @@ mod tests {
         );
         assert!(claude_quota_event(&json!({"type": "rate_limit_event"})).is_none());
     }
+}
+
+/// The error text inside a Claude `result` frame. Current CLI releases put
+/// the detail in `errors[]` and leave `result` unset, so check every known
+/// slot before falling back — otherwise the real reason ("No conversation
+/// found with session ID", auth failures) is replaced by a generic message.
+fn claude_result_error(message: &Value) -> Option<String> {
+    if let Some(text) = message
+        .get("result")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        return Some(text.to_owned());
+    }
+    let errors = message
+        .get("errors")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        return None;
+    }
+    Some(errors.join("; "))
 }
 
 // Protocol reference: anthropics/claude-agent-sdk-python, _internal/query.py.
@@ -1474,13 +1591,13 @@ async fn initialize_claude(
             if message.get("type").and_then(Value::as_str) == Some("result")
                 && message.get("is_error").and_then(Value::as_bool) == Some(true)
             {
-                return Err(AppError::ProviderUnavailable(format!(
-                    "Claude Code initialization failed: {}",
-                    message
-                        .get("result")
-                        .and_then(Value::as_str)
-                        .unwrap_or("provider rejected startup")
-                )));
+                let detail = claude_result_error(&message)
+                    .unwrap_or_else(|| "provider rejected startup".to_owned());
+                return Err(provider_exit_error(
+                    process,
+                    &format!("Claude Code initialization failed: {detail}"),
+                )
+                .await);
             }
             if message.get("type").and_then(Value::as_str) == Some("control_response")
                 && message
@@ -1684,10 +1801,8 @@ async fn run_claude_turn(
                     .unwrap_or(false);
                 if is_error {
                     return Err(AppError::ProviderUnavailable(
-                        message
-                            .get("result")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Claude Code returned an error")
+                        claude_result_error(&message)
+                            .unwrap_or_else(|| "Claude Code returned an error".to_owned())
                             .chars()
                             .take(1000)
                             .collect(),
