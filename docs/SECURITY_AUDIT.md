@@ -24,7 +24,7 @@
 - `cargo test --locked --all-targets --all-features -- --test-threads=1` 当前执行 177 个 backend 测试和 1 个非计费 E2E，耗时约 11 秒；5 个真实 provider 测试默认 ignored。
 - Provider protocol、event journal、catalog 扫描和 WebSocket 都有显式内存/数量上限，避免单个请求无界增长。
 - event replay 通过可重建的内存 sequence/offset 索引按页读取，每页仍校验返回的记录，遇到损坏记录即回退到完整校验扫描（见 [conversation-runtime.md](conversation-runtime.md)）；这优先保证 sequence 连续性和尾部恢复。启动时已结束的会话跳过完整扫描，其损坏在首次读取时发现。
-- journal 中间损坏时先整份备份为 `events.corrupt.<ts>.jsonl`，再原子重写并以 `journal.recordLost` 占位丢失的 sequence；占位数量受损坏字节数约束，损坏的 sequence 字段不能凭空生成大量占位，普通追加无法伪造任何 `journal.` 前缀的事件类型（包括 `journal.compacted` 压缩标记）。
+- journal 按 8 MiB 段滚动存放：已封存的 `events.NNNNNN.jsonl` 段在前、唯一可写的 `events.jsonl` 在后，sequence 是跨文件的全局行号；journal 中间损坏时先整份备份为 `events.corrupt.<ts>.jsonl`，再原子重写并以 `journal.recordLost` 占位丢失的 sequence；占位数量受损坏字节数约束，损坏的 sequence 字段不能凭空生成大量占位，普通追加无法伪造任何 `journal.` 前缀的事件类型（包括 `journal.compacted` 压缩标记）。
 - `cargo clippy --locked --all-targets --all-features` 可通过但报告 32 个既有 warning；`-D warnings` 尚未达到零 warning，主要是旧 Codex gateway/TUI 的大型 Result、参数数量和 enum 布局问题。
 
 ## 复核命令

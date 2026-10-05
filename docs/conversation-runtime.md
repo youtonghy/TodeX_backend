@@ -106,15 +106,26 @@ Backend control/write/cancel/compact defaults are 30/10/10/300 seconds, configur
 with `TODEX_AGENTD_PROVIDER_{CONTROL,WRITE,CANCEL,COMPACT}_TIMEOUT_SECONDS`.
 The first three accept 1–3600 seconds; compact accepts 1–86400 seconds.
 
-The backend's JSONL journal remains authoritative. Its in-memory sequence/offset
-index is rebuildable. A local debug fixture with 200 events per page measured
+The backend's JSONL journal remains authoritative. It is one logical sequence
+of files: sealed `events.NNNNNN.jsonl` segments in numeric order followed by
+the active `events.jsonl`, the only file appends touch. Once the active file
+passes 8 MiB the next append seals it under the next segment number and starts
+a fresh `events.jsonl` — a crash between the rename and the create leaves the
+journal ending in a sealed segment, which the next append recreates the active
+file for. Sequence `N` is still global journal line `N` across all files, so
+replay cursors, the cold index and `journal.*` placeholder semantics are
+unchanged; a legacy single `events.jsonl` is simply a journal of one active
+segment. Compaction and salvage rewrites collapse the journal back into one
+`events.jsonl` and unlink the sealed files. Its in-memory sequence/offset
+index is rebuildable and records `(segment, start, end)` per record. A local
+debug fixture with 200 events per page measured
 1,000 events at 66.09 ms for repeated full parsing versus 22.12 ms cold / 8.49 ms
 warm indexing; 10,000 events measured 6084.97 ms versus 199.97 / 78.05 ms. These
 are local measurements, not production latency guarantees.
 A cold index (for example after fork or migration) is built by a newline scan
-that parses only the first and last records; a journal without its final
-newline, or whose last sequence differs from its line count, gets the full
-validating scan with tail repair. Every page still validates its records, and a
+that parses only the first and last records of each segment; a journal without
+its final newline, or whose last sequence differs from its line count, gets
+the full validating scan with tail repair. Every page still validates its records, and a
 page that reaches a damaged record runs the full scan, which salvages or reports
 the damage. A local release fixture measured the cold 50-event tail page at
 7.8 → 0.5 ms for 10,000 events and 77 → 5 ms for 100,000 events (53 MB).
@@ -141,6 +152,9 @@ rewritten with valid records unchanged and each lost sequence replaced by a
 "runLength", "backup": "<file>"}`. Placeholders of one run share
 `runStart`/`runLength` and take the previous valid event's time; their count
 is bounded by the corrupt bytes, and clients cannot append that event type.
+A corrupt tail may span several trailing segments: wholly corrupt sealed files
+are deleted, the file containing the last valid record is truncated, and an
+empty `events.jsonl` is kept so the journal still ends in its active file.
 
 On overflow the journal is compacted toward 75% of the cap. Older streaming
 progress records that a terminal record already covers (`message.delta`,
@@ -159,7 +173,8 @@ that close a turn or record a restart (`turn.*` terminals,
 `provider.runtime` stopped) may use a further 64 KiB beyond it, and readers
 accept that reserve, so a turn whose many small events filled the journal can
 always be closed. Journals compaction could not shrink are remembered by
-(length, mtime) so they are not re-parsed on every attempt. Replay pages
+their ordered file fingerprint `(name, length, mtime)` so they are not
+re-parsed on every attempt. Replay pages
 (`afterSequence`, `beforeSequence`, WebSocket subscribe backfill) stop at
 `limit` events or about 8 MiB of journal, whichever comes first, but always
 hold at least one event; clients keep paging while `hasMore`.

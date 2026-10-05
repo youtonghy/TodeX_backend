@@ -225,9 +225,12 @@ Catalog 只读取 Provider 的用户级和项目级原生配置，项目级同�
 $DATA_DIR/conversations/<uuid-v4>/
   manifest.json
   events.jsonl
+  events.NNNNNN.jsonl   # 已封存段，可选、可多个
   snapshot.json
   provider-state.json
 ```
+
+journal 是一个有序文件序列：已封存的 `events.NNNNNN.jsonl` 段按编号排列，随后是唯一可写的 `events.jsonl`；`events.jsonl` 超过 8 MiB 后在下一次追加前被改名为下一个段号并新建空的活动文件。sequence 从 1 连续递增，即跨越所有文件的全局行号；段中间的损坏按 `journal.recordLost` 占位处理。压缩或打捞重写会把整段历史坍缩回单个 `events.jsonl`，旧段随之删除。
 
 `events.jsonl` 是规范事件日志，sequence 从 1 连续递增；每次追加以 fsync 后的 journal 行为唯一提交点。manifest 缓存在内存中：创建、状态变化、元数据更新、强制置状态，以及会改变 manifest 的恢复时立即写 `manifest.json` 与 `snapshot.json`（与 journal 一致的 manifest 在启动恢复时不重写）；仅 `lastSequence`、`updatedAt` 变化时最多延迟 2 秒写 `manifest.json`，关闭时刷盘，崩溃后从 journal 重建。journal 修复：末条记录缺少换行时恢复阶段补上；中间损坏时先整份备份为 `events.corrupt.<ts>.jsonl`，再原子重写，有效记录原样保留，每个丢失的 sequence 以 `journal.recordLost` 占位（payload `{ "reason": "corrupt", "runStart", "runLength", "backup" }`，同一段丢失共享 `runStart`/`runLength`，客户端可合并显示；普通追加无法伪造该事件类型）；末尾损坏仍隔离到备份文件后截断。journal 超限时自动压缩：最新 16 MiB 之外的流式进度记录（`message.delta`、`thought.delta`、`tool.updated`、`subagent.updated`——内容已被对应终态记录覆盖）原位替换为 `journal.compacted` 标记（保留原 sequence、eventId、time 与 provider，payload 为 `{ "reason": "compacted", "originalType", "runStart", "runLength" }`，同一剥离段共享 `runStart`/`runLength`），其余事件的超长字符串再按既有截断规则收缩；sequence 与行号一一对应的关系不变，客户端把该类型按未知事件处理、不产生时间线条目。daemon 就绪后会在后台复制迁移旧 `$DATA_DIR/codex_gateway/sessions`；旧文件不修改，迁移可重复执行，并会去除 approval response 和常见 secret 字段。迁移失败会记录日志并在下次启动时重试，不阻塞 API 可用性。
 
