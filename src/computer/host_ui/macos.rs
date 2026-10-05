@@ -1,12 +1,14 @@
 //! macOS host UI: an accessory `NSApplication` on the main thread (no Dock
 //! icon), panels excluded from screen capture, ⌘⇧⎋ through
-//! `global-hotkey`, and `NSAlert` for confirmations.
+//! `global-hotkey`, and a non-modal `NSAlert` window for confirmations
+//! (a modal loop would run inside a main-queue block and starve every other
+//! main-queue block, including its own timeout).
 
 use std::{
     cell::RefCell,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex,
+        mpsc, Mutex,
     },
     time::Duration,
 };
@@ -20,9 +22,9 @@ use objc2::{
     define_class, msg_send, rc::Retained, runtime::AnyObject, sel, MainThreadMarker, MainThreadOnly,
 };
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSButton, NSColor, NSPanel, NSScreen, NSTextField,
-    NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
+    NSPanel, NSScreen, NSTextField, NSWindowCollectionBehavior, NSWindowSharingType,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSLocale, NSObject, NSPoint, NSRect, NSSize, NSString};
 
@@ -49,6 +51,9 @@ struct Ui {
     pill: Option<Pill>,
     marker: Option<Retained<NSPanel>>,
     stop_target: Retained<StopTarget>,
+    answer_target: Retained<AnswerTarget>,
+    /// The confirmation on screen, if any.
+    confirming: Option<Retained<NSAlert>>,
 }
 
 struct Pill {
@@ -59,6 +64,11 @@ struct Pill {
 static MARKER_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// One confirmation dialog at a time.
 static CONFIRMING: Mutex<()> = Mutex::new(());
+/// Where the on-screen confirmation sends its answer.
+static ANSWER: Mutex<Option<mpsc::Sender<bool>>> = Mutex::new(None);
+/// Button tags of the confirmation.
+const ALLOW_TAG: isize = 1;
+const DENY_TAG: isize = 2;
 
 define_class!(
     // SAFETY: NSObject has no subclassing requirements and StopTarget does
@@ -83,6 +93,46 @@ impl StopTarget {
     }
 }
 
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements and AnswerTarget
+    // does not implement Drop.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TodexComputerAnswerTarget"]
+    struct AnswerTarget;
+
+    impl AnswerTarget {
+        #[unsafe(method(answer:))]
+        fn answer(&self, sender: Option<&NSButton>) {
+            let allowed = sender.is_some_and(|button| button.tag() == ALLOW_TAG);
+            close_confirmation();
+            if let Some(answer) = ANSWER
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = answer.send(allowed);
+            }
+        }
+    }
+);
+
+impl AnswerTarget {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        // SAFETY: plain NSObject init.
+        unsafe { msg_send![Self::alloc(mtm), init] }
+    }
+}
+
+/// Main thread: takes the confirmation off screen.
+fn close_confirmation() {
+    UI.with(|ui| {
+        if let Some(alert) = ui.borrow_mut().as_mut().and_then(|ui| ui.confirming.take()) {
+            alert.window().orderOut(None);
+        }
+    });
+}
+
 pub(super) fn run_with_main_loop(body: impl FnOnce() + Send + 'static) -> ! {
     let Some(mtm) = MainThreadMarker::new() else {
         body();
@@ -105,6 +155,8 @@ pub(super) fn run_with_main_loop(body: impl FnOnce() + Send + 'static) -> ! {
                     pill: None,
                     marker: None,
                     stop_target: StopTarget::new(mtm),
+                    answer_target: AnswerTarget::new(mtm),
+                    confirming: None,
                 });
             });
             super::mark_available();
@@ -278,36 +330,47 @@ pub(super) fn confirm(strings: &Strings, title: &str, message: &str, timeout: Du
     let _one_at_a_time = CONFIRMING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (sender, receiver) = mpsc::channel();
+    *ANSWER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
     let (title, message) = (title.to_owned(), message.to_owned());
     let (allow, deny) = (strings.allow, strings.deny);
-    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watchdog = {
-        let finished = finished.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(timeout);
-            if !finished.load(Ordering::SeqCst) {
-                run_on_main(|mtm| {
-                    let app = NSApplication::sharedApplication(mtm);
-                    if app.modalWindow().is_some() {
-                        app.abortModal();
-                    }
-                });
-            }
-        })
-    };
-    let allowed = run_on_main(move |mtm| {
-        let app = NSApplication::sharedApplication(mtm);
-        #[allow(deprecated)]
-        app.activateIgnoringOtherApps(true);
+    // Shown without a modal loop: this block returns at once and the
+    // buttons answer through `ANSWER`.
+    with_ui(move |ui, mtm| {
         let alert = NSAlert::new(mtm);
         alert.setMessageText(&NSString::from_str(&title));
         alert.setInformativeText(&NSString::from_str(&message));
-        alert.addButtonWithTitle(&NSString::from_str(allow));
-        alert.addButtonWithTitle(&NSString::from_str(deny));
-        alert.window().setLevel(STATUS_LEVEL);
-        alert.runModal() == NSAlertFirstButtonReturn
+        for (label, tag) in [(allow, ALLOW_TAG), (deny, DENY_TAG)] {
+            let button = alert.addButtonWithTitle(&NSString::from_str(label));
+            button.setTag(tag);
+            // SAFETY: the target outlives the button (kept in `Ui`).
+            unsafe {
+                button.setTarget(Some(&ui.answer_target));
+                button.setAction(Some(sel!(answer:)));
+            }
+        }
+        alert.layout();
+        let window = alert.window();
+        window.setLevel(STATUS_LEVEL);
+        window.center();
+        let app = NSApplication::sharedApplication(mtm);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+        window.makeKeyAndOrderFront(None);
+        // An accessory app may not become active; show it in front anyway.
+        window.orderFrontRegardless();
+        ui.confirming = Some(alert);
     });
-    finished.store(true, Ordering::SeqCst);
-    drop(watchdog);
-    allowed
+    let answer = receiver.recv_timeout(timeout);
+    if answer.is_err() {
+        // Nobody answered: withdraw the question.
+        ANSWER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        run_on_main(|_| close_confirmation());
+    }
+    answer.unwrap_or(false)
 }
