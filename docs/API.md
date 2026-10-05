@@ -606,12 +606,16 @@ Agent 运行在 daemon 所在机器，浏览器却属于用户的桌面端。桌
 
 ### Computer Use（`todex_desktop` 的 `computer_*` 工具）
 
-- 开关：`PUT /v2/agent-desktop` 也接受 `{ computerEnabled }`（字段都可选，至少给一个），`GET` 返回 `computerEnabled`；默认关闭，只有 `enabled` 也打开时生效。打开后工具列表多出 `computer_observe`、`computer_act`、`computer_done`（已运行的 Provider 要到下次启动才看到；关闭立即生效，并结束所有屏幕会话）。执行端以能力 `screen` 登记（桌面端仅在 macOS 14+、本机开关打开、屏幕录制与辅助功能已授权时登记）。
-- 首次授权：`permission.requested { kind: "desktop_computer", allowedDeviceIds }`，只有提供 `screen` 能力的在线设备能回答，与浏览器授权相互独立。
-- 屏幕租约：一台设备同一时间只服务一个会话，其他会话调用返回 `SCREEN_BUSY`；`computer_done`、停止、撤销或闲置 120 秒后释放（daemon 每 15 秒清理一次），释放时向执行端发 `executor.release { conversationId, capability: "screen" }`。
-- 按应用批准：执行端对本会话首次操作的应用返回 `APP_CONFIRM`（`error.detail { bundleId, name }`），daemon 发 `permission.requested { kind: "desktop_computer_app" }`（任意设备可答），批准后把 bundle id 放入 `args.allowedApps` 重试；向密码框输入时执行端返回 `SENSITIVE_ACTION`，daemon 发 `kind: "desktop_computer_action"` 单次确认后带 `confirmed: true` 重试。Agent 不能自行传 `allowedApps`/`confirmed`。禁止操作的应用（TodeX 自身、系统认证窗口、钥匙串、系统设置、密码管理器）由执行端以 `TARGET_BLOCKED` 拒绝。
-- `computer_observe { app?, window?, display?, screenshot?=true }` → 前台（或指定）应用、窗口列表、带 `[ref=eN]` 的无障碍树、显示器、窗口（或整屏）截图；`computer_act { action: click|double_click|right_click|hover|drag|scroll|type|key|wait|open_app|focus_window, ref?, x?, y?, toX?, toY?, text?, keys?, app?, window?, deltaX?, deltaY?, ms? }`，有 `ref` 时后台送达元素（`path: "background"`，不动指针），只给坐标时移动指针（`path: "pointer"`，用户正在操作时返回 `USER_ACTIVE`）。
-- 会话事件：`desktop.computer.session { status: "started"|"ended", deviceId?, deviceName?, reason? }`（reason：`done`、`idle`、`user`、`revoked`）；`desktop.computer.action { actionId, tool, ok, summary, app?, windowTitle?, path?, error?, shotId?, deviceId, deviceName }`；`desktop.computer.grant { status: "granted"|"revoked" }`。事件不含截图数据与输入的文字。
+Computer Use 由 daemon 在**自己所在的主机**上执行（`src/computer`，基于 xa11y：macOS AX、Windows UI Automation、Linux AT-SPI），客户端只做预览和审批。桌面端执行端不再提供 `screen` 能力；旧桌面端登记的 `screen` 会被忽略（浏览器照常可用）。
+
+- 开关：`PUT /v2/agent-desktop` 也接受 `{ computerEnabled }`（字段都可选，至少给一个），默认关闭，只有 `enabled` 也打开时生效。打开后工具列表多出 `computer_observe`、`computer_act`、`computer_done`（已运行的 Provider 要到下次启动才看到；关闭立即生效，并结束屏幕会话）。
+- 主机状态：`GET /v2/agent-desktop` 另返回 `computer { supported, available, reason?, host, platform, permissions: { screen, accessibility } }`。`available` 要求系统支持、权限齐全、且 daemon 运行在主机的桌面会话里（能弹出确认框）。`POST /v2/agent-desktop/computer/permissions` 在主机上弹出系统授权提示（macOS：屏幕录制、辅助功能），返回同样的设置对象。macOS 上 `serve`/`tui`/`daemon-run` 启动时会以自身身份重新执行（pid 不变），权限授给 `todex-agentd` 本身而不是启动它的终端；授权按“路径 + 签名身份”记录，所以发布版必须用固定证书签名、安装路径保持不变。
+- 首次授权：只能由主机前的人确认——daemon 在主机上弹出原生对话框（macOS NSAlert；300 秒无人确认按拒绝处理），其他设备无法代为批准。事件 `desktop.computer.grant { status: "requested" }`（客户端据此显示“等待主机确认”），随后 `granted` 或 `declined`；用户撤销或在主机上按“停止”时为 `revoked`。无人可确认时工具返回 `UNAVAILABLE`。
+- 屏幕租约：主机同一时间只服务一个会话，其他会话调用返回 `SCREEN_BUSY`；`computer_done`、停止、撤销或闲置 120 秒后释放（每 15 秒清理一次）。租约期间主机显示“Agent 正在控制”的浮条（不进截图），浮条“停止”或 ⌘⇧⎋（macOS）结束当前会话并撤销其授权。
+- 按应用批准：本会话首次操作某应用时 daemon 发 `permission.requested { kind: "desktop_computer_app", details: { bundleId, app, action } }`（任意设备可答），批准后记住；向密码框输入时发 `kind: "desktop_computer_action"` 单次确认。Agent 无法自行跳过。禁止操作的应用（TodeX 自身、系统认证窗口、凭据存储、系统设置、密码管理器）返回 `TARGET_BLOCKED`。
+- `computer_observe { app?, window?, display?, screenshot?=true }` → 前台（或指定）应用、窗口列表（`id` 来自本次观察）、带 `[ref=eN]` 的无障碍树、显示器、窗口（或整屏）截图；`computer_act { action: click|double_click|right_click|hover|drag|scroll|type|key|wait|open_app|focus_window, ref?, x?, y?, toX?, toY?, text?, keys?, app?, window?, deltaX?, deltaY?, ms? }`。有 `ref` 时尽量在后台送达元素（`path: "background"`，不动指针、不抢焦点；文字直接插入，不受输入法影响），只给坐标时移动指针（`path: "pointer"`，用户正在操作时返回 `USER_ACTIVE`）；无法后台完成的按键/输入会先激活目标应用（`path: "keyboard"`）。`keys` 里的 `cmd` 在 macOS 是 ⌘，其他平台是 Ctrl。
+- 实时画面：`GET /v2/conversations/{id}/agent-desktop/frame` → `{ mimeType, dataUrl }`，仅返回给当前持有屏幕租约的会话（否则 404）；最多每 300ms 截一次（宽 960、JPEG），多个观看者共享。客户端在预览可见时轮询，没有观看者时不截图。
+- 会话事件：`desktop.computer.session { status: "started"|"ended", deviceId?, deviceName?, reason? }`（reason：`done`、`idle`、`user`、`revoked`；`deviceId` 为 `host`，`deviceName` 为主机名）；`desktop.computer.action { actionId, tool, ok, summary, app?, windowTitle?, path?, error?, shotId?, deviceId, deviceName }`。事件不含截图数据与输入的文字。
 - `DELETE /v2/conversations/{id}/agent-desktop?capability=screen|browser` 只撤销其中一项；不带参数撤销两项。
 
 ## WebSocket 协议
