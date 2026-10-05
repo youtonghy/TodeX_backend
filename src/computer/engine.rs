@@ -868,6 +868,11 @@ fn native_input() -> xa11y::Result<InputSim> {
     native_provider().map(|_| unreachable!())
 }
 
+// Inside `engine` so it can read refs and element bounds.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "kde_wayland_e2e.rs"]
+mod kde_wayland_e2e;
+
 #[cfg(test)]
 mod tests {
     use super::*;
