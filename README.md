@@ -60,6 +60,9 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
   - Discovers `Host` aliases from the backend user's `~/.ssh/config` (following `Include`) and runs the system OpenSSH client, so keys, ssh-agent, ProxyJump and `known_hosts` behave as in the user's shell. Extra hosts and FTP sites are managed in `$DATA_DIR/ssh`; `~/.ssh/config` is never written and passwords are never stored.
   - SSH key listing, import and in-process generation; interactive SSH terminals over `/v2/ws`; SFTP/FTP(S) file sessions under `/v2/remote/*`.
   - Opt-in per host "Agent access" exposes a `todex_ssh` MCP server (`ssh_list_hosts`, `ssh_exec`) to Codex, Claude Code and ACP agents. See [API docs](docs/API.md#ssh-主机与远程连接).
+- **Computer Use on the host**:
+  - Agents observe and act on the computer the daemon runs on (`computer_*` tools of `todex_desktop`), in process through [xa11y](https://github.com/xa11y/xa11y) (macOS AX, Windows UI Automation, Linux AT-SPI). Clients only preview it (live frames, screenshots) and answer prompts.
+  - Each conversation's first use is confirmed by someone at the host; a pill with Stop and a global shortcut end it; TodeX, credential stores and system settings are never controlled. On macOS grant `todex-agentd` Screen Recording and Accessibility; see `docs/API.md`.
 - **Interactive TUI & Daemon Management**:
   - Interactive Terminal UI (`cargo run -- tui`) built with Ratatui to monitor status, inspect logs, control daemon lifecycle, and generate pairing QR codes with automatic LAN IP resolution.
   - Background daemon management (`start`, `stop`, `restart`, `status`) backed by a persistent PID file.

@@ -55,6 +55,9 @@
   - 自动读取后端用户 `~/.ssh/config` 中的 `Host`（跟随 `Include`），并调用系统 OpenSSH，密钥、ssh-agent、ProxyJump 与 `known_hosts` 的行为与用户终端一致；额外主机与 FTP 站点保存在 `$DATA_DIR/ssh`，从不写入 `~/.ssh/config`，也从不保存密码。
   - SSH 密钥查看、导入与进程内生成；通过 `/v2/ws` 的交互式 SSH 终端；`/v2/remote/*` 下的 SFTP/FTP(S) 文件会话。
   - 按主机手动开启的“Agent 访问”会向 Codex、Claude Code 与 ACP 类 Agent 暴露 `todex_ssh` MCP 服务器（`ssh_list_hosts`、`ssh_exec`）。详见 [API 文档](docs/API.md#ssh-主机与远程连接)。
+- **主机上的 Computer Use**：
+  - Agent 观察并操作 daemon 所在的电脑（`todex_desktop` 的 `computer_*` 工具），在进程内通过 [xa11y](https://github.com/xa11y/xa11y)（macOS AX、Windows UI Automation、Linux AT-SPI）完成；客户端只负责预览（实时画面、截图）和审批。
+  - 每个会话首次使用需由主机前的人确认；浮条“停止”和全局快捷键可随时结束；TodeX、凭据存储和系统设置永远不会被操作。macOS 上需为 `todex-agentd` 授予屏幕录制和辅助功能权限，详见 `docs/API.md`。
 - **交互式 TUI 与守护进程管理**：
   - 基于 Ratatui 构建的交互式 TUI（`cargo run -- tui`）：查看运行状态、实时日志、启停守护进程，并自动探测局域网 IP 生成移动端配对二维码。
   - 基于 PID 文件管理的后台守护进程模式（`start`、`stop`、`restart`、`status`）。
