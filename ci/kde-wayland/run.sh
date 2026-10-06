@@ -21,6 +21,12 @@ export KDE_FULL_SESSION=true
 export QT_QPA_PLATFORM=wayland
 export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
 export TODEX_KDE_WAYLAND_E2E=1
+# KWin captures screens only with OpenGL on a GPU render node; hosted CI
+# runners have none, so the test skips screenshots and portal input there.
+if ! ls /dev/dri/renderD* >/dev/null 2>&1; then
+    echo "no render node: testing observation and window focus only" >&2
+    export TODEX_KDE_WAYLAND_E2E_NO_GPU=1
+fi
 
 # Build first so the session only runs the test.
 cargo test --locked --no-run

@@ -1,6 +1,7 @@
 # Computer Use on KDE Plasma Wayland in a headless KWin (ci/kde-wayland).
-# Unverified until it has run on GitHub: package names, KWin flags and the
-# portal pre-authorization were written without a run to confirm them.
+# Hosted runners have no GPU render node, without which KWin can neither
+# take screenshots nor stream screens for portal input, so this run covers
+# observation and window focus only (see run.sh).
 name: KDE Wayland Computer Use
 
 on:
@@ -35,7 +36,10 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed git base-devel rustup dbus kwin kservice \
             xdg-desktop-portal xdg-desktop-portal-kde pipewire wireplumber \
-            at-spi2-core python pyside6 ttf-dejavu
+            at-spi2-core python pyside6 ttf-dejavu libcap
+          # KWin carries cap_sys_nice as a file capability, which Docker's
+          # bounding set lacks, so exec fails with EPERM until it is dropped.
+          setcap -r /usr/bin/kwin_wayland
           rustup toolchain install stable --profile minimal
           rustup default stable
 

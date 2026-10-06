@@ -3,6 +3,10 @@
 //! pointer and keyboard, so it is ignored by default and also needs
 //! `TODEX_KDE_WAYLAND_E2E=1`; `ci/kde-wayland/run.sh` provides both inside
 //! a private, headless KWin (the `kde-wayland` GitHub workflow).
+//! KWin captures screens (screenshots and the portal streams that pointer
+//! input targets) only with OpenGL, i.e. on a GPU render node; without one
+//! (`TODEX_KDE_WAYLAND_E2E_NO_GPU=1`, set by run.sh on hosted runners) the
+//! test covers observation and window focus only.
 
 use std::time::{Duration, Instant};
 
@@ -16,6 +20,7 @@ const SECOND_TITLE: &str = "TodeX KDE Second";
 
 struct Harness {
     engine: Engine,
+    gpu: bool,
     allowed: Vec<String>,
     windows: Value,
     tree: String,
@@ -32,7 +37,10 @@ impl Harness {
         let id = self
             .window_id(window_title)
             .unwrap_or_else(|| panic!("no window {window_title:?} in {}", listing["windows"]));
-        let observed = self.engine.observe(&json!({ "window": id })).unwrap();
+        let observed = self
+            .engine
+            .observe(&json!({ "window": id, "screenshot": self.gpu }))
+            .unwrap();
         self.tree = observed["tree"].as_str().unwrap_or_default().to_owned();
         if self.allowed.is_empty() {
             self.allowed
@@ -123,6 +131,7 @@ fn kde_wayland_end_to_end() {
     assert_eq!(crate::computer::platform::unsupported_reason(), None);
     let mut harness = Harness {
         engine: Engine::default(),
+        gpu: std::env::var_os("TODEX_KDE_WAYLAND_E2E_NO_GPU").is_none(),
         allowed: Vec::new(),
         windows: Value::Null,
         tree: String::new(),
@@ -142,8 +151,26 @@ fn kde_wayland_end_to_end() {
         std::thread::sleep(Duration::from_millis(500));
     }
     let observed = harness.observe(MAIN_TITLE);
-    assert!(observed["screenshot"]["width"].as_u64().unwrap() > 0);
     assert!(observed["window"]["width"].as_u64().unwrap() > 0);
+    assert!(harness.tree.contains("\"Press me\""), "{}", harness.tree);
+    if harness.gpu {
+        assert!(observed["screenshot"]["width"].as_u64().unwrap() > 0);
+        input(&mut harness);
+    }
+
+    // Focusing windows.
+    let second = harness.window_id(SECOND_TITLE).unwrap();
+    harness.act(json!({ "action": "focus_window", "window": second }));
+    harness.expect("active: second");
+    let main = harness.window_id(MAIN_TITLE).unwrap();
+    harness.act(json!({ "action": "focus_window", "window": main }));
+    harness.expect("active: main");
+
+    crate::computer::platform::end_session();
+}
+
+/// Pointer, keyboard and scrolling through the RemoteDesktop portal.
+fn input(harness: &mut Harness) {
     // Let the idle notification settle before the first pointer action.
     std::thread::sleep(Duration::from_secs(3));
 
@@ -192,14 +219,4 @@ fn kde_wayland_end_to_end() {
         );
         std::thread::sleep(Duration::from_millis(300));
     }
-
-    // Focusing windows.
-    let second = harness.window_id(SECOND_TITLE).unwrap();
-    harness.act(json!({ "action": "focus_window", "window": second }));
-    harness.expect("active: second");
-    let main = harness.window_id(MAIN_TITLE).unwrap();
-    harness.act(json!({ "action": "focus_window", "window": main }));
-    harness.expect("active: main");
-
-    crate::computer::platform::end_session();
 }
