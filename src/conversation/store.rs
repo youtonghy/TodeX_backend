@@ -3289,6 +3289,10 @@ impl ConversationStore {
 /// replaced by `textMac` / `contentMac` — enough to recognize the same
 /// request again and to check the text a retry supplies — and only file
 /// references stay. Idempotent.
+///
+/// `textMac` covers the trimmed text: prompts are trimmed before they run
+/// and `message.created` journals that form, so it is the text a client can
+/// decrypt and send back with `conversation.retry`.
 pub fn seal_request_snapshot(request: &mut Value, key: &FingerprintKey) {
     let Some(map) = request.as_object_mut() else {
         return;
@@ -3300,6 +3304,7 @@ pub fn seal_request_snapshot(request: &mut Value, key: &FingerprintKey) {
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or_default()
+        .trim()
         .to_owned();
     map.insert("textMac".to_owned(), Value::String(key.mac(&text)));
     map.insert("text".to_owned(), Value::String(String::new()));

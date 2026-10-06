@@ -1141,7 +1141,9 @@ impl ConversationSupervisor {
                     "The saved request is encrypted but no history key is available.".to_owned(),
                 )
             })?;
-            if key.mac(&text) != text_mac {
+            // The MAC covers the trimmed text, which is what `message.created`
+            // shows; snapshots sealed before that covered the raw text.
+            if key.mac(text.trim()) != text_mac && key.mac(&text) != text_mac {
                 return Err(AppError::Conflict(
                     "prompt is not the text of the request being retried".to_owned(),
                 ));
@@ -1149,7 +1151,7 @@ impl ConversationSupervisor {
             prompt.text = text;
         } else if encrypted {
             let text = prompt_text.ok_or_else(retry_prompt_required)?;
-            if text != prompt.text {
+            if text.trim() != prompt.text.trim() {
                 return Err(AppError::Conflict(
                     "prompt is not the text of the request being retried".to_owned(),
                 ));
@@ -3056,7 +3058,9 @@ mod tests {
         assert_ne!(renamed.title_enc, manifest.title_enc);
         let request = ConversationPrompt {
             client_request_id: Some("submit-1".to_owned()),
-            text: "PROMPT-SECRET".to_owned(),
+            // Prompts run trimmed and `message.created` shows them so: that
+            // trimmed text is what a client can send back with a retry.
+            text: "  PROMPT-SECRET\n".to_owned(),
             model: Some("fixture-model".to_owned()),
             reasoning_effort: None,
             skills: Vec::new(),

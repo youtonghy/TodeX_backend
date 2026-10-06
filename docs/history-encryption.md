@@ -180,7 +180,7 @@ e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容�
 | `history.keys.wraps` | `{conversationId, kids[≤500], rid?}`（默认调用方 `rid`） | `{wraps: {kid: WrappedKey}}` |
 | `history.grant.fulfill` | `{grantId?, rid, wraps:[{conversationId, kid, wrapped}]（≤500）, complete?}`（最后一批 `complete: true` 结束授权；已有封装跳过） | `{added}` |
 
-`conversation.retry` 在 e2e 下必须携带 `prompt`（客户端解密后的原请求文本），否则 `INVALID_REQUEST`。e2e 下 `last-request.json` 不含提示原文：`request.text` 为空串、内联 `text`/`image` 内容项被移除，只保留 `textMac`、`contentMac`（内联项 JSON 的 HMAC）与文件引用；`prompt` 的 HMAC 必须等于 `textMac`（快照是明文时必须等于原文），否则 `CONFLICT`。重试只带回文件类附件，内联文本与图片不会重发。off 模式下快照仍含原文，`prompt` 被忽略。
+`conversation.retry` 在 e2e 下必须携带 `prompt`（客户端解密后的原请求文本），否则 `INVALID_REQUEST`。e2e 下 `last-request.json` 不含提示原文：`request.text` 为空串、内联 `text`/`image` 内容项被移除，只保留 `textMac`（去掉首尾空白后的请求文本的 HMAC；prompt 执行前同样去掉首尾空白，`message.created` 的 `content` 即此形式）、`contentMac`（内联项 JSON 的 HMAC）与文件引用；去掉首尾空白后的 `prompt` 的 HMAC 必须等于 `textMac`（快照是明文时去掉首尾空白后必须等于原文；此前未去空白封存的快照也接受原样 `prompt`），否则 `CONFLICT`。带内联文本项或只选 Skill 的请求，其 `message.created` 文本含附加内容，与 `textMac` 不符，这类请求在 e2e 下无法重试。重试只带回文件类附件，内联文本与图片不会重发。off 模式下快照仍含原文，`prompt` 被忽略。
 
 control 幂等（`conversation.control` 以 `requestId` 去重）：加密记录只保留 control 对象的 MAC（`requestFingerprint`）与 `turnId`，重复请求按 MAC 判定是否为同一输入。已完成的重复请求返回本进程内存中记住的结果（最多 256 条，只在内存，不落盘）；daemon 重启后返回 `null`，结果仍在客户端可解密的 `control.completed` 事件中。被拒绝的重复请求返回 `Control was rejected (<code>).`（信封中的 `code`），原始错误信息只在密文里。
 
