@@ -8326,6 +8326,421 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_history_updates_are_pushed_and_revoked_devices_are_blocked() {
+        Box::pin(history_updates_scenario()).await;
+    }
+
+    /// Drains the pending `history.encryption.updated` payloads and checks
+    /// that none carries key material.
+    fn history_updates(
+        events: &mut tokio::sync::broadcast::Receiver<crate::event::EventRecord>,
+    ) -> Vec<Value> {
+        let allowed = [
+            "epoch",
+            "mode",
+            "reason",
+            "rid",
+            "deviceId",
+            "grantId",
+            "conversationIds",
+        ];
+        let mut updates = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event.event_type != super::history_keys::UPDATED_EVENT {
+                continue;
+            }
+            let object = event.payload.as_object().unwrap();
+            for key in object.keys() {
+                assert!(allowed.contains(&key.as_str()), "unexpected field {key}");
+            }
+            let text = event.payload.to_string();
+            for byte in [1, 2, 3, 4, 9] {
+                let key = crate::history_keys::test_support::public_key_text(byte);
+                assert!(!text.contains(&key[..64]), "public key in {text}");
+            }
+            updates.push(event.payload);
+        }
+        updates
+    }
+
+    async fn history_updates_scenario() {
+        use crate::history_crypto::{self, WrappedKey};
+        use crate::history_keys::decode_id;
+        use crate::history_keys::test_support::{public_key_text, recipient, seed};
+
+        let root = make_temp_workspace("v2-history-updates");
+        let state = Box::pin(auth_test_state(&root)).await;
+        let data_dir = root.join("data");
+        let devices = crate::devices::DeviceRegistry::load(&data_dir).unwrap();
+        let pair = |byte: u8| {
+            let signing = ed25519_dalek::SigningKey::from_bytes(&[byte; 32]);
+            devices
+                .register("Device", &signing.verifying_key().to_bytes())
+                .unwrap()
+                .device_id
+        };
+        let (a, b, c) = (pair(1), pair(2), pair(3));
+        let mut conversations = Vec::new();
+        for _ in 0..3 {
+            let manifest = state
+                .conversations
+                .create_owned(
+                    "local",
+                    ProviderKind::ClaudeCode,
+                    root.join("workspaces").join("project"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            conversations.push(manifest.id);
+        }
+        let (outgoing, _outgoing_rx) = mpsc::channel(16);
+        let mut subscriptions = WsSubscriptions::new();
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        let mut events = state.events.subscribe();
+        macro_rules! run {
+            ($device:expr, $type:expr, $payload:expr $(,)?) => {{
+                assert!(is_v2_native_command($type));
+                history_command(
+                    &state,
+                    &outgoing,
+                    &mut subscriptions,
+                    &event_scope,
+                    $device,
+                    $type,
+                    $payload,
+                )
+                .await
+            }};
+        }
+        let code = |result: Result<Value, AppError>| result.unwrap_err().code();
+        let register = |byte: u8| json!({ "publicKey": public_key_text(byte) });
+
+        // Registration, mode and recovery.
+        let rid_a = run!(&a, "history.recipient.register", register(1)).unwrap()["rid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            history_updates(&mut events),
+            vec![json!({
+                "epoch": 1, "mode": "off", "reason": "recipient.registered",
+                "rid": rid_a, "deviceId": a,
+            })]
+        );
+        // Idempotent re-registration writes nothing and publishes nothing.
+        run!(&a, "history.recipient.register", register(1)).unwrap();
+        assert!(history_updates(&mut events).is_empty());
+        run!(&a, "history.encryption.enable", json!({})).unwrap();
+        assert_eq!(
+            history_updates(&mut events),
+            vec![json!({ "epoch": 1, "mode": "e2e", "reason": "mode" })]
+        );
+        let rid_recovery = run!(&a, "history.recovery.set", register(9)).unwrap()["rid"].clone();
+        assert_eq!(
+            history_updates(&mut events),
+            vec![
+                json!({ "epoch": 2, "mode": "e2e", "reason": "recovery.set", "rid": rid_recovery })
+            ]
+        );
+
+        // Keys that predate B; A re-wraps them for B.
+        let mut keys = Vec::new();
+        for conversation in &conversations {
+            keys.push(
+                state
+                    .history_keys
+                    .deks()
+                    .current_key(conversation)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let rid_b = run!(&b, "history.recipient.register", register(2)).unwrap()["rid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            history_updates(&mut events)[0]["reason"],
+            "recipient.registered"
+        );
+        let grant = run!(&b, "history.grant.request", json!({})).unwrap()["grantId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            history_updates(&mut events),
+            vec![json!({
+                "epoch": 3, "mode": "e2e", "reason": "grant.requested",
+                "grantId": grant, "rid": rid_b, "deviceId": b,
+            })]
+        );
+        // The same pending grant again changes nothing.
+        run!(&b, "history.grant.request", json!({})).unwrap();
+        assert!(history_updates(&mut events).is_empty());
+
+        let rewrap = |index: usize, byte: u8| {
+            let (kid, _) = &keys[index];
+            let wraps = state.history_keys.keyrings().clone();
+            let conversation = conversations[index].clone();
+            let kid = kid.clone();
+            async move {
+                let rid_a = decode_id(&encode_rid(1), "rid").unwrap();
+                let mine = wraps
+                    .wraps_for(&conversation, std::slice::from_ref(&kid), &rid_a)
+                    .await
+                    .unwrap();
+                let mine: WrappedKey = serde_json::from_value(json!(mine)[&kid].clone()).unwrap();
+                let key = history_crypto::unwrap_for_tests(
+                    seed(1),
+                    &mine,
+                    decode_id(&kid, "kid").unwrap(),
+                )
+                .unwrap();
+                let wrapped = history_crypto::wrap(&key, &recipient(byte)).unwrap();
+                json!({ "conversationId": conversation, "kid": kid, "wrapped": wrapped })
+            }
+        };
+        fn encode_rid(byte: u8) -> String {
+            crate::history_keys::encode_id(
+                &crate::history_keys::test_support::recipient(byte).rid(),
+            )
+        }
+        let first = rewrap(0, 2).await;
+        run!(
+            &a,
+            "history.grant.fulfill",
+            json!({ "grantId": grant, "rid": rid_b, "wraps": [first.clone()] }),
+        )
+        .unwrap();
+        assert_eq!(
+            history_updates(&mut events),
+            vec![json!({
+                "epoch": 3, "mode": "e2e", "reason": "grant.progress",
+                "rid": rid_b, "grantId": grant, "conversationIds": [conversations[0]],
+            })]
+        );
+        // A retried batch adds nothing and announces nothing.
+        run!(
+            &a,
+            "history.grant.fulfill",
+            json!({ "grantId": grant, "rid": rid_b, "wraps": [first] }),
+        )
+        .unwrap();
+        assert!(history_updates(&mut events).is_empty());
+        // The last batch: progress first, then fulfilled.
+        let second = rewrap(1, 2).await;
+        run!(
+            &a,
+            "history.grant.fulfill",
+            json!({ "grantId": grant, "rid": rid_b, "wraps": [second], "complete": true }),
+        )
+        .unwrap();
+        assert_eq!(
+            history_updates(&mut events),
+            vec![
+                json!({
+                    "epoch": 3, "mode": "e2e", "reason": "grant.progress",
+                    "rid": rid_b, "grantId": grant, "conversationIds": [conversations[1]],
+                }),
+                json!({
+                    "epoch": 3, "mode": "e2e", "reason": "grant.fulfilled",
+                    "grantId": grant, "rid": rid_b,
+                }),
+            ]
+        );
+        // Recovery-style self-grant: no grantId.
+        let third = rewrap(2, 2).await;
+        run!(
+            &b,
+            "history.grant.fulfill",
+            json!({ "rid": rid_b, "wraps": [third] })
+        )
+        .unwrap();
+        assert_eq!(
+            history_updates(&mut events),
+            vec![json!({
+                "epoch": 3, "mode": "e2e", "reason": "grant.progress",
+                "rid": rid_b, "conversationIds": [conversations[2]],
+            })]
+        );
+        let dismissed = run!(&b, "history.grant.request", json!({})).unwrap()["grantId"].clone();
+        history_updates(&mut events);
+        run!(&a, "history.grant.dismiss", json!({ "grantId": dismissed })).unwrap();
+        assert_eq!(
+            history_updates(&mut events),
+            vec![
+                json!({ "epoch": 3, "mode": "e2e", "reason": "grant.dismissed", "grantId": dismissed })
+            ]
+        );
+        // Dismissing a settled grant changes nothing.
+        run!(&a, "history.grant.dismiss", json!({ "grantId": dismissed })).unwrap();
+        assert!(history_updates(&mut events).is_empty());
+
+        // A revokes B's recipient: B is blocked.
+        let revoked = run!(&a, "history.recipient.revoke", json!({ "rid": rid_b })).unwrap();
+        assert_eq!(revoked["myAccess"], "active");
+        assert_eq!(revoked["revokedDevices"][0]["deviceId"], b);
+        assert!(revoked["revokedDevices"][0].get("revokedBy").is_none());
+        assert_eq!(
+            history_updates(&mut events),
+            vec![json!({
+                "epoch": 4, "mode": "e2e", "reason": "recipient.revoked",
+                "rid": rid_b, "deviceId": b,
+            })]
+        );
+        let conversation = &conversations[0];
+        let kid = &keys[0].0;
+        let blocked = [
+            ("history.recipient.register", register(4)),
+            ("history.grant.request", json!({})),
+            ("history.grant.list", json!({})),
+            ("history.grant.dismiss", json!({ "grantId": dismissed })),
+            (
+                "history.grant.fulfill",
+                json!({ "rid": rid_b, "wraps": [] }),
+            ),
+            ("history.keys.list", json!({})),
+            (
+                "history.keys.wraps",
+                json!({ "conversationId": conversation, "kids": [kid] }),
+            ),
+            (
+                "history.keys.wraps",
+                json!({ "conversationId": conversation, "kids": [kid], "rid": rid_a }),
+            ),
+            ("history.recovery.set", register(4)),
+            ("history.encryption.enable", json!({})),
+            ("history.encryption.disable", json!({})),
+            ("history.recipient.revoke", json!({ "rid": rid_a })),
+            ("history.device.restore", json!({ "deviceId": b })),
+        ];
+        for (command, payload) in blocked {
+            assert_eq!(
+                code(run!(&b, command, payload)),
+                "HISTORY_ACCESS_REVOKED",
+                "{command}"
+            );
+        }
+        assert!(history_updates(&mut events).is_empty());
+        let view = run!(&b, "history.encryption.get", json!({})).unwrap();
+        assert_eq!(view["myAccess"], "revoked");
+        assert!(view.get("myRid").is_none());
+        assert_eq!(view["revokedDevices"][0]["deviceId"], b);
+        assert!(view["revokedDevices"][0]["revokedAt"].is_string());
+        // New keys exclude B.
+        let (new_kid, _) = state
+            .history_keys
+            .deks()
+            .current_key(conversation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(&new_kid, kid);
+        let for_b = run!(
+            &a,
+            "history.keys.wraps",
+            json!({ "conversationId": conversation, "kids": [new_kid], "rid": rid_b }),
+        )
+        .unwrap();
+        assert_eq!(for_b["wraps"], json!({}));
+
+        // A restores B; B registers a fresh key and new keys include it.
+        assert_eq!(
+            code(run!(&a, "history.device.restore", json!({ "deviceId": c }))),
+            "NOT_FOUND"
+        );
+        let restored = run!(&a, "history.device.restore", json!({ "deviceId": b })).unwrap();
+        assert_eq!(restored["revokedDevices"], json!([]));
+        assert_eq!(restored["myAccess"], "active");
+        assert_eq!(
+            history_updates(&mut events),
+            vec![json!({ "epoch": 4, "mode": "e2e", "reason": "device.restored", "deviceId": b })]
+        );
+        assert_eq!(
+            run!(&b, "history.encryption.get", json!({})).unwrap()["myAccess"],
+            "unregistered"
+        );
+        assert_eq!(
+            code(run!(&b, "history.recipient.register", register(2))),
+            "CONFLICT"
+        );
+        let fresh = run!(&b, "history.recipient.register", register(4)).unwrap()["rid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (fresh_kid, _) = state
+            .history_keys
+            .deks()
+            .current_key(conversation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(fresh_kid, new_kid);
+        let mine = run!(
+            &b,
+            "history.keys.wraps",
+            json!({ "conversationId": conversation, "kids": [fresh_kid] }),
+        )
+        .unwrap();
+        assert_eq!(
+            mine["wraps"][&fresh_kid]["rid"].as_str(),
+            Some(fresh.as_str())
+        );
+        history_updates(&mut events);
+
+        // The TUI revokes C through devices.json; the daemon pushes it.
+        run!(&c, "history.recipient.register", register(3)).unwrap();
+        history_updates(&mut events);
+        assert!(crate::devices::revoke_device(&data_dir, &c).unwrap());
+        super::history_keys::publish_external_changes(&state)
+            .await
+            .unwrap();
+        let updates = history_updates(&mut events);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["reason"], "device.revoked");
+        assert_eq!(updates[0]["deviceId"], c);
+        assert_eq!(updates[0]["mode"], "e2e");
+        // Re-pairing the same identity does not bring access back.
+        assert_eq!(pair(3), c);
+        assert_eq!(
+            code(run!(&c, "history.recipient.register", register(5))),
+            "HISTORY_ACCESS_REVOKED"
+        );
+        let view = run!(&c, "history.encryption.get", json!({})).unwrap();
+        assert_eq!(view["myAccess"], "revoked");
+        run!(&a, "history.encryption.disable", json!({})).unwrap();
+        let updates = history_updates(&mut events);
+        assert_eq!(updates.last().unwrap()["reason"], "mode");
+        assert_eq!(updates.last().unwrap()["mode"], "off");
+
+        // Blocked devices may still subscribe and replay ciphertext.
+        subscriptions.history_encryption = true;
+        let subscribed = Box::pin(dispatch_command(
+            &state,
+            &outgoing,
+            &mut subscriptions,
+            &event_scope,
+            "local",
+            &c,
+            V2Command {
+                id: "sub".to_owned(),
+                command_type: "conversation.subscribe".to_owned(),
+                payload: json!({ "conversationId": conversation }),
+            },
+        ))
+        .await;
+        assert!(subscribed.is_none(), "the subscription task answers");
+        subscriptions.abort_all();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn v2_e2e_history_requires_declared_clients() {
         use crate::history_keys::test_support::recipient;
 
