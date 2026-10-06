@@ -62,11 +62,44 @@ const JOURNAL_SCAN_BUFFER_BYTES: usize = 256 * 1024;
 /// over and the background maintenance task converts the sealed file into a
 /// compressed segment (see [`super::segment`]).
 #[cfg(not(test))]
-pub(super) const JOURNAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_JOURNAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// Tests rotate the active segment well below the production size so a
 /// multi-segment journal does not need hundreds of MiB of fixture writes.
 #[cfg(test)]
-pub(super) const JOURNAL_SEGMENT_BYTES: u64 = 128 * 1024;
+const DEFAULT_JOURNAL_SEGMENT_BYTES: u64 = 128 * 1024;
+
+/// Size at which the active `events.jsonl` is sealed.
+///
+/// Debug builds (never release builds or `cargo test`) honor
+/// `TODEX_AGENTD_DEBUG_JOURNAL_SEGMENT_BYTES` (at least 4096) so live
+/// end-to-end runs against an isolated daemon can seal segments after a few
+/// turns and exercise sealed and passthrough frames on real clients.
+pub(super) fn journal_segment_bytes() -> u64 {
+    #[cfg(all(debug_assertions, not(test)))]
+    {
+        static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let value = OVERRIDE.get_or_init(|| {
+            let raw = std::env::var("TODEX_AGENTD_DEBUG_JOURNAL_SEGMENT_BYTES").ok()?;
+            match raw.trim().parse::<u64>() {
+                Ok(bytes) if bytes >= 4096 => {
+                    tracing::warn!(bytes, "debug journal segment size override in effect");
+                    Some(bytes)
+                }
+                _ => {
+                    tracing::warn!(
+                        value = raw,
+                        "ignoring TODEX_AGENTD_DEBUG_JOURNAL_SEGMENT_BYTES: expected an integer >= 4096"
+                    );
+                    None
+                }
+            }
+        });
+        if let Some(bytes) = *value {
+            return bytes;
+        }
+    }
+    DEFAULT_JOURNAL_SEGMENT_BYTES
+}
 /// Lower bound on the serialized size of any journal record line (each
 /// carries a 36-byte event id plus its sequence, time and type). Salvage
 /// uses it to bound how many sequences a corrupt region can have
@@ -1197,7 +1230,7 @@ impl ConversationStore {
         // in the background.
         if files
             .last()
-            .is_some_and(|file| file.name == EVENTS_FILE && file.bytes >= JOURNAL_SEGMENT_BYTES)
+            .is_some_and(|file| file.name == EVENTS_FILE && file.bytes >= journal_segment_bytes())
         {
             let previous = files.clone();
             let (sealed, fresh) = rotate_journal(&directory, &files, terminated).await?;
@@ -2850,7 +2883,7 @@ impl ConversationStore {
     }
 
     /// Convert the oldest sealed plaintext files of a conversation (one
-    /// file, or several consecutive ones up to [`JOURNAL_SEGMENT_BYTES`]
+    /// file, or several consecutive ones up to [`journal_segment_bytes`]
     /// when migrating 8 MiB v2 files) into one compressed segment named
     /// after the first. The build runs without the conversation lock — the
     /// sources are immutable once sealed — and is committed under it only
@@ -2874,7 +2907,7 @@ impl ConversationStore {
             for file in &files[start + 1..] {
                 if file.is_sealed_segment()
                     || file.name == EVENTS_FILE
-                    || bytes + file.bytes > JOURNAL_SEGMENT_BYTES
+                    || bytes + file.bytes > journal_segment_bytes()
                 {
                     break;
                 }
@@ -3409,7 +3442,7 @@ struct ConversationDraft {
 }
 
 /// Writes v3 records into a new conversation's temporary directory,
-/// rotating plaintext files at [`JOURNAL_SEGMENT_BYTES`] like appends do.
+/// rotating plaintext files at [`journal_segment_bytes`] like appends do.
 pub(super) struct PlainJournalWriter {
     directory: PathBuf,
     writer: tokio::io::BufWriter<tokio::fs::File>,
@@ -3440,7 +3473,7 @@ impl PlainJournalWriter {
     }
 
     async fn write(&mut self, event: &ConversationEvent) -> Result<(), AppError> {
-        if self.bytes >= JOURNAL_SEGMENT_BYTES {
+        if self.bytes >= journal_segment_bytes() {
             self.seal().await?;
         }
         let mut line = encode_record(event)?;
@@ -6523,9 +6556,9 @@ mod tests {
             names,
             vec!["events.000001.jsonl", "events.000002.jsonl", "events.jsonl"]
         );
-        assert!(files[0].bytes >= JOURNAL_SEGMENT_BYTES);
-        assert!(files[1].bytes >= JOURNAL_SEGMENT_BYTES);
-        assert!(files[2].bytes < JOURNAL_SEGMENT_BYTES);
+        assert!(files[0].bytes >= journal_segment_bytes());
+        assert!(files[1].bytes >= journal_segment_bytes());
+        assert!(files[2].bytes < journal_segment_bytes());
         assert_eq!(store.get(&id).await.unwrap().last_sequence, 40);
 
         // Replay crosses the sealed/active boundary with global sequences.

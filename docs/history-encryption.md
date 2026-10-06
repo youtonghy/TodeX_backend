@@ -105,6 +105,7 @@ manifest.json  snapshot.json  provider-state.json  last-request.json  queue.json
 - 帧表与分片表一起从 `.idx` 读入（约每 MiB 原始数据 0.1 KB），不另行懒加载。
 - 封存精简的匹配规则：`message.delta` 需同 turn 内同 `block.id` 的后续 `message.completed`（或列在 `block.supersedes` 中）；没有 block id 的 delta（Claude Code、ACP）一律保留，因为终态记录无法按 id 对应；`tool.updated` 需同 turn 同 `toolCallId`/`block.id` 的后续 `tool.completed`/`tool.failed`，或 ACP 的 `status` 为 `completed`/`failed` 的后续 `tool.updated`（终态 update 本身保留）；`subagent.updated` 需同 `subagentId` 的后续 `subagent.completed`/`failed`/`cancelled`。终态必须在同一分片内。
 - 帧压缩级别 9：真实 64 MiB 会话封存为 4.0–5.9 MiB。
+- 调试构建（不含 release 与 `cargo test`）读取 `TODEX_AGENTD_DEBUG_JOURNAL_SEGMENT_BYTES`（≥ 4096）作为封存阈值，供隔离后端的端到端测试在几轮对话后就产生封存帧与 passthrough 帧；未设置时行为不变。
 
 ### 4.5 实现补充（密钥轨，e2e）
 
