@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Datelike, Days, LocalResult, TimeZone, Utc, Weekday};
+use chrono_tz::Tz;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -756,10 +758,11 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        claude_command_catalog, claude_model_aliases, claude_model_family, claude_question_details,
+        claude_command_catalog, claude_frame_limit_reset, claude_model_aliases,
+        claude_model_family, claude_permission_details, claude_question_details,
         claude_question_response, claude_quota_event, claude_result_error,
-        claude_transcript_loadable, claude_user_content, handle_stream_event, BackgroundTasks,
-        ClaudeSubagents, ClaudeToolCalls,
+        claude_transcript_loadable, claude_user_content, handle_stream_event, usage_limit_reset,
+        BackgroundTasks, ClaudeSubagents, ClaudeToolCalls,
     };
     use crate::conversation::{
         ConversationEventHub, ConversationManifest, ConversationStore, ProviderKind,
@@ -990,6 +993,32 @@ mod tests {
         assert_eq!(details["questions"][0]["isOther"], true);
         assert!(claude_question_details(&json!({ "questions": [] })).is_none());
         assert!(claude_question_details(&json!({ "questions": [{ "header": "x" }] })).is_none());
+    }
+
+    #[test]
+    fn tool_permission_details_surface_command_and_safety_reason() {
+        let request = json!({
+            "subtype": "can_use_tool",
+            "tool_name": "Bash",
+            "input": { "command": "rm -f $L/*", "description": "Clean logs" },
+            "decision_reason": "Dangerous rm operation on possibly-empty variable path",
+            "decision_reason_type": "safetyCheck",
+        });
+        let details = claude_permission_details(&request);
+        assert_eq!(details["command"], "rm -f $L/*");
+        assert_eq!(
+            details["reason"],
+            "Dangerous rm operation on possibly-empty variable path"
+        );
+        assert_eq!(details["decision_reason_type"], "safetyCheck");
+
+        let edit = claude_permission_details(&json!({
+            "tool_name": "Edit",
+            "input": { "file_path": "/tmp/a" },
+            "decision_reason": "  ",
+        }));
+        assert!(edit.get("command").is_none());
+        assert!(edit.get("reason").is_none());
     }
 
     #[test]
@@ -1564,6 +1593,63 @@ mod tests {
         );
         assert!(claude_quota_event(&json!({"type": "rate_limit_event"})).is_none());
     }
+
+    #[test]
+    fn usage_limit_text_resolves_the_reported_zone_and_weekday() {
+        use chrono::{TimeZone, Utc};
+
+        let now = Utc.with_ymd_and_hms(2026, 10, 6, 8, 22, 17).unwrap();
+        let session = usage_limit_reset(
+            "You've hit your session limit · resets 5:30pm (Australia/Perth)",
+            now,
+        )
+        .expect("session reset");
+        // Perth is UTC+8 with no daylight-saving; 5:30pm is 09:30 UTC the same day.
+        assert_eq!(
+            session,
+            Utc.with_ymd_and_hms(2026, 10, 6, 9, 30, 0).unwrap()
+        );
+
+        // 2026-10-06 is a Tuesday, so Monday 12:00am is the following Monday.
+        let weekly = usage_limit_reset(
+            "You've hit your weekly limit · resets Mon 12:00am (UTC)",
+            now,
+        )
+        .expect("weekly reset");
+        assert_eq!(weekly, Utc.with_ymd_and_hms(2026, 10, 12, 0, 0, 0).unwrap());
+
+        assert!(usage_limit_reset("fixture failure", now).is_none());
+        assert!(usage_limit_reset("You've hit your session limit", now).is_none());
+        // Non-ASCII text after "reset" must not split a character.
+        assert!(usage_limit_reset("usage limit reset 时间", now).is_none());
+        assert!(usage_limit_reset("resets 5:30 下午", now).is_none());
+    }
+
+    #[test]
+    fn assistant_quota_limits_are_a_rejected_reset() {
+        use chrono::{TimeZone, Utc};
+
+        let frame = json!({
+            "type": "assistant",
+            "error": "rate_limit",
+            "is_api_error_message": true,
+            "quotaLimits": {
+                "status": "rejected",
+                "resetsAt": 1791279000,
+                "rateLimitType": "five_hour"
+            },
+            "message": { "content": [{ "type": "text", "text": "You've hit your session limit" }] }
+        });
+        assert_eq!(
+            claude_frame_limit_reset(&frame),
+            Utc.timestamp_opt(1791279000, 0).single()
+        );
+        let allowed = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": { "status": "allowed", "resetsAt": 1791279000, "rateLimitType": "five_hour" }
+        });
+        assert!(claude_frame_limit_reset(&claude_quota_event(&allowed).unwrap()).is_none());
+    }
 }
 
 /// The error text inside a Claude `result` frame. Current CLI releases put
@@ -1770,6 +1856,12 @@ async fn run_claude_turn(
     let mut tools = ClaudeToolCalls::default();
     let mut background_tasks = BackgroundTasks::default();
     let mut subagents = ClaudeSubagents::default();
+    // Epoch from a rejected `rate_limit_event` or `quotaLimits`. Preferred
+    // over the wall clock in the error text, which Claude rounds.
+    let mut rejected_reset: Option<DateTime<Utc>> = None;
+    // Text of an API-error assistant frame, used when the following `result`
+    // has no usable message of its own.
+    let mut limit_text: Option<String> = None;
     // A `result` with zero model turns means the invocation ended without an
     // API call — a task notification queued during resume consumes the prompt
     // without answering it. The process stays alive on the open stream, so
@@ -1825,12 +1917,21 @@ async fn run_claude_turn(
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 if is_error {
+                    let detail = claude_result_error(&message)
+                        .unwrap_or_else(|| "Claude Code returned an error".to_owned());
+                    let parsed = usage_limit_reset(&detail, Utc::now()).or_else(|| {
+                        limit_text
+                            .as_deref()
+                            .and_then(|text| usage_limit_reset(text, Utc::now()))
+                    });
+                    // Re-emit at the end of the turn so a later non-exhausted
+                    // snapshot cannot clear the wait before `after_turn`.
+                    if let Some(until) = rejected_reset.or(parsed) {
+                        sink.emit("quota.updated", rejected_quota_payload(until))
+                            .await?;
+                    }
                     return Err(AppError::ProviderUnavailable(
-                        claude_result_error(&message)
-                            .unwrap_or_else(|| "Claude Code returned an error".to_owned())
-                            .chars()
-                            .take(1000)
-                            .collect(),
+                        detail.chars().take(1000).collect(),
                     ));
                 }
                 if message.get("num_turns").and_then(Value::as_u64) == Some(0)
@@ -1883,6 +1984,14 @@ async fn run_claude_turn(
             }
             Some("assistant") => {
                 saw_output = true;
+                if let Some(until) = claude_frame_limit_reset(&message) {
+                    rejected_reset = Some(until);
+                }
+                if claude_frame_is_api_error(&message) {
+                    if let Some(text) = claude_assistant_text(&message) {
+                        limit_text = Some(text);
+                    }
+                }
                 let subagent = message.get("parent_tool_use_id").and_then(Value::as_str);
                 sink.emit(
                     "message.completed",
@@ -1993,6 +2102,9 @@ async fn run_claude_turn(
             Some("control_response") => {}
             Some("rate_limit_event") => {
                 if let Some(quota) = claude_quota_event(&message) {
+                    if let Some(until) = claude_frame_limit_reset(&quota) {
+                        rejected_reset = Some(until);
+                    }
                     sink.emit("quota.updated", quota).await?;
                 }
             }
@@ -2042,6 +2154,264 @@ fn claude_quota_event(message: &Value) -> Option<Value> {
         "isUsingOverage": info.get("isUsingOverage"),
         "raw": info,
     }))
+}
+
+fn rejected_quota_payload(until: DateTime<Utc>) -> Value {
+    let resets_at = until.timestamp();
+    json!({
+        "provider": "claude-code",
+        "scope": "account",
+        "status": "rejected",
+        "windows": [{ "id": "session", "resetsAt": resets_at }],
+        "raw": { "resetsAt": resets_at },
+    })
+}
+
+fn claude_frame_is_api_error(message: &Value) -> bool {
+    message.get("error").and_then(Value::as_str) == Some("rate_limit")
+        || message.get("is_api_error_message").and_then(Value::as_bool) == Some(true)
+        || message.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
+}
+
+/// Reset instant carried on a rejected quota snapshot. Claude Code 2.1 puts
+/// this on the assistant frame as `quotaLimits` (the stream-json serializer
+/// usually drops it) and on `rate_limit_event` / the normalized quota payload.
+fn claude_frame_limit_reset(message: &Value) -> Option<DateTime<Utc>> {
+    let nested = message
+        .get("quotaLimits")
+        .or_else(|| message.get("quota_limits"))
+        .or_else(|| message.get("rate_limit_info"));
+    let source = nested.unwrap_or(message);
+    let status = source.get("status").and_then(Value::as_str);
+    // An explicit `allowed` snapshot is not exhaustion. A frame with no
+    // status still counts when the assistant message itself is the 429.
+    let rejected =
+        status == Some("rejected") || (status.is_none() && claude_frame_is_api_error(message));
+    if !rejected {
+        return None;
+    }
+    let raw = source
+        .get("resetsAt")
+        .or_else(|| source.pointer("/raw/resetsAt"))
+        .or_else(|| message.pointer("/raw/resetsAt"));
+    epoch_to_utc(raw?)
+}
+
+fn claude_assistant_text(message: &Value) -> Option<String> {
+    let content = message.pointer("/message/content")?;
+    if let Some(text) = content.as_str() {
+        let text = text.trim();
+        return (!text.is_empty()).then(|| text.to_owned());
+    }
+    let text = content
+        .as_array()?
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn epoch_to_utc(value: &Value) -> Option<DateTime<Utc>> {
+    let raw = value.as_i64()?;
+    let seconds = if raw > 100_000_000_000 {
+        raw.checked_div(1000)?
+    } else {
+        raw
+    };
+    DateTime::from_timestamp(seconds, 0)
+}
+
+/// Wall-clock reset in a Claude usage-limit error, for example
+/// "You've hit your session limit · resets 5:30pm (Australia/Perth)" or
+/// "You've hit your weekly limit · resets Mon 12:00am (UTC)".
+/// `None` when the text is not a usage limit or the clock cannot be resolved.
+fn usage_limit_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("reset")
+        || !(lower.contains("limit") || lower.contains("out of extra usage"))
+    {
+        return None;
+    }
+    let start = lower.rfind("reset")?;
+    let mut scan = Scan { text, i: start };
+    if !scan.eat_ignore("reset") {
+        return None;
+    }
+    scan.eat_ignore("s");
+    scan.skip_ws();
+    scan.eat_ignore("at");
+    scan.skip_ws();
+    let weekday = scan.peek_word().and_then(weekday_name).inspect(|_| {
+        scan.eat_word();
+    });
+    let (hour, minute) = scan.eat_clock()?;
+    let zone = scan.eat_zone();
+    match zone {
+        Some(name) => {
+            let tz: Tz = name.parse().ok()?;
+            next_zoned(&tz, now, hour, minute, weekday)
+        }
+        None => next_zoned(&chrono::Local, now, hour, minute, weekday),
+    }
+}
+
+fn next_zoned<T: TimeZone>(
+    tz: &T,
+    now: DateTime<Utc>,
+    hour: u32,
+    minute: u32,
+    weekday: Option<Weekday>,
+) -> Option<DateTime<Utc>> {
+    let today = now.with_timezone(tz).date_naive();
+    let span = if weekday.is_some() { 8 } else { 2 };
+    for day in 0..span {
+        let date = today.checked_add_days(Days::new(day))?;
+        if weekday.is_some_and(|weekday| date.weekday() != weekday) {
+            continue;
+        }
+        let naive = date.and_hms_opt(hour, minute, 0)?;
+        let utc = match tz.from_local_datetime(&naive) {
+            LocalResult::Single(local) => local.with_timezone(&Utc),
+            LocalResult::Ambiguous(early, late) => {
+                let early = early.with_timezone(&Utc);
+                if early > now {
+                    early
+                } else {
+                    late.with_timezone(&Utc)
+                }
+            }
+            LocalResult::None => continue,
+        };
+        if utc > now {
+            return Some(utc);
+        }
+    }
+    None
+}
+
+fn weekday_name(word: &str) -> Option<Weekday> {
+    Some(
+        match word.trim_end_matches(',').to_ascii_lowercase().as_str() {
+            "mon" | "monday" => Weekday::Mon,
+            "tue" | "tues" | "tuesday" => Weekday::Tue,
+            "wed" | "wednesday" => Weekday::Wed,
+            "thu" | "thur" | "thurs" | "thursday" => Weekday::Thu,
+            "fri" | "friday" => Weekday::Fri,
+            "sat" | "saturday" => Weekday::Sat,
+            "sun" | "sunday" => Weekday::Sun,
+            _ => return None,
+        },
+    )
+}
+
+struct Scan<'a> {
+    text: &'a str,
+    i: usize,
+}
+
+impl<'a> Scan<'a> {
+    fn rest(&self) -> &'a str {
+        &self.text[self.i..]
+    }
+
+    fn skip_ws(&mut self) {
+        let rest = self.rest();
+        self.i += rest.len() - rest.trim_start().len();
+    }
+
+    fn eat_ignore(&mut self, lit: &str) -> bool {
+        let rest = self.rest();
+        // Bytes, not a str slice: the text after `lit.len()` may split a
+        // multi-byte character, and an ASCII match ends on a boundary.
+        if rest
+            .as_bytes()
+            .get(..lit.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(lit.as_bytes()))
+        {
+            self.i += lit.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_word(&mut self) -> Option<&'a str> {
+        self.skip_ws();
+        let rest = self.rest();
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        (end > 0).then(|| &rest[..end])
+    }
+
+    fn eat_word(&mut self) -> Option<&'a str> {
+        let word = self.peek_word()?;
+        self.i += word.len();
+        Some(word)
+    }
+
+    fn eat_number(&mut self) -> Option<u32> {
+        let rest = self.rest();
+        let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 || digits > 2 {
+            return None;
+        }
+        let value = rest[..digits].parse().ok()?;
+        self.i += digits;
+        Some(value)
+    }
+
+    fn eat_clock(&mut self) -> Option<(u32, u32)> {
+        self.skip_ws();
+        let hour12 = self.eat_number()?;
+        let minute = if self.eat_ignore(":") {
+            self.eat_number()?
+        } else {
+            0
+        };
+        self.skip_ws();
+        let pm = if self.eat_ignore("p.m") {
+            while self.eat_ignore(".") {}
+            true
+        } else if self.eat_ignore("a.m") {
+            while self.eat_ignore(".") {}
+            false
+        } else if self.eat_ignore("pm") {
+            true
+        } else if self.eat_ignore("am") {
+            false
+        } else {
+            return None;
+        };
+        if !(1..=12).contains(&hour12) || minute > 59 {
+            return None;
+        }
+        let hour = match (hour12, pm) {
+            (12, false) => 0,
+            (12, true) => 12,
+            (hour, true) => hour + 12,
+            (hour, false) => hour,
+        };
+        Some((hour, minute))
+    }
+
+    fn eat_zone(&mut self) -> Option<&'a str> {
+        self.skip_ws();
+        let rest = self.rest();
+        if !rest.starts_with('(') {
+            return None;
+        }
+        let end = rest.find(')')?;
+        let name = rest[1..end].trim();
+        if name.is_empty() {
+            return None;
+        }
+        self.i += end + 1;
+        Some(name)
+    }
 }
 
 fn content_blocks<'a>(message: &'a Value, kind: &'a str) -> impl Iterator<Item = &'a Value> {
@@ -2591,7 +2961,7 @@ async fn tool_permission_response(
             request_id.to_owned(),
             "tool",
             format!("Allow Claude tool {tool_name}?"),
-            request.clone(),
+            claude_permission_details(request),
             json!([
                 { "id": "allow_once", "kind": "allow_once", "name": "Allow once" },
                 { "id": "reject_once", "kind": "reject_once", "name": "Reject" }
@@ -2614,6 +2984,32 @@ async fn tool_permission_response(
             "message": "User rejected this tool request",
         }),
     })
+}
+
+/// Lift the parts a person needs to judge a `can_use_tool` request to the
+/// shared top-level `command` / `reason` keys every client already renders for
+/// Codex approvals. `decision_reason` explains why Claude asked at all — a
+/// `safetyCheck` asks even under `bypassPermissions`.
+fn claude_permission_details(request: &Value) -> Value {
+    let mut details = request.clone();
+    let command = request
+        .pointer("/input/command")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let reason = request
+        .get("decision_reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+        .map(str::to_owned);
+    if let Some(object) = details.as_object_mut() {
+        if let Some(command) = command {
+            object.insert("command".to_owned(), Value::String(command));
+        }
+        if let Some(reason) = reason {
+            object.insert("reason".to_owned(), Value::String(reason));
+        }
+    }
+    details
 }
 
 /// Claude's clarifying-question tool. It is answered rather than approved:

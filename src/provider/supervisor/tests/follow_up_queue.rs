@@ -677,3 +677,136 @@ async fn daemon_restart_keeps_a_rate_limit_wait() {
     assert_eq!(snapshot["items"], armed["items"]);
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Real Claude driver, scripted CLI. The fixture speaks stream-json the way
+/// Claude Code 2.1.288 does on a usage limit: an assistant `rate_limit` frame
+/// with no `quotaLimits`, then `result.is_error` whose text is
+/// "You've hit your session limit · resets <time> (UTC)". No `rate_limit_event`.
+/// The reset is the next UTC minute. After that instant the queued continuation
+/// must run by itself.
+#[tokio::test]
+async fn claude_session_limit_retries_after_the_reset() {
+    let (root, store, supervisor, workspace) = control_fixture("todex-claude-limit-e2e").await;
+    fs::write(root.join("provider-fixture.sh"), CLAUDE_LIMIT_FIXTURE).unwrap();
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    supervisor
+        .prompt(&manifest.id, "finish the migration".to_owned(), None)
+        .await
+        .unwrap();
+
+    let armed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let snapshot = supervisor
+                .queue_list_owned("local", &manifest.id)
+                .await
+                .unwrap();
+            if snapshot["pauseReason"] == "rate_limited" && snapshot["resumeAt"].is_string() {
+                break snapshot;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a session-limit failure should arm the rate-limit wait");
+    let resume_at = chrono::DateTime::parse_from_rfc3339(armed["resumeAt"].as_str().unwrap())
+        .expect("resumeAt");
+    let remaining = resume_at.signed_duration_since(chrono::Utc::now());
+    assert!(
+        remaining.num_seconds() > 0 && remaining.num_seconds() < 120,
+        "reset should be the upcoming minute, got {resume_at}"
+    );
+    assert_eq!(
+        armed["items"][0]["text"], CONTINUE_TEXT,
+        "continuation is queued ahead of a manual retry"
+    );
+
+    let prompts = tokio::time::timeout(Duration::from_secs(90), async {
+        let log_path = root.join("prompts.log");
+        loop {
+            let log = fs::read_to_string(&log_path).unwrap_or_default();
+            let lines = log
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if lines.len() >= 2 {
+                break lines;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the continuation should start once the reset time has passed");
+    assert_eq!(prompts[0], "finish the migration");
+    assert!(
+        prompts[1].contains("provider usage limit"),
+        "second turn should be the auto continuation, got {:?}",
+        prompts
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while supervisor.has_active_turns() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("continuation turn should finish");
+    let snapshot = wait_for_queue(&supervisor, &manifest.id, |queue| {
+        queue["items"].as_array().unwrap().is_empty() && queue["paused"] == false
+    })
+    .await;
+    assert!(snapshot["resumeAt"].is_null());
+    let request = store.last_request(&manifest.id).await.unwrap().unwrap();
+    assert_eq!(request["request"]["text"], CONTINUE_TEXT);
+    fs::remove_dir_all(root).unwrap();
+}
+
+const CLAUDE_LIMIT_FIXTURE: &str = r#"#!/usr/bin/env python3
+import json, os, sys
+from datetime import datetime, timedelta, timezone
+
+log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts.log")
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+def limit_text():
+    now = datetime.now(timezone.utc)
+    target = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    if (target - now).total_seconds() < 5:
+        target += timedelta(minutes=1)
+    hour = target.hour
+    suffix = "am" if hour < 12 else "pm"
+    hour12 = hour % 12 or 12
+    return "You've hit your session limit · resets %d:%02d%s (UTC)" % (hour12, target.minute, suffix)
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    if msg.get("type") == "control_request":
+        emit({"type": "control_response", "response": {"subtype": "success", "request_id": msg.get("request_id"), "response": {}}})
+        continue
+    if msg.get("type") != "user":
+        continue
+    content = msg.get("message", {}).get("content", "")
+    if isinstance(content, list):
+        content = "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
+    with open(log_path, "a", encoding="utf-8") as log:
+        log.write(content.replace("\n", " ") + "\n")
+    if "provider usage limit" in content:
+        emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "continued"}}})
+        emit({"type": "result", "subtype": "success", "is_error": False, "session_id": "claude-native", "result": "continued"})
+        continue
+    notice = limit_text()
+    emit({"type": "assistant", "error": "rate_limit", "is_api_error_message": True, "message": {"role": "assistant", "content": [{"type": "text", "text": notice}]}})
+    emit({"type": "result", "subtype": "success", "is_error": True, "session_id": "claude-native", "result": notice})
+"#;
