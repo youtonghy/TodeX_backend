@@ -24,6 +24,8 @@ const MANIFEST_FILE: &str = "manifest.json";
 const EVENTS_FILE: &str = "events.jsonl";
 const SNAPSHOT_FILE: &str = "snapshot.json";
 const PROVIDER_STATE_FILE: &str = "provider-state.json";
+/// Prompts waiting for the running turn to finish; never copied by fork.
+const FOLLOW_UP_QUEUE_FILE: &str = "queue.json";
 const MAX_REPLAY_LIMIT: usize = 1000;
 /// New prompts are refused once the whole journal exceeds this size and
 /// compaction cannot shrink it below. The journal itself has no hard
@@ -783,6 +785,32 @@ impl ConversationStore {
         Ok(Some(
             read_json(&path, "conversation request snapshot").await?,
         ))
+    }
+
+    /// The backend follow-up queue persisted beside the request snapshot;
+    /// `None` when the conversation never queued anything.
+    pub async fn follow_up_queue(&self, conversation_id: &str) -> Result<Option<Value>, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let path = self.directory(conversation_id)?.join(FOLLOW_UP_QUEUE_FILE);
+        if !tokio::fs::try_exists(&path).await? {
+            return Ok(None);
+        }
+        Ok(Some(
+            read_json(&path, "conversation follow-up queue").await?,
+        ))
+    }
+
+    /// Replaces the follow-up queue file atomically. The conversation must
+    /// exist, so a deleted conversation cannot be recreated by a late write.
+    pub async fn save_follow_up_queue(
+        &self,
+        conversation_id: &str,
+        queue: &Value,
+    ) -> Result<(), AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let directory = self.directory(conversation_id)?;
+        self.get_unlocked(conversation_id).await?;
+        write_atomic_json(&directory.join(FOLLOW_UP_QUEUE_FILE), queue).await
     }
 
     pub async fn complete_history(

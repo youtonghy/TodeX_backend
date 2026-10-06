@@ -153,7 +153,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 `content` 可选，最多 16 项，支持 `text`、`localImage`、内联 `image`（`data` + `mimeType`）和 `file`。本地路径可相对 workspace，也可使用 workspace 内绝对路径；规范化后越界、符号链接逃逸和非普通文件都会拒绝。图片仅对 Codex 和 Pi 开放，允许 PNG/JPEG/GIF/WebP，解码后合计最多 10 MiB；不支持图片的 Provider 返回明确的 `UNSUPPORTED`。Codex 把文件映射为原生 mention，其他 Provider 使用 workspace 相对 `@` 引用。
 
-每个 conversation 同时只允许一个 mutating turn；并发 prompt 返回 `409 CONFLICT`，不会排队。daemon 重启按 journal（而非 manifest 状态）判断未完成 turn：仍打开的 turn 追加 `conversation.interrupted`（已知时携带该 turn 的 `turnId`），状态标记为 `interrupted`，不会通过重放 prompt 猜测恢复；journal 中已结束但 manifest 仍为 `running` 的会话只按 journal 修正状态，不追加事件。原生会话 ID 由 `provider-state.json` 保存，Provider 支持时下一 turn 使用原生 resume。
+每个 conversation 同时只允许一个 mutating turn；并发 `conversation.prompt` 返回 `409 CONFLICT`，不会排队。运行中要追加的消息改用后端追加队列（见下文 `conversation.queue.add`），它对所有 Provider 可用。daemon 重启按 journal（而非 manifest 状态）判断未完成 turn：仍打开的 turn 追加 `conversation.interrupted`（已知时携带该 turn 的 `turnId`），状态标记为 `interrupted`，不会通过重放 prompt 猜测恢复；journal 中已结束但 manifest 仍为 `running` 的会话只按 journal 修正状态，不追加事件。原生会话 ID 由 `provider-state.json` 保存，Provider 支持时下一 turn 使用原生 resume。
 
 每个已开始的 turn 都以一个终态事件结束：driver panic 产生 `turn.failed`（`code: "PROVIDER_PANIC"`，其他任务异常为 `PROVIDER_TASK_CANCELLED`）；终态事件写入失败时按 100 ms / 500 ms / 2 s 重试，每次重试前先查 journal 避免重复，全部失败则 manifest 状态置为 `failed`，重启恢复再在 journal 中关闭该 turn。`[agent].provider_idle_timeout_minutes`（默认 60，`0` 关闭）内 Provider 没有任何输出或事件的 turn 会被取消（有待答权限请求时不计时触发），30 秒内未结束则强制中止，最终以 `turn.failed`（`code: "PROVIDER_IDLE_TIMEOUT"`）结束。Provider stdout 中非 JSON 行或超过 4 MiB 的行不再使 turn 失败：每个 turn 最多 20 条记为 `provider.event`（`{ "kind": "invalid_line", "preview" }`，preview 已脱敏且不超过 512 字节；或 `{ "kind": "oversized_line", "bytes" }`），其余只写日志。
 
@@ -187,7 +187,7 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
 
 `conversation.subscribe` 的 `limit` 只是 replay 分页大小。可选 `detail`（`full` 默认 | `summary`）按 HTTP `detail=summary` 同样的规则折叠首次 replay 的过程事件；实时事件与缺口/滞后补放始终完整。可选 `backfillLimit` 限制首次 replay 的事件数：从 `afterSequence` 之后按 sequence 升序最多发送 `backfillLimit` 条，不跳过也不只发最新事件。结果为 `{ "conversationId", "subscribed": true, "nextSequence", "hasMore", "lastSequence" }`：`nextSequence` 是最后一条已 replay 的 sequence（未截断时等于高水位），`hasMore` 表示 `nextSequence` 与 `lastSequence`（订阅时的 journal 高水位）之间仍有未发送事件，实时推送从 `lastSequence` 之后继续。`hasMore: true` 时客户端用 HTTP `afterSequence=nextSequence` 翻页补齐 `(nextSequence, lastSequence]`，服务端不会把这段当作序号缺口补放。两个字段都省略时行为与之前完全一致（`hasMore` 恒为 `false`）。
 
-支持 `conversation.subscribe`、`conversation.unsubscribe`、`conversation.create`、`conversation.prompt`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
+支持 `conversation.subscribe`、`conversation.unsubscribe`、`conversation.create`、`conversation.prompt`、`conversation.queue.add` / `remove` / `clear` / `resume` / `list`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
 
 每条 socket 最多同时持有 128 个会话订阅，超出后 `conversation.subscribe` 返回 `INVALID_REQUEST`。`conversation.unsubscribe` 的 payload 为 `{ "conversationId": "..." }`，释放该订阅槽位并停止转发任务，幂等且返回 `{ "conversationId", "unsubscribed" }`；订阅任务因补放失败终止时发出的 `server.error` 在 `payload.conversationId` 中携带会话 ID，客户端可据此清理本地订阅记录并重订阅。删除会话（含过期清理）会关闭其广播通道，等同于终止该会话的全部订阅。
 
@@ -196,6 +196,17 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
 发送侧有截止时间：单次 socket 发送超过 20 秒，或出站队列持续满 10 秒，连接即被关闭；关闭时最多等待 2 秒让发送任务排空，随后中止。
 
 MCP 真实调用只走 Backend：客户端只发送 `resourceId`、`toolName` 和对象类型的 `arguments`。Catalog JSON 不含 command、URL 或凭据。调用前必须通过权限 broker，默认拒绝；仅 `allow_once` / `allow_always` 会放行。Backend 使用标准 MCP SDK 连接 stdio JSONL 或 Streamable HTTP transport，并对初始化、调用和关闭分别设置时限。
+
+### 后端追加队列
+
+Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追加消息（所有 Provider 都支持；`followUpQueue` 仍只表示 Provider 原生队列）。队列持久化在会话目录的 `queue.json`，保存完整请求（含附件与 Skill），fork 不复制，删除会话一并删除。每个会话最多 32 条、序列化后合计 32 MiB，超出返回 `RESOURCE_EXHAUSTED`。
+
+- `conversation.queue.add`：payload 与 `conversation.prompt` 相同，另加 `itemId`（1–200 字节，省略时用命令 `id`）与可选 `front: true`（插到队首）。入队前按 prompt 的规则校验内容、路径与 Skill，不合法立即拒绝。会话空闲且队列为空时直接开始，结果为 `{ "conversationId", "itemId", "status": "started", "turnId" }`；否则入队，结果为 `{ ..., "status": "queued" }`。同一 `itemId` 已在队列中或已投递时幂等返回其状态，不会重复执行。
+- `conversation.queue.remove`（`itemId` 必填，不存在返回 `NOT_FOUND`）、`conversation.queue.clear`、`conversation.queue.resume`、`conversation.queue.list`：payload 为 `{ "conversationId", "itemId"? }`，结果为 `{ "conversationId", "queue": <快照> }`。`resume` 解除暂停，会话空闲时立即开始队首。
+
+快照为 `{ "items": [{ "id", "text", "status": "queued", "queuedAt", "contentCount", "skills" }], "paused", "pauseReason", "pauseMessage" }`，不含内联图片数据。每次变化都会追加 `followups.updated` 事件（payload 即快照）；懒加载窗口可能不含最近一次该事件，客户端打开会话或重连后应调用 `conversation.queue.list` 取当前快照。
+
+派发规则：turn 以 `turn.completed` 结束（或原生压缩结束）后，daemon 以队列项的 `itemId` 作为 `clientRequestId` 开始队首，成功后移出队列。`turn.failed` / `turn.cancelled` / `turn.interrupted` 使队列暂停（`pauseReason` 为 `turn_failed` / `turn_cancelled` / `turn_interrupted`）；队首无法开始时保留在队首并暂停（`start_failed`，`pauseMessage` 为原因）；daemon 重启后有待发项的队列暂停（`daemon_restarted`）。暂停期间空闲会话仍可直接 `conversation.prompt`，该 turn 完成后队列保持暂停。
 
 ### Pi 扩展与常驻 runtime
 

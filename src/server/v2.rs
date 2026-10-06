@@ -26,8 +26,8 @@ use crate::device_auth;
 use crate::error::AppError;
 use crate::provider::{
     read_current_version, run_install, run_upgrade, CliOperationAction, CliUpgradeOperation,
-    CliVersionsResponse, ConversationPrompt, ConversationSupervisor, ManagedCli,
-    PermissionDecision, PromptContentRef, PromptSkillRef,
+    CliVersionsResponse, ConversationPrompt, ConversationSupervisor, FollowUpAddOutcome,
+    ManagedCli, PermissionDecision, PromptContentRef, PromptSkillRef,
 };
 use crate::transport_crypto::TransportCryptoSession;
 use crate::workspace_paths::{
@@ -83,6 +83,11 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.create"
             | "conversation.prompt"
             | "conversation.followUp"
+            | "conversation.queue.add"
+            | "conversation.queue.remove"
+            | "conversation.queue.clear"
+            | "conversation.queue.resume"
+            | "conversation.queue.list"
             | "conversation.retry"
             | "conversation.resume"
             | "conversation.fork"
@@ -1503,6 +1508,8 @@ async fn providers(
                     capabilities.insert("steering".to_owned(), json!(live_controls));
                     capabilities.insert("liveConfiguration".to_owned(), json!(live_controls));
                     capabilities.insert("followUpQueue".to_owned(), json!(native_queue));
+                    // Every provider can hold follow-ups in the daemon's queue.
+                    capabilities.insert("backendQueue".to_owned(), json!(true));
                     if runtime_stop {
                         capabilities.insert("runtimeStop".to_owned(), json!(true));
                         capabilities.insert("sessionCommands".to_owned(), json!(true));
@@ -3091,6 +3098,79 @@ async fn dispatch_command_inner(
                 .await?;
             Ok(json!({ "conversationId": request.conversation_id, "turnId": turn_id }))
         }
+        "conversation.queue.add" => {
+            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let item_id = request
+                .item_id
+                .clone()
+                .unwrap_or_else(|| command.id.clone());
+            let outcome = state
+                .conversations
+                .queue_add_owned(
+                    owner_id,
+                    &request.conversation_id,
+                    &item_id,
+                    ConversationPrompt {
+                        client_request_id: Some(item_id.clone()),
+                        text: request.text.unwrap_or_default(),
+                        model: request.model,
+                        reasoning_effort: request.reasoning_effort,
+                        permission_mode: request.permission_mode,
+                        work_mode: request.work_mode,
+                        permission_profile: request.permission_profile,
+                        sandbox_mode: request.sandbox_mode,
+                        approval_policy: request.approval_policy,
+                        skills: prompt_skills(request.skills),
+                        content: request.content,
+                    },
+                    request.front,
+                )
+                .await?;
+            Ok(match outcome {
+                FollowUpAddOutcome::Queued => json!({
+                    "conversationId": request.conversation_id, "itemId": item_id, "status": "queued",
+                }),
+                FollowUpAddOutcome::Started(turn_id) => json!({
+                    "conversationId": request.conversation_id, "itemId": item_id, "status": "started", "turnId": turn_id,
+                }),
+            })
+        }
+        "conversation.queue.remove"
+        | "conversation.queue.clear"
+        | "conversation.queue.resume"
+        | "conversation.queue.list" => {
+            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let conversations = &state.conversations;
+            let conversation_id = request.conversation_id.as_str();
+            let snapshot = match command.command_type.as_str() {
+                "conversation.queue.remove" => {
+                    let item_id = request.item_id.as_deref().ok_or_else(|| {
+                        AppError::InvalidRequest(
+                            "conversation.queue.remove requires itemId".to_owned(),
+                        )
+                    })?;
+                    conversations
+                        .queue_remove_owned(owner_id, conversation_id, item_id)
+                        .await?
+                }
+                "conversation.queue.clear" => {
+                    conversations
+                        .queue_clear_owned(owner_id, conversation_id)
+                        .await?
+                }
+                "conversation.queue.resume" => {
+                    conversations
+                        .queue_resume_owned(owner_id, conversation_id)
+                        .await?
+                }
+                _ => {
+                    conversations
+                        .queue_list_owned(owner_id, conversation_id)
+                        .await?
+                }
+            };
+            Ok(json!({ "conversationId": request.conversation_id, "queue": snapshot }))
+        }
         "conversation.retry" => {
             let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
             let turn_id = state
@@ -3663,6 +3743,12 @@ struct WsConversationRequest {
     sandbox_mode: Option<String>,
     #[serde(default)]
     approval_policy: Option<String>,
+    /// Follow-up queue item id (`conversation.queue.*`); defaults to the command id.
+    #[serde(default)]
+    item_id: Option<String>,
+    /// `conversation.queue.add`: place the item ahead of the others.
+    #[serde(default)]
+    front: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4987,6 +5073,110 @@ mod tests {
         .await;
         assert_eq!(resubscribed["payload"]["subscribed"], true);
         subscriptions.abort_all();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_follow_up_queue_commands_route_to_the_backend_queue() {
+        let root = std::env::temp_dir().join(format!("todex-v2-queue-{}", Uuid::new_v4()));
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root],
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+                ssh_bin: "ssh".to_owned(),
+                provider_idle_timeout_minutes: 0,
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+        })
+        .await
+        .unwrap();
+        let manifest = state
+            .conversations
+            .create_owned("local", ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let (outgoing, _events) = mpsc::channel(16);
+        let mut subscriptions = WsSubscriptions::new();
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        macro_rules! run {
+            ($id:expr, $type:expr, $payload:expr $(,)?) => {{
+                assert!(is_v2_native_command($type));
+                dispatch_command_inner(
+                    &state,
+                    &outgoing,
+                    &mut subscriptions,
+                    &event_scope,
+                    "local",
+                    "local",
+                    &V2Command {
+                        id: $id.to_owned(),
+                        command_type: $type.to_owned(),
+                        payload: $payload,
+                    },
+                )
+                .await
+            }};
+        }
+        let listed = run!(
+            "list",
+            "conversation.queue.list",
+            json!({ "conversationId": manifest.id }),
+        )
+        .unwrap();
+        assert_eq!(listed["conversationId"], manifest.id);
+        assert_eq!(listed["queue"]["items"], json!([]));
+        assert_eq!(listed["queue"]["paused"], false);
+        let cleared = run!(
+            "clear",
+            "conversation.queue.clear",
+            json!({ "conversationId": manifest.id }),
+        )
+        .unwrap();
+        assert_eq!(cleared["queue"]["items"], json!([]));
+        let missing_id = run!(
+            "remove",
+            "conversation.queue.remove",
+            json!({ "conversationId": manifest.id }),
+        )
+        .unwrap_err();
+        assert_eq!(missing_id.code(), "INVALID_REQUEST");
+        let absent = run!(
+            "remove-absent",
+            "conversation.queue.remove",
+            json!({ "conversationId": manifest.id, "itemId": "absent" }),
+        )
+        .unwrap_err();
+        assert_eq!(absent.code(), "NOT_FOUND");
         let _ = fs::remove_dir_all(root);
     }
 

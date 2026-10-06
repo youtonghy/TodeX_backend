@@ -21,7 +21,8 @@ pub(crate) use cli_manager::{
 pub(crate) use doctor::inspect_providers;
 pub(crate) use grok::inspect_grok;
 pub use supervisor::{
-    ConversationPrompt, ConversationSupervisor, PromptContentRef, PromptSkillRef,
+    ConversationPrompt, ConversationSupervisor, FollowUpAddOutcome, PromptContentRef,
+    PromptSkillRef,
 };
 pub use types::PermissionDecision;
 pub(crate) use types::PermissionOutcome;

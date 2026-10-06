@@ -210,6 +210,15 @@ Daemon startup waits up to 120 seconds for initialization; on timeout the
 spawned child is terminated and the daemon log identifies the last recovery
 progress. No in-progress turn is replayed automatically.
 
+The backend follow-up queue (`queue.json`, see API.md "后端追加队列") is held
+by the supervisor for every provider. A turn task releases its active slot
+before it schedules the queue, so the next item starts through the normal
+prompt path under the conversation's request gate, with the item id as its
+`clientRequestId`; a start replayed after a crash is therefore recognized as
+already delivered. Only `turn.completed` (or a finished native compaction)
+advances the queue; other terminals pause it, and so does recovery: every
+queue with waiting items is paused with `daemon_restarted` at startup.
+
 Regression coverage includes malformed approvals, provider wire parameters,
 quiet processes and blocked writes, replay/live races, late acknowledgements,
 partial replay approvals, legacy gaps, usage snapshots and status rendering.

@@ -41,6 +41,9 @@ use super::types::{
     ProviderDriver, ProviderImageInputCapability, ProviderModelDescriptor,
 };
 
+mod follow_ups;
+pub use follow_ups::FollowUpAddOutcome;
+
 fn prompt_fingerprint(prompt: &ConversationPrompt) -> Result<String, AppError> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(prompt)?)))
 }
@@ -553,6 +556,7 @@ impl ConversationSupervisor {
                     "conversation recovery failed; continuing startup"
                 );
             }
+            self.pause_follow_ups_after_restart(&manifest.id).await;
             if (index + 1) % 25 == 0 || index + 1 == total {
                 tracing::info!(
                     recovered = index + 1,
@@ -1250,7 +1254,7 @@ impl ConversationSupervisor {
         let request_id = client_request_id.to_owned();
         let spawned_id = operation_id.clone();
         tokio::spawn(async move {
-            let _cleanup = cleanup;
+            let cleanup = cleanup;
             let result = driver
                 .compact_session(
                     DriverContext {
@@ -1279,6 +1283,9 @@ impl ConversationSupervisor {
             if let Err(error) = supervisor.emit(&conversation_id, event_type, payload).await {
                 tracing::error!(conversation_id, error = %error, "failed to persist native compaction outcome");
             }
+            // Prompts queued during compaction continue after it.
+            drop(cleanup);
+            supervisor.schedule_after_turn(conversation_id, "compaction.finished");
         });
         Ok(operation_id)
     }
@@ -1805,7 +1812,7 @@ impl ConversationSupervisor {
             conversation_id: conversation_id.clone(),
         };
         tokio::spawn(async move {
-            let _cleanup = cleanup;
+            let cleanup = cleanup;
             let activity = ProviderActivity::new();
             let sink = DriverEventSink::new(
                 supervisor.store.clone(),
@@ -1860,7 +1867,7 @@ impl ConversationSupervisor {
                     }
                 },
             };
-            supervisor
+            let terminal = supervisor
                 .finish_turn(
                     &conversation_id,
                     &spawned_turn_id,
@@ -1870,6 +1877,9 @@ impl ConversationSupervisor {
                     idle_timeout,
                 )
                 .await;
+            // The queue's next prompt needs the conversation released first.
+            drop(cleanup);
+            supervisor.schedule_after_turn(conversation_id, terminal);
         });
         Ok(turn_id)
     }
@@ -1884,7 +1894,7 @@ impl ConversationSupervisor {
         provider_state: ProviderState,
         outcome: Result<Result<DriverTurnResult, AppError>, tokio::task::JoinError>,
         idle_timeout: Option<Duration>,
-    ) {
+    ) -> &'static str {
         let (event_type, payload) = match (outcome, idle_timeout) {
             // However the driver wound down, the watchdog stopped this turn.
             (outcome, Some(limit)) => {
@@ -1970,6 +1980,7 @@ impl ConversationSupervisor {
         };
         self.emit_terminal(conversation_id, turn_id, event_type, payload)
             .await;
+        event_type
     }
 
     /// Resolves once the turn's provider has been silent for `limit` while no
@@ -2723,6 +2734,8 @@ fn normalize_profile(
 
 #[cfg(all(test, unix))]
 mod tests {
+    mod follow_up_queue;
+
     use std::collections::BTreeMap;
     use std::fs;
     use std::sync::Arc;
