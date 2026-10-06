@@ -86,7 +86,7 @@ impl TextGenerator {
             for _ in 0..words {
                 text.push_str(WORDS[(self.next() % WORDS.len() as u64) as usize]);
                 text.push(' ');
-                if self.next() % 4 == 0 {
+                if self.next().is_multiple_of(4) {
                     text.push_str(&(self.next() % 100_000).to_string());
                     text.push(' ');
                 }
