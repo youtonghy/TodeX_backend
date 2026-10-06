@@ -49,8 +49,11 @@ const MAX_RECIPIENTS: usize = 256;
 /// Active (unrevoked) recipients; every new DEK is wrapped for each of them.
 const MAX_ACTIVE_RECIPIENTS: usize = 64;
 const MAX_GRANTS: usize = 64;
-/// Blocked devices kept on file; the oldest entries are pruned beyond this.
-const MAX_REVOKED_DEVICES: usize = 256;
+/// Unreported external revocations kept in memory between polls. The
+/// on-file block list itself is unbounded: dropping an entry would unblock
+/// a revoked device (only `MAX_FILE_BYTES` limits it, and a write past that
+/// fails instead of losing entries).
+const MAX_PENDING_EXTERNAL: usize = 256;
 /// `revokedBy` of devices blocked from the TUI (`devices.json` revocation).
 pub(crate) const REVOKED_BY_TUI: &str = "tui";
 /// `revokedBy` of devices blocked by the daemon itself because they vanished
@@ -645,8 +648,8 @@ impl Inner {
                 .into_iter()
                 .map(|device_id| ExternalRevocation { device_id, state }),
         );
-        if self.external.len() > MAX_REVOKED_DEVICES {
-            let excess = self.external.len() - MAX_REVOKED_DEVICES;
+        if self.external.len() > MAX_PENDING_EXTERNAL {
+            let excess = self.external.len() - MAX_PENDING_EXTERNAL;
             self.external.drain(..excess);
         }
     }
@@ -695,25 +698,10 @@ impl RecipientsFile {
     }
 
     /// Adds `device_id` to the block list; `false` when already blocked.
-    /// The oldest entries are pruned beyond [`MAX_REVOKED_DEVICES`].
+    /// Entries are never pruned (see [`MAX_PENDING_EXTERNAL`]).
     fn block(&mut self, device_id: &str, revoked_by: &str, now: DateTime<Utc>) -> bool {
         if self.is_blocked(device_id) {
             return false;
-        }
-        if self.revoked_devices.len() >= MAX_REVOKED_DEVICES {
-            if let Some(oldest) = self
-                .revoked_devices
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, entry)| entry.revoked_at)
-                .map(|(index, _)| index)
-            {
-                let pruned = self.revoked_devices.remove(oldest);
-                tracing::warn!(
-                    device_id = %pruned.device_id,
-                    "history revocation list is full; unblocking its oldest device"
-                );
-            }
         }
         self.revoked_devices.push(RevokedDevice {
             device_id: device_id.to_owned(),
@@ -823,13 +811,11 @@ impl RecipientsFile {
             return Err(corrupt());
         }
         let mut blocked = std::collections::HashSet::new();
-        if self.revoked_devices.len() > MAX_REVOKED_DEVICES
-            || self.revoked_devices.iter().any(|entry| {
-                entry.device_id.is_empty()
-                    || entry.revoked_by.is_empty()
-                    || !blocked.insert(entry.device_id.as_str())
-            })
-        {
+        if self.revoked_devices.iter().any(|entry| {
+            entry.device_id.is_empty()
+                || entry.revoked_by.is_empty()
+                || !blocked.insert(entry.device_id.as_str())
+        }) {
             return Err(corrupt());
         }
         Ok(())
@@ -1346,6 +1332,28 @@ mod tests {
             .find(|entry| entry.device_id == b)
             .unwrap();
         assert_eq!(entry.revoked_by, REVOKED_BY_DAEMON);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_block_list_never_drops_entries() {
+        let root = temp_dir("block-unbounded");
+        let registry = registry(&root, HistoryEncryption::Off);
+        registry.register_device("dev_a", &recipient(1)).unwrap();
+        let ids = (0..300).map(|n| format!("dev_{n}")).collect::<Vec<_>>();
+        revoke_device_recipients(&root, DeviceRevocation::All(&ids)).unwrap();
+        revoke_device_recipients(&root, DeviceRevocation::One("dev_late")).unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        assert_eq!(snapshot.revoked_devices.len(), 302);
+        for device_id in ids.iter().map(String::as_str).chain(["dev_a", "dev_late"]) {
+            assert_eq!(
+                registry.ensure_access(device_id).unwrap_err().code(),
+                "HISTORY_ACCESS_REVOKED"
+            );
+        }
+        // A reload validates and keeps every entry.
+        let reloaded = self::registry(&root, HistoryEncryption::Off);
+        assert_eq!(reloaded.snapshot().unwrap().revoked_devices.len(), 302);
         let _ = std::fs::remove_dir_all(root);
     }
 

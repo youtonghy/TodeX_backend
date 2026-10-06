@@ -46,7 +46,7 @@
 }
 ```
 
-  `epoch` 在接收方集合变化（新增、吊销、恢复密钥替换）时加一，切换 `mode` 不变。最多一个未吊销的 `recovery` 接收方；已吊销的公钥不能再次登记（`rid` 由公钥决定，须换新密钥对）。设备在 `devices.json` 被吊销时，其接收方同时标记 `revokedAt`，设备本身加入 `revokedDevices`（见 §3.4）；daemon 访问本文件时也会吊销 `devices.json` 中已不存在的设备的接收方并封禁该设备。`revokedDevices` 为空时不写出（缺省视为空，`version` 仍为 1），所以未封禁过设备的文件旧版 daemon 仍可读取；最多保留 256 项，超出时解封最早的一项并记录警告。授权 `status`：`pending`、`fulfilled`、`dismissed`、`revoked`（接收方被吊销或换钥时待办授权转为 `revoked`）。
+  `epoch` 在接收方集合变化（新增、吊销、恢复密钥替换）时加一，切换 `mode` 不变。最多一个未吊销的 `recovery` 接收方；已吊销的公钥不能再次登记（`rid` 由公钥决定，须换新密钥对）。设备在 `devices.json` 被吊销时，其接收方同时标记 `revokedAt`，设备本身加入 `revokedDevices`（见 §3.4）；daemon 访问本文件时也会吊销 `devices.json` 中已不存在的设备的接收方并封禁该设备。`revokedDevices` 为空时不写出（缺省视为空，`version` 仍为 1），所以未封禁过设备的文件旧版 daemon 仍可读取；该列表不设条数上限、从不自动删除项（删除即解封），只受本文件 2 MiB 大小上限约束，超出时写入失败并返回错误而不会丢项。授权 `status`：`pending`、`fulfilled`、`dismissed`、`revoked`（接收方被吊销或换钥时待办授权转为 `revoked`）。
   `mode` 的来源：文件不存在时视为 `off`；首次写入时取配置 `history_encryption`（`TODEX_AGENTD_HISTORY_ENCRYPTION`），但仅当该次写入后已有未吊销的设备接收方才为 `e2e`；文件存在后以文件为准，配置不再生效。
 - 每个会话 `keyring.json`（0600，原子替换）：`{"version":1,"keys":[{"kid","createdAt","epoch","wraps":[WrappedKey…]}]}`。授权新设备只向已有 `kid` 追加 `wraps`，不改动分片文件。
 
