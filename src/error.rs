@@ -58,6 +58,11 @@ pub enum AppError {
     /// The client cannot read end-to-end encrypted history.
     #[error("client upgrade required: {0}")]
     ClientUpgradeRequired(String),
+    /// The calling device is on the history revocation list
+    /// (docs/history-encryption.md §3.4); only `history.encryption.get` is
+    /// still allowed until another device restores it.
+    #[error("history access was revoked for this device; another device must restore it")]
+    HistoryAccessRevoked,
     /// The disk holding the data directory is nearly full; new turns are
     /// refused until space is freed.
     #[error("storage is low: {0}")]
@@ -114,6 +119,7 @@ impl AppError {
             Self::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
             Self::JournalFull(_) => "JOURNAL_FULL",
             Self::ClientUpgradeRequired(_) => "CLIENT_UPGRADE_REQUIRED",
+            Self::HistoryAccessRevoked => "HISTORY_ACCESS_REVOKED",
             Self::StorageLow(_) => "STORAGE_LOW",
             Self::ProviderUnavailable(_) => "PROVIDER_UNAVAILABLE",
             Self::RemoteAuthFailed(_) => "REMOTE_AUTH_FAILED",
@@ -155,6 +161,7 @@ impl IntoResponse for AppError {
             Self::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::JournalFull(_) | Self::StorageLow(_) => StatusCode::INSUFFICIENT_STORAGE,
             Self::ClientUpgradeRequired(_) => StatusCode::UPGRADE_REQUIRED,
+            Self::HistoryAccessRevoked => StatusCode::FORBIDDEN,
             Self::ProviderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             // Not 401: clients treat that as a failed device signature.
             Self::RemoteAuthFailed(_) | Self::RemoteHostKeyUnverified(_) => StatusCode::FORBIDDEN,

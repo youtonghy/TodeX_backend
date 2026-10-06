@@ -5,20 +5,33 @@
 //! backend only moves public keys and wrapped DEKs: it checks that a key id
 //! exists and that each wrap targets the granted recipient, and can never
 //! read what it stores.
+//!
+//! Every persisted change to recipients, grants, the mode or the device block
+//! list is announced to every `/v2/ws` connection as a global
+//! `history.encryption.updated` event (docs/history-encryption.md §7.1),
+//! published only after the write succeeded and never carrying key
+//! material. Blocked devices (`revokedDevices`) get `HISTORY_ACCESS_REVOKED`
+//! for every command but `history.encryption.get`.
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::app_state::AppState;
 use crate::config::HistoryEncryption;
 use crate::error::AppError;
+use crate::event::EventRecord;
 use crate::history_crypto::{RecipientPublicKey, WrappedKey, KID_LEN, RECIPIENT_ID_LEN};
-use crate::history_keys::{decode_id, GrantRecord, RecipientsSnapshot, MAX_BATCH};
+use crate::history_keys::{
+    decode_id, GrantRecord, RecipientKind, RecipientsSnapshot, Written, MAX_BATCH,
+};
+
+/// The global server event announcing a history key state change.
+pub(super) const UPDATED_EVENT: &str = "history.encryption.updated";
 
 /// Every `history.*` command; `is_v2_native_command` lists the same names.
-pub(super) const HISTORY_COMMANDS: [&str; 12] = [
+pub(super) const HISTORY_COMMANDS: [&str; 13] = [
     "history.encryption.get",
     "history.encryption.enable",
     "history.encryption.disable",
@@ -31,6 +44,7 @@ pub(super) const HISTORY_COMMANDS: [&str; 12] = [
     "history.grant.fulfill",
     "history.keys.list",
     "history.keys.wraps",
+    "history.device.restore",
 ];
 
 pub(super) fn is_history_command(command_type: &str) -> bool {
@@ -51,6 +65,12 @@ struct PublicKeyRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RidRequest {
     rid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeviceIdRequest {
+    device_id: String,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +130,10 @@ pub(super) async fn dispatch(
     let keys = &state.history_keys;
     let registry = keys.recipients();
     registry.ensure_device(device_id)?;
+    publish_external_changes(state).await?;
+    if command_type != "history.encryption.get" {
+        registry.ensure_access(device_id)?;
+    }
     match command_type {
         "history.encryption.get" => {
             parse::<Empty>(payload)?;
@@ -122,7 +146,8 @@ pub(super) async fn dispatch(
             } else {
                 HistoryEncryption::Off
             };
-            registry.set_mode(mode)?;
+            let applied = registry.set_mode(mode)?;
+            publish(state, applied.written, Updated::new("mode")).await;
             if mode == HistoryEncryption::E2e {
                 state.conversations.request_history_migration();
             }
@@ -131,23 +156,55 @@ pub(super) async fn dispatch(
         "history.recipient.register" => {
             let request = parse::<PublicKeyRequest>(payload)?;
             let key = RecipientPublicKey::from_base64url(&request.public_key)?;
-            let rid = registry.register_device(device_id, &key)?;
+            let applied = registry.register_device(device_id, &key)?;
+            let rid = applied.value;
+            let update = Updated::new("recipient.registered")
+                .rid(&rid)
+                .device(device_id);
+            publish(state, applied.written, update).await;
             Ok(json!({ "rid": rid }))
         }
         "history.recipient.revoke" => {
             let request = parse::<RidRequest>(payload)?;
             decode_id::<RECIPIENT_ID_LEN>(&request.rid, "rid")?;
-            registry.revoke(&request.rid)?;
+            let applied = registry.revoke(&request.rid, device_id)?;
+            let mut update = Updated::new("recipient.revoked").rid(&request.rid);
+            if let Some(revoked_device) = &applied.value {
+                update = update.device(revoked_device);
+            }
+            publish(state, applied.written, update).await;
+            encryption_state(state, device_id)
+        }
+        "history.device.restore" => {
+            let request = parse::<DeviceIdRequest>(payload)?;
+            let applied = registry.restore_device(&request.device_id)?;
+            let update = Updated::new("device.restored").device(&request.device_id);
+            publish(state, applied.written, update).await;
             encryption_state(state, device_id)
         }
         "history.recovery.set" => {
             let request = parse::<PublicKeyRequest>(payload)?;
             let key = RecipientPublicKey::from_base64url(&request.public_key)?;
-            Ok(json!({ "rid": registry.set_recovery(&key)? }))
+            let applied = registry.set_recovery(&key)?;
+            let rid = applied.value;
+            publish(
+                state,
+                applied.written,
+                Updated::new("recovery.set").rid(&rid),
+            )
+            .await;
+            Ok(json!({ "rid": rid }))
         }
         "history.grant.request" => {
             parse::<Empty>(payload)?;
-            Ok(json!({ "grantId": registry.request_grant(device_id)? }))
+            let applied = registry.request_grant(device_id)?;
+            let grant = applied.value;
+            let update = Updated::new("grant.requested")
+                .grant(&grant.grant_id)
+                .rid(&grant.rid)
+                .device(device_id);
+            publish(state, applied.written, update).await;
+            Ok(json!({ "grantId": grant.grant_id }))
         }
         "history.grant.list" => {
             parse::<Empty>(payload)?;
@@ -155,7 +212,9 @@ pub(super) async fn dispatch(
         }
         "history.grant.dismiss" => {
             let request = parse::<GrantIdRequest>(payload)?;
-            registry.dismiss_grant(&request.grant_id)?;
+            let applied = registry.dismiss_grant(&request.grant_id)?;
+            let update = Updated::new("grant.dismissed").grant(&request.grant_id);
+            publish(state, applied.written, update).await;
             Ok(json!({}))
         }
         "history.keys.list" => {
@@ -288,31 +347,196 @@ async fn fulfill(
         }
     }
     let mut added = 0;
+    let mut updated = Vec::new();
+    let mut failure = None;
     for (conversation_id, wraps) in by_conversation {
-        added += keys
+        match keys
             .keyrings()
             .append_wraps(&conversation_id, &target, wraps)
-            .await?;
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => {
+                added += count;
+                updated.push(conversation_id);
+            }
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    // Wraps already written stay usable, so they are announced even when a
+    // later conversation failed.
+    if !updated.is_empty() {
+        let mut update = Updated::new("grant.progress").rid(&request.rid);
+        update.conversation_ids = Some(updated);
+        if let Some(grant_id) = &request.grant_id {
+            update = update.grant(grant_id);
+        }
+        match registry.state() {
+            Ok(current) => publish(state, Some(current), update).await,
+            Err(error) => tracing::warn!(
+                error = %error,
+                "history grant progress was not announced"
+            ),
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
     }
     if request.complete {
         if let Some(grant_id) = &request.grant_id {
-            registry.complete_grant(grant_id)?;
+            let applied = registry.complete_grant(grant_id)?;
+            let update = Updated::new("grant.fulfilled")
+                .grant(grant_id)
+                .rid(&request.rid);
+            publish(state, applied.written, update).await;
         }
     }
     Ok(json!({ "added": added }))
 }
 
-/// `{mode, epoch, recipients[], myRid?, grants[]}`.
+/// Announces device blocks the registry noticed outside `history.*`
+/// commands: the TUI revoking devices through `devices.json` from its own
+/// process, or the daemon blocking devices that vanished from it. Called
+/// before every `history.*` command and by [`spawn_history_watch`].
+pub(super) async fn publish_external_changes(state: &AppState) -> Result<(), AppError> {
+    for change in state.history_keys.recipients().take_external_changes()? {
+        let update = Updated::new("device.revoked").device(&change.device_id);
+        publish(state, Some(change.state), update).await;
+    }
+    Ok(())
+}
+
+/// How often the daemon checks `recipients.json` for changes made by other
+/// processes, so TUI device revocations are pushed without a client request.
+const EXTERNAL_CHANGE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Polls for [`publish_external_changes`] until aborted.
+pub(crate) fn spawn_history_watch(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(EXTERNAL_CHANGE_POLL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut failing = false;
+        loop {
+            interval.tick().await;
+            match publish_external_changes(&state).await {
+                Ok(()) => failing = false,
+                // Log once per failure streak, not every two seconds.
+                Err(error) if !failing => {
+                    failing = true;
+                    tracing::warn!(
+                        error = %error,
+                        "history recipient registry check failed"
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+    })
+}
+
+/// `history.encryption.updated` payload; absent fields are omitted.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Updated {
+    epoch: u64,
+    mode: HistoryEncryption,
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversation_ids: Option<Vec<String>>,
+}
+
+impl Updated {
+    fn new(reason: &'static str) -> Self {
+        Self {
+            epoch: 0,
+            mode: HistoryEncryption::Off,
+            reason,
+            rid: None,
+            device_id: None,
+            grant_id: None,
+            conversation_ids: None,
+        }
+    }
+
+    fn rid(mut self, rid: &str) -> Self {
+        self.rid = Some(rid.to_owned());
+        self
+    }
+
+    fn device(mut self, device_id: &str) -> Self {
+        self.device_id = Some(device_id.to_owned());
+        self
+    }
+
+    fn grant(mut self, grant_id: &str) -> Self {
+        self.grant_id = Some(grant_id.to_owned());
+        self
+    }
+}
+
+/// Publishes `update` with the state `written` left behind; nothing when the
+/// command changed nothing (`written` is `None`).
+async fn publish(state: &AppState, written: Option<Written>, mut update: Updated) {
+    let Some(written) = written else {
+        return;
+    };
+    update.epoch = written.epoch;
+    update.mode = written.mode;
+    match serde_json::to_value(&update) {
+        Ok(payload) => {
+            state
+                .events
+                .publish(EventRecord::new(UPDATED_EVENT, None, None, None, payload))
+                .await;
+        }
+        Err(error) => tracing::warn!(error = %error, "history update event was not published"),
+    }
+}
+
+/// `{mode, epoch, recipients[], myRid?, myAccess, grants[], revokedDevices[]}`.
 fn encryption_state(state: &AppState, device_id: &str) -> Result<Value, AppError> {
-    let registry = state.history_keys.recipients();
-    let snapshot = registry.snapshot()?;
+    let snapshot = state.history_keys.recipients().snapshot()?;
+    let my_rid = snapshot
+        .recipients
+        .iter()
+        .find(|record| {
+            record.revoked_at.is_none()
+                && record.kind == RecipientKind::Device
+                && record.device_id.as_deref() == Some(device_id)
+        })
+        .map(|record| record.rid.clone());
+    let blocked = snapshot
+        .revoked_devices
+        .iter()
+        .any(|entry| entry.device_id == device_id);
+    let my_access = match (blocked, &my_rid) {
+        (true, _) => "revoked",
+        (false, Some(_)) => "active",
+        (false, None) => "unregistered",
+    };
+    let revoked_devices = snapshot
+        .revoked_devices
+        .iter()
+        .map(|entry| json!({ "deviceId": entry.device_id, "revokedAt": entry.revoked_at }))
+        .collect::<Vec<_>>();
     let mut response = json!({
         "mode": snapshot.mode,
         "epoch": snapshot.epoch,
         "recipients": snapshot.recipients,
         "grants": grants_json(&snapshot),
+        "myAccess": my_access,
+        "revokedDevices": revoked_devices,
     });
-    if let Some(rid) = registry.device_rid(device_id)? {
+    if let Some(rid) = my_rid {
         response["myRid"] = json!(rid);
     }
     Ok(response)

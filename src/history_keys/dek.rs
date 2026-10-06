@@ -499,7 +499,8 @@ mod tests {
         let rid = fixture
             .recipients
             .register_device("dev_a", &recipient(1))
-            .unwrap();
+            .unwrap()
+            .value;
         fixture.recipients.set_mode(HistoryEncryption::E2e).unwrap();
         let (first, _) = fixture.current().await;
         fixture.recipients.set_mode(HistoryEncryption::Off).unwrap();
@@ -517,7 +518,7 @@ mod tests {
         fixture.recipients.set_mode(HistoryEncryption::E2e).unwrap();
         assert_ne!(fixture.current().await.0, first);
 
-        fixture.recipients.revoke(&rid).unwrap();
+        fixture.recipients.revoke(&rid, "local").unwrap();
         assert_eq!(
             fixture
                 .deks
@@ -541,7 +542,8 @@ mod tests {
         let rid = fixture
             .recipients
             .register_device("dev_a", &recipient(1))
-            .unwrap();
+            .unwrap()
+            .value;
         fixture.recipients.set_mode(HistoryEncryption::E2e).unwrap();
         // A fresh key is recorded but never becomes the active one.
         let (fresh, _) = fixture
@@ -571,7 +573,7 @@ mod tests {
         let snapshot = fixture.deks.keys_snapshot(&fixture.conversation).await;
         assert!(snapshot.contains_key(&active) && snapshot.contains_key(&second));
         // Without recipients the newest key in memory stays usable.
-        fixture.recipients.revoke(&rid).unwrap();
+        fixture.recipients.revoke(&rid, "local").unwrap();
         assert!(fixture
             .deks
             .current_key(&fixture.conversation)

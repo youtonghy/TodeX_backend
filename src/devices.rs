@@ -5,6 +5,7 @@
 //! changes by mtime so revocation applies without a restart. The file is the
 //! source of truth: deleting it locks out every paired device.
 use crate::error::AppError;
+use crate::history_keys::DeviceRevocation;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -192,10 +193,11 @@ pub(crate) fn list_devices(data_dir: &Path) -> Result<Vec<DeviceRecord>> {
     Ok(devices.into_values().collect())
 }
 
-/// Removes the device, then revokes its history recipient (see
-/// `history_keys`). The device file is written first: if the history update
-/// fails the device is still locked out, the error says so, and the daemon
-/// revokes recipients of unpaired devices on its next history access.
+/// Removes the device, then revokes its history recipient and blocks it from
+/// history access (see `history_keys`). The device file is written first: if
+/// the history update fails the device is still locked out, the error says
+/// so, and the daemon revokes and blocks unpaired devices with a recipient on
+/// its next history access.
 pub(crate) fn revoke_device(data_dir: &Path, device_id: &str) -> Result<bool> {
     let path = data_dir.join(FILE_NAME);
     let (mut devices, _) = read_records(&path)?.unwrap_or_default();
@@ -209,11 +211,20 @@ pub(crate) fn revoke_device(data_dir: &Path, device_id: &str) -> Result<bool> {
             devices,
         },
     )?;
-    revoke_history_recipients(data_dir, Some(device_id))?;
+    revoke_history_recipients(data_dir, DeviceRevocation::One(device_id))?;
     Ok(true)
 }
 
 pub(crate) fn revoke_all_devices(data_dir: &Path) -> Result<()> {
+    // An unreadable file must not stop a revoke-all; devices with a history
+    // recipient are still blocked through their recipient records.
+    let paired = match list_devices(data_dir) {
+        Ok(devices) => devices.into_iter().map(|device| device.device_id).collect(),
+        Err(error) => {
+            tracing::warn!(error = %error, "revoking all devices from an unreadable registry");
+            Vec::new()
+        }
+    };
     write_records(
         &data_dir.join(FILE_NAME),
         &RegistryFile {
@@ -221,11 +232,11 @@ pub(crate) fn revoke_all_devices(data_dir: &Path) -> Result<()> {
             devices: BTreeMap::new(),
         },
     )?;
-    revoke_history_recipients(data_dir, None)
+    revoke_history_recipients(data_dir, DeviceRevocation::All(&paired))
 }
 
-fn revoke_history_recipients(data_dir: &Path, device_id: Option<&str>) -> Result<()> {
-    crate::history_keys::revoke_device_recipients(data_dir, device_id)
+fn revoke_history_recipients(data_dir: &Path, devices: DeviceRevocation<'_>) -> Result<()> {
+    crate::history_keys::revoke_device_recipients(data_dir, devices)
         .map(|_| ())
         .map_err(|error| {
             invalid(&format!(
@@ -362,19 +373,39 @@ mod tests {
         let second = registry.register("Laptop", &key(8)).unwrap();
         let recipients =
             RecipientRegistry::load(&root, HistoryEncryption::Off, None, system_clock()).unwrap();
+        // Paired but never registered for history: still blocked by revoke-all.
+        let third = registry.register("Tablet", &key(9)).unwrap();
         let first_rid = recipients
             .register_device(&first.device_id, &recipient(1))
-            .unwrap();
+            .unwrap()
+            .value;
         let second_rid = recipients
             .register_device(&second.device_id, &recipient(2))
-            .unwrap();
+            .unwrap()
+            .value;
 
         assert!(revoke_device(&root, &first.device_id).unwrap());
         assert!(!recipients.is_active(&first_rid).unwrap());
         assert!(recipients.is_active(&second_rid).unwrap());
         revoke_all_devices(&root).unwrap();
         assert!(!recipients.is_active(&second_rid).unwrap());
-        assert_eq!(recipients.snapshot().unwrap().epoch, 4);
+        let snapshot = recipients.snapshot().unwrap();
+        assert_eq!(snapshot.epoch, 4);
+        let blocked = snapshot
+            .revoked_devices
+            .iter()
+            .map(|entry| (entry.device_id.as_str(), entry.revoked_by.as_str()))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            blocked,
+            [
+                (first.device_id.as_str(), "tui"),
+                (second.device_id.as_str(), "tui"),
+                (third.device_id.as_str(), "tui"),
+            ]
+            .into_iter()
+            .collect()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

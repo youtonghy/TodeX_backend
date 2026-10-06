@@ -34,7 +34,8 @@ pub(crate) use dek::DekManager;
 pub(crate) use fingerprint::FingerprintKey;
 pub(crate) use keyring::KeyringStore;
 pub(crate) use recipients::{
-    revoke_device_recipients, GrantRecord, RecipientRegistry, RecipientsSnapshot,
+    revoke_device_recipients, DeviceRevocation, GrantRecord, RecipientKind, RecipientRegistry,
+    RecipientsSnapshot, Written,
 };
 
 type Result<T> = std::result::Result<T, AppError>;

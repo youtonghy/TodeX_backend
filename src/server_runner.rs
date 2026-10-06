@@ -22,6 +22,8 @@ pub struct ManagedServer {
     migration_task: Option<JoinHandle<()>>,
     /// Journal segment conversion, v2 migration and backup cleanup.
     maintenance_task: Option<JoinHandle<()>>,
+    /// Pushes history key changes made by other processes (the TUI).
+    history_watch_task: Option<JoinHandle<()>>,
 }
 
 /// Whether the server records the provider processes it spawns and reaps the
@@ -122,6 +124,7 @@ impl ManagedServer {
         });
         let migration_task = Some(state.spawn_legacy_conversation_migration());
         let maintenance_task = Some(state.spawn_journal_maintenance());
+        let history_watch_task = Some(server::spawn_history_watch(state.clone()));
 
         Ok(Self {
             config,
@@ -132,6 +135,7 @@ impl ManagedServer {
             retention_task,
             migration_task,
             maintenance_task,
+            history_watch_task,
         })
     }
 
@@ -162,6 +166,9 @@ impl ManagedServer {
         if let Some(task) = self.maintenance_task.take() {
             task.abort();
         }
+        if let Some(task) = self.history_watch_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.retention_task.take() {
             task.abort();
         }
@@ -182,6 +189,9 @@ impl ManagedServer {
             task.abort();
         }
         if let Some(task) = self.maintenance_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.history_watch_task.take() {
             task.abort();
         }
         self.state.conversations.shutdown_all().await;

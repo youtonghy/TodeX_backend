@@ -13,6 +13,12 @@
 //! file is reloaded whenever its stamp changes. When device auth is on, a
 //! device recipient whose device is no longer in `devices.json` is revoked on
 //! the next access even if the TUI hook did not run.
+//!
+//! Revoked devices are also blocked (`revokedDevices`): a blocked device may
+//! only call `history.encryption.get` until another device restores it, so
+//! re-pairing the same device identity does not bring history access back.
+//! Changes made from another process are reported through
+//! [`RecipientRegistry::take_external_changes`] so the daemon can push them.
 
 use std::{
     path::{Path, PathBuf},
@@ -43,6 +49,13 @@ const MAX_RECIPIENTS: usize = 256;
 /// Active (unrevoked) recipients; every new DEK is wrapped for each of them.
 const MAX_ACTIVE_RECIPIENTS: usize = 64;
 const MAX_GRANTS: usize = 64;
+/// Blocked devices kept on file; the oldest entries are pruned beyond this.
+const MAX_REVOKED_DEVICES: usize = 256;
+/// `revokedBy` of devices blocked from the TUI (`devices.json` revocation).
+pub(crate) const REVOKED_BY_TUI: &str = "tui";
+/// `revokedBy` of devices blocked by the daemon itself because they vanished
+/// from `devices.json` without the TUI hook running.
+pub(crate) const REVOKED_BY_DAEMON: &str = "local";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,6 +110,17 @@ pub(crate) struct GrantRecord {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+/// A device that may no longer use `history.*` (except
+/// `history.encryption.get`) until `history.device.restore`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RevokedDevice {
+    pub device_id: String,
+    pub revoked_at: DateTime<Utc>,
+    /// The revoking device id, `"tui"` or `"local"` (the daemon).
+    pub revoked_by: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecipientsFile {
@@ -105,6 +129,10 @@ struct RecipientsFile {
     epoch: u64,
     recipients: Vec<RecipientRecord>,
     grants: Vec<GrantRecord>,
+    /// Absent in files written before device blocking; omitted while empty
+    /// so such files stay readable by older daemons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    revoked_devices: Vec<RevokedDevice>,
 }
 
 impl Default for RecipientsFile {
@@ -115,6 +143,7 @@ impl Default for RecipientsFile {
             epoch: 0,
             recipients: Vec::new(),
             grants: Vec::new(),
+            revoked_devices: Vec::new(),
         }
     }
 }
@@ -126,6 +155,29 @@ pub(crate) struct RecipientsSnapshot {
     pub epoch: u64,
     pub recipients: Vec<RecipientRecord>,
     pub grants: Vec<GrantRecord>,
+    pub revoked_devices: Vec<RevokedDevice>,
+}
+
+/// The registry state a successful write left behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Written {
+    pub mode: HistoryEncryption,
+    pub epoch: u64,
+}
+
+/// The result of a mutation; `written` is set when it changed the file.
+#[derive(Debug)]
+pub(crate) struct Applied<T> {
+    pub value: T,
+    pub written: Option<Written>,
+}
+
+/// A device blocked by another process (the TUI) or by the daemon's own
+/// reconciliation, i.e. not by a `history.*` command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalRevocation {
+    pub device_id: String,
+    pub state: Written,
 }
 
 /// What a new DEK is wrapped for.
@@ -140,6 +192,8 @@ struct Inner {
     file: RecipientsFile,
     exists: bool,
     stamp: Option<FileStamp>,
+    /// Unreported [`ExternalRevocation`]s, oldest first, bounded.
+    external: Vec<ExternalRevocation>,
 }
 
 /// Daemon-side handle. Every operation reloads a changed file, reconciles
@@ -168,6 +222,7 @@ impl RecipientRegistry {
                 exists: loaded.is_some(),
                 file: loaded.unwrap_or_default(),
                 stamp,
+                external: Vec::new(),
             })),
             default_mode,
             devices,
@@ -182,6 +237,30 @@ impl RecipientRegistry {
                 epoch: file.epoch,
                 recipients: file.recipients.clone(),
                 grants: file.grants.clone(),
+                revoked_devices: file.revoked_devices.clone(),
+            })
+        })
+    }
+
+    /// Fails with `HISTORY_ACCESS_REVOKED` when `device_id` is blocked.
+    pub(crate) fn ensure_access(&self, device_id: &str) -> Result<()> {
+        self.update(|file, _| file.ensure_access(device_id))
+    }
+
+    /// Reloads a changed file, reconciles it and returns the device
+    /// revocations not made through this handle's commands since the last
+    /// call (see [`ExternalRevocation`]).
+    pub(crate) fn take_external_changes(&self) -> Result<Vec<ExternalRevocation>> {
+        self.update(|_, _| Ok(()))?;
+        Ok(std::mem::take(&mut self.lock()?.external))
+    }
+
+    /// The current mode and epoch.
+    pub(crate) fn state(&self) -> Result<Written> {
+        self.update(|file, _| {
+            Ok(Written {
+                mode: file.mode,
+                epoch: file.epoch,
             })
         })
     }
@@ -236,10 +315,11 @@ impl RecipientRegistry {
         &self,
         device_id: &str,
         key: &RecipientPublicKey,
-    ) -> Result<String> {
+    ) -> Result<Applied<String>> {
         let rid = encode_id(&key.rid());
         let public_key = encode_id(&key.to_bytes());
-        self.update(|file, now| {
+        self.apply(|file, now| {
+            file.ensure_access(device_id)?;
             if let Some(existing) = file.recipients.iter().find(|record| record.rid == rid) {
                 return match existing.kind {
                     _ if !existing.is_active() => Err(revoked_key()),
@@ -271,10 +351,10 @@ impl RecipientRegistry {
     }
 
     /// Replaces the recovery recipient (at most one is active).
-    pub(crate) fn set_recovery(&self, key: &RecipientPublicKey) -> Result<String> {
+    pub(crate) fn set_recovery(&self, key: &RecipientPublicKey) -> Result<Applied<String>> {
         let rid = encode_id(&key.rid());
         let public_key = encode_id(&key.to_bytes());
-        self.update(|file, now| {
+        self.apply(|file, now| {
             if let Some(existing) = file.recipients.iter().find(|record| record.rid == rid) {
                 return match existing.kind {
                     _ if !existing.is_active() => Err(revoked_key()),
@@ -299,19 +379,47 @@ impl RecipientRegistry {
         })
     }
 
-    /// Revokes `rid`. `Ok(false)` when it was already revoked.
-    pub(crate) fn revoke(&self, rid: &str) -> Result<bool> {
-        self.update(|file, now| {
-            if !file.recipients.iter().any(|record| record.rid == rid) {
+    /// Revokes `rid` and returns its device id (`None` for the recovery
+    /// recipient). Revoking a device's active recipient also blocks the
+    /// device (by `revoked_by`) when device auth is on: without it every
+    /// connection is the same `local` principal and nobody could restore it.
+    /// Revoking an already revoked recipient changes nothing.
+    pub(crate) fn revoke(&self, rid: &str, revoked_by: &str) -> Result<Applied<Option<String>>> {
+        let blocks_devices = self.devices.is_some();
+        self.apply(|file, now| {
+            let Some(record) = file.recipients.iter().find(|record| record.rid == rid) else {
                 return Err(AppError::NotFound(format!("history recipient {rid}")));
+            };
+            let device_id = record.device_id.clone();
+            if file.revoke(rid, now) && blocks_devices {
+                if let Some(device_id) = &device_id {
+                    file.block(device_id, revoked_by, now);
+                }
             }
-            Ok(file.revoke(rid, now))
+            Ok(device_id)
+        })
+    }
+
+    /// Lifts the block on `device_id` (`NOT_FOUND` when it is not blocked).
+    /// Its revoked keys stay revoked: the device registers a new key and
+    /// needs a new grant for older history.
+    pub(crate) fn restore_device(&self, device_id: &str) -> Result<Applied<()>> {
+        self.apply(|file, _| {
+            let before = file.revoked_devices.len();
+            file.revoked_devices
+                .retain(|entry| entry.device_id != device_id);
+            if file.revoked_devices.len() == before {
+                return Err(AppError::NotFound(format!(
+                    "device {device_id} is not blocked from history access"
+                )));
+            }
+            Ok(())
         })
     }
 
     /// `e2e` requires at least one active device recipient.
-    pub(crate) fn set_mode(&self, mode: HistoryEncryption) -> Result<()> {
-        self.update(|file, _| {
+    pub(crate) fn set_mode(&self, mode: HistoryEncryption) -> Result<Applied<()>> {
+        self.apply(|file, _| {
             if mode == HistoryEncryption::E2e && !file.has_active_device() {
                 return Err(invalid(
                     "history encryption requires a registered device recipient; call history.recipient.register first",
@@ -324,8 +432,9 @@ impl RecipientRegistry {
 
     /// Opens a grant for `device_id`'s active recipient, or returns the one
     /// already pending for it.
-    pub(crate) fn request_grant(&self, device_id: &str) -> Result<String> {
-        self.update(|file, now| {
+    pub(crate) fn request_grant(&self, device_id: &str) -> Result<Applied<RequestedGrant>> {
+        self.apply(|file, now| {
+            file.ensure_access(device_id)?;
             let rid = file
                 .active_device(device_id)
                 .map(|record| record.rid.clone())
@@ -335,7 +444,10 @@ impl RecipientRegistry {
                 .iter()
                 .find(|grant| grant.rid == rid && grant.status == GrantStatus::Pending)
             {
-                return Ok(grant.grant_id.clone());
+                return Ok(RequestedGrant {
+                    grant_id: grant.grant_id.clone(),
+                    rid,
+                });
             }
             if file.grants.len() >= MAX_GRANTS {
                 let Some(oldest) = file
@@ -355,20 +467,19 @@ impl RecipientRegistry {
             let grant_id = format!("grt_{}", uuid::Uuid::new_v4().simple());
             file.grants.push(GrantRecord {
                 grant_id: grant_id.clone(),
-                rid,
+                rid: rid.clone(),
                 device_id: device_id.to_owned(),
                 requested_at: now,
                 status: GrantStatus::Pending,
                 updated_at: None,
             });
-            Ok(grant_id)
+            Ok(RequestedGrant { grant_id, rid })
         })
     }
 
     /// Dismisses a pending grant; settled grants are left as they are.
-    pub(crate) fn dismiss_grant(&self, grant_id: &str) -> Result<()> {
+    pub(crate) fn dismiss_grant(&self, grant_id: &str) -> Result<Applied<GrantStatus>> {
         self.set_grant_status(grant_id, GrantStatus::Dismissed)
-            .map(|_| ())
     }
 
     /// The recipient a pending grant targets, for `history.grant.fulfill`.
@@ -384,13 +495,16 @@ impl RecipientRegistry {
         })
     }
 
-    pub(crate) fn complete_grant(&self, grant_id: &str) -> Result<()> {
+    pub(crate) fn complete_grant(&self, grant_id: &str) -> Result<Applied<GrantStatus>> {
         self.set_grant_status(grant_id, GrantStatus::Fulfilled)
-            .map(|_| ())
     }
 
-    fn set_grant_status(&self, grant_id: &str, status: GrantStatus) -> Result<GrantStatus> {
-        self.update(|file, now| {
+    fn set_grant_status(
+        &self,
+        grant_id: &str,
+        status: GrantStatus,
+    ) -> Result<Applied<GrantStatus>> {
+        self.apply(|file, now| {
             let grant = file
                 .grants
                 .iter_mut()
@@ -404,18 +518,27 @@ impl RecipientRegistry {
         })
     }
 
-    /// Runs `operation` on the current file and publishes any change. The
-    /// operation works on a copy, so a failed operation changes nothing.
     fn update<T>(
         &self,
         operation: impl FnOnce(&mut RecipientsFile, DateTime<Utc>) -> Result<T>,
     ) -> Result<T> {
+        self.apply(operation).map(|applied| applied.value)
+    }
+
+    /// Runs `operation` on the current file and publishes any change. The
+    /// operation works on a copy, so a failed operation changes nothing.
+    /// `written` reports whether the operation (or reconciliation) wrote.
+    fn apply<T>(
+        &self,
+        operation: impl FnOnce(&mut RecipientsFile, DateTime<Utc>) -> Result<T>,
+    ) -> Result<Applied<T>> {
         let mut inner = self.lock()?;
         inner.reload_if_changed()?;
         let now = (self.clock)();
         let mut file = inner.file.clone();
-        self.reconcile_devices(&mut file, now)?;
+        let reconciled = self.reconcile_devices(&mut file, now)?;
         let value = operation(&mut file, now)?;
+        let mut written = None;
         if file != inner.file {
             if !inner.exists && self.default_mode == HistoryEncryption::E2e {
                 // First write: seed the configured default (see module docs).
@@ -424,28 +547,62 @@ impl RecipientRegistry {
                 }
             }
             file.prune()?;
+            let state = Written {
+                mode: file.mode,
+                epoch: file.epoch,
+            };
             inner.write(file)?;
+            inner.report(reconciled, state);
+            written = Some(state);
         }
-        Ok(value)
+        Ok(Applied { value, written })
     }
 
-    fn reconcile_devices(&self, file: &mut RecipientsFile, now: DateTime<Utc>) -> Result<()> {
+    /// Keeps the file consistent with device state: recipients of blocked
+    /// devices are revoked, and with device auth on, devices missing from
+    /// `devices.json` lose their recipient and are blocked (the TUI hook did
+    /// not run). Returns the devices this newly blocked.
+    fn reconcile_devices(
+        &self,
+        file: &mut RecipientsFile,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>> {
+        let blocked_rids = file
+            .recipients
+            .iter()
+            .filter(|record| {
+                record.is_active()
+                    && record
+                        .device_id
+                        .as_deref()
+                        .is_some_and(|device_id| file.is_blocked(device_id))
+            })
+            .map(|record| record.rid.clone())
+            .collect::<Vec<_>>();
+        for rid in blocked_rids {
+            tracing::warn!(rid = %rid, "revoking active history recipient of a blocked device");
+            file.revoke(&rid, now);
+        }
         let Some(devices) = &self.devices else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let mut orphaned = Vec::new();
         for record in file.recipients.iter().filter(|record| record.is_active()) {
             if let Some(device_id) = &record.device_id {
                 if devices.get(device_id)?.is_none() {
-                    orphaned.push(record.rid.clone());
+                    orphaned.push((record.rid.clone(), device_id.clone()));
                 }
             }
         }
-        for rid in orphaned {
+        let mut blocked = Vec::new();
+        for (rid, device_id) in orphaned {
             tracing::info!(rid = %rid, "revoking history recipient of an unpaired device");
             file.revoke(&rid, now);
+            if file.block(&device_id, REVOKED_BY_DAEMON, now) {
+                blocked.push(device_id);
+            }
         }
-        Ok(())
+        Ok(blocked)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Inner>> {
@@ -456,15 +613,42 @@ impl RecipientRegistry {
 }
 
 impl Inner {
+    /// Reloads a file changed by another process and records the devices
+    /// that change blocked.
     fn reload_if_changed(&mut self) -> Result<()> {
         let stamp = file_stamp(&self.path);
         if stamp != self.stamp {
             let loaded = read_file(&self.path)?;
-            self.exists = loaded.is_some();
-            self.file = loaded.unwrap_or_default();
+            let exists = loaded.is_some();
+            let loaded = loaded.unwrap_or_default();
+            let blocked = loaded
+                .revoked_devices
+                .iter()
+                .filter(|entry| !self.file.is_blocked(&entry.device_id))
+                .map(|entry| entry.device_id.clone())
+                .collect::<Vec<_>>();
+            let state = Written {
+                mode: loaded.mode,
+                epoch: loaded.epoch,
+            };
+            self.exists = exists;
+            self.file = loaded;
             self.stamp = stamp;
+            self.report(blocked, state);
         }
         Ok(())
+    }
+
+    fn report(&mut self, device_ids: Vec<String>, state: Written) {
+        self.external.extend(
+            device_ids
+                .into_iter()
+                .map(|device_id| ExternalRevocation { device_id, state }),
+        );
+        if self.external.len() > MAX_REVOKED_DEVICES {
+            let excess = self.external.len() - MAX_REVOKED_DEVICES;
+            self.external.drain(..excess);
+        }
     }
 
     fn write(&mut self, file: RecipientsFile) -> Result<()> {
@@ -495,6 +679,48 @@ impl RecipientsFile {
         self.recipients
             .iter()
             .find(|record| record.is_active() && record.kind == RecipientKind::Recovery)
+    }
+
+    fn is_blocked(&self, device_id: &str) -> bool {
+        self.revoked_devices
+            .iter()
+            .any(|entry| entry.device_id == device_id)
+    }
+
+    fn ensure_access(&self, device_id: &str) -> Result<()> {
+        if self.is_blocked(device_id) {
+            return Err(AppError::HistoryAccessRevoked);
+        }
+        Ok(())
+    }
+
+    /// Adds `device_id` to the block list; `false` when already blocked.
+    /// The oldest entries are pruned beyond [`MAX_REVOKED_DEVICES`].
+    fn block(&mut self, device_id: &str, revoked_by: &str, now: DateTime<Utc>) -> bool {
+        if self.is_blocked(device_id) {
+            return false;
+        }
+        if self.revoked_devices.len() >= MAX_REVOKED_DEVICES {
+            if let Some(oldest) = self
+                .revoked_devices
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.revoked_at)
+                .map(|(index, _)| index)
+            {
+                let pruned = self.revoked_devices.remove(oldest);
+                tracing::warn!(
+                    device_id = %pruned.device_id,
+                    "history revocation list is full; unblocking its oldest device"
+                );
+            }
+        }
+        self.revoked_devices.push(RevokedDevice {
+            device_id: device_id.to_owned(),
+            revoked_at: now,
+            revoked_by: revoked_by.to_owned(),
+        });
+        true
     }
 
     fn has_active_device(&self) -> bool {
@@ -596,6 +822,16 @@ impl RecipientsFile {
         if active_recovery > 1 || active_devices.len() > MAX_ACTIVE_RECIPIENTS {
             return Err(corrupt());
         }
+        let mut blocked = std::collections::HashSet::new();
+        if self.revoked_devices.len() > MAX_REVOKED_DEVICES
+            || self.revoked_devices.iter().any(|entry| {
+                entry.device_id.is_empty()
+                    || entry.revoked_by.is_empty()
+                    || !blocked.insert(entry.device_id.as_str())
+            })
+        {
+            return Err(corrupt());
+        }
         Ok(())
     }
 }
@@ -625,33 +861,68 @@ fn write_file(path: &Path, file: &RecipientsFile) -> Result<()> {
     write_private_file(path, &bytes)
 }
 
+/// Which devices [`revoke_device_recipients`] revokes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DeviceRevocation<'a> {
+    One(&'a str),
+    /// Every device: these paired ids plus every device with an active
+    /// recipient.
+    All(&'a [String]),
+}
+
 /// File-level hook for device revocation (`devices::revoke_device` and
 /// `revoke_all_devices`, used by the TUI from its own process): revokes the
-/// recipients of `device_id`, or of every device when `None`. Returns how
-/// many were revoked; a missing registry file revokes nothing.
-pub(crate) fn revoke_device_recipients(data_dir: &Path, device_id: Option<&str>) -> Result<usize> {
+/// device recipients of the selected devices and blocks those devices
+/// (`revokedBy: "tui"`) in one atomic write. Returns how many recipients
+/// were revoked. A missing registry file changes nothing: no device has
+/// history keys yet. The daemon notices the change by the file stamp.
+pub(crate) fn revoke_device_recipients(
+    data_dir: &Path,
+    devices: DeviceRevocation<'_>,
+) -> Result<usize> {
     let path = data_dir.join(HISTORY_DIR).join(FILE_NAME);
     let Some(mut file) = read_file(&path)? else {
         return Ok(0);
     };
     let now = Utc::now();
+    let selected = |device_id: &str| match devices {
+        DeviceRevocation::One(target) => device_id == target,
+        DeviceRevocation::All(_) => true,
+    };
     let targets = file
         .recipients
         .iter()
         .filter(|record| {
             record.is_active()
                 && record.kind == RecipientKind::Device
-                && device_id.is_none_or(|device_id| record.device_id.as_deref() == Some(device_id))
+                && record.device_id.as_deref().is_some_and(selected)
         })
-        .map(|record| record.rid.clone())
+        .map(|record| (record.rid.clone(), record.device_id.clone()))
         .collect::<Vec<_>>();
-    for rid in &targets {
+    let mut blocked = match devices {
+        DeviceRevocation::One(device_id) => vec![device_id.to_owned()],
+        DeviceRevocation::All(paired) => paired.to_vec(),
+    };
+    for (rid, device_id) in &targets {
         file.revoke(rid, now);
+        blocked.extend(device_id.clone());
     }
-    if !targets.is_empty() {
+    let mut changed = !targets.is_empty();
+    for device_id in &blocked {
+        changed |= file.block(device_id, REVOKED_BY_TUI, now);
+    }
+    if changed {
         write_file(&path, &file)?;
     }
     Ok(targets.len())
+}
+
+/// `history.grant.request`'s result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RequestedGrant {
+    pub grant_id: String,
+    /// The requesting device's recipient.
+    pub rid: String,
 }
 
 fn revoked_key() -> AppError {
@@ -679,11 +950,17 @@ mod tests {
         assert_eq!((snapshot.mode, snapshot.epoch), (HistoryEncryption::Off, 0));
         assert!(!root.join(HISTORY_DIR).join(FILE_NAME).exists());
 
-        let first = registry.register_device("dev_a", &recipient(1)).unwrap();
+        let first = registry
+            .register_device("dev_a", &recipient(1))
+            .unwrap()
+            .value;
         assert_eq!(registry.snapshot().unwrap().epoch, 1);
         // Same key again: idempotent, no epoch change.
         assert_eq!(
-            registry.register_device("dev_a", &recipient(1)).unwrap(),
+            registry
+                .register_device("dev_a", &recipient(1))
+                .unwrap()
+                .value,
             first
         );
         assert_eq!(registry.snapshot().unwrap().epoch, 1);
@@ -697,7 +974,10 @@ mod tests {
         );
 
         // A new key replaces the device's old one: revoke + add.
-        let second = registry.register_device("dev_a", &recipient(2)).unwrap();
+        let second = registry
+            .register_device("dev_a", &recipient(2))
+            .unwrap()
+            .value;
         let snapshot = registry.snapshot().unwrap();
         assert_eq!(snapshot.epoch, 3);
         assert_eq!(registry.device_rid("dev_a").unwrap(), Some(second.clone()));
@@ -711,10 +991,24 @@ mod tests {
             "CONFLICT"
         );
 
-        assert!(registry.revoke(&second).unwrap());
-        assert!(!registry.revoke(&second).unwrap());
+        assert_eq!(
+            registry
+                .revoke(&second, "dev_admin")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("dev_a")
+        );
+        assert!(registry
+            .revoke(&second, "dev_admin")
+            .unwrap()
+            .written
+            .is_none());
         assert_eq!(registry.snapshot().unwrap().epoch, 4);
-        assert_eq!(registry.revoke("missing").unwrap_err().code(), "NOT_FOUND");
+        assert_eq!(
+            registry.revoke("missing", "dev_admin").unwrap_err().code(),
+            "NOT_FOUND"
+        );
         assert_eq!(registry.device_rid("dev_a").unwrap(), None);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -723,8 +1017,11 @@ mod tests {
     fn recovery_is_single_and_enable_needs_a_device() {
         let root = temp_dir("recovery");
         let registry = registry(&root, HistoryEncryption::Off);
-        let recovery = registry.set_recovery(&recipient(9)).unwrap();
-        assert_eq!(registry.set_recovery(&recipient(9)).unwrap(), recovery);
+        let recovery = registry.set_recovery(&recipient(9)).unwrap().value;
+        assert_eq!(
+            registry.set_recovery(&recipient(9)).unwrap().value,
+            recovery
+        );
         // Recovery alone cannot enable encryption.
         assert_eq!(
             registry
@@ -733,7 +1030,7 @@ mod tests {
                 .code(),
             "INVALID_REQUEST"
         );
-        let replacement = registry.set_recovery(&recipient(10)).unwrap();
+        let replacement = registry.set_recovery(&recipient(10)).unwrap().value;
         let snapshot = registry.snapshot().unwrap();
         let active_recovery = snapshot
             .recipients
@@ -797,10 +1094,16 @@ mod tests {
             "INVALID_REQUEST"
         );
         registry.register_device("dev_a", &recipient(1)).unwrap();
-        let rid_b = registry.register_device("dev_b", &recipient(2)).unwrap();
-        let grant = registry.request_grant("dev_b").unwrap();
+        let rid_b = registry
+            .register_device("dev_b", &recipient(2))
+            .unwrap()
+            .value;
+        let grant = registry.request_grant("dev_b").unwrap().value.grant_id;
         assert!(grant.starts_with("grt_"));
-        assert_eq!(registry.request_grant("dev_b").unwrap(), grant);
+        assert_eq!(
+            registry.request_grant("dev_b").unwrap().value.grant_id,
+            grant
+        );
         assert_eq!(registry.pending_grant_rid(&grant).unwrap(), rid_b);
         registry.dismiss_grant(&grant).unwrap();
         assert_eq!(
@@ -812,10 +1115,10 @@ mod tests {
             "NOT_FOUND"
         );
 
-        let second = registry.request_grant("dev_b").unwrap();
+        let second = registry.request_grant("dev_b").unwrap().value.grant_id;
         assert_ne!(second, grant);
         registry.complete_grant(&second).unwrap();
-        let third = registry.request_grant("dev_b").unwrap();
+        let third = registry.request_grant("dev_b").unwrap().value.grant_id;
         // Replacing the device key settles its pending grant.
         registry.register_device("dev_b", &recipient(3)).unwrap();
         let grants = registry.snapshot().unwrap().grants;
@@ -830,21 +1133,39 @@ mod tests {
     fn device_revocation_reaches_the_registry() {
         let root = temp_dir("device-hook");
         let registry = registry(&root, HistoryEncryption::Off);
-        let a = registry.register_device("dev_a", &recipient(1)).unwrap();
-        let b = registry.register_device("dev_b", &recipient(2)).unwrap();
-        let recovery = registry.set_recovery(&recipient(9)).unwrap();
+        let a = registry
+            .register_device("dev_a", &recipient(1))
+            .unwrap()
+            .value;
+        let b = registry
+            .register_device("dev_b", &recipient(2))
+            .unwrap()
+            .value;
+        let recovery = registry.set_recovery(&recipient(9)).unwrap().value;
         // The TUI process revokes through the file; the daemon reloads it.
-        assert_eq!(revoke_device_recipients(&root, Some("dev_a")).unwrap(), 1);
+        assert_eq!(
+            revoke_device_recipients(&root, DeviceRevocation::One("dev_a")).unwrap(),
+            1
+        );
         assert!(!registry.is_active(&a).unwrap());
         assert!(registry.is_active(&b).unwrap());
         assert_eq!(registry.snapshot().unwrap().epoch, 4);
-        assert_eq!(revoke_device_recipients(&root, None).unwrap(), 1);
+        assert_eq!(
+            revoke_device_recipients(&root, DeviceRevocation::All(&[])).unwrap(),
+            1
+        );
         assert!(!registry.is_active(&b).unwrap());
         // Recovery is not a device and survives a revoke-all.
         assert!(registry.is_active(&recovery).unwrap());
-        assert_eq!(revoke_device_recipients(&root, None).unwrap(), 0);
+        assert_eq!(
+            revoke_device_recipients(&root, DeviceRevocation::All(&[])).unwrap(),
+            0
+        );
         let empty = temp_dir("device-hook-empty");
-        assert_eq!(revoke_device_recipients(&empty, None).unwrap(), 0);
+        assert_eq!(
+            revoke_device_recipients(&empty, DeviceRevocation::All(&[])).unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(empty);
     }
@@ -867,7 +1188,8 @@ mod tests {
         registry.ensure_device(&device.device_id).unwrap();
         let rid = registry
             .register_device(&device.device_id, &recipient(1))
-            .unwrap();
+            .unwrap()
+            .value;
         // Bypass the hook: drop the device straight from devices.json.
         std::fs::remove_file(root.join("devices.json")).unwrap();
         assert!(!registry.is_active(&rid).unwrap());
@@ -878,6 +1200,179 @@ mod tests {
                 .code(),
             "UNAUTHENTICATED"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn paired(root: &Path, byte: u8) -> (DeviceRegistry, String) {
+        let devices = DeviceRegistry::load(root).unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[byte; 32]);
+        let device_id = devices
+            .register("Device", &signing.verifying_key().to_bytes())
+            .unwrap()
+            .device_id;
+        (devices, device_id)
+    }
+
+    #[test]
+    fn revoking_a_device_recipient_blocks_until_restored() {
+        let root = temp_dir("block");
+        let (devices, a) = paired(&root, 1);
+        let (_, b) = paired(&root, 2);
+        let registry =
+            RecipientRegistry::load(&root, HistoryEncryption::Off, Some(devices), system_clock())
+                .unwrap();
+        let rid_a = registry.register_device(&a, &recipient(1)).unwrap().value;
+        let rid_b = registry.register_device(&b, &recipient(2)).unwrap().value;
+        let recovery = registry.set_recovery(&recipient(9)).unwrap().value;
+
+        // Recovery revocation blocks nobody.
+        let revoked = registry.revoke(&recovery, &a).unwrap();
+        assert_eq!(revoked.value, None);
+        assert!(registry.snapshot().unwrap().revoked_devices.is_empty());
+
+        let revoked = registry.revoke(&rid_b, &a).unwrap();
+        assert_eq!(revoked.value.as_deref(), Some(b.as_str()));
+        let written = revoked.written.unwrap();
+        assert_eq!(written.epoch, registry.snapshot().unwrap().epoch);
+        let snapshot = registry.snapshot().unwrap();
+        assert_eq!(snapshot.revoked_devices.len(), 1);
+        assert_eq!(snapshot.revoked_devices[0].device_id, b);
+        assert_eq!(snapshot.revoked_devices[0].revoked_by, a);
+        let code = |error: AppError| error.code();
+        assert_eq!(
+            code(registry.ensure_access(&b).unwrap_err()),
+            "HISTORY_ACCESS_REVOKED"
+        );
+        assert_eq!(
+            code(registry.register_device(&b, &recipient(3)).unwrap_err()),
+            "HISTORY_ACCESS_REVOKED"
+        );
+        assert_eq!(
+            code(registry.request_grant(&b).unwrap_err()),
+            "HISTORY_ACCESS_REVOKED"
+        );
+        registry.ensure_access(&a).unwrap();
+        // Command-originated blocks are not "external".
+        assert!(registry.take_external_changes().unwrap().is_empty());
+
+        assert_eq!(
+            code(registry.restore_device("dev_unknown").unwrap_err()),
+            "NOT_FOUND"
+        );
+        let epoch = registry.snapshot().unwrap().epoch;
+        let restored = registry.restore_device(&b).unwrap();
+        assert_eq!(restored.written.unwrap().epoch, epoch);
+        registry.ensure_access(&b).unwrap();
+        // The revoked key stays refused; a fresh key works and is wrapped for.
+        assert_eq!(
+            code(registry.register_device(&b, &recipient(2)).unwrap_err()),
+            "CONFLICT"
+        );
+        let fresh = registry.register_device(&b, &recipient(3)).unwrap().value;
+        assert_ne!(fresh, rid_b);
+        assert_eq!(registry.active_recipients().unwrap().keys.len(), 2);
+        assert!(registry.is_active(&rid_a).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_blocked_device_never_keeps_an_active_recipient() {
+        let root = temp_dir("block-normalize");
+        let registry = registry(&root, HistoryEncryption::Off);
+        let rid = registry
+            .register_device("dev_a", &recipient(1))
+            .unwrap()
+            .value;
+        registry.register_device("dev_b", &recipient(2)).unwrap();
+        // A hand-edited file blocks dev_a but leaves its recipient active.
+        let path = root.join(HISTORY_DIR).join(FILE_NAME);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["revokedDevices"] = serde_json::json!([
+            { "deviceId": "dev_a", "revokedAt": Utc::now(), "revokedBy": "dev_b" }
+        ]);
+        secure_fs::write_owner_only_atomic(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(!registry.is_active(&rid).unwrap());
+        assert_eq!(registry.active_recipients().unwrap().keys.len(), 1);
+        assert_eq!(registry.device_rid("dev_a").unwrap(), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn external_revocations_are_reported_once() {
+        let root = temp_dir("external");
+        let (devices, a) = paired(&root, 1);
+        let (_, b) = paired(&root, 2);
+        let registry = RecipientRegistry::load(
+            &root,
+            HistoryEncryption::Off,
+            Some(devices.clone()),
+            system_clock(),
+        )
+        .unwrap();
+        registry.register_device(&a, &recipient(1)).unwrap();
+        registry.register_device(&b, &recipient(2)).unwrap();
+        assert!(registry.take_external_changes().unwrap().is_empty());
+
+        // The TUI revokes `a` from its own process (devices.json + hook).
+        assert!(crate::devices::revoke_device(&root, &a).unwrap());
+        let changes = registry.take_external_changes().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].device_id, a);
+        assert_eq!(changes[0].state.epoch, registry.snapshot().unwrap().epoch);
+        assert!(registry.take_external_changes().unwrap().is_empty());
+        let snapshot = registry.snapshot().unwrap();
+        assert_eq!(snapshot.revoked_devices[0].revoked_by, REVOKED_BY_TUI);
+
+        // `b` vanishes from devices.json without the hook: the daemon
+        // revokes and blocks it itself and reports that too.
+        let path = root.join("devices.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["devices"].as_object_mut().unwrap().remove(&b);
+        secure_fs::write_owner_only_atomic(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        let changes = registry.take_external_changes().unwrap();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|c| c.device_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![b.as_str()]
+        );
+        let snapshot = registry.snapshot().unwrap();
+        let entry = snapshot
+            .revoked_devices
+            .iter()
+            .find(|entry| entry.device_id == b)
+            .unwrap();
+        assert_eq!(entry.revoked_by, REVOKED_BY_DAEMON);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn files_without_revoked_devices_still_load() {
+        let root = temp_dir("compat");
+        let registry = registry(&root, HistoryEncryption::Off);
+        registry.register_device("dev_a", &recipient(1)).unwrap();
+        let path = root.join(HISTORY_DIR).join(FILE_NAME);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // An empty list is not written, so older daemons can still read it.
+        assert!(raw.get("revokedDevices").is_none());
+        let reloaded = self::registry(&root, HistoryEncryption::Off);
+        assert!(reloaded.snapshot().unwrap().revoked_devices.is_empty());
+        assert!(reloaded.device_rid("dev_a").unwrap().is_some());
+
+        assert_eq!(
+            revoke_device_recipients(&root, DeviceRevocation::One("dev_a")).unwrap(),
+            1
+        );
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["revokedDevices"][0]["deviceId"], "dev_a");
+        assert_eq!(raw["revokedDevices"][0]["revokedBy"], "tui");
+        assert!(raw["revokedDevices"][0]["revokedAt"].is_string());
+        assert_eq!(raw["version"], 1);
         let _ = std::fs::remove_dir_all(root);
     }
 

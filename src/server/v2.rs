@@ -122,6 +122,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "history.grant.fulfill"
             | "history.keys.list"
             | "history.keys.wraps"
+            | "history.device.restore"
     )
 }
 

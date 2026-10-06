@@ -574,7 +574,7 @@ async fn running_turns_keep_their_key_when_recipients_disappear() {
         .unwrap();
     let kid = first.payload["$enc"]["kid"].clone();
     let rid = crate::history_keys::encode_id(&recipient(1).rid());
-    e2e.keys.recipients().revoke(&rid).unwrap();
+    e2e.keys.recipients().revoke(&rid, "local").unwrap();
     // New prompts are refused before anything is written…
     let refused = e2e
         .store
