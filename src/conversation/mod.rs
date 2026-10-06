@@ -1,4 +1,5 @@
 mod coalesce;
+mod digest;
 mod hub;
 mod migration;
 mod model;
@@ -6,6 +7,7 @@ mod store;
 mod summary;
 
 pub use coalesce::{DeltaFragment, PendingDelta};
+pub use digest::{ControlOutcome, CONVERSATION_TERMINAL_EVENTS, TURN_TERMINAL_EVENTS};
 pub use hub::{ConversationEventHub, ConversationSubscription};
 pub use migration::migrate_legacy_codex_sessions;
 pub use model::{

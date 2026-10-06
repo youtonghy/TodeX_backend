@@ -139,6 +139,27 @@ page that reaches a damaged record runs the full scan, which salvages or reports
 the damage. A local release fixture measured the cold 50-event tail page at
 7.8 → 0.5 ms for 10,000 events and 77 → 5 ms for 100,000 events (53 MB).
 
+No request path loads the whole history. A per-conversation journal digest
+(`src/conversation/digest.rs`) holds only ids, sequences and status facts read
+from each event's type and small identity fields: the first and newest
+`message.created` per `clientRequestId` (with the newest `turnId`), the first
+`control.requested` and newest outcome per control `requestId`, the first
+native `queueAdd`/`steer` control per delivered id, turn-terminal events per
+`turnId`, the newest user message, and the restart-recovery fold (status, open
+turn, last runtime state, unresolved permissions). Prompt and control
+idempotency, retry, terminal-event retries, follow-up delivery checks and
+restart recovery query it and then point-read the one or two events whose
+payload they compare. The digest is built once per process by paging through
+the journal with the replay index (validating and salvaging like replay),
+folded forward by every append under the conversation lock, and rebuilt when
+the journal file fingerprint changes (salvage, compaction rewrite, deletion).
+Digests of adjacent ranges merge, so they can later be stored per sealed
+segment. Only fork still reads the complete history. On a local debug fixture
+of 200,000 events (55 MiB) a duplicate-prompt lookup took 1.7 s by full scan
+and 0.3 ms from the warm digest (control lookup 0.5 ms); the one-off digest
+build took 1.9 s and raised peak RSS by 15 MiB, versus about 240 MiB for one
+full scan.
+
 The synced journal line is the only per-append commit point. Manifests are
 cached in memory: `manifest.json` and `snapshot.json` are written at once on
 create, status change, metadata update, forced status, and recovery that
@@ -203,7 +224,7 @@ neither reaps nor tracks. Linux also sets `PR_SET_PDEATHSIG` (SIGKILL). Both
 are no-ops on Windows.
 
 Before reporting daemon readiness, startup recovers each conversation journal
-once and reuses that history to cancel stale approvals and mark resident
+once and reuses its digest to cancel stale approvals and mark resident
 runtimes stopped. Whether a turn was open comes from the journal (the last
 `turn.started` without a terminal event), not the manifest status: an open turn
 gets `conversation.interrupted` carrying its `turnId` when known, while a

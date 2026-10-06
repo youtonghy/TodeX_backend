@@ -139,17 +139,14 @@ impl ConversationSupervisor {
         conversation_id: &str,
         request_id: &str,
     ) -> Result<Option<String>, AppError> {
-        let history = self.store.complete_history(conversation_id).await?;
-        Ok(history
-            .iter()
-            .rev()
-            .find(|event| {
-                event.event_type == "message.created"
-                    && event.payload.get("clientRequestId").and_then(Value::as_str)
-                        == Some(request_id)
+        // The newest such message decides, as a resubmission records anew.
+        self.store
+            .digest(conversation_id, |digest| {
+                digest
+                    .client_request(request_id)
+                    .and_then(|facts| facts.last_turn_id.clone())
             })
-            .and_then(|event| event.payload.get("turnId").and_then(Value::as_str))
-            .map(str::to_owned))
+            .await
     }
 
     /// Queues `prompt` behind the running turn, or starts it when the

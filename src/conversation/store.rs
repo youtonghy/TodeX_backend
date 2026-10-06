@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::error::AppError;
 
 use super::coalesce::{DeltaFragment, PendingDelta};
+use super::digest::JournalDigest;
 use super::{
     redact_secrets, status_after_conversation_event, ConversationEvent, ConversationEventHub,
     ConversationManifest, ConversationReplay, ConversationSnapshot, ProviderState,
@@ -122,6 +123,18 @@ pub struct ConversationStore {
     /// file processed while its newest records were still protected is not
     /// cached — more of it becomes compactable as the journal grows.
     incompressible: Arc<DashMap<String, Vec<JournalFile>>>,
+    /// Whole-journal digests (see [`super::digest`]), built once by paging
+    /// through the journal and then folded forward by every append under the
+    /// conversation lock. Like the replay index it is a rebuildable cache
+    /// keyed by the journal file fingerprint: salvage, compaction rewrites
+    /// and anything else that changes the files make it stale.
+    digests: Arc<DashMap<String, CachedDigest>>,
+}
+
+struct CachedDigest {
+    /// Fingerprint of the journal files the digest describes in full.
+    files: Vec<JournalFile>,
+    digest: JournalDigest,
 }
 
 struct CachedManifest {
@@ -189,6 +202,7 @@ impl ConversationStore {
             delta_generation: Arc::new(AtomicU64::new(0)),
             manifests: Arc::new(DashMap::new()),
             incompressible: Arc::new(DashMap::new()),
+            digests: Arc::new(DashMap::new()),
         })
     }
 
@@ -375,6 +389,7 @@ impl ConversationStore {
         self.pending_deltas.remove(conversation_id);
         self.manifests.remove(conversation_id);
         self.incompressible.remove(conversation_id);
+        self.digests.remove(conversation_id);
     }
 
     pub async fn cleanup_before(
@@ -670,6 +685,11 @@ impl ConversationStore {
                     index.files = files.clone();
                 }
             }
+            if let Some(mut cached) = self.digests.get_mut(conversation_id) {
+                if cached.files == previous {
+                    cached.files = files.clone();
+                }
+            }
             terminated = true;
         }
         // `create` normally made the journal and rotation always creates the
@@ -706,6 +726,9 @@ impl ConversationStore {
         file.flush().await?;
         file.sync_data().await?;
         let metadata = file.metadata().await?;
+        let last = files.last_mut().expect("active segment is present");
+        last.bytes = metadata.len();
+        last.modified = metadata.modified().ok();
         if let Some(mut index) = self.indexes.get_mut(conversation_id) {
             if index.files == pre_write_files {
                 index.offsets.push((
@@ -713,11 +736,23 @@ impl ConversationStore {
                     active_bytes + separator,
                     active_bytes + line.len() as u64 - 1,
                 ));
-                index.files = files;
-                let last = index.files.last_mut().expect("active segment is present");
-                last.bytes = metadata.len();
-                last.modified = metadata.modified().ok();
+                index.files = files.clone();
             }
+        }
+        // A digest that described the journal up to this record stays exact
+        // by folding the record in; any other is stale and dropped, so the
+        // next query rebuilds it.
+        let digest_current = match self.digests.get_mut(conversation_id) {
+            Some(mut cached) if cached.files == pre_write_files => {
+                cached.digest.apply(&event);
+                cached.files = files;
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+        if !digest_current {
+            self.digests.remove(conversation_id);
         }
         self.tails.insert(
             conversation_id.to_owned(),
@@ -817,6 +852,8 @@ impl ConversationStore {
         write_atomic_json(&directory.join(FOLLOW_UP_QUEUE_FILE), queue).await
     }
 
+    /// Every event, loaded and validated at once. Only fork (which copies the
+    /// history) and tests use it; hot paths ask [`Self::digest`] instead.
     pub async fn complete_history(
         &self,
         conversation_id: &str,
@@ -826,7 +863,8 @@ impl ConversationStore {
         self.read_and_recover_events(conversation_id).await
     }
 
-    /// Internal complete scan: unlike the public paginated API this never truncates.
+    /// Full-scan answer the digest replaced; tests keep it as the reference.
+    #[cfg(test)]
     pub async fn last_user_message(
         &self,
         conversation_id: &str,
@@ -838,6 +876,114 @@ impl ConversationStore {
             event.event_type == "message.created"
                 && event.payload.get("role").and_then(Value::as_str) == Some("user")
         }))
+    }
+
+    /// Runs `read` against the conversation's journal digest, building the
+    /// digest first when none matches the journal on disk. Pending stream
+    /// text is journalled first, so the digest covers every emitted event.
+    pub async fn digest<R>(
+        &self,
+        conversation_id: &str,
+        read: impl FnOnce(&JournalDigest) -> R,
+    ) -> Result<R, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        self.flush_pending_delta_logged(conversation_id).await;
+        self.ensure_digest_locked(conversation_id).await?;
+        Ok(match self.digests.get(conversation_id) {
+            Some(cached) => read(&cached.digest),
+            None => read(&JournalDigest::default()),
+        })
+    }
+
+    /// Point read of the event with `sequence` through the replay index;
+    /// `None` when the journal holds no such event. Callers pair it with
+    /// [`Self::digest`], which names the sequence, to reach payload content
+    /// without loading the history around it.
+    pub async fn event_at(
+        &self,
+        conversation_id: &str,
+        sequence: u64,
+    ) -> Result<Option<ConversationEvent>, AppError> {
+        let Some(after) = sequence.checked_sub(1) else {
+            return Ok(None);
+        };
+        let page = self.replay(conversation_id, after, 1).await?;
+        Ok(page
+            .events
+            .into_iter()
+            .next()
+            .filter(|event| event.sequence == sequence))
+    }
+
+    /// Make the cached digest match the journal files on disk. A miss pages
+    /// through the journal with the replay index — the same validation and
+    /// salvage fallback as replay, bounded by one page of events in memory —
+    /// and restarts when a repair rewrote the journal mid-build. An absent
+    /// journal has the empty digest and caches nothing. Callers hold the
+    /// conversation lock.
+    async fn ensure_digest_locked(&self, conversation_id: &str) -> Result<(), AppError> {
+        let directory = self.directory(conversation_id)?;
+        let files = journal_files(&directory).await?;
+        if files.is_empty() {
+            self.digests.remove(conversation_id);
+            return Ok(());
+        }
+        if self
+            .digests
+            .get(conversation_id)
+            .is_some_and(|cached| cached.files == files)
+        {
+            return Ok(());
+        }
+        self.digests.remove(conversation_id);
+        let index_files = |store: &Self| {
+            store
+                .indexes
+                .get(conversation_id)
+                .map(|index| index.files.clone())
+        };
+        // One pass normally suffices; a second follows a salvage rewrite.
+        for _ in 0..3 {
+            let directory = self.replay_journal(conversation_id).await?;
+            let Some(start_files) = index_files(self) else {
+                return Err(AppError::InvalidRequest(format!(
+                    "conversation {conversation_id} journal index is missing"
+                )));
+            };
+            let mut digest = JournalDigest::default();
+            let mut from = 0usize;
+            let complete = loop {
+                let (_, to, total, events) = self
+                    .read_indexed_page(conversation_id, &directory, PageAnchor::Start, |total| {
+                        let from = from.min(total);
+                        (from, from.saturating_add(MAX_REPLAY_LIMIT).min(total))
+                    })
+                    .await?;
+                if index_files(self).as_ref() != Some(&start_files) {
+                    break false;
+                }
+                for event in &events {
+                    digest.apply(event);
+                }
+                if to >= total || events.is_empty() {
+                    break true;
+                }
+                from = to;
+            };
+            if complete {
+                self.digests.insert(
+                    conversation_id.to_owned(),
+                    CachedDigest {
+                        files: start_files,
+                        digest,
+                    },
+                );
+                return Ok(());
+            }
+        }
+        Err(AppError::Conflict(format!(
+            "conversation {conversation_id} journal kept changing while its digest was built"
+        )))
     }
 
     /// Forward replay of events after `after_sequence`, at most `limit`
@@ -1114,34 +1260,40 @@ impl ConversationStore {
         self.read_last_event(conversation_id).await
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn recover(&self, conversation_id: &str) -> Result<ConversationManifest, AppError> {
-        self.recover_with_history(conversation_id)
-            .await
-            .map(|(manifest, _)| manifest)
-    }
-
+    /// Full-scan recovery the digest replaced, plus the history tests check.
+    #[cfg(test)]
     pub async fn recover_with_history(
         &self,
         conversation_id: &str,
     ) -> Result<(ConversationManifest, Vec<ConversationEvent>), AppError> {
+        let manifest = self.recover(conversation_id).await?;
+        let history = self.complete_history(conversation_id).await?;
+        Ok((manifest, history))
+    }
+
+    /// Bring the manifest in line with the journal after a restart: its
+    /// sequence, time and status (an unfinished turn becomes `Interrupted`)
+    /// come from the digest, so the journal is paged through once rather
+    /// than loaded whole.
+    pub async fn recover(&self, conversation_id: &str) -> Result<ConversationManifest, AppError> {
         let _guard = self.lock(conversation_id).await;
         self.flush_pending_delta_logged(conversation_id).await;
         let mut manifest = self.get_unlocked(conversation_id).await?;
-        let events = self.read_and_recover_events(conversation_id).await?;
-        let last_sequence = events.last().map_or(0, |event| event.sequence);
-        let mut status = super::ConversationStatus::Idle;
-        for event in &events {
-            status = status_after_conversation_event(status, event);
-        }
+        self.ensure_digest_locked(conversation_id).await?;
+        let (last_sequence, last_time, mut status) = match self.digests.get(conversation_id) {
+            Some(cached) => (
+                cached.digest.last_sequence(),
+                cached.digest.last_time(),
+                cached.digest.status_from(super::ConversationStatus::Idle),
+            ),
+            None => (0, None, super::ConversationStatus::Idle),
+        };
         if status == super::ConversationStatus::Running
             || status == super::ConversationStatus::WaitingPermission
         {
             status = super::ConversationStatus::Interrupted;
         }
-        let updated_at = events
-            .last()
-            .map_or(manifest.updated_at, |event| event.time);
+        let updated_at = last_time.unwrap_or(manifest.updated_at);
         // Most journals already match their manifest. Rewriting it anyway cost
         // two atomic writes with full syncs per conversation on every start.
         let unchanged = manifest.last_sequence == last_sequence
@@ -1153,7 +1305,7 @@ impl ConversationStore {
         if !unchanged {
             self.persist_manifest_locked(&manifest).await?;
         }
-        Ok((manifest, events))
+        Ok(manifest)
     }
 
     pub async fn provider_state(&self, conversation_id: &str) -> Result<ProviderState, AppError> {
@@ -1407,8 +1559,10 @@ impl ConversationStore {
             )
             .await?;
             // The repair changed which files exist and what they hold, so
-            // cached compaction fingerprints no longer describe them.
+            // cached compaction fingerprints and the digest no longer
+            // describe them.
             self.incompressible.remove(conversation_id);
+            self.digests.remove(conversation_id);
         }
         let files = journal_files(&directory).await?;
         self.indexes.insert(
@@ -1614,6 +1768,7 @@ impl ConversationStore {
         // cached index no longer matches; the next replay rebuilds it.
         if rewrote || merged {
             self.indexes.remove(conversation_id);
+            self.digests.remove(conversation_id);
         }
         tracing::warn!(
             conversation_id,
@@ -4466,6 +4621,266 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Peak resident set size of this process in bytes.
+    fn peak_rss_bytes() -> u64 {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `getrusage` only writes the struct it is handed.
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        let max = usage.ru_maxrss as u64;
+        if cfg!(target_os = "macos") {
+            max
+        } else {
+            max * 1024
+        }
+    }
+
+    /// Idempotency lookups on a 200k-event journal: the full scans the
+    /// digest replaced against a cold digest build and warm digest lookups
+    /// plus point reads. Peak RSS only grows, so the digest is measured
+    /// first. Run alone:
+    /// `cargo test -- --ignored measure_digest_lookups_200k --nocapture`.
+    #[tokio::test]
+    #[ignore = "opt-in 200k-event digest lookup measurement"]
+    async fn measure_digest_lookups_200k() {
+        use std::io::Write;
+        const COUNT: u64 = 200_000;
+        let root = temp_dir("todex-digest-measurement");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let id = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap()
+            .id;
+        let path = root.join("conversations").join(&id).join(EVENTS_FILE);
+        let mut file = std::io::BufWriter::new(fs::File::create(&path).unwrap());
+        for sequence in 1..=COUNT {
+            let turn = format!("turn-{}", sequence / 50);
+            let (event_type, payload) = match sequence % 50 {
+                1 => (
+                    "message.created",
+                    json!({ "role": "user", "turnId": turn, "content": "question ".repeat(20),
+                        "clientRequestId": format!("request-{}", sequence / 50),
+                        "requestFingerprint": "f" }),
+                ),
+                2 => ("turn.started", json!({ "turnId": turn })),
+                3 => (
+                    "control.requested",
+                    json!({ "turnId": turn, "requestId": format!("control-{}", sequence / 50),
+                        "control": { "action": "setModel", "model": "m" }, "status": "pending" }),
+                ),
+                4 => (
+                    "control.completed",
+                    json!({ "turnId": turn, "requestId": format!("control-{}", sequence / 50),
+                        "result": {} }),
+                ),
+                0 => ("turn.completed", json!({ "turnId": turn })),
+                _ => ("message.delta", json!({ "turnId": turn, "delta": "d" })),
+            };
+            serde_json::to_writer(
+                &mut file,
+                &ConversationEvent::new(&id, sequence, event_type, payload),
+            )
+            .unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+        let journal_mib = fs::metadata(&path).unwrap().len() as f64 / (1024. * 1024.);
+        let probe = "request-1";
+        let control = "control-1";
+        let ms = |start: std::time::Instant| start.elapsed().as_secs_f64() * 1000.;
+
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let rss_before = peak_rss_bytes();
+        let start = std::time::Instant::now();
+        let first = store
+            .digest(&id, |digest| {
+                digest.client_request(probe).map(|facts| facts.first)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let cold_build_ms = ms(start);
+        let rss_digest = peak_rss_bytes();
+        const ROUNDS: u32 = 200;
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let first = store
+                .digest(&id, |digest| {
+                    digest.client_request(probe).map(|facts| facts.first)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store.event_at(&id, first).await.unwrap().unwrap().sequence,
+                51
+            );
+        }
+        let warm_prompt_ms = ms(start) / f64::from(ROUNDS);
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let facts = store
+                .digest(&id, |digest| digest.control(control).cloned())
+                .await
+                .unwrap()
+                .unwrap();
+            store.event_at(&id, facts.requested.unwrap()).await.unwrap();
+            store.event_at(&id, facts.outcome.unwrap().1).await.unwrap();
+        }
+        let warm_control_ms = ms(start) / f64::from(ROUNDS);
+        // An append folds into the digest; the next lookup stays warm.
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            store
+                .append(&id, "message.delta", json!({ "turnId": "t", "delta": "x" }))
+                .await
+                .unwrap();
+            store
+                .digest(&id, |digest| digest.control(control).cloned())
+                .await
+                .unwrap();
+        }
+        let append_and_lookup_ms = ms(start) / f64::from(ROUNDS);
+        drop(store);
+
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let start = std::time::Instant::now();
+        let history = store.complete_history(&id).await.unwrap();
+        let previous = history
+            .iter()
+            .find(|event| event.payload.get("clientRequestId") == Some(&json!(probe)))
+            .unwrap();
+        assert_eq!(previous.sequence, first);
+        let full_scan_ms = ms(start);
+        let rss_full = peak_rss_bytes();
+        drop(history);
+        let start = std::time::Instant::now();
+        let history = store.complete_history(&id).await.unwrap();
+        assert!(history.iter().any(|event| {
+            event.event_type == "control.requested" && event.payload["requestId"] == control
+        }));
+        let full_scan_warm_ms = ms(start);
+        eprintln!(
+            "digest_measurement events={COUNT} journal_mib={journal_mib:.1} \
+             full_scan_lookup_cold_ms={full_scan_ms:.1} full_scan_lookup_warm_ms={full_scan_warm_ms:.1} \
+             digest_cold_build_ms={cold_build_ms:.1} digest_prompt_lookup_ms={warm_prompt_ms:.3} \
+             digest_control_lookup_ms={warm_control_ms:.3} append_plus_lookup_ms={append_and_lookup_ms:.3} \
+             peak_rss_mib_start={:.1} peak_rss_mib_after_digest_build={:.1} peak_rss_mib_after_full_scan={:.1}",
+            rss_before as f64 / 1048576.,
+            rss_digest as f64 / 1048576.,
+            rss_full as f64 / 1048576.,
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn digest_follows_appends_rotation_deltas_and_restarts() {
+        use crate::conversation::digest::tests::{assert_matches_reference, varied_payloads};
+        let root = temp_dir("todex-digest-appends");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let hub = ConversationEventHub::default();
+        let id = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap()
+            .id;
+        // Built while the journal is still empty, then only folded forward.
+        let empty = store.digest(&id, Clone::clone).await.unwrap();
+        assert_eq!(empty.last_sequence(), 0);
+        for (index, (event_type, mut payload)) in varied_payloads(7, 600).into_iter().enumerate() {
+            // Padding rolls the journal across several test segments.
+            payload["pad"] = json!("p".repeat(400));
+            // Appends only take lower-case types; legacy journals hold the
+            // camel-case alias, which the in-memory equivalence test covers.
+            let event_type = match event_type.as_str() {
+                "tool.awaitingApproval" => "permission.requested".to_owned(),
+                _ => event_type,
+            };
+            store.append(&id, event_type, payload).await.unwrap();
+            if index % 40 == 0 {
+                // A coalesced fragment reaches the digest through its flush.
+                delta(&store, &hub, &id, "message.delta", "b", "text").await;
+            }
+            if index % 75 == 0 {
+                let digest = store.digest(&id, Clone::clone).await.unwrap();
+                assert_matches_reference(&digest, &store.complete_history(&id).await.unwrap());
+            }
+        }
+        let directory = root.join("conversations").join(&id);
+        assert!(journal_files(&directory).await.unwrap().len() > 2);
+        // Appends (rotation included) kept the cached digest current.
+        assert!(store.digests.contains_key(&id));
+        let live = store.digest(&id, Clone::clone).await.unwrap();
+        let history = store.complete_history(&id).await.unwrap();
+        assert_matches_reference(&live, &history);
+
+        // A restarted store pages through the segments to the same digest.
+        let restarted = ConversationStore::new(root.clone()).await.unwrap();
+        assert_eq!(restarted.digest(&id, Clone::clone).await.unwrap(), live);
+        let sequence = live.last_user_message().unwrap();
+        let point = restarted.event_at(&id, sequence).await.unwrap().unwrap();
+        assert_eq!(point.event_id, history[sequence as usize - 1].event_id);
+        assert_eq!(point.payload, history[sequence as usize - 1].payload);
+        assert!(restarted.event_at(&id, 0).await.unwrap().is_none());
+        assert!(restarted
+            .event_at(&id, live.last_sequence() + 1)
+            .await
+            .unwrap()
+            .is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn digest_is_rebuilt_after_a_salvage_rewrite() {
+        use crate::conversation::digest::tests::assert_matches_reference;
+        let (root, id, path) = seed_journal("todex-digest-salvage", 6).await;
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        assert_eq!(
+            store
+                .digest(&id, |digest| digest.last_user_message())
+                .await
+                .unwrap(),
+            Some(6)
+        );
+        let mut lines = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        lines[5] = "\u{0}garbage".to_owned();
+        lines.push(
+            serde_json::to_string(&ConversationEvent::new(
+                &id,
+                7,
+                "turn.completed",
+                json!({ "turnId": "t" }),
+            ))
+            .unwrap(),
+        );
+        write_lines(&path, &lines);
+        // The changed files make the cached digest stale; the rebuild meets
+        // the damaged record, salvages it and starts over on the rewrite.
+        let digest = store.digest(&id, Clone::clone).await.unwrap();
+        assert_eq!(corrupt_copies(&path).len(), 1);
+        let history = store.complete_history(&id).await.unwrap();
+        assert_eq!(history[5].event_type, JOURNAL_RECORD_LOST_EVENT);
+        assert_matches_reference(&digest, &history);
+        assert_eq!(digest.last_user_message(), Some(5));
+        assert_eq!(digest.has_turn_terminal("t", "turn.completed"), Some(true));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn journal_salvages_two_records_glued_onto_one_line_as_a_run_of_two() {
         let (root, id, path) = seed_journal("todex-salvage-glued", 6).await;
@@ -5017,6 +5432,10 @@ mod tests {
         let page = store.replay(&id, marker.sequence - 1, 2).await.unwrap();
         assert_eq!(page.events[0].sequence, marker.sequence);
         assert_eq!(page.events[0].event_type, JOURNAL_COMPACTED_EVENT);
+
+        // The rewrite invalidated the digest; its rebuild reads the markers.
+        let digest = store.digest(&id, Clone::clone).await.unwrap();
+        crate::conversation::digest::tests::assert_matches_reference(&digest, &events);
 
         // A compacted journal validates cleanly on a cold open.
         let restarted = ConversationStore::new(root.clone()).await.unwrap();

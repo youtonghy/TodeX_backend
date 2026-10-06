@@ -18,8 +18,9 @@ use crate::agent_mcp::{AgentMcp, AgentMcpLaunch};
 use crate::catalog::CatalogService;
 use crate::config::Config;
 use crate::conversation::{
-    status_after_conversation_event, ConversationEventHub, ConversationManifest,
-    ConversationReplay, ConversationStatus, ConversationStore, ProviderKind, ProviderState,
+    ControlOutcome, ConversationEventHub, ConversationManifest, ConversationReplay,
+    ConversationStatus, ConversationStore, ProviderKind, ProviderState,
+    CONVERSATION_TERMINAL_EVENTS, TURN_TERMINAL_EVENTS,
 };
 use crate::error::AppError;
 use crate::mcp;
@@ -82,36 +83,6 @@ const TERMINAL_EVENT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(500),
     Duration::from_secs(2),
 ];
-
-/// Events that end the turn they name (or, without a turnId, any open turn).
-const TURN_TERMINAL_EVENTS: [&str; 4] = [
-    "turn.completed",
-    "turn.failed",
-    "turn.cancelled",
-    "turn.interrupted",
-];
-/// Conversation-level events that end whatever turn was open.
-const CONVERSATION_TERMINAL_EVENTS: [&str; 2] = ["conversation.interrupted", "conversation.failed"];
-
-/// The turn a crash left open: the last `turn.started` with no later terminal
-/// event for it. A turn terminal without a turnId, or a conversation-level
-/// interruption or failure, closes whatever turn was open.
-fn open_turn_id(history: &[crate::conversation::ConversationEvent]) -> Option<String> {
-    let mut open = None;
-    for event in history {
-        let turn_id = event.payload.get("turnId").and_then(Value::as_str);
-        let event_type = event.event_type.as_str();
-        if event_type == "turn.started" {
-            open = turn_id.map(str::to_owned);
-        } else if CONVERSATION_TERMINAL_EVENTS.contains(&event_type)
-            || (TURN_TERMINAL_EVENTS.contains(&event_type)
-                && (turn_id.is_none() || turn_id == open.as_deref()))
-        {
-            open = None;
-        }
-    }
-    open
-}
 
 /// Runs `attempt(0)`, then one retry per delay while it fails, and returns
 /// the last error once the delays are exhausted.
@@ -621,54 +592,30 @@ impl ConversationSupervisor {
     }
 
     async fn recover_conversation(&self, manifest: &ConversationManifest) -> Result<(), AppError> {
-        let (recovered, history) = self.store.recover_with_history(&manifest.id).await?;
+        let recovered = self.store.recover(&manifest.id).await?;
         // Whether work was in flight comes from the journal, not the manifest:
         // the manifest is written after the journal line, so a crash between
-        // the two leaves a stale status in either direction.
-        let open_turn = open_turn_id(&history);
-        let journal_status = history
-            .iter()
-            .fold(ConversationStatus::Idle, status_after_conversation_event);
+        // the two leaves a stale status in either direction. The journal
+        // digest carries the fold, so the history is never loaded whole.
+        let facts = self
+            .store
+            .digest(&manifest.id, |digest| digest.recovery())
+            .await?;
+        let open_turn = facts.open_turn;
         let was_active = open_turn.is_some()
             || matches!(
-                journal_status,
+                facts.status,
                 ConversationStatus::Running | ConversationStatus::WaitingPermission
             );
-        let mut expired = std::collections::BTreeMap::new();
-        let mut resident_runtimes = std::collections::BTreeSet::new();
-        for event in history {
-            if event.event_type == "provider.runtime" {
-                if let Some(id) = event.payload.get("runtimeId").and_then(Value::as_str) {
-                    match event.payload.get("status").and_then(Value::as_str) {
-                        Some("ready") => {
-                            resident_runtimes.insert(id.to_owned());
-                        }
-                        Some("stopped") => {
-                            resident_runtimes.remove(id);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let Some(id) = event.payload.get("permissionId").and_then(Value::as_str) {
-                match event.event_type.as_str() {
-                    "permission.requested" | "tool.awaitingApproval" => {
-                        expired.insert(id.to_owned(), json!({"scope":event.payload.get("scope"),"runtimeId":event.payload.get("runtimeId")}));
-                    }
-                    "permission.resolved" => {
-                        expired.remove(id);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        for (permission_id, context) in expired {
+        // Dialogs requested and never resolved, by permission id; resident
+        // runtimes are those whose last record says `ready`, by runtime id.
+        for (permission_id, context) in facts.pending_permissions {
             self.emit(&manifest.id, "permission.resolved", json!({
                 "permissionId": permission_id, "outcome": "cancelled", "optionId": Value::Null,
-                "reason": "daemon_restarted", "scope":context.get("scope"),"runtimeId":context.get("runtimeId"),
+                "reason": "daemon_restarted", "scope":context.scope,"runtimeId":context.runtime_id,
             })).await?;
         }
-        for runtime_id in resident_runtimes {
+        for runtime_id in facts.resident_runtimes {
             self.emit(
                 &manifest.id,
                 "provider.runtime",
@@ -1082,13 +1029,17 @@ impl ConversationSupervisor {
     ) -> Result<String, AppError> {
         self.get_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
-        let latest = self
+        let latest = match self
             .store
-            .last_user_message(conversation_id)
+            .digest(conversation_id, |digest| digest.last_user_message())
             .await?
-            .ok_or_else(|| {
-                AppError::Conflict("conversation has no user message to retry".to_owned())
-            })?;
+        {
+            Some(sequence) => self.store.event_at(conversation_id, sequence).await?,
+            None => None,
+        }
+        .ok_or_else(|| {
+            AppError::Conflict("conversation has no user message to retry".to_owned())
+        })?;
         let snapshot = self.store.last_request(conversation_id).await?
             .ok_or_else(|| AppError::Unsupported("This older request has no complete retry snapshot; submit it explicitly with its attachments and settings.".to_owned()))?;
         if snapshot.get("turnId") != latest.payload.get("turnId") {
@@ -1381,12 +1332,17 @@ impl ConversationSupervisor {
             .await?;
         validate_provider_control(request_id, expected_turn_id, &control)?;
         let serialized = serde_json::to_value(&control)?;
-        let history = self.store.complete_history(conversation_id).await?;
-        let prior = history.iter().find(|event| {
-            event.event_type == "control.requested"
-                && event.payload.get("requestId").and_then(Value::as_str) == Some(request_id)
-        });
-        if let Some(prior) = prior {
+        // The digest names the first request and newest outcome recorded
+        // under this id; only those two events are read for their payloads.
+        let recorded = self
+            .store
+            .digest(conversation_id, |digest| {
+                digest.control(request_id).cloned()
+            })
+            .await?
+            .unwrap_or_default();
+        if let Some(prior) = recorded.requested {
+            let prior = self.recorded_event(conversation_id, prior).await?;
             if prior.payload.get("control") != Some(&serialized)
                 || prior.payload.get("turnId").and_then(Value::as_str) != Some(expected_turn_id)
             {
@@ -1394,16 +1350,12 @@ impl ConversationSupervisor {
                     "Control request ID was already used with different input.".to_owned(),
                 ));
             }
-            if let Some(done) = history.iter().rev().find(|event| {
-                matches!(
-                    event.event_type.as_str(),
-                    "control.completed" | "control.rejected" | "control.unknown"
-                ) && event.payload.get("requestId").and_then(Value::as_str) == Some(request_id)
-            }) {
-                if done.event_type == "control.completed" {
+            if let Some((outcome, sequence)) = recorded.outcome {
+                let done = self.recorded_event(conversation_id, sequence).await?;
+                if outcome == ControlOutcome::Completed {
                     return Ok(done.payload.get("result").cloned().unwrap_or(Value::Null));
                 }
-                if done.event_type == "control.unknown" {
+                if outcome == ControlOutcome::Unknown {
                     return Err(AppError::ProviderUnavailable("Control delivery outcome is unknown; it was not sent again. Inspect the effective state before issuing a new request.".to_owned()));
                 }
                 return Err(AppError::Conflict(
@@ -1576,12 +1528,20 @@ impl ConversationSupervisor {
             .ensure_trusted(owner_id, &manifest.workspace)
             .await?;
         if let Some(request_id) = client_request_id.as_deref() {
-            let history = self.store.complete_history(conversation_id).await?;
-            if let Some(previous) = history.iter().find(|event| {
-                event.event_type == "message.created"
-                    && event.payload.get("clientRequestId").and_then(Value::as_str)
-                        == Some(request_id)
-            }) {
+            // The digest names the first message recorded under this id and
+            // any native queue/steer control that delivered its text; only
+            // those events are read for their payloads.
+            let (previous, control) = self
+                .store
+                .digest(conversation_id, |digest| {
+                    (
+                        digest.client_request(request_id).map(|facts| facts.first),
+                        digest.text_control(request_id),
+                    )
+                })
+                .await?;
+            if let Some(previous) = previous {
+                let previous = self.recorded_event(conversation_id, previous).await?;
                 let matches = if let Some(recorded) = previous
                     .payload
                     .get("requestFingerprint")
@@ -1592,25 +1552,13 @@ impl ConversationSupervisor {
                     // Native queue/steering deliveries have an original durable control,
                     // rather than a prompt snapshot. Recognize exactly that text-only
                     // submission so reconnect cannot execute its tools a second time.
-                    let control_text = history.iter().find_map(|event| {
-                        if event.event_type != "control.requested" {
-                            return None;
+                    let control_text = match control {
+                        Some(sequence) => {
+                            let event = self.recorded_event(conversation_id, sequence).await?;
+                            event.payload["control"]["text"].as_str().map(str::to_owned)
                         }
-                        let control = event.payload.get("control")?;
-                        let matches_id = match control.get("action").and_then(Value::as_str) {
-                            Some("queueAdd") => {
-                                control.get("itemId").and_then(Value::as_str) == Some(request_id)
-                            }
-                            Some("steer") => {
-                                event.payload.get("requestId").and_then(Value::as_str)
-                                    == Some(request_id)
-                            }
-                            _ => false,
-                        };
-                        matches_id
-                            .then(|| control.get("text").and_then(Value::as_str))
-                            .flatten()
-                    });
+                        None => None,
+                    };
                     if let Some(control_text) = control_text {
                         request_snapshot.text == control_text
                             && request_snapshot.content.is_empty()
@@ -2118,11 +2066,21 @@ impl ConversationSupervisor {
         turn_id: &str,
         event_type: &str,
     ) -> bool {
-        match self.store.complete_history(conversation_id).await {
-            Ok(history) => history.iter().rev().any(|event| {
-                event.event_type == event_type
-                    && event.payload.get("turnId").and_then(Value::as_str) == Some(turn_id)
-            }),
+        let recorded = self
+            .store
+            .digest(conversation_id, |digest| {
+                digest.has_turn_terminal(turn_id, event_type)
+            })
+            .await
+            .and_then(|recorded| {
+                recorded.ok_or_else(|| {
+                    AppError::InvalidRequest(format!(
+                        "{event_type} is not a turn terminal event the journal digest tracks"
+                    ))
+                })
+            });
+        match recorded {
+            Ok(recorded) => recorded,
             Err(error) => {
                 tracing::warn!(conversation_id, error = %error, "failed to read the journal before retrying a terminal event");
                 false
@@ -2443,6 +2401,24 @@ impl ConversationSupervisor {
             .append_and_publish(conversation_id, event_type, payload, &self.hub)
             .await?;
         Ok(())
+    }
+
+    /// The journal event a digest lookup named. Journals keep every sequence
+    /// (compaction and salvage only replace records in place), so a missing
+    /// one means the journal was cut back underneath the lookup.
+    async fn recorded_event(
+        &self,
+        conversation_id: &str,
+        sequence: u64,
+    ) -> Result<crate::conversation::ConversationEvent, AppError> {
+        self.store
+            .event_at(conversation_id, sequence)
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "conversation {conversation_id} no longer holds journal event {sequence}"
+                ))
+            })
     }
 }
 
@@ -4034,37 +4010,6 @@ mod tests {
             history.len()
         );
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn open_turn_is_the_last_started_turn_without_its_own_terminal_event() {
-        let event = |event_type: &str, payload: Value| {
-            ConversationEvent::new("conversation", 1, event_type, payload)
-        };
-        assert_eq!(open_turn_id(&[]), None);
-        assert_eq!(
-            open_turn_id(&[
-                event("turn.started", json!({ "turnId": "a" })),
-                event("turn.completed", json!({ "turnId": "a" })),
-                event("turn.started", json!({ "turnId": "b" })),
-                event("turn.failed", json!({ "turnId": "a" })),
-            ]),
-            Some("b".to_owned())
-        );
-        for terminal in [
-            event("turn.cancelled", json!({ "turnId": "b" })),
-            event("turn.interrupted", json!({})),
-            event(
-                "conversation.interrupted",
-                json!({ "reason": "daemon_restarted" }),
-            ),
-            event("conversation.failed", json!({})),
-        ] {
-            assert_eq!(
-                open_turn_id(&[event("turn.started", json!({ "turnId": "b" })), terminal]),
-                None
-            );
-        }
     }
 
     #[tokio::test]
