@@ -80,6 +80,30 @@ impl Default for PairingEncryption {
     }
 }
 
+/// Conversation history at-rest encryption (docs/history-encryption.md).
+///
+/// Only the default for a new install: once `$DATA_DIR/history/recipients.json`
+/// exists, its `mode` is authoritative and devices switch it with
+/// `history.encryption.enable` / `disable`. See [`load_history_encryption`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
+pub enum HistoryEncryption {
+    #[default]
+    #[serde(rename = "off")]
+    Off,
+    #[serde(rename = "e2e")]
+    E2e,
+}
+
+impl HistoryEncryption {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" => Some(Self::Off),
+            "e2e" | "end-to-end" => Some(Self::E2e),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
     pub default_agent: String,
@@ -129,6 +153,7 @@ struct FileConfig {
     host: Option<String>,
     port: Option<u16>,
     pairing_encryption: Option<PairingEncryption>,
+    history_encryption: Option<HistoryEncryption>,
     data_dir: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     workspace_roots: Option<Vec<PathBuf>>,
@@ -506,6 +531,7 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
     replace_some!(base.host, overlay.host);
     replace_some!(base.port, overlay.port);
     replace_some!(base.pairing_encryption, overlay.pairing_encryption);
+    replace_some!(base.history_encryption, overlay.history_encryption);
     replace_some!(base.data_dir, overlay.data_dir);
     replace_some!(base.workspace_root, overlay.workspace_root);
     replace_some!(base.workspace_roots, overlay.workspace_roots);
@@ -557,6 +583,21 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
         replace_some!(base_security.auth_token, overlay_security.auth_token);
     }
     base
+}
+
+/// The history encryption default for a new install:
+/// `TODEX_AGENTD_HISTORY_ENCRYPTION`, then `history_encryption` in the data
+/// directory's `config.toml`, then `off`. It is resolved separately from
+/// [`Config`] because it only seeds `history/recipients.json` once; after that
+/// file exists the persisted mode wins and this value is ignored.
+pub fn load_history_encryption(data_dir: &Path) -> anyhow::Result<HistoryEncryption> {
+    if let Ok(value) = env::var("TODEX_AGENTD_HISTORY_ENCRYPTION") {
+        return HistoryEncryption::parse(&value).with_context(|| {
+            format!("TODEX_AGENTD_HISTORY_ENCRYPTION must be off or e2e, got {value:?}")
+        });
+    }
+    let (_, file_config) = load_file_config(data_dir, false)?;
+    Ok(file_config.history_encryption.unwrap_or_default())
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -747,8 +788,9 @@ mod tests {
     };
 
     use super::{
-        expand_home_with_home, load_file_config, optional_non_empty, Config, PairingEncryption,
-        ServeArgs, DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
+        expand_home_with_home, load_file_config, load_history_encryption, optional_non_empty,
+        Config, HistoryEncryption, PairingEncryption, ServeArgs,
+        DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
     };
     use uuid::Uuid;
 
@@ -1030,6 +1072,39 @@ codex_bin = "codex"
         assert!(updated.contains("custom_value = \"kept\""));
         assert!(updated.contains("[agent]"));
         assert!(updated.contains("[tui]"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_encryption_defaults_off_and_reads_the_config_file() {
+        assert_eq!(
+            HistoryEncryption::parse(" E2E "),
+            Some(HistoryEncryption::E2e)
+        );
+        assert_eq!(
+            HistoryEncryption::parse("none"),
+            Some(HistoryEncryption::Off)
+        );
+        assert_eq!(HistoryEncryption::parse("maybe"), None);
+        if env::var_os("TODEX_AGENTD_HISTORY_ENCRYPTION").is_some() {
+            return;
+        }
+        let root = env::temp_dir().join(format!(
+            "todex-config-history-encryption-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            load_history_encryption(&root).unwrap(),
+            HistoryEncryption::Off
+        );
+        fs::write(root.join("config.toml"), "history_encryption = \"e2e\"\n").unwrap();
+        assert_eq!(
+            load_history_encryption(&root).unwrap(),
+            HistoryEncryption::E2e
+        );
+        fs::write(root.join("config.toml"), "history_encryption = \"later\"\n").unwrap();
+        assert!(load_history_encryption(&root).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
