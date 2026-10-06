@@ -22,7 +22,9 @@ use tracing::warn;
 
 use crate::app_state::AppState;
 use crate::config::HistoryEncryption;
-use crate::conversation::{ConversationManifest, ConversationSubscription, ProviderKind};
+use crate::conversation::{
+    ConversationEvent, ConversationManifest, ConversationSubscription, ProviderKind, ReplayDetail,
+};
 use crate::device_auth;
 use crate::error::AppError;
 use crate::provider::{
@@ -2006,6 +2008,7 @@ async fn replay_conversation(
             .is_some_and(|version| version >= HISTORY_ENCRYPTION_VERSION),
     )?;
     let summary = summary_detail(query.detail.as_deref())?;
+    let detail = replay_detail(summary);
     let limit = query.limit.unwrap_or(200);
     // `beforeSequence` pages backwards through the journal for lazy history
     // loading; `hasMore` then reports whether earlier events remain.
@@ -2013,7 +2016,13 @@ async fn replay_conversation(
         Some(before_sequence) => {
             state
                 .conversations
-                .replay_before_owned(&auth.tenant_id, &conversation_id, before_sequence, limit)
+                .replay_before_owned(
+                    &auth.tenant_id,
+                    &conversation_id,
+                    before_sequence,
+                    limit,
+                    detail,
+                )
                 .await?
         }
         None => {
@@ -2024,16 +2033,40 @@ async fn replay_conversation(
                     &conversation_id,
                     query.after_sequence.unwrap_or(0),
                     limit,
+                    detail,
                 )
                 .await?
         }
     };
-    if summary {
-        for event in &mut replay.events {
-            crate::conversation::summarize_event(event);
-        }
+    for event in &mut replay.events {
+        crate::conversation::present_event(event, summary);
     }
     Ok(Json(serde_json::to_value(replay)?))
+}
+
+fn replay_detail(summary: bool) -> ReplayDetail {
+    if summary {
+        ReplayDetail::Summary
+    } else {
+        ReplayDetail::Full
+    }
+}
+
+/// One `conversation.event` frame. A sealed-segment record of an encrypted
+/// conversation carries the ciphertext frames it refers to beside it
+/// (top-level `frames`, §5.3), since each socket message is decrypted on
+/// its own.
+fn conversation_event_frame(
+    delivery: &str,
+    event: &ConversationEvent,
+    frames: &serde_json::Map<String, Value>,
+) -> Value {
+    let mut frame = json!({ "type": "conversation.event", "delivery": delivery, "payload": event });
+    let referenced = crate::conversation::event_frames(event, frames);
+    if !referenced.is_empty() {
+        frame["frames"] = Value::Object(referenced);
+    }
+    frame
 }
 
 /// Shared `detail` switch of HTTP event pages and websocket backfill:
@@ -2787,6 +2820,7 @@ impl SubscriptionWorker {
                     &self.conversation_id,
                     replay_cursor,
                     self.page_size.min(remaining),
+                    replay_detail(self.summary),
                 )
                 .await?;
             let mut advanced = false;
@@ -2797,12 +2831,10 @@ impl SubscriptionWorker {
             {
                 replay_cursor = event.sequence;
                 advanced = true;
-                if self.summary {
-                    crate::conversation::summarize_event(&mut event);
-                }
+                crate::conversation::present_event(&mut event, self.summary);
                 queue_frame(
                     &self.outgoing,
-                    json!({ "type": "conversation.event", "delivery": "replay", "payload": event }),
+                    conversation_event_frame("replay", &event, &replay.frames),
                 )
                 .await
                 .map_err(|_| AppError::StreamClosed)?;
@@ -2839,19 +2871,48 @@ impl SubscriptionWorker {
                     if event.sequence > delivered_through + 1 {
                         let recovery = async {
                             while delivered_through + 1 < event.sequence {
-                                let replay = conversations.replay_owned(owner_id, conversation_id, delivered_through, page_size).await?;
+                                let replay = conversations
+                                    .replay_owned(
+                                        owner_id,
+                                        conversation_id,
+                                        delivered_through,
+                                        page_size,
+                                        ReplayDetail::Full,
+                                    )
+                                    .await?;
                                 let previous = delivered_through;
-                                for missing in replay.events.into_iter().take_while(|missing| missing.sequence < event.sequence) {
+                                for mut missing in replay
+                                    .events
+                                    .into_iter()
+                                    .take_while(|missing| missing.sequence < event.sequence)
+                                {
                                     if missing.sequence != delivered_through + 1 {
-                                        return Err(AppError::Conflict("Conversation replay contains a sequence gap".to_owned()));
+                                        return Err(AppError::Conflict(
+                                            "Conversation replay contains a sequence gap"
+                                                .to_owned(),
+                                        ));
                                     }
-                                    outgoing.send(json!({ "type": "conversation.event", "delivery": "replay", "payload": missing })).await.map_err(|_| AppError::StreamClosed)?;
+                                    crate::conversation::present_event(&mut missing, false);
+                                    outgoing
+                                        .send(conversation_event_frame(
+                                            "replay",
+                                            &missing,
+                                            &replay.frames,
+                                        ))
+                                        .await
+                                        .map_err(|_| AppError::StreamClosed)?;
                                     delivered_through = missing.sequence;
                                 }
-                                if previous == delivered_through { return Err(AppError::Conflict("Conversation sequence gap could not be recovered".to_owned())); }
+                                if previous == delivered_through {
+                                    return Err(AppError::Conflict(
+                                        "Conversation sequence gap could not be recovered"
+                                            .to_owned(),
+                                    ));
+                                }
                             }
                             Ok::<(), AppError>(())
-                        }.await;
+                        }
+                        .await;
                         if let Err(error) = recovery {
                             let mut frame = error_response(None, error);
                             frame["payload"]["conversationId"] = json!(conversation_id);
@@ -2859,6 +2920,10 @@ impl SubscriptionWorker {
                         }
                     }
                     delivered_through = event.sequence;
+                    // The published event is the stored record: the same
+                    // ciphertext the journal holds goes out unchanged.
+                    let mut event = event;
+                    crate::conversation::present_event(&mut event, false);
                     if outgoing
                         .send(json!({ "type": "conversation.event", "delivery": "live", "payload": event }))
                         .await
@@ -2888,20 +2953,22 @@ impl SubscriptionWorker {
                                     conversation_id,
                                     delivered_through,
                                     page_size,
+                                    ReplayDetail::Full,
                                 )
                                 .await?;
                             let mut advanced = false;
-                            for event in replay.events.into_iter().take_while(|event| {
+                            for mut event in replay.events.into_iter().take_while(|event| {
                                 event.sequence <= recovery_high_water
                             }) {
                                 delivered_through = event.sequence;
                                 advanced = true;
+                                crate::conversation::present_event(&mut event, false);
                                 outgoing
-                                    .send(json!({
-                                        "type": "conversation.event",
-                                        "delivery": "replay",
-                                        "payload": event,
-                                    }))
+                                    .send(conversation_event_frame(
+                                        "replay",
+                                        &event,
+                                        &replay.frames,
+                                    ))
                                     .await
                                     .map_err(|_| AppError::StreamClosed)?;
                             }
@@ -3233,7 +3300,12 @@ async fn dispatch_command_inner(
             let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
             let turn_id = state
                 .conversations
-                .retry_owned(owner_id, &request.conversation_id, Some(command.id.clone()))
+                .retry_owned(
+                    owner_id,
+                    &request.conversation_id,
+                    Some(command.id.clone()),
+                    request.prompt,
+                )
                 .await?;
             Ok(
                 json!({ "conversationId": request.conversation_id, "turnId": turn_id, "retried": true }),
@@ -3817,6 +3889,10 @@ struct WsConversationRequest {
     /// `conversation.queue.add`: place the item ahead of the others.
     #[serde(default)]
     front: bool,
+    /// `conversation.retry` under history encryption: the decrypted text of
+    /// the request being retried.
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

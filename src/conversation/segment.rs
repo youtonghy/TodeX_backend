@@ -4,54 +4,74 @@
 //! A sealed segment is a pair of files:
 //!
 //! - `events.NNNNNN.seg`: a 24-byte header (`TDXSEG1\n` plus a random
-//!   16-byte segment id) followed by frames. Each frame is a 32-byte header
-//!   (`TDXF`, stream, `kid` length, first sequence, record count, raw and
-//!   stored length, frame ordinal, CRC-32 of the raw data), the optional
-//!   `kid`, and the frame data compressed as raw DEFLATE (RFC 1951, no
-//!   zlib/gzip header, so browsers can inflate it) — in e2e mode sealed by
-//!   [`ContentCodec::seal_frame`] after compression. Frame headers make the
-//!   file self-describing, so a lost `.idx` can be rebuilt from it.
+//!   16-byte segment id) followed by frames. Each frame is a 36-byte header
+//!   (`TDXF`, stream, `kid` length, flags, first sequence, record count, raw
+//!   and stored length, frame ordinal, CRC-32), the optional `kid`, and the
+//!   frame data compressed as raw DEFLATE (RFC 1951, no zlib/gzip header,
+//!   so browsers can inflate it). Frame headers make the file
+//!   self-describing, so a lost `.idx` can be rebuilt from it.
 //! - `events.NNNNNN.idx`: JSON `{"sha256", "body"}` where `sha256` covers
 //!   the raw `body` text. The body holds the first/last sequence, the frame
 //!   table, the segment's [`JournalDigest`], the `.seg` length, id and
 //!   SHA-256, and the plaintext files the segment replaced (`sources`).
 //!
 //! There are three streams, each cut into frames of about
-//! [`FRAME_RAW_BYTES`] raw bytes that never span two `kid`s:
-//! the envelope stream (one [`super::record`] line per record without its
-//! content, never encrypted), the summary content stream (a JSON array of
+//! [`FRAME_RAW_BYTES`] raw bytes: the envelope stream (one
+//! [`super::record`] line per record without its content, never
+//! encrypted), the summary content stream (a JSON array of
 //! [`summarize_event`] payloads, so `detail=summary` can read it alone) and
-//! the full content stream (a JSON array of payloads). Stream numbers 3
-//! and 4 are the frame streams of the history crypto AAD (§2).
+//! the full content stream (a JSON array of payloads).
+//!
+//! A content frame belongs to one [`FrameGroup`] and never mixes two:
+//!
+//! - `Plain`: plaintext payloads (history encryption off, or not migrated
+//!   yet). The CRC covers the raw frame.
+//! - `Sealed(kid)`: payloads sealed under that DEK after compression
+//!   (history crypto stream 3/4, counter [`frame_counter`]). The daemon
+//!   only does this while the DEK is still in memory (sealing right after
+//!   the records were written, or migrating plaintext under a fresh key)
+//!   and never decrypts such a frame again: replays hand the ciphertext to
+//!   clients (`$enc.fr` plus the page's `frames`). The summary and full
+//!   frames of a sealed run cover the same records, so one index `i`
+//!   addresses both. The CRC covers the stored ciphertext.
+//! - `Passthrough`: event-level `$enc` objects kept as ciphertext because
+//!   their DEK was gone when the segment was sealed (the daemon restarted)
+//!   or they are a fork's copies. Replays serve them like active-file
+//!   records.
 //!
 //! Sealing also slims history (§4.3): streaming progress records whose
 //! terminal record is in the same segment become `journal.compacted`
 //! markers; see [`SlimPlan`] for the exact rule. Sequences stay dense.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
 use super::digest::JournalDigest;
 use super::record::{
-    compacted_marker, decode_journal_record, encode_envelope, parse_record, record_bytes,
-    ContentCodec, JOURNAL_COMPACTED_EVENT,
+    add_history_macs, compacted_marker, decode_journal_record, encode_envelope, encrypted_content,
+    open_event, parse_record, record_bytes, ENCRYPTED_FIELD, JOURNAL_COMPACTED_EVENT,
 };
 use super::{summarize_event, ConversationEvent, ProviderKind};
+use crate::history_crypto::{self, ContentStream, SegmentKey};
+use crate::history_keys::FingerprintKey;
 
 const SEGMENT_MAGIC: &[u8; 8] = b"TDXSEG1\n";
 const SEGMENT_ID_BYTES: usize = 16;
 const SEGMENT_HEADER_BYTES: u64 = (SEGMENT_MAGIC.len() + SEGMENT_ID_BYTES) as u64;
 const FRAME_MAGIC: &[u8; 4] = b"TDXF";
 const FRAME_HEADER_BYTES: usize = 36;
+/// Frame header flag: the items are event-level `$enc` objects.
+const FLAG_PASSTHROUGH: u8 = 1;
 /// Raw bytes a frame collects before it is compressed. Reading one record
 /// decompresses at most this much per stream.
 pub(super) const FRAME_RAW_BYTES: usize = 1024 * 1024;
@@ -86,6 +106,15 @@ pub(super) fn numbered(name: &str, extension: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// The AEAD counter of sealed frame `ordinal` in segment `number`:
+/// `number << 32 | ordinal`. Ordinals restart in every segment, and a key's
+/// records normally all live in one segment (the active file rotates its
+/// DEK when it is sealed); the segment number in the high bits keeps the
+/// nonce unique even when a key's frames end up in several segments.
+pub(super) fn frame_counter(number: u64, ordinal: u32) -> u64 {
+    (number << 32) | u64::from(ordinal)
+}
+
 #[derive(Debug)]
 pub(super) enum SegmentError {
     Io(std::io::Error),
@@ -118,6 +147,18 @@ fn invalid(reason: impl Into<String>) -> SegmentError {
     SegmentError::Invalid(reason.into())
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// What the items of a content frame are; see the module docs.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) enum FrameGroup {
+    Plain,
+    Passthrough,
+    Sealed(String),
+}
+
 /// One frame of a `.seg` file, as listed in its `.idx`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(super) struct FrameEntry {
@@ -131,21 +172,41 @@ pub(super) struct FrameEntry {
     /// Offset of the frame data (after its header) in the `.seg` file.
     #[serde(rename = "o")]
     pub offset: u64,
-    /// Stored (compressed, and in e2e sealed) length.
+    /// Stored (compressed, and when sealed encrypted) length.
     #[serde(rename = "l")]
     pub len: u32,
     /// Decompressed length.
     #[serde(rename = "u")]
     pub raw: u32,
+    /// The DEK a sealed frame is encrypted under.
     #[serde(rename = "k", default, skip_serializing_if = "Option::is_none")]
     pub kid: Option<String>,
-    /// Frame number under `(kid, stream)`: the AEAD counter in e2e mode.
+    /// The items are event-level `$enc` objects ([`FrameGroup::Passthrough`]).
+    #[serde(rename = "x", default, skip_serializing_if = "is_false")]
+    pub passthrough: bool,
+    /// Frame number under `(group, stream)` within this segment; the AEAD
+    /// counter of a sealed frame is [`frame_counter`] of it.
     #[serde(rename = "f")]
     pub ordinal: u32,
-    /// CRC-32 of the raw (decompressed) frame; DEFLATE has no checksum of
-    /// its own.
+    /// CRC-32 of the raw (decompressed) frame — DEFLATE has no checksum of
+    /// its own — or, for a sealed frame, of the stored ciphertext the
+    /// daemon cannot open.
     #[serde(rename = "c")]
     pub crc: u32,
+}
+
+impl FrameEntry {
+    pub fn group(&self) -> FrameGroup {
+        match (&self.kid, self.passthrough) {
+            (Some(kid), _) => FrameGroup::Sealed(kid.clone()),
+            (None, true) => FrameGroup::Passthrough,
+            (None, false) => FrameGroup::Plain,
+        }
+    }
+
+    fn contains(&self, sequence: u64) -> bool {
+        sequence >= self.first && sequence < self.first + u64::from(self.count)
+    }
 }
 
 /// The checksummed body of an `.idx` file.
@@ -169,6 +230,16 @@ pub(super) struct SegmentIndexBody {
     pub digest: JournalDigest,
 }
 
+impl SegmentIndexBody {
+    /// Whether any content is stored as plaintext: what end-to-end
+    /// migration still has to re-encrypt.
+    pub fn has_plain_content(&self) -> bool {
+        self.frames
+            .iter()
+            .any(|frame| frame.stream != STREAM_ENVELOPE && frame.group() == FrameGroup::Plain)
+    }
+}
+
 #[derive(Serialize)]
 struct IndexFileOut<'a> {
     sha256: String,
@@ -190,7 +261,8 @@ pub(super) struct SealedSegment {
     pub number: u64,
     pub first: u64,
     pub last: u64,
-    /// Identifies the `.seg` content; frame cache keys use it.
+    /// Identifies the `.seg` content; frame cache keys and wire frame ids
+    /// use it.
     pub segment_id: String,
     frames: Vec<FrameEntry>,
     /// Indexes into `frames` per stream, in sequence order.
@@ -220,6 +292,7 @@ impl SealedSegment {
             if frame.count == 0
                 || frame.offset < SEGMENT_HEADER_BYTES + FRAME_HEADER_BYTES as u64
                 || end.is_none_or(|end| end > body.seg_bytes)
+                || (frame.stream == STREAM_ENVELOPE && frame.group() != FrameGroup::Plain)
             {
                 return Err(invalid("segment index lists a frame outside its file"));
             }
@@ -239,14 +312,30 @@ impl SealedSegment {
                 return Err(invalid("segment index frames do not cover the segment"));
             }
         }
-        Ok(Self {
+        let segment = Self {
             number,
             first: body.first_sequence,
             last: body.last_sequence,
             segment_id: body.segment_id.clone(),
             frames: body.frames.clone(),
             by_stream,
-        })
+        };
+        // A sealed run's summary and full frames must line up: `$enc.fr`
+        // carries one index for both.
+        for frame in segment.frames.iter().filter(|frame| frame.kid.is_some()) {
+            let other = if frame.stream == STREAM_FULL {
+                STREAM_SUMMARY
+            } else {
+                STREAM_FULL
+            };
+            let paired = segment.frame(other, frame.first).is_some_and(|pair| {
+                pair.first == frame.first && pair.count == frame.count && pair.kid == frame.kid
+            });
+            if !paired {
+                return Err(invalid("sealed segment frames are not aligned"));
+            }
+        }
+        Ok(segment)
     }
 
     pub fn count(&self) -> u64 {
@@ -264,7 +353,13 @@ impl SealedSegment {
             .partition_point(|index| self.frames[*index].first <= sequence)
             .checked_sub(1)?;
         let frame = &self.frames[indexes[position]];
-        (sequence < frame.first + u64::from(frame.count)).then_some(frame)
+        frame.contains(sequence).then_some(frame)
+    }
+
+    /// The wire id of `frame` (§5.3 `frames` keys): unique per segment
+    /// build, so a client's cached frame never names other ciphertext.
+    pub fn frame_id(&self, frame: &FrameEntry) -> String {
+        format!("{}-{:x}", self.segment_id, frame.offset)
     }
 }
 
@@ -393,17 +488,31 @@ fn decode_frame(stream: u8, bytes: Vec<u8>, count: u32) -> Result<DecodedFrame, 
     Ok(DecodedFrame { bytes, items })
 }
 
-/// Read, open and decompress one frame.
-fn load_frame(
-    file: &mut std::fs::File,
-    entry: &FrameEntry,
-    codec: ContentCodec,
-) -> Result<DecodedFrame, SegmentError> {
+/// The stored bytes of one frame.
+fn read_stored(file: &mut std::fs::File, entry: &FrameEntry) -> Result<Vec<u8>, SegmentError> {
     let mut stored = vec![0u8; entry.len as usize];
     file.seek(SeekFrom::Start(entry.offset))?;
     file.read_exact(&mut stored)?;
-    let compressed = codec.open_frame(entry.stream, entry.kid.as_deref(), entry.ordinal, stored)?;
-    let raw = inflate(&compressed, entry.raw as usize)?;
+    Ok(stored)
+}
+
+/// The stored ciphertext of a sealed frame, checked against its CRC.
+fn read_sealed(file: &mut std::fs::File, entry: &FrameEntry) -> Result<Vec<u8>, SegmentError> {
+    let stored = read_stored(file, entry)?;
+    if crc32(&stored) != entry.crc {
+        return Err(invalid("sealed frame checksum mismatch"));
+    }
+    Ok(stored)
+}
+
+/// Read and decompress one plaintext or passthrough frame. Sealed frames
+/// are never opened by the daemon.
+fn load_frame(file: &mut std::fs::File, entry: &FrameEntry) -> Result<DecodedFrame, SegmentError> {
+    if entry.kid.is_some() {
+        return Err(invalid("a sealed frame cannot be read by the daemon"));
+    }
+    let stored = read_stored(file, entry)?;
+    let raw = inflate(&stored, entry.raw as usize)?;
     if crc32(&raw) != entry.crc {
         return Err(invalid("frame checksum mismatch"));
     }
@@ -476,15 +585,32 @@ impl FrameCache {
     }
 }
 
+/// A sealed frame one replayed record refers to (`$enc.fr`).
+#[derive(Clone, Debug)]
+pub(super) struct FrameRef {
+    pub id: String,
+    pub entry: FrameEntry,
+}
+
+/// One record read back from a segment.
+pub(super) struct SegmentRecord {
+    pub event: ConversationEvent,
+    /// Journal bytes for page budgets; a sealed record counts its envelope
+    /// only, the caller adds each referenced frame once.
+    pub bytes: u64,
+    /// The sealed frame the record's content is in, for the requested
+    /// detail.
+    pub frame: Option<FrameRef>,
+}
+
 /// Reads records of one sealed segment, keeping the current envelope and
 /// content frame at hand so consecutive records decompress each frame once.
 pub(super) struct SegmentReader<'a> {
     segment: &'a SealedSegment,
     file: std::fs::File,
     cache: &'a FrameCache,
-    codec: ContentCodec,
     conversation_id: &'a str,
-    current: [Option<(u64, Arc<DecodedFrame>)>; 2],
+    current: [Option<(u64, Arc<DecodedFrame>)>; 3],
 }
 
 impl<'a> SegmentReader<'a> {
@@ -492,35 +618,34 @@ impl<'a> SegmentReader<'a> {
         directory: &Path,
         segment: &'a SealedSegment,
         cache: &'a FrameCache,
-        codec: ContentCodec,
         conversation_id: &'a str,
     ) -> Result<Self, SegmentError> {
         Ok(Self {
             file: std::fs::File::open(directory.join(segment.file_name()))?,
             segment,
             cache,
-            codec,
             conversation_id,
-            current: [None, None],
+            current: [None, None, None],
         })
     }
 
-    fn frame_item(&mut self, stream: u8, sequence: u64) -> Result<Vec<u8>, SegmentError> {
-        let slot = usize::from(stream != STREAM_ENVELOPE);
-        let entry = self
-            .segment
+    fn entry(&self, stream: u8, sequence: u64) -> Result<FrameEntry, SegmentError> {
+        self.segment
             .frame(stream, sequence)
-            .ok_or_else(|| invalid(format!("no frame holds sequence {sequence}")))?
-            .clone();
+            .cloned()
+            .ok_or_else(|| invalid(format!("no frame holds sequence {sequence}")))
+    }
+
+    fn frame_item(&mut self, entry: &FrameEntry, sequence: u64) -> Result<Vec<u8>, SegmentError> {
+        let slot = stream_slot(entry.stream).unwrap_or_default();
         let current = match &self.current[slot] {
             Some((offset, frame)) if *offset == entry.offset => frame.clone(),
             _ => {
                 let file = &mut self.file;
-                let codec = self.codec;
                 let frame = self
                     .cache
                     .get_or_load((self.segment.segment_id.clone(), entry.offset), || {
-                        load_frame(file, &entry, codec)
+                        load_frame(file, entry)
                     })?;
                 self.current[slot] = Some((entry.offset, frame.clone()));
                 frame
@@ -532,10 +657,13 @@ impl<'a> SegmentReader<'a> {
             .ok_or_else(|| invalid(format!("frame lacks sequence {sequence}")))
     }
 
-    /// The record with `sequence` and its journal bytes for page budgets.
-    pub fn event(&mut self, sequence: u64) -> Result<(ConversationEvent, u64), SegmentError> {
-        let envelope = self.frame_item(STREAM_ENVELOPE, sequence)?;
-        let content = self.frame_item(STREAM_FULL, sequence)?;
+    /// The record with `sequence`. Plaintext content is always the full
+    /// payload (replays summarize it); ciphertext comes in the detail asked
+    /// for: a passthrough record's summary item, or the summary frame of a
+    /// sealed run.
+    pub fn record(&mut self, sequence: u64, summary: bool) -> Result<SegmentRecord, SegmentError> {
+        let envelope_entry = self.entry(STREAM_ENVELOPE, sequence)?;
+        let envelope = self.frame_item(&envelope_entry, sequence)?;
         let record = parse_record(&envelope)?;
         if record.sequence() != sequence {
             return Err(invalid(format!(
@@ -543,11 +671,86 @@ impl<'a> SegmentReader<'a> {
                 record.sequence()
             )));
         }
-        let payload: Value = serde_json::from_slice(&content)?;
+        let full = self.entry(STREAM_FULL, sequence)?;
+        let (payload, content_bytes, frame) = match full.group() {
+            FrameGroup::Plain => {
+                let content = self.frame_item(&full, sequence)?;
+                (serde_json::from_slice(&content)?, content.len(), None)
+            }
+            FrameGroup::Passthrough => {
+                let entry = if summary {
+                    self.entry(STREAM_SUMMARY, sequence)?
+                } else {
+                    full
+                };
+                let content = self.frame_item(&entry, sequence)?;
+                let encrypted: Map<String, Value> = serde_json::from_slice(&content)?;
+                let mut payload = record.envelope().clone();
+                payload.insert(ENCRYPTED_FIELD.to_owned(), Value::Object(encrypted));
+                (Value::Object(payload), content.len(), None)
+            }
+            FrameGroup::Sealed(kid) => {
+                let summary_entry = self.entry(STREAM_SUMMARY, sequence)?;
+                let index = sequence - full.first;
+                let reference = serde_json::json!({
+                    "s": self.segment.frame_id(&summary_entry),
+                    "f": self.segment.frame_id(&full),
+                    "i": index,
+                });
+                let mut encrypted = Map::new();
+                encrypted.insert("v".to_owned(), Value::from(1u64));
+                encrypted.insert("kid".to_owned(), Value::String(kid));
+                encrypted.insert(
+                    "c".to_owned(),
+                    Value::String(self.conversation_id.to_owned()),
+                );
+                encrypted.insert("n".to_owned(), Value::from(sequence));
+                encrypted.insert("fr".to_owned(), reference);
+                let mut payload = record.envelope().clone();
+                payload.insert(ENCRYPTED_FIELD.to_owned(), Value::Object(encrypted));
+                let entry = if summary { summary_entry } else { full };
+                let frame = FrameRef {
+                    id: self.segment.frame_id(&entry),
+                    entry,
+                };
+                (Value::Object(payload), 0, Some(frame))
+            }
+        };
         let event = record
             .into_event(self.conversation_id, Some(payload))
             .map_err(invalid)?;
-        Ok((event, record_bytes(envelope.len(), content.len())))
+        Ok(SegmentRecord {
+            event,
+            bytes: record_bytes(envelope.len(), content_bytes),
+            frame,
+        })
+    }
+
+    /// The record with `sequence` and its journal bytes, in full detail.
+    pub fn event(&mut self, sequence: u64) -> Result<(ConversationEvent, u64), SegmentError> {
+        let record = self.record(sequence, false)?;
+        Ok((record.event, record.bytes))
+    }
+
+    /// The wire form of a sealed frame (§5.3 `frames` value): `{kid, stream,
+    /// counter, c, ct}`, the ciphertext read straight from the `.seg`.
+    pub fn wire_frame(&mut self, entry: &FrameEntry) -> Result<Value, SegmentError> {
+        let kid = entry
+            .kid
+            .clone()
+            .ok_or_else(|| invalid("only sealed frames are sent as frames"))?;
+        let stored = read_sealed(&mut self.file, entry)?;
+        let stream = match entry.stream {
+            STREAM_SUMMARY => ContentStream::FrameSummary,
+            _ => ContentStream::FrameFull,
+        };
+        Ok(serde_json::json!({
+            "kid": kid,
+            "stream": stream.as_u32(),
+            "counter": frame_counter(self.segment.number, entry.ordinal),
+            "c": self.conversation_id,
+            "ct": URL_SAFE_NO_PAD.encode(stored),
+        }))
     }
 }
 
@@ -571,7 +774,10 @@ impl<'a> SegmentReader<'a> {
 ///
 /// Message and tool ids are scoped by the record's `turnId` (payload, else
 /// `block.turnId`), since fallback ids such as Codex's `current` repeat
-/// across turns; subagent ids are unique and outlive turns.
+/// across turns; subagent ids are unique and outlive turns. Encrypted
+/// records are judged by their plaintext while their DEK is in memory;
+/// passthrough ciphertext only contributes its envelope as a terminal and
+/// is never stripped.
 #[derive(Default)]
 pub(super) struct SlimPlan {
     messages: HashMap<(Option<String>, String), u64>,
@@ -633,6 +839,9 @@ impl SlimPlan {
 
     pub fn strips(&self, event: &ConversationEvent) -> bool {
         let payload = &event.payload;
+        if payload.get(ENCRYPTED_FIELD).is_some() {
+            return false;
+        }
         let later = |terminal: Option<&u64>| terminal.is_some_and(|seq| *seq > event.sequence);
         let scoped = |map: &HashMap<(Option<String>, String), u64>, id: Option<&str>| {
             id.is_some_and(|id| later(map.get(&(turn_of(payload), id.to_owned()))))
@@ -653,6 +862,129 @@ impl SlimPlan {
     }
 }
 
+/// A fresh DEK end-to-end migration seals plaintext records under, with the
+/// fingerprint key their deduplication fields are MAC'd with first.
+pub(super) struct MigrationKey {
+    pub kid: String,
+    pub key: Arc<SegmentKey>,
+    pub fingerprint: Arc<FingerprintKey>,
+}
+
+/// The keys a segment build may encrypt with. Default: none (plaintext and
+/// ciphertext are framed as they are).
+#[derive(Default)]
+pub(super) struct SealPolicy {
+    /// DEKs still in memory, by kid: event ciphertext under them is opened
+    /// and repacked into sealed frames.
+    pub keys: HashMap<String, Arc<SegmentKey>>,
+    /// History encryption is on: plaintext records are sealed under this
+    /// key.
+    pub migrate: Option<MigrationKey>,
+}
+
+/// Content of one record handed to [`SegmentBuilder::push`].
+pub(super) enum Item {
+    /// Plaintext payload, framed as plaintext.
+    Plain(Value),
+    /// Plaintext payload to seal under the builder's key `kid`.
+    Sealed { kid: String, payload: Value },
+    /// An event-level `$enc` object kept as ciphertext.
+    Passthrough(Map<String, Value>),
+    /// The record's content is in sealed frames copied with
+    /// [`SegmentBuilder::push_verbatim`].
+    Verbatim,
+}
+
+/// One record as a build will store it.
+struct Classified {
+    /// What the envelope stream describes and the digest folds in.
+    stored: ConversationEvent,
+    /// The plaintext, for slimming; `None` for passthrough ciphertext.
+    view: Option<ConversationEvent>,
+    /// The group its content (or its marker's) goes to.
+    group: FrameGroup,
+}
+
+impl SealPolicy {
+    /// Decide how `event` (as read from a plaintext journal file) is
+    /// stored; see [`FrameGroup`].
+    fn classify(&self, event: ConversationEvent, conversation_id: &str) -> Classified {
+        if let Some(encrypted) = encrypted_content(&event.payload) {
+            let opened = encrypted
+                .get("kid")
+                .and_then(Value::as_str)
+                .and_then(|kid| Some((kid, self.keys.get(kid)?)))
+                .and_then(|(kid, key)| {
+                    let (full, _) = open_event(encrypted, conversation_id, event.sequence, key)?;
+                    Some((kid.to_owned(), full))
+                });
+            return match opened {
+                Some((kid, full)) => {
+                    let mut view = event.clone();
+                    view.payload = full;
+                    Classified {
+                        stored: event,
+                        view: Some(view),
+                        group: FrameGroup::Sealed(kid),
+                    }
+                }
+                None => Classified {
+                    stored: event,
+                    view: None,
+                    group: FrameGroup::Passthrough,
+                },
+            };
+        }
+        match &self.migrate {
+            Some(migrate) => {
+                let mut stored = event;
+                add_history_macs(
+                    &stored.event_type,
+                    &mut stored.payload,
+                    &migrate.fingerprint,
+                );
+                Classified {
+                    view: Some(stored.clone()),
+                    stored,
+                    group: FrameGroup::Sealed(migrate.kid.clone()),
+                }
+            }
+            None => Classified {
+                view: Some(event.clone()),
+                stored: event,
+                group: FrameGroup::Plain,
+            },
+        }
+    }
+
+    /// The content item of `classified` (or of a marker in its place).
+    fn item(group: &FrameGroup, payload: Value) -> Item {
+        match group {
+            FrameGroup::Plain => Item::Plain(payload),
+            FrameGroup::Sealed(kid) => Item::Sealed {
+                kid: kid.clone(),
+                payload,
+            },
+            FrameGroup::Passthrough => match payload {
+                Value::Object(mut map) => match map.remove(ENCRYPTED_FIELD) {
+                    Some(Value::Object(encrypted)) => Item::Passthrough(encrypted),
+                    _ => Item::Plain(Value::Object(map)),
+                },
+                other => Item::Plain(other),
+            },
+        }
+    }
+
+    /// Every key a frame may be sealed under.
+    fn sealing_keys(&self) -> HashMap<String, Arc<SegmentKey>> {
+        let mut keys = self.keys.clone();
+        if let Some(migrate) = &self.migrate {
+            keys.insert(migrate.kid.clone(), migrate.key.clone());
+        }
+        keys
+    }
+}
+
 /// Output of a segment build: the temporary `.seg`/`.idx` (durable) and the
 /// index body they describe.
 pub(super) struct PreparedSegment {
@@ -660,6 +992,9 @@ pub(super) struct PreparedSegment {
     pub temp_seg: PathBuf,
     pub temp_idx: PathBuf,
     pub body: SegmentIndexBody,
+    /// DEKs whose event ciphertext was opened and repacked: released once
+    /// the segment is committed.
+    pub repacked: Vec<String>,
 }
 
 impl PreparedSegment {
@@ -675,10 +1010,22 @@ pub(super) const SEAL_TEMP_PREFIX: &str = ".seal.";
 
 struct StreamBuffer {
     stream: u8,
-    kid: Option<String>,
+    group: FrameGroup,
     first: u64,
     count: u32,
     raw: Vec<u8>,
+}
+
+impl StreamBuffer {
+    fn new(stream: u8) -> Self {
+        Self {
+            stream,
+            group: FrameGroup::Plain,
+            first: 0,
+            count: 0,
+            raw: Vec::new(),
+        }
+    }
 }
 
 /// Streams records into a new `.seg` (blocking I/O; run off the runtime).
@@ -692,8 +1039,17 @@ pub(super) struct SegmentBuilder {
     segment_id: String,
     frames: Vec<FrameEntry>,
     buffers: [StreamBuffer; 3],
-    ordinals: HashMap<(Option<String>, u8), u32>,
-    codec: ContentCodec,
+    ordinals: HashMap<(FrameGroup, u8), u32>,
+    /// Ordinals taken per `(kid, stream)`, so a copied frame and a new one
+    /// can never share an AEAD counter.
+    sealed_ordinals: HashSet<(String, u8, u32)>,
+    /// Next sequence each content stream expects (summary, full), once
+    /// the first record or copied frame set it.
+    content_next: [u64; 2],
+    content_started: bool,
+    conversation_id: String,
+    keys: HashMap<String, Arc<SegmentKey>>,
+    repacked: BTreeSet<String>,
     digest: JournalDigest,
     first: Option<u64>,
     last: u64,
@@ -703,8 +1059,9 @@ pub(super) struct SegmentBuilder {
 impl SegmentBuilder {
     pub fn create(
         directory: &Path,
+        conversation_id: &str,
         number: u64,
-        codec: ContentCodec,
+        policy: &SealPolicy,
     ) -> Result<Self, SegmentError> {
         let tag = uuid::Uuid::new_v4().simple().to_string();
         let temp_seg = directory.join(format!("{SEAL_TEMP_PREFIX}{tag}.seg.tmp"));
@@ -724,15 +1081,14 @@ impl SegmentBuilder {
             offset: 0,
             segment_id: hex(&id),
             frames: Vec::new(),
-            buffers: STREAMS.map(|stream| StreamBuffer {
-                stream,
-                kid: None,
-                first: 0,
-                count: 0,
-                raw: Vec::new(),
-            }),
+            buffers: STREAMS.map(StreamBuffer::new),
             ordinals: HashMap::new(),
-            codec,
+            sealed_ordinals: HashSet::new(),
+            content_next: [0; 2],
+            content_started: false,
+            conversation_id: conversation_id.to_owned(),
+            keys: policy.sealing_keys(),
+            repacked: BTreeSet::new(),
             digest: JournalDigest::default(),
             first: None,
             last: 0,
@@ -756,33 +1112,150 @@ impl SegmentBuilder {
         self.digest.apply(original);
     }
 
-    /// Append the stored form of the next record.
-    pub fn push(&mut self, stored: &ConversationEvent) -> Result<(), SegmentError> {
+    /// Note that event ciphertext under `kid` was opened for this segment.
+    pub fn note_repacked(&mut self, kid: &str) {
+        if !self.repacked.contains(kid) {
+            self.repacked.insert(kid.to_owned());
+        }
+    }
+
+    /// Append the next record: `stored` describes its envelope, `item` its
+    /// content.
+    pub fn push(&mut self, stored: &ConversationEvent, item: Item) -> Result<(), SegmentError> {
+        let sequence = stored.sequence;
         if self.first.is_none() {
-            self.first = Some(stored.sequence);
-        } else if stored.sequence != self.last + 1 {
+            self.first = Some(sequence);
+            if !self.content_started {
+                self.content_next = [sequence; 2];
+                self.content_started = true;
+            }
+        } else if sequence != self.last + 1 {
             return Err(invalid(format!(
-                "segment record {} does not follow {}",
-                stored.sequence, self.last
+                "segment record {sequence} does not follow {}",
+                self.last
             )));
         }
-        self.last = stored.sequence;
+        self.last = sequence;
         if stored.event_type == JOURNAL_COMPACTED_EVENT {
             self.slimmed += 1;
         }
-        let kid = self.codec.kid().map(str::to_owned);
         let mut envelope = encode_envelope(stored)?;
         envelope.push(b'\n');
-        let full = serde_json::to_vec(&stored.payload)?;
+        self.append(0, sequence, &FrameGroup::Plain, &envelope)?;
+        let (group, payload) = match item {
+            Item::Verbatim => {
+                if self.content_next.iter().any(|next| *next <= sequence) {
+                    return Err(invalid(format!(
+                        "record {sequence} has no copied frame holding its content"
+                    )));
+                }
+                return Ok(());
+            }
+            Item::Plain(payload) => (FrameGroup::Plain, payload),
+            Item::Sealed { kid, payload } => {
+                if !self.keys.contains_key(&kid) {
+                    return Err(invalid("no key to seal the frame under"));
+                }
+                (FrameGroup::Sealed(kid), payload)
+            }
+            Item::Passthrough(encrypted) => {
+                // The full item keeps both ciphertexts (so the summary item
+                // can be derived again); the summary item drops `f` when a
+                // separate summary exists.
+                let mut summary = encrypted.clone();
+                if summary.contains_key("s") {
+                    summary.remove("f");
+                }
+                let full = serde_json::to_vec(&encrypted)?;
+                let summary = serde_json::to_vec(&summary)?;
+                return self.append_content(sequence, FrameGroup::Passthrough, &summary, &full);
+            }
+        };
+        let full = serde_json::to_vec(&payload)?;
         let mut summarized = stored.clone();
+        summarized.payload = payload;
         let summary = if summarize_event(&mut summarized) {
             serde_json::to_vec(&summarized.payload)?
         } else {
             full.clone()
         };
-        self.append(0, stored.sequence, &kid, &envelope)?;
-        self.append(1, stored.sequence, &kid, &summary)?;
-        self.append(2, stored.sequence, &kid, &full)?;
+        self.append_content(sequence, group, &summary, &full)
+    }
+
+    /// Copy a sealed run's summary and full frames as they are (salvage,
+    /// re-encryption of a segment holding them). The records they hold are
+    /// then pushed with [`Item::Verbatim`].
+    pub fn push_verbatim(
+        &mut self,
+        summary: (FrameEntry, Vec<u8>),
+        full: (FrameEntry, Vec<u8>),
+    ) -> Result<(), SegmentError> {
+        let first = full.0.first;
+        if !self.content_started {
+            self.content_next = [first; 2];
+            self.content_started = true;
+        }
+        for (slot, entry) in [(1usize, &summary.0), (2usize, &full.0)] {
+            if entry.kid.is_none()
+                || entry.first != first
+                || entry.count != full.0.count
+                || entry.stream != STREAMS[slot]
+                || entry.kid != full.0.kid
+                || self.content_next[slot - 1] != first
+            {
+                return Err(invalid("copied frames do not line up"));
+            }
+            self.flush(slot)?;
+        }
+        for (slot, (entry, stored)) in [(1usize, summary), (2usize, full)] {
+            let kid = entry.kid.clone().unwrap_or_default();
+            if !self
+                .sealed_ordinals
+                .insert((kid, entry.stream, entry.ordinal))
+            {
+                return Err(invalid("copied frame reuses a frame counter"));
+            }
+            self.content_next[slot - 1] = entry.first + u64::from(entry.count);
+            self.write_frame(entry, &stored)?;
+        }
+        Ok(())
+    }
+
+    fn append_content(
+        &mut self,
+        sequence: u64,
+        group: FrameGroup,
+        summary: &[u8],
+        full: &[u8],
+    ) -> Result<(), SegmentError> {
+        if self.content_next != [sequence; 2] {
+            return Err(invalid(format!(
+                "segment content for {sequence} is out of order"
+            )));
+        }
+        let needs_flush = |buffer: &StreamBuffer, item: &[u8]| {
+            buffer.count > 0
+                && (buffer.raw.len() + item.len() > FRAME_RAW_BYTES || buffer.group != group)
+        };
+        let summary_full = needs_flush(&self.buffers[1], summary);
+        let full_full = needs_flush(&self.buffers[2], full);
+        if matches!(group, FrameGroup::Sealed(_)) {
+            // A sealed run's summary and full frames cover the same records.
+            if summary_full || full_full {
+                self.flush(1)?;
+                self.flush(2)?;
+            }
+        } else {
+            if summary_full {
+                self.flush(1)?;
+            }
+            if full_full {
+                self.flush(2)?;
+            }
+        }
+        self.append(1, sequence, &group, summary)?;
+        self.append(2, sequence, &group, full)?;
+        self.content_next = [sequence + 1; 2];
         Ok(())
     }
 
@@ -790,19 +1263,20 @@ impl SegmentBuilder {
         &mut self,
         slot: usize,
         sequence: u64,
-        kid: &Option<String>,
+        group: &FrameGroup,
         item: &[u8],
     ) -> Result<(), SegmentError> {
         let buffer = &self.buffers[slot];
-        if buffer.count > 0
-            && (buffer.raw.len() + item.len() > FRAME_RAW_BYTES || buffer.kid != *kid)
+        if slot == 0
+            && buffer.count > 0
+            && (buffer.raw.len() + item.len() > FRAME_RAW_BYTES || buffer.group != *group)
         {
             self.flush(slot)?;
         }
         let buffer = &mut self.buffers[slot];
         if buffer.count == 0 {
             buffer.first = sequence;
-            buffer.kid = kid.clone();
+            buffer.group = group.clone();
             if buffer.stream != STREAM_ENVELOPE {
                 buffer.raw.push(b'[');
             }
@@ -815,16 +1289,8 @@ impl SegmentBuilder {
     }
 
     fn flush(&mut self, slot: usize) -> Result<(), SegmentError> {
-        let mut buffer = std::mem::replace(
-            &mut self.buffers[slot],
-            StreamBuffer {
-                stream: STREAMS[slot],
-                kid: None,
-                first: 0,
-                count: 0,
-                raw: Vec::new(),
-            },
-        );
+        let mut buffer =
+            std::mem::replace(&mut self.buffers[slot], StreamBuffer::new(STREAMS[slot]));
         if buffer.count == 0 {
             return Ok(());
         }
@@ -832,52 +1298,92 @@ impl SegmentBuilder {
             buffer.raw.push(b']');
         }
         let compressed = deflate(&buffer.raw)?;
-        let crc = crc32(&buffer.raw);
-        let ordinal = {
+        let mut ordinal = {
             let slot = self
                 .ordinals
-                .entry((buffer.kid.clone(), buffer.stream))
+                .entry((buffer.group.clone(), buffer.stream))
                 .or_default();
             let ordinal = *slot;
             *slot += 1;
             ordinal
         };
-        let stored = self.codec.seal_frame(buffer.stream, ordinal, compressed);
-        let kid_bytes = buffer
-            .kid
-            .as_deref()
-            .unwrap_or_default()
-            .as_bytes()
-            .to_vec();
-        if kid_bytes.len() > usize::from(u8::MAX) {
-            return Err(invalid("frame key id is too long"));
-        }
-        let mut header = Vec::with_capacity(FRAME_HEADER_BYTES + kid_bytes.len());
-        header.extend_from_slice(FRAME_MAGIC);
-        header.push(buffer.stream);
-        header.push(kid_bytes.len() as u8);
-        header.extend_from_slice(&[0, 0]);
-        header.extend_from_slice(&buffer.first.to_le_bytes());
-        header.extend_from_slice(&buffer.count.to_le_bytes());
-        header.extend_from_slice(&(buffer.raw.len() as u32).to_le_bytes());
-        header.extend_from_slice(&(stored.len() as u32).to_le_bytes());
-        header.extend_from_slice(&ordinal.to_le_bytes());
-        header.extend_from_slice(&crc.to_le_bytes());
-        header.extend_from_slice(&kid_bytes);
-        self.write(&header)?;
-        let offset = self.offset;
-        self.write(&stored)?;
-        self.frames.push(FrameEntry {
+        let (stored, crc, kid) = match &buffer.group {
+            FrameGroup::Sealed(kid) => {
+                while !self
+                    .sealed_ordinals
+                    .insert((kid.clone(), buffer.stream, ordinal))
+                {
+                    ordinal = ordinal
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("frame ordinals exhausted"))?;
+                    self.ordinals
+                        .insert((buffer.group.clone(), buffer.stream), ordinal + 1);
+                }
+                let key = self
+                    .keys
+                    .get(kid)
+                    .ok_or_else(|| invalid("no key to seal the frame under"))?;
+                let stream = if buffer.stream == STREAM_SUMMARY {
+                    ContentStream::FrameSummary
+                } else {
+                    ContentStream::FrameFull
+                };
+                let sealed = history_crypto::seal(
+                    key,
+                    &self.conversation_id,
+                    stream,
+                    frame_counter(self.number, ordinal),
+                    &compressed,
+                )
+                .map_err(|error| invalid(error.to_string()))?;
+                let crc = crc32(&sealed);
+                (sealed, crc, Some(kid.clone()))
+            }
+            _ => (compressed, crc32(&buffer.raw), None),
+        };
+        let entry = FrameEntry {
             stream: buffer.stream,
             first: buffer.first,
             count: buffer.count,
-            offset,
+            offset: 0,
             len: stored.len() as u32,
             raw: buffer.raw.len() as u32,
-            kid: buffer.kid,
+            kid,
+            passthrough: buffer.group == FrameGroup::Passthrough,
             ordinal,
             crc,
-        });
+        };
+        self.write_frame(entry, &stored)
+    }
+
+    /// Write a frame header and data; `entry.offset` is filled in.
+    fn write_frame(&mut self, mut entry: FrameEntry, stored: &[u8]) -> Result<(), SegmentError> {
+        let kid_bytes = entry.kid.as_deref().unwrap_or_default().as_bytes().to_vec();
+        if kid_bytes.len() > usize::from(u8::MAX) {
+            return Err(invalid("frame key id is too long"));
+        }
+        let flags = if entry.passthrough {
+            FLAG_PASSTHROUGH
+        } else {
+            0
+        };
+        let mut header = Vec::with_capacity(FRAME_HEADER_BYTES + kid_bytes.len());
+        header.extend_from_slice(FRAME_MAGIC);
+        header.push(entry.stream);
+        header.push(kid_bytes.len() as u8);
+        header.extend_from_slice(&[flags, 0]);
+        header.extend_from_slice(&entry.first.to_le_bytes());
+        header.extend_from_slice(&entry.count.to_le_bytes());
+        header.extend_from_slice(&entry.raw.to_le_bytes());
+        header.extend_from_slice(&(stored.len() as u32).to_le_bytes());
+        header.extend_from_slice(&entry.ordinal.to_le_bytes());
+        header.extend_from_slice(&entry.crc.to_le_bytes());
+        header.extend_from_slice(&kid_bytes);
+        self.write(&header)?;
+        entry.offset = self.offset;
+        entry.len = stored.len() as u32;
+        self.write(stored)?;
+        self.frames.push(entry);
         Ok(())
     }
 
@@ -890,6 +1396,10 @@ impl SegmentBuilder {
         };
         for slot in 0..STREAMS.len() {
             self.flush(slot)?;
+        }
+        if self.content_next != [self.last + 1; 2] {
+            self.abandon();
+            return Err(invalid("segment content does not cover its records"));
         }
         self.writer.flush()?;
         let file = self
@@ -916,6 +1426,7 @@ impl SegmentBuilder {
             temp_seg: self.temp_seg,
             temp_idx: self.temp_idx,
             body,
+            repacked: self.repacked.into_iter().collect(),
         })
     }
 
@@ -994,54 +1505,205 @@ fn for_each_plain_record(
     Ok(expected)
 }
 
+/// Push one classified record (see [`SealPolicy::classify`]).
+fn push_classified(
+    builder: &mut SegmentBuilder,
+    classified: Classified,
+) -> Result<(), SegmentError> {
+    let Classified {
+        stored,
+        view,
+        group,
+    } = classified;
+    let item = match (&group, view) {
+        (FrameGroup::Sealed(kid), Some(view)) => {
+            if encrypted_content(&stored.payload).is_some() {
+                builder.note_repacked(kid);
+            }
+            Item::Sealed {
+                kid: kid.clone(),
+                payload: view.payload,
+            }
+        }
+        _ => SealPolicy::item(&group, stored.payload.clone()),
+    };
+    builder.push(&stored, item)
+}
+
 /// Build segment `number` from the sealed plaintext files `sources`
-/// (consecutive, in order), slimming covered streaming records. Two passes
-/// keep memory bounded: the first collects the terminal ids, the second
-/// writes frames. Blocking.
+/// (consecutive, in order), slimming covered streaming records and
+/// encrypting what `policy` holds keys for. Two passes keep memory
+/// bounded: the first collects the terminal ids, the second writes frames.
+/// Blocking.
 pub(super) fn build_from_plain(
     directory: &Path,
     conversation_id: &str,
     number: u64,
     sources: &[String],
     expected_first: u64,
-    codec: ContentCodec,
+    policy: &SealPolicy,
 ) -> Result<PreparedSegment, SegmentError> {
     let paths: Vec<PathBuf> = sources.iter().map(|name| directory.join(name)).collect();
     let mut plan = SlimPlan::default();
     for_each_plain_record(&paths, conversation_id, expected_first, |event| {
-        plan.observe(&event);
+        let classified = policy.classify(event, conversation_id);
+        plan.observe(classified.view.as_ref().unwrap_or(&classified.stored));
         Ok(())
     })?;
-    let mut builder = SegmentBuilder::create(directory, number, codec)?;
+    let mut builder = SegmentBuilder::create(directory, conversation_id, number, policy)?;
     // Stripped records of the open run: written as markers once the run's
-    // length is known. Only ids and times are held.
-    let mut run: Vec<ConversationEvent> = Vec::new();
+    // length is known. Only ids, times and their frame group are held.
+    let mut run: Vec<(ConversationEvent, FrameGroup)> = Vec::new();
     let flush_run = |builder: &mut SegmentBuilder,
-                     run: &mut Vec<ConversationEvent>|
+                     run: &mut Vec<(ConversationEvent, FrameGroup)>|
      -> Result<(), SegmentError> {
-        let Some(start) = run.first().map(|event| event.sequence) else {
+        let Some(start) = run.first().map(|(event, _)| event.sequence) else {
             return Ok(());
         };
         let length = run.len() as u64;
-        for original in run.drain(..) {
-            builder.push(&compacted_marker(&original, start, length))?;
+        for (original, group) in run.drain(..) {
+            let marker = compacted_marker(&original, start, length);
+            let item = SealPolicy::item(&group, marker.payload.clone());
+            builder.push(&marker, item)?;
         }
         Ok(())
     };
     let built = for_each_plain_record(&paths, conversation_id, expected_first, |event| {
-        builder.observe(&event);
-        if plan.strips(&event) {
-            let mut slim = event;
+        let classified = policy.classify(event, conversation_id);
+        builder.observe(&classified.stored);
+        let stripped = classified
+            .view
+            .as_ref()
+            .is_some_and(|view| plan.strips(view));
+        if stripped {
+            if let (FrameGroup::Sealed(kid), true) = (
+                &classified.group,
+                encrypted_content(&classified.stored.payload).is_some(),
+            ) {
+                builder.note_repacked(kid);
+            }
+            let mut slim = classified.stored;
             slim.payload = Value::Null;
-            run.push(slim);
+            run.push((slim, classified.group));
             return Ok(());
         }
         flush_run(&mut builder, &mut run)?;
-        builder.push(&event)
+        push_classified(&mut builder, classified)
     })
     .and_then(|_| flush_run(&mut builder, &mut run));
     match built {
         Ok(()) => builder.finish(sources.to_vec()),
+        Err(error) => {
+            builder.abandon();
+            Err(error)
+        }
+    }
+}
+
+/// The envelope-only event an envelope line describes (digest input of a
+/// record whose content stays in a copied sealed frame).
+fn envelope_event(line: &[u8], conversation_id: &str) -> Result<ConversationEvent, SegmentError> {
+    let record = parse_record(line)?;
+    let payload = Value::Object(record.envelope().clone());
+    record
+        .into_event(conversation_id, Some(payload))
+        .map_err(invalid)
+}
+
+/// Rewrite intact segment `number` with `policy` (end-to-end migration):
+/// plaintext content is sealed under the migration key, ciphertext whose
+/// DEK is in memory is repacked, sealed runs are copied as they are. No
+/// slimming happens again. Blocking.
+pub(super) fn rebuild_segment(
+    directory: &Path,
+    conversation_id: &str,
+    number: u64,
+    policy: &SealPolicy,
+) -> Result<PreparedSegment, SegmentError> {
+    let loaded = load_index(directory, number)?;
+    let segment = loaded.segment;
+    let mut file = std::fs::File::open(directory.join(segment_name(number)))?;
+    let mut builder = SegmentBuilder::create(directory, conversation_id, number, policy)?;
+    let result = (|| -> Result<(), SegmentError> {
+        let mut decoded: [Option<(u64, DecodedFrame)>; 2] = [None, None];
+        let mut item = |file: &mut std::fs::File,
+                        slot: usize,
+                        entry: &FrameEntry,
+                        sequence: u64|
+         -> Result<Vec<u8>, SegmentError> {
+            if decoded[slot]
+                .as_ref()
+                .is_none_or(|(offset, _)| *offset != entry.offset)
+            {
+                decoded[slot] = Some((entry.offset, load_frame(file, entry)?));
+            }
+            let (_, frame) = decoded[slot].as_ref().expect("frame was just loaded");
+            frame
+                .item((sequence - entry.first) as usize)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| invalid(format!("frame lacks sequence {sequence}")))
+        };
+        let mut sequence = segment.first;
+        while sequence <= segment.last {
+            let envelope_entry = segment
+                .frame(STREAM_ENVELOPE, sequence)
+                .cloned()
+                .ok_or_else(|| invalid(format!("no envelope holds sequence {sequence}")))?;
+            let full = segment
+                .frame(STREAM_FULL, sequence)
+                .cloned()
+                .ok_or_else(|| invalid(format!("no content holds sequence {sequence}")))?;
+            if full.kid.is_some() {
+                let summary = segment
+                    .frame(STREAM_SUMMARY, sequence)
+                    .cloned()
+                    .ok_or_else(|| invalid("sealed run lacks its summary frame"))?;
+                let summary_bytes = read_sealed(&mut file, &summary)?;
+                let full_bytes = read_sealed(&mut file, &full)?;
+                let end = full.first + u64::from(full.count);
+                builder.push_verbatim((summary, summary_bytes), (full, full_bytes))?;
+                while sequence < end {
+                    let entry = segment
+                        .frame(STREAM_ENVELOPE, sequence)
+                        .cloned()
+                        .ok_or_else(|| invalid("no envelope holds a sealed record"))?;
+                    let line = item(&mut file, 0, &entry, sequence)?;
+                    let event = envelope_event(&line, conversation_id)?;
+                    builder.observe(&event);
+                    builder.push(&event, Item::Verbatim)?;
+                    sequence += 1;
+                }
+                continue;
+            }
+            let line = item(&mut file, 0, &envelope_entry, sequence)?;
+            let content = item(&mut file, 1, &full, sequence)?;
+            let record = parse_record(&line)?;
+            let payload = if full.passthrough {
+                let encrypted: Map<String, Value> = serde_json::from_slice(&content)?;
+                let mut payload = record.envelope().clone();
+                payload.insert(ENCRYPTED_FIELD.to_owned(), Value::Object(encrypted));
+                Value::Object(payload)
+            } else {
+                serde_json::from_slice(&content)?
+            };
+            let event = record
+                .into_event(conversation_id, Some(payload))
+                .map_err(invalid)?;
+            if event.sequence != sequence {
+                return Err(invalid(format!(
+                    "envelope frame holds sequence {} where {sequence} belongs",
+                    event.sequence
+                )));
+            }
+            let classified = policy.classify(event, conversation_id);
+            builder.observe(&classified.stored);
+            push_classified(&mut builder, classified)?;
+            sequence += 1;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => builder.finish(Vec::new()),
         Err(error) => {
             builder.abandon();
             Err(error)
@@ -1090,7 +1752,46 @@ pub(super) fn commit_prepared(
     Ok(())
 }
 
-/// Step boundaries of [`commit_prepared`], for crash-injection tests.
+/// Suffix of a replacement segment's files while [`commit_replacement`]
+/// swaps them in.
+const REPLACEMENT_SUFFIX: &str = ".next";
+
+/// Replace existing segment `number` with a rebuild of it (end-to-end
+/// migration), crash-safely: both new files are first renamed to
+/// `events.NNNNNN.idx.next` / `.seg.next` and synced, then `.idx` and
+/// `.seg` are replaced in that order. [`reconcile_directory`] finishes or
+/// rolls back an interrupted swap: while `.idx.next` exists the old pair is
+/// intact and the `.next` files are dropped; once it is gone the new index
+/// is in place and `.seg.next` is renamed after it. Blocking; callers hold
+/// the conversation lock.
+pub(super) fn commit_replacement(
+    directory: &Path,
+    prepared: &PreparedSegment,
+    stop_after: Option<CommitStep>,
+) -> Result<(), SegmentError> {
+    let stop = |step: CommitStep| stop_after == Some(step);
+    let number = prepared.number;
+    let next = |name: String| directory.join(format!("{name}{REPLACEMENT_SUFFIX}"));
+    std::fs::rename(&prepared.temp_idx, next(index_name(number)))?;
+    std::fs::rename(&prepared.temp_seg, next(segment_name(number)))?;
+    sync_directory_blocking(directory)?;
+    if stop(CommitStep::Written) {
+        return Ok(());
+    }
+    std::fs::rename(next(index_name(number)), directory.join(index_name(number)))?;
+    if stop(CommitStep::IndexRenamed) {
+        return Ok(());
+    }
+    std::fs::rename(
+        next(segment_name(number)),
+        directory.join(segment_name(number)),
+    )?;
+    sync_directory_blocking(directory)?;
+    Ok(())
+}
+
+/// Step boundaries of [`commit_prepared`] and [`commit_replacement`], for
+/// crash-injection tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CommitStep {
     /// Temporaries durable, nothing renamed.
@@ -1115,19 +1816,22 @@ pub(super) struct Reconciled {
     pub changed: bool,
 }
 
-/// Restore the §4.1 invariants after a crash. For every `.seg`/`.idx`:
-/// an `.idx` without its `.seg` is removed; a pair whose plaintext sources
-/// still exist is kept (and the sources removed) only when the whole `.seg`
-/// hashes to its index, otherwise the pair is removed and the sources stay;
-/// a `.seg` whose index is unusable is removed when a plaintext file of the
-/// same number exists (the conversion is redone) and otherwise left for
-/// segment salvage. Leftover build temporaries are removed unless
-/// `building` says a build is writing them. Blocking.
+/// Restore the §4.1 invariants after a crash. An interrupted
+/// [`commit_replacement`] is finished or rolled back first. Then for every
+/// `.seg`/`.idx`: an `.idx` without its `.seg` is removed; a pair whose
+/// plaintext sources still exist is kept (and the sources removed) only
+/// when the whole `.seg` hashes to its index, otherwise the pair is
+/// removed and the sources stay; a `.seg` whose index is unusable is
+/// removed when a plaintext file of the same number exists (the conversion
+/// is redone) and otherwise left for segment salvage. Leftover build
+/// temporaries are removed unless `building` says a build is writing them.
+/// Blocking.
 pub(super) fn reconcile_directory(directory: &Path, building: bool) -> std::io::Result<Reconciled> {
     let mut outcome = Reconciled::default();
     let mut segs = Vec::new();
     let mut idxs = Vec::new();
     let mut plains = std::collections::HashSet::new();
+    let mut replacements = BTreeSet::new();
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(outcome),
@@ -1136,7 +1840,11 @@ pub(super) fn reconcile_directory(directory: &Path, building: bool) -> std::io::
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(number) = numbered(&name, ".seg") {
+        if let Some(base) = name.strip_suffix(REPLACEMENT_SUFFIX) {
+            if let Some(number) = numbered(base, ".seg").or_else(|| numbered(base, ".idx")) {
+                replacements.insert(number);
+            }
+        } else if let Some(number) = numbered(&name, ".seg") {
             segs.push(number);
         } else if let Some(number) = numbered(&name, ".idx") {
             idxs.push(number);
@@ -1154,6 +1862,25 @@ pub(super) fn reconcile_directory(directory: &Path, building: bool) -> std::io::
             Err(error) => Err(error),
         }
     };
+    for number in replacements {
+        outcome.changed = true;
+        let next_idx = format!("{}{REPLACEMENT_SUFFIX}", index_name(number));
+        let next_seg = format!("{}{REPLACEMENT_SUFFIX}", segment_name(number));
+        if directory.join(&next_idx).exists() || !directory.join(&next_seg).exists() {
+            // The swap had not started: the old pair is intact.
+            remove(next_idx)?;
+            remove(next_seg)?;
+            continue;
+        }
+        // The new index is in place; its segment follows it.
+        std::fs::rename(
+            directory.join(&next_seg),
+            directory.join(segment_name(number)),
+        )?;
+        if !segs.contains(&number) {
+            segs.push(number);
+        }
+    }
     for number in &idxs {
         if !segs.contains(number) {
             remove(index_name(*number))?;
@@ -1221,6 +1948,7 @@ fn walk_frames(path: &Path) -> std::io::Result<Vec<FrameEntry>> {
         let u32_at = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().unwrap());
         let stream = header[4];
         let kid_len = u64::from(header[5]);
+        let flags = header[6];
         let first = u64::from_le_bytes(header[8..16].try_into().unwrap());
         let (count, raw, len, ordinal) = (u32_at(16), u32_at(20), u32_at(24), u32_at(28));
         let crc = u32_at(32);
@@ -1243,6 +1971,7 @@ fn walk_frames(path: &Path) -> std::io::Result<Vec<FrameEntry>> {
             len,
             raw,
             kid,
+            passthrough: flags & FLAG_PASSTHROUGH != 0,
             ordinal,
             crc,
         });
@@ -1257,13 +1986,15 @@ pub(super) struct SalvagedSegment {
     pub lost: u64,
 }
 
-/// Rebuild segment `number` from whatever of it still reads (§9 of the
-/// task, per-segment salvage): frames are located through the `.idx` when
-/// it is usable, else by walking frame headers. A record survives when its
-/// envelope and full content decode (the summary stream is regenerated);
-/// every other sequence of `first..=last` becomes a `journal.recordLost`
+/// Rebuild segment `number` from whatever of it still reads (per-segment
+/// salvage): frames are located through the `.idx` when it is usable, else
+/// by walking frame headers. A plaintext or passthrough record survives
+/// when its envelope and full content decode (the summary is regenerated);
+/// a sealed run survives as a whole — both frames copied as they are —
+/// when both pass their checksum and every envelope of the run decodes.
+/// Every other sequence of `first..=last` becomes a `journal.recordLost`
 /// placeholder naming `backup`. `last` defaults to the newest sequence any
-/// envelope frame still holds. Blocking.
+/// envelope frame still holds. Never encrypts anything. Blocking.
 pub(super) fn salvage_segment(
     directory: &Path,
     conversation_id: &str,
@@ -1271,7 +2002,6 @@ pub(super) fn salvage_segment(
     first: u64,
     last: Option<u64>,
     backup: &str,
-    codec: ContentCodec,
 ) -> Result<SalvagedSegment, SegmentError> {
     let seg_path = directory.join(segment_name(number));
     let frames = match load_index(directory, number) {
@@ -1280,12 +2010,23 @@ pub(super) fn salvage_segment(
     };
     let mut file = std::fs::File::open(&seg_path)?;
     let mut envelopes: HashMap<u64, Vec<u8>> = HashMap::new();
-    let mut contents: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut contents: HashMap<u64, (bool, Vec<u8>)> = HashMap::new();
+    // Intact sealed frames by (stream, first sequence).
+    let mut sealed: HashMap<(u8, u64), (FrameEntry, Vec<u8>)> = HashMap::new();
     let mut newest = 0u64;
     // Frames decode one at a time; only records of the segment's range are
     // kept, which bounds memory by the segment's raw size.
-    for frame in frames.iter().filter(|frame| frame.stream != STREAM_SUMMARY) {
-        let Ok(decoded) = load_frame(&mut file, frame, codec) else {
+    for frame in &frames {
+        if frame.kid.is_some() {
+            if let Ok(stored) = read_sealed(&mut file, frame) {
+                sealed.insert((frame.stream, frame.first), (frame.clone(), stored));
+            }
+            continue;
+        }
+        if frame.stream == STREAM_SUMMARY {
+            continue;
+        }
+        let Ok(decoded) = load_frame(&mut file, frame) else {
             continue;
         };
         for index in 0..frame.count as usize {
@@ -1297,7 +2038,7 @@ pub(super) fn salvage_segment(
                 newest = newest.max(sequence);
                 envelopes.insert(sequence, item.to_vec());
             } else {
-                contents.insert(sequence, item.to_vec());
+                contents.insert(sequence, (frame.passthrough, item.to_vec()));
             }
         }
     }
@@ -1305,36 +2046,98 @@ pub(super) fn salvage_segment(
     if last < first {
         return Err(invalid("nothing of the segment is readable"));
     }
-    let mut builder = SegmentBuilder::create(directory, number, codec)?;
+    // Sealed runs whose two frames and every envelope survived.
+    let mut runs: HashMap<u64, ((FrameEntry, Vec<u8>), (FrameEntry, Vec<u8>))> = HashMap::new();
+    let full_starts: Vec<u64> = sealed
+        .keys()
+        .filter(|(stream, _)| *stream == STREAM_FULL)
+        .map(|(_, start)| *start)
+        .collect();
+    for start in full_starts {
+        let Some(full) = sealed.remove(&(STREAM_FULL, start)) else {
+            continue;
+        };
+        let Some(summary) = sealed.remove(&(STREAM_SUMMARY, start)) else {
+            continue;
+        };
+        let end = start + u64::from(full.0.count);
+        let complete = summary.0.count == full.0.count
+            && summary.0.kid == full.0.kid
+            && start >= first
+            && end <= last + 1
+            && (start..end).all(|sequence| {
+                envelopes.get(&sequence).is_some_and(|line| {
+                    parse_record(line).is_ok_and(|record| record.sequence() == sequence)
+                })
+            });
+        if complete {
+            runs.insert(start, (summary, full));
+        }
+    }
+    let readable = |sequence: u64,
+                    envelopes: &HashMap<u64, Vec<u8>>,
+                    contents: &HashMap<u64, (bool, Vec<u8>)>,
+                    runs: &HashMap<u64, _>| {
+        runs.contains_key(&sequence)
+            || (envelopes.contains_key(&sequence) && contents.contains_key(&sequence))
+    };
+    let policy = SealPolicy::default();
+    let mut builder = SegmentBuilder::create(directory, conversation_id, number, &policy)?;
     let mut lost = 0u64;
     let mut previous: Option<(DateTime<Utc>, Option<ProviderKind>)> = None;
     let mut sequence = first;
     let result = (|| -> Result<(), SegmentError> {
         while sequence <= last {
+            if let Some((summary, full)) = runs.remove(&sequence) {
+                let end = full.0.first + u64::from(full.0.count);
+                builder.push_verbatim(summary, full)?;
+                while sequence < end {
+                    let line = envelopes.remove(&sequence).unwrap_or_default();
+                    let event = envelope_event(&line, conversation_id)?;
+                    previous = Some((event.time, event.provider));
+                    builder.observe(&event);
+                    builder.push(&event, Item::Verbatim)?;
+                    sequence += 1;
+                }
+                continue;
+            }
             let recovered = envelopes
                 .remove(&sequence)
                 .zip(contents.remove(&sequence))
-                .and_then(|(envelope, content)| {
-                    let payload: Value = serde_json::from_slice(&content).ok()?;
+                .and_then(|(envelope, (passthrough, content))| {
                     let record = parse_record(&envelope).ok()?;
-                    (record.sequence() == sequence)
-                        .then(|| record.into_event(conversation_id, Some(payload)).ok())
-                        .flatten()
+                    if record.sequence() != sequence {
+                        return None;
+                    }
+                    if passthrough {
+                        let encrypted: Map<String, Value> =
+                            serde_json::from_slice(&content).ok()?;
+                        let mut payload = record.envelope().clone();
+                        payload
+                            .insert(ENCRYPTED_FIELD.to_owned(), Value::Object(encrypted.clone()));
+                        let event = record
+                            .into_event(conversation_id, Some(Value::Object(payload)))
+                            .ok()?;
+                        Some((event, Item::Passthrough(encrypted)))
+                    } else {
+                        let payload: Value = serde_json::from_slice(&content).ok()?;
+                        let event = record
+                            .into_event(conversation_id, Some(payload.clone()))
+                            .ok()?;
+                        Some((event, Item::Plain(payload)))
+                    }
                 });
-            if let Some(event) = recovered {
+            if let Some((event, item)) = recovered {
                 previous = Some((event.time, event.provider));
                 builder.observe(&event);
-                builder.push(&event)?;
+                builder.push(&event, item)?;
                 sequence += 1;
                 continue;
             }
             // A run of unreadable sequences shares one notice.
             let run_start = sequence;
             let mut run_end = sequence;
-            while run_end < last
-                && !(envelopes.contains_key(&(run_end + 1))
-                    && contents.contains_key(&(run_end + 1)))
-            {
+            while run_end < last && !readable(run_end + 1, &envelopes, &contents, &runs) {
                 run_end += 1;
             }
             let run_length = run_end - run_start + 1;
@@ -1355,7 +2158,8 @@ pub(super) fn salvage_segment(
                     placeholder.provider = provider;
                 }
                 builder.observe(&placeholder);
-                builder.push(&placeholder)?;
+                let payload = placeholder.payload.clone();
+                builder.push(&placeholder, Item::Plain(payload))?;
             }
             lost += run_length;
             sequence = run_end + 1;
@@ -1518,7 +2322,7 @@ mod tests {
     fn write_plain(directory: &Path, name: &str, events: &[ConversationEvent]) {
         let mut bytes = Vec::new();
         for event in events {
-            bytes.extend(super::super::record::encode_record(event, ContentCodec::Plain).unwrap());
+            bytes.extend(super::super::record::encode_record(event).unwrap());
             bytes.push(b'\n');
         }
         std::fs::write(directory.join(name), bytes).unwrap();
@@ -1526,14 +2330,7 @@ mod tests {
 
     fn read_all(directory: &Path, segment: &SealedSegment) -> Vec<ConversationEvent> {
         let cache = FrameCache::new(4 * 1024 * 1024);
-        let mut reader = SegmentReader::open(
-            directory,
-            segment,
-            &cache,
-            ContentCodec::Plain,
-            CONVERSATION,
-        )
-        .unwrap();
+        let mut reader = SegmentReader::open(directory, segment, &cache, CONVERSATION).unwrap();
         (segment.first..=segment.last)
             .map(|sequence| reader.event(sequence).unwrap().0)
             .collect()
@@ -1566,7 +2363,7 @@ mod tests {
                 "events.000002.jsonl".to_owned(),
             ],
             1,
-            ContentCodec::Plain,
+            &SealPolicy::default(),
         )
         .unwrap();
         commit_prepared(&directory, &prepared, None).unwrap();
@@ -1594,7 +2391,7 @@ mod tests {
             1,
             &["events.000001.jsonl".to_owned()],
             1,
-            ContentCodec::Plain,
+            &SealPolicy::default(),
         )
         .unwrap();
         commit_prepared(&directory, &prepared, None).unwrap();
@@ -1613,14 +2410,8 @@ mod tests {
         bytes[(damaged.offset + u64::from(damaged.len) / 2) as usize] ^= 0xff;
         std::fs::write(&seg_path, &bytes).unwrap();
         let cache = FrameCache::new(1 << 20);
-        let mut reader = SegmentReader::open(
-            &directory,
-            &loaded.segment,
-            &cache,
-            ContentCodec::Plain,
-            CONVERSATION,
-        )
-        .unwrap();
+        let mut reader =
+            SegmentReader::open(&directory, &loaded.segment, &cache, CONVERSATION).unwrap();
         assert!(reader.event(damaged.first).is_err());
         // Losing the index too: salvage walks the frame headers.
         std::fs::remove_file(directory.join("events.000001.idx")).unwrap();
@@ -1631,7 +2422,6 @@ mod tests {
             1,
             Some(3_000),
             "events.corrupt.test.seg",
-            ContentCodec::Plain,
         )
         .unwrap();
         assert_eq!(salvaged.lost, u64::from(damaged.count));

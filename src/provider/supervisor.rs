@@ -18,11 +18,12 @@ use crate::agent_mcp::{AgentMcp, AgentMcpLaunch};
 use crate::catalog::CatalogService;
 use crate::config::Config;
 use crate::conversation::{
-    ControlOutcome, ConversationEventHub, ConversationManifest, ConversationReplay,
-    ConversationStatus, ConversationStore, ProviderKind, ProviderState,
-    CONVERSATION_TERMINAL_EVENTS, TURN_TERMINAL_EVENTS,
+    control_mac, encrypted_content, seal_request_snapshot, ControlOutcome, ConversationEventHub,
+    ConversationManifest, ConversationReplay, ConversationStatus, ConversationStore, ProviderKind,
+    ProviderState, ReplayDetail, CONVERSATION_TERMINAL_EVENTS, TURN_TERMINAL_EVENTS,
 };
 use crate::error::AppError;
+use crate::history_keys::FingerprintKey;
 use crate::mcp;
 use crate::workspace_paths::validate_workspace_directory_text;
 use crate::workspace_store::stable_workspace_id;
@@ -47,6 +48,33 @@ pub use follow_ups::FollowUpAddOutcome;
 
 fn prompt_fingerprint(prompt: &ConversationPrompt) -> Result<String, AppError> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(prompt)?)))
+}
+
+/// Whether a recorded `requestFingerprint` is `fingerprint`: the plain
+/// SHA-256 written while history encryption was off, or its MAC written
+/// while it was on (`docs/history-encryption.md` §5.2).
+fn fingerprint_matches(recorded: &str, fingerprint: &str, key: Option<&FingerprintKey>) -> bool {
+    recorded == fingerprint || key.is_some_and(|key| key.mac(fingerprint) == recorded)
+}
+
+/// The `request` of `last-request.json`: the prompt, sealed with
+/// [`seal_request_snapshot`] while history encryption is on (`key`) so the
+/// file holds no plaintext prompt (§7).
+fn saved_request(
+    prompt: &ConversationPrompt,
+    key: Option<&FingerprintKey>,
+) -> Result<Value, AppError> {
+    let mut snapshot = serde_json::to_value(prompt)?;
+    if let Some(key) = key {
+        seal_request_snapshot(&mut snapshot, key);
+    }
+    Ok(snapshot)
+}
+
+fn retry_prompt_required() -> AppError {
+    AppError::InvalidRequest(
+        "conversation.retry needs `prompt` (the decrypted text of the request) while history is end-to-end encrypted".to_owned(),
+    )
 }
 
 fn control_failure_event(error: &AppError) -> &'static str {
@@ -909,6 +937,12 @@ impl ConversationSupervisor {
         self.store.get(conversation_id).await
     }
 
+    /// History encryption was enabled: encrypt existing plaintext history
+    /// in the background now (§8).
+    pub fn request_history_migration(&self) {
+        self.store.request_history_migration();
+    }
+
     pub async fn get_owned(
         &self,
         owner_id: &str,
@@ -986,6 +1020,7 @@ impl ConversationSupervisor {
         Ok(removed)
     }
 
+    #[cfg(test)]
     pub async fn replay(
         &self,
         conversation_id: &str,
@@ -997,15 +1032,20 @@ impl ConversationSupervisor {
             .await
     }
 
+    /// Forward replay page; encrypted records carry the ciphertext of
+    /// `detail` (see [`ConversationStore::replay_detail`]).
     pub async fn replay_owned(
         &self,
         owner_id: &str,
         conversation_id: &str,
         after_sequence: u64,
         limit: usize,
+        detail: ReplayDetail,
     ) -> Result<ConversationReplay, AppError> {
         self.get_owned(owner_id, conversation_id).await?;
-        self.replay(conversation_id, after_sequence, limit).await
+        self.store
+            .replay_detail(conversation_id, after_sequence, limit, detail)
+            .await
     }
 
     pub async fn replay_before_owned(
@@ -1014,18 +1054,25 @@ impl ConversationSupervisor {
         conversation_id: &str,
         before_sequence: u64,
         limit: usize,
+        detail: ReplayDetail,
     ) -> Result<ConversationReplay, AppError> {
         self.get_owned(owner_id, conversation_id).await?;
         self.store
-            .replay_before(conversation_id, before_sequence, limit)
+            .replay_before_detail(conversation_id, before_sequence, limit, detail)
             .await
     }
 
+    /// Re-submit the latest prompt with its saved settings. With history
+    /// encryption on the saved request holds no prompt text, so the client
+    /// sends the decrypted original as `prompt`; it must match the MAC the
+    /// request recorded. While encryption is off and the saved request has
+    /// its text, `prompt` is ignored.
     pub async fn retry_owned(
         &self,
         owner_id: &str,
         conversation_id: &str,
         client_request_id: Option<String>,
+        prompt_text: Option<String>,
     ) -> Result<String, AppError> {
         self.get_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
@@ -1053,7 +1100,30 @@ impl ConversationSupervisor {
                 return Err(AppError::Conflict("An attached file or skill changed since this request. Submit a new request to use its current contents.".to_owned()));
             }
         }
-        let mut prompt: ConversationPrompt = serde_json::from_value(snapshot["request"].clone())?;
+        let saved = &snapshot["request"];
+        let mut prompt: ConversationPrompt = serde_json::from_value(saved.clone())?;
+        let encrypted = self.store.history_encrypted()?;
+        if let Some(text_mac) = saved.get("textMac").and_then(Value::as_str) {
+            let text = prompt_text.ok_or_else(retry_prompt_required)?;
+            let key = self.store.fingerprint_key()?.ok_or_else(|| {
+                AppError::Conflict(
+                    "The saved request is encrypted but no history key is available.".to_owned(),
+                )
+            })?;
+            if key.mac(&text) != text_mac {
+                return Err(AppError::Conflict(
+                    "prompt is not the text of the request being retried".to_owned(),
+                ));
+            }
+            prompt.text = text;
+        } else if encrypted {
+            let text = prompt_text.ok_or_else(retry_prompt_required)?;
+            if text != prompt.text {
+                return Err(AppError::Conflict(
+                    "prompt is not the text of the request being retried".to_owned(),
+                ));
+            }
+        }
         prompt.client_request_id =
             client_request_id.or_else(|| Some(format!("retry_{}", Uuid::new_v4().simple())));
         self.prompt_inner(owner_id, conversation_id, prompt).await
@@ -1353,7 +1423,21 @@ impl ConversationSupervisor {
             .unwrap_or_default();
         if let Some(prior) = recorded.requested {
             let prior = self.recorded_event(conversation_id, prior).await?;
-            if prior.payload.get("control") != Some(&serialized)
+            // An encrypted record keeps only the MAC of its control object.
+            let same_input = if encrypted_content(&prior.payload).is_some() {
+                let key = self.store.fingerprint_key()?;
+                prior
+                    .payload
+                    .get("requestFingerprint")
+                    .and_then(Value::as_str)
+                    .is_some_and(|recorded| {
+                        key.as_deref()
+                            .is_some_and(|key| control_mac(key, &serialized) == recorded)
+                    })
+            } else {
+                prior.payload.get("control") == Some(&serialized)
+            };
+            if !same_input
                 || prior.payload.get("turnId").and_then(Value::as_str) != Some(expected_turn_id)
             {
                 return Err(AppError::Conflict(
@@ -1362,19 +1446,27 @@ impl ConversationSupervisor {
             }
             if let Some((outcome, sequence)) = recorded.outcome {
                 let done = self.recorded_event(conversation_id, sequence).await?;
+                let encrypted = encrypted_content(&done.payload).is_some();
                 if outcome == ControlOutcome::Completed {
-                    return Ok(done.payload.get("result").cloned().unwrap_or(Value::Null));
+                    // Encrypted: the result is only in the (encrypted)
+                    // `control.completed` record the client can read.
+                    return Ok(if encrypted {
+                        Value::Null
+                    } else {
+                        done.payload.get("result").cloned().unwrap_or(Value::Null)
+                    });
                 }
                 if outcome == ControlOutcome::Unknown {
                     return Err(AppError::ProviderUnavailable("Control delivery outcome is unknown; it was not sent again. Inspect the effective state before issuing a new request.".to_owned()));
                 }
-                return Err(AppError::Conflict(
-                    done.payload
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Control was rejected.")
-                        .to_owned(),
-                ));
+                let message = match done.payload.get("message").and_then(Value::as_str) {
+                    Some(message) => message.to_owned(),
+                    None => match done.payload.get("code").and_then(Value::as_str) {
+                        Some(code) => format!("Control was rejected ({code})."),
+                        None => "Control was rejected.".to_owned(),
+                    },
+                };
+                return Err(AppError::Conflict(message));
             }
             return Err(AppError::ProviderUnavailable("Control was already submitted; its outcome is unknown. Inspect the conversation record before trying a new request.".to_owned()));
         }
@@ -1500,6 +1592,7 @@ impl ConversationSupervisor {
     ) -> Result<String, AppError> {
         let request_fingerprint = prompt_fingerprint(&prompt)?;
         let request_snapshot = prompt.clone();
+        let fingerprint_key = self.store.fingerprint_key()?;
         let ConversationPrompt {
             client_request_id,
             text,
@@ -1557,20 +1650,30 @@ impl ConversationSupervisor {
                     .get("requestFingerprint")
                     .and_then(Value::as_str)
                 {
-                    recorded == request_fingerprint
+                    fingerprint_matches(recorded, &request_fingerprint, fingerprint_key.as_deref())
                 } else {
                     // Native queue/steering deliveries have an original durable control,
                     // rather than a prompt snapshot. Recognize exactly that text-only
                     // submission so reconnect cannot execute its tools a second time.
+                    // An encrypted control keeps only the MAC of its text.
                     let control_text = match control {
                         Some(sequence) => {
                             let event = self.recorded_event(conversation_id, sequence).await?;
-                            event.payload["control"]["text"].as_str().map(str::to_owned)
+                            let control = &event.payload["control"];
+                            match (control["text"].as_str(), control["textMac"].as_str()) {
+                                (Some(text), _) => Some(request_snapshot.text == text),
+                                (None, Some(mac)) => Some(
+                                    fingerprint_key
+                                        .as_deref()
+                                        .is_some_and(|key| key.mac(&request_snapshot.text) == mac),
+                                ),
+                                (None, None) => None,
+                            }
                         }
                         None => None,
                     };
-                    if let Some(control_text) = control_text {
-                        request_snapshot.text == control_text
+                    if let Some(text_matches) = control_text {
+                        text_matches
                             && request_snapshot.content.is_empty()
                             && request_snapshot.skills.is_empty()
                             && request_snapshot.model.is_none()
@@ -1581,12 +1684,12 @@ impl ConversationSupervisor {
                             && request_snapshot.sandbox_mode.is_none()
                             && request_snapshot.approval_policy.is_none()
                     } else if let Some(saved) = self.store.last_request(conversation_id).await? {
+                        let plain = saved_request(&request_snapshot, None)?;
+                        let sealed = saved_request(&request_snapshot, fingerprint_key.as_deref())?;
                         saved.get("turnId") == previous.payload.get("turnId")
-                            && saved.get("request").is_some_and(|request| {
-                                request
-                                    == &serde_json::to_value(&request_snapshot)
-                                        .unwrap_or(Value::Null)
-                            })
+                            && saved
+                                .get("request")
+                                .is_some_and(|request| *request == plain || *request == sealed)
                     } else {
                         false
                     }
@@ -1705,8 +1808,21 @@ impl ConversationSupervisor {
             }
         };
 
+        let saved_request = self.store.history_encrypted().and_then(|encrypted| {
+            saved_request(
+                &request_snapshot,
+                fingerprint_key.as_deref().filter(|_| encrypted),
+            )
+        });
+        let saved_request = match saved_request {
+            Ok(saved_request) => saved_request,
+            Err(error) => {
+                self.active.remove(conversation_id);
+                return Err(error);
+            }
+        };
         if let Err(error) = self.store.save_request(conversation_id, &json!({
-            "schemaVersion": 1, "turnId": turn_id, "request": request_snapshot, "files": snapshot_files,
+            "schemaVersion": 1, "turnId": turn_id, "request": saved_request, "files": snapshot_files,
         })).await {
             self.active.remove(conversation_id);
             return Err(error);
@@ -2881,7 +2997,9 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            supervisor.retry_owned("local", &manifest.id, None).await,
+            supervisor
+                .retry_owned("local", &manifest.id, None, None)
+                .await,
             Err(AppError::Unsupported(_))
         ));
         let file = workspace.join("attachment.txt");
@@ -2919,7 +3037,7 @@ mod tests {
             serde_json::to_value(&request).unwrap()
         );
         supervisor
-            .retry_owned("local", &manifest.id, Some("retry-2".to_owned()))
+            .retry_owned("local", &manifest.id, Some("retry-2".to_owned()), None)
             .await
             .unwrap();
         wait_until_idle(&supervisor).await;
@@ -2941,7 +3059,9 @@ mod tests {
         let before = store.get(&manifest.id).await.unwrap().last_sequence;
         fs::write(file, "changed attachment").unwrap();
         assert!(matches!(
-            supervisor.retry_owned("local", &manifest.id, None).await,
+            supervisor
+                .retry_owned("local", &manifest.id, None, None)
+                .await,
             Err(AppError::Conflict(_))
         ));
         assert_eq!(store.get(&manifest.id).await.unwrap().last_sequence, before);

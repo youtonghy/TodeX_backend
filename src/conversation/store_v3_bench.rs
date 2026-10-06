@@ -148,7 +148,7 @@ async fn measure_v3_build_synthetic() {
             written = 0;
         }
         let event = synthetic_event(SYNTHETIC_ID, index, &mut text);
-        let mut line = encode_record(&event, ContentCodec::Plain).unwrap();
+        let mut line = encode_record(&event).unwrap();
         line.push(b'\n');
         writer.as_mut().unwrap().write_all(&line).unwrap();
         written += line.len() as u64;

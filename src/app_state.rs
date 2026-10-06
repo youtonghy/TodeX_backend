@@ -125,7 +125,15 @@ impl AppState {
         let ssh = SshService::new(&config.data_dir, config.agent.ssh_bin.clone()).await?;
         let agent_desktop = AgentDesktop::load(&config.data_dir).await?;
         let agent_mcp = AgentMcp::new(&config.data_dir, ssh.clone(), agent_desktop.clone()).await?;
-        let conversation_store = ConversationStore::new(config.data_dir.clone()).await?;
+        let devices = DeviceRegistry::load(&config.data_dir)?;
+        let history_keys = HistoryKeys::load(
+            &config.data_dir,
+            crate::config::load_history_encryption(&config.data_dir)?,
+            config.security.enable_auth.then(|| devices.clone()),
+        )?;
+        let conversation_store = ConversationStore::new(config.data_dir.clone())
+            .await?
+            .with_history_keys(history_keys.clone());
         let conversation_hub = ConversationEventHub::default();
         let quota = QuotaStore::default();
         let conversations = ConversationSupervisor::new_with_execution_gate(
@@ -141,13 +149,7 @@ impl AppState {
         let local_terminals = LocalTerminalManager::new(events.clone());
         let cli_manager = CliManager::default();
         let pairing_keys = PairingKeys::load_or_generate(&config.data_dir).await?;
-        let devices = DeviceRegistry::load(&config.data_dir)?;
         let device_auth = DeviceAuthenticator::new(devices.clone());
-        let history_keys = HistoryKeys::load(
-            &config.data_dir,
-            crate::config::load_history_encryption(&config.data_dir)?,
-            config.security.enable_auth.then(|| devices.clone()),
-        )?;
         let device_pairing =
             DevicePairingRegistry::new(&config.data_dir, config.security.enable_auth, devices)?;
         let websocket_connections = Arc::new(AtomicUsize::new(0));

@@ -123,6 +123,9 @@ pub(super) async fn dispatch(
                 HistoryEncryption::Off
             };
             registry.set_mode(mode)?;
+            if mode == HistoryEncryption::E2e {
+                state.conversations.request_history_migration();
+            }
             encryption_state(state, device_id)
         }
         "history.recipient.register" => {

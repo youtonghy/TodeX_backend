@@ -486,3 +486,42 @@ mod tests {
         assert_eq!(untouched("message.created", user.clone()), user);
     }
 }
+
+/// Shapes a replayed or live event for the wire in `detail`
+/// (`docs/history-encryption.md` §5.3). An encrypted payload is never
+/// summarized here — the writer already sealed its summary — it only drops
+/// the ciphertext the detail does not use: `summary` keeps `s` when there
+/// is one (else `f`), `full` keeps `f`. A plaintext payload is summarized
+/// for `summary`.
+pub fn present_event(event: &mut ConversationEvent, summary: bool) {
+    if let Some(Value::Object(encrypted)) = event.payload.get_mut(super::record::ENCRYPTED_FIELD) {
+        if summary {
+            if encrypted.contains_key("s") {
+                encrypted.remove("f");
+            }
+        } else if encrypted.contains_key("f") {
+            encrypted.remove("s");
+        }
+        return;
+    }
+    if summary {
+        summarize_event(event);
+    }
+}
+
+/// The entries of a page's `frames` that `event` refers to (`$enc.fr`),
+/// for a message carrying that one event.
+pub fn event_frames(event: &ConversationEvent, frames: &Map<String, Value>) -> Map<String, Value> {
+    let Some(reference) = event
+        .payload
+        .get(super::record::ENCRYPTED_FIELD)
+        .and_then(|encrypted| encrypted.get("fr"))
+    else {
+        return Map::new();
+    };
+    ["s", "f"]
+        .into_iter()
+        .filter_map(|key| reference.get(key)?.as_str())
+        .filter_map(|id| Some((id.to_owned(), frames.get(id)?.clone())))
+        .collect()
+}

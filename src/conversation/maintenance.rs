@@ -1,11 +1,13 @@
 //! Background journal maintenance: converting sealed plaintext files into
-//! compressed segments, lazily migrating v2 journals to history v3
+//! compressed segments, lazily migrating v2 journals to history v3 and,
+//! with history encryption on, re-encrypting plaintext history
 //! (`docs/history-encryption.md` §8), and deleting migration backups after
 //! a week. One task does all of it, one conversation and one segment at a
 //! time, so it never competes with turns for more than a core.
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -15,6 +17,8 @@ use tokio::task::JoinHandle;
 
 use crate::error::AppError;
 
+use super::record::{decode_journal_record, encrypted_content};
+use super::segment;
 use super::store::{journal_files, ConversationStore, JournalFile};
 use super::ConversationStatus;
 
@@ -39,6 +43,8 @@ const IDLE_TICK: Duration = Duration::from_secs(60);
 pub(crate) struct MaintenanceQueue {
     pending: std::sync::Mutex<BTreeSet<String>>,
     notify: Notify,
+    /// History encryption was just enabled: run a migration pass now.
+    migrate_soon: AtomicBool,
 }
 
 impl MaintenanceQueue {
@@ -47,6 +53,12 @@ impl MaintenanceQueue {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(conversation_id.to_owned());
+        self.notify.notify_one();
+    }
+
+    /// Run the next migration pass without waiting for its interval.
+    pub fn request_migration(&self) {
+        self.migrate_soon.store(true, Ordering::Release);
         self.notify.notify_one();
     }
 
@@ -122,6 +134,9 @@ impl ConversationStore {
                     store.seal_all_logged(&conversation_id).await;
                 }
                 let now = tokio::time::Instant::now();
+                if store.maintenance.migrate_soon.swap(false, Ordering::AcqRel) {
+                    next_migration = next_migration.min(now);
+                }
                 if now >= next_cleanup {
                     if let Err(error) = store.remove_expired_backups().await {
                         tracing::warn!(error = %error, "failed to clean up journal migration backups");
@@ -179,6 +194,7 @@ impl ConversationStore {
     /// One migration pass: every conversation with v2 data or sealed
     /// plaintext files, largest first, as long as each stays idle.
     pub(super) async fn migrate_idle(&self) -> Result<(), AppError> {
+        let encrypting = self.history_encrypted()?;
         let mut candidates = Vec::new();
         for manifest in self.list().await? {
             let directory = self.directory(&manifest.id)?;
@@ -195,20 +211,276 @@ impl ConversationStore {
             let pending = files
                 .iter()
                 .any(|file| !file.is_sealed_segment() && file.number().is_some());
-            if pending || manifest.storage_version != Some(super::model::STORAGE_VERSION) {
+            let unencrypted = encrypting && manifest.history_encrypted_at.is_none();
+            if pending
+                || unencrypted
+                || manifest.storage_version != Some(super::model::STORAGE_VERSION)
+            {
                 candidates.push((waiting, manifest.id));
             }
         }
         candidates.sort_by(|left, right| right.cmp(left));
         for (_, conversation_id) in candidates {
-            match self.migrate_conversation(&conversation_id).await {
-                Ok(_) | Err(AppError::NotFound(_)) => {}
+            let migrated = match self.migrate_conversation(&conversation_id).await {
+                Ok(migrated) => migrated,
+                Err(AppError::NotFound(_)) => false,
                 Err(error) => {
                     tracing::warn!(conversation_id, error = %error, "journal migration failed; will retry");
+                    false
+                }
+            };
+            if !migrated || !encrypting {
+                continue;
+            }
+            match self.encrypt_conversation(&conversation_id).await {
+                Ok(_) | Err(AppError::NotFound(_)) => {}
+                Err(error) => {
+                    tracing::warn!(conversation_id, error = %error, "history encryption migration failed; will retry");
                 }
             }
         }
         Ok(())
+    }
+
+    /// End-to-end migration of one idle conversation (§8): plaintext
+    /// records are sealed into encrypted segments under fresh DEKs, the
+    /// title becomes `titleEnc` and `last-request.json` loses its prompt
+    /// text. The active file is sealed first so its plaintext goes through
+    /// the same conversion; every segment is committed on its own (as
+    /// crash-safe as sealing), so a kill resumes where it stopped. The
+    /// manifest's `historyEncryptedAt` marks the end. Returns whether the
+    /// conversation is fully encrypted. The daemon sees this plaintext once
+    /// more while re-encrypting it.
+    pub(super) async fn encrypt_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<bool, AppError> {
+        if !self.history_encrypted()? {
+            return Ok(false);
+        }
+        if !self.migration_idle(conversation_id).await {
+            return Ok(false);
+        }
+        {
+            let _guard = self.lock(conversation_id).await;
+            if self
+                .get_unlocked(conversation_id)
+                .await?
+                .history_encrypted_at
+                .is_some()
+            {
+                return Ok(true);
+            }
+            if self.active_has_plaintext_locked(conversation_id).await? {
+                self.seal_active_locked(conversation_id).await?;
+            }
+        }
+        loop {
+            if !self.migration_idle(conversation_id).await {
+                return Ok(false);
+            }
+            if !self.seal_next(conversation_id).await? {
+                break;
+            }
+            tokio::time::sleep(MIGRATION_PAUSE).await;
+        }
+        loop {
+            if !self.migration_idle(conversation_id).await {
+                return Ok(false);
+            }
+            let Some(number) = self.next_plain_segment(conversation_id).await? else {
+                break;
+            };
+            if !self.reencrypt_segment(conversation_id, number).await? {
+                return Ok(false);
+            }
+            tokio::time::sleep(MIGRATION_PAUSE).await;
+        }
+        let _guard = self.lock(conversation_id).await;
+        if !self.history_encrypted()?
+            || self
+                .next_plain_segment_locked(conversation_id)
+                .await?
+                .is_some()
+            || self.active_has_plaintext_locked(conversation_id).await?
+        {
+            // Encryption was switched off or plaintext arrived meanwhile.
+            return Ok(false);
+        }
+        let mut manifest = self.get_unlocked(conversation_id).await?;
+        if let Some(title) = manifest.title.clone() {
+            self.apply_title(&mut manifest, Some(title)).await?;
+        }
+        self.seal_last_request_locked(conversation_id).await?;
+        manifest.history_encrypted_at = Some(Utc::now());
+        self.persist_manifest_locked(&manifest).await?;
+        tracing::info!(conversation_id, "encrypted conversation history");
+        Ok(true)
+    }
+
+    /// Whether the active file holds a plaintext record. Callers hold the
+    /// conversation lock.
+    async fn active_has_plaintext_locked(&self, conversation_id: &str) -> Result<bool, AppError> {
+        let path = self
+            .directory(conversation_id)?
+            .join(super::store::EVENTS_FILE);
+        let raw = match tokio::fs::read(&path).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        for line in raw.split(|byte| *byte == b'\n') {
+            let line = line.trim_ascii();
+            if line.is_empty() {
+                continue;
+            }
+            match decode_journal_record(line, conversation_id) {
+                Ok(event) if encrypted_content(&event.payload).is_some() => {}
+                // Unreadable lines are left to journal validation; sealing
+                // the file routes them through it.
+                _ => return Ok(true),
+            }
+        }
+        Ok(false)
+    }
+
+    /// The oldest sealed segment still holding plaintext content.
+    async fn next_plain_segment(&self, conversation_id: &str) -> Result<Option<u64>, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        self.next_plain_segment_locked(conversation_id).await
+    }
+
+    async fn next_plain_segment_locked(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<u64>, AppError> {
+        let directory = self.directory(conversation_id)?;
+        let files = self.files_locked(conversation_id, &directory).await?;
+        let numbers: Vec<u64> = files
+            .iter()
+            .filter(|file| file.is_sealed_segment())
+            .filter_map(JournalFile::number)
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            for number in numbers {
+                match segment::load_index(&directory, number) {
+                    Ok(loaded) if loaded.body.has_plain_content() => return Ok(Some(number)),
+                    Ok(_) => {}
+                    // Damage is repaired by the read path (segment salvage).
+                    Err(error) => {
+                        return Err(AppError::InvalidRequest(format!(
+                            "journal segment {number} is unreadable: {error}"
+                        )))
+                    }
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))?
+    }
+
+    /// Rewrite sealed segment `number` with its plaintext encrypted under a
+    /// fresh DEK and swap it in (see [`segment::commit_replacement`]).
+    /// Returns whether it was committed.
+    pub(super) async fn reencrypt_segment(
+        &self,
+        conversation_id: &str,
+        number: u64,
+    ) -> Result<bool, AppError> {
+        let policy = self.seal_policy(conversation_id).await;
+        if policy.migrate.is_none() {
+            return Err(AppError::Conflict(
+                "no history key to encrypt the conversation with".to_owned(),
+            ));
+        }
+        let directory = self.directory(conversation_id)?;
+        let before = {
+            let _guard = self.lock(conversation_id).await;
+            self.files_locked(conversation_id, &directory).await?
+        };
+        self.sealing.insert(conversation_id.to_owned(), ());
+        let path = directory.clone();
+        let id = conversation_id.to_owned();
+        let built = tokio::task::spawn_blocking(move || {
+            segment::rebuild_segment(&path, &id, number, &policy)
+        })
+        .await;
+        let prepared = match built {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
+                self.sealing.remove(conversation_id);
+                return Err(AppError::InvalidRequest(format!(
+                    "conversation {conversation_id} journal segment {number} could not be re-encrypted: {error}"
+                )));
+            }
+            Err(error) => {
+                self.sealing.remove(conversation_id);
+                return Err(AppError::Anyhow(error.into()));
+            }
+        };
+        let committed = async {
+            let _guard = self.lock(conversation_id).await;
+            if self.files_locked(conversation_id, &directory).await? != before {
+                return Ok(false);
+            }
+            let stop = self.commit_stop();
+            let path = directory.clone();
+            let temp_seg = prepared.temp_seg.clone();
+            let temp_idx = prepared.temp_idx.clone();
+            let body = prepared.body.clone();
+            tokio::task::spawn_blocking(move || {
+                let prepared = segment::PreparedSegment {
+                    number,
+                    temp_seg,
+                    temp_idx,
+                    body,
+                    repacked: Vec::new(),
+                };
+                segment::commit_replacement(&path, &prepared, stop)
+            })
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))?
+            .map_err(|error| {
+                AppError::InvalidRequest(format!(
+                    "conversation {conversation_id} journal segment {number} swap failed: {error}"
+                ))
+            })?;
+            // The replay index, digest and tail are rebuildable caches.
+            self.forget_journal_caches_locked(conversation_id);
+            Ok::<_, AppError>(stop.is_none())
+        }
+        .await;
+        self.sealing.remove(conversation_id);
+        match committed {
+            Ok(true) => {
+                if let Some(keys) = &self.history {
+                    keys.deks()
+                        .release_sealed(conversation_id, &prepared.repacked)
+                        .await;
+                }
+                tracing::info!(
+                    conversation_id,
+                    segment = number,
+                    "re-encrypted journal segment"
+                );
+                Ok(true)
+            }
+            Ok(false) => {
+                prepared.discard();
+                if self.commit_stop().is_some() {
+                    // A simulated crash ends the caller like a killed process.
+                    return Err(AppError::Conflict(
+                        "simulated crash during segment replacement".to_owned(),
+                    ));
+                }
+                Ok(false)
+            }
+            Err(error) => {
+                prepared.discard();
+                Err(error)
+            }
+        }
     }
 
     /// Migrate one conversation as far as it stays idle. Before the first

@@ -18,5 +18,6 @@ pub use model::{
     ConversationReplay, ConversationSnapshot, ConversationStatus, ProviderKind, ProviderState,
     CONVERSATION_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES,
 };
-pub use store::ConversationStore;
-pub use summary::summarize_event;
+pub(crate) use record::{control_mac, encrypted_content};
+pub use store::{seal_request_snapshot, ConversationStore, ReplayDetail};
+pub use summary::{event_frames, present_event, summarize_event};

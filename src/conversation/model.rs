@@ -99,8 +99,13 @@ pub struct ConversationManifest {
     pub workspace: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// Plaintext title. Absent while the title is encrypted (`titleEnc`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The title sealed for the history recipients
+    /// (`docs/history-encryption.md` §3.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_enc: Option<TitleEnc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_profile: Option<String>,
     pub status: ConversationStatus,
@@ -111,6 +116,20 @@ pub struct ConversationManifest {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_version: Option<u32>,
+    /// Set once every record, the title and the request snapshot are
+    /// stored encrypted (new conversations under history encryption, or the
+    /// end of the background migration, §8); cleared by a plaintext append.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_encrypted_at: Option<DateTime<Utc>>,
+}
+
+/// `manifest.titleEnc`: the UTF-8 title sealed under `kid` with history
+/// crypto stream 2, counter 0.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TitleEnc {
+    pub kid: String,
+    pub ct: String,
 }
 
 impl ConversationManifest {
@@ -129,6 +148,7 @@ impl ConversationManifest {
             workspace,
             workspace_id: None,
             title,
+            title_enc: None,
             provider_profile,
             status: ConversationStatus::Idle,
             archived_at: None,
@@ -136,6 +156,7 @@ impl ConversationManifest {
             created_at: now,
             updated_at: now,
             storage_version: None,
+            history_encrypted_at: None,
         }
     }
 }
@@ -280,6 +301,10 @@ pub struct ConversationReplay {
     pub next_sequence: u64,
     pub has_more: bool,
     pub events: Vec<ConversationEvent>,
+    /// Sealed-segment ciphertext frames the events' `$enc.fr` refer to
+    /// (`docs/history-encryption.md` §5.3), by frame id.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub frames: serde_json::Map<String, Value>,
 }
 
 pub fn status_after_event(current: ConversationStatus, event_type: &str) -> ConversationStatus {

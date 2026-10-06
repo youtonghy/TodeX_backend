@@ -16,24 +16,34 @@
 //! Reads accept v2 full-event lines, [`CompactedRecord`] markers and v3
 //! records alike, and always return the same [`ConversationEvent`].
 //!
-//! # Encryption seam
+//! # End-to-end encrypted records
 //!
-//! The content of a record goes through [`ContentCodec`]. Today the only
-//! codec is `Plain`, which writes the payload as `c`. The e2e track adds a
-//! variant that writes `x` (ciphertext under a per-shard `kid`, §5.3)
-//! instead, keeps the [`envelope_fields`] in `e` as the only plaintext, and
-//! seals sealed-segment frames after compression (stream 3/4, counter = the
-//! frame ordinal under that `kid`). Frame building in
-//! [`super::segment`] already groups records by an optional `kid` so no
-//! frame ever spans two keys; the codec only has to supply the key id and
-//! the frame transform.
+//! With history encryption on, [`seal_event`] turns an event into its
+//! *stored form*: the [`envelope_fields`] plus `"$enc": {v, kid, c, n, s?,
+//! f}` (§5.3), the content sealed under the conversation's current DEK.
+//! [`encode_record`] writes such a payload as `e` + `x` (`x` is exactly the
+//! `$enc` object) and decoding returns the same stored form, so the record
+//! on disk, the event the hub publishes and every replay carry identical
+//! ciphertext. The daemon never decrypts a record it serves; only sealing
+//! a segment (`super::segment`) opens the ciphertext of keys still in
+//! memory, to repack it into frames.
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::model::normalized_event_type;
-use super::{ConversationEvent, ProviderKind, CONVERSATION_SCHEMA_VERSION};
+use super::{summarize_event, ConversationEvent, ProviderKind, CONVERSATION_SCHEMA_VERSION};
+use crate::error::AppError;
+use crate::history_crypto::{self, ContentStream, SegmentKey};
+use crate::history_keys::FingerprintKey;
+
+/// Payload key of encrypted content on the wire (§5.3). A record stores the
+/// same object as `x`.
+pub(crate) const ENCRYPTED_FIELD: &str = "$enc";
+/// `$enc.v`: history crypto v1.
+const ENCRYPTED_VERSION: u64 = 1;
 
 /// Every v3 record line starts with this; v2 full events start with
 /// `{"schemaVersion"` and [`CompactedRecord`] lines with `{"sequence"`.
@@ -50,50 +60,6 @@ const COMPACTED_RECORD_PREFIX: &[u8] = b"{\"sequence\":";
 /// forge it: the store rejects the `journal.` prefix, and clients classify
 /// the type as unknown so the markers render nothing.
 pub(super) const JOURNAL_COMPACTED_EVENT: &str = "journal.compacted";
-
-/// How record content is stored. See the module docs for the e2e seam.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) enum ContentCodec {
-    /// `history_encryption = "off"`: content is the plaintext payload `c`
-    /// and sealed frames are plain raw DEFLATE.
-    #[default]
-    Plain,
-}
-
-impl ContentCodec {
-    /// The key id content is encrypted under; frames never mix two ids.
-    /// `None` for plaintext.
-    pub(super) fn kid(&self) -> Option<&str> {
-        match self {
-            Self::Plain => None,
-        }
-    }
-
-    /// Transform a compressed frame before it is written (e2e: AEAD with
-    /// the `kid`'s DEK, stream 3/4, counter = `ordinal`).
-    pub(super) fn seal_frame(&self, _stream: u8, _ordinal: u32, compressed: Vec<u8>) -> Vec<u8> {
-        match self {
-            Self::Plain => compressed,
-        }
-    }
-
-    /// Inverse of [`Self::seal_frame`] for a frame read back from disk.
-    pub(super) fn open_frame(
-        &self,
-        _stream: u8,
-        kid: Option<&str>,
-        _ordinal: u32,
-        stored: Vec<u8>,
-    ) -> std::io::Result<Vec<u8>> {
-        match (self, kid) {
-            (Self::Plain, None) => Ok(stored),
-            (Self::Plain, Some(_)) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "encrypted journal frame needs a history key",
-            )),
-        }
-    }
-}
 
 /// Identity fields the e2e envelope keeps in plaintext (§5.2).
 const ENVELOPE_ID_KEYS: [&str; 10] = [
@@ -116,10 +82,9 @@ const ENVELOPE_ID_KEYS: [&str; 10] = [
 /// Off mode writes the envelope too, so digests, deduplication and the
 /// future e2e codec can rely on it being there.
 ///
-/// TODO(history-keys): `requestFingerprint` and the `textMac` of text
-/// controls must become `HMAC-SHA256(fingerprintKey, …)` once the keys
-/// track provides `history/fingerprint.key`; until then an existing
-/// `requestFingerprint` is copied unchanged and no `textMac` is derived.
+/// `requestFingerprint` and `textMac` are copied as they are; with history
+/// encryption on, [`add_history_macs`] has already turned them into
+/// `HMAC-SHA256(fingerprintKey, …)` values.
 pub(super) fn envelope_fields(event_type: &str, payload: &Value) -> Map<String, Value> {
     let mut envelope = Map::new();
     let Some(payload) = payload.as_object() else {
@@ -143,8 +108,15 @@ pub(super) fn envelope_fields(event_type: &str, payload: &Value) -> Map<String, 
     if event_type == "provider.runtime" || keyed("turn.") || keyed("subagent.") {
         copy("status", &mut envelope);
     }
-    if keyed("permission.") {
+    // `tool.awaitingApproval` opens the same dialogs as `permission.*`; its
+    // `scope` decides whether the conversation status changes.
+    if keyed("permission.") || event_type == "tool.awaitingApproval" {
         copy("scope", &mut envelope);
+    }
+    // A control's outcome code (never its message or result) lets a
+    // retried control report how the first attempt ended.
+    if keyed("control.") {
+        copy("code", &mut envelope);
     }
     copy("stopReason", &mut envelope);
     copy("requestFingerprint", &mut envelope);
@@ -177,6 +149,136 @@ pub(super) fn envelope_fields(event_type: &str, payload: &Value) -> Map<String, 
         envelope.insert("usage".to_owned(), usage);
     }
     envelope
+}
+
+/// The `$enc` object of a stored-form payload, if it is encrypted.
+pub(crate) fn encrypted_content(payload: &Value) -> Option<&Map<String, Value>> {
+    payload.get(ENCRYPTED_FIELD)?.as_object()
+}
+
+/// e2e (§5.2): replace what deduplication compares with MACs under the
+/// fingerprint key, so it keeps working without plaintext. Applied exactly
+/// once to a plaintext payload, right before it is encrypted (an append, or
+/// migrating an old plaintext record):
+///
+/// - `requestFingerprint` (the SHA-256 of a prompt request) becomes its MAC;
+/// - a `control.requested` gets `requestFingerprint` = MAC of its `control`
+///   object's JSON, so a retried control is matched without its arguments;
+/// - a control's `text` gets `control.textMac`.
+pub(crate) fn add_history_macs(event_type: &str, payload: &mut Value, key: &FingerprintKey) {
+    let Some(map) = payload.as_object_mut() else {
+        return;
+    };
+    if let Some(Value::String(fingerprint)) = map.get("requestFingerprint") {
+        let mac = key.mac(fingerprint);
+        map.insert("requestFingerprint".to_owned(), Value::String(mac));
+    } else if event_type == "control.requested" {
+        if let Some(control) = map.get("control").filter(|control| control.is_object()) {
+            let mac = control_mac(key, control);
+            map.insert("requestFingerprint".to_owned(), Value::String(mac));
+        }
+    }
+    if let Some(Value::Object(control)) = map.get_mut("control") {
+        if let Some(Value::String(text)) = control.get("text") {
+            let mac = key.mac(text);
+            control.insert("textMac".to_owned(), Value::String(mac));
+        }
+    }
+}
+
+/// The e2e `requestFingerprint` of a control request: the MAC of its JSON
+/// (object keys sorted, as `serde_json` serializes a `Value`).
+pub(crate) fn control_mac(key: &FingerprintKey, control: &Value) -> String {
+    key.mac(&control.to_string())
+}
+
+/// The stored form of `event` sealed under `key` (§5.3): envelope fields
+/// plus `$enc {v, kid, c, n, s?, f}`, stream 2 (full) and stream 1
+/// (summary, only when [`summarize_event`] changes the payload), counter =
+/// the event's sequence. The summary is computed here because only the
+/// writer sees the plaintext.
+pub(crate) fn seal_event(
+    event: &ConversationEvent,
+    kid: &str,
+    key: &SegmentKey,
+) -> Result<ConversationEvent, AppError> {
+    let conversation_id = event.conversation_id.as_str();
+    let sequence = event.sequence;
+    let full = serde_json::to_vec(&event.payload)?;
+    let mut summarized = event.clone();
+    let summary = if summarize_event(&mut summarized) {
+        Some(serde_json::to_vec(&summarized.payload)?)
+    } else {
+        None
+    };
+    let mut encrypted = Map::new();
+    encrypted.insert("v".to_owned(), Value::from(ENCRYPTED_VERSION));
+    encrypted.insert("kid".to_owned(), Value::String(kid.to_owned()));
+    encrypted.insert("c".to_owned(), Value::String(conversation_id.to_owned()));
+    encrypted.insert("n".to_owned(), Value::from(sequence));
+    if let Some(summary) = summary {
+        let sealed = history_crypto::seal(
+            key,
+            conversation_id,
+            ContentStream::EventSummary,
+            sequence,
+            &summary,
+        )?;
+        encrypted.insert(
+            "s".to_owned(),
+            Value::String(URL_SAFE_NO_PAD.encode(sealed)),
+        );
+    }
+    let sealed = history_crypto::seal(
+        key,
+        conversation_id,
+        ContentStream::EventFull,
+        sequence,
+        &full,
+    )?;
+    encrypted.insert(
+        "f".to_owned(),
+        Value::String(URL_SAFE_NO_PAD.encode(sealed)),
+    );
+    let mut payload = envelope_fields(&event.event_type, &event.payload);
+    payload.insert(ENCRYPTED_FIELD.to_owned(), Value::Object(encrypted));
+    let mut stored = event.clone();
+    stored.payload = Value::Object(payload);
+    Ok(stored)
+}
+
+/// Opens an event-level `$enc` this conversation sealed under `key`:
+/// `(full, summary)` payloads, the summary equal to the full payload when
+/// `s` is absent. `None` when the object is not one [`seal_event`] wrote for
+/// `(conversation_id, sequence)` — a fork's copy, a frame reference — or
+/// does not authenticate; such content is kept as ciphertext.
+pub(crate) fn open_event(
+    encrypted: &Map<String, Value>,
+    conversation_id: &str,
+    sequence: u64,
+    key: &SegmentKey,
+) -> Option<(Value, Value)> {
+    if encrypted.get("v").and_then(Value::as_u64) != Some(ENCRYPTED_VERSION)
+        || encrypted.get("c").and_then(Value::as_str) != Some(conversation_id)
+        || encrypted.get("n").and_then(Value::as_u64) != Some(sequence)
+        || encrypted.contains_key("fr")
+    {
+        return None;
+    }
+    let open = |field: &str, stream: ContentStream| -> Option<Value> {
+        let sealed = URL_SAFE_NO_PAD
+            .decode(encrypted.get(field)?.as_str()?)
+            .ok()?;
+        let plaintext =
+            history_crypto::open(key, conversation_id, stream, sequence, &sealed).ok()?;
+        serde_json::from_slice(&plaintext).ok()
+    };
+    let full = open("f", ContentStream::EventFull)?;
+    let summary = match encrypted.get("s") {
+        Some(_) => open("s", ContentStream::EventSummary)?,
+        None => full.clone(),
+    };
+    Some((full, summary))
 }
 
 /// The numeric skeleton of a usage object: numbers, and objects holding
@@ -221,6 +323,8 @@ struct RecordOut<'a> {
     e: &'a Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     c: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x: Option<&'a Value>,
 }
 
 /// A parsed v3 record or envelope line.
@@ -251,6 +355,11 @@ impl RecordIn {
         self.s
     }
 
+    /// The plaintext envelope fields (`e`).
+    pub(super) fn envelope(&self) -> &Map<String, Value> {
+        &self.e
+    }
+
     /// The event this record describes; `content` replaces `c` when the
     /// payload is stored elsewhere (a sealed segment's content stream).
     pub(super) fn into_event(
@@ -268,16 +377,16 @@ impl RecordIn {
             Some(value) if value.is_empty() => None,
             Some(value) => Some(value),
         };
-        let payload = match content.or(self.c) {
-            Some(payload) => payload,
-            // Content this codec cannot open (an e2e record without its
-            // key): the envelope stands in, flagged like a locked detail.
-            None if self.x.is_some() => {
-                let mut locked = self.e;
-                locked.insert("detailLocked".to_owned(), Value::Bool(true));
-                Value::Object(locked)
+        let payload = match (content.or(self.c), self.x) {
+            (Some(payload), _) => payload,
+            // Encrypted content: the stored form, envelope plus `$enc`.
+            (None, Some(Value::Object(encrypted))) => {
+                let mut payload = self.e;
+                payload.insert(ENCRYPTED_FIELD.to_owned(), Value::Object(encrypted));
+                Value::Object(payload)
             }
-            None => return Err(format!("record {} has no content", self.s)),
+            (None, Some(_)) => return Err(format!("record {} has invalid ciphertext", self.s)),
+            (None, None) => return Err(format!("record {} has no content", self.s)),
         };
         Ok(ConversationEvent {
             schema_version: CONVERSATION_SCHEMA_VERSION,
@@ -299,6 +408,7 @@ fn record_out<'a>(
     envelope: &'a Map<String, Value>,
     normalized: &'a str,
     content: Option<&'a Value>,
+    encrypted: Option<&'a Value>,
 ) -> RecordOut<'a> {
     let nanos = event.time.timestamp_subsec_nanos() % 1000;
     RecordOut {
@@ -316,21 +426,27 @@ fn record_out<'a>(
         tn: (nanos > 0).then_some(nanos),
         e: envelope,
         c: content,
+        x: encrypted,
     }
 }
 
-/// The v3 journal line of `event` (without its newline), content encoded
-/// by `codec`.
-pub(super) fn encode_record(
-    event: &ConversationEvent,
-    codec: ContentCodec,
-) -> Result<Vec<u8>, serde_json::Error> {
+/// The v3 journal line of `event` (without its newline). A stored-form
+/// payload (envelope plus `$enc`, see [`seal_event`]) is written as `e` and
+/// `x`; any other payload as `c`.
+pub(super) fn encode_record(event: &ConversationEvent) -> Result<Vec<u8>, serde_json::Error> {
     let envelope = envelope_fields(&event.event_type, &event.payload);
     let normalized = normalized_event_type(&event.event_type);
-    let content = match codec {
-        ContentCodec::Plain => Some(&event.payload),
+    let (content, encrypted) = match event.payload.get(ENCRYPTED_FIELD) {
+        Some(encrypted) if encrypted.is_object() => (None, Some(encrypted)),
+        _ => (Some(&event.payload), None),
     };
-    serde_json::to_vec(&record_out(event, &envelope, &normalized, content))
+    serde_json::to_vec(&record_out(
+        event,
+        &envelope,
+        &normalized,
+        content,
+        encrypted,
+    ))
 }
 
 /// The envelope-stream line of `event` for a sealed segment: the record
@@ -338,7 +454,7 @@ pub(super) fn encode_record(
 pub(super) fn encode_envelope(event: &ConversationEvent) -> Result<Vec<u8>, serde_json::Error> {
     let envelope = envelope_fields(&event.event_type, &event.payload);
     let normalized = normalized_event_type(&event.event_type);
-    serde_json::to_vec(&record_out(event, &envelope, &normalized, None))
+    serde_json::to_vec(&record_out(event, &envelope, &normalized, None, None))
 }
 
 /// Journal bytes of one record for replay page budgets: the length of its
@@ -478,7 +594,7 @@ mod tests {
         for original in cases {
             let v2_line = serde_json::to_vec(&original).unwrap();
             let v2 = decode_journal_record(&v2_line, conversation).unwrap();
-            let v3_line = encode_record(&v2, ContentCodec::Plain).unwrap();
+            let v3_line = encode_record(&v2).unwrap();
             assert!(v3_line.starts_with(V3_RECORD_PREFIX));
             assert!(v3_line.len() < v2_line.len() + 64);
             let decoded = decode_journal_record(&v3_line, conversation).unwrap();
@@ -552,10 +668,16 @@ mod tests {
     }
 
     #[test]
-    fn locked_content_falls_back_to_the_envelope() {
-        let line =
-            br#"{"s":1,"i":"evt_1","t":1,"y":"message.delta","e":{"turnId":"t"},"x":{"v":1}}"#;
+    fn encrypted_records_decode_to_their_stored_form_and_back() {
+        let line = br#"{"s":1,"i":"evt_1","t":1,"y":"message.delta","e":{"turnId":"t"},"x":{"v":1,"kid":"k","c":"c","n":1,"f":"AA"}}"#;
         let event = decode_journal_record(line, "c").unwrap();
-        assert_eq!(event.payload, json!({"turnId": "t", "detailLocked": true}));
+        assert_eq!(
+            event.payload,
+            json!({"turnId": "t", "$enc": {"v": 1, "kid": "k", "c": "c", "n": 1, "f": "AA"}})
+        );
+        // The stored form is written back as `e` + `x`, byte for byte.
+        assert_eq!(encode_record(&event).unwrap(), line.to_vec());
+        let invalid = br#"{"s":1,"i":"evt_1","t":1,"y":"message.delta","x":"nope"}"#;
+        assert!(decode_journal_record(invalid, "c").is_err());
     }
 }

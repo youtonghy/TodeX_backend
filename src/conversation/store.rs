@@ -18,19 +18,26 @@ use crate::error::AppError;
 use super::coalesce::{DeltaFragment, PendingDelta};
 use super::digest::JournalDigest;
 use super::maintenance::{available_space, MaintenanceQueue};
-use super::record::{decode_journal_record, encode_record, ContentCodec, JOURNAL_COMPACTED_EVENT};
+use super::record::{
+    add_history_macs, decode_journal_record, encode_record, encrypted_content, seal_event,
+    JOURNAL_COMPACTED_EVENT,
+};
 use super::segment::{
-    self, CommitStep, FrameCache, PreparedSegment, SealedSegment, SegmentError, SegmentReader,
-    JOURNAL_RECORD_LOST_EVENT,
+    self, CommitStep, FrameCache, FrameRef, MigrationKey, PreparedSegment, SealPolicy,
+    SealedSegment, SegmentError, SegmentReader, JOURNAL_RECORD_LOST_EVENT,
 };
 use super::{
     redact_secrets, status_after_conversation_event, ConversationEvent, ConversationEventHub,
     ConversationManifest, ConversationReplay, ConversationSnapshot, ProviderState,
     CONVERSATION_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES,
 };
+use crate::config::HistoryEncryption;
+use crate::history_crypto::{self, ContentStream, SegmentKey};
+use crate::history_keys::{FingerprintKey, HistoryKeys};
 
 const MANIFEST_FILE: &str = "manifest.json";
-const EVENTS_FILE: &str = "events.jsonl";
+const LAST_REQUEST_FILE: &str = "last-request.json";
+pub(super) const EVENTS_FILE: &str = "events.jsonl";
 const SNAPSHOT_FILE: &str = "snapshot.json";
 const PROVIDER_STATE_FILE: &str = "provider-state.json";
 /// Prompts waiting for the running turn to finish; never copied by fork.
@@ -109,7 +116,9 @@ pub struct ConversationStore {
     pub(super) sealing: Arc<DashMap<String, ()>>,
     /// Conversations with sealed plaintext waiting for conversion.
     pub(super) maintenance: Arc<MaintenanceQueue>,
-    codec: ContentCodec,
+    /// History encryption keys (`None`: plaintext only, as in most tests).
+    /// See `docs/history-encryption.md` §3 and [`Self::with_history_keys`].
+    pub(super) history: Option<HistoryKeys>,
     /// Test override for the free-space probe (`u64::MAX`: none).
     free_space_override: Arc<AtomicU64>,
     /// Crash-injection point for segment commits in tests.
@@ -256,6 +265,61 @@ enum PartSlice {
     },
 }
 
+/// Which ciphertext encrypted records carry in a replay (§5.3): the
+/// summary or the full payload. Plaintext payloads are always full.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReplayDetail {
+    #[default]
+    Full,
+    Summary,
+}
+
+/// One page read through the replay index.
+struct IndexedPage {
+    /// Window actually read (0-based positions) and the journal length.
+    from: usize,
+    to: usize,
+    total: usize,
+    events: Vec<ConversationEvent>,
+    frames: serde_json::Map<String, Value>,
+}
+
+/// Which records of a sealed segment a page reads.
+struct SealedSlice {
+    segment: Arc<SealedSegment>,
+    first: u64,
+    last: u64,
+    backward: bool,
+    detail: ReplayDetail,
+}
+
+/// Directory inside a fork holding the sealed frames its copied records
+/// refer to (`<frame id>.json`, the wire form `{kid, stream, counter, c,
+/// ct}`).
+const COPIED_FRAMES_DIR: &str = "frames";
+
+/// Frame ids are `<segment id hex>-<offset hex>`; anything else is not
+/// looked up on disk.
+fn valid_frame_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
+async fn read_copied_frame(directory: &Path, id: &str) -> Result<Option<Value>, AppError> {
+    if !valid_frame_id(id) {
+        return Ok(None);
+    }
+    let path = directory.join(COPIED_FRAMES_DIR).join(format!("{id}.json"));
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Why a page read failed, so the caller can repair the right file.
 enum PageError {
     Plain(AppError),
@@ -355,7 +419,7 @@ impl ConversationStore {
             reconciled: Arc::new(DashMap::new()),
             sealing: Arc::new(DashMap::new()),
             maintenance: Arc::new(MaintenanceQueue::default()),
-            codec: ContentCodec::Plain,
+            history: None,
             free_space_override: Arc::new(AtomicU64::new(u64::MAX)),
             #[cfg(test)]
             commit_stop: Arc::new(std::sync::Mutex::new(None)),
@@ -390,6 +454,134 @@ impl ConversationStore {
 
     fn index_remove(&self, conversation_id: &str) {
         self.index_cache().pop(conversation_id);
+    }
+
+    /// Encrypt history with `keys` (`docs/history-encryption.md`). While
+    /// their mode is `e2e` every new record is sealed under the
+    /// conversation's current DEK, titles are stored as `titleEnc`, sealed
+    /// segments are repacked into encrypted frames and older plaintext is
+    /// migrated in the background.
+    pub fn with_history_keys(mut self, keys: HistoryKeys) -> Self {
+        self.history = Some(keys);
+        self
+    }
+
+    /// The history encryption mode now (`off` without keys).
+    pub(super) fn history_mode(&self) -> Result<HistoryEncryption, AppError> {
+        match &self.history {
+            Some(keys) => keys.recipients().mode(),
+            None => Ok(HistoryEncryption::Off),
+        }
+    }
+
+    /// Whether new history is encrypted now.
+    pub fn history_encrypted(&self) -> Result<bool, AppError> {
+        Ok(self.history_mode()? == HistoryEncryption::E2e)
+    }
+
+    /// The key behind `requestFingerprint` / `textMac` MACs, for comparing
+    /// what earlier records stored (in any mode: records written while
+    /// encryption was on keep their MACs). `None` without history keys.
+    pub fn fingerprint_key(&self) -> Result<Option<Arc<FingerprintKey>>, AppError> {
+        self.history
+            .as_ref()
+            .map(HistoryKeys::fingerprint)
+            .transpose()
+    }
+
+    /// With history encryption on, new work must be able to encrypt what it
+    /// writes: this creates (or confirms) the conversation's current DEK and
+    /// fails with `CONFLICT` when no recipient is left to wrap it for, so a
+    /// prompt is refused before its turn starts (§3.2). Turns already
+    /// running keep their key; see [`Self::record_key`].
+    pub async fn ensure_history_writable(&self, conversation_id: &str) -> Result<(), AppError> {
+        if let Some(keys) = &self.history {
+            keys.deks().current_key(conversation_id).await?;
+        }
+        Ok(())
+    }
+
+    /// The DEK the next record of `conversation_id` is sealed under and
+    /// the fingerprint key; `None` while encryption is off. When no new DEK
+    /// can be had (every recipient revoked, the keyring unwritable) a
+    /// running turn keeps encrypting under the newest DEK still in memory;
+    /// with none left the append fails rather than writing plaintext.
+    async fn record_key(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(String, Arc<SegmentKey>, Arc<FingerprintKey>)>, AppError> {
+        let Some(keys) = &self.history else {
+            return Ok(None);
+        };
+        let (kid, key) = match keys.deks().current_key(conversation_id).await {
+            Ok(None) => return Ok(None),
+            Ok(Some(current)) => current,
+            Err(error) => match keys.deks().fallback_key(conversation_id).await {
+                Some(previous) => {
+                    tracing::error!(
+                        conversation_id,
+                        error = %error,
+                        "no new history key; encrypting under the previous one until the turn ends"
+                    );
+                    previous
+                }
+                None => {
+                    tracing::error!(
+                        conversation_id,
+                        error = %error,
+                        "history encryption is on but no key is available; refusing to journal plaintext"
+                    );
+                    return Err(error);
+                }
+            },
+        };
+        Ok(Some((kid, key, keys.fingerprint()?)))
+    }
+
+    /// e2e: `manifest.titleEnc` for `title` (§3.2): stream 2, counter 0,
+    /// under a fresh DEK of its own, so a new title never reuses a nonce.
+    /// `None` while encryption is off.
+    async fn seal_title(
+        &self,
+        conversation_id: &str,
+        title: &str,
+    ) -> Result<Option<super::model::TitleEnc>, AppError> {
+        let Some(keys) = &self.history else {
+            return Ok(None);
+        };
+        let Some((kid, key)) = keys.deks().fresh_key(conversation_id).await? else {
+            return Ok(None);
+        };
+        let sealed = history_crypto::seal(
+            &key,
+            conversation_id,
+            ContentStream::EventFull,
+            0,
+            title.as_bytes(),
+        )?;
+        Ok(Some(super::model::TitleEnc {
+            kid,
+            ct: base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, sealed),
+        }))
+    }
+
+    /// Set (or clear) the manifest title: plaintext while encryption is off,
+    /// `titleEnc` with an empty `title` while it is on.
+    pub(super) async fn apply_title(
+        &self,
+        manifest: &mut ConversationManifest,
+        title: Option<String>,
+    ) -> Result<(), AppError> {
+        manifest.title_enc = None;
+        manifest.title = None;
+        let Some(title) = title else {
+            return Ok(());
+        };
+        match self.seal_title(&manifest.id, &title).await? {
+            Some(sealed) => manifest.title_enc = Some(sealed),
+            None => manifest.title = Some(title),
+        }
+        Ok(())
     }
 
     pub async fn create(
@@ -448,11 +640,14 @@ impl ConversationStore {
             .0
             .map_or(0, |event| event.sequence);
         let mut draft = self.begin_conversation(&manifest).await?;
+        let temporary = draft.temporary.clone();
         let filled = async {
             let mut after = 0u64;
             let mut copied = 0u64;
             while after < end {
                 let page = self.replay(source_id, after, MAX_REPLAY_LIMIT).await?;
+                // Copied sealed records keep referring to their frames.
+                write_copied_frames(&temporary, &page.frames).await?;
                 for event in page.events {
                     if event.sequence > end {
                         break;
@@ -474,6 +669,11 @@ impl ConversationStore {
                 manifest.status = status_after_conversation_event(manifest.status, &next);
                 manifest.last_sequence = next.sequence;
                 draft.writer.write(&next).await?;
+            }
+            // Copied ciphertext stays readable through the fork's own id:
+            // its keys are the source's.
+            if let Some(keys) = &self.history {
+                keys.keyrings().copy_into(source_id, &temporary).await?;
             }
             Ok(())
         }
@@ -502,7 +702,7 @@ impl ConversationStore {
         tokio::fs::create_dir(&temporary).await?;
         let created = async {
             set_owner_only(&temporary, true).await?;
-            PlainJournalWriter::create(&temporary, self.codec).await
+            PlainJournalWriter::create(&temporary).await
         }
         .await;
         match created {
@@ -527,6 +727,19 @@ impl ConversationStore {
         request: Option<Value>,
     ) -> Result<ConversationManifest, AppError> {
         manifest.storage_version = Some(super::model::STORAGE_VERSION);
+        // With history encryption on the title is sealed once the
+        // conversation directory (and so its keyring) exists; until then
+        // no plaintext title is written. A conversation that starts empty
+        // under encryption is entirely encrypted from its first record.
+        let encrypting = self.history_encrypted()?;
+        let title = if encrypting {
+            manifest.title.take()
+        } else {
+            None
+        };
+        if encrypting && !draft.writer.wrote_records() {
+            manifest.history_encrypted_at = Some(Utc::now());
+        }
         let ConversationDraft { temporary, writer } = draft;
         let create_result = async {
             filled?;
@@ -543,7 +756,7 @@ impl ConversationStore {
             )
             .await?;
             if let Some(request) = request {
-                write_atomic_json(&temporary.join("last-request.json"), &request).await?;
+                write_atomic_json(&temporary.join(LAST_REQUEST_FILE), &request).await?;
             }
             sync_directory(&temporary).await?;
             Ok::<_, AppError>(sealed)
@@ -583,6 +796,11 @@ impl ConversationStore {
         );
         if sealed > 0 {
             self.maintenance.request(&manifest.id);
+        }
+        if let Some(title) = title {
+            // Still under the conversation lock taken for the rename.
+            self.apply_title(&mut manifest, Some(title)).await?;
+            self.persist_manifest_locked(&manifest).await?;
         }
         Ok(manifest)
     }
@@ -630,9 +848,10 @@ impl ConversationStore {
         let _guard = self.lock(conversation_id).await;
         let mut manifest = self.get_unlocked(conversation_id).await?;
         if let Some(title) = title {
-            manifest.title = title
+            let title = title
                 .map(|value| value.trim().chars().take(200).collect::<String>())
                 .filter(|value| !value.is_empty());
+            self.apply_title(&mut manifest, title).await?;
         }
         if let Some(archived) = archived {
             manifest.archived_at = archived.then(Utc::now);
@@ -675,9 +894,13 @@ impl ConversationStore {
         Ok(())
     }
 
-    /// Drop every cache entry of a removed conversation. Callers hold the
+    /// Drop every cache entry of a removed conversation, its DEKs included
+    /// (its keyring went with its directory). Callers hold the
     /// conversation lock.
     fn forget_locked(&self, conversation_id: &str) {
+        if let Some(keys) = &self.history {
+            keys.deks().forget(conversation_id);
+        }
         self.index_remove(conversation_id);
         self.tails.remove(conversation_id);
         self.pending_deltas.remove(conversation_id);
@@ -930,7 +1153,6 @@ impl ConversationStore {
         // v3 records store microseconds; the published event matches what a
         // later replay decodes.
         event.time = truncate_to_micros(event.time);
-        let record = encode_record(&event, self.codec)?;
         let event_path = directory.join(EVENTS_FILE);
         let mut files = self.files_locked(conversation_id, &directory).await?;
         // A torn final record (a write interrupted before its newline) must
@@ -977,7 +1199,29 @@ impl ConversationStore {
             }
             terminated = true;
             self.maintenance.request(conversation_id);
+            // Each DEK's records stay inside one sealed file, which is what
+            // lets the seal converter repack them and then drop the key.
+            if let Some(keys) = &self.history {
+                keys.deks().rotate(conversation_id).await;
+            }
         }
+        // With history encryption on, the record is sealed now — after any
+        // rotation, so it uses the new file's key — and the stored form
+        // (envelope plus `$enc`) is what is journalled, published and
+        // folded into the digest.
+        let event = match self.record_key(conversation_id).await? {
+            Some((kid, key, fingerprint)) => {
+                add_history_macs(&event.event_type, &mut event.payload, &fingerprint);
+                seal_event(&event, &kid, &key)?
+            }
+            None => {
+                // Plaintext from here on: the conversation is no longer
+                // entirely encrypted.
+                manifest.history_encrypted_at = None;
+                event
+            }
+        };
+        let record = encode_record(&event)?;
         // `create` normally made the journal and rotation always creates the
         // fresh active file; only here does a missing one get created, and
         // only then do its permissions and directory entry need work.
@@ -1080,9 +1324,11 @@ impl ConversationStore {
         self.get_unlocked(conversation_id).await?;
         // Every prompt saves its request before the turn starts, so this is
         // where a nearly full disk refuses new turns. Running turns are
-        // unaffected — appends never refuse on size.
+        // unaffected — appends never refuse on size. Likewise a turn whose
+        // history could not be encrypted (no recipient left) never starts.
         self.ensure_free_space(&directory).await?;
-        write_atomic_json(&directory.join("last-request.json"), request).await
+        self.ensure_history_writable(conversation_id).await?;
+        write_atomic_json(&directory.join(LAST_REQUEST_FILE), request).await
     }
 
     /// `STORAGE_LOW` when the data directory's filesystem has less than
@@ -1123,7 +1369,7 @@ impl ConversationStore {
 
     pub async fn last_request(&self, conversation_id: &str) -> Result<Option<Value>, AppError> {
         let _guard = self.lock(conversation_id).await;
-        let path = self.directory(conversation_id)?.join("last-request.json");
+        let path = self.directory(conversation_id)?.join(LAST_REQUEST_FILE);
         if !tokio::fs::try_exists(&path).await? {
             return Ok(None);
         }
@@ -1314,11 +1560,16 @@ impl ConversationStore {
                 let mut from = (first - 1) as usize;
                 let end = (first - 1 + count) as usize;
                 while from < end {
-                    let (_, to, _, events) = self
-                        .read_indexed_page(conversation_id, &directory, PageAnchor::Start, |_| {
-                            (from, from.saturating_add(MAX_REPLAY_LIMIT).min(end))
-                        })
+                    let page = self
+                        .read_indexed_page(
+                            conversation_id,
+                            &directory,
+                            PageAnchor::Start,
+                            ReplayDetail::Full,
+                            |_| (from, from.saturating_add(MAX_REPLAY_LIMIT).min(end)),
+                        )
                         .await?;
+                    let (to, events) = (page.to, page.events);
                     if index_files(self).as_ref() != Some(&start_files) {
                         complete = false;
                         break 'parts;
@@ -1358,26 +1609,51 @@ impl ConversationStore {
         after_sequence: u64,
         limit: usize,
     ) -> Result<ConversationReplay, AppError> {
+        self.replay_detail(conversation_id, after_sequence, limit, ReplayDetail::Full)
+            .await
+    }
+
+    /// [`Self::replay`] with the ciphertext of encrypted records in
+    /// `detail`: summary pages carry summary frames and `$enc` objects whose
+    /// separate summary ciphertext exists. Plaintext payloads are always
+    /// full; callers summarize them.
+    pub async fn replay_detail(
+        &self,
+        conversation_id: &str,
+        after_sequence: u64,
+        limit: usize,
+        detail: ReplayDetail,
+    ) -> Result<ConversationReplay, AppError> {
         let _guard = self.lock(conversation_id).await;
         // Readers see every fragment emitted so far.
         self.flush_pending_delta_logged(conversation_id).await;
         let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
         let directory = self.replay_journal(conversation_id).await?;
-        let (_, to, total, events) = self
-            .read_indexed_page(conversation_id, &directory, PageAnchor::Start, |total| {
-                let from = usize::try_from(after_sequence)
-                    .unwrap_or(usize::MAX)
-                    .min(total);
-                (from, from.saturating_add(limit).min(total))
-            })
+        let page = self
+            .read_indexed_page(
+                conversation_id,
+                &directory,
+                PageAnchor::Start,
+                detail,
+                |total| {
+                    let from = usize::try_from(after_sequence)
+                        .unwrap_or(usize::MAX)
+                        .min(total);
+                    (from, from.saturating_add(limit).min(total))
+                },
+            )
             .await?;
-        let next_sequence = events.last().map_or(after_sequence, |event| event.sequence);
+        let next_sequence = page
+            .events
+            .last()
+            .map_or(after_sequence, |event| event.sequence);
         Ok(ConversationReplay {
             conversation_id: conversation_id.to_owned(),
             from_sequence: after_sequence,
             next_sequence,
-            has_more: to < total,
-            events,
+            has_more: page.to < page.total,
+            events: page.events,
+            frames: page.frames,
         })
     }
 
@@ -1387,34 +1663,55 @@ impl ConversationStore {
     /// `before_sequence = first_returned_sequence - 1` (`from_sequence`). The
     /// same byte budget as [`Self::replay`] applies, dropping the oldest
     /// records of the window first.
+    #[cfg(test)]
     pub async fn replay_before(
         &self,
         conversation_id: &str,
         before_sequence: u64,
         limit: usize,
     ) -> Result<ConversationReplay, AppError> {
+        self.replay_before_detail(conversation_id, before_sequence, limit, ReplayDetail::Full)
+            .await
+    }
+
+    /// [`Self::replay_before`] in `detail`; see [`Self::replay_detail`].
+    pub async fn replay_before_detail(
+        &self,
+        conversation_id: &str,
+        before_sequence: u64,
+        limit: usize,
+        detail: ReplayDetail,
+    ) -> Result<ConversationReplay, AppError> {
         let _guard = self.lock(conversation_id).await;
         // Readers see every fragment emitted so far.
         self.flush_pending_delta_logged(conversation_id).await;
         let limit = limit.clamp(1, MAX_REPLAY_LIMIT);
         let directory = self.replay_journal(conversation_id).await?;
-        let (from, _, _, events) = self
-            .read_indexed_page(conversation_id, &directory, PageAnchor::End, |total| {
-                let to = usize::try_from(before_sequence)
-                    .unwrap_or(usize::MAX)
-                    .min(total);
-                (to.saturating_sub(limit), to)
-            })
+        let page = self
+            .read_indexed_page(
+                conversation_id,
+                &directory,
+                PageAnchor::End,
+                detail,
+                |total| {
+                    let to = usize::try_from(before_sequence)
+                        .unwrap_or(usize::MAX)
+                        .min(total);
+                    (to.saturating_sub(limit), to)
+                },
+            )
             .await?;
-        let next_sequence = events
+        let next_sequence = page
+            .events
             .last()
             .map_or(before_sequence, |event| event.sequence);
         Ok(ConversationReplay {
             conversation_id: conversation_id.to_owned(),
-            from_sequence: from as u64,
+            from_sequence: page.from as u64,
             next_sequence,
-            has_more: from > 0,
-            events,
+            has_more: page.from > 0,
+            events: page.events,
+            frames: page.frames,
         })
     }
 
@@ -1529,14 +1826,14 @@ impl ConversationStore {
     /// not parse or validate is repaired where it lives: a plaintext file
     /// through the full validating scan (when the index was built fast), a
     /// sealed segment by segment salvage; the page is then read again.
-    /// Returns `(from, to, total, events)`.
     async fn read_indexed_page(
         &self,
         conversation_id: &str,
         directory: &Path,
         anchor: PageAnchor,
+        detail: ReplayDetail,
         window: impl Fn(usize) -> (usize, usize),
-    ) -> Result<(usize, usize, usize, Vec<ConversationEvent>), AppError> {
+    ) -> Result<IndexedPage, AppError> {
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -1549,10 +1846,14 @@ impl ConversationStore {
                     from.min(to),
                     to.min(total),
                     anchor,
+                    detail,
                 )
                 .await
             {
-                Ok((from, to, events)) => return Ok((from, to, total, events)),
+                Ok(mut page) => {
+                    page.total = total;
+                    return Ok(page);
+                }
                 Err(error) => error,
             };
             match error {
@@ -1582,7 +1883,7 @@ impl ConversationStore {
     }
 
     /// Records `from..to` (0-based positions) under the page byte budget,
-    /// kept from the `anchor` end. Returns the window actually read.
+    /// kept from the `anchor` end, with the sealed frames they refer to.
     async fn read_window(
         &self,
         conversation_id: &str,
@@ -1590,9 +1891,17 @@ impl ConversationStore {
         from: usize,
         to: usize,
         anchor: PageAnchor,
-    ) -> Result<(usize, usize, Vec<ConversationEvent>), PageError> {
+        detail: ReplayDetail,
+    ) -> Result<IndexedPage, PageError> {
+        let mut page = IndexedPage {
+            from,
+            to: from,
+            total: 0,
+            events: Vec::new(),
+            frames: serde_json::Map::new(),
+        };
         if from >= to {
-            return Ok((from, from, Vec::new()));
+            return Ok(page);
         }
         let mut slices = self
             .index_get(conversation_id, |index| index.slices(from, to))
@@ -1631,11 +1940,15 @@ impl ConversationStore {
                     self.read_sealed_slice(
                         conversation_id,
                         directory,
-                        segment,
-                        first,
-                        last,
-                        backward,
+                        SealedSlice {
+                            segment,
+                            first,
+                            last,
+                            backward,
+                            detail,
+                        },
                         &mut budget,
+                        &mut page.frames,
                     )
                     .await
                     .map_err(|error| PageError::Sealed(number, error))?
@@ -1650,12 +1963,54 @@ impl ConversationStore {
         if backward {
             chunks.reverse();
         }
-        let events: Vec<ConversationEvent> = chunks.into_iter().flatten().collect();
-        Ok(if backward {
-            (to - read, to, events)
+        page.events = chunks.into_iter().flatten().collect();
+        // Forked copies of sealed records refer to frames the fork keeps
+        // beside its journal.
+        self.attach_copied_frames(directory, &page.events, detail, &mut page.frames)
+            .await
+            .map_err(PageError::Plain)?;
+        if backward {
+            page.from = to - read;
+            page.to = to;
         } else {
-            (from, from + read, events)
-        })
+            page.to = from + read;
+        }
+        Ok(page)
+    }
+
+    /// Adds the frames of event-level `$enc.fr` references (a fork's copies
+    /// of sealed records, see [`Self::create_from_journal`]) from the
+    /// conversation's `frames/` directory: under `detail` the matching frame
+    /// when present, else the other.
+    async fn attach_copied_frames(
+        &self,
+        directory: &Path,
+        events: &[ConversationEvent],
+        detail: ReplayDetail,
+        frames: &mut serde_json::Map<String, Value>,
+    ) -> Result<(), AppError> {
+        for event in events {
+            let Some(reference) = encrypted_content(&event.payload)
+                .and_then(|encrypted| encrypted.get("fr"))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            let ids = match detail {
+                ReplayDetail::Summary => ["s", "f"],
+                ReplayDetail::Full => ["f", "s"],
+            };
+            for id in ids.iter().filter_map(|key| reference.get(*key)?.as_str()) {
+                if frames.contains_key(id) {
+                    break;
+                }
+                if let Some(frame) = read_copied_frame(directory, id).await? {
+                    frames.insert(id.to_owned(), frame);
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read the plaintext records `offsets` (the first holding `first`)
@@ -1709,55 +2064,76 @@ impl ConversationStore {
 
     /// Sealed counterpart of [`Self::read_plain_slice`] for sequences
     /// `first..=last` of `segment`; sizes are known only once a record is
-    /// decoded, so the budget is applied as records are read.
-    #[allow(clippy::too_many_arguments)]
+    /// decoded, so the budget is applied as records are read. A sealed
+    /// frame counts once per page, when its first record is admitted, and
+    /// is added to `frames`.
     async fn read_sealed_slice(
         &self,
         conversation_id: &str,
         directory: &Path,
-        segment: Arc<SealedSegment>,
-        first: u64,
-        last: u64,
-        backward: bool,
+        slice: SealedSlice,
         budget: &mut PageBudget,
+        frames: &mut serde_json::Map<String, Value>,
     ) -> Result<(Vec<ConversationEvent>, bool), AppError> {
         let directory = directory.to_owned();
         let cache = self.frames.clone();
-        let codec = self.codec;
         let id = conversation_id.to_owned();
         let mut owned_budget = PageBudget::new(budget.limit);
         owned_budget.used = budget.used;
         owned_budget.admitted = budget.admitted;
-        let (events, complete, owned_budget) = tokio::task::spawn_blocking(move || {
-            let number = segment.number;
-            let mut reader = SegmentReader::open(&directory, &segment, &cache, codec, &id)
-                .map_err(|error| segment_error(&id, number, error))?;
-            let mut events = Vec::new();
-            let mut complete = true;
-            let sequences: Box<dyn Iterator<Item = u64>> = if backward {
-                Box::new((first..=last).rev())
-            } else {
-                Box::new(first..=last)
-            };
-            for sequence in sequences {
-                let (event, bytes) = reader
-                    .event(sequence)
+        let mut owned_frames = std::mem::take(frames);
+        let (events, complete, owned_budget, owned_frames) =
+            tokio::task::spawn_blocking(move || {
+                let SealedSlice {
+                    segment,
+                    first,
+                    last,
+                    backward,
+                    detail,
+                } = slice;
+                let number = segment.number;
+                let mut reader = SegmentReader::open(&directory, &segment, &cache, &id)
                     .map_err(|error| segment_error(&id, number, error))?;
-                if !owned_budget.admit(bytes) {
-                    complete = false;
-                    break;
+                let mut events = Vec::new();
+                let mut complete = true;
+                let sequences: Box<dyn Iterator<Item = u64>> = if backward {
+                    Box::new((first..=last).rev())
+                } else {
+                    Box::new(first..=last)
+                };
+                for sequence in sequences {
+                    let record = reader
+                        .record(sequence, detail == ReplayDetail::Summary)
+                        .map_err(|error| segment_error(&id, number, error))?;
+                    let new_frame = record
+                        .frame
+                        .as_ref()
+                        .filter(|frame| !owned_frames.contains_key(&frame.id));
+                    let frame_bytes = new_frame.map_or(0, |frame: &FrameRef| {
+                        u64::from(frame.entry.len).div_ceil(3) * 4
+                    });
+                    if !owned_budget.admit(record.bytes + frame_bytes) {
+                        complete = false;
+                        break;
+                    }
+                    if let Some(frame) = new_frame {
+                        let wire = reader
+                            .wire_frame(&frame.entry)
+                            .map_err(|error| segment_error(&id, number, error))?;
+                        owned_frames.insert(frame.id.clone(), wire);
+                    }
+                    validate_event(&record.event, &id, sequence)?;
+                    events.push(record.event);
                 }
-                validate_event(&event, &id, sequence)?;
-                events.push(event);
-            }
-            if backward {
-                events.reverse();
-            }
-            Ok::<_, AppError>((events, complete, owned_budget))
-        })
-        .await
-        .map_err(blocking_error)??;
+                if backward {
+                    events.reverse();
+                }
+                Ok::<_, AppError>((events, complete, owned_budget, owned_frames))
+            })
+            .await
+            .map_err(blocking_error)??;
         *budget = owned_budget;
+        *frames = owned_frames;
         Ok((events, complete))
     }
 
@@ -1796,10 +2172,8 @@ impl ConversationStore {
             .unwrap_or_default();
         let path = directory.to_owned();
         let id = conversation_id.to_owned();
-        let codec = self.codec;
         let lost = tokio::task::spawn_blocking(move || {
-            let salvaged =
-                segment::salvage_segment(&path, &id, number, first, last, &backup_name, codec)?;
+            let salvaged = segment::salvage_segment(&path, &id, number, first, last, &backup_name)?;
             if let Err(error) =
                 segment::replace_with_salvaged(&path, &salvaged.prepared, &backup_name)
             {
@@ -2289,7 +2663,7 @@ impl ConversationStore {
                                 placeholder.time =
                                     time.unwrap_or_else(|| truncate_to_micros(Utc::now()));
                                 placeholder.provider = *provider;
-                                lines.push(encode_record(&placeholder, self.codec)?);
+                                lines.push(encode_record(&placeholder)?);
                             }
                             lost_records += run_length;
                         }
@@ -2401,11 +2775,10 @@ impl ConversationStore {
             let number = last.number().unwrap_or_default();
             let path = directory.clone();
             let cache = self.frames.clone();
-            let codec = self.codec;
             let id = conversation_id.to_owned();
             let event = tokio::task::spawn_blocking(move || {
                 let loaded = segment::load_index(&path, number)?;
-                let mut reader = SegmentReader::open(&path, &loaded.segment, &cache, codec, &id)?;
+                let mut reader = SegmentReader::open(&path, &loaded.segment, &cache, &id)?;
                 reader.event(loaded.segment.last).map(|(event, _)| event)
             })
             .await
@@ -2527,9 +2900,9 @@ impl ConversationStore {
         self.sealing.insert(conversation_id.to_owned(), ());
         let path = directory.clone();
         let id = conversation_id.to_owned();
-        let codec = self.codec;
+        let policy = self.seal_policy(conversation_id).await;
         let built = tokio::task::spawn_blocking(move || {
-            segment::build_from_plain(&path, &id, number, &sources, expected_first, codec)
+            segment::build_from_plain(&path, &id, number, &sources, expected_first, &policy)
         })
         .await;
         let prepared = match built {
@@ -2561,20 +2934,66 @@ impl ConversationStore {
         if !matches!(committed, Ok(true)) {
             prepared.discard();
         }
-        #[cfg(test)]
-        if committed.is_ok()
-            && self
-                .commit_stop
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_some()
-        {
+        if matches!(committed, Ok(true)) && !prepared.repacked.is_empty() {
+            // The repacked records now live in sealed frames: their DEKs
+            // are no longer needed and are zeroized (§3.2).
+            if let Some(keys) = &self.history {
+                keys.deks()
+                    .release_sealed(conversation_id, &prepared.repacked)
+                    .await;
+            }
+        }
+        if committed.is_ok() && self.commit_stop().is_some() {
             // A simulated crash ends the caller like a killed process.
             return Err(AppError::Conflict(
                 "simulated crash during segment commit".to_owned(),
             ));
         }
         committed.map(|_| true)
+    }
+
+    /// The keys a segment build of `conversation_id` may use: every DEK
+    /// still in memory (their records are repacked into sealed frames), and
+    /// while encryption is on and the conversation is not known to be fully
+    /// encrypted, a fresh key its plaintext records are sealed under (§8).
+    /// Without that key plaintext simply stays plaintext; the migration
+    /// pass retries it.
+    pub(super) async fn seal_policy(&self, conversation_id: &str) -> SealPolicy {
+        let Some(keys) = &self.history else {
+            return SealPolicy::default();
+        };
+        let mut policy = SealPolicy {
+            keys: keys.deks().keys_snapshot(conversation_id).await,
+            migrate: None,
+        };
+        let encrypted = self
+            .get(conversation_id)
+            .await
+            .is_ok_and(|manifest| manifest.history_encrypted_at.is_some());
+        if encrypted || !matches!(self.history_mode(), Ok(HistoryEncryption::E2e)) {
+            return policy;
+        }
+        let fresh = match keys.deks().fresh_key(conversation_id).await {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                tracing::warn!(conversation_id, error = %error, "no key to encrypt plaintext history while sealing; it stays plaintext for now");
+                return policy;
+            }
+        };
+        match (fresh, keys.fingerprint()) {
+            (Some((kid, key)), Ok(fingerprint)) => {
+                policy.migrate = Some(MigrationKey {
+                    kid,
+                    key: Arc::new(key),
+                    fingerprint,
+                });
+            }
+            (None, _) => {}
+            (Some(_), Err(error)) => {
+                tracing::warn!(conversation_id, error = %error, "history fingerprint key unavailable while sealing; plaintext stays plaintext for now");
+            }
+        }
+        policy
     }
 
     /// Publish a built segment if its sources are unchanged and update the
@@ -2595,13 +3014,7 @@ impl ConversationStore {
             );
             return Ok(false);
         }
-        #[cfg(test)]
-        let stop = *self
-            .commit_stop
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        #[cfg(not(test))]
-        let stop: Option<CommitStep> = None;
+        let stop = self.commit_stop();
         let path = directory.to_owned();
         let body_sources = prepared.body.sources.clone();
         let (temp_seg, temp_idx, number) = (
@@ -2616,6 +3029,7 @@ impl ConversationStore {
                 temp_seg,
                 temp_idx,
                 body,
+                repacked: Vec::new(),
             };
             segment::commit_prepared(&path, &prepared, stop)
         })
@@ -2625,10 +3039,7 @@ impl ConversationStore {
         if stop.is_some() {
             // A simulated crash: leave the directory as it is and forget
             // everything, like a restarted process would.
-            self.reconciled.remove(conversation_id);
-            self.index_remove(conversation_id);
-            self.digests.remove(conversation_id);
-            self.tails.remove(conversation_id);
+            self.forget_journal_caches_locked(conversation_id);
             return Ok(true);
         }
         let new_files = journal_files(directory).await?;
@@ -2687,6 +3098,65 @@ impl ConversationStore {
         Ok(true)
     }
 
+    /// The crash-injection point of segment commits (always `None` outside
+    /// tests).
+    pub(super) fn commit_stop(&self) -> Option<CommitStep> {
+        #[cfg(test)]
+        return *self
+            .commit_stop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(not(test))]
+        None
+    }
+
+    /// Forget the rebuildable journal caches of a conversation whose files
+    /// were rewritten, and reconcile its directory again on next access.
+    /// Callers hold the conversation lock.
+    pub(super) fn forget_journal_caches_locked(&self, conversation_id: &str) {
+        self.reconciled.remove(conversation_id);
+        self.index_remove(conversation_id);
+        self.digests.remove(conversation_id);
+        self.tails.remove(conversation_id);
+    }
+
+    /// Ask the maintenance task to encrypt existing plaintext history now
+    /// (history encryption was just enabled, §8). Plaintext outside the
+    /// journal is not touched: migration backups keep theirs until they
+    /// expire, and filesystem snapshots are out of reach.
+    pub fn request_history_migration(&self) {
+        tracing::warn!(
+            "history encryption enabled: existing plaintext history is re-encrypted in the \
+             background; journal-v2-backup/ copies (deleted after 7 days), events.corrupt.* \
+             salvage copies and Time Machine / APFS snapshots may still hold old plaintext"
+        );
+        self.maintenance.request_migration();
+    }
+
+    /// Replace the prompt text of `last-request.json` with its MAC (see
+    /// [`seal_request_snapshot`]). Callers hold the conversation lock.
+    pub(super) async fn seal_last_request_locked(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), AppError> {
+        let path = self.directory(conversation_id)?.join(LAST_REQUEST_FILE);
+        if !tokio::fs::try_exists(&path).await? {
+            return Ok(());
+        }
+        let mut saved: Value = read_json(&path, "conversation request snapshot").await?;
+        let Some(request) = saved.get_mut("request") else {
+            return Ok(());
+        };
+        if request.get("textMac").is_some() {
+            return Ok(());
+        }
+        let key = self.fingerprint_key()?.ok_or_else(|| {
+            AppError::Conflict("history fingerprint key is unavailable".to_owned())
+        })?;
+        seal_request_snapshot(request, &key);
+        write_atomic_json(&path, &saved).await
+    }
+
     /// Stop segment commits after `step`, simulating a crash.
     #[cfg(test)]
     pub(super) fn set_commit_stop(&self, step: Option<CommitStep>) {
@@ -2724,6 +3194,9 @@ impl ConversationStore {
             }
         }
         self.tails.remove(conversation_id);
+        if let Some(keys) = &self.history {
+            keys.deks().rotate(conversation_id).await;
+        }
         Ok(())
     }
 
@@ -2742,6 +3215,42 @@ impl ConversationStore {
             .clone();
         lock.lock_owned().await
     }
+}
+
+/// History encryption for a `last-request.json` `request` (a serialized
+/// prompt): the text and the inline content items (`text`, `image`) are
+/// replaced by `textMac` / `contentMac` — enough to recognize the same
+/// request again and to check the text a retry supplies — and only file
+/// references stay. Idempotent.
+pub fn seal_request_snapshot(request: &mut Value, key: &FingerprintKey) {
+    let Some(map) = request.as_object_mut() else {
+        return;
+    };
+    if map.contains_key("textMac") {
+        return;
+    }
+    let text = map
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    map.insert("textMac".to_owned(), Value::String(key.mac(&text)));
+    map.insert("text".to_owned(), Value::String(String::new()));
+    let items = match map.remove("content") {
+        Some(Value::Array(items)) => items,
+        _ => Vec::new(),
+    };
+    let (inline, kept): (Vec<Value>, Vec<Value>) = items.into_iter().partition(|item| {
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("text" | "image")
+        )
+    });
+    if !inline.is_empty() {
+        let mac = key.mac(&Value::Array(inline).to_string());
+        map.insert("contentMac".to_owned(), Value::String(mac));
+    }
+    map.insert("content".to_owned(), Value::Array(kept));
 }
 
 /// Drop the sub-microsecond part v3 records do not store.
@@ -2869,14 +3378,13 @@ struct ConversationDraft {
 /// rotating plaintext files at [`JOURNAL_SEGMENT_BYTES`] like appends do.
 pub(super) struct PlainJournalWriter {
     directory: PathBuf,
-    codec: ContentCodec,
     writer: tokio::io::BufWriter<tokio::fs::File>,
     bytes: u64,
     sealed: u64,
 }
 
 impl PlainJournalWriter {
-    async fn create(directory: &Path, codec: ContentCodec) -> Result<Self, AppError> {
+    async fn create(directory: &Path) -> Result<Self, AppError> {
         let path = directory.join(EVENTS_FILE);
         let file = tokio::fs::OpenOptions::new()
             .create_new(true)
@@ -2886,18 +3394,22 @@ impl PlainJournalWriter {
         set_owner_only(&path, false).await?;
         Ok(Self {
             directory: directory.to_owned(),
-            codec,
             writer: tokio::io::BufWriter::with_capacity(JOURNAL_SCAN_BUFFER_BYTES, file),
             bytes: 0,
             sealed: 0,
         })
     }
 
+    /// Whether any record was written.
+    fn wrote_records(&self) -> bool {
+        self.bytes > 0 || self.sealed > 0
+    }
+
     async fn write(&mut self, event: &ConversationEvent) -> Result<(), AppError> {
         if self.bytes >= JOURNAL_SEGMENT_BYTES {
             self.seal().await?;
         }
-        let mut line = encode_record(event, self.codec)?;
+        let mut line = encode_record(event)?;
         line.push(b'\n');
         self.writer.write_all(&line).await?;
         self.bytes += line.len() as u64;
@@ -3218,6 +3730,29 @@ async fn write_atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), A
     tokio::fs::rename(&temporary, path).await?;
     set_owner_only(path, false).await?;
     sync_directory(parent).await
+}
+
+/// Keep the sealed frames a fork's copied records refer to in its
+/// [`COPIED_FRAMES_DIR`].
+async fn write_copied_frames(
+    directory: &Path,
+    frames: &serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    let target = directory.join(COPIED_FRAMES_DIR);
+    tokio::fs::create_dir_all(&target).await?;
+    set_owner_only(&target, true).await?;
+    for (id, frame) in frames {
+        if !valid_frame_id(id) {
+            return Err(AppError::InvalidRequest(format!(
+                "invalid history frame id {id}"
+            )));
+        }
+        write_atomic_json(&target.join(format!("{id}.json")), frame).await?;
+    }
+    Ok(())
 }
 
 /// Append the newline an interrupted write left off the final record.

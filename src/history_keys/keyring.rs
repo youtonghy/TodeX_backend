@@ -233,6 +233,25 @@ impl KeyringStore {
         })
     }
 
+    /// Copies every key of `conversation_id` into `directory/keyring.json`
+    /// (a fork being assembled before it is published), so ciphertext the
+    /// fork copied stays readable through the fork's own id. Returns whether
+    /// the source had a keyring.
+    pub(crate) async fn copy_into(&self, conversation_id: &str, directory: &Path) -> Result<bool> {
+        let source = self.path(conversation_id)?;
+        let target = directory.join(FILE_NAME);
+        let lock = self.lock_for(conversation_id);
+        let _guard = lock.lock().await;
+        blocking(move || match read_keyring(&source)? {
+            Some(file) if !file.keys.is_empty() => {
+                write_keyring(&target, &file)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        })
+        .await
+    }
+
     pub(crate) fn path(&self, conversation_id: &str) -> Result<PathBuf> {
         validate_conversation_id(conversation_id)?;
         Ok(self.root.join(conversation_id).join(FILE_NAME))

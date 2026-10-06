@@ -37,6 +37,10 @@ struct ConversationKeys {
     active: Option<ActiveKey>,
     /// Rotated keys whose segment is not sealed yet, by kid.
     retained: HashMap<String, Arc<SegmentKey>>,
+    /// The most recently created key, while it is still in memory: what a
+    /// running turn keeps encrypting under when no new key can be created
+    /// (see [`DekManager::fallback_key`]).
+    newest: Option<String>,
 }
 
 impl ConversationKeys {
@@ -92,9 +96,7 @@ impl DekManager {
         }
         keys.retire_active();
         if recipients.keys.is_empty() {
-            return Err(AppError::Conflict(
-                "history encryption has no active recipients".to_owned(),
-            ));
+            return Err(no_recipients());
         }
         let key = SegmentKey::generate();
         let kid = encode_id(&key.kid());
@@ -115,6 +117,7 @@ impl DekManager {
             )
             .await?;
         let key = Arc::new(key);
+        keys.newest = Some(kid.clone());
         keys.active = Some(ActiveKey {
             kid: kid.clone(),
             key: key.clone(),
@@ -122,6 +125,80 @@ impl DekManager {
             created_at: now,
         });
         Ok(Some((kid, key)))
+    }
+
+    /// A one-off key for content that must never share a nonce with the
+    /// event streams — an encrypted title (stream 2, counter 0) or a
+    /// migrated segment's frames. Like [`Self::current_key`] it is wrapped
+    /// for every active recipient and durable in the keyring before it is
+    /// returned, but it is not kept: the caller drops (and so zeroizes) it.
+    /// `None` while history encryption is off.
+    pub(crate) async fn fresh_key(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(String, SegmentKey)>> {
+        self.keyrings.path(conversation_id)?;
+        let recipients = self.recipients.active_recipients()?;
+        if recipients.mode == HistoryEncryption::Off {
+            return Ok(None);
+        }
+        if recipients.keys.is_empty() {
+            return Err(no_recipients());
+        }
+        let key = SegmentKey::generate();
+        let kid = encode_id(&key.kid());
+        let wraps = recipients
+            .keys
+            .iter()
+            .map(|recipient| history_crypto::wrap(&key, recipient))
+            .collect::<Result<Vec<_>>>()?;
+        self.keyrings
+            .add_key(
+                conversation_id,
+                KeyEntry {
+                    kid: kid.clone(),
+                    created_at: (self.clock)(),
+                    epoch: recipients.epoch,
+                    wraps,
+                },
+            )
+            .await?;
+        Ok(Some((kid, key)))
+    }
+
+    /// The newest key of `conversation_id` still in memory, active or
+    /// retired. A running turn whose [`Self::current_key`] fails (every
+    /// recipient was revoked, the keyring cannot be written) keeps
+    /// encrypting under it rather than writing plaintext; `None` once the
+    /// daemon restarted or the key's segment was sealed.
+    pub(crate) async fn fallback_key(
+        &self,
+        conversation_id: &str,
+    ) -> Option<(String, Arc<SegmentKey>)> {
+        let slot = self.existing_slot(conversation_id)?;
+        let keys = slot.lock().await;
+        let kid = keys.newest.as_ref()?;
+        match &keys.active {
+            Some(active) if &active.kid == kid => Some((kid.clone(), active.key.clone())),
+            _ => keys.retained.get(kid).map(|key| (kid.clone(), key.clone())),
+        }
+    }
+
+    /// Every key of `conversation_id` still in memory (active and retired),
+    /// by kid: what a segment build may repack with.
+    pub(crate) async fn keys_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> HashMap<String, Arc<SegmentKey>> {
+        let Some(slot) = self.existing_slot(conversation_id) else {
+            return HashMap::new();
+        };
+        let keys = slot.lock().await;
+        let mut snapshot = keys.retained.clone();
+        if let Some(active) = &keys.active {
+            snapshot.insert(active.kid.clone(), active.key.clone());
+        }
+        snapshot
     }
 
     /// Ends the active key (the active segment was sealed); the next write
@@ -162,6 +239,9 @@ impl DekManager {
                 keys.active = None;
             }
             keys.retained.retain(|kid, _| !kids.contains(kid));
+            if keys.newest.as_ref().is_some_and(|kid| kids.contains(kid)) {
+                keys.newest = None;
+            }
             keys.active.is_none() && keys.retained.is_empty()
         };
         if empty {
@@ -192,6 +272,16 @@ impl DekManager {
             .get(conversation_id)
             .map(|slot| slot.clone())
     }
+}
+
+/// `CONFLICT`: nobody could read what would be encrypted. New prompts are
+/// refused with it; see `ConversationStore::ensure_history_writable`.
+fn no_recipients() -> AppError {
+    AppError::Conflict(
+        "history encryption has no active recipients; register a device key \
+         (history.recipient.register) or disable history encryption"
+            .to_owned(),
+    )
 }
 
 #[cfg(test)]
