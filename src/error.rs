@@ -52,6 +52,9 @@ pub enum AppError {
     ResourceExhausted(String),
     #[error("conversation history is full: {0}")]
     JournalFull(String),
+    /// The client cannot read end-to-end encrypted history.
+    #[error("client upgrade required: {0}")]
+    ClientUpgradeRequired(String),
     #[error("provider unavailable: {0}")]
     ProviderUnavailable(String),
     #[error("remote authentication failed: {0}")]
@@ -103,6 +106,7 @@ impl AppError {
             Self::TurnCancelled => "TURN_CANCELLED",
             Self::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
             Self::JournalFull(_) => "JOURNAL_FULL",
+            Self::ClientUpgradeRequired(_) => "CLIENT_UPGRADE_REQUIRED",
             Self::ProviderUnavailable(_) => "PROVIDER_UNAVAILABLE",
             Self::RemoteAuthFailed(_) => "REMOTE_AUTH_FAILED",
             Self::RemoteHostKeyUnverified(_) => "REMOTE_HOST_KEY_UNVERIFIED",
@@ -142,6 +146,7 @@ impl IntoResponse for AppError {
             Self::TurnCancelled => StatusCode::CONFLICT,
             Self::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::JournalFull(_) => StatusCode::INSUFFICIENT_STORAGE,
+            Self::ClientUpgradeRequired(_) => StatusCode::UPGRADE_REQUIRED,
             Self::ProviderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             // Not 401: clients treat that as a failed device signature.
             Self::RemoteAuthFailed(_) | Self::RemoteHostKeyUnverified(_) => StatusCode::FORBIDDEN,

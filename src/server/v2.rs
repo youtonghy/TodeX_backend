@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::warn;
 
 use crate::app_state::AppState;
+use crate::config::HistoryEncryption;
 use crate::conversation::{ConversationManifest, ConversationSubscription, ProviderKind};
 use crate::device_auth;
 use crate::error::AppError;
@@ -37,6 +38,7 @@ use crate::workspace_store::{RejectedWorkspace, WorkspaceRecord};
 
 use super::agent_providers;
 use super::git;
+use super::history_keys;
 use super::websocket::{self, AuthContext};
 
 /// Maximum WebSocket message size for the unified `/v2/ws` socket (8MB).
@@ -103,6 +105,18 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "mcp.call"
             | "server.ping"
             | "session.resume"
+            | "history.encryption.get"
+            | "history.encryption.enable"
+            | "history.encryption.disable"
+            | "history.recipient.register"
+            | "history.recipient.revoke"
+            | "history.recovery.set"
+            | "history.grant.request"
+            | "history.grant.list"
+            | "history.grant.dismiss"
+            | "history.grant.fulfill"
+            | "history.keys.list"
+            | "history.keys.wraps"
     )
 }
 
@@ -266,6 +280,7 @@ pub(super) async fn version(State(state): State<AppState>) -> Json<VersionRespon
             .iter()
             .map(|root| root.display().to_string())
             .collect(),
+        history_encryption: HISTORY_ENCRYPTION_VERSION,
     })
 }
 
@@ -1984,6 +1999,12 @@ async fn replay_conversation(
     Query(query): Query<ReplayQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
+    ensure_history_client(
+        &state,
+        query
+            .history_encryption
+            .is_some_and(|version| version >= HISTORY_ENCRYPTION_VERSION),
+    )?;
     let summary = summary_detail(query.detail.as_deref())?;
     let limit = query.limit.unwrap_or(200);
     // `beforeSequence` pages backwards through the journal for lazy history
@@ -2109,10 +2130,41 @@ async fn ws(
     // parameters) so the encrypted channel is bound to the device identity.
     let auth = require_auth(&state, &headers)?;
     let crypto = websocket::transport_crypto_from_handshake(&state, &headers, uri.query())?;
+    let history_encryption = declares_history_encryption(uri.query());
     Ok(ws
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_socket(state, socket, crypto, auth)))
+        .on_upgrade(move |socket| handle_socket(state, socket, crypto, auth, history_encryption)))
+}
+
+/// History crypto version the client can decrypt (spec §5.4).
+const HISTORY_ENCRYPTION_VERSION: u8 = 1;
+
+/// Whether the client declared `historyEncryption=1` (or later) in the query
+/// of the `/v2/ws` handshake (covered by the device signature) or of an HTTP
+/// history request.
+fn declares_history_encryption(query: Option<&str>) -> bool {
+    query
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter_map(|pair| pair.split_once('='))
+        .any(|(key, value)| {
+            key == "historyEncryption"
+                && value
+                    .parse::<u8>()
+                    .is_ok_and(|version| version >= HISTORY_ENCRYPTION_VERSION)
+        })
+}
+
+/// With history encryption on, history only goes to clients that declared
+/// they can decrypt it; older clients get `CLIENT_UPGRADE_REQUIRED`.
+fn ensure_history_client(state: &AppState, declared: bool) -> Result<(), AppError> {
+    if declared || state.history_keys.recipients().mode()? == HistoryEncryption::Off {
+        return Ok(());
+    }
+    Err(AppError::ClientUpgradeRequired(
+        "conversation history is end-to-end encrypted; update this client".to_owned(),
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2164,6 +2216,7 @@ async fn handle_socket(
     socket: WebSocket,
     crypto: Option<TransportCryptoSession>,
     auth: AuthContext,
+    history_encryption: bool,
 ) {
     let authenticated = state.config.security.enable_auth;
     let active_connections = state.increment_websocket_connections();
@@ -2289,6 +2342,7 @@ async fn handle_socket(
     });
 
     let mut subscriptions = WsSubscriptions::new();
+    subscriptions.history_encryption = history_encryption;
     let mut browser_watches: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let operation_limit = Arc::new(Semaphore::new(MAX_WS_IN_FLIGHT_OPERATIONS));
     let mut operation_tasks = Vec::new();
@@ -2608,6 +2662,8 @@ struct WsSubscriptions {
     /// Bounds concurrent backfills so a reconnect burst does not page every
     /// journal into memory at once.
     backfill_permits: Arc<Semaphore>,
+    /// The client declared `historyEncryption` in the handshake.
+    history_encryption: bool,
 }
 
 impl WsSubscriptions {
@@ -2616,6 +2672,7 @@ impl WsSubscriptions {
             active: Arc::new(Mutex::new(HashSet::new())),
             tasks: HashMap::new(),
             backfill_permits: Arc::new(Semaphore::new(MAX_WS_CONCURRENT_BACKFILLS)),
+            history_encryption: false,
         }
     }
 
@@ -2940,6 +2997,7 @@ async fn start_subscription(
 ) -> Result<Option<Value>, AppError> {
     let request: SubscribeRequest = serde_json::from_value(command.payload.clone())?;
     let summary = summary_detail(request.detail.as_deref())?;
+    ensure_history_client(state, subscriptions.history_encryption)?;
     state
         .conversations
         .get_owned(owner_id, &request.conversation_id)
@@ -3245,6 +3303,9 @@ async fn dispatch_command_inner(
             dispatch_mcp_command(state, owner_id, command).await
         }
         "server.ping" => Ok(json!({ "pong": true })),
+        command_type if history_keys::is_history_command(command_type) => {
+            history_keys::dispatch(state, owner_id, device_id, command_type, &command.payload).await
+        }
         "session.resume" => {
             // Replaces the transport-hello session cursor replay: grant this
             // connection visibility for still-existing Codex sessions and
@@ -3465,6 +3526,10 @@ pub(super) struct VersionResponse {
     data_dir: String,
     workspace_root: String,
     workspace_roots: Vec<String>,
+    /// History crypto version this backend speaks; clients declare theirs
+    /// with `historyEncryption` on `/v2/ws` and history requests.
+    #[serde(rename = "historyEncryption")]
+    history_encryption: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3632,6 +3697,9 @@ struct ReplayQuery {
     /// full payloads for a sequence range on demand.
     #[serde(default)]
     detail: Option<String>,
+    /// History crypto version the client can decrypt (spec §5.4).
+    #[serde(default)]
+    history_encryption: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7838,5 +7906,396 @@ mod tests {
         let root = std::env::temp_dir().join(format!("todex-{name}-{nonce}"));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn history_encryption_declaration_is_read_from_the_query() {
+        assert!(declares_history_encryption(Some(
+            "enc=x&historyEncryption=1"
+        )));
+        assert!(declares_history_encryption(Some("historyEncryption=2")));
+        assert!(!declares_history_encryption(Some("historyEncryption=0")));
+        assert!(!declares_history_encryption(Some("historyEncryption=yes")));
+        assert!(!declares_history_encryption(Some("xhistoryEncryption=1")));
+        assert!(!declares_history_encryption(None));
+        for command in super::history_keys::HISTORY_COMMANDS {
+            assert!(is_v2_native_command(command), "{command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_history_key_commands_cover_registration_grants_and_revocation() {
+        Box::pin(history_key_commands_scenario()).await;
+    }
+
+    /// One dispatch per call frame: in debug builds every inlined
+    /// `dispatch_command_inner` future would get its own stack slot.
+    async fn history_command(
+        state: &AppState,
+        outgoing: &mpsc::Sender<Value>,
+        subscriptions: &mut WsSubscriptions,
+        event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
+        device_id: &str,
+        command_type: &str,
+        payload: Value,
+    ) -> Result<Value, AppError> {
+        Box::pin(dispatch_command_inner(
+            state,
+            outgoing,
+            subscriptions,
+            event_scope,
+            "local",
+            device_id,
+            &V2Command {
+                id: "history".to_owned(),
+                command_type: command_type.to_owned(),
+                payload,
+            },
+        ))
+        .await
+    }
+
+    async fn history_key_commands_scenario() {
+        use crate::history_crypto::{self, ContentStream, WrappedKey};
+        use crate::history_keys::test_support::{public_key_text, recipient, seed};
+        use crate::history_keys::{decode_id, encode_id};
+
+        let root = make_temp_workspace("v2-history-keys");
+        let state = Box::pin(auth_test_state(&root)).await;
+        let data_dir = root.join("data");
+        let devices = crate::devices::DeviceRegistry::load(&data_dir).unwrap();
+        let pair = |byte: u8| {
+            let signing = ed25519_dalek::SigningKey::from_bytes(&[byte; 32]);
+            devices
+                .register("Device", &signing.verifying_key().to_bytes())
+                .unwrap()
+                .device_id
+        };
+        let (a, b) = (pair(1), pair(2));
+        let manifest = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::ClaudeCode,
+                root.join("workspaces").join("project"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let conversation = manifest.id.clone();
+        let (outgoing, _events) = mpsc::channel(16);
+        let mut subscriptions = WsSubscriptions::new();
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        macro_rules! run {
+            ($device:expr, $type:expr, $payload:expr $(,)?) => {{
+                assert!(is_v2_native_command($type));
+                history_command(
+                    &state,
+                    &outgoing,
+                    &mut subscriptions,
+                    &event_scope,
+                    $device,
+                    $type,
+                    $payload,
+                )
+                .await
+            }};
+        }
+        let code = |result: Result<Value, AppError>| result.unwrap_err().code();
+
+        let initial = run!(&a, "history.encryption.get", Value::Null).unwrap();
+        assert_eq!(initial["mode"], "off");
+        assert_eq!(initial["epoch"], 0);
+        assert!(initial.get("myRid").is_none());
+        assert_eq!(
+            code(run!("dev_ghost", "history.encryption.get", json!({}))),
+            "UNAUTHENTICATED"
+        );
+        assert_eq!(
+            code(run!(&a, "history.encryption.enable", json!({}))),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            code(run!(&a, "history.encryption.get", json!({ "extra": 1 }))),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            code(run!(
+                &a,
+                "history.recipient.register",
+                json!({ "publicKey": "AAAA" })
+            )),
+            "INVALID_REQUEST"
+        );
+
+        let rid_a = run!(
+            &a,
+            "history.recipient.register",
+            json!({ "publicKey": public_key_text(1) }),
+        )
+        .unwrap()["rid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            run!(
+                &a,
+                "history.recipient.register",
+                json!({ "publicKey": public_key_text(1) }),
+            )
+            .unwrap()["rid"],
+            rid_a
+        );
+        let enabled = run!(&a, "history.encryption.enable", json!({})).unwrap();
+        assert_eq!(enabled["mode"], "e2e");
+        assert_eq!(enabled["myRid"], rid_a);
+        let rid_recovery = run!(
+            &a,
+            "history.recovery.set",
+            json!({ "publicKey": public_key_text(9) }),
+        )
+        .unwrap()["rid"]
+            .clone();
+        assert_eq!(rid_recovery, encode_id(&recipient(9).rid()));
+
+        // The first encrypted write creates a key wrapped for A and recovery.
+        let (kid, key) = state
+            .history_keys
+            .deks()
+            .current_key(&conversation)
+            .await
+            .unwrap()
+            .unwrap();
+        let listed = run!(&a, "history.keys.list", json!({})).unwrap();
+        assert_eq!(
+            listed,
+            json!({ "items": [{ "conversationId": conversation, "kid": kid }] })
+        );
+        assert_eq!(
+            code(run!(&a, "history.keys.list", json!({ "limit": 501 }))),
+            "INVALID_REQUEST"
+        );
+        let wraps = run!(
+            &a,
+            "history.keys.wraps",
+            json!({ "conversationId": conversation, "kids": [kid] }),
+        )
+        .unwrap();
+        let mine: WrappedKey = serde_json::from_value(wraps["wraps"][&kid].clone()).unwrap();
+        let kid_bytes = decode_id(&kid, "kid").unwrap();
+        let unwrapped = history_crypto::unwrap_for_tests(seed(1), &mine, kid_bytes).unwrap();
+        let sealed =
+            history_crypto::seal(&key, &conversation, ContentStream::EventFull, 1, b"x").unwrap();
+        assert_eq!(
+            history_crypto::open(
+                &unwrapped,
+                &conversation,
+                ContentStream::EventFull,
+                1,
+                &sealed
+            )
+            .unwrap(),
+            b"x"
+        );
+
+        // B joins and asks for old history; A re-wraps for B.
+        let rid_b = run!(
+            &b,
+            "history.recipient.register",
+            json!({ "publicKey": public_key_text(2) }),
+        )
+        .unwrap()["rid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let grant = run!(&b, "history.grant.request", json!({})).unwrap()["grantId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let grants = run!(&a, "history.grant.list", json!({})).unwrap();
+        assert_eq!(grants["grants"][0]["grantId"], grant);
+        assert_eq!(grants["grants"][0]["status"], "pending");
+        assert_eq!(grants["grants"][0]["publicKey"], public_key_text(2));
+        let for_b = history_crypto::wrap(&unwrapped, &recipient(2)).unwrap();
+        let for_other = history_crypto::wrap(&unwrapped, &recipient(3)).unwrap();
+        let fulfill = |grant: Option<&str>, rid: &str, wrapped: &WrappedKey, kid: &str| {
+            let mut payload = json!({
+                "rid": rid,
+                "wraps": [{ "conversationId": conversation, "kid": kid, "wrapped": wrapped }],
+            });
+            if let Some(grant) = grant {
+                payload["grantId"] = json!(grant);
+            }
+            payload
+        };
+        assert_eq!(
+            code(run!(
+                &a,
+                "history.grant.fulfill",
+                fulfill(Some(&grant), &rid_a, &mine, &kid),
+            )),
+            "UNAUTHORIZED"
+        );
+        assert_eq!(
+            code(run!(
+                &a,
+                "history.grant.fulfill",
+                fulfill(Some(&grant), &rid_b, &for_other, &kid),
+            )),
+            "INVALID_REQUEST"
+        );
+        let unknown_kid = encode_id(&[0; 16]);
+        assert_eq!(
+            code(run!(
+                &a,
+                "history.grant.fulfill",
+                fulfill(Some(&grant), &rid_b, &for_b, &unknown_kid),
+            )),
+            "NOT_FOUND"
+        );
+        let too_many = json!({
+            "grantId": grant,
+            "rid": rid_b,
+            "wraps": vec![json!({ "conversationId": conversation, "kid": kid, "wrapped": for_b }); 501],
+        });
+        assert_eq!(
+            code(run!(&a, "history.grant.fulfill", too_many)),
+            "INVALID_REQUEST"
+        );
+        let mut payload = fulfill(Some(&grant), &rid_b, &for_b, &kid);
+        payload["complete"] = json!(true);
+        assert_eq!(
+            run!(&a, "history.grant.fulfill", payload.clone()).unwrap(),
+            json!({ "added": 1 })
+        );
+        // The grant is settled; repeating it is refused.
+        assert_eq!(code(run!(&a, "history.grant.fulfill", payload)), "CONFLICT");
+        let mine_b = run!(
+            &b,
+            "history.keys.wraps",
+            json!({ "conversationId": conversation, "kids": [kid] }),
+        )
+        .unwrap();
+        let mine_b: WrappedKey = serde_json::from_value(mine_b["wraps"][&kid].clone()).unwrap();
+        history_crypto::unwrap_for_tests(seed(2), &mine_b, kid_bytes).unwrap();
+
+        // Without a grant, wraps may only target the caller itself.
+        assert_eq!(
+            code(run!(
+                &b,
+                "history.grant.fulfill",
+                fulfill(None, &rid_a, &mine, &kid),
+            )),
+            "UNAUTHORIZED"
+        );
+        assert_eq!(
+            run!(
+                &b,
+                "history.grant.fulfill",
+                fulfill(None, &rid_b, &for_b, &kid)
+            )
+            .unwrap(),
+            json!({ "added": 0 })
+        );
+        assert_eq!(
+            code(run!(
+                &a,
+                "history.grant.dismiss",
+                json!({ "grantId": "grt_missing" })
+            )),
+            "NOT_FOUND"
+        );
+
+        let before = run!(&a, "history.encryption.get", json!({})).unwrap()["epoch"]
+            .as_u64()
+            .unwrap();
+        let revoked = run!(&a, "history.recipient.revoke", json!({ "rid": rid_b })).unwrap();
+        assert_eq!(revoked["epoch"], before + 1);
+        assert!(revoked["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["rid"] == rid_b && !record["revokedAt"].is_null()));
+
+        // Revoking A's device revokes its recipient and its access.
+        assert!(crate::devices::revoke_device(&data_dir, &a).unwrap());
+        assert_eq!(
+            code(run!(&a, "history.encryption.get", json!({}))),
+            "UNAUTHENTICATED"
+        );
+        assert!(!state.history_keys.recipients().is_active(&rid_a).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_e2e_history_requires_declared_clients() {
+        use crate::history_keys::test_support::recipient;
+
+        let root = make_temp_workspace("v2-history-gate");
+        let state = Box::pin(auth_test_state(&root)).await;
+        let manifest = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::ClaudeCode,
+                root.join("workspaces").join("project"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (outgoing, _events) = mpsc::channel(16);
+        let mut subscriptions = WsSubscriptions::new();
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        let subscribe = || V2Command {
+            id: "sub".to_owned(),
+            command_type: "conversation.subscribe".to_owned(),
+            payload: json!({ "conversationId": manifest.id }),
+        };
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let device = crate::devices::DeviceRegistry::load(&root.join("data"))
+            .unwrap()
+            .register("Phone", &signing.verifying_key().to_bytes())
+            .unwrap();
+        let registry = state.history_keys.recipients();
+        registry
+            .register_device(&device.device_id, &recipient(1))
+            .unwrap();
+        registry
+            .set_mode(crate::config::HistoryEncryption::E2e)
+            .unwrap();
+        let refused = dispatch_command(
+            &state,
+            &outgoing,
+            &mut subscriptions,
+            &event_scope,
+            "local",
+            "local",
+            subscribe(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["payload"]["code"], "CLIENT_UPGRADE_REQUIRED");
+        assert!(subscriptions.active.lock().await.is_empty());
+
+        subscriptions.history_encryption = true;
+        let accepted = dispatch_command(
+            &state,
+            &outgoing,
+            &mut subscriptions,
+            &event_scope,
+            "local",
+            "local",
+            subscribe(),
+        )
+        .await;
+        assert!(accepted.is_none(), "the subscription task answers");
+        subscriptions.abort_all();
+        let _ = fs::remove_dir_all(root);
     }
 }

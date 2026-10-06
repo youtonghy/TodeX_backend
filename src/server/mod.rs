@@ -2,6 +2,7 @@ mod agent_desktop;
 mod agent_providers;
 mod device_pairing;
 mod git;
+mod history_keys;
 pub mod protocol;
 mod quota;
 mod remote;
