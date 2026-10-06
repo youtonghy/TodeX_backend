@@ -14,8 +14,10 @@ use tokio::time::Instant;
 /// Merged fragments are held back at most this long; it bounds the extra live
 /// latency coalescing adds.
 pub const DELTA_COALESCE_WINDOW: Duration = Duration::from_millis(100);
-/// Merged text stays below the journal compaction string limit.
-pub const DELTA_COALESCE_MAX_BYTES: usize = 2 * 1024;
+/// Bounds the text of one merged event. Compaction replaces old stream
+/// fragments with markers wholesale, so its string limit does not apply; a
+/// larger window means fewer per-event envelopes in the journal.
+pub const DELTA_COALESCE_MAX_BYTES: usize = 16 * 1024;
 
 /// Identity and text location of one streaming fragment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,6 +224,21 @@ mod tests {
             pending.try_append("message.delta", &key, overflow.clone()),
             Err(overflow)
         );
+    }
+
+    #[tokio::test]
+    async fn one_window_holds_up_to_sixteen_kib_of_text() {
+        assert_eq!(DELTA_COALESCE_MAX_BYTES, 16 * 1024);
+        let first = json!({"delta": "x".repeat(1024)});
+        let key = fragment(&first);
+        let mut pending = PendingDelta::new((), "thought.delta", key.clone(), first);
+        for _ in 1..16 {
+            pending
+                .try_append("thought.delta", &key, json!({"delta": "x".repeat(1024)}))
+                .unwrap();
+        }
+        let (_, _, payload) = pending.into_parts();
+        assert_eq!(payload["delta"].as_str().unwrap().len(), 16 * 1024);
     }
 
     #[tokio::test]

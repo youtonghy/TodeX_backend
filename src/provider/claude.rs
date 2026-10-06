@@ -770,7 +770,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn stream_text_merges_per_content_block_and_keeps_tool_json_fragments() {
+    async fn stream_text_and_tool_json_merge_per_content_block() {
         let root = std::env::temp_dir().join(format!(
             "todex-claude-deltas-{}",
             uuid::Uuid::new_v4().simple()
@@ -808,7 +808,16 @@ mod tests {
                 3,
                 json!({"type":"input_json_delta","partial_json":"{\"a\""}),
             ),
-            delta(3, json!({"type":"input_json_delta","partial_json":":1}"})),
+            delta(3, json!({"type":"input_json_delta","partial_json":":1"})),
+            // Another tool block interleaves; neither block absorbs the other.
+            delta(
+                4,
+                json!({"type":"input_json_delta","partial_json":"{\"b\""}),
+            ),
+            delta(3, json!({"type":"input_json_delta","partial_json":"}"})),
+            delta(4, json!({"type":"input_json_delta","partial_json":":2}"})),
+            delta(4, json!({"type":"signature_delta","signature":"s1"})),
+            delta(4, json!({"type":"signature_delta","signature":"s2"})),
         ] {
             handle_stream_event(&message, "turn-1", &mut tools, &sink)
                 .await
@@ -837,11 +846,27 @@ mod tests {
                 ),
                 (
                     "message.delta",
-                    json!({"type":"input_json_delta","partial_json":"{\"a\""})
+                    json!({"type":"input_json_delta","partial_json":"{\"a\":1"})
                 ),
                 (
                     "message.delta",
-                    json!({"type":"input_json_delta","partial_json":":1}"})
+                    json!({"type":"input_json_delta","partial_json":"{\"b\""})
+                ),
+                (
+                    "message.delta",
+                    json!({"type":"input_json_delta","partial_json":"}"})
+                ),
+                (
+                    "message.delta",
+                    json!({"type":"input_json_delta","partial_json":":2}"})
+                ),
+                (
+                    "message.delta",
+                    json!({"type":"signature_delta","signature":"s1"})
+                ),
+                (
+                    "message.delta",
+                    json!({"type":"signature_delta","signature":"s2"})
                 ),
                 ("message.completed", serde_json::Value::Null),
             ]
@@ -2422,11 +2447,13 @@ async fn handle_stream_event(
             };
             let subagent = message.get("parent_tool_use_id").and_then(Value::as_str);
             let payload = json!({ "provider": "claude-code", "role": "assistant", "delta": delta, "subagentId": subagent });
-            // Only text and thinking merge; tool-argument JSON and signatures
-            // stay one event per fragment.
+            // Text, thinking and tool-argument JSON merge per content block
+            // (concatenated `partial_json` is still the same JSON prefix);
+            // signatures stay one event per fragment.
             let text: Option<&'static [&'static str]> = match delta_type {
                 Some("text_delta") => Some(&["/delta/text"]),
                 Some("thinking_delta") => Some(&["/delta/thinking"]),
+                Some("input_json_delta") => Some(&["/delta/partial_json"]),
                 _ => None,
             };
             match text {
