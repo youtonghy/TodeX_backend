@@ -3756,6 +3756,10 @@ async fn set_owner_only(path: &Path, directory: bool) -> Result<(), AppError> {
 mod v3_tests;
 
 #[cfg(test)]
+#[path = "store_v3_bench.rs"]
+mod v3_bench;
+
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::time::Duration;
