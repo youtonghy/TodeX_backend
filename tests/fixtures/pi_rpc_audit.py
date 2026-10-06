@@ -57,6 +57,51 @@ def finish(reason='stop', text='answer'):
     out({'type': 'agent_end'})
     out({'type': 'agent_settled'})
 
+def stream_with_tool():
+    # Real Pi stream shape: every assistantMessageEvent repeats `partial`, the
+    # whole message so far with a zero usage/cost object, and each tool
+    # execution update repeats args plus the accumulated partialResult.
+    zero = {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0, 'totalTokens': 0,
+            'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0, 'total': 0}}
+    content = []
+    def partial():
+        return {'role': 'assistant', 'content': content, 'api': 'fixture', 'provider': 'fixture',
+                'model': 'text', 'usage': zero, 'stopReason': 'stop', 'timestamp': 123456}
+    def update(event):
+        event['partial'] = partial()
+        out({'type': 'message_update', 'assistantMessageEvent': event})
+    out({'type': 'message_start', 'message': {'role': 'assistant'}})
+    content.append({'type': 'thinking', 'thinking': ''})
+    update({'type': 'thinking_start', 'contentIndex': 0})
+    for index in range(50):
+        token = 't%02d' % index
+        content[0]['thinking'] += token
+        update({'type': 'thinking_delta', 'contentIndex': 0, 'delta': token})
+    update({'type': 'thinking_end', 'contentIndex': 0, 'content': content[0]['thinking']})
+    content.append({'type': 'text', 'text': ''})
+    update({'type': 'text_start', 'contentIndex': 1})
+    for token in ['Run', 'ning', ' it']:
+        content[1]['text'] += token
+        update({'type': 'text_delta', 'contentIndex': 1, 'delta': token})
+    update({'type': 'text_end', 'contentIndex': 1, 'content': content[1]['text']})
+    call = {'type': 'toolCall', 'id': 'call-1', 'name': 'bash', 'arguments': {'command': 'make'}}
+    content.append(call)
+    update({'type': 'toolcall_start', 'contentIndex': 2, 'id': 'call-1', 'toolName': 'bash'})
+    update({'type': 'toolcall_end', 'contentIndex': 2, 'toolCall': call})
+    out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'toolUse', 'content': content, 'usage': {'input': 5, 'output': 7}}})
+    args = {'command': 'make'}
+    out({'type': 'tool_execution_start', 'toolCallId': 'call-1', 'toolName': 'bash', 'args': args})
+    output = ''
+    for index in range(25):
+        if index == 20:
+            time.sleep(0.6)
+        output += 'line %d\n' % index
+        out({'type': 'tool_execution_update', 'toolCallId': 'call-1', 'toolName': 'bash', 'args': args,
+             'partialResult': {'content': [{'type': 'text', 'text': output}]}})
+    out({'type': 'tool_execution_end', 'toolCallId': 'call-1', 'toolName': 'bash',
+         'result': {'content': [{'type': 'text', 'text': output}]}, 'isError': False})
+    finish()
+
 def update_queue():
     out({'type': 'queue_update', 'steering': steering[:], 'followUp': queue[:]})
 
@@ -87,6 +132,8 @@ for line in sys.stdin:
                     out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': reason, 'content': [{'type': 'text', 'text': 'part'}]}})
                 streaming = False
                 out({'type': 'agent_settled'})
+            elif scenario == 'stream':
+                stream_with_tool()
             elif scenario == 'dialog':
                 out({'type': 'extension_ui_request', 'id': 'dialog-a', 'method': 'confirm', 'title': 'Expires', 'timeout': 20})
                 out({'type': 'extension_ui_request', 'id': 'dialog-b', 'method': 'confirm', 'title': 'Concurrent', 'timeout': 30})

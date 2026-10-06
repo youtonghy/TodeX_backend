@@ -27,6 +27,9 @@ const PI_UI_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// are merged (shared window and size limits) so the journal does not store
 /// one event per token.
 const PI_DELTA_TEXT: &[&str] = &["/delta/delta"];
+/// Minimum spacing between `tool_execution_update` snapshots of one tool
+/// call, as for ACP: each carries the whole accumulated `partialResult`.
+const PI_TOOL_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct PiDriver {
     binary: String,
@@ -684,7 +687,7 @@ async fn pi_session_worker(
                     continue;
                 }
             };
-            if let Err(error) = rpc.flush_pending_delta().await {
+            if let Err(error) = rpc.flush_streamed().await {
                 tracing::warn!(error = %error, "failed to persist Pi background text");
             }
             let native = turn
@@ -701,8 +704,9 @@ async fn pi_session_worker(
                 result = run_pi_turn(&mut rpc, turn.context, turn.prompt, &sink, &mut controls, &mut requests, &mut queue) => result,
                 _ = shutdown.changed() => Err(AppError::TurnCancelled),
             };
-            // Text streamed right before a cancel or failure still belongs to this turn.
-            if let Err(error) = rpc.flush_pending_delta().await {
+            // Text and tool progress streamed right before a cancel or failure
+            // still belong to this turn.
+            if let Err(error) = rpc.flush_streamed().await {
                 tracing::error!(error = %error, "failed to persist Pi streamed text");
                 if result.is_ok() {
                     result = Err(error);
@@ -773,7 +777,7 @@ async fn pi_session_worker(
     } else {
         reason = "persistence_error".to_owned();
     }
-    if let Err(error) = rpc.flush_pending_delta().await {
+    if let Err(error) = rpc.flush_streamed().await {
         tracing::warn!(error = %error, "failed to persist Pi background text");
     }
     rpc.close_all_dialogs().await;
@@ -1198,10 +1202,8 @@ async fn run_pi_turn(
                 }
             }
             Some("message_update") => {
-                let delta = message
-                    .get("assistantMessageEvent")
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                let event = message.get("assistantMessageEvent").unwrap_or(&Value::Null);
+                let delta = slim_pi_stream_event(event);
                 let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
                 // Argument fragments carry no tool call id on the wire; they
                 // would surface as an orphan card next to the execution events.
@@ -1228,7 +1230,7 @@ async fn run_pi_turn(
                     "delta"
                 };
                 let content_index = delta.get("contentIndex").and_then(Value::as_u64);
-                let block_id = pi_delta_block_id(&delta, &active_message_id, category);
+                let block_id = pi_delta_block_id(event, &active_message_id, category);
                 note_pi_text_block(&mut rpc.streamed_text_blocks, category, &block_id);
                 // Streaming frames carry no final usage; `usage.updated` reports it.
                 let mut payload = json!({
@@ -1265,11 +1267,8 @@ async fn run_pi_turn(
             }
             Some("tool_execution_update") => {
                 cache_pi_tool_args(&mut rpc.tool_args, &message);
-                sink.emit(
-                    "tool.updated",
-                    pi_tool_payload(&message, &prompt.turn_id, "delta", &rpc.tool_args),
-                )
-                .await?;
+                let payload = pi_tool_payload(&message, &prompt.turn_id, "delta", &rpc.tool_args);
+                rpc.queue_tool_update(sink, payload).await?;
             }
             Some("tool_execution_end") => {
                 let payload =
@@ -1277,6 +1276,7 @@ async fn run_pi_turn(
                 if let Some(id) = message.get("toolCallId").and_then(Value::as_str) {
                     rpc.tool_args.remove(id);
                 }
+                rpc.finish_tool_updates(&payload).await?;
                 sink.emit("tool.completed", payload).await?;
             }
             Some("response" | "agent_start" | "agent_end" | "turn_start" | "turn_end") => {}
@@ -1590,6 +1590,10 @@ struct PiRpc<'a> {
     /// Latest thinking/text fragment, held back so following fragments of the
     /// same block can be appended. Any other frame flushes it first.
     pending_delta: Option<PendingDelta<DriverEventSink>>,
+    /// Newest throttled `tool.updated` per tool block id, and when that block
+    /// last emitted one (see [`PI_TOOL_UPDATE_INTERVAL`]).
+    tool_pending: HashMap<String, (DriverEventSink, Value)>,
+    tool_emitted_at: HashMap<String, tokio::time::Instant>,
     /// Assistant-text blocks streamed for the open native message. Its final
     /// answer lists them in `block.supersedes` so clients drop the progress
     /// copy instead of showing the answer twice.
@@ -1597,8 +1601,7 @@ struct PiRpc<'a> {
 }
 
 /// Clients append `delta.delta` per block, so a merged fragment renders
-/// exactly like the sequence it replaces. The rest of the delta (Pi's
-/// `partial` snapshot) changes per frame, so identity is the block alone.
+/// exactly like the sequence it replaces. Identity is the block alone.
 fn pi_delta_fragment(payload: &Value) -> DeltaFragment {
     let identity: Vec<_> = ["/block/id", "/delta/type", "/delta/contentIndex"]
         .iter()
@@ -1649,6 +1652,8 @@ impl<'a> PiRpc<'a> {
             ui_pending: HashMap::new(),
             tool_args: HashMap::new(),
             pending_delta: None,
+            tool_pending: HashMap::new(),
+            tool_emitted_at: HashMap::new(),
             streamed_text_blocks: Vec::new(),
         }
     }
@@ -1680,6 +1685,92 @@ impl<'a> PiRpc<'a> {
         if let Some(pending) = self.pending_delta.take() {
             let (sink, event_type, payload) = pending.into_parts();
             sink.emit(event_type, payload).await?;
+        }
+        Ok(())
+    }
+
+    /// Everything held back for the journal: text first, then the newest
+    /// progress of every running tool. Called before a turn ends.
+    async fn flush_streamed(&mut self) -> Result<(), AppError> {
+        self.flush_pending_delta().await?;
+        self.flush_tool_updates(true).await
+    }
+
+    /// `tool.updated` for an execution in progress; within
+    /// [`PI_TOOL_UPDATE_INTERVAL`] of the block's previous one only the newest
+    /// snapshot is kept, journalled by the read loop's timer or a flush.
+    async fn queue_tool_update(
+        &mut self,
+        sink: &DriverEventSink,
+        payload: Value,
+    ) -> Result<(), AppError> {
+        let Some(id) = payload.pointer("/block/id").and_then(Value::as_str) else {
+            return sink.emit("tool.updated", payload).await.map(|_| ());
+        };
+        let id = id.to_owned();
+        let now = tokio::time::Instant::now();
+        if self
+            .tool_emitted_at
+            .get(&id)
+            .is_some_and(|at| now < *at + PI_TOOL_UPDATE_INTERVAL)
+        {
+            self.tool_pending.insert(id, (sink.clone(), payload));
+            return Ok(());
+        }
+        self.tool_pending.remove(&id);
+        sink.emit("tool.updated", payload).await?;
+        self.tool_emitted_at.insert(id, now);
+        Ok(())
+    }
+
+    /// Journals the held-back progress of the tool `completed` closes, so its
+    /// last update still precedes `tool.completed`, and forgets the block.
+    async fn finish_tool_updates(&mut self, completed: &Value) -> Result<(), AppError> {
+        let Some(id) = completed.pointer("/block/id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        self.tool_emitted_at.remove(id);
+        if let Some((sink, payload)) = self.tool_pending.remove(id) {
+            sink.emit("tool.updated", payload).await?;
+        }
+        Ok(())
+    }
+
+    fn tool_flush_deadline(&self) -> Option<tokio::time::Instant> {
+        self.tool_pending
+            .keys()
+            .filter_map(|id| self.tool_emitted_at.get(id))
+            .min()
+            .map(|at| *at + PI_TOOL_UPDATE_INTERVAL)
+    }
+
+    async fn flush_tool_updates(&mut self, force: bool) -> Result<(), AppError> {
+        let now = tokio::time::Instant::now();
+        let due: Vec<_> = self
+            .tool_pending
+            .keys()
+            .filter(|id| {
+                force
+                    || self
+                        .tool_emitted_at
+                        .get(*id)
+                        .is_none_or(|at| now >= *at + PI_TOOL_UPDATE_INTERVAL)
+            })
+            .cloned()
+            .collect();
+        if !due.is_empty() {
+            self.flush_pending_delta().await?;
+        }
+        for id in due {
+            if let Some((sink, payload)) = self.tool_pending.remove(&id) {
+                sink.emit("tool.updated", payload).await?;
+                self.tool_emitted_at.insert(id, now);
+            }
+        }
+        if force {
+            // At a turn boundary; calls that never completed (a cancelled
+            // turn) would otherwise stay tracked for the runtime's lifetime.
+            self.tool_emitted_at.clear();
         }
         Ok(())
     }
@@ -1775,7 +1866,17 @@ impl<'a> PiRpc<'a> {
                 .min()
                 .map(|last| *last + PI_UI_UPDATE_INTERVAL);
             let delta_deadline = self.pending_delta.as_ref().map(PendingDelta::deadline);
+            let tool_deadline = self.tool_flush_deadline();
             let message = tokio::select! {
+                _ = async {
+                    match tool_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.flush_tool_updates(false).await?;
+                    continue;
+                }
                 _ = async {
                     match ui_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -2252,10 +2353,8 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
             }
         }
         Some("message_update") => {
-            let delta = message
-                .get("assistantMessageEvent")
-                .cloned()
-                .unwrap_or(Value::Null);
+            let event = message.get("assistantMessageEvent").unwrap_or(&Value::Null);
+            let delta = slim_pi_stream_event(event);
             let kind = delta.get("type").and_then(Value::as_str).unwrap_or("");
             if kind == "toolcall_delta"
                 || (kind == "toolcall_start" && delta.get("id").and_then(Value::as_str).is_none())
@@ -2281,7 +2380,7 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                 sink.runtime_id().unwrap_or("pi"),
                 rpc.idle_message_sequence
             );
-            let block_id = pi_delta_block_id(&delta, &message_id, category);
+            let block_id = pi_delta_block_id(event, &message_id, category);
             note_pi_text_block(&mut rpc.streamed_text_blocks, category, &block_id);
             let mut payload = json!({"provider":"pi","role":"assistant","delta":delta,
                 "block":{"category":category,"id":block_id,"phase":phase}});
@@ -2312,6 +2411,7 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                 if let Some(id) = message.get("toolCallId").and_then(Value::as_str) {
                     rpc.tool_args.remove(id);
                 }
+                rpc.finish_tool_updates(&payload).await?;
                 sink.emit(kind, payload).await?;
             } else {
                 cache_pi_tool_args(&mut rpc.tool_args, &message);
@@ -2322,7 +2422,11 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                     &rpc.tool_args,
                 );
                 clear_pi_turn_identity(&mut payload);
-                sink.emit(kind, payload).await?;
+                if phase == "delta" {
+                    rpc.queue_tool_update(&sink, payload).await?;
+                } else {
+                    sink.emit(kind, payload).await?;
+                }
             }
         }
         Some("compaction_start" | "compaction_end") => {
@@ -2350,6 +2454,25 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
         }
     }
     Ok(())
+}
+
+/// Pi's stream events repeat `partial`, the whole assistant message so far
+/// (every earlier block plus a usage/cost object), on every frame, so the
+/// journal grew quadratically with the reply. Clients render a frame from
+/// its own `delta`/`content`/`toolCall` and the event's `block`, and the
+/// final message arrives with `message_end`. Block identity is derived from
+/// the unslimmed event.
+fn slim_pi_stream_event(event: &Value) -> Value {
+    match event.as_object() {
+        Some(object) => Value::Object(
+            object
+                .iter()
+                .filter(|(key, _)| key.as_str() != "partial")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        None => event.clone(),
+    }
 }
 
 fn clear_pi_turn_identity(payload: &mut Value) {
@@ -2965,6 +3088,220 @@ mod tests {
             .count();
         assert!(requested >= 3);
         assert_eq!(requested, resolved);
+        fixture.finish().await;
+    }
+
+    /// Journal bytes of 2,000 3-character thinking tokens as journalled
+    /// before (whole `assistantMessageEvent`) and after slimming: unmerged
+    /// (tokens more than one coalescing window apart) and at 40 tokens/s,
+    /// where Pi's 100 ms merge window holds 4 tokens; with Pi's `partial`
+    /// carrying only the envelope or the accumulated text. Run with
+    /// `cargo test --bin todex-agentd pi_thinking_journal_bytes -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "measurement"]
+    async fn pi_thinking_journal_bytes() {
+        use crate::conversation::{ConversationEventHub, ConversationManifest, ConversationStore};
+        let root =
+            std::env::temp_dir().join(format!("todex-pi-bytes-{}", uuid::Uuid::new_v4().simple()));
+        let store = ConversationStore::new(root.join("data")).await.unwrap();
+        let zero = json!({"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,
+            "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}});
+        for (accumulated, cadence) in [
+            (false, None),
+            (true, None),
+            (false, Some(4)),
+            (true, Some(4)),
+        ] {
+            let mut sizes = Vec::new();
+            let mut payload_bytes = 0;
+            let mut records = 0;
+            for slim in [false, true] {
+                let manifest = store
+                    .create(ConversationManifest::new(
+                        ProviderKind::Pi,
+                        root.clone(),
+                        None,
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                let sink = DriverEventSink::new(
+                    store.clone(),
+                    ConversationEventHub::default(),
+                    super::super::types::PermissionBroker::default(),
+                    &manifest.id,
+                )
+                .with_turn_id("turn-1");
+                let mut pending: Option<PendingDelta<()>> = None;
+                let mut last = None;
+                let mut thinking = String::new();
+                for index in 0..2000 {
+                    let token = format!("{:03}", index % 1000);
+                    thinking.push_str(&token);
+                    let shown = if accumulated { thinking.as_str() } else { "" };
+                    let event = json!({"type":"thinking_delta","contentIndex":0,"delta":token,
+                        "partial":{"role":"assistant","content":[{"type":"thinking","thinking":shown}],
+                        "api":"anthropic-messages","provider":"anthropic","model":"claude-opus-4-5",
+                        "usage":zero,"stopReason":"stop","timestamp":1_790_000_000_000u64}});
+                    let block_id = pi_delta_block_id(&event, "turn-1", "reasoning");
+                    let delta = if slim {
+                        slim_pi_stream_event(&event)
+                    } else {
+                        event
+                    };
+                    let mut payload = json!({"provider":"pi","role":"assistant","delta":delta,
+                        "block":{"category":"reasoning","id":block_id,"turnId":"turn-1",
+                        "phase":"delta","contentIndex":0}});
+                    if let Some(per_window) = cadence {
+                        let fragment = pi_delta_fragment(&payload);
+                        if index % per_window != 0 {
+                            pending
+                                .as_mut()
+                                .unwrap()
+                                .try_append("thought.delta", &fragment, payload)
+                                .unwrap();
+                            continue;
+                        }
+                        let next = PendingDelta::new((), "thought.delta", fragment, payload);
+                        let Some(previous) = pending.replace(next) else {
+                            continue;
+                        };
+                        payload = previous.into_parts().2;
+                    }
+                    last = Some(sink.emit("thought.delta", payload).await.unwrap());
+                }
+                if let Some(open) = pending.take() {
+                    last = Some(
+                        sink.emit("thought.delta", open.into_parts().2)
+                            .await
+                            .unwrap(),
+                    );
+                }
+                let last = last.unwrap();
+                payload_bytes = serde_json::to_string(&last.payload).unwrap().len();
+                records = last.sequence;
+                let dir = root.join("data/conversations").join(&manifest.id);
+                let mut bytes = 0;
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_name().to_string_lossy().starts_with("events") {
+                        bytes += entry.metadata().unwrap().len();
+                    }
+                }
+                sizes.push(bytes);
+            }
+            println!(
+                "partial text {}, {}: before {} B, after {} B ({records} records, last payload {payload_bytes} B), reduction {:.1}%",
+                if accumulated { "accumulated" } else { "empty" },
+                cadence.map_or("unmerged".to_owned(), |tokens| format!("{tokens} tokens per window")),
+                sizes[0],
+                sizes[1],
+                100.0 * (1.0 - sizes[1] as f64 / sizes[0] as f64)
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn rpc_stream_journal_drops_snapshots_and_throttles_tool_progress() {
+        let fixture = Fixture::new().await;
+        fixture.run("stream", "stream-turn").await.unwrap();
+        let events = fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap();
+        // Clients see the same event types in the same order.
+        let mut kinds: Vec<&str> = Vec::new();
+        for event in &events {
+            let kind = event.event_type.as_str();
+            if matches!(
+                kind,
+                "thought.delta"
+                    | "message.delta"
+                    | "tool.started"
+                    | "tool.updated"
+                    | "tool.completed"
+                    | "usage.updated"
+                    | "message.completed"
+            ) && kinds.last() != Some(&kind)
+            {
+                kinds.push(kind);
+            }
+        }
+        assert_eq!(
+            kinds,
+            [
+                "thought.delta",
+                "message.delta",
+                "tool.updated",
+                "usage.updated",
+                "tool.started",
+                "tool.updated",
+                "tool.completed",
+                "usage.updated",
+                "message.completed",
+            ]
+        );
+        // No stream frame repeats the message snapshot (or its zero usage);
+        // text, `content`, `toolCall` and block identity stay.
+        let stream: Vec<_> = events
+            .iter()
+            .filter(|event| event.payload["delta"].is_object())
+            .collect();
+        assert!(stream
+            .iter()
+            .all(|event| event.payload["delta"].get("partial").is_none()));
+        let thinking: String = stream
+            .iter()
+            .filter(|event| event.payload["delta"]["type"] == "thinking_delta")
+            .filter_map(|event| event.payload["delta"]["delta"].as_str())
+            .collect();
+        let expected: String = (0..50).map(|index| format!("t{index:02}")).collect();
+        assert_eq!(thinking, expected);
+        let ends: Vec<_> = stream
+            .iter()
+            .filter(|event| event.payload["block"]["phase"] == "completed")
+            .map(|event| &event.payload["delta"])
+            .collect();
+        assert_eq!(ends[0]["content"], json!(expected));
+        assert_eq!(ends[1]["content"], "Running it");
+        assert_eq!(ends[2]["toolCall"]["arguments"]["command"], "make");
+        assert_eq!(ends[2]["contentIndex"], 2);
+        assert!(stream.iter().all(|event| event.payload["block"]["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())));
+        // 25 execution updates: the first, at most one per 500 ms, and the
+        // newest right before completion, which keeps the arguments.
+        let progress: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event_type == "tool.updated" && event.payload["block"]["phase"] == "delta"
+            })
+            .collect();
+        assert!(progress.len() <= 4, "{} tool updates", progress.len());
+        let text = |event: &crate::conversation::ConversationEvent| {
+            event.payload["partialResult"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .count()
+        };
+        assert_eq!(text(progress[0]), 1);
+        assert_eq!(text(progress[progress.len() - 1]), 25);
+        assert_eq!(
+            progress[progress.len() - 1].payload["arguments"]["command"],
+            "make"
+        );
+        let completed = events
+            .iter()
+            .position(|event| event.event_type == "tool.completed")
+            .unwrap();
+        assert_eq!(
+            events[completed - 1].sequence,
+            progress[progress.len() - 1].sequence
+        );
         fixture.finish().await;
     }
 
