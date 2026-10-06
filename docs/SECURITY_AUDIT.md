@@ -16,7 +16,7 @@
 - Unix 上已启动的 Provider 以 pid、pgid 与启动时间记录在 `<data_dir>/provider_processes.json`（0600、原子写入，另记录所属 server 的 pid 与启动时间）；server 启动时只 kill 首进程启动时间仍匹配的进程组，避免误杀复用 PID；所属 server 仍存活时第二个 server 既不回收也不接管。Linux 另设 `PR_SET_PDEATHSIG`；Windows 不做回收。
 - Provider 在信任读许可仍有效时完成子进程 spawn；撤销工作区信任取得写锁后会阻止后续启动，并取消已登记的活动 turn。信任状态只有在快照成功落盘后才更新内存。
 - Pi 在工作区获得 TodeX 信任后固定使用 `--approve` 全自动运行；TodeX 不为 Pi 声明逐工具审批或 OS sandbox，`permissions` capability 保持 `false`。
-- conversation event payload 上限 1 MiB：超过 1 MiB − 16 KiB 的 payload 在脱敏之后截断（最大字符串截断并记录原长度，必要时整体替换为 `{"truncated": true, "originalBytes": N}`），1 MiB 检查保留为最后防线。journal 不设总量上限：追加永不拒绝，进行中的 turn 总能写完；只有新 prompt 有闸门——journal 超过 56 MiB 时先逐段压缩（最新 16 MiB 之外的旧流式进度记录替换为 `journal.compacted` 占位标记（磁盘上为紧凑行，读取时还原）、其余事件超长 payload 就地截断、sequence 均不变；只重写有变化的段并把相邻小段合并），压缩后仍超限才返回 `JOURNAL_FULL`（HTTP 507），提示新建会话。已完全处理的封存段按 `(name, length, mtime)` 指纹缓存，不在每次追加时重复解析。replay limit 上限 1000，且每页不超过约 8 MiB journal。v2 WebSocket 单消息上限 8 MiB（升级层强制，超限关闭连接）、单连接订阅上限 128、并发补放上限 4；socket 发送超过 20 秒或出站队列阻塞超过 10 秒即断开连接。
+- conversation event payload 上限 1 MiB：超过 1 MiB − 16 KiB 的 payload 在脱敏之后截断（最大字符串截断并记录原长度，必要时整体替换为 `{"truncated": true, "originalBytes": N}`），1 MiB 检查保留为最后防线。journal 与单个会话都不设体积上限：追加永不拒绝，进行中的 turn 总能写完；只有新 prompt 有闸门——数据目录所在磁盘可用空间低于 1 GiB 时返回 `STORAGE_LOW`（HTTP 507）。活动文件超过 64 MiB 封存，后台转为 raw DEFLATE 分帧的 `.seg`（帧约 1 MiB，CRC-32 校验；`.idx` 带 SHA-256），封存时把已有终态记录覆盖的流式进度记录换成 `journal.compacted` 标记。内存有界：解压帧缓存全局 32 MiB、会话索引最多 64 个（LRU），封存分片只常驻分片表与帧表，活动文件按记录保留偏移（≤64 MiB）。replay limit 上限 1000，且每页不超过约 8 MiB journal。v2 WebSocket 单消息上限 8 MiB（升级层强制，超限关闭连接）、单连接订阅上限 128、并发补放上限 4；socket 发送超过 20 秒或出站队列阻塞超过 10 秒即断开连接。
 - MCP/Skill catalog 只读取配置，跳过 symlink，限制扫描深度、文件数和文件大小；响应不包含 command、args、env、URL 或凭据；现有测试验证输入文件未被修改。
 - 旧 Codex session migration 是 copy-only、redacted、idempotent，并保留原始文件。
 
@@ -25,7 +25,7 @@
 - `cargo test --locked --all-targets --all-features -- --test-threads=1` 当前执行 177 个 backend 测试和 1 个非计费 E2E，耗时约 11 秒；5 个真实 provider 测试默认 ignored。
 - Provider protocol、event journal、catalog 扫描和 WebSocket 都有显式内存/数量上限，避免单个请求无界增长。
 - event replay 通过可重建的内存 sequence/offset 索引按页读取，每页仍校验返回的记录，遇到损坏记录即回退到完整校验扫描（见 [conversation-runtime.md](conversation-runtime.md)）；这优先保证 sequence 连续性和尾部恢复。启动时已结束的会话跳过完整扫描，其损坏在首次读取时发现。
-- journal 按 8 MiB 段滚动存放：已封存的 `events.NNNNNN.jsonl` 段在前、唯一可写的 `events.jsonl` 在后，sequence 是跨文件的全局行号；journal 中间损坏时先整份备份为 `events.corrupt.<ts>.jsonl`，再原子重写并以 `journal.recordLost` 占位丢失的 sequence；占位数量受损坏字节数约束，损坏的 sequence 字段不能凭空生成大量占位，普通追加无法伪造任何 `journal.` 前缀的事件类型（包括 `journal.compacted` 压缩标记）。
+- journal 为 history v3 分片：封存分片（`.seg`/`.idx`，或等待转换的 `events.NNNNNN.jsonl`）在前、唯一可写的 `events.jsonl` 在后，sequence 跨文件连续；明文文件中间损坏时先把受损文件备份为 `events.corrupt.<ts>.jsonl`，再原子重写这些文件并以 `journal.recordLost` 占位丢失的 sequence，`.seg` 帧或 `.idx` 损坏时只重建该分片（备份为 `events.corrupt.<ts>.seg`），无法恢复的记录同样占位；v2 迁移前原文件硬链接到 `journal-v2-backup/`，7 天后删除；占位数量受损坏字节数约束，损坏的 sequence 字段不能凭空生成大量占位，普通追加无法伪造任何 `journal.` 前缀的事件类型（包括 `journal.compacted` 压缩标记）。
 - `cargo clippy --locked --all-targets --all-features` 可通过但报告 32 个既有 warning；`-D warnings` 尚未达到零 warning，主要是旧 Codex gateway/TUI 的大型 Result、参数数量和 enum 布局问题。
 
 ## 复核命令

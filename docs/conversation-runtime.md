@@ -113,31 +113,62 @@ Backend control/write/cancel/compact defaults are 30/10/10/300 seconds, configur
 with `TODEX_AGENTD_PROVIDER_{CONTROL,WRITE,CANCEL,COMPACT}_TIMEOUT_SECONDS`.
 The first three accept 1–3600 seconds; compact accepts 1–86400 seconds.
 
-The backend's JSONL journal remains authoritative. It is one logical sequence
-of files: sealed `events.NNNNNN.jsonl` segments in numeric order followed by
-the active `events.jsonl`, the only file appends touch. Once the active file
-passes 8 MiB the next append seals it under the next segment number and starts
-a fresh `events.jsonl` — a crash between the rename and the create leaves the
-journal ending in a sealed segment, which the next append recreates the active
-file for. Sequence `N` is still global journal line `N` across all files, so
-replay cursors, the cold index and `journal.*` placeholder semantics are
-unchanged; a legacy single `events.jsonl` is simply a journal of one active
-segment. Salvage rewrites collapse the journal back into one `events.jsonl`
-and unlink the sealed files; compaction instead rewrites each segment in
-place and merges adjacent sealed segments that fit one target size, keeping
-the file count bounded. Its in-memory sequence/offset index is rebuildable
-and records `(segment, start, end)` per record. A local
-debug fixture with 200 events per page measured
-1,000 events at 66.09 ms for repeated full parsing versus 22.12 ms cold / 8.49 ms
-warm indexing; 10,000 events measured 6084.97 ms versus 199.97 / 78.05 ms. These
-are local measurements, not production latency guarantees.
-A cold index (for example after fork or migration) is built by a newline scan
-that parses only the first and last records of each segment; a journal without
-its final newline, or whose last sequence differs from its line count, gets
-the full validating scan with tail repair. Every page still validates its records, and a
-page that reaches a damaged record runs the full scan, which salvages or reports
-the damage. A local release fixture measured the cold 50-event tail page at
-7.8 → 0.5 ms for 10,000 events and 77 → 5 ms for 100,000 events (53 MB).
+The backend's journal remains authoritative. Its storage format is history v3
+(`docs/history-encryption.md` §4): one logical sequence of files ordered by
+segment number — sealed segments (`events.NNNNNN.seg` with its `.idx`, or
+`events.NNNNNN.jsonl` briefly between sealing and conversion) followed by the
+active `events.jsonl`, the only file appends touch. Every new line is a
+short-key v3 record (`s`, `i`, `t` in µs, `y`, `r`, `p`, envelope `e`, content
+`c`); v2 full-event lines and v2 compaction markers still decode, and every
+read returns the same `ConversationEvent` as before, so the wire format is
+unchanged. Once the active file passes 64 MiB the next append renames it to
+the next segment number and starts a fresh `events.jsonl` (a crash between the
+two leaves the journal ending in a sealed file, which the next append
+recreates the active file for). The background maintenance task then
+converts the sealed file into a `.seg`: three streams (envelope lines, summary
+payloads, full payloads) cut into ~1 MiB raw-DEFLATE frames with CRC-32, and a
+checksummed `.idx` holding the frame table, the segment's journal digest and
+the `.seg` SHA-256. The commit renames `.idx`, then `.seg`, then deletes the
+plaintext source and syncs the directory; on the first access after a restart
+a `.seg` beside its surviving sources is kept only when its whole content
+hashes to the index, otherwise it is removed and the conversion redone.
+Sealing also slims history: a `message.delta` whose `block.id` reaches a later
+`message.completed` (same turn, or listed in `block.supersedes`), a
+`tool.updated` whose call reaches a later `tool.completed`/`tool.failed` or a
+terminal-status `tool.updated` (ACP), and a `subagent.updated` whose run
+reaches a later `subagent.completed`/`failed`/`cancelled` — all within the same
+segment — become `journal.compacted` markers keeping sequence, event id and
+time (payload `{"reason": "compacted", "originalType", "runStart",
+"runLength"}`). Deltas without a block id (Claude Code, ACP) and
+`thought.delta` are kept. Sequences stay dense and global across files.
+
+The replay index of a conversation holds each sealed segment's range and frame
+table plus per-record offsets of the plaintext files (the active file stays
+under 64 MiB); indexes are LRU-bounded to 64 conversations and decompressed
+frames share one 32 MiB LRU. Replay pages read plaintext spans and decode
+sealed frames transparently, with the same limits (1000 records or about
+8 MiB of journal, a sealed record counting the length of its v3 line). A cold
+index reads only the `.idx` files and newline-scans the plaintext files,
+parsing their boundary records; anything unclean falls back to the full
+validating scan. In a release build a 1,000,000-event synthetic journal (1.56 GiB of v3
+lines, random log-like tool output) sealed to 264 MiB in 22 s; three real
+64 MiB journals sealed to 4.0, 5.85 and 5.75 MiB. On that synthetic journal a
+release build measured: tail read 14 ms, cold open plus newest 200-record page
+11 ms, digest 13 ms, RSS growth on open 6.5 MiB, backward paging to the first
+page 0.49 / 1.71 ms p50 / p99 per page, `save_request` 7.9 / 8.8 ms p50 / p99
+(local macOS measurements, not guarantees).
+
+Conversations written before v3 are migrated lazily: no rewrite at startup;
+two minutes after it, and every ten minutes, the maintenance task takes idle
+conversations (not running or waiting, no write for two minutes) largest
+first, hard-links their plaintext files into `journal-v2-backup/` (copies
+where links fail; `backup.json` marks a complete backup), seals the active
+file, and converts up to 64 MiB of consecutive files per segment, committing
+each segment on its own so a killed daemon resumes. The manifest then gains
+`storageVersion: 3` (new conversations carry it from the start); older
+daemons cannot read a migrated conversation. Backups older than seven days
+are deleted. Fork streams the source journal page by page into the new
+conversation's v3 files, so a fork of any size copies in bounded memory.
 
 No request path loads the whole history. A per-conversation journal digest
 (`src/conversation/digest.rs`) holds only ids, sequences and status facts read
@@ -149,12 +180,12 @@ native `queueAdd`/`steer` control per delivered id, turn-terminal events per
 turn, last runtime state, unresolved permissions). Prompt and control
 idempotency, retry, terminal-event retries, follow-up delivery checks and
 restart recovery query it and then point-read the one or two events whose
-payload they compare. The digest is built once per process by paging through
-the journal with the replay index (validating and salvaging like replay),
-folded forward by every append under the conversation lock, and rebuilt when
-the journal file fingerprint changes (salvage, compaction rewrite, deletion).
-Digests of adjacent ranges merge, so they can later be stored per sealed
-segment. Only fork still reads the complete history. On a local debug fixture
+payload they compare. Digests of adjacent ranges merge: each sealed segment
+stores its own in its `.idx`, so the digest is built once per process by
+merging those (no sealed bytes are read) and paging through the plaintext
+files with the replay index (validating and salvaging like replay), folded
+forward by every append under the conversation lock, and rebuilt when the
+journal file fingerprint changes (salvage, deletion). On a local debug fixture
 of 200,000 events (55 MiB) a duplicate-prompt lookup took 1.7 s by full scan
 and 0.3 ms from the warm digest (control lookup 0.5 ms); the one-off digest
 build took 1.9 s and raised peak RSS by 15 MiB, versus about 240 MiB for one
@@ -174,43 +205,28 @@ parent directories, so a late flush cannot resurrect a deleted conversation.
 
 Journal repair: a final record missing its newline is terminated during
 recovery, and an append to an unterminated journal starts a new line. Corrupt
-lines with no valid record after them are still quarantined to
-`events.corrupt.<ts>.jsonl` and cut off. Interior corruption is salvaged: the
-whole journal is backed up to `events.corrupt.<ts>.jsonl`, then atomically
-rewritten with valid records unchanged and each lost sequence replaced by a
-`journal.recordLost` event with payload `{"reason": "corrupt", "runStart",
-"runLength", "backup": "<file>"}`. Placeholders of one run share
-`runStart`/`runLength` and take the previous valid event's time; their count
-is bounded by the corrupt bytes, and clients cannot append that event type.
-A corrupt tail may span several trailing segments: wholly corrupt sealed files
-are deleted, the file containing the last valid record is truncated, and an
-empty `events.jsonl` is kept so the journal still ends in its active file.
+plaintext lines with no valid record after them are quarantined to
+`events.corrupt.<ts>.jsonl` and cut off. Interior corruption is salvaged per
+file: the damaged files are backed up to `events.corrupt.<ts>.jsonl`, then
+each is atomically rewritten in place with valid records unchanged and each
+lost sequence replaced by a `journal.recordLost` event with payload
+`{"reason": "corrupt", "runStart", "runLength", "backup": "<file>"}`.
+Placeholders of one run share `runStart`/`runLength` and take the previous
+valid event's time; their count is bounded by the corrupt bytes, and clients
+cannot append that event type. A damaged `.seg` frame or `.idx` rebuilds only
+that segment: frames are located through the index or, when it is lost, by
+walking frame headers; records whose envelope and full content still decode
+are kept (the summary stream is regenerated), the rest become
+`journal.recordLost` placeholders, and the damaged files are kept as
+`events.corrupt.<ts>.seg`/`.idx`. No repair collapses the journal into one
+file.
 
-The journal has no total capacity limit: every append lands, so a running
-turn can always finish, and forks can carry histories of any size. The only
-gate is on new prompts. Once an append or a prompt would push the journal
-past 56 MiB, a compaction pass runs segment by segment: older streaming
-progress records that a terminal record already covers (`message.delta`,
-`thought.delta`, `tool.updated`, `subagent.updated` — everything but the
-newest 16 MiB) are replaced by `journal.compacted` markers keeping the
-original sequence, event id and time with payload
-`{"reason": "compacted", "originalType", "runStart", "runLength"}` where one
-run shares `runStart`/`runLength`. On disk a marker is a compact line
-(`{"sequence", "compacted": {"eventId", "timeUs", "originalType", "runStart",
-"runLength"}}`, ~150 bytes instead of ~350 for a full event, since a full
-envelope is as large as the small delta it replaces); every read expands it
-back to the full event, and a pass re-encodes full-event markers written by
-older builds. Each sequence still occupies its line, so the cold index and
-replay cursors stay valid; clients classify the marker as an unknown type
-and render nothing. Any remaining oversized payload strings
-are then truncated largest-first, oldest files first, until the journal fits
-48 MiB or nothing more can shrink. Only files that actually change are
-rewritten, in place and atomically; adjacent sealed segments that fit one
-8 MiB target are concatenated so the file count stays bounded, and a
-sealed segment processed in full is remembered by its `(name, length,
-mtime)` fingerprint so later passes skip it. A journal still above 56 MiB
-after compaction refuses new prompts with `JOURNAL_FULL` (HTTP 507) — start
-a new conversation — while appends keep landing regardless. Replay pages
+History has no size limit: every append lands, so a running turn can always
+finish, and forks can carry histories of any size. The only gate is on new
+prompts: when the filesystem holding the data directory has less than 1 GiB
+available, saving the prompt's request snapshot fails with `STORAGE_LOW`
+(HTTP 507); running turns keep appending. `JOURNAL_FULL` is no longer
+returned. Replay pages
 (`afterSequence`, `beforeSequence`, WebSocket subscribe backfill) stop at
 `limit` events or about 8 MiB of journal, whichever comes first, but always
 hold at least one event; clients keep paging while `hasMore`.

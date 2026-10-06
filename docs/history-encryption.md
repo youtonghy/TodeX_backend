@@ -67,7 +67,7 @@
 ```
 events.jsonl            活动分片：v3 行，明文 JSONL，只追加并逐条 fsync
 events.000007.jsonl     刚封存、待压缩的分片（短暂）
-events.000006.seg       封存分片：分帧 zstd（e2e 下再加密）
+events.000006.seg       封存分片：分帧 raw DEFLATE（e2e 下再加密）
 events.000006.idx       sidecar 索引（JSON，含校验和）
 keyring.json            e2e 才有
 manifest.json  snapshot.json  provider-state.json  last-request.json  queue.json
@@ -88,10 +88,22 @@ manifest.json  snapshot.json  provider-state.json  last-request.json  queue.json
 
 ### 4.3 封存分片
 
-- 帧：按约 1 MiB 原始数据切分，帧不跨 `kid`。三条流：信封流（每行 `{"s","i","t","y","r","p","e"}`，zstd，不加密）、摘要内容流、完整内容流（各为 payload 的 JSON 数组，zstd 后在 e2e 下以 stream 3/4、counter=帧序号加密）。
+- 帧：按约 1 MiB 原始数据切分，帧不跨 `kid`。三条流：信封流（每行 `{"s","i","t","y","r","p","e"}`，raw DEFLATE，不加密）、摘要内容流、完整内容流（各为 payload 的 JSON 数组，raw DEFLATE（RFC 1951，无 zlib/gzip 头，浏览器可直接解压）后在 e2e 下以 stream 3/4、counter=帧序号加密）。
 - `.idx`：首尾 sequence、每帧（流、首 sequence、条数、压缩偏移与长度、原始长度、`kid`、帧序号）、§6 的分片摘要、SHA-256。
 - 封存时精简：已确认存在终态记录（`message.completed`、`tool.completed`、`subagent.completed` 等，按 block/tool id 匹配）的 `message.delta`、`tool.updated`、`subagent.updated` 换成 `journal.compacted` 标记；`thought.delta` 与以 toolUse 结束的旁白 delta 保留。
 - 内存：每个会话只常驻分片表；帧表按需加载；全局解压帧缓存 32 MiB、会话索引 64 个，均 LRU。
+
+### 4.4 实现补充（存储轨，off 模式）
+
+以下是 `src/conversation/{record,segment,store,maintenance}.rs` 对本节的细化，不改变上文约定：
+
+- v3 行另有两个可选字段：`n` 仅在原 `normalizedType` 与按 `y` 重算的值不同时写入（`""` 表示原值缺失）；`tn` 保存旧事件微秒以下的纳秒余数。迁移后的事件与原事件逐字段相同。新追加的事件时间截到微秒。信封 `e` 为空时省略。
+- `.seg` 文件头为 `TDXSEG1\n` 加 16 字节分片 id；每帧有 36 字节帧头（流、`kid` 长度、首 sequence、条数、原始与存储长度、帧序号、原始数据 CRC-32），因此丢失或损坏的 `.idx` 可由帧头重建。raw DEFLATE 自身无校验，读取每帧都核对 CRC-32；`.idx` 的 SHA-256 覆盖其 body，另记 `.seg` 全文 SHA-256（只在崩溃恢复判定时计算）。信封流编号 0，内容帧沿用 3/4。
+- `.idx` 记录 `sources`（被替换的明文文件）。v2 迁移把相邻明文段合并为至多 64 MiB 的一个分片、以首个来源的段号命名，恢复时 `.idx` 通过且 `.seg` 全文校验通过才删除残留来源，否则删除 `.seg/.idx` 重做。单个超过 64 MiB 的旧文件整体成为一个分片。
+- 帧表与分片表一起从 `.idx` 读入（约每 MiB 原始数据 0.1 KB），不另行懒加载。
+- 封存精简的匹配规则：`message.delta` 需同 turn 内同 `block.id` 的后续 `message.completed`（或列在 `block.supersedes` 中）；没有 block id 的 delta（Claude Code、ACP）一律保留，因为终态记录无法按 id 对应；`tool.updated` 需同 turn 同 `toolCallId`/`block.id` 的后续 `tool.completed`/`tool.failed`，或 ACP 的 `status` 为 `completed`/`failed` 的后续 `tool.updated`（终态 update 本身保留）；`subagent.updated` 需同 `subagentId` 的后续 `subagent.completed`/`failed`/`cancelled`。终态必须在同一分片内。
+- 帧压缩级别 9：真实 64 MiB 会话封存为 4.0–5.9 MiB。
+- `requestFingerprint`/`textMac` 的 HMAC 留给密钥轨；off 模式下 `e` 原样携带已有的 `requestFingerprint`。
 
 ## 5. 线上格式
 
