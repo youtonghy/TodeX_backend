@@ -551,6 +551,7 @@ impl CompactedRecord {
 
 #[cfg(test)]
 mod tests {
+    use chrono::SubsecRound;
     use serde_json::json;
 
     use super::*;
@@ -616,7 +617,9 @@ mod tests {
 
     #[test]
     fn compacted_record_lines_still_decode() {
-        let original = ConversationEvent::new("c", 3, "message.delta", json!({"x": 1}));
+        let mut original = ConversationEvent::new("c", 3, "message.delta", json!({"x": 1}));
+        // Markers store microseconds; Linux clocks carry nanoseconds.
+        original.time = original.time.trunc_subsecs(6);
         let line = serde_json::to_vec(&CompactedRecord {
             sequence: 3,
             compacted: CompactedRun {

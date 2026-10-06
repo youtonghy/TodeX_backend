@@ -5889,6 +5889,7 @@ mod tests {
     }
 
     /// Peak resident set size of this process in bytes.
+    #[cfg(unix)]
     fn peak_rss_bytes() -> u64 {
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
         // SAFETY: `getrusage` only writes the struct it is handed.
@@ -5906,6 +5907,7 @@ mod tests {
     /// plus point reads. Peak RSS only grows, so the digest is measured
     /// first. Run alone:
     /// `cargo test -- --ignored measure_digest_lookups_200k --nocapture`.
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "opt-in 200k-event digest lookup measurement"]
     async fn measure_digest_lookups_200k() {

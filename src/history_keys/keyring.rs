@@ -372,6 +372,8 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(mode_of(&directory.join(FILE_NAME)), 0o600);
+        #[cfg(not(unix))]
+        let _ = directory;
 
         // Grant: a second recipient's wrap for the same kid.
         let target = recipient(2).rid();

@@ -7700,6 +7700,12 @@ mod tests {
     async fn auth_test_state(root: &Path) -> AppState {
         let workspace_root = root.join("workspaces");
         fs::create_dir_all(workspace_root.join("project")).unwrap();
+        // Conversations are created with Claude Code, which must resolve to
+        // an executable; the tests never spawn it.
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         AppState::new(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
@@ -7710,7 +7716,7 @@ mod tests {
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
-                claude_bin: "claude".to_owned(),
+                claude_bin: executable,
                 pi_bin: "pi".to_owned(),
                 grok_bin: "grok".to_owned(),
                 grok_auth_method: None,
