@@ -3157,6 +3157,24 @@ impl ConversationStore {
         write_atomic_json(&path, &saved).await
     }
 
+    /// Seal the active file now, as a rotation would.
+    #[cfg(test)]
+    pub async fn seal_active_for_tests(&self, conversation_id: &str) -> Result<(), AppError> {
+        let _guard = self.lock(conversation_id).await;
+        self.seal_active_locked(conversation_id).await
+    }
+
+    /// Convert every sealed plaintext file now (what the maintenance task
+    /// does in the background). Returns how many segments were sealed.
+    #[cfg(test)]
+    pub async fn seal_all_for_tests(&self, conversation_id: &str) -> Result<usize, AppError> {
+        let mut sealed = 0;
+        while self.seal_next(conversation_id).await? {
+            sealed += 1;
+        }
+        Ok(sealed)
+    }
+
     /// Stop segment commits after `step`, simulating a crash.
     #[cfg(test)]
     pub(super) fn set_commit_stop(&self, step: Option<CommitStep>) {
@@ -4293,6 +4311,10 @@ mod v3_tests;
 #[cfg(test)]
 #[path = "store_v3_bench.rs"]
 mod v3_bench;
+
+#[cfg(test)]
+#[path = "store_e2e_tests.rs"]
+mod e2e_tests;
 
 #[cfg(test)]
 mod tests {

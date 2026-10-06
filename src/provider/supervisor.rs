@@ -291,7 +291,15 @@ pub struct ConversationSupervisor {
     agent_mcp: Option<AgentMcp>,
     /// Account-level quota snapshots mirrored from `quota.updated` events.
     quota: crate::quota_store::QuotaStore,
+    /// Results of recently completed controls, by `(conversation, request
+    /// id)`, so a retried control gets the original result while history is
+    /// encrypted and the journal only holds it as ciphertext. In memory
+    /// only: control results may carry prompt text.
+    control_results: Arc<std::sync::Mutex<lru::LruCache<(String, String), Value>>>,
 }
+
+/// Completed control results kept for retried requests.
+const CONTROL_RESULT_CACHE: usize = 256;
 
 struct ActiveTurn {
     turn_id: String,
@@ -372,7 +380,30 @@ impl ConversationSupervisor {
             cli_execution_gate,
             agent_mcp: None,
             quota: crate::quota_store::QuotaStore::default(),
+            control_results: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(CONTROL_RESULT_CACHE)
+                    .expect("the control result cache is not empty"),
+            ))),
         }
+    }
+
+    fn control_results(&self) -> std::sync::MutexGuard<'_, lru::LruCache<(String, String), Value>> {
+        self.control_results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn remember_control_result(&self, conversation_id: &str, request_id: &str, result: &Value) {
+        self.control_results().put(
+            (conversation_id.to_owned(), request_id.to_owned()),
+            result.clone(),
+        );
+    }
+
+    fn control_result(&self, conversation_id: &str, request_id: &str) -> Option<Value> {
+        self.control_results()
+            .get(&(conversation_id.to_owned(), request_id.to_owned()))
+            .cloned()
     }
 
     pub fn with_agent_mcp(mut self, agent_mcp: AgentMcp) -> Self {
@@ -1448,13 +1479,15 @@ impl ConversationSupervisor {
                 let done = self.recorded_event(conversation_id, sequence).await?;
                 let encrypted = encrypted_content(&done.payload).is_some();
                 if outcome == ControlOutcome::Completed {
-                    // Encrypted: the result is only in the (encrypted)
-                    // `control.completed` record the client can read.
-                    return Ok(if encrypted {
-                        Value::Null
-                    } else {
-                        done.payload.get("result").cloned().unwrap_or(Value::Null)
-                    });
+                    if !encrypted {
+                        return Ok(done.payload.get("result").cloned().unwrap_or(Value::Null));
+                    }
+                    // Encrypted: the result is in the `control.completed`
+                    // record only as ciphertext; this process may still
+                    // remember it, else `null` (the client can read it).
+                    return Ok(self
+                        .control_result(conversation_id, request_id)
+                        .unwrap_or(Value::Null));
                 }
                 if outcome == ControlOutcome::Unknown {
                     return Err(AppError::ProviderUnavailable("Control delivery outcome is unknown; it was not sent again. Inspect the effective state before issuing a new request.".to_owned()));
@@ -1517,6 +1550,9 @@ impl ConversationSupervisor {
             let result = driver
                 .control(&conversation_id, &turn_id, &request_id, control)
                 .await;
+            if let Ok(value) = &result {
+                supervisor.remember_control_result(&conversation_id, &request_id, value);
+            }
             let (event_type, payload) = match &result {
                 Ok(value) => (
                     "control.completed",
@@ -2875,7 +2911,54 @@ mod tests {
         fixture_acp_profile: bool,
         fixture_devin: bool,
     ) -> (PathBuf, ConversationStore, ConversationSupervisor, PathBuf) {
+        control_fixture_keyed(label, fixture_acp_profile, fixture_devin, None).await
+    }
+
+    /// [`control_fixture`] with end-to-end encrypted history for one
+    /// recipient (seed 1); also returns the history keys.
+    async fn encrypted_control_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        ConversationStore,
+        ConversationSupervisor,
+        PathBuf,
+        crate::history_keys::HistoryKeys,
+    ) {
         let root = temp_dir(label);
+        let data_dir = root.join("data");
+        let keys = crate::history_keys::HistoryKeys::load(
+            &data_dir,
+            crate::config::HistoryEncryption::Off,
+            None,
+        )
+        .unwrap();
+        keys.recipients()
+            .register_device("dev_a", &crate::history_keys::test_support::recipient(1))
+            .unwrap();
+        keys.recipients()
+            .set_mode(crate::config::HistoryEncryption::E2e)
+            .unwrap();
+        let (root, store, supervisor, workspace) =
+            control_fixture_keyed_at(root, false, false, Some(keys.clone())).await;
+        (root, store, supervisor, workspace, keys)
+    }
+
+    async fn control_fixture_keyed(
+        label: &str,
+        fixture_acp_profile: bool,
+        fixture_devin: bool,
+        keys: Option<crate::history_keys::HistoryKeys>,
+    ) -> (PathBuf, ConversationStore, ConversationSupervisor, PathBuf) {
+        control_fixture_keyed_at(temp_dir(label), fixture_acp_profile, fixture_devin, keys).await
+    }
+
+    async fn control_fixture_keyed_at(
+        root: PathBuf,
+        fixture_acp_profile: bool,
+        fixture_devin: bool,
+        keys: Option<crate::history_keys::HistoryKeys>,
+    ) -> (PathBuf, ConversationStore, ConversationSupervisor, PathBuf) {
         let workspace_root = root.join("workspaces");
         let workspace = workspace_root.join("project");
         fs::create_dir_all(&workspace).unwrap();
@@ -2929,9 +3012,12 @@ mod tests {
                 enable_tls: false,
             },
         });
-        let store = ConversationStore::new(config.data_dir.clone())
+        let mut store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
+        if let Some(keys) = keys {
+            store = store.with_history_keys(keys);
+        }
         let trust = trust_store(&config, "local", Some(&workspace)).await;
         let supervisor = ConversationSupervisor::new(
             config,
@@ -2940,6 +3026,131 @@ mod tests {
             trust,
         );
         (root, store, supervisor, workspace)
+    }
+
+    #[tokio::test]
+    async fn e2e_requests_titles_retries_and_forks_keep_prompts_encrypted() {
+        let (root, store, supervisor, workspace, keys) =
+            encrypted_control_fixture("todex-e2e-supervisor").await;
+        let manifest = supervisor
+            .create_owned(
+                "local",
+                ProviderKind::Codex,
+                workspace.clone(),
+                Some("TITLE-SECRET".to_owned()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(manifest.title.is_none() && manifest.title_enc.is_some());
+        let renamed = supervisor
+            .update_metadata_owned(
+                "local",
+                &manifest.id,
+                Some(Some("RENAMED".to_owned())),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(renamed.title.is_none());
+        assert_ne!(renamed.title_enc, manifest.title_enc);
+        let request = ConversationPrompt {
+            client_request_id: Some("submit-1".to_owned()),
+            text: "PROMPT-SECRET".to_owned(),
+            model: Some("fixture-model".to_owned()),
+            reasoning_effort: None,
+            skills: Vec::new(),
+            content: vec![PromptContentRef::Text {
+                text: "INLINE-SECRET".to_owned(),
+            }],
+            permission_mode: None,
+            work_mode: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
+        };
+        let turn = supervisor
+            .prompt_owned("local", &manifest.id, request.clone())
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        // The same request again resolves to its turn (by MAC).
+        assert_eq!(
+            supervisor
+                .prompt_owned("local", &manifest.id, request.clone())
+                .await
+                .unwrap(),
+            turn
+        );
+        let saved = store.last_request(&manifest.id).await.unwrap().unwrap();
+        assert_eq!(saved["request"]["text"], "");
+        assert_eq!(saved["request"]["content"], json!([]));
+        assert!(saved["request"]["textMac"].is_string());
+        assert!(saved["request"]["contentMac"].is_string());
+        let directory = root.join("data/conversations").join(&manifest.id);
+        fn bytes_under(directory: &Path) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    bytes.extend(bytes_under(&path));
+                } else {
+                    bytes.extend(fs::read(&path).unwrap());
+                }
+            }
+            bytes
+        }
+        let disk = bytes_under(&directory);
+        for secret in ["TITLE-SECRET", "RENAMED", "PROMPT-SECRET", "INLINE-SECRET"] {
+            assert!(
+                !disk
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "{secret} is on disk"
+            );
+        }
+        // Retry needs the decrypted prompt, and only the original one.
+        assert!(matches!(
+            supervisor
+                .retry_owned("local", &manifest.id, None, None)
+                .await,
+            Err(AppError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            supervisor
+                .retry_owned("local", &manifest.id, None, Some("other".to_owned()))
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let retried = supervisor
+            .retry_owned(
+                "local",
+                &manifest.id,
+                Some("retry-2".to_owned()),
+                Some("PROMPT-SECRET".to_owned()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(retried, turn);
+        wait_until_idle(&supervisor).await;
+        // A fork copies the ciphertext and the keys that read it.
+        let fork = supervisor
+            .fork_owned("local", &manifest.id, None)
+            .await
+            .unwrap();
+        assert!(fork.title.is_none());
+        let source = store.complete_history(&manifest.id).await.unwrap();
+        let forked = store.complete_history(&fork.id).await.unwrap();
+        assert_eq!(forked.len(), source.len() + 1);
+        for (copy, original) in forked.iter().zip(&source) {
+            assert_eq!(copy.payload["$enc"], original.payload["$enc"]);
+        }
+        assert_eq!(
+            keys.keyrings().keys(&fork.id).await.unwrap().len(),
+            keys.keyrings().keys(&manifest.id).await.unwrap().len()
+        );
+        supervisor.delete_owned("local", &fork.id).await.unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     async fn wait_until_idle(supervisor: &ConversationSupervisor) {

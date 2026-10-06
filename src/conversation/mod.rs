@@ -1,5 +1,7 @@
 mod coalesce;
 mod digest;
+#[cfg(test)]
+pub(crate) mod e2e_support;
 mod hub;
 mod maintenance;
 mod migration;

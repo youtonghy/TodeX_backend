@@ -1187,8 +1187,8 @@ impl SegmentBuilder {
     /// then pushed with [`Item::Verbatim`].
     pub fn push_verbatim(
         &mut self,
-        summary: (FrameEntry, Vec<u8>),
-        full: (FrameEntry, Vec<u8>),
+        summary: StoredFrame,
+        full: StoredFrame,
     ) -> Result<(), SegmentError> {
         let first = full.0.first;
         if !self.content_started {
@@ -1980,6 +1980,9 @@ fn walk_frames(path: &Path) -> std::io::Result<Vec<FrameEntry>> {
     Ok(frames)
 }
 
+/// A frame's index entry and its stored bytes.
+type StoredFrame = (FrameEntry, Vec<u8>);
+
 /// A rebuilt segment and what salvage could not recover.
 pub(super) struct SalvagedSegment {
     pub prepared: PreparedSegment,
@@ -2012,7 +2015,7 @@ pub(super) fn salvage_segment(
     let mut envelopes: HashMap<u64, Vec<u8>> = HashMap::new();
     let mut contents: HashMap<u64, (bool, Vec<u8>)> = HashMap::new();
     // Intact sealed frames by (stream, first sequence).
-    let mut sealed: HashMap<(u8, u64), (FrameEntry, Vec<u8>)> = HashMap::new();
+    let mut sealed: HashMap<(u8, u64), StoredFrame> = HashMap::new();
     let mut newest = 0u64;
     // Frames decode one at a time; only records of the segment's range are
     // kept, which bounds memory by the segment's raw size.
@@ -2047,7 +2050,7 @@ pub(super) fn salvage_segment(
         return Err(invalid("nothing of the segment is readable"));
     }
     // Sealed runs whose two frames and every envelope survived.
-    let mut runs: HashMap<u64, ((FrameEntry, Vec<u8>), (FrameEntry, Vec<u8>))> = HashMap::new();
+    let mut runs: HashMap<u64, (StoredFrame, StoredFrame)> = HashMap::new();
     let full_starts: Vec<u64> = sealed
         .keys()
         .filter(|(stream, _)| *stream == STREAM_FULL)

@@ -234,7 +234,8 @@ pub struct JournalDigest {
     controls: HashMap<String, ControlFacts>,
     /// First `control.requested` delivering prompt text natively — a
     /// `queueAdd` keyed by its `itemId` or a `steer` keyed by its
-    /// `requestId` — whose control carries a `text` string.
+    /// `requestId` — whose control carries a `text` string (or, encrypted,
+    /// its `textMac`).
     text_controls: HashMap<String, u64>,
     /// Bit `i` set: the journal holds `TURN_TERMINAL_EVENTS[i]` for the turn.
     turn_terminals: HashMap<String, u8>,
@@ -303,7 +304,9 @@ impl JournalDigest {
                     Some("steer") => text("requestId"),
                     _ => None,
                 };
-                if let Some(id) = delivered.filter(|_| control_text("text").is_some()) {
+                // Encrypted records keep only the text's MAC.
+                let has_text = control_text("text").is_some() || control_text("textMac").is_some();
+                if let Some(id) = delivered.filter(|_| has_text) {
                     self.text_controls
                         .entry(id.to_owned())
                         .or_insert(event.sequence);

@@ -185,6 +185,11 @@ impl AppState {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn conversation_store(&self) -> &ConversationStore {
+        &self.conversation_store
+    }
+
     pub(crate) fn spawn_legacy_conversation_migration(&self) -> JoinHandle<()> {
         let data_dir = self.config.data_dir.clone();
         let workspace_roots = self.config.workspace_roots.clone();

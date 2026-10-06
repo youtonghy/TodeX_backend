@@ -8374,4 +8374,333 @@ mod tests {
         subscriptions.abort_all();
         let _ = fs::remove_dir_all(root);
     }
+
+    /// The REST page, its summary twin and the socket backfill of an
+    /// encrypted conversation with sealed and active records — what
+    /// `tests/fixtures/history-e2e-replay.json` hands to the clients.
+    async fn e2e_replay_scenario() -> (Value, Vec<Value>) {
+        use crate::conversation::e2e_support::{client_keys, client_view, decrypt_title};
+
+        let root = make_temp_workspace("v2-history-e2e-replay");
+        let state = Box::pin(auth_test_state(&root)).await;
+        let device = enroll(&root.join("data"));
+        let registry = state.history_keys.recipients();
+        registry
+            .register_device(
+                &device.device_id,
+                &crate::history_keys::test_support::recipient(1),
+            )
+            .unwrap();
+        registry
+            .set_mode(crate::config::HistoryEncryption::E2e)
+            .unwrap();
+        let app = crate::server::router(state.clone());
+        let store = state.conversation_store();
+        // Created through the store: no `conversation.created` record, whose
+        // workspace path would differ between runs.
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.join("workspaces").join("project"),
+                Some("Fixture title".to_owned()),
+                None,
+            ))
+            .await
+            .unwrap();
+        let id = manifest.id.clone();
+        let mut events = vec![
+            (
+                "message.created",
+                json!({"turnId": "t1", "role": "user", "content": "Fixture prompt"}),
+            ),
+            ("turn.started", json!({"turnId": "t1", "status": "running"})),
+        ];
+        for index in 0..3 {
+            events.push((
+                "tool.updated",
+                json!({"turnId": "t1", "toolCallId": format!("call_{index}"),
+                       "block": {"category": "tool", "id": format!("call_{index}"), "turnId": "t1", "phase": "delta"},
+                       "output": format!("fixture line {index}\n").repeat(4)}),
+            ));
+        }
+        events.push((
+            "message.completed",
+            json!({"turnId": "t1", "role": "assistant",
+                   "block": {"category": "assistant_final", "id": "answer", "turnId": "t1"},
+                   "message": {"text": "Fixture answer"}}),
+        ));
+        events.push((
+            "turn.completed",
+            json!({"turnId": "t1", "status": "completed"}),
+        ));
+        for (event_type, payload) in &events {
+            store
+                .append(&id, *event_type, payload.clone())
+                .await
+                .unwrap();
+        }
+        store.seal_active_for_tests(&id).await.unwrap();
+        assert_eq!(store.seal_all_for_tests(&id).await.unwrap(), 1);
+        let active = [
+            (
+                "message.created",
+                json!({"turnId": "t2", "role": "user", "content": "Second prompt"}),
+            ),
+            (
+                "tool.updated",
+                json!({"turnId": "t2", "toolCallId": "call_x",
+                "block": {"category": "tool", "id": "call_x", "turnId": "t2", "phase": "delta"},
+                "output": "short output"}),
+            ),
+            (
+                "turn.completed",
+                json!({"turnId": "t2", "status": "completed"}),
+            ),
+        ];
+        for (event_type, payload) in &active {
+            store
+                .append(&id, *event_type, payload.clone())
+                .await
+                .unwrap();
+        }
+        let expected: Vec<Value> = events
+            .iter()
+            .chain(active.iter())
+            .map(|(_, payload)| payload.clone())
+            .collect();
+
+        let get = |uri: String| {
+            let app = app.clone();
+            let device = &device;
+            async move {
+                let response = app
+                    .oneshot(signed_request(device, "GET", &uri, ""))
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body: Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), 64 * 1024 * 1024)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                (status, body)
+            }
+        };
+        // Undeclared clients get nothing.
+        let (status, body) = get(format!("/v2/conversations/{id}/events")).await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(body["code"], "CLIENT_UPGRADE_REQUIRED");
+        let (status, listed) = get(format!("/v2/conversations/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(listed.get("title").is_none());
+        let keys = client_keys(&state.history_keys, &id, 1).await;
+        assert_eq!(
+            decrypt_title(&keys, &id, &listed["titleEnc"]),
+            "Fixture title"
+        );
+
+        let mut pages = serde_json::Map::new();
+        for detail in ["full", "summary"] {
+            let (status, page) = get(format!(
+                "/v2/conversations/{id}/events?historyEncryption=1&limit=1000&detail={detail}"
+            ))
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let summary = detail == "summary";
+            let events: Vec<ConversationEvent> =
+                serde_json::from_value(page["events"].clone()).unwrap();
+            let frames = page["frames"].as_object().cloned().unwrap_or_default();
+            assert!(!frames.is_empty(), "sealed records travel as frames");
+            for frame in frames.values() {
+                assert_eq!(frame["stream"], if summary { 3 } else { 4 });
+                assert_eq!(frame["c"], id.as_str());
+            }
+            for event in &events {
+                let encrypted = &event.payload["$enc"];
+                assert_eq!(encrypted["v"], 1);
+                assert!(encrypted["kid"].is_string());
+                assert_eq!(encrypted["n"], event.sequence);
+                // One ciphertext per detail, never both.
+                assert!(!(encrypted.get("s").is_some() && encrypted.get("f").is_some()));
+                if !summary {
+                    assert!(encrypted.get("s").is_none());
+                }
+            }
+            let view = client_view(&keys, &events, &frames, summary);
+            for (event, original) in view.iter().zip(&expected) {
+                let mut original = ConversationEvent::new(
+                    &id,
+                    event.sequence,
+                    &event.event_type,
+                    original.clone(),
+                );
+                if summary {
+                    crate::conversation::summarize_event(&mut original);
+                }
+                if event.event_type != "journal.compacted" {
+                    assert_eq!(
+                        event.payload, original.payload,
+                        "{detail} {}",
+                        event.sequence
+                    );
+                }
+            }
+            pages.insert(detail.to_owned(), page);
+        }
+
+        // Socket backfill: every message carries the frames it refers to.
+        let (outgoing, mut received) = mpsc::channel(256);
+        let mut subscriptions = WsSubscriptions::new();
+        subscriptions.history_encryption = true;
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        assert!(dispatch_command(
+            &state,
+            &outgoing,
+            &mut subscriptions,
+            &event_scope,
+            "local",
+            &device.device_id,
+            V2Command {
+                id: "sub".to_owned(),
+                command_type: "conversation.subscribe".to_owned(),
+                payload: json!({ "conversationId": id, "afterSequence": 0, "detail": "summary" }),
+            },
+        )
+        .await
+        .is_none());
+        let mut messages = Vec::new();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if message["type"] == "server.result" {
+                break;
+            }
+            assert_eq!(message["type"], "conversation.event");
+            let event: ConversationEvent =
+                serde_json::from_value(message["payload"].clone()).unwrap();
+            let frames = message["frames"].as_object().cloned().unwrap_or_default();
+            if let Some(reference) = event.payload["$enc"].get("fr") {
+                assert_eq!(frames.len(), 1);
+                assert!(frames.contains_key(reference["s"].as_str().unwrap()));
+            } else {
+                assert!(frames.is_empty());
+            }
+            let view = client_view(&keys, std::slice::from_ref(&event), &frames, true);
+            let mut original = ConversationEvent::new(
+                &id,
+                event.sequence,
+                &event.event_type,
+                expected[event.sequence as usize - 1].clone(),
+            );
+            crate::conversation::summarize_event(&mut original);
+            assert_eq!(view[0].payload, original.payload);
+            messages.push(message);
+        }
+        assert_eq!(messages.len(), expected.len());
+        subscriptions.abort_all();
+
+        let keyring = state
+            .history_keys
+            .keyrings()
+            .keys(&id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.kid, json!(entry.wraps)))
+            .collect::<serde_json::Map<_, _>>();
+        let fixture = json!({
+            "description": "History e2e replay fixture (docs/history-encryption.md §5.3): REST pages in full and summary detail and the socket backfill of one conversation with a sealed segment (frame-level `fr`) and active records (event-level `s`/`f`). Unwrap `keyring` with the X-Wing seed for `seed`, decrypt, and compare with `expected` (summary: summarize_event of the same payloads, see `expectedSummary`).",
+            "seed": crate::history_keys::test_support::seed(1)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "rid": crate::history_keys::encode_id(&crate::history_keys::test_support::recipient(1).rid()),
+            "conversationId": id,
+            "manifest": { "titleEnc": listed["titleEnc"].clone(), "expectedTitle": "Fixture title" },
+            "keyring": keyring,
+            "pages": pages,
+            "socketBackfillSummary": messages,
+            "expected": expected,
+            "expectedSummary": expected
+                .iter()
+                .enumerate()
+                .map(|(index, payload)| {
+                    let mut event = ConversationEvent::new(&id, index as u64 + 1, "", payload.clone());
+                    event.event_type = events
+                        .iter()
+                        .chain(active.iter())
+                        .nth(index)
+                        .map(|(event_type, _)| (*event_type).to_owned())
+                        .unwrap();
+                    crate::conversation::summarize_event(&mut event);
+                    event.payload
+                })
+                .collect::<Vec<_>>(),
+        });
+        let _ = fs::remove_dir_all(root);
+        (fixture, expected)
+    }
+
+    #[tokio::test]
+    async fn v2_e2e_history_pages_backfill_and_shared_fixture() {
+        use crate::conversation::e2e_support::client_view;
+
+        let (fixture, expected) = Box::pin(e2e_replay_scenario()).await;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/history-e2e-replay.json");
+        if std::env::var_os("TODEX_WRITE_FIXTURES").is_some() {
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&fixture).unwrap() + "\n",
+            )
+            .unwrap();
+        }
+        // The committed fixture still decrypts to its expected payloads.
+        let committed: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/history-e2e-replay.json"))
+                .unwrap();
+        assert_eq!(committed["expected"], json!(expected));
+        let seed: [u8; 32] = (0..32)
+            .map(|index| {
+                u8::from_str_radix(
+                    &committed["seed"].as_str().unwrap()[index * 2..index * 2 + 2],
+                    16,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let keys: std::collections::HashMap<String, crate::history_crypto::SegmentKey> = committed
+            ["keyring"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(kid, wraps)| {
+                let wraps: Vec<crate::history_crypto::WrappedKey> =
+                    serde_json::from_value(wraps.clone()).unwrap();
+                let key = crate::history_crypto::unwrap_for_tests(
+                    seed,
+                    &wraps[0],
+                    crate::history_keys::decode_id(kid, "kid").unwrap(),
+                )
+                .unwrap();
+                (kid.clone(), key)
+            })
+            .collect();
+        for (detail, wanted) in [("full", "expected"), ("summary", "expectedSummary")] {
+            let page = &committed["pages"][detail];
+            let events: Vec<ConversationEvent> =
+                serde_json::from_value(page["events"].clone()).unwrap();
+            let frames = page["frames"].as_object().cloned().unwrap();
+            let view = client_view(&keys, &events, &frames, detail == "summary");
+            let payloads: Vec<Value> = view.into_iter().map(|event| event.payload).collect();
+            assert_eq!(json!(payloads), committed[wanted], "{detail}");
+        }
+    }
 }

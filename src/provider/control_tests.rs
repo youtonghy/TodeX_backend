@@ -24,6 +24,11 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
+        Self::with_encryption(false).await
+    }
+
+    /// With `encrypted`, history is end-to-end encrypted for one recipient.
+    async fn with_encryption(encrypted: bool) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!(
             "todex-control-contract-{}",
@@ -74,9 +79,24 @@ impl Harness {
                 enable_tls: false,
             },
         });
-        let store = ConversationStore::new(config.data_dir.clone())
+        let mut store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
+        if encrypted {
+            let keys = crate::history_keys::HistoryKeys::load(
+                &config.data_dir,
+                crate::config::HistoryEncryption::Off,
+                None,
+            )
+            .unwrap();
+            keys.recipients()
+                .register_device("dev_a", &crate::history_keys::test_support::recipient(1))
+                .unwrap();
+            keys.recipients()
+                .set_mode(crate::config::HistoryEncryption::E2e)
+                .unwrap();
+            store = store.with_history_keys(keys);
+        }
         let trust = WorkspaceTrustStore::new(root.join("trust"), vec![root.clone()])
             .await
             .unwrap();
@@ -571,5 +591,158 @@ async fn consumed_native_queue_id_cannot_be_replayed_as_a_new_prompt() {
             .await,
         Err(AppError::Conflict(_))
     ));
+    harness.finish().await;
+}
+
+/// History encryption: deduplication of prompts, native queue deliveries
+/// and controls works on the MACs the encrypted journal keeps.
+#[tokio::test]
+async fn e2e_history_deduplicates_by_mac() {
+    let harness = Harness::with_encryption(true).await;
+    let turn = harness.start().await;
+    // The same prompt under its id resolves to the running turn…
+    assert_eq!(
+        harness
+            .supervisor
+            .prompt_owned(
+                "owner-a",
+                &harness.manifest.id,
+                Harness::prompt("submission", "hold")
+            )
+            .await
+            .unwrap(),
+        turn
+    );
+    // …different input under it is refused.
+    assert!(matches!(
+        harness
+            .supervisor
+            .prompt_owned(
+                "owner-a",
+                &harness.manifest.id,
+                Harness::prompt("submission", "different")
+            )
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    // Controls: a duplicate gets the original result, other input under
+    // the same id is refused, rejections stay rejected.
+    let command = ProviderControl::QueueAdd {
+        item_id: "delivered-id".to_owned(),
+        text: "follow up".to_owned(),
+    };
+    let first = harness
+        .supervisor
+        .control_owned(
+            "owner-a",
+            &harness.manifest.id,
+            &turn,
+            "add",
+            command.clone(),
+        )
+        .await
+        .unwrap();
+    let repeated = harness
+        .supervisor
+        .control_owned("owner-a", &harness.manifest.id, &turn, "add", command)
+        .await
+        .unwrap();
+    assert_eq!(first, repeated);
+    assert!(matches!(
+        harness
+            .supervisor
+            .control_owned(
+                "owner-a",
+                &harness.manifest.id,
+                &turn,
+                "add",
+                ProviderControl::Steer {
+                    text: "follow up".to_owned()
+                }
+            )
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    let rejected = ProviderControl::Configure {
+        model: Some("fixture/reject".to_owned()),
+        reasoning_effort: None,
+    };
+    for _ in 0..2 {
+        assert!(harness
+            .supervisor
+            .control_owned(
+                "owner-a",
+                &harness.manifest.id,
+                &turn,
+                "rejected",
+                rejected.clone()
+            )
+            .await
+            .is_err());
+    }
+    harness
+        .supervisor
+        .control_owned(
+            "owner-a",
+            &harness.manifest.id,
+            &turn,
+            "finish",
+            ProviderControl::Steer {
+                text: "finish".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    harness.wait_event("turn.completed", None).await;
+    // The native queue delivered "follow up" under `delivered-id`: the
+    // encrypted control's text MAC recognizes the resubmission.
+    assert_eq!(
+        harness
+            .supervisor
+            .prompt_owned(
+                "owner-a",
+                &harness.manifest.id,
+                Harness::prompt("delivered-id", "follow up")
+            )
+            .await
+            .unwrap(),
+        turn
+    );
+    assert!(harness
+        .supervisor
+        .prompt_owned(
+            "owner-a",
+            &harness.manifest.id,
+            Harness::prompt("delivered-id", "something else")
+        )
+        .await
+        .is_err());
+    let natives = harness.native_commands().await;
+    assert_eq!(
+        natives
+            .iter()
+            .filter(|command| command.get("type") == Some(&json!("prompt")))
+            .count(),
+        1
+    );
+    assert_eq!(
+        natives
+            .iter()
+            .filter(|command| command.get("type") == Some(&json!("follow_up")))
+            .count(),
+        1
+    );
+    let events = harness.events().await;
+    assert!(events
+        .iter()
+        .all(|event| event.payload.get("$enc").is_some()));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "control.rejected"
+                && event.payload.get("requestId") == Some(&json!("rejected")))
+            .count(),
+        1
+    );
     harness.finish().await;
 }
