@@ -30,7 +30,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rmcp = { version = "=3.1.3", default-features = false, features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
 ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "rsa", "encryption", "getrandom"] }
@@ -45,6 +45,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
+# History v3: sealed journal segments are raw-DEFLATE frames (clients
+# decompress e2e frames, and browsers can inflate raw DEFLATE natively); LRU
+# caches bound decompressed frames and conversation indexes.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+lru = "0.12"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 # History crypto v1: X-Wing (ML-KEM-768 + X25519, draft-06) device keys.
 x-wing = { version = "0.1.1", features = ["getrandom", "zeroize"] }
@@ -96,4 +101,9 @@ tungstenite = "0.29"
 opt-level = 3
 
 [profile.dev.package.rsa]
+opt-level = 3
+
+# Sealing a 64 MiB journal segment compresses it; unoptimized DEFLATE makes
+# debug builds and tests needlessly slow.
+[profile.dev.package.miniz_oxide]
 opt-level = 3

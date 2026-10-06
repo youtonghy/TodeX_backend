@@ -20,6 +20,8 @@ pub struct ManagedServer {
     handle: JoinHandle<Result<()>>,
     retention_task: Option<JoinHandle<()>>,
     migration_task: Option<JoinHandle<()>>,
+    /// Journal segment conversion, v2 migration and backup cleanup.
+    maintenance_task: Option<JoinHandle<()>>,
 }
 
 /// Whether the server records the provider processes it spawns and reaps the
@@ -119,6 +121,7 @@ impl ManagedServer {
             .context("server failed")
         });
         let migration_task = Some(state.spawn_legacy_conversation_migration());
+        let maintenance_task = Some(state.spawn_journal_maintenance());
 
         Ok(Self {
             config,
@@ -128,6 +131,7 @@ impl ManagedServer {
             handle,
             retention_task,
             migration_task,
+            maintenance_task,
         })
     }
 
@@ -155,6 +159,9 @@ impl ManagedServer {
         if let Some(task) = self.migration_task.take() {
             task.abort();
         }
+        if let Some(task) = self.maintenance_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.retention_task.take() {
             task.abort();
         }
@@ -172,6 +179,9 @@ impl ManagedServer {
         }
         let result = self.handle.await.context("server task join failed");
         if let Some(task) = self.migration_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.maintenance_task.take() {
             task.abort();
         }
         self.state.conversations.shutdown_all().await;

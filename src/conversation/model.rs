@@ -7,6 +7,10 @@ use uuid::Uuid;
 
 pub const CONVERSATION_SCHEMA_VERSION: u32 = 2;
 pub const MAX_EVENT_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// `storageVersion` of a conversation whose journal is fully in the
+/// history v3 layout (`docs/history-encryption.md` §4); absent on
+/// conversations still holding v2 journal files.
+pub const STORAGE_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -105,6 +109,8 @@ pub struct ConversationManifest {
     pub last_sequence: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_version: Option<u32>,
 }
 
 impl ConversationManifest {
@@ -129,6 +135,7 @@ impl ConversationManifest {
             last_sequence: 0,
             created_at: now,
             updated_at: now,
+            storage_version: None,
         }
     }
 }

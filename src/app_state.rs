@@ -205,6 +205,12 @@ impl AppState {
         })
     }
 
+    /// Background conversion of sealed journal files, lazy v2 → v3
+    /// migration and migration-backup cleanup.
+    pub(crate) fn spawn_journal_maintenance(&self) -> JoinHandle<()> {
+        self.conversation_store.spawn_maintenance()
+    }
+
     pub fn increment_websocket_connections(&self) -> usize {
         self.websocket_connections.fetch_add(1, Ordering::Relaxed) + 1
     }

@@ -1103,7 +1103,6 @@ impl ConversationSupervisor {
             .acquire_owned(owner_id, &source.workspace)
             .await?;
         let provider_state = self.store.provider_state(conversation_id).await?;
-        let history = self.store.complete_history(conversation_id).await?;
         let request = self.store.last_request(conversation_id).await?;
         let native_fork = driver
             .fork_session(
@@ -1123,28 +1122,39 @@ impl ConversationSupervisor {
         );
         fork.owner_id = owner_id.to_owned();
         fork.workspace_id = source.workspace_id.clone();
-        let mut copied = Vec::with_capacity(history.len() + 1);
-        for event in history {
-            let mut next = crate::conversation::ConversationEvent::new(
-                &fork.id,
-                copied.len() as u64 + 1,
-                event.event_type,
-                event.payload,
-            );
-            next.provider = Some(source.provider);
-            next.time = event.time;
-            copied.push(next);
-        }
-        let mut completed = crate::conversation::ConversationEvent::new(
-            &fork.id,
-            copied.len() as u64 + 1,
-            "conversation.forked",
-            json!({ "sourceConversationId": source.id, "sourceSequence": copied.len() }),
-        );
-        completed.provider = Some(source.provider);
-        copied.push(completed);
+        // The history is streamed page by page into the new journal, so a
+        // fork of any size copies in bounded memory.
+        let fork_id = fork.id.clone();
+        let provider = source.provider;
+        let source_id = source.id.clone();
         self.store
-            .create_with_history(fork, copied, Some(native_fork), request)
+            .create_from_journal(
+                conversation_id,
+                fork,
+                Some(native_fork),
+                request,
+                |event, sequence| {
+                    let mut next = crate::conversation::ConversationEvent::new(
+                        &fork_id,
+                        sequence,
+                        event.event_type,
+                        event.payload,
+                    );
+                    next.provider = Some(provider);
+                    next.time = event.time;
+                    next
+                },
+                |copied| {
+                    let mut completed = crate::conversation::ConversationEvent::new(
+                        &fork_id,
+                        copied + 1,
+                        "conversation.forked",
+                        json!({ "sourceConversationId": source_id, "sourceSequence": copied }),
+                    );
+                    completed.provider = Some(provider);
+                    vec![completed]
+                },
+            )
             .await
     }
 

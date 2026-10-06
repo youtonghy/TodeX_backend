@@ -11,11 +11,14 @@
 //! A digest describes a contiguous range of the journal and is mergeable:
 //! `digest(A ++ B) == digest(A).merge(digest(B))`. The store keeps one per
 //! conversation for the whole journal and folds each appended event in;
-//! the same shape can later be persisted per sealed segment.
+//! every sealed segment persists the digest of its own range in its `.idx`
+//! (see [`super::segment`]), so a cold open merges those instead of reading
+//! sealed history.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{status_after_conversation_event, ConversationEvent, ConversationStatus};
@@ -51,7 +54,7 @@ fn status_slot(status: ConversationStatus) -> usize {
 }
 
 /// How a control request ended.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum ControlOutcome {
     Completed,
     Rejected,
@@ -70,7 +73,7 @@ impl ControlOutcome {
 }
 
 /// `message.created` records carrying one `clientRequestId`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct ClientRequestFacts {
     /// Sequence of the first such record.
     pub first: u64,
@@ -81,7 +84,7 @@ pub struct ClientRequestFacts {
 
 /// One control `requestId`: its first `control.requested` and the newest
 /// outcome recorded under the id (which may exist without a request).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct ControlFacts {
     pub requested: Option<u64>,
     pub outcome: Option<(ControlOutcome, u64)>,
@@ -90,7 +93,7 @@ pub struct ControlFacts {
 /// What restart recovery needs to close a cancelled permission dialog.
 /// `scope` and `runtimeId` are short routing values echoed back on the
 /// synthetic `permission.resolved`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct PermissionContext {
     pub scope: Option<Value>,
     pub runtime_id: Option<Value>,
@@ -111,7 +114,7 @@ pub struct RecoveryFacts {
 
 /// The status fold as a function of the status the range starts from, so
 /// two ranges compose without replaying either.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 struct StatusTransform([ConversationStatus; 5]);
 
 impl Default for StatusTransform {
@@ -136,13 +139,27 @@ impl StatusTransform {
     }
 }
 
+/// A field that is present deserializes to `Some`, even when `null`.
+fn present_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
 /// The turn a crash left open: the last `turn.started` with no later
 /// terminal event for it. A range without a `turn.started` cannot know
 /// which turn is open, so it records what it would close instead.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 struct OpenTurnFold {
     /// `Some` once the range holds a `turn.started`: the turn still open at
     /// the end of the range (`Some(None)` when it was closed again).
+    /// Serialized as absent / `null` / the id so the two `None`s survive.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_option"
+    )]
     started: Option<Option<String>>,
     /// Before the range's first `turn.started`: whether a conversation
     /// terminal or an id-less turn terminal closed whatever was open…
@@ -207,7 +224,7 @@ impl OpenTurnFold {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct JournalDigest {
     last_sequence: u64,
     last_time: Option<DateTime<Utc>>,
@@ -343,7 +360,6 @@ impl JournalDigest {
     }
 
     /// Append the digest of the range directly after this one.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn merge(&mut self, later: Self) {
         if later.last_sequence == 0 {
             return;

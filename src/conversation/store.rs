@@ -1,9 +1,11 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use lru::LruCache;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -15,6 +17,12 @@ use crate::error::AppError;
 
 use super::coalesce::{DeltaFragment, PendingDelta};
 use super::digest::JournalDigest;
+use super::maintenance::{available_space, MaintenanceQueue};
+use super::record::{decode_journal_record, encode_record, ContentCodec, JOURNAL_COMPACTED_EVENT};
+use super::segment::{
+    self, CommitStep, FrameCache, PreparedSegment, SealedSegment, SegmentError, SegmentReader,
+    JOURNAL_RECORD_LOST_EVENT,
+};
 use super::{
     redact_secrets, status_after_conversation_event, ConversationEvent, ConversationEventHub,
     ConversationManifest, ConversationReplay, ConversationSnapshot, ProviderState,
@@ -28,84 +36,53 @@ const PROVIDER_STATE_FILE: &str = "provider-state.json";
 /// Prompts waiting for the running turn to finish; never copied by fork.
 const FOLLOW_UP_QUEUE_FILE: &str = "queue.json";
 const MAX_REPLAY_LIMIT: usize = 1000;
-/// New prompts are refused once the whole journal exceeds this size and
-/// compaction cannot shrink it below. The journal itself has no hard
-/// capacity: appends always land, so a running turn can never die mid-flight
-/// the way the retired 64 MiB cap let it. Instead the journal rolls into
-/// sealed segments and each append past this limit triggers a compaction
-/// pass, which keeps recoverable history below the prompt gate whenever the
-/// content is compressible.
-const JOURNAL_PROMPT_LIMIT_BYTES: u64 = 56 * 1024 * 1024;
-/// Compaction rewrites history below this target so a journal that just
-/// crossed the prompt limit does not compact again on every append.
-const JOURNAL_COMPACT_TARGET_BYTES: u64 = 48 * 1024 * 1024;
-/// The newest events keep byte-identical payloads; only older history is
-/// truncated so recent tool output stays intact for replay.
-const JOURNAL_COMPACT_PROTECTED_BYTES: u64 = 16 * 1024 * 1024;
-const JOURNAL_COMPACT_STRING_MAX: usize = 4 * 1024;
-const JOURNAL_COMPACT_STRING_KEEP: usize = 1024;
+/// New prompts are refused with `STORAGE_LOW` while the filesystem holding
+/// the data directory has less than this free. History itself has no size
+/// limit (`docs/history-encryption.md` §1): appends always land, so a
+/// running turn can always finish.
+pub(super) const STORAGE_LOW_BYTES: u64 = 1024 * 1024 * 1024;
 /// Read buffer for the cold-index newline scan.
 const JOURNAL_SCAN_BUFFER_BYTES: usize = 256 * 1024;
-/// The journal is a sequence of files: sealed `events.NNNNNN.jsonl` segments
-/// in numeric order followed by the active `events.jsonl`, the only file
-/// appends touch. Once the active segment passes this size it is sealed
-/// under the next number and a fresh active file takes over, so an append
-/// stays O(1) and a compacted or salvaged journal collapses back into one
-/// active file. Sealed segments are never appended to; recovery, replay and
-/// compaction treat the ordered files as one logical journal whose global
-/// line number is the sequence.
+/// The journal is one logical sequence of files ordered by segment number:
+/// sealed segments (`events.NNNNNN.seg` + `.idx`, or `events.NNNNNN.jsonl`
+/// briefly between sealing and conversion) followed by the active
+/// `events.jsonl`, the only file appends touch. Once the active file passes
+/// this size it is sealed under the next number, a fresh active file takes
+/// over and the background maintenance task converts the sealed file into a
+/// compressed segment (see [`super::segment`]).
 #[cfg(not(test))]
-const JOURNAL_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const JOURNAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// Tests rotate the active segment well below the production size so a
-/// multi-segment journal does not need tens of MiB of fixture writes.
+/// multi-segment journal does not need hundreds of MiB of fixture writes.
 #[cfg(test)]
-const JOURNAL_SEGMENT_BYTES: u64 = 128 * 1024;
-/// Placeholder written in place of each sequence a corrupt journal region
-/// lost. Its payload is `{reason, runStart, runLength, backup}`; clients show
-/// consecutive placeholders sharing `runStart` as one notice. Appends cannot
-/// forge it: [`validate_event_type`] rejects its upper-case letter.
-const JOURNAL_RECORD_LOST_EVENT: &str = "journal.recordLost";
-/// Marker written in place of each sequence whose record compaction stripped:
-/// it keeps the original sequence, event id and time so line `N` still
-/// carries sequence `N` and no client ever waits on a gap. Its payload is
-/// `{reason, originalType, runStart, runLength}`; consecutive markers sharing
-/// `runStart` describe one stripped run. Appends cannot forge it:
-/// [`validate_event_type`] rejects the `journal.` prefix, and clients
-/// classify the type as unknown so the markers render nothing. On disk a
-/// marker is a [`CompactedRecord`], not a full event.
-const JOURNAL_COMPACTED_EVENT: &str = "journal.compacted";
-/// Every [`CompactedRecord`] line starts with this; a full event serializes
-/// `schemaVersion` first, so the prefix alone tells the two apart.
-const COMPACTED_RECORD_PREFIX: &[u8] = b"{\"sequence\":";
-/// Streaming progress records whose content is durably repeated by the
-/// stream's terminal record (`*.completed`); compaction replaces them with
-/// [`JOURNAL_COMPACTED_EVENT`] markers since their payloads are dead weight
-/// in old history and rarely contain strings large enough to truncate.
-const JOURNAL_COMPACT_STRIP_TYPES: &[&str] = &[
-    "message.delta",
-    "thought.delta",
-    "tool.updated",
-    "subagent.updated",
-];
-/// Lower bound on the serialized size of any journal record (each carries a
-/// 36-byte event id plus its sequence and time; full events also a 36-byte
-/// conversation id). Salvage uses it to bound how many sequences a corrupt
-/// region can have swallowed, so a record with a damaged sequence number
-/// cannot conjure a huge run of placeholders.
-const MIN_JOURNAL_RECORD_BYTES: usize = 96;
+pub(super) const JOURNAL_SEGMENT_BYTES: u64 = 128 * 1024;
+/// Lower bound on the serialized size of any journal record line (each
+/// carries a 36-byte event id plus its sequence, time and type). Salvage
+/// uses it to bound how many sequences a corrupt region can have
+/// swallowed, so a record with a damaged sequence number cannot conjure a
+/// huge run of placeholders.
+const MIN_JOURNAL_RECORD_BYTES: usize = 64;
 /// Replay pages stop adding records once their journal bytes would exceed
 /// this (records reach ~1 MiB, so 1000 of them could otherwise approach the
-/// whole journal). A page always holds at least one record.
+/// whole journal). A page always holds at least one record. Sealed records
+/// count the length of their v3 line, as if they were still plaintext.
 const MAX_REPLAY_PAGE_BYTES: u64 = 8 * 1024 * 1024;
 /// Appends that leave the status unchanged only mark the cached manifest
 /// dirty; it reaches `manifest.json` at most this often per conversation.
 const MANIFEST_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Decompressed sealed frames kept across requests (process-wide).
+const FRAME_CACHE_BYTES: usize = 32 * 1024 * 1024;
+/// Replay indexes kept in memory; the least recently used is rebuilt from
+/// the segment `.idx` files and the active file when needed again.
+const INDEX_CACHE_ENTRIES: usize = 64;
 
 #[derive(Clone)]
 pub struct ConversationStore {
-    root: PathBuf,
+    pub(super) root: PathBuf,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
-    indexes: Arc<DashMap<String, JournalIndex>>,
+    /// Replay indexes, LRU-bounded. Only touched under the conversation
+    /// lock and never held across an await.
+    indexes: Arc<std::sync::Mutex<LruCache<String, JournalIndex>>>,
     tails: Arc<DashMap<String, JournalTail>>,
     /// Open streaming-text merge window per conversation. Only touched while
     /// the conversation lock is held, so any other write flushes it first and
@@ -116,19 +93,28 @@ pub struct ConversationStore {
     /// conversation lock; loads on a cache miss take it too, so a stale disk
     /// read can never overwrite a newer entry or resurrect a deleted one.
     manifests: Arc<DashMap<String, CachedManifest>>,
-    /// Fingerprints of journal files compaction already processed in full
-    /// and cannot shrink further, so a full journal only pays the parse of
-    /// newly sealed segments on each compaction pass. Only sealed files are
-    /// listed: they are immutable, so a fingerprint stays valid forever. A
-    /// file processed while its newest records were still protected is not
-    /// cached — more of it becomes compactable as the journal grows.
-    incompressible: Arc<DashMap<String, Vec<JournalFile>>>,
-    /// Whole-journal digests (see [`super::digest`]), built once by paging
-    /// through the journal and then folded forward by every append under the
-    /// conversation lock. Like the replay index it is a rebuildable cache
-    /// keyed by the journal file fingerprint: salvage, compaction rewrites
-    /// and anything else that changes the files make it stale.
+    /// Whole-journal digests (see [`super::digest`]): the merge of every
+    /// sealed segment's persisted digest plus the plaintext files paged
+    /// through, then folded forward by every append under the conversation
+    /// lock. Like the replay index it is a rebuildable cache keyed by the
+    /// journal file fingerprint.
     digests: Arc<DashMap<String, CachedDigest>>,
+    /// Decompressed sealed frames shared by every conversation.
+    frames: Arc<FrameCache>,
+    /// Conversations whose directory went through crash reconciliation
+    /// (see [`segment::reconcile_directory`]) in this process.
+    reconciled: Arc<DashMap<String, ()>>,
+    /// Conversations with a segment build in flight; their build
+    /// temporaries are not leftovers.
+    pub(super) sealing: Arc<DashMap<String, ()>>,
+    /// Conversations with sealed plaintext waiting for conversion.
+    pub(super) maintenance: Arc<MaintenanceQueue>,
+    codec: ContentCodec,
+    /// Test override for the free-space probe (`u64::MAX`: none).
+    free_space_override: Arc<AtomicU64>,
+    /// Crash-injection point for segment commits in tests.
+    #[cfg(test)]
+    commit_stop: Arc<std::sync::Mutex<Option<CommitStep>>>,
 }
 
 struct CachedDigest {
@@ -151,41 +137,202 @@ struct StoreDelta {
     delta: PendingDelta<Option<ConversationEventHub>>,
 }
 
+/// Rebuildable replay index of one conversation: a part per journal file.
+/// Sealed segments contribute their range and frame table (from `.idx`);
+/// plaintext files — the active file (at most one segment size) and sealed
+/// files awaiting conversion or migration — keep per-record offsets.
 #[derive(Clone)]
 struct JournalIndex {
-    /// Fingerprint of the ordered journal files `offsets` were built from.
-    /// Any append, rotation, truncation or rewrite changes it, which is how
-    /// the rebuildable cache detects a stale index.
+    /// Fingerprint of the ordered journal files the parts were built from.
+    /// Any append, rotation, conversion, truncation or rewrite changes it,
+    /// which is how the cache detects a stale index.
     files: Vec<JournalFile>,
-    /// `(segment, start, end)` of every record: `segment` indexes `files`,
-    /// `start`/`end` are byte offsets inside it with `end` excluding the
-    /// newline. The record's global position in the vec is its sequence − 1.
-    offsets: Vec<(u32, u64, u64)>,
-    /// `false` when built by the cold newline scan, which parsed only the
-    /// boundary records of each segment. Pages still validate every record
+    /// Contiguous sequence ranges starting at 1, in journal order.
+    parts: Vec<IndexPart>,
+    /// `false` when built by the cold scan, which parsed only the boundary
+    /// records of each plaintext file. Pages still validate every record
     /// they return; one that fails triggers the full validating scan (see
     /// [`ConversationStore::read_indexed_page`]).
     fully_validated: bool,
 }
 
-/// One journal file in sequence order: a sealed `events.NNNNNN.jsonl`
-/// segment or the active `events.jsonl` (always last when present). The
-/// `(name, bytes, modified)` triple fingerprints it for cache validity.
+#[derive(Clone)]
+enum IndexPart {
+    Sealed(Arc<SealedSegment>),
+    /// `file` indexes [`JournalIndex::files`]; `offsets` are the
+    /// `(start, end)` bytes of each record (`end` excludes the newline),
+    /// the first holding sequence `first`.
+    Plain {
+        file: usize,
+        first: u64,
+        offsets: Vec<(u64, u64)>,
+    },
+}
+
+impl IndexPart {
+    fn first(&self) -> u64 {
+        match self {
+            Self::Sealed(segment) => segment.first,
+            Self::Plain { first, .. } => *first,
+        }
+    }
+
+    fn count(&self) -> u64 {
+        match self {
+            Self::Sealed(segment) => segment.count(),
+            Self::Plain { offsets, .. } => offsets.len() as u64,
+        }
+    }
+}
+
+impl JournalIndex {
+    fn total(&self) -> usize {
+        self.parts.iter().map(IndexPart::count).sum::<u64>() as usize
+    }
+
+    /// Slices of the parts covering records `from..to` (0-based positions,
+    /// i.e. sequences `from + 1..=to`), in journal order.
+    fn slices(&self, from: usize, to: usize) -> Vec<PartSlice> {
+        let (from, to) = (from as u64 + 1, to as u64);
+        let mut slices = Vec::new();
+        for part in &self.parts {
+            let lo = part.first().max(from);
+            let hi = (part.first() + part.count()).saturating_sub(1).min(to);
+            if part.count() == 0 || lo > hi {
+                continue;
+            }
+            slices.push(match part {
+                IndexPart::Sealed(segment) => PartSlice::Sealed {
+                    segment: segment.clone(),
+                    first: lo,
+                    last: hi,
+                },
+                IndexPart::Plain {
+                    file,
+                    first,
+                    offsets,
+                } => PartSlice::Plain {
+                    name: self.files[*file].name.clone(),
+                    first: lo,
+                    offsets: offsets[(lo - first) as usize..=(hi - first) as usize].to_vec(),
+                },
+            });
+        }
+        slices
+    }
+
+    /// Record a durable append to the active file at `file`.
+    fn push_active(&mut self, file: usize, sequence: u64, start: u64, end: u64) {
+        if let Some(IndexPart::Plain {
+            file: last_file,
+            offsets,
+            ..
+        }) = self.parts.last_mut()
+        {
+            if *last_file == file {
+                offsets.push((start, end));
+                return;
+            }
+        }
+        self.parts.push(IndexPart::Plain {
+            file,
+            first: sequence,
+            offsets: vec![(start, end)],
+        });
+    }
+}
+
+/// The part of a replay window inside one journal file.
+enum PartSlice {
+    Sealed {
+        segment: Arc<SealedSegment>,
+        first: u64,
+        last: u64,
+    },
+    Plain {
+        name: String,
+        first: u64,
+        offsets: Vec<(u64, u64)>,
+    },
+}
+
+/// Why a page read failed, so the caller can repair the right file.
+enum PageError {
+    Plain(AppError),
+    Sealed(u64, AppError),
+}
+
+/// Byte budget of one replay page: every record is admitted until the
+/// total would exceed the limit, but the first always is.
+struct PageBudget {
+    used: u64,
+    limit: u64,
+    admitted: bool,
+}
+
+impl PageBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            used: 0,
+            limit,
+            admitted: false,
+        }
+    }
+
+    fn admit(&mut self, bytes: u64) -> bool {
+        let used = self.used.saturating_add(bytes);
+        if self.admitted && used > self.limit {
+            return false;
+        }
+        self.used = used;
+        self.admitted = true;
+        true
+    }
+}
+
+/// One journal file in sequence order: a sealed `events.NNNNNN.seg`, a
+/// sealed plaintext `events.NNNNNN.jsonl`, or the active `events.jsonl`
+/// (always last when present). The `(name, bytes, modified)` triple
+/// fingerprints it for cache validity.
 #[derive(Clone, Debug, PartialEq)]
-struct JournalFile {
-    name: String,
-    bytes: u64,
-    modified: Option<std::time::SystemTime>,
+pub(super) struct JournalFile {
+    pub name: String,
+    pub bytes: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
+impl JournalFile {
+    pub fn is_sealed_segment(&self) -> bool {
+        self.name.ends_with(".seg")
+    }
+
+    /// Segment number; `None` for the active file.
+    pub fn number(&self) -> Option<u64> {
+        segment::numbered(&self.name, ".seg").or_else(|| sealed_segment_number(&self.name))
+    }
 }
 
 #[derive(Clone)]
 struct JournalTail {
     /// Name, size and mtime of the journal file the cached last record came
-    /// from — the last non-empty segment, not necessarily the active one.
+    /// from — the last non-empty file, not necessarily the active one.
     name: String,
     bytes: u64,
     modified: Option<std::time::SystemTime>,
     event: ConversationEvent,
+}
+
+fn blocking_error(error: tokio::task::JoinError) -> AppError {
+    AppError::Anyhow(error.into())
+}
+
+fn segment_error(conversation_id: &str, number: u64, error: SegmentError) -> AppError {
+    match error {
+        SegmentError::Io(error) => error.into(),
+        SegmentError::Invalid(reason) => AppError::InvalidRequest(format!(
+            "conversation {conversation_id} journal segment {number} is unreadable: {reason}"
+        )),
+    }
 }
 
 impl ConversationStore {
@@ -196,14 +343,53 @@ impl ConversationStore {
         Ok(Self {
             root,
             locks: Arc::new(DashMap::new()),
-            indexes: Arc::new(DashMap::new()),
+            indexes: Arc::new(std::sync::Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(INDEX_CACHE_ENTRIES).expect("index cache is not empty"),
+            ))),
             tails: Arc::new(DashMap::new()),
             pending_deltas: Arc::new(DashMap::new()),
             delta_generation: Arc::new(AtomicU64::new(0)),
             manifests: Arc::new(DashMap::new()),
-            incompressible: Arc::new(DashMap::new()),
             digests: Arc::new(DashMap::new()),
+            frames: Arc::new(FrameCache::new(FRAME_CACHE_BYTES)),
+            reconciled: Arc::new(DashMap::new()),
+            sealing: Arc::new(DashMap::new()),
+            maintenance: Arc::new(MaintenanceQueue::default()),
+            codec: ContentCodec::Plain,
+            free_space_override: Arc::new(AtomicU64::new(u64::MAX)),
+            #[cfg(test)]
+            commit_stop: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    fn index_cache(&self) -> std::sync::MutexGuard<'_, LruCache<String, JournalIndex>> {
+        self.indexes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn index_get<R>(
+        &self,
+        conversation_id: &str,
+        read: impl FnOnce(&JournalIndex) -> R,
+    ) -> Option<R> {
+        self.index_cache().get(conversation_id).map(read)
+    }
+
+    fn index_update<R>(
+        &self,
+        conversation_id: &str,
+        update: impl FnOnce(&mut JournalIndex) -> R,
+    ) -> Option<R> {
+        self.index_cache().get_mut(conversation_id).map(update)
+    }
+
+    fn index_put(&self, conversation_id: &str, index: JournalIndex) {
+        self.index_cache().put(conversation_id.to_owned(), index);
+    }
+
+    fn index_remove(&self, conversation_id: &str) {
+        self.index_cache().pop(conversation_id);
     }
 
     pub async fn create(
@@ -214,7 +400,8 @@ impl ConversationStore {
             .await
     }
 
-    /// Publish a fork directory only after history, provider state and snapshot are complete.
+    /// Publish a conversation directory only after history, provider state
+    /// and snapshot are complete.
     pub async fn create_with_history(
         &self,
         mut manifest: ConversationManifest,
@@ -223,17 +410,85 @@ impl ConversationStore {
         request: Option<Value>,
     ) -> Result<ConversationManifest, AppError> {
         validate_id(&manifest.id)?;
-        let mut journal = Vec::new();
         for (index, event) in events.iter().enumerate() {
             validate_event(event, &manifest.id, index as u64 + 1)?;
-            serde_json::to_writer(&mut journal, event)?;
-            journal.push(b'\n');
-            manifest.status = status_after_conversation_event(manifest.status, event);
-            manifest.last_sequence = event.sequence;
         }
-        let _guard = self.lock(&manifest.id).await;
-        let directory = self.directory(&manifest.id)?;
-        if tokio::fs::try_exists(&directory).await? {
+        let mut draft = self.begin_conversation(&manifest).await?;
+        let filled = async {
+            for event in &events {
+                draft.writer.write(event).await?;
+                manifest.status = status_after_conversation_event(manifest.status, event);
+                manifest.last_sequence = event.sequence;
+            }
+            Ok(())
+        }
+        .await;
+        self.publish_conversation(draft, filled, manifest, provider_state, request)
+            .await
+    }
+
+    /// Create `manifest` with a copy of `source_id`'s journal, streamed page
+    /// by page so a history of any size is copied in bounded memory. `copy`
+    /// maps each source event to the record at the given new sequence;
+    /// `trailer` receives the number copied and returns the events written
+    /// after them. Only events present when the copy starts are copied.
+    pub async fn create_from_journal(
+        &self,
+        source_id: &str,
+        mut manifest: ConversationManifest,
+        provider_state: Option<ProviderState>,
+        request: Option<Value>,
+        mut copy: impl FnMut(ConversationEvent, u64) -> ConversationEvent,
+        trailer: impl FnOnce(u64) -> Vec<ConversationEvent>,
+    ) -> Result<ConversationManifest, AppError> {
+        validate_id(&manifest.id)?;
+        let end = self
+            .journal_tail(source_id)
+            .await?
+            .0
+            .map_or(0, |event| event.sequence);
+        let mut draft = self.begin_conversation(&manifest).await?;
+        let filled = async {
+            let mut after = 0u64;
+            let mut copied = 0u64;
+            while after < end {
+                let page = self.replay(source_id, after, MAX_REPLAY_LIMIT).await?;
+                for event in page.events {
+                    if event.sequence > end {
+                        break;
+                    }
+                    after = event.sequence;
+                    copied += 1;
+                    let next = copy(event, copied);
+                    validate_event(&next, &manifest.id, copied)?;
+                    manifest.status = status_after_conversation_event(manifest.status, &next);
+                    manifest.last_sequence = next.sequence;
+                    draft.writer.write(&next).await?;
+                }
+                if !page.has_more {
+                    break;
+                }
+            }
+            for next in trailer(copied) {
+                validate_event(&next, &manifest.id, manifest.last_sequence + 1)?;
+                manifest.status = status_after_conversation_event(manifest.status, &next);
+                manifest.last_sequence = next.sequence;
+                draft.writer.write(&next).await?;
+            }
+            Ok(())
+        }
+        .await;
+        self.publish_conversation(draft, filled, manifest, provider_state, request)
+            .await
+    }
+
+    /// A private temporary directory with an empty journal writer; see
+    /// [`Self::publish_conversation`].
+    async fn begin_conversation(
+        &self,
+        manifest: &ConversationManifest,
+    ) -> Result<ConversationDraft, AppError> {
+        if tokio::fs::try_exists(self.directory(&manifest.id)?).await? {
             return Err(AppError::Conflict(format!(
                 "conversation {} already exists",
                 manifest.id
@@ -245,20 +500,37 @@ impl ConversationStore {
             Uuid::new_v4().simple()
         ));
         tokio::fs::create_dir(&temporary).await?;
-        let create_result = async {
+        let created = async {
             set_owner_only(&temporary, true).await?;
-            let event_file = temporary.join(EVENTS_FILE);
-            let mut file = tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&event_file)
-                .await?;
-            file.write_all(&journal).await?;
-            file.flush().await?;
-            file.sync_all().await?;
-            drop(file);
-            set_owner_only(&event_file, false).await?;
+            PlainJournalWriter::create(&temporary, self.codec).await
+        }
+        .await;
+        match created {
+            Ok(writer) => Ok(ConversationDraft { temporary, writer }),
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&temporary).await;
+                Err(error)
+            }
+        }
+    }
 
+    /// Finish a draft whose journal `filled` reports on: manifest, snapshot
+    /// and provider state are written, then the directory is renamed into
+    /// place. Sealed plaintext files the writer rotated are queued for
+    /// conversion. Any failure removes the draft.
+    async fn publish_conversation(
+        &self,
+        draft: ConversationDraft,
+        filled: Result<(), AppError>,
+        mut manifest: ConversationManifest,
+        provider_state: Option<ProviderState>,
+        request: Option<Value>,
+    ) -> Result<ConversationManifest, AppError> {
+        manifest.storage_version = Some(super::model::STORAGE_VERSION);
+        let ConversationDraft { temporary, writer } = draft;
+        let create_result = async {
+            filled?;
+            let sealed = writer.finish().await?;
             write_atomic_json(&temporary.join(MANIFEST_FILE), &manifest).await?;
             write_atomic_json(
                 &temporary.join(SNAPSHOT_FILE),
@@ -274,11 +546,30 @@ impl ConversationStore {
                 write_atomic_json(&temporary.join("last-request.json"), &request).await?;
             }
             sync_directory(&temporary).await?;
+            Ok::<_, AppError>(sealed)
+        }
+        .await;
+        let sealed = match create_result {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&temporary).await;
+                return Err(error);
+            }
+        };
+        let _guard = self.lock(&manifest.id).await;
+        let directory = self.directory(&manifest.id)?;
+        let published = async {
+            if tokio::fs::try_exists(&directory).await? {
+                return Err(AppError::Conflict(format!(
+                    "conversation {} already exists",
+                    manifest.id
+                )));
+            }
             tokio::fs::rename(&temporary, &directory).await?;
             sync_directory(&self.root).await
         }
         .await;
-        if let Err(error) = create_result {
+        if let Err(error) = published {
             let _ = tokio::fs::remove_dir_all(&temporary).await;
             return Err(error);
         }
@@ -290,6 +581,9 @@ impl ConversationStore {
                 flush_scheduled: false,
             },
         );
+        if sealed > 0 {
+            self.maintenance.request(&manifest.id);
+        }
         Ok(manifest)
     }
 
@@ -384,12 +678,12 @@ impl ConversationStore {
     /// Drop every cache entry of a removed conversation. Callers hold the
     /// conversation lock.
     fn forget_locked(&self, conversation_id: &str) {
-        self.indexes.remove(conversation_id);
+        self.index_remove(conversation_id);
         self.tails.remove(conversation_id);
         self.pending_deltas.remove(conversation_id);
         self.manifests.remove(conversation_id);
-        self.incompressible.remove(conversation_id);
         self.digests.remove(conversation_id);
+        self.reconciled.remove(conversation_id);
     }
 
     pub async fn cleanup_before(
@@ -551,6 +845,11 @@ impl ConversationStore {
             .map(|_| ())
     }
 
+    /// Whether an open merge window holds unjournalled stream text.
+    pub(super) fn has_pending_delta(&self, conversation_id: &str) -> bool {
+        self.pending_deltas.contains_key(conversation_id)
+    }
+
     async fn append_inner(
         &self,
         conversation_id: &str,
@@ -628,18 +927,21 @@ impl ConversationStore {
             payload,
         );
         event.provider = Some(manifest.provider);
-        let record = serde_json::to_vec(&event)?;
+        // v3 records store microseconds; the published event matches what a
+        // later replay decodes.
+        event.time = truncate_to_micros(event.time);
+        let record = encode_record(&event, self.codec)?;
         let event_path = directory.join(EVENTS_FILE);
-        let mut files = journal_files(&directory).await?;
+        let mut files = self.files_locked(conversation_id, &directory).await?;
         // A torn final record (a write interrupted before its newline) must
         // be closed before anything else is appended. When it is the active
         // file's tail the separator is prepended to the new line below; when
-        // a sealed segment owns it (the active file is missing or empty) it
-        // is terminated in place so the records never glue across the
-        // segment boundary.
+        // a sealed plaintext file owns it (the active file is missing or
+        // empty) it is terminated in place so the records never glue across
+        // the file boundary. Sealed `.seg` files are always complete.
         if !terminated {
             if let Some(file) = files.iter().rev().find(|file| file.bytes > 0) {
-                if file.name == EVENTS_FILE {
+                if file.name == EVENTS_FILE || file.is_sealed_segment() {
                     // Handled by the separator prepended to `line` below.
                 } else {
                     terminate_journal(&directory.join(&file.name)).await?;
@@ -649,29 +951,12 @@ impl ConversationStore {
                 terminated = true;
             }
         }
-        // The record plus its newline, plus the separator an unterminated
-        // tail needs — whether prepended to the line or written by the
-        // rotation below, it always lands on the journal total.
-        let needed = record.len() as u64 + 1 + u64::from(!terminated);
-        let journal_bytes: u64 = files.iter().map(|file| file.bytes).sum();
-        // The journal has no capacity limit: a running turn always lands its
-        // events — refusing one would leave it permanently open, which is how
-        // the retired hard cap failed. Past the prompt limit each append runs
-        // a compaction pass instead; per-segment caching keeps repeat passes
-        // cheap while the prompt gate alone decides whether a *new* turn may
-        // start on this history.
-        if journal_bytes.saturating_add(needed) > JOURNAL_PROMPT_LIMIT_BYTES {
-            self.compact_journal(conversation_id).await?;
-            files = journal_files(&directory).await?;
-            // Compaction rewrites the files it touched newline-terminated (or
-            // leaves them unchanged), so the write-target state is re-read.
-            terminated = self.read_last_event(conversation_id).await?.1;
-        }
-        // Seal the active segment once it passed its target size and start a
+        // Seal the active file once it passed its target size and start a
         // fresh `events.jsonl`. Sealing only renames the active file, so a
-        // matching cached index survives by retagging its entries: the
+        // matching cached index survives by retagging its file list: the
         // sealed file holds exactly the bytes the active file held and the
-        // fresh file starts empty.
+        // fresh file starts empty. Conversion to a compressed segment runs
+        // in the background.
         if files
             .last()
             .is_some_and(|file| file.name == EVENTS_FILE && file.bytes >= JOURNAL_SEGMENT_BYTES)
@@ -680,17 +965,18 @@ impl ConversationStore {
             let (sealed, fresh) = rotate_journal(&directory, &files, terminated).await?;
             *files.last_mut().expect("active segment is present") = sealed;
             files.push(fresh);
-            if let Some(mut index) = self.indexes.get_mut(conversation_id) {
+            self.index_update(conversation_id, |index| {
                 if index.files == previous {
                     index.files = files.clone();
                 }
-            }
+            });
             if let Some(mut cached) = self.digests.get_mut(conversation_id) {
                 if cached.files == previous {
                     cached.files = files.clone();
                 }
             }
             terminated = true;
+            self.maintenance.request(conversation_id);
         }
         // `create` normally made the journal and rotation always creates the
         // fresh active file; only here does a missing one get created, and
@@ -705,9 +991,11 @@ impl ConversationStore {
         }
         let active_index = files.len() - 1;
         let active_bytes = files[active_index].bytes;
-        let separator = u64::from(!terminated);
+        // A torn sealed `.seg` cannot exist, and an unterminated active
+        // file gets the separator.
+        let separator = u64::from(!terminated && active_bytes > 0);
         let mut line = Vec::with_capacity(record.len() + 2);
-        if !terminated {
+        if separator == 1 {
             line.push(b'\n');
         }
         line.extend_from_slice(&record);
@@ -729,16 +1017,17 @@ impl ConversationStore {
         let last = files.last_mut().expect("active segment is present");
         last.bytes = metadata.len();
         last.modified = metadata.modified().ok();
-        if let Some(mut index) = self.indexes.get_mut(conversation_id) {
+        self.index_update(conversation_id, |index| {
             if index.files == pre_write_files {
-                index.offsets.push((
-                    active_index as u32,
+                index.push_active(
+                    active_index,
+                    event.sequence,
                     active_bytes + separator,
                     active_bytes + line.len() as u64 - 1,
-                ));
+                );
                 index.files = files.clone();
             }
-        }
+        });
         // A digest that described the journal up to this record stays exact
         // by folding the record in; any other is stale and dropped, so the
         // next query rebuilds it.
@@ -790,29 +1079,46 @@ impl ConversationStore {
         let directory = self.directory(conversation_id)?;
         self.get_unlocked(conversation_id).await?;
         // Every prompt saves its request before the turn starts, so this is
-        // where a nearly full history refuses new turns.
-        self.ensure_prompt_capacity_locked(conversation_id).await?;
+        // where a nearly full disk refuses new turns. Running turns are
+        // unaffected — appends never refuse on size.
+        self.ensure_free_space(&directory).await?;
         write_atomic_json(&directory.join("last-request.json"), request).await
     }
 
-    /// Refuse a new turn once the journal exceeds
-    /// [`JOURNAL_PROMPT_LIMIT_BYTES`] and compaction cannot bring it back
-    /// below. Running turns are unaffected — appends never refuse on size.
-    /// Callers hold the conversation lock.
-    async fn ensure_prompt_capacity_locked(&self, conversation_id: &str) -> Result<(), AppError> {
-        let directory = self.directory(conversation_id)?;
-        if journal_bytes(&journal_files(&directory).await?) <= JOURNAL_PROMPT_LIMIT_BYTES {
+    /// `STORAGE_LOW` when the data directory's filesystem has less than
+    /// [`STORAGE_LOW_BYTES`] available.
+    async fn ensure_free_space(&self, directory: &Path) -> Result<(), AppError> {
+        let available = match self.free_space_override.load(Ordering::Relaxed) {
+            u64::MAX => {
+                let directory = directory.to_owned();
+                match tokio::task::spawn_blocking(move || available_space(&directory))
+                    .await
+                    .map_err(blocking_error)?
+                {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        // An unanswerable probe must not block prompts.
+                        tracing::warn!(error = %error, "free disk space unavailable; not enforcing the storage floor");
+                        return Ok(());
+                    }
+                }
+            }
+            bytes => bytes,
+        };
+        if available >= STORAGE_LOW_BYTES {
             return Ok(());
         }
-        self.compact_journal(conversation_id).await?;
-        let bytes = journal_bytes(&journal_files(&directory).await?);
-        if bytes <= JOURNAL_PROMPT_LIMIT_BYTES {
-            return Ok(());
-        }
-        Err(AppError::JournalFull(format!(
-            "conversation {conversation_id} holds {bytes} journal bytes, above the \
-             {JOURNAL_PROMPT_LIMIT_BYTES} byte limit for new turns; start a new conversation"
+        Err(AppError::StorageLow(format!(
+            "only {available} bytes are free on the disk holding TodeX data, below the \
+             {STORAGE_LOW_BYTES} byte floor for new turns; free disk space and retry"
         )))
+    }
+
+    /// Pretend the data directory's filesystem has `bytes` free.
+    #[cfg(test)]
+    pub fn set_free_space_for_tests(&self, bytes: Option<u64>) {
+        self.free_space_override
+            .store(bytes.unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     pub async fn last_request(&self, conversation_id: &str) -> Result<Option<Value>, AppError> {
@@ -852,15 +1158,38 @@ impl ConversationStore {
         write_atomic_json(&directory.join(FOLLOW_UP_QUEUE_FILE), queue).await
     }
 
-    /// Every event, loaded and validated at once. Only fork (which copies the
-    /// history) and tests use it; hot paths ask [`Self::digest`] instead.
+    /// Every event, paged through replay into one vector. Only tests use
+    /// it; hot paths ask [`Self::digest`] and fork streams
+    /// ([`Self::create_from_journal`]).
+    #[cfg(test)]
     pub async fn complete_history(
         &self,
         conversation_id: &str,
     ) -> Result<Vec<ConversationEvent>, AppError> {
-        let _guard = self.lock(conversation_id).await;
-        self.flush_pending_delta_logged(conversation_id).await;
-        self.read_and_recover_events(conversation_id).await
+        {
+            let _guard = self.lock(conversation_id).await;
+            self.flush_pending_delta_logged(conversation_id).await;
+            let directory = self.directory(conversation_id)?;
+            if self
+                .files_locked(conversation_id, &directory)
+                .await?
+                .is_empty()
+            {
+                return Ok(Vec::new());
+            }
+        }
+        let mut events = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = self
+                .replay(conversation_id, after, MAX_REPLAY_LIMIT)
+                .await?;
+            after = page.next_sequence;
+            events.extend(page.events);
+            if !page.has_more {
+                return Ok(events);
+            }
+        }
     }
 
     /// Full-scan answer the digest replaced; tests keep it as the reference.
@@ -869,9 +1198,7 @@ impl ConversationStore {
         &self,
         conversation_id: &str,
     ) -> Result<Option<ConversationEvent>, AppError> {
-        let _guard = self.lock(conversation_id).await;
-        self.flush_pending_delta_logged(conversation_id).await;
-        let events = self.read_and_recover_events(conversation_id).await?;
+        let events = self.complete_history(conversation_id).await?;
         Ok(events.into_iter().rev().find(|event| {
             event.event_type == "message.created"
                 && event.payload.get("role").and_then(Value::as_str) == Some("user")
@@ -915,15 +1242,16 @@ impl ConversationStore {
             .filter(|event| event.sequence == sequence))
     }
 
-    /// Make the cached digest match the journal files on disk. A miss pages
-    /// through the journal with the replay index — the same validation and
-    /// salvage fallback as replay, bounded by one page of events in memory —
-    /// and restarts when a repair rewrote the journal mid-build. An absent
-    /// journal has the empty digest and caches nothing. Callers hold the
-    /// conversation lock.
+    /// Make the cached digest match the journal files on disk. A miss
+    /// merges the digest each sealed segment persisted in its `.idx` (no
+    /// sealed bytes are read) and pages through the plaintext files with
+    /// the replay index — the same validation and salvage fallback as
+    /// replay, bounded by one page of events in memory — and restarts when
+    /// a repair changed the journal mid-build. An absent journal has the
+    /// empty digest and caches nothing. Callers hold the conversation lock.
     async fn ensure_digest_locked(&self, conversation_id: &str) -> Result<(), AppError> {
         let directory = self.directory(conversation_id)?;
-        let files = journal_files(&directory).await?;
+        let files = self.files_locked(conversation_id, &directory).await?;
         if files.is_empty() {
             self.digests.remove(conversation_id);
             return Ok(());
@@ -936,12 +1264,8 @@ impl ConversationStore {
             return Ok(());
         }
         self.digests.remove(conversation_id);
-        let index_files = |store: &Self| {
-            store
-                .indexes
-                .get(conversation_id)
-                .map(|index| index.files.clone())
-        };
+        let index_files =
+            |store: &Self| store.index_get(conversation_id, |index| index.files.clone());
         // One pass normally suffices; a second follows a salvage rewrite.
         for _ in 0..3 {
             let directory = self.replay_journal(conversation_id).await?;
@@ -950,27 +1274,65 @@ impl ConversationStore {
                     "conversation {conversation_id} journal index is missing"
                 )));
             };
+            let ranges: Vec<(Option<u64>, u64, u64)> = self
+                .index_get(conversation_id, |index| {
+                    index
+                        .parts
+                        .iter()
+                        .map(|part| match part {
+                            IndexPart::Sealed(segment) => {
+                                (Some(segment.number), part.first(), part.count())
+                            }
+                            IndexPart::Plain { .. } => (None, part.first(), part.count()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut digest = JournalDigest::default();
-            let mut from = 0usize;
-            let complete = loop {
-                let (_, to, total, events) = self
-                    .read_indexed_page(conversation_id, &directory, PageAnchor::Start, |total| {
-                        let from = from.min(total);
-                        (from, from.saturating_add(MAX_REPLAY_LIMIT).min(total))
-                    })
-                    .await?;
-                if index_files(self).as_ref() != Some(&start_files) {
-                    break false;
+            let mut complete = true;
+            'parts: for (number, first, count) in ranges {
+                if let Some(number) = number {
+                    let path = directory.clone();
+                    let loaded =
+                        tokio::task::spawn_blocking(move || segment::load_index(&path, number))
+                            .await
+                            .map_err(blocking_error)?;
+                    match loaded {
+                        Ok(loaded) => digest.merge(loaded.body.digest),
+                        Err(error) => {
+                            // Unreadable since the index was built: salvage
+                            // through the page path, then start over.
+                            tracing::warn!(conversation_id, number, error = %error, "sealed segment index unreadable while building the digest");
+                            self.salvage_segment_locked(conversation_id, &directory, number)
+                                .await?;
+                            complete = false;
+                            break 'parts;
+                        }
+                    }
+                    continue;
                 }
-                for event in &events {
-                    digest.apply(event);
+                let mut from = (first - 1) as usize;
+                let end = (first - 1 + count) as usize;
+                while from < end {
+                    let (_, to, _, events) = self
+                        .read_indexed_page(conversation_id, &directory, PageAnchor::Start, |_| {
+                            (from, from.saturating_add(MAX_REPLAY_LIMIT).min(end))
+                        })
+                        .await?;
+                    if index_files(self).as_ref() != Some(&start_files) {
+                        complete = false;
+                        break 'parts;
+                    }
+                    for event in &events {
+                        digest.apply(event);
+                    }
+                    if events.is_empty() {
+                        break;
+                    }
+                    from = to;
                 }
-                if to >= total || events.is_empty() {
-                    break true;
-                }
-                from = to;
-            };
-            if complete {
+            }
+            if complete && index_files(self).as_ref() == Some(&start_files) {
                 self.digests.insert(
                     conversation_id.to_owned(),
                     CachedDigest {
@@ -1056,9 +1418,38 @@ impl ConversationStore {
         })
     }
 
-    /// Shared replay prelude: the manifest must exist and the byte-offset
-    /// index — a rebuildable cache — must match the journal files on disk.
-    /// Returns the conversation directory replay pages read segments from.
+    /// The conversation's ordered journal files, after crash
+    /// reconciliation of its directory once per process. Callers hold the
+    /// conversation lock.
+    pub(super) async fn files_locked(
+        &self,
+        conversation_id: &str,
+        directory: &Path,
+    ) -> Result<Vec<JournalFile>, AppError> {
+        if !self.reconciled.contains_key(conversation_id) {
+            let building = self.sealing.contains_key(conversation_id);
+            let path = directory.to_owned();
+            let outcome =
+                tokio::task::spawn_blocking(move || segment::reconcile_directory(&path, building))
+                    .await
+                    .map_err(blocking_error)??;
+            if outcome.changed {
+                tracing::warn!(
+                    conversation_id,
+                    "reconciled journal segments after an interrupted conversion"
+                );
+                self.index_remove(conversation_id);
+                self.digests.remove(conversation_id);
+                self.tails.remove(conversation_id);
+            }
+            self.reconciled.insert(conversation_id.to_owned(), ());
+        }
+        journal_files(directory).await
+    }
+
+    /// Shared replay prelude: the manifest must exist and the index — a
+    /// rebuildable cache — must match the journal files on disk. Returns
+    /// the conversation directory replay pages read segments from.
     /// Callers hold the conversation lock.
     async fn replay_journal(&self, conversation_id: &str) -> Result<PathBuf, AppError> {
         let directory = self.directory(conversation_id)?;
@@ -1067,65 +1458,66 @@ impl ConversationStore {
                 "conversation {conversation_id}"
             )));
         }
-        let files = journal_files(&directory).await?;
+        let files = self.files_locked(conversation_id, &directory).await?;
         if files.is_empty() {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
         }
         let valid_index = self
-            .indexes
-            .get(conversation_id)
-            .is_some_and(|index| index.files == files);
+            .index_get(conversation_id, |index| index.files == files)
+            .unwrap_or(false);
         if !valid_index
             && !self
                 .index_journal_fast(conversation_id, &directory, files)
                 .await?
         {
-            // Validate and repair once; the byte index is only a rebuildable cache.
-            self.read_and_recover_events(conversation_id).await?;
+            // Validate and repair once; the index is only a rebuildable cache.
+            self.validate_journal_locked(conversation_id).await?;
         }
         Ok(directory)
     }
 
-    /// Cold index build without deserializing every record: a newline scan
-    /// per segment plus validation of each segment's boundary records.
-    /// Returns `false` when the journal is not in the clean shape appends
-    /// leave behind (see [`scan_journal_offsets`]) so the caller runs the
-    /// full validating scan with its tail repair.
+    /// Cold index build without deserializing every record: each sealed
+    /// segment contributes its `.idx` (no `.seg` bytes are read) and each
+    /// plaintext file a newline scan plus validation of its boundary
+    /// records. Returns `false` when the journal is not in the clean shape
+    /// appends and conversions leave behind so the caller runs the full
+    /// validating scan with its repairs.
     async fn index_journal_fast(
         &self,
         conversation_id: &str,
         directory: &Path,
         files: Vec<JournalFile>,
     ) -> Result<bool, AppError> {
-        let paths: Vec<PathBuf> = files
-            .iter()
-            .map(|file| directory.join(&file.name))
-            .collect();
+        let path = directory.to_owned();
         let id = conversation_id.to_owned();
-        let scanned = tokio::task::spawn_blocking(move || scan_journal_offsets(&paths, &id))
-            .await
-            .map_err(|error| AppError::Anyhow(error.into()))??;
-        let Some(scanned) = scanned else {
+        let scan_files = files.clone();
+        let scanned =
+            tokio::task::spawn_blocking(move || scan_journal_fast(&path, &scan_files, &id))
+                .await
+                .map_err(blocking_error)??;
+        let Some((parts, last)) = scanned else {
             tracing::debug!(
                 conversation_id,
                 "journal needs a full scan to build its replay index"
             );
             return Ok(false);
         };
-        self.tails.insert(
-            conversation_id.to_owned(),
-            JournalTail {
-                name: files[scanned.last_segment as usize].name.clone(),
-                bytes: files[scanned.last_segment as usize].bytes,
-                modified: files[scanned.last_segment as usize].modified,
-                event: scanned.last,
-            },
-        );
-        self.indexes.insert(
-            conversation_id.to_owned(),
+        if let Some((file, event)) = last {
+            self.tails.insert(
+                conversation_id.to_owned(),
+                JournalTail {
+                    name: files[file].name.clone(),
+                    bytes: files[file].bytes,
+                    modified: files[file].modified,
+                    event,
+                },
+            );
+        }
+        self.index_put(
+            conversation_id,
             JournalIndex {
                 files,
-                offsets: scanned.offsets,
+                parts,
                 fully_validated: false,
             },
         );
@@ -1133,11 +1525,11 @@ impl ConversationStore {
     }
 
     /// Read the page `window(total)` selects from the current index, cut to
-    /// [`MAX_REPLAY_PAGE_BYTES`] from its `anchor` end before any record is
-    /// read. When a fast-built index meets a record that does not parse or
-    /// validate, the full scan runs so corruption is reported (or salvaged)
-    /// exactly as an eagerly validated index would, then the page is read
-    /// again. Returns `(from, to, total, events)`.
+    /// [`MAX_REPLAY_PAGE_BYTES`] from its `anchor` end. A record that does
+    /// not parse or validate is repaired where it lives: a plaintext file
+    /// through the full validating scan (when the index was built fast), a
+    /// sealed segment by segment salvage; the page is then read again.
+    /// Returns `(from, to, total, events)`.
     async fn read_indexed_page(
         &self,
         conversation_id: &str,
@@ -1145,105 +1537,331 @@ impl ConversationStore {
         anchor: PageAnchor,
         window: impl Fn(usize) -> (usize, usize),
     ) -> Result<(usize, usize, usize, Vec<ConversationEvent>), AppError> {
-        let total = self.journal_len(conversation_id);
-        let (from, to) = self.budgeted_window(conversation_id, window(total), anchor);
-        let error = match self
-            .read_replay_window(conversation_id, directory, from, to)
-            .await
-        {
-            Ok(events) => return Ok((from, to, total, events)),
-            Err(error) => error,
-        };
-        let fully_validated = self
-            .indexes
-            .get(conversation_id)
-            .is_none_or(|index| index.fully_validated);
-        if fully_validated {
-            return Err(error);
-        }
-        tracing::warn!(conversation_id, error = %error, "unreadable record behind the fast journal index; running full validation");
-        self.read_and_recover_events(conversation_id).await?;
-        let total = self.journal_len(conversation_id);
-        let (from, to) = self.budgeted_window(conversation_id, window(total), anchor);
-        let events = self
-            .read_replay_window(conversation_id, directory, from, to)
-            .await?;
-        Ok((from, to, total, events))
-    }
-
-    fn budgeted_window(
-        &self,
-        conversation_id: &str,
-        window: (usize, usize),
-        anchor: PageAnchor,
-    ) -> (usize, usize) {
-        match self.indexes.get(conversation_id) {
-            Some(index) => budget_window(&index.offsets, window, anchor, MAX_REPLAY_PAGE_BYTES),
-            None => window,
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let total = self.journal_len(conversation_id);
+            let (from, to) = window(total);
+            let error = match self
+                .read_window(
+                    conversation_id,
+                    directory,
+                    from.min(to),
+                    to.min(total),
+                    anchor,
+                )
+                .await
+            {
+                Ok((from, to, events)) => return Ok((from, to, total, events)),
+                Err(error) => error,
+            };
+            match error {
+                PageError::Sealed(number, error) if attempt < 3 => {
+                    tracing::warn!(conversation_id, number, error = %error, "unreadable sealed journal segment; salvaging it");
+                    self.salvage_segment_locked(conversation_id, directory, number)
+                        .await?;
+                    self.replay_journal(conversation_id).await?;
+                }
+                PageError::Plain(error)
+                    if attempt < 3
+                        && !self
+                            .index_get(conversation_id, |index| index.fully_validated)
+                            .unwrap_or(true) =>
+                {
+                    tracing::warn!(conversation_id, error = %error, "unreadable record behind the fast journal index; running full validation");
+                    self.validate_journal_locked(conversation_id).await?;
+                }
+                PageError::Plain(error) | PageError::Sealed(_, error) => return Err(error),
+            }
         }
     }
 
     fn journal_len(&self, conversation_id: &str) -> usize {
-        self.indexes
-            .get(conversation_id)
-            .map(|index| index.offsets.len())
+        self.index_get(conversation_id, JournalIndex::total)
             .unwrap_or_default()
     }
 
-    /// Read `offsets[from..to]` as a journal page, reading one contiguous
-    /// span per segment the window crosses. `from` is the absolute index so
-    /// sequence validation still matches global journal positions.
-    async fn read_replay_window(
+    /// Records `from..to` (0-based positions) under the page byte budget,
+    /// kept from the `anchor` end. Returns the window actually read.
+    async fn read_window(
         &self,
         conversation_id: &str,
         directory: &Path,
         from: usize,
         to: usize,
-    ) -> Result<Vec<ConversationEvent>, AppError> {
-        let (offsets, files) = {
-            let index = self.indexes.get(conversation_id);
-            index
-                .map(|entry| {
-                    let len = entry.offsets.len();
-                    (
-                        entry.offsets[from.min(len)..to.min(len)].to_vec(),
-                        entry.files.clone(),
+        anchor: PageAnchor,
+    ) -> Result<(usize, usize, Vec<ConversationEvent>), PageError> {
+        if from >= to {
+            return Ok((from, from, Vec::new()));
+        }
+        let mut slices = self
+            .index_get(conversation_id, |index| index.slices(from, to))
+            .unwrap_or_default();
+        let backward = matches!(anchor, PageAnchor::End);
+        if backward {
+            slices.reverse();
+        }
+        let mut budget = PageBudget::new(MAX_REPLAY_PAGE_BYTES);
+        let mut chunks: Vec<Vec<ConversationEvent>> = Vec::new();
+        let mut read = 0usize;
+        for slice in slices {
+            let (events, complete) = match slice {
+                PartSlice::Plain {
+                    name,
+                    first,
+                    offsets,
+                } => self
+                    .read_plain_slice(
+                        conversation_id,
+                        directory,
+                        &name,
+                        first,
+                        &offsets,
+                        backward,
+                        &mut budget,
                     )
-                })
-                .unwrap_or_default()
-        };
-        let mut events = Vec::with_capacity(offsets.len());
-        let mut cursor = 0usize;
-        while cursor < offsets.len() {
-            let segment = offsets[cursor].0 as usize;
-            let mut run_end = cursor + 1;
-            while run_end < offsets.len() && offsets[run_end].0 as usize == segment {
-                run_end += 1;
-            }
-            let Some(file_meta) = files.get(segment) else {
-                return Err(AppError::InvalidRequest(format!(
-                    "conversation {conversation_id} journal index is out of bounds"
-                )));
+                    .await
+                    .map_err(PageError::Plain)?,
+                PartSlice::Sealed {
+                    segment,
+                    first,
+                    last,
+                } => {
+                    let number = segment.number;
+                    self.read_sealed_slice(
+                        conversation_id,
+                        directory,
+                        segment,
+                        first,
+                        last,
+                        backward,
+                        &mut budget,
+                    )
+                    .await
+                    .map_err(|error| PageError::Sealed(number, error))?
+                }
             };
-            let start = offsets[cursor].1;
-            let end = offsets[run_end - 1].2;
-            let mut file = tokio::fs::File::open(directory.join(&file_meta.name)).await?;
-            file.seek(std::io::SeekFrom::Start(start)).await?;
-            let mut page = vec![0u8; (end - start) as usize];
-            file.read_exact(&mut page).await?;
-            for (index, (_, start_offset, end_offset)) in
-                offsets[cursor..run_end].iter().enumerate()
-            {
-                let event = decode_journal_record(
-                    &page[(start_offset - start) as usize..(end_offset - start) as usize],
-                    conversation_id,
-                )?;
-                validate_event(&event, conversation_id, (from + cursor + index + 1) as u64)?;
+            read += events.len();
+            chunks.push(events);
+            if !complete {
+                break;
+            }
+        }
+        if backward {
+            chunks.reverse();
+        }
+        let events: Vec<ConversationEvent> = chunks.into_iter().flatten().collect();
+        Ok(if backward {
+            (to - read, to, events)
+        } else {
+            (from, from + read, events)
+        })
+    }
+
+    /// Read the plaintext records `offsets` (the first holding `first`)
+    /// that fit the budget, from the start or (`backward`) the end, as one
+    /// contiguous span. Returns the records in order and whether all fit.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_plain_slice(
+        &self,
+        conversation_id: &str,
+        directory: &Path,
+        name: &str,
+        first: u64,
+        offsets: &[(u64, u64)],
+        backward: bool,
+        budget: &mut PageBudget,
+    ) -> Result<(Vec<ConversationEvent>, bool), AppError> {
+        let size = |(start, end): &(u64, u64)| end.saturating_sub(*start);
+        let (lo, hi) = if backward {
+            let mut lo = offsets.len();
+            while lo > 0 && budget.admit(size(&offsets[lo - 1])) {
+                lo -= 1;
+            }
+            (lo, offsets.len())
+        } else {
+            let mut hi = 0;
+            while hi < offsets.len() && budget.admit(size(&offsets[hi])) {
+                hi += 1;
+            }
+            (0, hi)
+        };
+        let complete = lo == 0 && hi == offsets.len();
+        if lo == hi {
+            return Ok((Vec::new(), complete));
+        }
+        let start = offsets[lo].0;
+        let end = offsets[hi - 1].1;
+        let mut file = tokio::fs::File::open(directory.join(name)).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        let mut page = vec![0u8; (end - start) as usize];
+        file.read_exact(&mut page).await?;
+        let mut events = Vec::with_capacity(hi - lo);
+        for (index, (start_offset, end_offset)) in offsets[lo..hi].iter().enumerate() {
+            let line =
+                trim_ascii(&page[(start_offset - start) as usize..(end_offset - start) as usize]);
+            let event = decode_journal_record(line, conversation_id)?;
+            validate_event(&event, conversation_id, first + (lo + index) as u64)?;
+            events.push(event);
+        }
+        Ok((events, complete))
+    }
+
+    /// Sealed counterpart of [`Self::read_plain_slice`] for sequences
+    /// `first..=last` of `segment`; sizes are known only once a record is
+    /// decoded, so the budget is applied as records are read.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_sealed_slice(
+        &self,
+        conversation_id: &str,
+        directory: &Path,
+        segment: Arc<SealedSegment>,
+        first: u64,
+        last: u64,
+        backward: bool,
+        budget: &mut PageBudget,
+    ) -> Result<(Vec<ConversationEvent>, bool), AppError> {
+        let directory = directory.to_owned();
+        let cache = self.frames.clone();
+        let codec = self.codec;
+        let id = conversation_id.to_owned();
+        let mut owned_budget = PageBudget::new(budget.limit);
+        owned_budget.used = budget.used;
+        owned_budget.admitted = budget.admitted;
+        let (events, complete, owned_budget) = tokio::task::spawn_blocking(move || {
+            let number = segment.number;
+            let mut reader = SegmentReader::open(&directory, &segment, &cache, codec, &id)
+                .map_err(|error| segment_error(&id, number, error))?;
+            let mut events = Vec::new();
+            let mut complete = true;
+            let sequences: Box<dyn Iterator<Item = u64>> = if backward {
+                Box::new((first..=last).rev())
+            } else {
+                Box::new(first..=last)
+            };
+            for sequence in sequences {
+                let (event, bytes) = reader
+                    .event(sequence)
+                    .map_err(|error| segment_error(&id, number, error))?;
+                if !owned_budget.admit(bytes) {
+                    complete = false;
+                    break;
+                }
+                validate_event(&event, &id, sequence)?;
                 events.push(event);
             }
-            cursor = run_end;
-        }
-        Ok(events)
+            if backward {
+                events.reverse();
+            }
+            Ok::<_, AppError>((events, complete, owned_budget))
+        })
+        .await
+        .map_err(blocking_error)??;
+        *budget = owned_budget;
+        Ok((events, complete))
+    }
+
+    /// Rebuild sealed segment `number` from what still reads (see
+    /// [`segment::salvage_segment`]), keeping the damaged files as
+    /// `events.corrupt.<ts>.seg`/`.idx`. Callers hold the conversation lock.
+    async fn salvage_segment_locked(
+        &self,
+        conversation_id: &str,
+        directory: &Path,
+        number: u64,
+    ) -> Result<(), AppError> {
+        // The range comes from the index when it still knows the segment,
+        // else from its neighbours.
+        let known = self
+            .index_get(conversation_id, |index| {
+                index.parts.iter().find_map(|part| match part {
+                    IndexPart::Sealed(segment) if segment.number == number => {
+                        Some((segment.first, Some(segment.last)))
+                    }
+                    _ => None,
+                })
+            })
+            .flatten();
+        let (first, last) = match known {
+            Some(range) => range,
+            None => {
+                self.neighbour_range(conversation_id, directory, number)
+                    .await?
+            }
+        };
+        let backup = corrupt_copy_path(&directory.join(EVENTS_FILE), "seg");
+        let backup_name = backup
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let path = directory.to_owned();
+        let id = conversation_id.to_owned();
+        let codec = self.codec;
+        let lost = tokio::task::spawn_blocking(move || {
+            let salvaged =
+                segment::salvage_segment(&path, &id, number, first, last, &backup_name, codec)?;
+            if let Err(error) =
+                segment::replace_with_salvaged(&path, &salvaged.prepared, &backup_name)
+            {
+                salvaged.prepared.discard();
+                return Err(error);
+            }
+            Ok(salvaged.lost)
+        })
+        .await
+        .map_err(blocking_error)?
+        .map_err(|error| segment_error(conversation_id, number, error))?;
+        tracing::warn!(
+            conversation_id,
+            number,
+            lost_records = lost,
+            "salvaged corrupt sealed journal segment; lost records replaced with placeholders"
+        );
+        self.index_remove(conversation_id);
+        self.digests.remove(conversation_id);
+        self.tails.remove(conversation_id);
+        Ok(())
+    }
+
+    /// Sequence range of segment `number` from the files around it, for a
+    /// segment whose own index is unusable: it starts after the previous
+    /// file's last record and ends before the next file's first.
+    async fn neighbour_range(
+        &self,
+        conversation_id: &str,
+        directory: &Path,
+        number: u64,
+    ) -> Result<(u64, Option<u64>), AppError> {
+        let files = journal_files(directory).await?;
+        let position = files
+            .iter()
+            .position(|file| file.is_sealed_segment() && file.number() == Some(number))
+            .ok_or_else(|| {
+                AppError::NotFound(format!("conversation {conversation_id} segment {number}"))
+            })?;
+        let path = directory.to_owned();
+        let id = conversation_id.to_owned();
+        let before = files[..position].to_vec();
+        let after = files[position + 1..].to_vec();
+        tokio::task::spawn_blocking(move || {
+            let first = match before.last() {
+                None => 1,
+                Some(file) => boundary_sequence(&path, file, &id, true)?
+                    .map(|last| last + 1)
+                    .ok_or_else(|| {
+                        AppError::InvalidRequest(format!(
+                            "conversation {id} journal has no readable record before segment {number}"
+                        ))
+                    })?,
+            };
+            let last = match after.iter().find(|file| file.bytes > 0) {
+                None => None,
+                Some(file) => boundary_sequence(&path, file, &id, false)?.map(|next| next - 1),
+            };
+            Ok::<_, AppError>((first, last))
+        })
+        .await
+        .map_err(blocking_error)?
     }
 
     /// The journal's newest record, read from the end of the file only, and
@@ -1266,6 +1884,10 @@ impl ConversationStore {
         &self,
         conversation_id: &str,
     ) -> Result<(ConversationManifest, Vec<ConversationEvent>), AppError> {
+        {
+            let _guard = self.lock(conversation_id).await;
+            self.validate_journal_locked(conversation_id).await?;
+        }
         let manifest = self.recover(conversation_id).await?;
         let history = self.complete_history(conversation_id).await?;
         Ok((manifest, history))
@@ -1273,8 +1895,7 @@ impl ConversationStore {
 
     /// Bring the manifest in line with the journal after a restart: its
     /// sequence, time and status (an unfinished turn becomes `Interrupted`)
-    /// come from the digest, so the journal is paged through once rather
-    /// than loaded whole.
+    /// come from the digest, so the journal is never loaded whole.
     pub async fn recover(&self, conversation_id: &str) -> Result<ConversationManifest, AppError> {
         let _guard = self.lock(conversation_id).await;
         self.flush_pending_delta_logged(conversation_id).await;
@@ -1332,7 +1953,10 @@ impl ConversationStore {
 
     /// Cached manifest, loaded from disk on a miss. Callers hold the
     /// conversation lock.
-    async fn get_unlocked(&self, conversation_id: &str) -> Result<ConversationManifest, AppError> {
+    pub(super) async fn get_unlocked(
+        &self,
+        conversation_id: &str,
+    ) -> Result<ConversationManifest, AppError> {
         if let Some(cached) = self.manifests.get(conversation_id) {
             return Ok(cached.manifest.clone());
         }
@@ -1354,7 +1978,7 @@ impl ConversationStore {
     /// Write the manifest and its snapshot now. A failed write leaves the
     /// cache authoritative and dirty so the debounce timer retries it.
     /// Callers hold the conversation lock.
-    async fn persist_manifest_locked(
+    pub(super) async fn persist_manifest_locked(
         &self,
         manifest: &ConversationManifest,
     ) -> Result<(), AppError> {
@@ -1438,165 +2062,291 @@ impl ConversationStore {
         Ok(())
     }
 
-    async fn read_and_recover_events(
-        &self,
-        conversation_id: &str,
-    ) -> Result<Vec<ConversationEvent>, AppError> {
+    /// Validate every record of the journal and repair what is damaged,
+    /// then cache a fully validated index. Sealed segments are checked
+    /// through their `.idx` (an unusable one triggers segment salvage);
+    /// each run of plaintext files is scanned line by line: interior
+    /// corruption is rewritten in the damaged files only, with a
+    /// `journal.recordLost` placeholder per lost sequence and the damaged
+    /// files backed up to `events.corrupt.<ts>.jsonl`; a corrupt tail is
+    /// quarantined and cut; a missing final newline is added. Memory is
+    /// bounded by offsets, not events. Callers hold the conversation lock.
+    async fn validate_journal_locked(&self, conversation_id: &str) -> Result<(), AppError> {
         let directory = self.directory(conversation_id)?;
-        let mut files = journal_files(&directory).await?;
-        if files.is_empty() {
-            return Ok(Vec::new());
-        }
-        // The ordered segments form one logical journal: feed each file's
-        // lines to the salvage scan in order so memory stays bounded by the
-        // largest file plus the parsed events, and record offsets come out
-        // already tagged `(segment, start, end)` for the replay index.
-        let mut scan = SalvageScan::new();
-        let mut unterminated: Option<usize> = None;
-        let mut index = 0usize;
-        while index < files.len() {
-            match tokio::fs::read(directory.join(&files[index].name)).await {
-                Ok(bytes) => {
-                    if !bytes.is_empty() {
-                        unterminated = (bytes.last() != Some(&b'\n')).then_some(index);
-                    }
-                    for (start, end) in line_ranges(&bytes) {
-                        let line = trim_ascii(&bytes[start..end]);
-                        if line.is_empty() {
+        for _ in 0..4 {
+            let files = self.files_locked(conversation_id, &directory).await?;
+            let mut parts = Vec::new();
+            let mut expected = 1u64;
+            let mut tail: Option<(usize, ConversationEvent)> = None;
+            let mut repaired = false;
+            let mut position = 0usize;
+            while position < files.len() {
+                if files[position].is_sealed_segment() {
+                    let number = files[position].number().unwrap_or_default();
+                    let path = directory.clone();
+                    let loaded =
+                        tokio::task::spawn_blocking(move || segment::load_index(&path, number))
+                            .await
+                            .map_err(blocking_error)?;
+                    match loaded {
+                        Ok(loaded) if loaded.segment.first == expected => {
+                            expected = loaded.segment.last + 1;
+                            tail = None;
+                            parts.push(IndexPart::Sealed(Arc::new(loaded.segment)));
+                            position += 1;
                             continue;
                         }
-                        scan.feed(
-                            line,
-                            index as u32,
-                            start as u64,
-                            end as u64,
-                            conversation_id,
-                        );
+                        Ok(loaded) => {
+                            return Err(AppError::InvalidRequest(format!(
+                                "conversation {conversation_id} journal segment {number} starts at \
+                                 sequence {} where {expected} belongs",
+                                loaded.segment.first
+                            )));
+                        }
+                        Err(SegmentError::Io(error)) => return Err(error.into()),
+                        Err(SegmentError::Invalid(reason)) => {
+                            tracing::warn!(
+                                conversation_id,
+                                number,
+                                reason,
+                                "sealed journal segment index unusable"
+                            );
+                            self.salvage_segment_locked(conversation_id, &directory, number)
+                                .await?;
+                            repaired = true;
+                            break;
+                        }
                     }
-                    index += 1;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    files.remove(index);
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let salvaged = scan.finish();
-        let repaired = salvaged.interior_damage || salvaged.corrupt_tail.is_some();
-        let (events, offsets) = if salvaged.interior_damage {
-            // Lines before the last valid record are damaged: back the whole
-            // journal up and rewrite it with placeholders for lost sequences.
-            // A corrupt tail after that record is dropped by the rewrite,
-            // and the rewritten journal collapses into one active file.
-            rewrite_salvaged_journal(conversation_id, &directory, &files, salvaged).await?
-        } else {
-            let mut events = Vec::with_capacity(salvaged.entries.len());
-            let mut offsets = Vec::with_capacity(salvaged.entries.len());
-            for entry in salvaged.entries {
-                if let SalvagedEntry::Record {
-                    event,
-                    segment,
-                    start,
-                    end,
-                } = entry
-                {
-                    offsets.push((segment, start, end));
-                    events.push(event);
-                }
-            }
-            if let Some((segment, start)) = salvaged.corrupt_tail {
-                // Nothing valid follows these lines, so they are an
-                // interrupted write rather than lost history: quarantine
-                // them and cut the journal back to its last valid record.
-                // A corrupt tail is a suffix, so it may span several
-                // trailing segments; wholly corrupt ones are deleted, the
-                // one containing `start` is truncated, and an empty active
-                // file is kept so the journal still ends in `events.jsonl`.
-                quarantine_tail(&directory, &files, segment, start).await?;
-                for (index, entry) in files.iter().enumerate().skip(segment as usize) {
-                    let path = directory.join(&entry.name);
-                    if index > segment as usize && entry.name != EVENTS_FILE {
-                        tokio::fs::remove_file(&path).await?;
-                        continue;
-                    }
-                    let file = tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&path)
-                        .await?;
-                    file.set_len(if index == segment as usize { start } else { 0 })
-                        .await?;
-                    file.sync_all().await?;
-                }
-                sync_directory(&directory).await?;
-                let quarantined: u64 = files[segment as usize..]
+                // A run of plaintext files up to the next sealed segment,
+                // whose first sequence bounds any loss inside the run.
+                let end = files[position..]
                     .iter()
-                    .map(|file| file.bytes)
-                    .sum::<u64>()
-                    .saturating_sub(start);
-                tracing::warn!(
-                    conversation_id,
-                    quarantined_bytes = quarantined,
-                    "recovered invalid conversation journal tail"
-                );
-            } else if let Some(last) = unterminated {
-                // A complete record whose trailing newline never reached the
-                // disk parses fine, but the next O_APPEND write would glue its
-                // record onto it and a later scan would quarantine both.
-                // Terminate it now; the recorded offsets already end where the
-                // newline lands. Only the last non-empty file can hold it.
-                terminate_journal(&directory.join(&files[last].name)).await?;
-                tracing::warn!(
-                    conversation_id,
-                    "terminated conversation journal missing its final newline"
-                );
+                    .position(JournalFile::is_sealed_segment)
+                    .map_or(files.len(), |offset| position + offset);
+                let barrier = if end < files.len() {
+                    let path = directory.clone();
+                    let id = conversation_id.to_owned();
+                    let file = files[end].clone();
+                    let next = tokio::task::spawn_blocking(move || {
+                        boundary_sequence(&path, &file, &id, false)
+                    })
+                    .await
+                    .map_err(blocking_error)??;
+                    Some(next.ok_or_else(|| {
+                        AppError::InvalidRequest(format!(
+                            "conversation {conversation_id} sealed segment after plaintext journal is unreadable"
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                let path = directory.clone();
+                let id = conversation_id.to_owned();
+                let run: Vec<(usize, JournalFile)> = (position..end)
+                    .map(|index| (index, files[index].clone()))
+                    .collect();
+                let scan = tokio::task::spawn_blocking(move || {
+                    scan_plain_run(&path, &run, &id, expected, barrier)
+                })
+                .await
+                .map_err(blocking_error)??;
+                if scan.needs_repair() {
+                    self.repair_plain_run(conversation_id, &directory, &files, scan)
+                        .await?;
+                    repaired = true;
+                    break;
+                }
+                expected = scan.expected;
+                if let Some(last) = scan.last {
+                    tail = Some(last);
+                }
+                parts.extend(scan.parts);
+                position = end;
             }
-            (events, offsets)
-        };
-        if repaired {
-            self.follow_repaired_journal_locked(
+            if repaired {
+                self.index_remove(conversation_id);
+                self.digests.remove(conversation_id);
+                self.tails.remove(conversation_id);
+                self.follow_repaired_journal_locked(conversation_id).await?;
+                continue;
+            }
+            match tail {
+                Some((file, event)) => {
+                    self.tails.insert(
+                        conversation_id.to_owned(),
+                        JournalTail {
+                            name: files[file].name.clone(),
+                            bytes: files[file].bytes,
+                            modified: files[file].modified,
+                            event,
+                        },
+                    );
+                }
+                None => {
+                    self.tails.remove(conversation_id);
+                }
+            }
+            self.index_put(
                 conversation_id,
-                events.last().map_or(0, |event| event.sequence),
-            )
-            .await?;
-            // The repair changed which files exist and what they hold, so
-            // cached compaction fingerprints and the digest no longer
-            // describe them.
-            self.incompressible.remove(conversation_id);
-            self.digests.remove(conversation_id);
-        }
-        let files = journal_files(&directory).await?;
-        self.indexes.insert(
-            conversation_id.to_owned(),
-            JournalIndex {
-                files: files.clone(),
-                offsets,
-                fully_validated: true,
-            },
-        );
-        if let Some(event) = events.last() {
-            let tail = files
-                .iter()
-                .rev()
-                .find(|file| file.bytes > 0)
-                .cloned()
-                .unwrap_or_else(|| JournalFile {
-                    name: EVENTS_FILE.to_owned(),
-                    bytes: 0,
-                    modified: None,
-                });
-            self.tails.insert(
-                conversation_id.to_owned(),
-                JournalTail {
-                    name: tail.name,
-                    bytes: tail.bytes,
-                    modified: tail.modified,
-                    event: event.clone(),
+                JournalIndex {
+                    files,
+                    parts,
+                    fully_validated: true,
                 },
             );
-        } else {
-            self.tails.remove(conversation_id);
+            return Ok(());
         }
-        Ok(events)
+        Err(AppError::Conflict(format!(
+            "conversation {conversation_id} journal kept changing while it was repaired"
+        )))
+    }
+
+    /// Apply the repairs a [`PlainRunScan`] found. Callers hold the
+    /// conversation lock.
+    async fn repair_plain_run(
+        &self,
+        conversation_id: &str,
+        directory: &Path,
+        files: &[JournalFile],
+        mut scan: PlainRunScan,
+    ) -> Result<(), AppError> {
+        if let Some((segment, _)) = scan.corrupt_tail {
+            if scan.damaged.is_empty() {
+                // Quarantine first: the tail copy must hold the original
+                // bytes.
+                let (segment, start) = scan.corrupt_tail.expect("tail is present");
+                quarantine_tail(directory, files, segment, start).await?;
+            } else {
+                // The interior backup covers the tail as well: its files
+                // are rewritten with their valid records only.
+                scan.damaged.extend(
+                    (segment..files.len()).filter(|index| !files[*index].is_sealed_segment()),
+                );
+            }
+        }
+        let mut rewritten = BTreeSet::new();
+        if !scan.damaged.is_empty() {
+            let backup = corrupt_copy_path(&directory.join(EVENTS_FILE), "jsonl");
+            let backup_name = backup
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // The damaged files, concatenated in journal order, must be
+            // durable before any of them is rewritten.
+            {
+                let copy = tokio::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&backup)
+                    .await?;
+                set_owner_only(&backup, false).await?;
+                let mut writer =
+                    tokio::io::BufWriter::with_capacity(JOURNAL_SCAN_BUFFER_BYTES, copy);
+                for file in &scan.damaged {
+                    writer
+                        .write_all(&tokio::fs::read(directory.join(&files[*file].name)).await?)
+                        .await?;
+                }
+                writer.flush().await?;
+                writer.into_inner().sync_all().await?;
+            }
+            sync_directory(directory).await?;
+            let mut lost_records = 0u64;
+            for file in &scan.damaged {
+                let bytes = tokio::fs::read(directory.join(&files[*file].name)).await?;
+                let mut lines: Vec<Vec<u8>> = Vec::new();
+                for entry in scan.entries.iter().filter(|entry| entry.file() == *file) {
+                    match entry {
+                        SalvagedEntry::Record { start, end, .. } => {
+                            lines.push(trim_ascii(&bytes[*start as usize..*end as usize]).to_vec());
+                        }
+                        SalvagedEntry::Lost {
+                            run_start,
+                            run_length,
+                            time,
+                            provider,
+                            ..
+                        } => {
+                            for sequence in *run_start..run_start + run_length {
+                                let mut placeholder = ConversationEvent::new(
+                                    conversation_id,
+                                    sequence,
+                                    JOURNAL_RECORD_LOST_EVENT,
+                                    serde_json::json!({
+                                        "reason": "corrupt",
+                                        "runStart": run_start,
+                                        "runLength": run_length,
+                                        "backup": backup_name,
+                                    }),
+                                );
+                                placeholder.time =
+                                    time.unwrap_or_else(|| truncate_to_micros(Utc::now()));
+                                placeholder.provider = *provider;
+                                lines.push(encode_record(&placeholder, self.codec)?);
+                            }
+                            lost_records += run_length;
+                        }
+                    }
+                }
+                replace_journal(&directory.join(&files[*file].name), &lines).await?;
+                rewritten.insert(*file);
+            }
+            tracing::warn!(
+                conversation_id,
+                lost_records,
+                backup = %backup_name,
+                "salvaged corrupt conversation journal; lost records replaced with placeholders"
+            );
+        }
+        if let Some((segment, start)) = scan.corrupt_tail {
+            // Nothing valid follows these lines, so they are an interrupted
+            // write rather than lost history: cut the journal back to its
+            // last valid record. A corrupt tail is a suffix, so it may span
+            // several trailing files; wholly corrupt sealed ones are
+            // deleted, the one containing `start` is truncated (unless the
+            // interior rewrite already dropped its tail lines), and an
+            // empty active file is kept so the journal still ends in
+            // `events.jsonl`.
+            for (index, entry) in files.iter().enumerate().skip(segment) {
+                if rewritten.contains(&index) || entry.is_sealed_segment() {
+                    continue;
+                }
+                let path = directory.join(&entry.name);
+                if index > segment && entry.name != EVENTS_FILE {
+                    tokio::fs::remove_file(&path).await?;
+                    continue;
+                }
+                let file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .await?;
+                file.set_len(if index == segment { start } else { 0 })
+                    .await?;
+                file.sync_all().await?;
+            }
+            sync_directory(directory).await?;
+            let quarantined: u64 = files[segment..]
+                .iter()
+                .map(|file| file.bytes)
+                .sum::<u64>()
+                .saturating_sub(start);
+            tracing::warn!(
+                conversation_id,
+                quarantined_bytes = quarantined,
+                "recovered invalid conversation journal tail"
+            );
+        } else if let Some(last) = scan.unterminated {
+            // A complete record whose trailing newline never reached the
+            // disk parses fine, but the next O_APPEND write would glue its
+            // record onto it and a later scan would quarantine both.
+            terminate_journal(&directory.join(&files[last].name)).await?;
+            tracing::warn!(
+                conversation_id,
+                "terminated conversation journal missing its final newline"
+            );
+        }
+        Ok(())
     }
 
     /// A repair can leave the journal ending below the cached manifest, which
@@ -1604,11 +2354,12 @@ impl ConversationStore {
     /// `last_sequence` back to the journal; a manifest that is merely behind
     /// is left to [`Self::append_locked`], which also replays the status.
     /// Callers hold the conversation lock.
-    async fn follow_repaired_journal_locked(
-        &self,
-        conversation_id: &str,
-        journal_sequence: u64,
-    ) -> Result<(), AppError> {
+    async fn follow_repaired_journal_locked(&self, conversation_id: &str) -> Result<(), AppError> {
+        let journal_sequence = self
+            .read_last_event(conversation_id)
+            .await?
+            .0
+            .map_or(0, |event| event.sequence);
         let mut manifest = self.get_unlocked(conversation_id).await?;
         if manifest.last_sequence > journal_sequence {
             manifest.last_sequence = journal_sequence;
@@ -1621,23 +2372,49 @@ impl ConversationStore {
     /// file ends with a newline. `false` means an interrupted write left
     /// the final record unterminated, so the next append must close that
     /// record first — with an in-line separator when the torn file is the
-    /// active one, or by terminating a sealed segment in place.
+    /// active one, or by terminating a sealed plaintext file in place. A
+    /// journal ending in a sealed `.seg` decodes its last frames.
     async fn read_last_event(
         &self,
         conversation_id: &str,
     ) -> Result<(Option<ConversationEvent>, bool), AppError> {
         let directory = self.directory(conversation_id)?;
-        let files = journal_files(&directory).await?;
+        let files = self.files_locked(conversation_id, &directory).await?;
         let Some(last) = files.iter().rev().find(|file| file.bytes > 0) else {
             return Ok((None, true));
         };
         // Every writer that fills the tail cache leaves its file
-        // newline-terminated (appends, recovery, the cold scan, compaction).
+        // newline-terminated (appends, recovery, the cold scan).
         if let Some(tail) = self.tails.get(conversation_id) {
             if tail.name == last.name && tail.bytes == last.bytes && tail.modified == last.modified
             {
                 return Ok((Some(tail.event.clone()), true));
             }
+        }
+        if last.is_sealed_segment() {
+            let number = last.number().unwrap_or_default();
+            let path = directory.clone();
+            let cache = self.frames.clone();
+            let codec = self.codec;
+            let id = conversation_id.to_owned();
+            let event = tokio::task::spawn_blocking(move || {
+                let loaded = segment::load_index(&path, number)?;
+                let mut reader = SegmentReader::open(&path, &loaded.segment, &cache, codec, &id)?;
+                reader.event(loaded.segment.last).map(|(event, _)| event)
+            })
+            .await
+            .map_err(blocking_error)?
+            .map_err(|error| segment_error(conversation_id, number, error))?;
+            self.tails.insert(
+                conversation_id.to_owned(),
+                JournalTail {
+                    name: last.name.clone(),
+                    bytes: last.bytes,
+                    modified: last.modified,
+                    event: event.clone(),
+                },
+            );
+            return Ok((Some(event), true));
         }
         let path = directory.join(&last.name);
         let window = (MAX_EVENT_PAYLOAD_BYTES as u64 + 64 * 1024).min(last.bytes);
@@ -1677,115 +2454,275 @@ impl ConversationStore {
         Ok((Some(event), terminated))
     }
 
-    /// Free journal space without disturbing replay cursors: every event
-    /// keeps its sequence. The journal is compacted file by file — each
-    /// segment is rewritten in place only when it actually shrinks — so a
-    /// pass costs the still-unprotected prefix, not a whole-journal rewrite.
-    /// Older streaming records superseded by a terminal record are replaced
-    /// by [`JOURNAL_COMPACTED_EVENT`] markers, and oversized payload strings
-    /// in the rest are truncated, oldest files first. The newest
-    /// `JOURNAL_COMPACT_PROTECTED_BYTES` of events stay byte-identical so
-    /// recent history retains full fidelity. Sealed segments that end up
-    /// small enough are merged into their predecessor to keep the file
-    /// count bounded. Callers must hold the conversation lock.
-    async fn compact_journal(&self, conversation_id: &str) -> Result<(), AppError> {
+    /// Convert the oldest sealed plaintext files of a conversation (one
+    /// file, or several consecutive ones up to [`JOURNAL_SEGMENT_BYTES`]
+    /// when migrating 8 MiB v2 files) into one compressed segment named
+    /// after the first. The build runs without the conversation lock — the
+    /// sources are immutable once sealed — and is committed under it only
+    /// if they are unchanged. Returns `false` when nothing was waiting.
+    pub(super) async fn seal_next(&self, conversation_id: &str) -> Result<bool, AppError> {
         let directory = self.directory(conversation_id)?;
-        let files = journal_files(&directory).await?;
-        if files.is_empty() {
-            return Ok(());
-        }
-        let mut total = journal_bytes(&files);
-        if total <= JOURNAL_COMPACT_TARGET_BYTES {
-            return Ok(());
-        }
-        // Records ending at or before this journal byte position may lose
-        // fidelity; everything newer stays byte-identical.
-        let protected_floor = total.saturating_sub(JOURNAL_COMPACT_PROTECTED_BYTES);
-        let mut done = self
-            .incompressible
-            .get(conversation_id)
-            .map(|entry| entry.value().clone())
-            .unwrap_or_default();
-        done.retain(|cached| files.contains(cached));
-        let mut compacted = 0usize;
-        let mut truncated = 0usize;
-        let mut rewrote = false;
-        let mut cursor = 0u64;
-        for file in &files {
-            // The protected window is the journal's newest bytes, so a file
-            // at or beyond the floor — and every file after it — is skipped.
-            if cursor >= protected_floor {
-                break;
+        let (group, expected_first) = {
+            let _guard = self.lock(conversation_id).await;
+            if !tokio::fs::try_exists(directory.join(MANIFEST_FILE)).await? {
+                return Ok(false);
             }
-            let file_start = cursor;
-            cursor += file.bytes;
-            if done.contains(file) {
-                continue;
-            }
-            if total <= JOURNAL_COMPACT_TARGET_BYTES {
-                break;
-            }
-            let path = directory.join(&file.name);
-            let raw = match tokio::fs::read(&path).await {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
+            let files = self.files_locked(conversation_id, &directory).await?;
+            let Some(start) = files
+                .iter()
+                .position(|file| !file.is_sealed_segment() && file.name != EVENTS_FILE)
+            else {
+                return Ok(false);
             };
-            let outcome = compact_journal_file(
+            let mut group = vec![files[start].clone()];
+            let mut bytes = files[start].bytes;
+            for file in &files[start + 1..] {
+                if file.is_sealed_segment()
+                    || file.name == EVENTS_FILE
+                    || bytes + file.bytes > JOURNAL_SEGMENT_BYTES
+                {
+                    break;
+                }
+                bytes += file.bytes;
+                group.push(file.clone());
+            }
+            self.replay_journal(conversation_id).await?;
+            let first = self
+                .index_get(conversation_id, |index| {
+                    index.parts.iter().find_map(|part| match part {
+                        IndexPart::Plain { file, first, .. } if index.files[*file] == group[0] => {
+                            Some(*first)
+                        }
+                        _ => None,
+                    })
+                })
+                .flatten();
+            match first {
+                Some(first) => (group, first),
+                // An empty sealed file holds nothing to convert.
+                None => {
+                    for file in &group {
+                        if file.bytes == 0 {
+                            remove_if_exists(&directory.join(&file.name)).await?;
+                        }
+                    }
+                    if group.iter().any(|file| file.bytes > 0) {
+                        return Err(AppError::InvalidRequest(format!(
+                            "conversation {conversation_id} sealed journal file is not indexed"
+                        )));
+                    }
+                    sync_directory(&directory).await?;
+                    return Ok(true);
+                }
+            }
+        };
+        let number = group[0].number().unwrap_or_default();
+        let sources: Vec<String> = group.iter().map(|file| file.name.clone()).collect();
+        self.sealing.insert(conversation_id.to_owned(), ());
+        let path = directory.clone();
+        let id = conversation_id.to_owned();
+        let codec = self.codec;
+        let built = tokio::task::spawn_blocking(move || {
+            segment::build_from_plain(&path, &id, number, &sources, expected_first, codec)
+        })
+        .await;
+        let prepared = match built {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
+                self.sealing.remove(conversation_id);
+                if let SegmentError::Invalid(reason) = &error {
+                    // Damage in a sealed plaintext file: repair it through
+                    // the validating scan so the next attempt can convert.
+                    tracing::warn!(
+                        conversation_id,
+                        reason,
+                        "sealed journal file failed to convert; validating the journal"
+                    );
+                    let _guard = self.lock(conversation_id).await;
+                    self.validate_journal_locked(conversation_id).await?;
+                }
+                return Err(segment_error(conversation_id, number, error));
+            }
+            Err(error) => {
+                self.sealing.remove(conversation_id);
+                return Err(blocking_error(error));
+            }
+        };
+        let committed = self
+            .commit_segment(conversation_id, &directory, &group, &prepared)
+            .await;
+        self.sealing.remove(conversation_id);
+        if !matches!(committed, Ok(true)) {
+            prepared.discard();
+        }
+        committed.map(|_| true)
+    }
+
+    /// Publish a built segment if its sources are unchanged and update the
+    /// caches in place. Returns whether it was committed.
+    async fn commit_segment(
+        &self,
+        conversation_id: &str,
+        directory: &Path,
+        group: &[JournalFile],
+        prepared: &PreparedSegment,
+    ) -> Result<bool, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let files = self.files_locked(conversation_id, directory).await?;
+        if !group.iter().all(|source| files.contains(source)) {
+            tracing::debug!(
                 conversation_id,
-                &raw,
-                file_start,
-                protected_floor,
-                &mut total,
-            )?;
-            compacted += outcome.compacted;
-            truncated += outcome.truncated;
-            let mut fingerprint = file.clone();
-            if let Some(lines) = outcome.lines {
-                replace_journal(&path, &lines).await?;
-                rewrote = true;
-                let metadata = tokio::fs::metadata(&path).await?;
-                fingerprint = JournalFile {
-                    name: file.name.clone(),
-                    bytes: metadata.len(),
-                    modified: metadata.modified().ok(),
-                };
-            }
-            if outcome.fully_unprotected {
-                // Only a sealed file can end fully before the protected
-                // window; sealed files are immutable, so once its whole
-                // range was processed it never needs parsing again.
-                done.push(fingerprint);
-            }
+                "journal changed during segment build; discarding it"
+            );
+            return Ok(false);
         }
-        let merged = merge_journal_segments(&directory, &mut done).await?;
-        if done.is_empty() {
-            self.incompressible.remove(conversation_id);
-        } else {
-            self.incompressible.insert(conversation_id.to_owned(), done);
-        }
-        // Rewritten and merged files changed their fingerprints, so the
-        // cached index no longer matches; the next replay rebuilds it.
-        if rewrote || merged {
-            self.indexes.remove(conversation_id);
-            self.digests.remove(conversation_id);
-        }
-        tracing::warn!(
-            conversation_id,
-            compacted_events = compacted,
-            truncated_events = truncated,
-            journal_bytes = total,
-            "conversation journal compacted"
+        #[cfg(test)]
+        let stop = *self
+            .commit_stop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(not(test))]
+        let stop: Option<CommitStep> = None;
+        let path = directory.to_owned();
+        let body_sources = prepared.body.sources.clone();
+        let (temp_seg, temp_idx, number) = (
+            prepared.temp_seg.clone(),
+            prepared.temp_idx.clone(),
+            prepared.number,
         );
+        let body = prepared.body.clone();
+        tokio::task::spawn_blocking(move || {
+            let prepared = PreparedSegment {
+                number,
+                temp_seg,
+                temp_idx,
+                body,
+            };
+            segment::commit_prepared(&path, &prepared, stop)
+        })
+        .await
+        .map_err(blocking_error)?
+        .map_err(|error| segment_error(conversation_id, number, error))?;
+        if stop.is_some() {
+            // A simulated crash: leave the directory as it is and forget
+            // everything, like a restarted process would.
+            self.reconciled.remove(conversation_id);
+            self.index_remove(conversation_id);
+            self.digests.remove(conversation_id);
+            self.tails.remove(conversation_id);
+            return Ok(true);
+        }
+        let new_files = journal_files(directory).await?;
+        let sealed = SealedSegment::from_body(number, &prepared.body)
+            .map_err(|error| segment_error(conversation_id, number, error))?;
+        let sealed = Arc::new(sealed);
+        let updated = self.index_update(conversation_id, |index| {
+            if index.files != files {
+                return false;
+            }
+            let mut parts = Vec::with_capacity(index.parts.len());
+            let mut placed = false;
+            for part in index.parts.drain(..) {
+                match &part {
+                    IndexPart::Plain { file, .. } if body_sources.contains(&files[*file].name) => {
+                        if !placed {
+                            parts.push(IndexPart::Sealed(sealed.clone()));
+                            placed = true;
+                        }
+                    }
+                    _ => parts.push(part),
+                }
+            }
+            // Plain parts refer to files by position; renumber them.
+            for part in &mut parts {
+                if let IndexPart::Plain { file, .. } = part {
+                    let name = &files[*file].name;
+                    *file = new_files
+                        .iter()
+                        .position(|candidate| &candidate.name == name)
+                        .unwrap_or(*file);
+                }
+            }
+            index.parts = parts;
+            index.files = new_files.clone();
+            true
+        });
+        if updated != Some(true) {
+            self.index_remove(conversation_id);
+        }
+        if let Some(mut cached) = self.digests.get_mut(conversation_id) {
+            // Slimming keeps every sequence and the digest is computed from
+            // the original records, so it still describes the journal.
+            if cached.files == files {
+                cached.files = new_files.clone();
+            }
+        }
+        tracing::info!(
+            conversation_id,
+            segment = number,
+            records = prepared.body.last_sequence - prepared.body.first_sequence + 1,
+            slimmed = prepared.body.slimmed,
+            bytes = prepared.body.seg_bytes,
+            "sealed journal segment"
+        );
+        Ok(true)
+    }
+
+    /// Stop segment commits after `step`, simulating a crash.
+    #[cfg(test)]
+    pub(super) fn set_commit_stop(&self, step: Option<CommitStep>) {
+        *self
+            .commit_stop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = step;
+    }
+
+    /// Forget every cached view of a conversation, as a restart would.
+    #[cfg(test)]
+    pub(super) fn forget_caches(&self, conversation_id: &str) {
+        self.index_remove(conversation_id);
+        self.digests.remove(conversation_id);
+        self.tails.remove(conversation_id);
+        self.reconciled.remove(conversation_id);
+    }
+
+    /// Seal the active file now (as a rotation would) when it holds any
+    /// record, so migration can convert it. Callers hold the lock.
+    pub(super) async fn seal_active_locked(&self, conversation_id: &str) -> Result<(), AppError> {
+        let directory = self.directory(conversation_id)?;
+        let files = self.files_locked(conversation_id, &directory).await?;
+        if !files
+            .last()
+            .is_some_and(|file| file.name == EVENTS_FILE && file.bytes > 0)
+        {
+            return Ok(());
+        }
+        let terminated = self.read_last_event(conversation_id).await?.1;
+        let previous = files.clone();
+        let mut files = files;
+        let (sealed, fresh) = rotate_journal(&directory, &files, terminated).await?;
+        *files.last_mut().expect("active segment is present") = sealed;
+        files.push(fresh);
+        self.index_update(conversation_id, |index| {
+            if index.files == previous {
+                index.files = files.clone();
+            }
+        });
+        if let Some(mut cached) = self.digests.get_mut(conversation_id) {
+            if cached.files == previous {
+                cached.files = files.clone();
+            }
+        }
+        self.tails.remove(conversation_id);
         Ok(())
     }
 
-    fn directory(&self, conversation_id: &str) -> Result<PathBuf, AppError> {
+    pub(super) fn directory(&self, conversation_id: &str) -> Result<PathBuf, AppError> {
         validate_id(conversation_id)?;
         Ok(self.root.join(conversation_id))
     }
 
-    async fn lock(&self, conversation_id: &str) -> OwnedMutexGuard<()> {
+    pub(super) async fn lock(&self, conversation_id: &str) -> OwnedMutexGuard<()> {
         // Drop the DashMap shard guard before awaiting the async mutex. Holding
         // it across await can block every executor thread under concurrent writes.
         let lock = self
@@ -1797,22 +2734,32 @@ impl ConversationStore {
     }
 }
 
-/// `events.NNNNNN.jsonl` → its segment number; anything else → `None`.
-fn sealed_segment_number(name: &str) -> Option<u64> {
-    let digits = name.strip_prefix("events.")?.strip_suffix(".jsonl")?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
+/// Drop the sub-microsecond part v3 records do not store.
+fn truncate_to_micros(time: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(time.timestamp_micros()).unwrap_or(time)
 }
 
-/// Ordered journal files of a conversation directory: sealed
-/// `events.NNNNNN.jsonl` segments by number followed by the active
-/// `events.jsonl` when present. Everything else — `events.corrupt.*`
-/// backups, manifests, rewrite temporaries — is ignored. The list is the
-/// journal's identity: any rename, append or truncation changes it.
-async fn journal_files(directory: &Path) -> Result<Vec<JournalFile>, AppError> {
-    let mut sealed: Vec<(u64, JournalFile)> = Vec::new();
+async fn remove_if_exists(path: &Path) -> Result<(), AppError> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// `events.NNNNNN.jsonl` → its segment number; anything else → `None`.
+fn sealed_segment_number(name: &str) -> Option<u64> {
+    segment::numbered(name, ".jsonl")
+}
+
+/// Ordered journal files of a conversation directory: sealed segments
+/// (`events.NNNNNN.seg`, or `events.NNNNNN.jsonl` awaiting conversion) by
+/// number followed by the active `events.jsonl` when present. Everything
+/// else — `.idx` siblings, `events.corrupt.*` backups, manifests,
+/// temporaries — is ignored. The list is the journal's identity: any
+/// rename, append, conversion or truncation changes it.
+pub(super) async fn journal_files(directory: &Path) -> Result<Vec<JournalFile>, AppError> {
+    let mut sealed: Vec<((u64, bool), JournalFile)> = Vec::new();
     let mut active = None;
     let mut entries = match tokio::fs::read_dir(directory).await {
         Ok(entries) => entries,
@@ -1822,12 +2769,14 @@ async fn journal_files(directory: &Path) -> Result<Vec<JournalFile>, AppError> {
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_active = name == EVENTS_FILE;
-        let number = if is_active {
+        let key = if is_active {
             None
+        } else if let Some(number) = sealed_segment_number(&name) {
+            Some((number, false))
         } else {
-            sealed_segment_number(&name)
+            segment::numbered(&name, ".seg").map(|number| (number, true))
         };
-        if !is_active && number.is_none() {
+        if !is_active && key.is_none() {
             continue;
         }
         let metadata = entry.metadata().await?;
@@ -1839,29 +2788,22 @@ async fn journal_files(directory: &Path) -> Result<Vec<JournalFile>, AppError> {
             bytes: metadata.len(),
             modified: metadata.modified().ok(),
         };
-        if is_active {
-            active = Some(file);
-        } else {
-            sealed.push((number.expect("sealed name carries a number"), file));
+        match key {
+            None => active = Some(file),
+            Some(key) => sealed.push((key, file)),
         }
     }
-    sealed.sort_by_key(|(number, _)| *number);
+    sealed.sort_by_key(|(key, _)| *key);
     let mut files: Vec<JournalFile> = sealed.into_iter().map(|(_, file)| file).collect();
     files.extend(active);
     Ok(files)
 }
 
-/// Total bytes across a conversation's journal files.
-fn journal_bytes(files: &[JournalFile]) -> u64 {
-    files.iter().map(|file| file.bytes).sum()
-}
-
-/// Seal the active `events.jsonl` under the next `events.NNNNNN.jsonl`
-/// number and create a fresh empty active file. `terminated` reports
-/// whether the active file ends with a newline; a torn final record is
-/// terminated before sealing so no record ever straddles a segment
-/// boundary. Returns the sealed and fresh active file metadata. Callers
-/// hold the conversation lock.
+/// Seal the active `events.jsonl` under the next segment number and create
+/// a fresh empty active file. `terminated` reports whether the active file
+/// ends with a newline; a torn final record is terminated before sealing so
+/// no record ever straddles a file boundary. Returns the sealed and fresh
+/// active file metadata. Callers hold the conversation lock.
 async fn rotate_journal(
     directory: &Path,
     files: &[JournalFile],
@@ -1873,7 +2815,7 @@ async fn rotate_journal(
     }
     let next = files
         .iter()
-        .filter_map(|file| sealed_segment_number(&file.name))
+        .filter_map(JournalFile::number)
         .max()
         .unwrap_or(0)
         + 1;
@@ -1881,7 +2823,7 @@ async fn rotate_journal(
     let sealed_path = directory.join(&sealed_name);
     tokio::fs::rename(&active_path, &sealed_path).await?;
     // A crash between the rename and this create leaves the journal ending
-    // in a sealed segment; the next append recreates `events.jsonl`.
+    // in a sealed file; the next append recreates `events.jsonl`.
     let fresh = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -1905,6 +2847,85 @@ async fn rotate_journal(
             modified: fresh_metadata.modified().ok(),
         },
     ))
+}
+
+/// A conversation directory being written before it is published.
+struct ConversationDraft {
+    temporary: PathBuf,
+    writer: PlainJournalWriter,
+}
+
+/// Writes v3 records into a new conversation's temporary directory,
+/// rotating plaintext files at [`JOURNAL_SEGMENT_BYTES`] like appends do.
+pub(super) struct PlainJournalWriter {
+    directory: PathBuf,
+    codec: ContentCodec,
+    writer: tokio::io::BufWriter<tokio::fs::File>,
+    bytes: u64,
+    sealed: u64,
+}
+
+impl PlainJournalWriter {
+    async fn create(directory: &Path, codec: ContentCodec) -> Result<Self, AppError> {
+        let path = directory.join(EVENTS_FILE);
+        let file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await?;
+        set_owner_only(&path, false).await?;
+        Ok(Self {
+            directory: directory.to_owned(),
+            codec,
+            writer: tokio::io::BufWriter::with_capacity(JOURNAL_SCAN_BUFFER_BYTES, file),
+            bytes: 0,
+            sealed: 0,
+        })
+    }
+
+    async fn write(&mut self, event: &ConversationEvent) -> Result<(), AppError> {
+        if self.bytes >= JOURNAL_SEGMENT_BYTES {
+            self.seal().await?;
+        }
+        let mut line = encode_record(event, self.codec)?;
+        line.push(b'\n');
+        self.writer.write_all(&line).await?;
+        self.bytes += line.len() as u64;
+        Ok(())
+    }
+
+    async fn sync(&mut self) -> Result<(), AppError> {
+        self.writer.flush().await?;
+        self.writer.get_mut().sync_all().await?;
+        Ok(())
+    }
+
+    async fn seal(&mut self) -> Result<(), AppError> {
+        self.sync().await?;
+        self.sealed += 1;
+        let active = self.directory.join(EVENTS_FILE);
+        tokio::fs::rename(
+            &active,
+            self.directory
+                .join(format!("events.{:06}.jsonl", self.sealed)),
+        )
+        .await?;
+        let file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&active)
+            .await?;
+        set_owner_only(&active, false).await?;
+        self.writer = tokio::io::BufWriter::with_capacity(JOURNAL_SCAN_BUFFER_BYTES, file);
+        self.bytes = 0;
+        Ok(())
+    }
+
+    /// Make everything durable; returns how many files were sealed.
+    async fn finish(mut self) -> Result<u64, AppError> {
+        self.sync().await?;
+        Ok(self.sealed)
+    }
 }
 
 /// Serialized size an oversized payload is cut down to. The headroom below
@@ -2077,36 +3098,6 @@ fn serialized_prefix_len(text: &str, limit: usize) -> usize {
     text.len()
 }
 
-/// Truncate oversized strings inside a journal payload. Returns whether any
-/// string changed so callers can skip reserializing untouched events. Every
-/// branch is visited deliberately — `any` would short-circuit and leave later
-/// strings untouched.
-fn truncate_journal_strings(value: &mut Value) -> bool {
-    match value {
-        Value::String(text) if text.len() > JOURNAL_COMPACT_STRING_MAX => {
-            let original = text.len();
-            let kept: String = text.chars().take(JOURNAL_COMPACT_STRING_KEEP).collect();
-            *text = format!("{kept}…[truncated from {original} bytes]");
-            true
-        }
-        Value::Array(items) => {
-            let mut changed = false;
-            for item in items {
-                changed |= truncate_journal_strings(item);
-            }
-            changed
-        }
-        Value::Object(map) => {
-            let mut changed = false;
-            for item in map.values_mut() {
-                changed |= truncate_journal_strings(item);
-            }
-            changed
-        }
-        _ => false,
-    }
-}
-
 fn validate_id(id: &str) -> Result<(), AppError> {
     match Uuid::parse_str(id) {
         Ok(parsed) if parsed.get_version_num() == 4 => Ok(()),
@@ -2232,16 +3223,16 @@ async fn terminate_journal(path: &Path) -> Result<(), AppError> {
 }
 
 /// Quarantine the journal tail starting at `start` bytes into
-/// `files[segment]` and covering every later file. The copy is written as
-/// one concatenated stream so a tail spanning several segments lands in a
-/// single backup.
+/// `files[segment]` and covering every later plaintext file. The copy is
+/// written as one concatenated stream so a tail spanning several files
+/// lands in a single backup.
 async fn quarantine_tail(
     directory: &Path,
     files: &[JournalFile],
-    segment: u32,
+    segment: usize,
     start: u64,
 ) -> Result<(), AppError> {
-    let copy_path = corrupt_copy_path(&directory.join(EVENTS_FILE));
+    let copy_path = corrupt_copy_path(&directory.join(EVENTS_FILE), "jsonl");
     let copy = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -2249,15 +3240,14 @@ async fn quarantine_tail(
         .await?;
     set_owner_only(&copy_path, false).await?;
     let mut writer = tokio::io::BufWriter::with_capacity(JOURNAL_SCAN_BUFFER_BYTES, copy);
-    for (index, file) in files.iter().enumerate().skip(segment as usize) {
+    for (index, file) in files.iter().enumerate().skip(segment) {
+        if file.is_sealed_segment() {
+            continue;
+        }
         match tokio::fs::read(directory.join(&file.name)).await {
             Ok(bytes) => {
-                let offset = if index == segment as usize {
-                    start as usize
-                } else {
-                    0
-                };
-                writer.write_all(&bytes[offset..]).await?;
+                let offset = if index == segment { start as usize } else { 0 };
+                writer.write_all(&bytes[offset.min(bytes.len())..]).await?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -2268,347 +3258,381 @@ async fn quarantine_tail(
     Ok(())
 }
 
-/// `events.corrupt.<UTC timestamp>.jsonl` next to the journal: where damaged
-/// journal bytes are kept before recovery cuts or rewrites them.
-fn corrupt_copy_path(path: &Path) -> PathBuf {
+/// `events.corrupt.<UTC timestamp>.<extension>` next to the journal: where
+/// damaged journal bytes are kept before recovery cuts or rewrites them.
+fn corrupt_copy_path(path: &Path, extension: &str) -> PathBuf {
     path.with_file_name(format!(
-        "events.corrupt.{}.jsonl",
-        Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+        "events.corrupt.{}.{extension}",
+        Utc::now().format("%Y%m%dT%H%M%S%.6fZ")
     ))
 }
 
-/// On-disk form of a [`JOURNAL_COMPACTED_EVENT`] marker. A full event line
-/// spends ~350 bytes on envelope fields, about as much as the streaming
-/// record it replaces, so history made of many small deltas could never
-/// compact below the prompt limit. This form keeps only what the marker
-/// event needs — the conversation id comes from the journal's directory —
-/// and [`decode_journal_record`] expands it back, so replay is unchanged.
-#[derive(serde::Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CompactedRecord {
-    sequence: u64,
-    compacted: CompactedRun,
-}
-
-#[derive(serde::Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CompactedRun {
-    event_id: String,
-    #[serde(with = "chrono::serde::ts_microseconds")]
-    time_us: DateTime<Utc>,
-    original_type: String,
-    run_start: u64,
-    run_length: u64,
-}
-
-impl CompactedRecord {
-    fn line(
-        original: &ConversationEvent,
-        original_type: &str,
+/// One entry of a salvaged plaintext run, in sequence order.
+enum SalvagedEntry {
+    /// A valid record and its line range inside `file` — `end` excludes
+    /// the newline, matching `line_ranges`.
+    Record {
+        file: usize,
+        sequence: u64,
+        start: u64,
+        end: u64,
+    },
+    /// Sequences `run_start..run_start + run_length` that no valid line
+    /// holds, placed in `file` (where the corrupt lines began) and stamped
+    /// with the previous valid record's time and provider.
+    Lost {
+        file: usize,
         run_start: u64,
         run_length: u64,
-    ) -> Result<Vec<u8>, AppError> {
-        Ok(serde_json::to_vec(&Self {
-            sequence: original.sequence,
-            compacted: CompactedRun {
-                event_id: original.event_id.clone(),
-                time_us: original.time,
-                original_type: original_type.to_owned(),
-                run_start,
-                run_length,
-            },
-        })?)
-    }
-
-    fn into_event(self, conversation_id: &str) -> ConversationEvent {
-        let run = self.compacted;
-        let mut event = ConversationEvent::new(
-            conversation_id,
-            self.sequence,
-            JOURNAL_COMPACTED_EVENT,
-            serde_json::json!({
-                "reason": "compacted",
-                "originalType": run.original_type,
-                "runStart": run.run_start,
-                "runLength": run.run_length,
-            }),
-        );
-        event.event_id = run.event_id;
-        event.time = run.time_us;
-        event
-    }
+        time: Option<DateTime<Utc>>,
+        provider: Option<super::ProviderKind>,
+    },
 }
 
-/// Parse one journal line, expanding a [`CompactedRecord`] into its marker
-/// event. Every journal read goes through here.
-fn decode_journal_record(
-    line: &[u8],
-    conversation_id: &str,
-) -> Result<ConversationEvent, serde_json::Error> {
-    if line.starts_with(COMPACTED_RECORD_PREFIX) {
-        serde_json::from_slice::<CompactedRecord>(line)
-            .map(|record| record.into_event(conversation_id))
-    } else {
-        serde_json::from_slice(line)
-    }
-}
-
-/// One journal file's compaction pass.
-struct CompactedJournalFile {
-    /// The rewritten lines (records without newlines) when any unprotected
-    /// record changed; `None` when the file stays byte-identical.
-    lines: Option<Vec<Vec<u8>>>,
-    /// Every record in the file sat before the protected window, so the
-    /// pass covered the whole file and its fingerprint can be cached.
-    fully_unprotected: bool,
-    compacted: usize,
-    truncated: usize,
-}
-
-/// Compact the records of one journal file whose lines end at or before
-/// `protected_floor` — a journal-wide byte position — while later records
-/// stay byte-for-byte. Sequences are validated against the file's own first
-/// record; cross-segment continuity is the recovery path's job. `total` is
-/// the whole journal's serialized size, updated in place as records shrink.
-/// Strip-type records are always swapped for markers; payload strings are
-/// truncated largest-first only while the journal stays above
-/// [`JOURNAL_COMPACT_TARGET_BYTES`].
-fn compact_journal_file(
-    conversation_id: &str,
-    raw: &[u8],
-    file_start: u64,
-    protected_floor: u64,
-    total: &mut u64,
-) -> Result<CompactedJournalFile, AppError> {
-    use std::borrow::Cow;
-
-    let mut lines: Vec<Cow<'_, [u8]>> = Vec::new();
-    let mut events: Vec<Option<ConversationEvent>> = Vec::new();
-    // Indexes into `lines`/`events` of the records eligible for changes.
-    let mut unprotected: Vec<usize> = Vec::new();
-    let mut expected = None;
-    for (start, end) in line_ranges(raw) {
-        let line = trim_ascii(&raw[start..end]);
-        if line.is_empty() {
-            continue;
+impl SalvagedEntry {
+    fn file(&self) -> usize {
+        match self {
+            Self::Record { file, .. } | Self::Lost { file, .. } => *file,
         }
-        // A record keeps full fidelity when its end lies inside the journal's
-        // newest `JOURNAL_COMPACT_PROTECTED_BYTES`.
-        if file_start + end as u64 + 1 > protected_floor {
-            lines.push(Cow::Borrowed(line));
-            events.push(None);
-            continue;
-        }
-        let event = decode_journal_record(line, conversation_id).map_err(|error| {
-            AppError::InvalidRequest(format!(
-                "conversation {conversation_id} journal segment is corrupt: {error}"
-            ))
-        })?;
-        // The file's first record sets the base; each following record must
-        // continue it, which catches line-level damage inside the segment.
-        let expected_sequence = expected.unwrap_or(event.sequence);
-        validate_event(&event, conversation_id, expected_sequence)?;
-        expected = Some(expected_sequence.saturating_add(1));
-        lines.push(Cow::Borrowed(line));
-        unprotected.push(events.len());
-        events.push(Some(event));
     }
-    let fully_unprotected = file_start + raw.len() as u64 <= protected_floor;
-    let mut compacted = 0usize;
-    let mut truncated = 0usize;
-    let mut index = 0usize;
-    // Streaming progress records are dead weight once their stream's
-    // terminal record exists, and a journal built from them has no
-    // truncatable bulk: replace each unprotected one with a minimal
-    // `journal.compacted` marker that keeps its sequence position. Runs are
-    // per file — a stripped run continuing in the next file gets its own
-    // `runStart`. Markers are never truncation candidates, so their slots
-    // are emptied.
-    while index < unprotected.len() {
-        let slot = unprotected[index];
-        let event = events[slot]
-            .as_ref()
-            .expect("unprotected slots hold events");
-        if event.event_type == JOURNAL_COMPACTED_EVENT {
-            let marker = events[slot].take().expect("unprotected slots hold events");
-            // Markers written before `CompactedRecord` existed are full
-            // events; re-encode them, keeping their run.
-            if !lines[slot].starts_with(COMPACTED_RECORD_PREFIX) {
-                let payload = &marker.payload;
-                let line = CompactedRecord::line(
-                    &marker,
-                    payload["originalType"].as_str().unwrap_or_default(),
-                    payload["runStart"].as_u64().unwrap_or(marker.sequence),
-                    payload["runLength"].as_u64().unwrap_or(1),
-                )?;
-                *total = *total - lines[slot].len() as u64 + line.len() as u64;
-                lines[slot] = Cow::Owned(line);
-                compacted += 1;
+}
+
+/// Corrupt lines since the last valid record.
+struct PendingCorrupt {
+    /// File and byte offset of the run's first line.
+    file: usize,
+    start: u64,
+    lines: u64,
+    bytes: u64,
+    files: BTreeSet<usize>,
+}
+
+/// Result of [`scan_plain_run`]: the run's index parts when it is clean,
+/// otherwise everything [`ConversationStore::repair_plain_run`] needs.
+struct PlainRunScan {
+    parts: Vec<IndexPart>,
+    /// Next sequence after the run.
+    expected: u64,
+    /// The run's newest record and the file holding it.
+    last: Option<(usize, ConversationEvent)>,
+    entries: Vec<SalvagedEntry>,
+    /// Files that must be rewritten: they hold interior corrupt lines or
+    /// receive placeholders.
+    damaged: BTreeSet<usize>,
+    /// `(file, byte offset)` where corrupt lines no valid record follows
+    /// begin; everything from there to the journal end is a tail.
+    corrupt_tail: Option<(usize, u64)>,
+    /// The last non-empty file lacks its final newline.
+    unterminated: Option<usize>,
+}
+
+impl PlainRunScan {
+    fn needs_repair(&self) -> bool {
+        !self.damaged.is_empty() || self.corrupt_tail.is_some() || self.unterminated.is_some()
+    }
+}
+
+/// Validate a run of plaintext journal files line by line, file by file, so
+/// a journal of any size is checked without concatenating its files. A line
+/// is corrupt when it does not parse as one record of this conversation
+/// (garbage, a torn write, two records glued onto one line) or its sequence
+/// does not continue the previous valid record. Each corrupt run is bounded
+/// by the valid records around it: after valid sequence `p`, the next valid
+/// record `q > p` resumes the journal and `p + 1..q` are lost. `q` is only
+/// accepted while the lost count fits in the corrupt lines seen (one record
+/// per line plus one per [`MIN_JOURNAL_RECORD_BYTES`]); otherwise the record
+/// is itself treated as corrupt, so a damaged sequence number cannot swallow
+/// the rest of the journal. A sealed segment after the run (`barrier`, its
+/// first sequence) ends the run like a valid record would; without one,
+/// corrupt lines no valid record follows are a tail. Blocking.
+fn scan_plain_run(
+    directory: &Path,
+    run: &[(usize, JournalFile)],
+    conversation_id: &str,
+    expected_first: u64,
+    barrier: Option<u64>,
+) -> Result<PlainRunScan, AppError> {
+    let mut expected = expected_first;
+    let mut entries = Vec::new();
+    let mut damaged = BTreeSet::new();
+    let mut pending: Option<PendingCorrupt> = None;
+    let mut last: Option<(usize, ConversationEvent)> = None;
+    let mut unterminated = None;
+    let mut present = Vec::new();
+    for (file, meta) in run {
+        let bytes = match std::fs::read(directory.join(&meta.name)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        present.push(*file);
+        if !bytes.is_empty() {
+            unterminated = (bytes.last() != Some(&b'\n')).then_some(*file);
+        }
+        for (start, end) in line_ranges(&bytes) {
+            let line = trim_ascii(&bytes[start..end]);
+            if line.is_empty() {
+                continue;
             }
-            index += 1;
-            continue;
+            let record = decode_journal_record(line, conversation_id)
+                .ok()
+                .filter(|event| {
+                    event.sequence >= expected
+                        && barrier.is_none_or(|barrier| event.sequence < barrier)
+                        && validate_event(event, conversation_id, event.sequence).is_ok()
+                });
+            if let Some(event) = record {
+                let lost = event.sequence - expected;
+                let capacity = pending.as_ref().map_or(0, |pending| {
+                    pending
+                        .lines
+                        .saturating_add(pending.bytes / MIN_JOURNAL_RECORD_BYTES as u64)
+                });
+                if lost <= capacity {
+                    if let Some(corrupt) = pending.take() {
+                        damaged.extend(corrupt.files);
+                        if lost > 0 {
+                            entries.push(SalvagedEntry::Lost {
+                                file: corrupt.file,
+                                run_start: expected,
+                                run_length: lost,
+                                time: last.as_ref().map(|(_, event)| event.time),
+                                provider: last.as_ref().and_then(|(_, event)| event.provider),
+                            });
+                        }
+                    }
+                    expected = event.sequence + 1;
+                    entries.push(SalvagedEntry::Record {
+                        file: *file,
+                        sequence: event.sequence,
+                        start: start as u64,
+                        end: end as u64,
+                    });
+                    last = Some((*file, event));
+                    continue;
+                }
+            }
+            let corrupt = pending.get_or_insert(PendingCorrupt {
+                file: *file,
+                start: start as u64,
+                lines: 0,
+                bytes: 0,
+                files: BTreeSet::new(),
+            });
+            corrupt.lines += 1;
+            corrupt.bytes += (end - start + 1) as u64;
+            corrupt.files.insert(*file);
         }
-        if !JOURNAL_COMPACT_STRIP_TYPES.contains(&event.event_type.as_str()) {
-            index += 1;
-            continue;
-        }
-        let run_start = event.sequence;
-        let mut run_end = index + 1;
-        while run_end < unprotected.len()
-            && JOURNAL_COMPACT_STRIP_TYPES.contains(
-                &events[unprotected[run_end]]
+    }
+    let mut corrupt_tail = None;
+    match barrier {
+        Some(barrier) => {
+            if expected > barrier {
+                return Err(AppError::InvalidRequest(format!(
+                    "conversation {conversation_id} journal overlaps its sealed segment at sequence {barrier}"
+                )));
+            }
+            // The sealed segment fixes where the run must end; anything
+            // missing before it is lost interior history.
+            if expected < barrier || pending.is_some() {
+                let place = pending
                     .as_ref()
-                    .expect("unprotected slots hold events")
-                    .event_type
-                    .as_str(),
-            )
+                    .map(|corrupt| corrupt.file)
+                    .or(present.last().copied());
+                if let Some(corrupt) = pending.take() {
+                    damaged.extend(corrupt.files);
+                }
+                if let (Some(file), true) = (place, expected < barrier) {
+                    damaged.insert(file);
+                    entries.push(SalvagedEntry::Lost {
+                        file,
+                        run_start: expected,
+                        run_length: barrier - expected,
+                        time: last.as_ref().map(|(_, event)| event.time),
+                        provider: last.as_ref().and_then(|(_, event)| event.provider),
+                    });
+                    expected = barrier;
+                }
+            }
+        }
+        None => corrupt_tail = pending.map(|corrupt| (corrupt.file, corrupt.start)),
+    }
+    let mut parts = Vec::new();
+    for entry in &entries {
+        if let SalvagedEntry::Record {
+            file,
+            sequence,
+            start,
+            end,
+        } = entry
         {
-            run_end += 1;
-        }
-        let run_length = run_end - index;
-        for slot in unprotected[index..run_end].iter().copied() {
-            let original = events[slot].take().expect("unprotected slots hold events");
-            let line = CompactedRecord::line(
-                &original,
-                &original.event_type,
-                run_start,
-                run_length as u64,
-            )?;
-            *total = *total - lines[slot].len() as u64 + line.len() as u64;
-            lines[slot] = Cow::Owned(line);
-            compacted += 1;
-        }
-        index = run_end;
-    }
-    // Truncate the bulkiest unprotected records first, oldest file first:
-    // the fewest possible recent events lose payload fidelity before the
-    // journal fits again.
-    if *total > JOURNAL_COMPACT_TARGET_BYTES {
-        unprotected.sort_by_key(|slot| std::cmp::Reverse(lines[*slot].len()));
-        for slot in unprotected {
-            if *total <= JOURNAL_COMPACT_TARGET_BYTES {
-                break;
+            match parts.last_mut() {
+                Some(IndexPart::Plain {
+                    file: part_file,
+                    offsets,
+                    ..
+                }) if part_file == file => offsets.push((*start, *end)),
+                _ => parts.push(IndexPart::Plain {
+                    file: *file,
+                    first: *sequence,
+                    offsets: vec![(*start, *end)],
+                }),
             }
-            let Some(event) = events[slot].as_mut() else {
-                continue;
-            };
-            if !truncate_journal_strings(&mut event.payload) {
-                continue;
-            }
-            let line = serde_json::to_vec(event)?;
-            *total = *total - lines[slot].len() as u64 + line.len() as u64;
-            lines[slot] = Cow::Owned(line);
-            truncated += 1;
         }
     }
-    let lines =
-        (compacted + truncated > 0).then(|| lines.into_iter().map(Cow::into_owned).collect());
-    Ok(CompactedJournalFile {
-        lines,
-        fully_unprotected,
-        compacted,
-        truncated,
+    Ok(PlainRunScan {
+        parts,
+        expected,
+        last,
+        entries,
+        damaged,
+        corrupt_tail,
+        unterminated,
     })
 }
 
-/// Concatenate adjacent sealed segments that together fit one segment
-/// target; sealed files are immutable and newline-terminated, so a merge is
-/// a byte copy under the earliest segment's name followed by unlinking the
-/// now-redundant file. A crash between the two leaves duplicate sequences
-/// that recovery drops as interior damage, so the merge converges. `done`
-/// receives the merged fingerprint when every source file was already
-/// compacted, so a later pass does not re-parse it.
-async fn merge_journal_segments(
+/// First (or, with `last`, newest) sequence a journal file holds; `None`
+/// when it holds no readable boundary record. Blocking.
+fn boundary_sequence(
     directory: &Path,
-    done: &mut Vec<JournalFile>,
-) -> Result<bool, AppError> {
-    let mut files = journal_files(directory).await?;
-    let mut merged_any = false;
-    let mut index = 0usize;
-    while index + 1 < files.len() {
-        let next = &files[index + 1];
-        if next.name == EVENTS_FILE || files[index].bytes + next.bytes > JOURNAL_SEGMENT_BYTES {
-            index += 1;
-            continue;
-        }
-        let merged = match (
-            tokio::fs::read(directory.join(&files[index].name)).await,
-            tokio::fs::read(directory.join(&next.name)).await,
-        ) {
-            (Ok(mut head), Ok(tail)) => {
-                // An unterminated head file would glue its last record onto
-                // the merged tail's first line.
-                if head.last() != Some(&b'\n') {
-                    head.push(b'\n');
-                }
-                head.extend_from_slice(&tail);
-                head
-            }
-            (Err(error), _) | (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                index += 1;
-                continue;
-            }
-            (Err(error), _) | (_, Err(error)) => return Err(error.into()),
-        };
-        let name = files[index].name.clone();
-        let both_done = done.contains(&files[index]) && done.contains(next);
-        let path = directory.join(&name);
-        replace_journal_bytes(&path, &merged).await?;
-        match tokio::fs::remove_file(directory.join(&next.name)).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        sync_directory(directory).await?;
-        let metadata = tokio::fs::metadata(&path).await?;
-        files[index] = JournalFile {
-            name,
-            bytes: metadata.len(),
-            modified: metadata.modified().ok(),
-        };
-        if both_done {
-            done.push(files[index].clone());
-        }
-        files.remove(index + 1);
-        merged_any = true;
+    file: &JournalFile,
+    conversation_id: &str,
+    last: bool,
+) -> Result<Option<u64>, AppError> {
+    if file.is_sealed_segment() {
+        return Ok(
+            segment::load_index(directory, file.number().unwrap_or_default())
+                .ok()
+                .map(|loaded| {
+                    if last {
+                        loaded.segment.last
+                    } else {
+                        loaded.segment.first
+                    }
+                }),
+        );
     }
-    Ok(merged_any)
+    let bytes = match std::fs::read(directory.join(&file.name)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let ranges = line_ranges(&bytes);
+    let decode = |(start, end): &(usize, usize)| {
+        decode_journal_record(trim_ascii(&bytes[*start..*end]), conversation_id)
+            .ok()
+            .map(|event| event.sequence)
+    };
+    Ok(if last {
+        ranges.iter().rev().find_map(decode)
+    } else {
+        ranges.iter().find_map(decode)
+    })
 }
 
-/// Atomically replace the journal file at `path` with `bytes`, which must
-/// already be complete newline-terminated records: temp file, fsync,
-/// rename, directory fsync. Unlike [`replace_journal`] the content needs no
-/// offsets, so it is written as one buffer.
-async fn replace_journal_bytes(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
-    let directory = path
-        .parent()
-        .ok_or_else(|| AppError::InvalidRequest("journal has no parent directory".to_owned()))?;
-    let temporary = directory.join(format!(".events.{}.tmp", Uuid::new_v4().simple()));
-    let file = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .await?;
-    let written = async {
-        set_owner_only(&temporary, false).await?;
-        let mut writer = tokio::io::BufWriter::with_capacity(JOURNAL_SCAN_BUFFER_BYTES, file);
-        writer.write_all(bytes).await?;
-        writer.flush().await?;
-        writer.into_inner().sync_all().await?;
-        #[cfg(windows)]
-        if tokio::fs::try_exists(path).await? {
-            tokio::fs::remove_file(path).await?;
+type FastScan = Option<(Vec<IndexPart>, Option<(usize, ConversationEvent)>)>;
+
+/// Blocking cold index build. Sealed segments contribute their `.idx`
+/// (checksummed, never their `.seg` bytes). Plaintext files get a newline
+/// scan in which only each file's first and last records are parsed: a
+/// file's first record must carry the running sequence and its last must
+/// carry `first + lines − 1`. Returns `None` whenever the journal differs
+/// from what appends and conversions produce — no records at all, a missing
+/// final newline, an unusable `.idx`, or a boundary record that fails to
+/// parse or validate. Callers then run the full validating scan, which owns
+/// repairs and corruption reporting.
+fn scan_journal_fast(
+    directory: &Path,
+    files: &[JournalFile],
+    conversation_id: &str,
+) -> Result<FastScan, AppError> {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+
+    let mut parts = Vec::new();
+    let mut expected = 1u64;
+    let mut last = None;
+    for (file_index, meta) in files.iter().enumerate() {
+        if meta.is_sealed_segment() {
+            let loaded = match segment::load_index(directory, meta.number().unwrap_or_default()) {
+                Ok(loaded) => loaded,
+                Err(SegmentError::Io(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into());
+                }
+                Err(_) => return Ok(None),
+            };
+            if loaded.segment.first != expected {
+                return Ok(None);
+            }
+            expected = loaded.segment.last + 1;
+            // The tail of a journal ending in a `.seg` is decoded on demand.
+            last = None;
+            parts.push(IndexPart::Sealed(Arc::new(loaded.segment)));
+            continue;
         }
-        tokio::fs::rename(&temporary, path).await?;
-        Ok::<_, AppError>(())
+        let path = directory.join(&meta.name);
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            // A file that vanished since enumeration is not corruption.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let bytes = file.metadata()?.len();
+        if bytes == 0 {
+            continue;
+        }
+        let mut final_byte = [0u8; 1];
+        file.seek(SeekFrom::End(-1))?;
+        file.read_exact(&mut final_byte)?;
+        if final_byte[0] != b'\n' {
+            return Ok(None);
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = std::io::BufReader::with_capacity(JOURNAL_SCAN_BUFFER_BYTES, file);
+        let mut offsets = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let read = reader.skip_until(b'\n')? as u64;
+            if read == 0 {
+                break;
+            }
+            // `end` excludes the newline, matching `line_ranges`.
+            offsets.push((cursor, cursor + read - 1));
+            cursor += read;
+        }
+        if cursor != bytes {
+            return Ok(None);
+        }
+        let mut file = reader.into_inner();
+        let mut read_record =
+            |(start, end): (u64, u64)| -> Result<Option<ConversationEvent>, AppError> {
+                let mut line = vec![0u8; (end - start) as usize];
+                file.seek(SeekFrom::Start(start))?;
+                file.read_exact(&mut line)?;
+                Ok(decode_journal_record(&line, conversation_id).ok())
+            };
+        let count = offsets.len() as u64;
+        let first_valid = read_record(offsets[0])?
+            .is_some_and(|event| validate_event(&event, conversation_id, expected).is_ok());
+        if !first_valid {
+            return Ok(None);
+        }
+        let Some(file_last) = read_record(offsets[offsets.len() - 1])?
+            .filter(|event| validate_event(event, conversation_id, expected + count - 1).is_ok())
+        else {
+            return Ok(None);
+        };
+        parts.push(IndexPart::Plain {
+            file: file_index,
+            first: expected,
+            offsets,
+        });
+        expected += count;
+        last = Some((file_index, file_last));
     }
-    .await;
-    if let Err(error) = written {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(error);
+    if parts.is_empty() {
+        return Ok(None);
     }
-    set_owner_only(path, false).await?;
-    sync_directory(directory).await
+    Ok(Some((parts, last)))
 }
 
 /// Atomically replace the journal at `path` with `lines` (records without
@@ -2661,256 +3685,6 @@ async fn replace_journal<L: AsRef<[u8]>>(
     Ok(offsets)
 }
 
-/// One entry of a salvaged journal, in sequence order.
-// Records are the common variant; boxing them would cost an allocation per
-// record on every full read to shrink the rare `Lost` entries.
-#[allow(clippy::large_enum_variant)]
-enum SalvagedEntry {
-    /// A valid record and its line range inside `segment` — `end` excludes
-    /// the newline, matching `line_ranges`.
-    Record {
-        event: ConversationEvent,
-        segment: u32,
-        start: u64,
-        end: u64,
-    },
-    /// Sequences `run_start..run_start + run_length` that no valid line holds.
-    Lost { run_start: u64, run_length: u64 },
-}
-
-/// Result of [`SalvageScan::finish`].
-struct SalvagedJournal {
-    entries: Vec<SalvagedEntry>,
-    /// Lines before the last valid record were dropped or sequences lost, so
-    /// the journal must be rewritten.
-    interior_damage: bool,
-    /// `(segment, byte offset)` where corrupt lines no valid record follows
-    /// begin; everything from there to the journal end is a tail.
-    corrupt_tail: Option<(u32, u64)>,
-}
-
-/// Classifies journal lines as they are read, file by file, so a journal of
-/// any size is validated without concatenating its segments in memory. A
-/// line is corrupt when it does not parse as one record of this conversation
-/// (garbage, a torn write, two records glued onto one line) or its sequence
-/// does not continue the previous valid record. Each corrupt run is bounded
-/// by the valid records around it: after valid sequence `p`, the next valid
-/// record `q > p` resumes the journal and `p + 1..q` are lost. `q` is only
-/// accepted while the lost count fits in the corrupt lines seen (one record
-/// per line plus one per [`MIN_JOURNAL_RECORD_BYTES`]); otherwise the record
-/// is itself treated as corrupt, so a damaged sequence number cannot swallow
-/// the rest of the journal. Corrupt lines with no valid record after them
-/// are a tail.
-#[derive(Default)]
-struct SalvageScan {
-    entries: Vec<SalvagedEntry>,
-    interior_damage: bool,
-    expected: u64,
-    /// Corrupt lines since the last valid record.
-    pending: Option<PendingCorrupt>,
-}
-
-struct PendingCorrupt {
-    /// File and byte offset of the run's first line.
-    segment: u32,
-    start: u64,
-    lines: u64,
-    bytes: u64,
-}
-
-impl SalvageScan {
-    fn new() -> Self {
-        Self {
-            expected: 1,
-            ..Self::default()
-        }
-    }
-
-    /// `line` is already trimmed and non-empty; `segment`, `start` and `end`
-    /// are its file index and byte range (newline excluded).
-    fn feed(&mut self, line: &[u8], segment: u32, start: u64, end: u64, conversation_id: &str) {
-        let record = decode_journal_record(line, conversation_id)
-            .ok()
-            .filter(|event| {
-                event.sequence >= self.expected
-                    && validate_event(event, conversation_id, event.sequence).is_ok()
-            });
-        if let Some(event) = record {
-            let lost = event.sequence - self.expected;
-            let capacity = self.pending.as_ref().map_or(0, |pending| {
-                pending
-                    .lines
-                    .saturating_add(pending.bytes / MIN_JOURNAL_RECORD_BYTES as u64)
-            });
-            if lost <= capacity {
-                if self.pending.take().is_some() {
-                    self.interior_damage = true;
-                }
-                if lost > 0 {
-                    self.entries.push(SalvagedEntry::Lost {
-                        run_start: self.expected,
-                        run_length: lost,
-                    });
-                }
-                self.expected = event.sequence.saturating_add(1);
-                self.entries.push(SalvagedEntry::Record {
-                    event,
-                    segment,
-                    start,
-                    end,
-                });
-                return;
-            }
-        }
-        let pending = self.pending.get_or_insert(PendingCorrupt {
-            segment,
-            start,
-            lines: 0,
-            bytes: 0,
-        });
-        pending.lines += 1;
-        pending.bytes += end - start + 1;
-    }
-
-    fn finish(self) -> SalvagedJournal {
-        SalvagedJournal {
-            entries: self.entries,
-            interior_damage: self.interior_damage,
-            corrupt_tail: self.pending.map(|pending| (pending.segment, pending.start)),
-        }
-    }
-}
-
-/// Back up the original journal, then atomically rewrite it with every valid
-/// record byte-for-byte and a [`JOURNAL_RECORD_LOST_EVENT`] placeholder for
-/// each lost sequence. Corrupt lines after the last valid record are dropped
-/// (the backup keeps them). The rewrite lands on `events.jsonl` — the single
-/// active file — and the sealed segments it replaces are unlinked after it
-/// is durable. Returns the new events and their `(0, start, end)` offsets.
-/// The segments are re-read here rather than shared with the scanning pass:
-/// the backup streams them and the rewrite keeps only the segment it is
-/// copying from, so even a damaged journal never sits in memory whole.
-/// Callers hold the conversation lock.
-async fn rewrite_salvaged_journal(
-    conversation_id: &str,
-    directory: &Path,
-    files: &[JournalFile],
-    salvaged: SalvagedJournal,
-) -> Result<(Vec<ConversationEvent>, Vec<(u32, u64, u64)>), AppError> {
-    let backup = corrupt_copy_path(&directory.join(EVENTS_FILE));
-    let backup_name = backup
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    // The backup must be durable before the rewrite replaces the originals;
-    // it holds all segments concatenated in journal order.
-    {
-        let copy = tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&backup)
-            .await?;
-        set_owner_only(&backup, false).await?;
-        let mut writer = tokio::io::BufWriter::with_capacity(JOURNAL_SCAN_BUFFER_BYTES, copy);
-        for file in files {
-            match tokio::fs::read(directory.join(&file.name)).await {
-                Ok(bytes) => writer.write_all(&bytes).await?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        writer.flush().await?;
-        writer.into_inner().sync_all().await?;
-    }
-    sync_directory(directory).await?;
-    // Valid records are copied byte-for-byte from their source segment.
-    let mut events: Vec<ConversationEvent> = Vec::with_capacity(salvaged.entries.len());
-    let mut lines: Vec<Vec<u8>> = Vec::with_capacity(salvaged.entries.len());
-    let mut segment_bytes: Vec<u8> = Vec::new();
-    let mut open_segment = u32::MAX;
-    let mut lost_records = 0u64;
-    for entry in salvaged.entries {
-        match entry {
-            SalvagedEntry::Record {
-                event,
-                segment,
-                start,
-                end,
-            } => {
-                if segment != open_segment {
-                    let name = &files
-                        .get(segment as usize)
-                        .ok_or_else(|| {
-                            AppError::InvalidRequest(format!(
-                                "conversation {conversation_id} journal lost a segment during salvage"
-                            ))
-                        })?
-                        .name;
-                    segment_bytes = tokio::fs::read(directory.join(name)).await?;
-                    open_segment = segment;
-                }
-                let line = trim_ascii(&segment_bytes[start as usize..end as usize]);
-                lines.push(line.to_vec());
-                events.push(event);
-            }
-            SalvagedEntry::Lost {
-                run_start,
-                run_length,
-            } => {
-                let previous = events.last();
-                let time = previous.map_or_else(Utc::now, |event| event.time);
-                let provider = previous.and_then(|event| event.provider);
-                for sequence in run_start..run_start + run_length {
-                    let mut placeholder = ConversationEvent::new(
-                        conversation_id,
-                        sequence,
-                        JOURNAL_RECORD_LOST_EVENT,
-                        serde_json::json!({
-                            "reason": "corrupt",
-                            "runStart": run_start,
-                            "runLength": run_length,
-                            "backup": backup_name,
-                        }),
-                    );
-                    placeholder.time = time;
-                    placeholder.provider = provider;
-                    lines.push(serde_json::to_vec(&placeholder)?);
-                    events.push(placeholder);
-                }
-                lost_records += run_length;
-            }
-        }
-    }
-    let offsets = replace_journal(&directory.join(EVENTS_FILE), &lines).await?;
-    // The rewritten active file supersedes the sealed segments. A crash
-    // before this point leaves the untouched originals plus the new file,
-    // whose duplicate sequences recover as a corrupt tail — the salvage
-    // converges instead of diverging.
-    for file in files {
-        if file.name != EVENTS_FILE {
-            match tokio::fs::remove_file(directory.join(&file.name)).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-    sync_directory(directory).await?;
-    tracing::warn!(
-        conversation_id,
-        lost_records,
-        backup = %backup_name,
-        "salvaged corrupt conversation journal; lost records replaced with placeholders"
-    );
-    Ok((
-        events,
-        offsets
-            .into_iter()
-            .map(|(start, end)| (0, start, end))
-            .collect(),
-    ))
-}
-
 /// Which end of a replay window the byte budget keeps.
 #[derive(Clone, Copy)]
 enum PageAnchor {
@@ -2918,136 +3692,6 @@ enum PageAnchor {
     Start,
     /// Reverse replay: keep the newest records, drop older ones.
     End,
-}
-
-/// Shrink `from..to` from the end opposite `anchor` until its records span
-/// at most `budget` journal bytes, keeping at least one record.
-fn budget_window(
-    offsets: &[(u32, u64, u64)],
-    (from, to): (usize, usize),
-    anchor: PageAnchor,
-    budget: u64,
-) -> (usize, usize) {
-    let to = to.min(offsets.len());
-    let from = from.min(to);
-    let size = |index: usize| offsets[index].2.saturating_sub(offsets[index].1);
-    let mut bytes = 0u64;
-    match anchor {
-        PageAnchor::Start => {
-            for index in from..to {
-                bytes = bytes.saturating_add(size(index));
-                if bytes > budget && index > from {
-                    return (from, index);
-                }
-            }
-        }
-        PageAnchor::End => {
-            for index in (from..to).rev() {
-                bytes = bytes.saturating_add(size(index));
-                if bytes > budget && index + 1 < to {
-                    return (index + 1, to);
-                }
-            }
-        }
-    }
-    (from, to)
-}
-
-/// Offset index produced by [`scan_journal_offsets`].
-struct ScannedJournal {
-    offsets: Vec<(u32, u64, u64)>,
-    /// Index into the scanned `paths` of the file the last record came from.
-    last_segment: u32,
-    last: ConversationEvent,
-}
-
-/// Blocking newline scan for a cold replay index; memory stays bounded by
-/// the read buffer plus two records per segment. Sequence `N` must be
-/// global line `N`, so only each segment's first and last records are
-/// parsed: a segment's first record must carry the running sequence and its
-/// last must carry `first + lines − 1`. Returns `None` whenever the journal
-/// differs from what appends produce — no records at all, a non-final
-/// newline anywhere, or a boundary record that fails to parse or validate.
-/// Callers then run the full validating scan, which owns tail repair and
-/// corruption reporting.
-fn scan_journal_offsets(
-    paths: &[PathBuf],
-    conversation_id: &str,
-) -> Result<Option<ScannedJournal>, AppError> {
-    use std::io::{BufRead, Read, Seek, SeekFrom};
-
-    let mut offsets = Vec::new();
-    let mut expected = 1u64;
-    let mut last = None;
-    for (file_index, path) in paths.iter().enumerate() {
-        let mut file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            // A segment that vanished since enumeration is not corruption.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        };
-        let metadata = file.metadata()?;
-        let bytes = metadata.len();
-        if bytes == 0 {
-            continue;
-        }
-        let mut final_byte = [0u8; 1];
-        file.seek(SeekFrom::End(-1))?;
-        file.read_exact(&mut final_byte)?;
-        if final_byte[0] != b'\n' {
-            return Ok(None);
-        }
-        file.seek(SeekFrom::Start(0))?;
-        let mut reader = std::io::BufReader::with_capacity(JOURNAL_SCAN_BUFFER_BYTES, file);
-        let mut file_offsets = Vec::new();
-        let mut cursor = 0u64;
-        loop {
-            let read = reader.skip_until(b'\n')? as u64;
-            if read == 0 {
-                break;
-            }
-            // `end` excludes the newline, matching `line_ranges`.
-            file_offsets.push((cursor, cursor + read - 1));
-            cursor += read;
-        }
-        if cursor != bytes {
-            return Ok(None);
-        }
-        let mut file = reader.into_inner();
-        let mut read_record =
-            |(start, end): (u64, u64)| -> Result<Option<ConversationEvent>, AppError> {
-                let mut line = vec![0u8; (end - start) as usize];
-                file.seek(SeekFrom::Start(start))?;
-                file.read_exact(&mut line)?;
-                Ok(decode_journal_record(&line, conversation_id).ok())
-            };
-        let count = file_offsets.len() as u64;
-        let first_valid = read_record(file_offsets[0])?
-            .is_some_and(|event| validate_event(&event, conversation_id, expected).is_ok());
-        if !first_valid {
-            return Ok(None);
-        }
-        let Some(segment_last) = read_record(file_offsets[file_offsets.len() - 1])?
-            .filter(|event| validate_event(event, conversation_id, expected + count - 1).is_ok())
-        else {
-            return Ok(None);
-        };
-        expected += count;
-        offsets.extend(
-            file_offsets
-                .iter()
-                .map(|(start, end)| (file_index as u32, *start, *end)),
-        );
-        last = Some((file_index as u32, segment_last));
-    }
-    let Some((last_segment, last)) = last else {
-        return Ok(None);
-    };
-    Ok(Some(ScannedJournal {
-        offsets,
-        last_segment,
-        last,
-    }))
 }
 
 fn line_ranges(raw: &[u8]) -> Vec<(usize, usize)> {
@@ -3108,6 +3752,14 @@ mod tests {
     use super::*;
     use crate::conversation::{ConversationStatus, ProviderKind};
 
+    impl ConversationStore {
+        /// A copy of the cached replay index; panics when none is cached.
+        fn test_index(&self, conversation_id: &str) -> JournalIndex {
+            self.index_get(conversation_id, Clone::clone)
+                .expect("replay index is cached")
+        }
+    }
+
     #[tokio::test]
     #[ignore = "opt-in 1k/10k journal replay performance measurement"]
     async fn measure_journal_replay_1k_and_10k() {
@@ -3148,7 +3800,7 @@ mod tests {
             }
             assert_eq!(restored, count as usize);
             let baseline = baseline_start.elapsed();
-            store.indexes.clear();
+            store.index_cache().clear();
             let cold_start = std::time::Instant::now();
             let mut cold_first_page = std::time::Duration::ZERO;
             let mut cursor = 0;
@@ -3176,8 +3828,8 @@ mod tests {
             assert_eq!(cursor, count);
             let warm = warm_start.elapsed();
             let offset_capacity_bytes = {
-                let index = store.indexes.get(&manifest.id).unwrap();
-                index.offsets.capacity() * std::mem::size_of::<(u64, u64)>()
+                let index = store.test_index(&manifest.id);
+                index.total() * std::mem::size_of::<(u64, u64)>()
             };
             // Measure durable append queueing while the same journal is repeatedly replayed.
             let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3587,11 +4239,8 @@ mod tests {
                 .sequence,
             1202
         );
-        assert_eq!(
-            store.indexes.get(&conversation.id).unwrap().offsets.len(),
-            1202
-        );
-        store.indexes.clear();
+        assert_eq!(store.test_index(&conversation.id).total(), 1202);
+        store.index_cache().clear();
         assert_eq!(
             store
                 .replay(&conversation.id, 1199, 1000)
@@ -3739,26 +4388,15 @@ mod tests {
     }
 
     #[test]
-    fn budget_window_keeps_one_record_even_above_the_budget() {
-        let offsets = vec![(0, 0, 100), (0, 101, 301), (1, 0, 50), (1, 51, 61)];
-        assert_eq!(
-            budget_window(&offsets, (0, 4), PageAnchor::Start, 10),
-            (0, 1)
-        );
-        assert_eq!(budget_window(&offsets, (0, 4), PageAnchor::End, 5), (3, 4));
-        assert_eq!(
-            budget_window(&offsets, (0, 4), PageAnchor::Start, 300),
-            (0, 2)
-        );
-        assert_eq!(
-            budget_window(&offsets, (0, 4), PageAnchor::End, 260),
-            (1, 4)
-        );
-        assert_eq!(
-            budget_window(&offsets, (1, 3), PageAnchor::Start, 1000),
-            (1, 3)
-        );
-        assert_eq!(budget_window(&offsets, (4, 9), PageAnchor::End, 1), (4, 4));
+    fn page_budget_keeps_one_record_even_above_the_budget() {
+        let mut budget = PageBudget::new(10);
+        assert!(budget.admit(100));
+        assert!(!budget.admit(1));
+        let mut budget = PageBudget::new(300);
+        assert!(budget.admit(100) && budget.admit(200));
+        assert!(!budget.admit(50));
+        let mut budget = PageBudget::new(0);
+        assert!(budget.admit(0) && budget.admit(0));
     }
 
     /// Seeds `count` events; the returned store has no replay index yet.
@@ -3801,12 +4439,12 @@ mod tests {
         assert_eq!(sequences(&tail), (101..=120).collect::<Vec<_>>());
         assert!(tail.has_more);
         {
-            let index = store.indexes.get(&id).unwrap();
+            let index = store.test_index(&id);
             assert!(
                 !index.fully_validated,
                 "clean journal must use the fast scan"
             );
-            assert_eq!(index.offsets.len(), 120);
+            assert_eq!(index.total(), 120);
         }
         assert_eq!(store.tails.get(&id).unwrap().event.sequence, 120);
 
@@ -3825,9 +4463,9 @@ mod tests {
             .unwrap();
         assert_eq!(appended.sequence, 121);
         {
-            let index = store.indexes.get(&id).unwrap();
+            let index = store.test_index(&id);
             assert!(!index.fully_validated);
-            assert_eq!(index.offsets.len(), 121);
+            assert_eq!(index.total(), 121);
         }
         let newest = store.replay_before(&id, u64::MAX, 2).await.unwrap();
         assert_eq!(sequences(&newest), vec![120, 121]);
@@ -3845,7 +4483,7 @@ mod tests {
 
         let tail = store.replay_before(&id, u64::MAX, 10).await.unwrap();
         assert_eq!(sequences(&tail), (21..=30).collect::<Vec<_>>());
-        assert!(store.indexes.get(&id).unwrap().fully_validated);
+        assert!(store.test_index(&id).fully_validated);
         // The torn record is quarantined and the journal cut back to its last
         // complete record, as the full scan always did.
         assert_eq!(fs::read(&path).unwrap(), clean);
@@ -3882,7 +4520,7 @@ mod tests {
         // valid follows it, so the full scan quarantines it as a tail.
         let tail = store.replay_before(&id, u64::MAX, 5).await.unwrap();
         assert_eq!(sequences(&tail), (6..=10).collect::<Vec<_>>());
-        assert!(store.indexes.get(&id).unwrap().fully_validated);
+        assert!(store.test_index(&id).fully_validated);
         assert_eq!(fs::read_to_string(&path).unwrap(), clean);
         assert_eq!(corrupt_copies(&path).len(), 1);
         fs::remove_dir_all(root).unwrap();
@@ -3908,7 +4546,7 @@ mod tests {
         let page = store.replay(&id, 0, 10).await.unwrap();
         assert_eq!(sequences(&page), (1..=10).collect::<Vec<_>>());
         assert_eq!(page.events[2].event_type, JOURNAL_RECORD_LOST_EVENT);
-        assert!(store.indexes.get(&id).unwrap().fully_validated);
+        assert!(store.test_index(&id).fully_validated);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4569,7 +5207,7 @@ mod tests {
         let (root, id, path) = seed_journal("todex-salvage-garbage", 5).await;
         let original = fs::read_to_string(&path).unwrap();
         let mut lines = original.lines().map(str::to_owned).collect::<Vec<_>>();
-        let second: ConversationEvent = serde_json::from_str(&lines[1]).unwrap();
+        let second = decode_journal_record(lines[1].as_bytes(), &id).unwrap();
         lines[2] = "\u{0}\u{0}garbage".to_owned();
         let corrupt = write_lines(&path, &lines);
         let store = ConversationStore::new(root.clone()).await.unwrap();
@@ -4909,7 +5547,7 @@ mod tests {
         let (root, id, path) = seed_journal("todex-salvage-runs", 12).await;
         let original = fs::read_to_string(&path).unwrap();
         let mut lines = original.lines().map(str::to_owned).collect::<Vec<_>>();
-        let first: ConversationEvent = serde_json::from_str(&lines[0]).unwrap();
+        let first = decode_journal_record(lines[0].as_bytes(), &id).unwrap();
         // Run one: sequences 2..=3 (garbage, then a repeat of sequence 1).
         lines[1] = "not json".to_owned();
         lines[2] = lines[0].clone();
@@ -4918,7 +5556,7 @@ mod tests {
         // Run three: sequence 9 carries a damaged sequence number far ahead,
         // which must not swallow the records after it.
         let mut damaged: Value = serde_json::from_str(&lines[8]).unwrap();
-        damaged["sequence"] = json!(1_000_000_000u64);
+        damaged["s"] = json!(1_000_000_000u64);
         lines[8] = damaged.to_string();
         // Unbounded tail: nothing valid follows, so it is cut, not salvaged.
         lines.push("{\"schemaVersion\":2,\"sequ".to_owned());
@@ -5039,265 +5677,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_compacts_a_full_journal_and_preserves_sequences() {
-        let root = temp_dir("todex-journal-compact");
-        let workspace = root.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
-        let store = ConversationStore::new(root.clone()).await.unwrap();
-        let manifest = store
-            .create(ConversationManifest::new(
-                ProviderKind::Codex,
-                workspace,
-                None,
-                None,
-            ))
-            .await
-            .unwrap();
-        let path = root
-            .join("conversations")
-            .join(&manifest.id)
-            .join(EVENTS_FILE);
-
-        // Hand-write a journal just under the prompt limit; each event
-        // carries one truncatable 256 KiB string.
-        use std::io::Write;
-        let bulky = "x".repeat(256 * 1024);
-        let mut file = fs::File::create(&path).unwrap();
-        let mut sequence = 0u64;
-        let mut written = 0u64;
-        loop {
-            let mut line = serde_json::to_vec(&ConversationEvent::new(
-                &manifest.id,
-                sequence + 1,
-                "tool.started",
-                json!({ "output": bulky, "index": sequence }),
-            ))
-            .unwrap();
-            line.push(b'\n');
-            if written + line.len() as u64 > JOURNAL_PROMPT_LIMIT_BYTES - 2048 {
-                break;
-            }
-            file.write_all(&line).unwrap();
-            written += line.len() as u64;
-            sequence += 1;
-        }
-        drop(file);
-        store.recover(&manifest.id).await.unwrap();
-
-        // Crossing the prompt limit runs compaction before the record lands.
-        let appended = store
-            .append(
-                &manifest.id,
-                "message.delta",
-                json!({ "content": "y".repeat(300 * 1024) }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(appended.sequence, sequence + 1);
-        // Compaction output may have been sealed by rotation on append, so
-        // measure all journal files and subtract the appended record.
-        let record_bytes = serde_json::to_vec(&appended).unwrap().len() as u64 + 1;
-        let compacted: u64 = journal_files(path.parent().unwrap())
-            .await
-            .unwrap()
-            .iter()
-            .map(|file| file.bytes)
-            .sum::<u64>()
-            - record_bytes;
-        assert!(compacted <= JOURNAL_COMPACT_TARGET_BYTES + 400 * 1024);
-
-        let events = store.complete_history(&manifest.id).await.unwrap();
-        assert_eq!(events.len() as u64, sequence + 1);
-        for (index, event) in events.iter().enumerate() {
-            assert_eq!(event.sequence, index as u64 + 1);
-        }
-        // Older unprotected events lost their oversized payloads.
-        let truncated_count = events[..sequence as usize]
-            .iter()
-            .filter(|event| {
-                event.payload["output"]
-                    .as_str()
-                    .is_some_and(|output| output.contains("truncated"))
-            })
-            .count();
-        assert!(truncated_count > 0);
-        // The protected tail keeps full-fidelity payloads.
-        let recent = events[(sequence - 1) as usize].payload["output"]
-            .as_str()
-            .unwrap();
-        assert_eq!(recent.len(), bulky.len());
-        // The byte index rebuilt during compaction still serves replay.
-        let page = store.replay(&manifest.id, 0, 5).await.unwrap();
-        assert_eq!(page.events.len(), 5);
-        assert_eq!(page.events[0].sequence, 1);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn journal_appends_past_the_former_storage_limit() {
-        // Bulk made of many short strings leaves nothing to compact: the
-        // journal crosses the old 64 MiB ceiling and keeps growing.
-        let items: Vec<String> = (0..3000).map(|index| format!("item-{index:05}")).collect();
-        let (root, store, id) = fill_journal(
-            "todex-journal-uncapped",
-            "provider.event",
-            json!({ "items": items }),
-            64 * 1024 * 1024,
-        )
-        .await;
-
-        // Appends never refuse on size: compaction runs past the prompt
-        // limit, shrinks nothing here, and the record still lands.
-        let appended = store
-            .append(&id, "turn.completed", json!({ "turnId": "t" }))
-            .await
-            .unwrap();
-        let directory = root.join("conversations").join(&id);
-        let total: u64 = journal_files(&directory)
-            .await
-            .unwrap()
-            .iter()
-            .map(|file| file.bytes)
-            .sum();
-        assert!(total > 64 * 1024 * 1024);
-
-        // A new prompt is still gated: compaction cannot bring this journal
-        // under the prompt limit, so the request is refused.
-        assert!(matches!(
-            store.save_request(&id, &json!({ "turnId": "u" })).await,
-            Err(AppError::JournalFull(_))
-        ));
-        assert_eq!(store.last_request(&id).await.unwrap(), None);
-
-        // A restarted store recovers the oversized journal intact.
-        let restarted = ConversationStore::new(root.clone()).await.unwrap();
-        let history = restarted.complete_history(&id).await.unwrap();
-        assert_eq!(history.last().unwrap().sequence, appended.sequence);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    /// Hand-write a journal of `event_type` records carrying `payload` until
-    /// it exceeds `minimum` bytes, then recover so the store indexes it.
-    async fn fill_journal(
-        prefix: &str,
-        event_type: &str,
-        payload: Value,
-        minimum: u64,
-    ) -> (PathBuf, ConversationStore, String) {
-        use std::io::Write;
-        let root = temp_dir(prefix);
-        let store = ConversationStore::new(root.clone()).await.unwrap();
-        let manifest = store
-            .create(ConversationManifest::new(
-                ProviderKind::Codex,
-                root.clone(),
-                None,
-                None,
-            ))
-            .await
-            .unwrap();
-        let path = root
-            .join("conversations")
-            .join(&manifest.id)
-            .join(EVENTS_FILE);
-        let mut file = fs::File::create(&path).unwrap();
-        let mut sequence = 0u64;
-        let mut written = 0u64;
-        loop {
-            let mut line = serde_json::to_vec(&ConversationEvent::new(
-                &manifest.id,
-                sequence + 1,
-                event_type,
-                payload.clone(),
-            ))
-            .unwrap();
-            line.push(b'\n');
-            file.write_all(&line).unwrap();
-            written += line.len() as u64;
-            sequence += 1;
-            if written > minimum {
-                break;
-            }
-        }
-        drop(file);
-        store.recover(&manifest.id).await.unwrap();
-        (root, store, manifest.id)
-    }
-
-    #[tokio::test]
-    async fn full_journal_refuses_new_prompts_but_running_turns_still_append() {
-        // Bulk made of many short strings leaves nothing to compact.
-        let items: Vec<String> = (0..3000).map(|index| format!("item-{index:05}")).collect();
-        let (root, store, id) = fill_journal(
-            "todex-journal-full",
-            "provider.event",
-            json!({ "items": items }),
-            JOURNAL_PROMPT_LIMIT_BYTES,
-        )
-        .await;
-        let request = json!({ "turnId": "t" });
-
-        let error = store.save_request(&id, &request).await.unwrap_err();
-        assert!(matches!(error, AppError::JournalFull(_)));
-        assert_eq!(error.code(), "JOURNAL_FULL");
-        assert_eq!(store.last_request(&id).await.unwrap(), None);
-
-        // A turn that already started keeps journalling without any ceiling.
-        let appended = store
-            .append(&id, "turn.completed", json!({ "turnId": "t" }))
-            .await
-            .unwrap();
-        assert!(appended.sequence > 1);
-        // The journal grew, so the next prompt is refused again.
-        assert!(matches!(
-            store.save_request(&id, &request).await,
-            Err(AppError::JournalFull(_))
-        ));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn journal_over_the_prompt_limit_still_closes_its_turn() {
-        // Many small events: nothing for compaction to shrink.
-        let items: Vec<String> = (0..20).map(|index| format!("item-{index:02}")).collect();
-        let payload = json!({ "items": items });
-        let (root, store, id) = fill_journal(
-            "todex-journal-close",
-            "provider.event",
-            payload.clone(),
-            JOURNAL_PROMPT_LIMIT_BYTES,
-        )
-        .await;
-
-        // Ordinary events and the close record both keep landing: journal
-        // size never interrupts a running turn.
-        store.append(&id, "provider.event", payload).await.unwrap();
-        let closed = store
-            .append(
-                &id,
-                "conversation.interrupted",
-                json!({ "reason": "daemon_restarted", "detail": "x".repeat(1024) }),
-            )
-            .await
-            .unwrap();
-        let directory = root.join("conversations").join(&id);
-        let total: u64 = journal_files(&directory)
-            .await
-            .unwrap()
-            .iter()
-            .map(|file| file.bytes)
-            .sum();
-        assert!(total > JOURNAL_PROMPT_LIMIT_BYTES);
-
-        // A restarted store reads the oversized journal.
-        let restarted = ConversationStore::new(root.clone()).await.unwrap();
-        let (manifest, history) = restarted.recover_with_history(&id).await.unwrap();
-        assert_eq!(history.last().unwrap().sequence, closed.sequence);
-        assert_eq!(manifest.status, ConversationStatus::Interrupted);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
     async fn recovery_rewrites_the_manifest_only_when_the_journal_changed_it() {
         let root = temp_dir("todex-recover-no-rewrite");
         let store = ConversationStore::new(root.clone()).await.unwrap();
@@ -5338,215 +5717,6 @@ mod tests {
         assert_eq!(recovered.last_sequence, 2);
         assert!(directory.join(SNAPSHOT_FILE).exists());
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn prompt_on_a_full_but_compactable_journal_compacts_and_proceeds() {
-        let (root, store, id) = fill_journal(
-            "todex-journal-full-compactable",
-            "provider.event",
-            json!({ "output": "x".repeat(256 * 1024) }),
-            JOURNAL_PROMPT_LIMIT_BYTES,
-        )
-        .await;
-        let request = json!({ "turnId": "t" });
-        store.save_request(&id, &request).await.unwrap();
-        assert_eq!(store.last_request(&id).await.unwrap(), Some(request));
-        let bytes: u64 = journal_files(&root.join("conversations").join(&id))
-            .await
-            .unwrap()
-            .iter()
-            .map(|file| file.bytes)
-            .sum();
-        assert!(bytes <= JOURNAL_COMPACT_TARGET_BYTES);
-        assert!(store.incompressible.get(&id).is_none());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn append_compacts_a_delta_filled_journal_into_markers() {
-        // A journal of small coalesced stream events has no truncatable
-        // strings; compaction must swap them for markers instead.
-        let (root, store, id) = fill_journal(
-            "todex-journal-delta-compact",
-            "message.delta",
-            json!({ "delta": "x".repeat(600), "turnId": "t" }),
-            JOURNAL_PROMPT_LIMIT_BYTES,
-        )
-        .await;
-        let path = root.join("conversations").join(&id).join(EVENTS_FILE);
-        let last = store.get(&id).await.unwrap().last_sequence;
-
-        // A payload larger than the remaining headroom forces compaction.
-        let appended = store
-            .append(
-                &id,
-                "provider.event",
-                json!({ "output": "y".repeat(300 * 1024) }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(appended.sequence, last + 1);
-
-        // The compacted output may have been sealed by rotation on append;
-        // measure the whole journal minus the appended record.
-        let record_bytes = serde_json::to_vec(&appended).unwrap().len() as u64 + 1;
-        let compacted: u64 = journal_files(path.parent().unwrap())
-            .await
-            .unwrap()
-            .iter()
-            .map(|file| file.bytes)
-            .sum::<u64>()
-            - record_bytes;
-        assert!(compacted <= JOURNAL_COMPACT_TARGET_BYTES);
-        assert!(store.incompressible.get(&id).is_none());
-
-        // Every sequence still occupies its line: stripped records became
-        // `journal.compacted` markers, the protected tail kept full fidelity.
-        let events = store.complete_history(&id).await.unwrap();
-        assert_eq!(events.len() as u64, last + 1);
-        for (index, event) in events.iter().enumerate() {
-            assert_eq!(event.sequence, index as u64 + 1);
-        }
-        let markers = events[..last as usize]
-            .iter()
-            .filter(|event| event.event_type == JOURNAL_COMPACTED_EVENT)
-            .count();
-        let kept_deltas = events[..last as usize]
-            .iter()
-            .filter(|event| event.event_type == "message.delta")
-            .count();
-        assert_eq!(markers + kept_deltas, last as usize);
-        assert!(markers > 0 && kept_deltas > 0);
-        let marker = events[..last as usize]
-            .iter()
-            .find(|event| event.event_type == JOURNAL_COMPACTED_EVENT)
-            .unwrap();
-        assert_eq!(marker.payload["originalType"], "message.delta");
-        assert_eq!(marker.payload["reason"], "compacted");
-        let tail = &events[last as usize - 1];
-        assert_eq!(tail.event_type, "message.delta");
-        assert_eq!(tail.payload["delta"].as_str().unwrap().len(), 600);
-
-        // Markers are ordinary history for replay and stay on their sequence.
-        let page = store.replay(&id, marker.sequence - 1, 2).await.unwrap();
-        assert_eq!(page.events[0].sequence, marker.sequence);
-        assert_eq!(page.events[0].event_type, JOURNAL_COMPACTED_EVENT);
-
-        // The rewrite invalidated the digest; its rebuild reads the markers.
-        let digest = store.digest(&id, Clone::clone).await.unwrap();
-        crate::conversation::digest::tests::assert_matches_reference(&digest, &events);
-
-        // A compacted journal validates cleanly on a cold open.
-        let restarted = ConversationStore::new(root.clone()).await.unwrap();
-        let (manifest, _) = restarted.recover_with_history(&id).await.unwrap();
-        assert_eq!(manifest.last_sequence, last + 1);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn history_of_small_deltas_compacts_below_the_prompt_limit() {
-        // Each delta line is smaller than a full-event marker would be, so
-        // only the compact on-disk marker frees enough space for the
-        // conversation to accept prompts again.
-        let (root, store, id) = fill_journal(
-            "todex-small-deltas",
-            "message.delta",
-            json!({ "delta": "x".repeat(16), "turnId": "t" }),
-            JOURNAL_PROMPT_LIMIT_BYTES,
-        )
-        .await;
-        store
-            .save_request(&id, &json!({ "turnId": "t2" }))
-            .await
-            .unwrap();
-        let directory = root.join("conversations").join(&id);
-        assert!(
-            journal_bytes(&journal_files(&directory).await.unwrap())
-                <= JOURNAL_COMPACT_TARGET_BYTES
-        );
-        let events = store.complete_history(&id).await.unwrap();
-        let marker = events
-            .iter()
-            .find(|event| event.event_type == JOURNAL_COMPACTED_EVENT)
-            .unwrap();
-        assert_eq!(marker.conversation_id, id);
-        assert_eq!(marker.payload["originalType"], "message.delta");
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn compaction_re_encodes_full_event_markers() {
-        // Journals compacted before `CompactedRecord` hold full-event
-        // markers; the next pass shrinks them but keeps id, time and run.
-        let (root, store, id) = fill_journal(
-            "todex-legacy-markers",
-            JOURNAL_COMPACTED_EVENT,
-            json!({
-                "reason": "compacted",
-                "originalType": "message.delta",
-                "runStart": 1,
-                "runLength": 7,
-            }),
-            JOURNAL_PROMPT_LIMIT_BYTES,
-        )
-        .await;
-        let before = store.complete_history(&id).await.unwrap();
-        store
-            .save_request(&id, &json!({ "turnId": "t" }))
-            .await
-            .unwrap();
-        let after = store.complete_history(&id).await.unwrap();
-        assert_eq!(after.len(), before.len());
-        let directory = root.join("conversations").join(&id);
-        let oldest = &journal_files(&directory).await.unwrap()[0].name;
-        let first = fs::read(directory.join(oldest)).unwrap();
-        assert!(first.starts_with(COMPACTED_RECORD_PREFIX));
-        for (old, new) in before.iter().zip(&after).take(1000) {
-            assert_eq!(new.event_id, old.event_id);
-            assert_eq!(new.time, old.time);
-            assert_eq!(new.payload, old.payload);
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn compacted_record_round_trips_its_marker() {
-        let original = ConversationEvent::new("conv", 42, "tool.updated", json!({ "x": 1 }));
-        let line = CompactedRecord::line(&original, &original.event_type, 40, 3).unwrap();
-        assert!(line.starts_with(COMPACTED_RECORD_PREFIX));
-        // The shortest strippable type at sequence 1 still meets the salvage
-        // bound on record size.
-        let shortest = CompactedRecord::line(
-            &ConversationEvent::new("conv", 1, "tool.updated", json!({})),
-            "tool.updated",
-            1,
-            1,
-        )
-        .unwrap();
-        assert!(shortest.len() >= MIN_JOURNAL_RECORD_BYTES);
-        let marker = decode_journal_record(&line, "conv").unwrap();
-        assert_eq!(marker.schema_version, CONVERSATION_SCHEMA_VERSION);
-        assert_eq!(marker.sequence, 42);
-        assert_eq!(marker.event_id, original.event_id);
-        assert_eq!(marker.conversation_id, "conv");
-        assert_eq!(marker.time, original.time);
-        assert_eq!(marker.event_type, JOURNAL_COMPACTED_EVENT);
-        assert_eq!(
-            marker.payload,
-            json!({
-                "reason": "compacted",
-                "originalType": "tool.updated",
-                "runStart": 40,
-                "runLength": 3,
-            })
-        );
-        // Unknown fields mean the line is not a marker this build wrote.
-        assert!(decode_journal_record(
-            br#"{"sequence":1,"compacted":{"eventId":"e","timeUs":0,"originalType":"","runStart":1,"runLength":1,"extra":1}}"#,
-            "conv",
-        )
-        .is_err());
     }
 
     #[tokio::test]
@@ -5794,12 +5964,15 @@ mod tests {
             (1..=40).collect::<Vec<_>>()
         );
         {
-            let index = restarted.indexes.get(&id).unwrap();
+            let index = restarted.test_index(&id);
             assert!(index.files.len() >= 3);
-            let segments: std::collections::BTreeSet<u32> = index
-                .offsets
+            let segments: std::collections::BTreeSet<usize> = index
+                .parts
                 .iter()
-                .map(|(segment, _, _)| *segment)
+                .filter_map(|part| match part {
+                    IndexPart::Plain { file, .. } => Some(*file),
+                    IndexPart::Sealed(_) => None,
+                })
                 .collect();
             assert!(segments.len() >= 3, "records must span sealed segments");
         }
@@ -5807,7 +5980,7 @@ mod tests {
         let cold = ConversationStore::new(root.clone()).await.unwrap();
         let page = cold.replay(&id, 0, 40).await.unwrap();
         assert_eq!(sequences(&page), (1..=40).collect::<Vec<_>>());
-        assert!(!cold.indexes.get(&id).unwrap().fully_validated);
+        assert!(!cold.test_index(&id).fully_validated);
         let before = cold.replay_before(&id, 20, 6).await.unwrap();
         assert_eq!(sequences(&before), (15..=20).collect::<Vec<_>>());
         fs::remove_dir_all(root).unwrap();
@@ -5860,9 +6033,9 @@ mod tests {
         let (root, store, id, directory) = segmented_journal("todex-seal-salvage", 24).await;
         drop(store);
 
-        // Corrupt a record inside the sealed segment: salvage rewrites the
-        // whole journal onto `events.jsonl`, unlinks the sealed file, and
-        // keeps every sequence occupied by a record or a placeholder.
+        // Corrupt a record inside the sealed file: salvage rewrites that
+        // file only, keeps every sequence occupied by a record or a
+        // placeholder, and leaves the other files untouched.
         let sealed = directory.join("events.000001.jsonl");
         let raw = fs::read_to_string(&sealed).unwrap();
         let mut lines = raw.lines().map(str::to_owned).collect::<Vec<_>>();
@@ -5879,242 +6052,24 @@ mod tests {
             (1..=24).collect::<Vec<_>>()
         );
         assert_eq!(lost_runs(&history), vec![(4, 4, 1)]);
-        // The rewrite collapses the journal to the single active file.
-        let files = journal_files(&directory).await.unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].name, EVENTS_FILE);
-        assert_eq!(corrupt_copies(&directory.join(EVENTS_FILE)).len(), 1);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn compaction_rewrites_segments_in_place_and_keeps_files_sealed() {
-        // Hand-write a journal just under the prompt limit, split across a
-        // sealed segment and the active file so compaction must read both.
-        let root = temp_dir("todex-compact-segments");
-        let workspace = root.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
-        let store = ConversationStore::new(root.clone()).await.unwrap();
-        let manifest = store
-            .create(ConversationManifest::new(
-                ProviderKind::Codex,
-                workspace,
-                None,
-                None,
-            ))
+        // Per-file salvage: the sealed file is rewritten in place and the
+        // backup holds only that file's original bytes.
+        let names: Vec<String> = journal_files(&directory)
             .await
-            .unwrap();
-        let directory = root.join("conversations").join(&manifest.id);
-        let path = directory.join(EVENTS_FILE);
-        use std::io::Write;
-        let bulky = "x".repeat(256 * 1024);
-        let mut file = fs::File::create(&path).unwrap();
-        let mut sequence = 0u64;
-        let mut written = 0u64;
-        let mut boundary = 0u64;
-        loop {
-            let mut line = serde_json::to_vec(&ConversationEvent::new(
-                &manifest.id,
-                sequence + 1,
-                "tool.started",
-                json!({ "output": bulky, "index": sequence }),
-            ))
-            .unwrap();
-            line.push(b'\n');
-            if written + line.len() as u64 > JOURNAL_PROMPT_LIMIT_BYTES - 2048 {
-                break;
-            }
-            file.write_all(&line).unwrap();
-            written += line.len() as u64;
-            sequence += 1;
-            // Split near the middle so both files carry plenty of records.
-            if boundary == 0 && written > JOURNAL_PROMPT_LIMIT_BYTES / 2 {
-                boundary = written;
-            }
-        }
-        drop(file);
-        let raw = fs::read(&path).unwrap();
-        fs::write(
-            directory.join("events.000001.jsonl"),
-            &raw[..boundary as usize],
-        )
-        .unwrap();
-        fs::write(&path, &raw[boundary as usize..]).unwrap();
-        store.recover(&manifest.id).await.unwrap();
-
-        let appended = store
-            .append(
-                &manifest.id,
-                "message.delta",
-                json!({ "content": "y".repeat(300 * 1024) }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(appended.sequence, sequence + 1);
-        // The append sealed the oversized active file first, then compaction
-        // rewrote both sealed segments in place: two sealed segments plus
-        // the active file holding just the new record.
-        let files = journal_files(&directory).await.unwrap();
-        assert_eq!(
-            files
-                .iter()
-                .map(|file| file.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["events.000001.jsonl", "events.000002.jsonl", EVENTS_FILE]
+            .unwrap()
+            .into_iter()
+            .map(|file| file.name)
+            .collect();
+        assert!(
+            names.contains(&"events.000001.jsonl".to_owned()),
+            "{names:?}"
         );
-        let total: u64 = files.iter().map(|file| file.bytes).sum();
-        assert!(total <= JOURNAL_COMPACT_TARGET_BYTES + 400 * 1024);
+        assert_eq!(names.last().map(String::as_str), Some(EVENTS_FILE));
+        let copies = corrupt_copies(&directory.join(EVENTS_FILE));
+        assert_eq!(copies.len(), 1);
         assert_eq!(
-            sequences(&store.replay(&manifest.id, 0, 3).await.unwrap()),
-            vec![1, 2, 3]
-        );
-        assert_eq!(
-            store
-                .replay(&manifest.id, sequence, 1)
-                .await
-                .unwrap()
-                .events[0]
-                .sequence,
-            sequence + 1
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    /// Hand-write sealed journal files of `sealed_sizes` bytes each plus an
-    /// active file of `active_size` bytes — `event_type` records carrying
-    /// `payload` with global sequences — then recover so the store indexes
-    /// them.
-    async fn segmented_fill(
-        prefix: &str,
-        event_type: &str,
-        payload: Value,
-        sealed_sizes: &[u64],
-        active_size: u64,
-    ) -> (PathBuf, ConversationStore, String, PathBuf) {
-        use std::io::Write;
-        let root = temp_dir(prefix);
-        let store = ConversationStore::new(root.clone()).await.unwrap();
-        let manifest = store
-            .create(ConversationManifest::new(
-                ProviderKind::Codex,
-                root.clone(),
-                None,
-                None,
-            ))
-            .await
-            .unwrap();
-        let directory = root.join("conversations").join(&manifest.id);
-        let mut sequence = 0u64;
-        for index in 0..=sealed_sizes.len() {
-            let name = if index == sealed_sizes.len() {
-                EVENTS_FILE.to_owned()
-            } else {
-                format!("events.{:06}.jsonl", index + 1)
-            };
-            let size = sealed_sizes.get(index).copied().unwrap_or(active_size);
-            let mut file = fs::File::create(directory.join(&name)).unwrap();
-            let mut written = 0u64;
-            while written < size {
-                let mut line = serde_json::to_vec(&ConversationEvent::new(
-                    &manifest.id,
-                    sequence + 1,
-                    event_type,
-                    payload.clone(),
-                ))
-                .unwrap();
-                line.push(b'\n');
-                file.write_all(&line).unwrap();
-                written += line.len() as u64;
-                sequence += 1;
-            }
-        }
-        store.recover(&manifest.id).await.unwrap();
-        (root, store, manifest.id, directory)
-    }
-
-    #[tokio::test]
-    async fn incompressible_cache_fingerprints_fully_processed_segments() {
-        // Incompressible records over the prompt limit: the two oldest
-        // sealed segments sit wholly before the protected window, so their
-        // fingerprints are cached; the boundary file and the active file —
-        // whose unprotected share keeps growing — are not.
-        let payload = json!({
-            "items": (0..3000).map(|i| format!("item-{i:05}")).collect::<Vec<_>>()
-        });
-        let (root, store, id, directory) = segmented_fill(
-            "todex-seal-cache",
-            "provider.event",
-            payload,
-            &[20 * 1024 * 1024, 20 * 1024 * 1024],
-            20 * 1024 * 1024,
-        )
-        .await;
-        store.compact_journal(&id).await.unwrap();
-        let cached = store.incompressible.get(&id).unwrap().clone();
-        let files = journal_files(&directory).await.unwrap();
-        assert_eq!(files.len(), 3);
-        assert_eq!(cached.len(), 2);
-        assert_eq!(cached[0].name, "events.000001.jsonl");
-        assert_eq!(cached[1].name, "events.000002.jsonl");
-
-        // A changed segment fingerprint expires its cache entry: a byte
-        // inside the first segment's payload changes its size without
-        // touching sequences, so the next pass re-processes and re-caches
-        // only that file.
-        let path = directory.join("events.000001.jsonl");
-        let mut raw = fs::read(&path).unwrap();
-        let at = raw
-            .windows(5)
-            .position(|window| window == b"item-")
-            .map(|index| index + 5)
-            .unwrap();
-        raw.insert(at, b'z');
-        fs::write(&path, &raw).unwrap();
-        store.compact_journal(&id).await.unwrap();
-        let recached = store.incompressible.get(&id).unwrap().clone();
-        assert_eq!(recached.len(), 2);
-        assert!(recached
-            .iter()
-            .any(|file| file.name == "events.000001.jsonl" && *file != cached[0]));
-        assert!(recached.iter().any(|file| *file == cached[1]));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn compaction_merges_small_sealed_segments() {
-        // Four small incompressible segments plus an oversized active file:
-        // nothing shrinks, so compaction merges the small sealed files into
-        // pairs bounded by the segment size.
-        let payload = json!({
-            "items": (0..30).map(|i| format!("item-{i:02}")).collect::<Vec<_>>()
-        });
-        let (root, store, id, directory) = segmented_fill(
-            "todex-merge",
-            "provider.event",
-            payload,
-            &[48 * 1024, 48 * 1024, 48 * 1024, 48 * 1024],
-            JOURNAL_PROMPT_LIMIT_BYTES + 1024 * 1024,
-        )
-        .await;
-        store.compact_journal(&id).await.unwrap();
-
-        let files = journal_files(&directory).await.unwrap();
-        assert_eq!(
-            files
-                .iter()
-                .map(|file| file.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["events.000001.jsonl", "events.000003.jsonl", EVENTS_FILE]
-        );
-        // Merged files keep their records byte-for-byte, so sequences and
-        // replay still cross every segment boundary.
-        let history = store.complete_history(&id).await.unwrap();
-        assert_eq!(
-            history
-                .iter()
-                .map(|event| event.sequence)
-                .collect::<Vec<_>>(),
-            (1..=history.len() as u64).collect::<Vec<_>>()
+            fs::read_to_string(&copies[0]).unwrap(),
+            format!("{}\n", lines.join("\n"))
         );
         fs::remove_dir_all(root).unwrap();
     }

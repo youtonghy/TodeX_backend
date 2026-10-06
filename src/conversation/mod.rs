@@ -1,8 +1,11 @@
 mod coalesce;
 mod digest;
 mod hub;
+mod maintenance;
 mod migration;
 mod model;
+mod record;
+mod segment;
 mod store;
 mod summary;
 
