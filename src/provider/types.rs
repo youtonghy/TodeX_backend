@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -22,6 +23,10 @@ use super::process::ProviderRead;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Unparseable provider lines journalled per turn; later ones are only logged.
 const MAX_REPORTED_UNPARSED_LINES: usize = 20;
+/// Snapshot events a provider may repeat verbatim (rate-limit and token
+/// counters resent on every poll). An identical repeat carries no news for
+/// clients, which upsert both by identity, so it is not journalled again.
+const REPEATABLE_SNAPSHOT_EVENTS: &[&str] = &["quota.updated", "usage.updated"];
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -545,6 +550,9 @@ pub struct DriverEventSink {
     /// Account-level quota snapshots (`quota.updated`) mirrored for
     /// `/v2/providers/quota`.
     quota: crate::quota_store::QuotaStore,
+    /// Last journalled payload (after attribution) and event per
+    /// [`REPEATABLE_SNAPSHOT_EVENTS`] type, shared like `unparsed_lines`.
+    snapshots: Arc<Mutex<HashMap<String, (Value, ConversationEvent)>>>,
 }
 
 impl DriverEventSink {
@@ -565,6 +573,7 @@ impl DriverEventSink {
             unparsed_lines: Arc::default(),
             activity: None,
             quota: crate::quota_store::QuotaStore::default(),
+            snapshots: Arc::default(),
         }
     }
 
@@ -591,6 +600,7 @@ impl DriverEventSink {
     pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
         self.current_turn_id = Some(turn_id.into());
         self.unparsed_lines = Arc::default();
+        self.snapshots = Arc::default();
         if self.runtime_id.is_some() {
             self.scope = Some("turn");
         }
@@ -604,6 +614,7 @@ impl DriverEventSink {
         self.runtime_id = Some(runtime_id.into());
         self.scope = Some("session");
         self.unparsed_lines = Arc::default();
+        self.snapshots = Arc::default();
         self
     }
 
@@ -626,13 +637,40 @@ impl DriverEventSink {
         if event_type == "quota.updated" {
             self.quota.record(&payload);
         }
+        let snapshot = REPEATABLE_SNAPSHOT_EVENTS.contains(&event_type.as_str());
+        if snapshot {
+            if let Some(event) = self.repeated_snapshot(&event_type, &payload) {
+                return Ok(event);
+            }
+        }
+        let recorded = snapshot.then(|| (event_type.clone(), payload.clone()));
         let result = self
             .store
             .append_and_publish(&self.conversation_id, event_type, payload, &self.hub)
             .await;
+        if let (Some((event_type, payload)), Ok(event)) = (recorded, &result) {
+            self.snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(event_type, (payload, event.clone()));
+        }
         // Time spent journalling is the daemon's, not provider silence.
         self.touch();
         result
+    }
+
+    /// The journalled event when `payload` (already attributed, so turn,
+    /// runtime and scope are part of the comparison) repeats the last
+    /// journalled event of this type verbatim.
+    fn repeated_snapshot(&self, event_type: &str, payload: &Value) -> Option<ConversationEvent> {
+        let snapshots = self
+            .snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshots
+            .get(event_type)
+            .filter(|(last, _)| last == payload)
+            .map(|(_, event)| event.clone())
     }
 
     /// Streaming text fragment (`message.delta` / `thought.delta`). Adjacent
@@ -1667,6 +1705,90 @@ mod tests {
             PermissionOutcome::AllowOnce
         ));
         assert!(broker.resolve("c", "p", "dev", valid).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn identical_quota_and_usage_repeats_are_journalled_once() {
+        let root =
+            std::env::temp_dir().join(format!("todex-snapshot-dedupe-{}", Uuid::new_v4().simple()));
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let quota = crate::quota_store::QuotaStore::default();
+        let sink = DriverEventSink::new(
+            store.clone(),
+            ConversationEventHub::default(),
+            PermissionBroker::default(),
+            &manifest.id,
+        )
+        .with_turn_id("turn-1")
+        .with_quota(quota.clone());
+        let limits = |used: u64| json!({"provider": "codex", "scope": "account", "windows": [{"usedPercent": used}]});
+        let usage = json!({"provider": "codex", "source": "provider", "usage": {"total": 5}});
+
+        let first = sink.emit("quota.updated", limits(10)).await.unwrap();
+        // Clones share the last snapshot; a repeat returns the journalled event.
+        let repeat = sink
+            .clone()
+            .emit("quota.updated", limits(10))
+            .await
+            .unwrap();
+        assert_eq!(repeat.sequence, first.sequence);
+        sink.emit("quota.updated", limits(20)).await.unwrap();
+        sink.emit("quota.updated", limits(20)).await.unwrap();
+        sink.emit("quota.updated", limits(10)).await.unwrap();
+        sink.emit("usage.updated", usage.clone()).await.unwrap();
+        sink.emit("usage.updated", usage.clone()).await.unwrap();
+        // Another turn attributes the same counters differently.
+        let next_turn = sink.clone().with_turn_id("turn-2");
+        next_turn
+            .emit("usage.updated", usage.clone())
+            .await
+            .unwrap();
+        // Other event types are never deduplicated.
+        sink.emit("plan.updated", json!({"plan": []}))
+            .await
+            .unwrap();
+        sink.emit("plan.updated", json!({"plan": []}))
+            .await
+            .unwrap();
+
+        // Every update still refreshes the REST quota snapshot.
+        sink.emit("quota.updated", limits(10)).await.unwrap();
+        assert_eq!(quota.get("codex").unwrap()["windows"][0]["usedPercent"], 10);
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let journalled: Vec<_> = history
+            .iter()
+            .filter(|event| event.event_type != "conversation.created")
+            .map(|event| {
+                (
+                    event.event_type.as_str(),
+                    event.payload["windows"][0]["usedPercent"].as_u64(),
+                    event.payload["turnId"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            journalled,
+            [
+                ("quota.updated", Some(10), Some("turn-1")),
+                ("quota.updated", Some(20), Some("turn-1")),
+                ("quota.updated", Some(10), Some("turn-1")),
+                ("usage.updated", None, Some("turn-1")),
+                ("usage.updated", None, Some("turn-2")),
+                ("plan.updated", None, Some("turn-1")),
+                ("plan.updated", None, Some("turn-1")),
+            ]
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[tokio::test]
