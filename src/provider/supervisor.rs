@@ -1123,7 +1123,8 @@ impl ConversationSupervisor {
         Ok(removed)
     }
 
-    #[cfg(test)]
+    // Its tests are Unix-only.
+    #[cfg(all(test, unix))]
     pub async fn replay(
         &self,
         conversation_id: &str,

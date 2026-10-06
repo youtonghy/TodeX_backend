@@ -383,6 +383,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// An `AgentMcp` on a fixture ssh service with a loopback endpoint.
+    #[cfg(unix)]
     pub(crate) async fn registry(ssh: SshService, root: &std::path::Path) -> AgentMcp {
         let desktop = AgentDesktop::load(&root.join("data")).await.unwrap();
         let mcp = AgentMcp::with_bridge_command(

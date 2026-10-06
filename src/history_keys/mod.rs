@@ -241,16 +241,9 @@ pub(crate) mod test_support {
         (id, directory)
     }
 
+    #[cfg(unix)]
     pub(crate) fn mode_of(path: &Path) -> u32 {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::metadata(path).unwrap().permissions().mode() & 0o777
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            0
-        }
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 }
