@@ -55,6 +55,9 @@ const MAX_WS_SUBSCRIPTIONS: usize = 128;
 /// Subscription backfills run beside the read loop, at most this many at once
 /// per connection.
 const MAX_WS_CONCURRENT_BACKFILLS: usize = 4;
+/// Sealed-frame bytes one subscription backfill may repeat across its
+/// messages before it stops early with `hasMore` (history encryption).
+const MAX_WS_BACKFILL_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WS_IN_FLIGHT_OPERATIONS: usize = 16;
 /// Keep idle connections alive; mirrors the legacy `/v1/ws` socket so clients
 /// without an application-level heartbeat are not reaped. A Ping draws an
@@ -2811,7 +2814,11 @@ impl SubscriptionWorker {
                 .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
                 .min(high_water)
         });
-        while replay_cursor < backfill_end {
+        // Every socket message carries the sealed frames it refers to, so
+        // encrypted sealed history repeats them; past this budget the rest
+        // is left to HTTP pages (`hasMore`), which send each frame once.
+        let mut frame_bytes = 0usize;
+        'pages: while replay_cursor < backfill_end {
             let remaining = usize::try_from(backfill_end - replay_cursor).unwrap_or(usize::MAX);
             let replay = self
                 .conversations
@@ -2829,15 +2836,23 @@ impl SubscriptionWorker {
                 .into_iter()
                 .take_while(|event| event.sequence <= backfill_end)
             {
+                crate::conversation::present_event(&mut event, self.summary);
+                let frame = conversation_event_frame("replay", &event, &replay.frames);
+                let carried = frame
+                    .get("frames")
+                    .map_or(0, |frames| frames.to_string().len());
+                if carried > 0
+                    && frame_bytes > 0
+                    && frame_bytes + carried > MAX_WS_BACKFILL_FRAME_BYTES
+                {
+                    break 'pages;
+                }
+                frame_bytes += carried;
                 replay_cursor = event.sequence;
                 advanced = true;
-                crate::conversation::present_event(&mut event, self.summary);
-                queue_frame(
-                    &self.outgoing,
-                    conversation_event_frame("replay", &event, &replay.frames),
-                )
-                .await
-                .map_err(|_| AppError::StreamClosed)?;
+                queue_frame(&self.outgoing, frame)
+                    .await
+                    .map_err(|_| AppError::StreamClosed)?;
             }
             if !advanced {
                 return Err(AppError::Conflict(format!(

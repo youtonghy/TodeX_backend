@@ -150,7 +150,7 @@ e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容�
 ```
 
 - 事件级（活动分片、passthrough 帧与实时推送）：`s`/`f` 为 base64url；摘要与完整相同则省略 `s`。`detail=summary` 下发 `s`（缺省时发 `f`），`detail=full` 下发 `f`，同一事件不会同时带两者。实时推送按 `full` 下发，与写入 journal 的密文逐字节相同。摘要在写入时由后端用明文算出，回放从不对密文运行摘要。
-- 帧级（`Sealed` 帧）：事件 `$enc` 为 `{v, kid, c, n, fr: {s, f, i}}`（`kid` 为帧的 `kid`，`c`/`n` 为本会话与该事件 sequence），`s`/`f` 是摘要帧与完整帧的 id（不透明字符串，`<分片 id>-<偏移>`，分片重建后不复用）。HTTP 分页响应顶层附 `frames: { "<帧 id>": {"kid","stream","counter","c","ct"} }`，只含所请求 detail 的那一种帧（summary 为 stream 3，full 为 stream 4），同一页内去重；帧在页字节预算中按 base64 长度计一次。WebSocket 每条 `conversation.event` 单独解密，所以凡引用帧的回放消息顶层都附带它所引用的帧（同一帧会在多条消息里重复出现）；大量封存历史应走 HTTP 分页。帧明文是 raw DEFLATE 压缩的 payload JSON 数组，`i` 为下标。
+- 帧级（`Sealed` 帧）：事件 `$enc` 为 `{v, kid, c, n, fr: {s, f, i}}`（`kid` 为帧的 `kid`，`c`/`n` 为本会话与该事件 sequence），`s`/`f` 是摘要帧与完整帧的 id（不透明字符串，`<分片 id>-<偏移>`，分片重建后不复用）。HTTP 分页响应顶层附 `frames: { "<帧 id>": {"kid","stream","counter","c","ct"} }`，只含所请求 detail 的那一种帧（summary 为 stream 3，full 为 stream 4），同一页内去重；帧在页字节预算中按 base64 长度计一次。WebSocket 每条 `conversation.event` 单独解密，所以凡引用帧的回放消息顶层都附带它所引用的帧（同一帧会在多条消息里重复出现）。一次订阅补放累计携带的帧超过 16 MiB 时补放提前结束，结果为 `hasMore: true`，其余由客户端按 `nextSequence` 走 HTTP 分页（每帧只发一次）。帧明文是 raw DEFLATE 压缩的 payload JSON 数组，`i` 为下标。
 - `c`/`n` 是 AAD 用的原会话与 sequence：fork 复制密文时保留来源值，新会话 sequence 可不同。fork 复制的帧级记录保留 `fr`，被引用的帧以线上形式存放在 fork 目录的 `frames/<帧 id>.json`，回放时同样放进 `frames`；fork 同时复制来源的 `keyring.json`，客户端用 fork 的会话 id 取封装。
 - 解密后的 payload 整体替换 `payload`（其中已含信封字段）。无法解密（无 DEK、授权未到、校验失败）时 `payload` = 信封字段 + `{"detailLocked": true}`，sequence 照常推进。
 

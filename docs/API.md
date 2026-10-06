@@ -237,7 +237,7 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 加密历史的线上形状（细节见 [history-encryption.md](history-encryption.md) §5）：
 
 - 事件 `payload` 只剩信封字段（`turnId`、`role`、`status` 等）加 `$enc`。活动分片与实时事件为事件级 `{ "v": 1, "kid", "c", "n", "s"?, "f"? }`：`detail=summary` 带 `s`（无单独摘要时带 `f`），`detail=full`、实时事件与缺口/滞后补放带 `f`，不会同时出现。封存分片为帧级 `{ "v": 1, "kid", "c", "n", "fr": { "s", "f", "i" } }`。
-- HTTP 回放页顶层附 `frames: { "<帧 id>": { "kid", "stream", "counter", "c", "ct" } }`（只含所请求 detail 的帧，页内去重）；WebSocket 每条引用帧的 `conversation.event` 消息顶层各自附带它需要的 `frames`。
+- HTTP 回放页顶层附 `frames: { "<帧 id>": { "kid", "stream", "counter", "c", "ct" } }`（只含所请求 detail 的帧，页内去重）；WebSocket 每条引用帧的 `conversation.event` 消息顶层各自附带它需要的 `frames`；一次订阅补放累计携带超过 16 MiB 帧数据时提前结束并返回 `hasMore: true`，其余走 HTTP 分页。
 - 会话 manifest（列表、详情、创建与更新的结果）在加密时不含 `title`，改为 `titleEnc: { "kid", "ct" }`；fork 不继承加密标题（可在 `conversation.fork` 中另给标题）。迁移完成或加密下新建的会话带 `historyEncryptedAt`。
 - `conversation.retry` payload 为 `{ "conversationId", "prompt"? }`：加密时必须带 `prompt`（解密后的原请求文本），缺失为 `INVALID_REQUEST`，与原请求不符为 `CONFLICT`；明文会话忽略该字段。
 - 加密时 `conversation.control` 以同一 `requestId` 重试：同一 control 返回原结果（daemon 重启后为 `null`），被拒绝的返回 `Control was rejected (<code>).`。
