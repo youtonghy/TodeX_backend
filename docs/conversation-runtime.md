@@ -250,7 +250,12 @@ prompt path under the conversation's request gate, with the item id as its
 `clientRequestId`; a start replayed after a crash is therefore recognized as
 already delivered. Only `turn.completed` (or a finished native compaction)
 advances the queue; other terminals pause it, and so does recovery: every
-queue with waiting items is paused with `daemon_restarted` at startup.
+queue with waiting items is paused with `daemon_restarted` at startup. A
+`turn.failed` whose turn last reported an exhausted plan window (tracked per
+turn in the quota store, since concurrent conversations overwrite the
+provider snapshot) instead inserts one continuation item at the head and
+pauses with `rate_limited` until `resumeAt`; a wall-clock timer, re-armed on
+recovery, lifts that pause and drains the queue.
 
 Regression coverage includes malformed approvals, provider wire parameters,
 quiet processes and blocked writes, replay/live races, late acknowledgements,

@@ -4,9 +4,13 @@
 //! complete prompt requests, attachments and skills included, for every
 //! provider. A turn that completes starts the head item; a turn that fails,
 //! is cancelled, or is interrupted pauses the queue until a client resumes
-//! it, and so does a daemon restart. Clients learn the queue through
+//! it, and so does a daemon restart. A turn that failed on an exhausted plan
+//! window instead gets a continuation prompt at the head and the queue
+//! resumes on its own once the window resets. Clients learn the queue through
 //! `followups.updated` events and the list command; events never carry
 //! inline image data.
+
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -20,6 +24,17 @@ pub(super) const MAX_FOLLOW_UP_ITEMS: usize = 32;
 pub(super) const MAX_FOLLOW_UP_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 const FOLLOW_UP_QUEUE_SCHEMA_VERSION: u32 = 1;
 pub(super) const FOLLOW_UP_QUEUE_EVENT: &str = "followups.updated";
+/// Pause reason of a queue waiting for a provider plan window to reset.
+const RATE_LIMITED: &str = "rate_limited";
+/// Item id prefix of the prompt that continues a rate-limited turn.
+const RATE_LIMIT_CONTINUE_PREFIX: &str = "rate-limit-continue-";
+/// Model-facing, so it stays English whatever the client locale: the
+/// interrupted request already sits in the provider transcript, so this
+/// resumes it rather than repeating it.
+const RATE_LIMIT_CONTINUE_TEXT: &str = "The previous request was interrupted by a provider usage limit before it could finish. Continue where it left off and complete the task.";
+/// Longest single sleep while waiting for a reset. Monotonic timers stop
+/// while the machine sleeps, so the wall clock is re-read at least this often.
+const RATE_LIMIT_RECHECK: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +49,9 @@ pub(super) struct FollowUpQueue {
     pause_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pause_message: Option<String>,
+    /// When a `rate_limited` pause lifts by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -78,6 +96,7 @@ impl FollowUpQueue {
             "paused": self.paused,
             "pauseReason": self.pause_reason,
             "pauseMessage": self.pause_message,
+            "resumeAt": self.resume_at,
         })
     }
 
@@ -91,6 +110,11 @@ impl FollowUpQueue {
         self.paused = false;
         self.pause_reason = None;
         self.pause_message = None;
+        self.resume_at = None;
+    }
+
+    fn rate_limited(&self) -> bool {
+        self.paused && self.pause_reason.as_deref() == Some(RATE_LIMITED)
     }
 }
 
@@ -292,17 +316,36 @@ impl ConversationSupervisor {
     /// Runs [`Self::after_turn`] on its own task. Turn tasks call this
     /// rather than awaiting it: the next prompt spawns another turn task, and
     /// awaiting it inline would make the turn future's type recursive.
-    pub(super) fn schedule_after_turn(&self, conversation_id: String, terminal: &'static str) {
+    pub(super) fn schedule_after_turn(
+        &self,
+        conversation_id: String,
+        turn_id: Option<String>,
+        terminal: &'static str,
+    ) {
         let supervisor = self.clone();
-        tokio::spawn(async move { supervisor.after_turn(&conversation_id, terminal).await });
+        tokio::spawn(async move {
+            supervisor
+                .after_turn(&conversation_id, turn_id.as_deref(), terminal)
+                .await
+        });
     }
 
     /// Called once a turn or operation released the conversation. A
-    /// completed turn or finished compaction advances the queue; other turn
+    /// completed turn or finished compaction advances the queue; a turn that
+    /// failed on an exhausted plan window waits for its reset; other turn
     /// endings pause it.
-    async fn after_turn(&self, conversation_id: &str, terminal: &str) {
+    async fn after_turn(&self, conversation_id: &str, turn_id: Option<&str>, terminal: &str) {
+        let exhausted_until = turn_id.and_then(|turn_id| self.quota.take_turn_exhaustion(turn_id));
         if matches!(terminal, "turn.completed" | "compaction.finished") {
+            if terminal == "turn.completed" {
+                self.end_rate_limit_wait(conversation_id).await;
+            }
             self.drain_follow_ups(conversation_id).await;
+            return;
+        }
+        if let (Some(turn_id), Some(until), "turn.failed") = (turn_id, exhausted_until, terminal) {
+            self.wait_for_rate_limit_reset(conversation_id, turn_id, until)
+                .await;
             return;
         }
         let reason = match terminal {
@@ -368,9 +411,170 @@ impl ConversationSupervisor {
     }
 
     /// A restart interrupted whatever ran before it; queued items wait for
-    /// an explicit resume instead of continuing on their own.
-    pub(super) async fn pause_follow_ups_after_restart(&self, conversation_id: &str) {
-        self.pause_follow_ups(conversation_id, "daemon_restarted", None)
-            .await;
+    /// an explicit resume instead of continuing on their own. A queue already
+    /// waiting for a plan window keeps that wait and its timer is re-armed.
+    pub(super) async fn restore_follow_ups_after_restart(&self, conversation_id: &str) {
+        let resume_at = match self.load_follow_ups(conversation_id).await {
+            Ok(queue) if queue.rate_limited() => queue.resume_at,
+            Ok(_) => None,
+            Err(error) => {
+                tracing::error!(conversation_id, error = %error, "failed to read follow-up queue after restart");
+                None
+            }
+        };
+        match resume_at {
+            Some(until) => self.spawn_rate_limit_timer(conversation_id, until),
+            None => {
+                self.pause_follow_ups(conversation_id, "daemon_restarted", None)
+                    .await
+            }
+        }
+    }
+
+    /// `turn_id` failed because its provider plan window is exhausted until
+    /// `until`. A continuation prompt joins the head of the queue (once,
+    /// however often the limit is hit before the reset) and the queue pauses
+    /// until the reset, when it resumes by itself.
+    async fn wait_for_rate_limit_reset(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        until: DateTime<Utc>,
+    ) {
+        let result = async {
+            let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+            let mut queue = self.load_follow_ups(conversation_id).await?;
+            if !queue
+                .items
+                .iter()
+                .any(|item| item.id.starts_with(RATE_LIMIT_CONTINUE_PREFIX))
+            {
+                let item_id = format!("{RATE_LIMIT_CONTINUE_PREFIX}{turn_id}");
+                let request = self
+                    .continuation_prompt(conversation_id, turn_id, &item_id)
+                    .await?;
+                // The cap bounds client additions; this item replaces the
+                // failed turn rather than adding work, so it may exceed it.
+                queue.items.insert(
+                    0,
+                    FollowUpItem {
+                        id: item_id,
+                        queued_at: Utc::now(),
+                        request,
+                    },
+                );
+            }
+            queue.pause(RATE_LIMITED, None);
+            queue.resume_at = Some(until);
+            self.save_follow_ups(conversation_id, &mut queue).await
+        }
+        .await;
+        match result {
+            Ok(()) => self.spawn_rate_limit_timer(conversation_id, until),
+            Err(error) => {
+                tracing::error!(conversation_id, turn_id, error = %error, "failed to queue the rate-limit continuation");
+                self.pause_follow_ups(conversation_id, "turn_failed", None)
+                    .await;
+            }
+        }
+    }
+
+    /// The failed turn's settings (model, effort, permissions) with its text
+    /// replaced by the continuation instruction. Attachments and skills are
+    /// already part of the provider transcript, so they are not sent again.
+    async fn continuation_prompt(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<ConversationPrompt, AppError> {
+        let snapshot = self
+            .store
+            .last_request(conversation_id)
+            .await?
+            .filter(|snapshot| snapshot.get("turnId").and_then(Value::as_str) == Some(turn_id));
+        let mut prompt = match snapshot {
+            Some(mut snapshot) => serde_json::from_value(snapshot["request"].take())?,
+            None => ConversationPrompt {
+                permission_mode: None,
+                work_mode: None,
+                client_request_id: None,
+                text: String::new(),
+                model: None,
+                reasoning_effort: None,
+                skills: Vec::new(),
+                content: Vec::new(),
+                permission_profile: None,
+                sandbox_mode: None,
+                approval_policy: None,
+            },
+        };
+        prompt.client_request_id = Some(item_id.to_owned());
+        RATE_LIMIT_CONTINUE_TEXT.clone_into(&mut prompt.text);
+        prompt.skills.clear();
+        prompt.content.clear();
+        Ok(prompt)
+    }
+
+    fn spawn_rate_limit_timer(&self, conversation_id: &str, until: DateTime<Utc>) {
+        let supervisor = self.clone();
+        let conversation_id = conversation_id.to_owned();
+        tokio::spawn(async move {
+            // `to_std` fails once the reset is in the past.
+            while let Ok(remaining) = (until - Utc::now()).to_std() {
+                if remaining.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(remaining.min(RATE_LIMIT_RECHECK)).await;
+            }
+            supervisor
+                .resume_after_rate_limit(&conversation_id, until)
+                .await;
+        });
+    }
+
+    /// Lifts the pause armed for `until`. A queue that was resumed, cleared or
+    /// re-armed for a later reset in the meantime is left alone.
+    async fn resume_after_rate_limit(&self, conversation_id: &str, until: DateTime<Utc>) {
+        let result = async {
+            let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+            let mut queue = self.load_follow_ups(conversation_id).await?;
+            if !queue.rate_limited() || queue.resume_at != Some(until) {
+                return Ok(false);
+            }
+            queue.unpause();
+            self.save_follow_ups(conversation_id, &mut queue).await?;
+            Ok::<_, AppError>(true)
+        }
+        .await;
+        match result {
+            Ok(true) => self.drain_follow_ups(conversation_id).await,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(conversation_id, error = %error, "failed to resume the follow-up queue after a rate limit");
+            }
+        }
+    }
+
+    /// A turn completed while the queue waited for a reset — the user went on
+    /// by hand — so the window is open again and the pending continuation
+    /// would repeat work: drop it and lift the wait.
+    async fn end_rate_limit_wait(&self, conversation_id: &str) {
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        let result = async {
+            let mut queue = self.load_follow_ups(conversation_id).await?;
+            if !queue.rate_limited() {
+                return Ok(());
+            }
+            queue
+                .items
+                .retain(|item| !item.id.starts_with(RATE_LIMIT_CONTINUE_PREFIX));
+            queue.unpause();
+            self.save_follow_ups(conversation_id, &mut queue).await
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::error!(conversation_id, error = %error, "failed to end the rate-limit wait");
+        }
     }
 }

@@ -8,12 +8,14 @@ use tokio::sync::Semaphore;
 use super::*;
 
 /// Each turn records its prompt text, then waits for a permit (or its
-/// cancellation). `fail_next` makes the next released turn fail.
+/// cancellation). `fail_next` makes the next released turn fail;
+/// `limit_next` makes it fail on a plan window exhausted until that instant.
 struct GatedDriver {
     real: Arc<dyn ProviderDriver>,
     permits: Arc<Semaphore>,
     prompts: Arc<StdMutex<Vec<String>>>,
     fail_next: Arc<AtomicBool>,
+    limit_next: Arc<StdMutex<Option<chrono::DateTime<chrono::Utc>>>>,
 }
 
 #[async_trait::async_trait]
@@ -26,7 +28,7 @@ impl ProviderDriver for GatedDriver {
         &self,
         _context: DriverContext,
         prompt: DriverPrompt,
-        _sink: DriverEventSink,
+        sink: DriverEventSink,
         mut cancel: watch::Receiver<bool>,
         _launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
@@ -34,6 +36,22 @@ impl ProviderDriver for GatedDriver {
         tokio::select! {
             permit = self.permits.acquire() => permit.unwrap().forget(),
             _ = cancel.wait_for(|cancelled| *cancelled) => return Err(AppError::TurnCancelled),
+        }
+        let limit = self.limit_next.lock().unwrap().take();
+        if let Some(reset) = limit {
+            sink.emit(
+                "quota.updated",
+                json!({
+                    "provider": "claude-code",
+                    "scope": "account",
+                    "status": "rejected",
+                    "windows": [{ "id": "five_hour", "usedPercent": 101.0, "resetsAt": reset.timestamp() }],
+                }),
+            )
+            .await?;
+            return Err(AppError::ProviderUnavailable(
+                "You've hit your session limit".to_owned(),
+            ));
         }
         if self.fail_next.swap(false, Ordering::SeqCst) {
             return Err(AppError::ProviderUnavailable("fixture failure".to_owned()));
@@ -50,9 +68,18 @@ struct Gate {
     permits: Arc<Semaphore>,
     prompts: Arc<StdMutex<Vec<String>>>,
     fail_next: Arc<AtomicBool>,
+    limit_next: Arc<StdMutex<Option<chrono::DateTime<chrono::Utc>>>>,
 }
 
 impl Gate {
+    /// The next released turn fails on a plan window resetting `after` from
+    /// now (whole seconds, as providers report it).
+    fn limit_next(&self, after: chrono::Duration) {
+        let reset = chrono::Utc::now() + after;
+        *self.limit_next.lock().unwrap() =
+            chrono::DateTime::from_timestamp(reset.timestamp() + 1, 0);
+    }
+
     fn release(&self) {
         self.permits.add_permits(1);
     }
@@ -86,11 +113,13 @@ async fn gated_fixture(
         permits: Arc::new(Semaphore::new(0)),
         prompts: Arc::default(),
         fail_next: Arc::default(),
+        limit_next: Arc::default(),
     };
-    let (permits, prompts, fail_next) = (
+    let (permits, prompts, fail_next, limit_next) = (
         gate.permits.clone(),
         gate.prompts.clone(),
         gate.fail_next.clone(),
+        gate.limit_next.clone(),
     );
     replace_driver(&mut supervisor, ProviderKind::ClaudeCode, move |real| {
         Arc::new(GatedDriver {
@@ -98,6 +127,7 @@ async fn gated_fixture(
             permits,
             prompts,
             fail_next,
+            limit_next,
         })
     });
     (root, store, supervisor, workspace, gate)
@@ -489,5 +519,161 @@ async fn daemon_restart_pauses_a_waiting_queue() {
     supervisor.cancel(&manifest.id).await.unwrap();
     wait_until_idle(&supervisor).await;
     assert_eq!(gate.prompts().len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+const CONTINUE_TEXT: &str = "The previous request was interrupted by a provider usage limit before it could finish. Continue where it left off and complete the task.";
+
+#[tokio::test]
+async fn rate_limited_turn_continues_by_itself_after_the_reset() {
+    let (root, store, supervisor, workspace, gate) =
+        gated_fixture("todex-queue-rate-limit-empty").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    let mut first = queued_prompt("long task");
+    first.client_request_id = Some("first".to_owned());
+    first.model = Some("claude-opus-5-5".to_owned());
+    let failed_turn = supervisor
+        .prompt_owned("local", &manifest.id, first)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    gate.limit_next(chrono::Duration::zero());
+    gate.release();
+
+    // An empty queue still gets the continuation, waiting for the reset.
+    let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| q["paused"] == true).await;
+    assert_eq!(snapshot["pauseReason"], "rate_limited");
+    assert!(snapshot["resumeAt"].is_string(), "{snapshot}");
+    let continue_id = format!("rate-limit-continue-{failed_turn}");
+    assert_eq!(
+        queue_ids(&supervisor, &manifest.id).await.0,
+        std::slice::from_ref(&continue_id)
+    );
+    assert_eq!(gate.prompts().len(), 1, "nothing starts before the reset");
+
+    gate.wait_for_prompts(2).await;
+    assert_eq!(gate.prompts()[1], CONTINUE_TEXT);
+    gate.release();
+    let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| {
+        q["items"].as_array().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(snapshot["paused"], false);
+    assert!(snapshot["resumeAt"].is_null());
+    wait_until_idle(&supervisor).await;
+    // The continuation keeps the failed turn's settings.
+    let request = store.last_request(&manifest.id).await.unwrap().unwrap();
+    assert_eq!(request["request"]["clientRequestId"], continue_id);
+    assert_eq!(request["request"]["model"], "claude-opus-5-5");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn rate_limit_continuation_goes_ahead_of_queued_items_once() {
+    let (root, _store, supervisor, workspace, gate) =
+        gated_fixture("todex-queue-rate-limit-front").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    supervisor
+        .prompt(&manifest.id, "first".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    add(&supervisor, &manifest.id, "item-2", queued_prompt("second")).await;
+    gate.limit_next(chrono::Duration::zero());
+    gate.release();
+
+    gate.wait_for_prompts(2).await;
+    assert_eq!(gate.prompts()[1], CONTINUE_TEXT);
+    assert_eq!(queue_ids(&supervisor, &manifest.id).await.0, ["item-2"]);
+    // The continuation hits the limit again: one new continuation, still
+    // ahead of the queued item.
+    gate.limit_next(chrono::Duration::zero());
+    gate.release();
+    gate.wait_for_prompts(3).await;
+    assert_eq!(gate.prompts()[2], CONTINUE_TEXT);
+    gate.release();
+    gate.wait_for_prompts(4).await;
+    assert_eq!(gate.prompts()[3], "second");
+    gate.release();
+    wait_until_idle(&supervisor).await;
+    assert!(queue_ids(&supervisor, &manifest.id).await.0.is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_turn_completed_during_the_wait_drops_the_continuation() {
+    let (root, _store, supervisor, workspace, gate) =
+        gated_fixture("todex-queue-rate-limit-manual").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    supervisor
+        .prompt(&manifest.id, "first".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    add(&supervisor, &manifest.id, "item-2", queued_prompt("second")).await;
+    gate.limit_next(chrono::Duration::hours(1));
+    gate.release();
+    let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| q["paused"] == true).await;
+    assert_eq!(snapshot["pauseReason"], "rate_limited");
+    wait_until_idle(&supervisor).await;
+
+    // The user continues by hand once the window reopened.
+    supervisor
+        .prompt(&manifest.id, "manual".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(2).await;
+    gate.release();
+    gate.wait_for_prompts(3).await;
+    assert_eq!(gate.prompts()[1..], ["manual", "second"]);
+    gate.release();
+    wait_until_idle(&supervisor).await;
+    let (ids, snapshot) = queue_ids(&supervisor, &manifest.id).await;
+    assert!(ids.is_empty());
+    assert_eq!(snapshot["paused"], false);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn daemon_restart_keeps_a_rate_limit_wait() {
+    let (root, store, supervisor, workspace, gate) =
+        gated_fixture("todex-queue-rate-limit-restart").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    supervisor
+        .prompt(&manifest.id, "first".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    gate.limit_next(chrono::Duration::hours(1));
+    gate.release();
+    let armed = wait_for_queue(&supervisor, &manifest.id, |q| q["paused"] == true).await;
+    wait_until_idle(&supervisor).await;
+
+    let restarted = ConversationSupervisor::new(
+        supervisor.config.clone(),
+        store.clone(),
+        ConversationEventHub::default(),
+        supervisor.workspace_trust.clone(),
+    );
+    restarted.recover_all().await.unwrap();
+    let snapshot = restarted
+        .queue_list_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    assert_eq!(snapshot["pauseReason"], "rate_limited");
+    assert_eq!(snapshot["resumeAt"], armed["resumeAt"]);
+    assert_eq!(snapshot["items"], armed["items"]);
     fs::remove_dir_all(root).unwrap();
 }

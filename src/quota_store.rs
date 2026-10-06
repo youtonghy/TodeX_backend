@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, TimeZone, Utc};
 use dashmap::DashMap;
 use serde_json::{json, Value};
 
@@ -22,6 +23,11 @@ fn now_ms() -> u64 {
 #[derive(Clone, Default)]
 pub struct QuotaStore {
     entries: Arc<DashMap<String, Value>>,
+    /// Reset instant of an exhausted window, per turn that observed it. Kept
+    /// per turn rather than read from `entries`: conversations sharing the
+    /// account hit the limit together, and each overwrites the provider's
+    /// latest snapshot. The turn's end takes its entry.
+    exhausted_turns: Arc<DashMap<String, DateTime<Utc>>>,
 }
 
 impl QuotaStore {
@@ -32,6 +38,16 @@ impl QuotaStore {
         let Some(provider) = payload.get("provider").and_then(Value::as_str) else {
             return;
         };
+        if let Some(turn_id) = payload.get("turnId").and_then(Value::as_str) {
+            match exhausted_until(payload) {
+                Some(until) => {
+                    self.exhausted_turns.insert(turn_id.to_owned(), until);
+                }
+                None => {
+                    self.exhausted_turns.remove(turn_id);
+                }
+            }
+        }
         let mut entry = payload.clone();
         entry["fetchedAt"] = json!(now_ms());
         entry["state"] = json!("ok");
@@ -41,6 +57,52 @@ impl QuotaStore {
     pub fn get(&self, provider: &str) -> Option<Value> {
         self.entries.get(provider).map(|entry| entry.clone())
     }
+
+    /// Removes and returns when the plan window that `turn_id` last saw
+    /// exhausted resets; `None` when the turn's latest snapshot had room left.
+    pub fn take_turn_exhaustion(&self, turn_id: &str) -> Option<DateTime<Utc>> {
+        self.exhausted_turns.remove(turn_id).map(|(_, until)| until)
+    }
+}
+
+/// Reset instant of a snapshot whose plan limit is reached: Claude reports
+/// `status: "rejected"`, Codex a window at 100 %. The latest reset among the
+/// full windows decides; a rejection without one falls back to the top-level
+/// `resetsAt`. `None` when nothing is exhausted or no reset time is known.
+fn exhausted_until(payload: &Value) -> Option<DateTime<Utc>> {
+    let windows = payload
+        .get("windows")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let full_window_reset = windows
+        .iter()
+        .filter(|window| {
+            window
+                .get("usedPercent")
+                .and_then(Value::as_f64)
+                .is_some_and(|percent| percent >= 100.0)
+        })
+        .filter_map(|window| reset_instant(window.get("resetsAt")?))
+        .max();
+    let rejected = payload.get("status").and_then(Value::as_str) == Some("rejected");
+    full_window_reset.or_else(|| {
+        rejected
+            .then(|| payload.pointer("/raw/resetsAt"))
+            .flatten()
+            .and_then(reset_instant)
+    })
+}
+
+/// Providers report epoch seconds; accept milliseconds as well.
+fn reset_instant(value: &Value) -> Option<DateTime<Utc>> {
+    let raw = value.as_i64()?;
+    let millis = if raw > 100_000_000_000 {
+        raw
+    } else {
+        raw.checked_mul(1000)?
+    };
+    Utc.timestamp_millis_opt(millis).single()
 }
 
 #[cfg(test)]
@@ -55,6 +117,65 @@ mod tests {
         assert_eq!(entry["state"], "ok");
         assert!(entry["fetchedAt"].as_u64().unwrap_or(0) > 0);
         assert!(store.get("codex").is_none());
+    }
+
+    #[test]
+    fn exhausted_windows_are_remembered_per_turn() {
+        let store = QuotaStore::default();
+        let snapshot = |turn: &str, status: &str, five_hour: f64| {
+            json!({
+                "provider": "claude-code",
+                "turnId": turn,
+                "status": status,
+                "windows": [
+                    { "id": "five_hour", "usedPercent": five_hour, "resetsAt": 1791279000 },
+                    { "id": "seven_day", "usedPercent": 41.0, "resetsAt": 1791493200 },
+                ],
+                "raw": { "resetsAt": 1791279000 },
+            })
+        };
+        store.record(&snapshot("turn-a", "rejected", 101.0));
+        // Another conversation's snapshot replaces the provider entry but
+        // not turn-a's exhaustion.
+        store.record(&snapshot("turn-b", "rejected", 101.0));
+        store.record(&snapshot("turn-c", "allowed_warning", 99.0));
+        let reset = Utc.timestamp_opt(1791279000, 0).single();
+        assert_eq!(store.take_turn_exhaustion("turn-a"), reset);
+        assert_eq!(store.take_turn_exhaustion("turn-a"), None);
+        assert_eq!(store.take_turn_exhaustion("turn-c"), None);
+        // A later snapshot with room left clears the turn's entry.
+        store.record(&snapshot("turn-b", "allowed", 10.0));
+        assert_eq!(store.take_turn_exhaustion("turn-b"), None);
+    }
+
+    #[test]
+    fn exhaustion_reads_full_windows_and_rejections() {
+        let full_codex = json!({
+            "windows": [{ "id": "primary", "usedPercent": 100.0, "resetsAt": 1792694011 }],
+        });
+        assert_eq!(
+            exhausted_until(&full_codex),
+            Utc.timestamp_opt(1792694011, 0).single()
+        );
+        let bare_rejection = json!({
+            "status": "rejected",
+            "windows": [{ "id": "five_hour", "resetsAt": 1791279000 }],
+            "raw": { "resetsAt": 1_791_279_000_000_i64 },
+        });
+        assert_eq!(
+            exhausted_until(&bare_rejection),
+            Utc.timestamp_opt(1791279000, 0).single()
+        );
+        assert_eq!(
+            exhausted_until(&json!({ "status": "rejected", "windows": [] })),
+            None
+        );
+        assert_eq!(
+            exhausted_until(&json!({
+                "windows": [{ "id": "five_hour", "usedPercent": 99.0, "resetsAt": 1 }],
+            })),
+            None
+        );
     }
 
     #[test]

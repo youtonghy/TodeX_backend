@@ -204,9 +204,11 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 - `conversation.queue.add`：payload 与 `conversation.prompt` 相同，另加 `itemId`（1–200 字节，省略时用命令 `id`）与可选 `front: true`（插到队首）。入队前按 prompt 的规则校验内容、路径与 Skill，不合法立即拒绝。会话空闲且队列为空时直接开始，结果为 `{ "conversationId", "itemId", "status": "started", "turnId" }`；否则入队，结果为 `{ ..., "status": "queued" }`。同一 `itemId` 已在队列中或已投递时幂等返回其状态，不会重复执行。
 - `conversation.queue.remove`（`itemId` 必填，不存在返回 `NOT_FOUND`）、`conversation.queue.clear`、`conversation.queue.resume`、`conversation.queue.list`：payload 为 `{ "conversationId", "itemId"? }`，结果为 `{ "conversationId", "queue": <快照> }`。`resume` 解除暂停，会话空闲时立即开始队首。
 
-快照为 `{ "items": [{ "id", "text", "status": "queued", "queuedAt", "contentCount", "skills" }], "paused", "pauseReason", "pauseMessage" }`，不含内联图片数据。每次变化都会追加 `followups.updated` 事件（payload 即快照）；懒加载窗口可能不含最近一次该事件，客户端打开会话或重连后应调用 `conversation.queue.list` 取当前快照。
+快照为 `{ "items": [{ "id", "text", "status": "queued", "queuedAt", "contentCount", "skills" }], "paused", "pauseReason", "pauseMessage", "resumeAt" }`，不含内联图片数据。每次变化都会追加 `followups.updated` 事件（payload 即快照）；懒加载窗口可能不含最近一次该事件，客户端打开会话或重连后应调用 `conversation.queue.list` 取当前快照。
 
 派发规则：turn 以 `turn.completed` 结束（或原生压缩结束）后，daemon 以队列项的 `itemId` 作为 `clientRequestId` 开始队首，成功后移出队列。`turn.failed` / `turn.cancelled` / `turn.interrupted` 使队列暂停（`pauseReason` 为 `turn_failed` / `turn_cancelled` / `turn_interrupted`）；队首无法开始时保留在队首并暂停（`start_failed`，`pauseMessage` 为原因）；daemon 重启后有待发项的队列暂停（`daemon_restarted`）。暂停期间空闲会话仍可直接 `conversation.prompt`，该 turn 完成后队列保持暂停。
+
+额度续写：turn 失败且该 turn 最近一次 `quota.updated` 显示套餐窗口已用尽（Claude `status: "rejected"`，或某窗口 `usedPercent` ≥ 100），daemon 不按普通失败处理，而是在队首插入一条续写项（`id` 为 `rate-limit-continue-<turnId>`，沿用失败请求的模型、思考强度与权限设置，正文为固定英文续写指令，不重复附件与 skills）——队列为空时也插入，已有续写项时不重复插入——并以 `rate_limited` 暂停，`resumeAt` 为窗口重置时间（ISO 8601）。到点后 daemon 自行解除暂停并开始队首（按墙钟时间每 30 秒复核，机器休眠后也会补上），daemon 重启后继续等待。等待期间客户端可移除续写项或 `resume` 提前开始；若期间有 turn 以 `turn.completed` 结束（用户已手动继续），续写项被移除、暂停解除。
 
 ### 历史加密密钥（`history.*`）
 

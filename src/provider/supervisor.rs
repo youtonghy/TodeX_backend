@@ -527,7 +527,7 @@ impl ConversationSupervisor {
                     "conversation recovery failed; continuing startup"
                 );
             }
-            self.pause_follow_ups_after_restart(&manifest.id).await;
+            self.restore_follow_ups_after_restart(&manifest.id).await;
             if (index + 1) % 25 == 0 || index + 1 == total {
                 tracing::info!(
                     recovered = index + 1,
@@ -1236,7 +1236,7 @@ impl ConversationSupervisor {
             }
             // Prompts queued during compaction continue after it.
             drop(cleanup);
-            supervisor.schedule_after_turn(conversation_id, "compaction.finished");
+            supervisor.schedule_after_turn(conversation_id, None, "compaction.finished");
         });
         Ok(operation_id)
     }
@@ -1827,7 +1827,7 @@ impl ConversationSupervisor {
                 .await;
             // The queue's next prompt needs the conversation released first.
             drop(cleanup);
-            supervisor.schedule_after_turn(conversation_id, terminal);
+            supervisor.schedule_after_turn(conversation_id, Some(spawned_turn_id), terminal);
         });
         Ok(turn_id)
     }
