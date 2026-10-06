@@ -21,6 +21,7 @@ use crate::{
     devices::DeviceRegistry,
     error::Result,
     event::EventBus,
+    history_keys::HistoryKeys,
     kanban_store::KanbanTaskStore,
     local_terminal::LocalTerminalManager,
     provider::{CliManager, ConversationSupervisor},
@@ -50,6 +51,9 @@ pub struct AppState {
     pub pairing_keys: PairingKeys,
     pub(crate) device_auth: DeviceAuthenticator,
     pub(crate) device_pairing: DevicePairingRegistry,
+    /// History encryption recipients, keyrings and DEKs; see
+    /// [`crate::history_keys`].
+    pub(crate) history_keys: HistoryKeys,
     pub workspaces: WorkspaceStore,
     pub kanban_tasks: KanbanTaskStore,
     pub agent_providers: AgentProviderService,
@@ -139,6 +143,11 @@ impl AppState {
         let pairing_keys = PairingKeys::load_or_generate(&config.data_dir).await?;
         let devices = DeviceRegistry::load(&config.data_dir)?;
         let device_auth = DeviceAuthenticator::new(devices.clone());
+        let history_keys = HistoryKeys::load(
+            &config.data_dir,
+            crate::config::load_history_encryption(&config.data_dir)?,
+            config.security.enable_auth.then(|| devices.clone()),
+        )?;
         let device_pairing =
             DevicePairingRegistry::new(&config.data_dir, config.security.enable_auth, devices)?;
         let websocket_connections = Arc::new(AtomicUsize::new(0));
@@ -159,6 +168,7 @@ impl AppState {
             pairing_keys,
             device_auth,
             device_pairing,
+            history_keys,
             workspaces,
             kanban_tasks,
             agent_providers,

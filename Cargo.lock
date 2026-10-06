@@ -4338,6 +4338,7 @@ dependencies = [
  "futures-util",
  "global-hotkey",
  "hkdf",
+ "hmac",
  "if-addrs",
  "jpeg-encoder",
  "json5",

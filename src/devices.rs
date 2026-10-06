@@ -192,6 +192,10 @@ pub(crate) fn list_devices(data_dir: &Path) -> Result<Vec<DeviceRecord>> {
     Ok(devices.into_values().collect())
 }
 
+/// Removes the device, then revokes its history recipient (see
+/// `history_keys`). The device file is written first: if the history update
+/// fails the device is still locked out, the error says so, and the daemon
+/// revokes recipients of unpaired devices on its next history access.
 pub(crate) fn revoke_device(data_dir: &Path, device_id: &str) -> Result<bool> {
     let path = data_dir.join(FILE_NAME);
     let (mut devices, _) = read_records(&path)?.unwrap_or_default();
@@ -205,6 +209,7 @@ pub(crate) fn revoke_device(data_dir: &Path, device_id: &str) -> Result<bool> {
             devices,
         },
     )?;
+    revoke_history_recipients(data_dir, Some(device_id))?;
     Ok(true)
 }
 
@@ -215,7 +220,18 @@ pub(crate) fn revoke_all_devices(data_dir: &Path) -> Result<()> {
             version: 1,
             devices: BTreeMap::new(),
         },
-    )
+    )?;
+    revoke_history_recipients(data_dir, None)
+}
+
+fn revoke_history_recipients(data_dir: &Path, device_id: Option<&str>) -> Result<()> {
+    crate::history_keys::revoke_device_recipients(data_dir, device_id)
+        .map(|_| ())
+        .map_err(|error| {
+            invalid(&format!(
+                "device revoked, but its history recipient was not updated: {error}"
+            ))
+        })
 }
 
 type RecordsSnapshot = (BTreeMap<String, DeviceRecord>, Option<SystemTime>);
@@ -333,6 +349,32 @@ mod tests {
         assert!(revoke_device(&root, &record.device_id).unwrap());
         assert!(registry.get(&record.device_id).unwrap().is_none());
         assert!(!revoke_device(&root, &record.device_id).unwrap());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn revoking_devices_revokes_their_history_recipients() {
+        use crate::config::HistoryEncryption;
+        use crate::history_keys::{system_clock, test_support::recipient, RecipientRegistry};
+
+        let (root, registry) = fixture();
+        let first = registry.register("Phone", &key(7)).unwrap();
+        let second = registry.register("Laptop", &key(8)).unwrap();
+        let recipients =
+            RecipientRegistry::load(&root, HistoryEncryption::Off, None, system_clock()).unwrap();
+        let first_rid = recipients
+            .register_device(&first.device_id, &recipient(1))
+            .unwrap();
+        let second_rid = recipients
+            .register_device(&second.device_id, &recipient(2))
+            .unwrap();
+
+        assert!(revoke_device(&root, &first.device_id).unwrap());
+        assert!(!recipients.is_active(&first_rid).unwrap());
+        assert!(recipients.is_active(&second_rid).unwrap());
+        revoke_all_devices(&root).unwrap();
+        assert!(!recipients.is_active(&second_rid).unwrap());
+        assert_eq!(recipients.snapshot().unwrap().epoch, 4);
         let _ = fs::remove_dir_all(&root);
     }
 
