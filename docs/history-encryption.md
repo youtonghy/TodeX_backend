@@ -39,11 +39,14 @@
   "grants": [
     { "grantId": "grt_…", "rid": "…", "deviceId": "dev_…",
       "requestedAt": "RFC3339", "status": "pending" }
+  ],
+  "revokedDevices": [
+    { "deviceId": "dev_…", "revokedAt": "RFC3339", "revokedBy": "dev_…" }
   ]
 }
 ```
 
-  `epoch` 在接收方集合变化（新增、吊销、恢复密钥替换）时加一，切换 `mode` 不变。最多一个未吊销的 `recovery` 接收方；已吊销的公钥不能再次登记（`rid` 由公钥决定，须换新密钥对）。设备在 `devices.json` 被吊销时，其接收方同时标记 `revokedAt`；daemon 访问本文件时也会吊销 `devices.json` 中已不存在的设备的接收方。授权 `status`：`pending`、`fulfilled`、`dismissed`、`revoked`（接收方被吊销或换钥时待办授权转为 `revoked`）。
+  `epoch` 在接收方集合变化（新增、吊销、恢复密钥替换）时加一，切换 `mode` 不变。最多一个未吊销的 `recovery` 接收方；已吊销的公钥不能再次登记（`rid` 由公钥决定，须换新密钥对）。设备在 `devices.json` 被吊销时，其接收方同时标记 `revokedAt`，设备本身加入 `revokedDevices`（见 §3.4）；daemon 访问本文件时也会吊销 `devices.json` 中已不存在的设备的接收方并封禁该设备。`revokedDevices` 为空时不写出（缺省视为空，`version` 仍为 1），所以未封禁过设备的文件旧版 daemon 仍可读取；最多保留 256 项，超出时解封最早的一项并记录警告。授权 `status`：`pending`、`fulfilled`、`dismissed`、`revoked`（接收方被吊销或换钥时待办授权转为 `revoked`）。
   `mode` 的来源：文件不存在时视为 `off`；首次写入时取配置 `history_encryption`（`TODEX_AGENTD_HISTORY_ENCRYPTION`），但仅当该次写入后已有未吊销的设备接收方才为 `e2e`；文件存在后以文件为准，配置不再生效。
 - 每个会话 `keyring.json`（0600，原子替换）：`{"version":1,"keys":[{"kid","createdAt","epoch","wraps":[WrappedKey…]}]}`。授权新设备只向已有 `kid` 追加 `wraps`，不改动分片文件。
 
@@ -58,9 +61,16 @@
 
 ### 3.3 新设备与恢复
 
-- 新设备配对后调用 `history.recipient.register` 登记自己的公钥；它只能读取此后轮换出的 DEK。
+- 新设备配对后调用 `history.recipient.register` 登记自己的公钥；它只能读取此后轮换出的 DEK。被封禁的设备（§3.4）不能登记，须先由另一台设备解封。
 - 读取旧历史需要授权：新设备发 `history.grant.request` → 已授权设备 `history.grant.list` 看到待办 → 逐会话 `history.keys.list` 枚举 `kid`、`history.keys.wraps` 取回给自己的封装、本地解开后对目标 `rid` 重新封装 → `history.grant.fulfill` 分批上传。后端只校验 `kid` 存在、目标 `rid` 与授权一致，不接触 DEK。
 - 恢复密钥：首台设备开启加密时生成 32 字节种子，以 BIP39 英文 24 词与二维码展示（可跳过，跳过须二次确认警告），只上传公钥（`history.recovery.set`）。导入恢复密钥的设备以恢复 `rid` 取回封装，对自己重新封装后上传（等价于一次自授权 `history.grant.fulfill`，`grantId` 为空、目标为自身 `rid`）。
+
+### 3.4 设备吊销与恢复
+
+- 吊销设备的接收方（`history.recipient.revoke` 的目标是某设备当前未吊销的 `rid`），或在 TUI 吊销设备（单台或全部，`devices.json` 钩子），会在同一次原子写入中吊销其接收方（`epoch+1`）并把该设备加入 `revokedDevices`（`revokedBy` 为执行吊销的设备 id；TUI 为 `"tui"`；daemon 发现设备已从 `devices.json` 消失而自行吊销时为 `"local"`）。吊销已吊销的 `rid`（例如换钥后留下的旧 `rid`）、恢复接收方不封禁任何设备。未开启设备认证时所有连接同为 `local`，命令吊销不封禁（否则无人能解封）。`recipients.json` 尚不存在时 TUI 吊销不写入封禁（此时没有任何历史密钥）。
+- 被封禁的设备除 `history.encryption.get` 外的所有 `history.*` 命令都返回 `HISTORY_ACCESS_REVOKED`（HTTP 403），包括登记新公钥、申请/履约/列出/驳回授权、`history.keys.list`、任意 `rid` 的 `history.keys.wraps`、设置恢复密钥、开关加密、吊销与解封。重新配对同一设备身份（`deviceId` 由设备签名公钥决定）不会解除封禁。被封禁设备仍可订阅与回放会话、收到密文，只是取不到新 DEK 的封装：其 `rid` 已吊销，新 DEK 只为未吊销的接收方封装；文件中若出现被封禁设备仍有未吊销接收方的情况，daemon 在下次访问时把该接收方吊销。
+- `history.device.restore {deviceId}` 由任一未被封禁的已配对设备调用，把该设备移出 `revokedDevices`（不改变 `epoch`）。旧公钥仍被拒绝（`CONFLICT`）：设备须生成新密钥对重新登记，之后的新 DEK 才包含它，读取旧历史需要新的授权。设备未被封禁时返回 `NOT_FOUND`。所有设备都被封禁时，只能由新身份（重新安装客户端后配对）的设备解封。
+- `history.encryption.get` 的 `myAccess`：调用方被封禁为 `revoked`，有未吊销的设备接收方为 `active`，否则为 `unregistered`。
 
 ## 4. 存储格式 v3
 
@@ -167,11 +177,12 @@ e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容�
 
 | 命令 | 请求 | 响应 |
 |---|---|---|
-| `history.encryption.get` | `{}` | `{mode, epoch, recipients[], myRid?, grants[]}` |
+| `history.encryption.get` | `{}` | `{mode, epoch, recipients[], myRid?, myAccess, grants[], revokedDevices:[{deviceId, revokedAt}]}`（被封禁设备也可调用） |
 | `history.encryption.enable` | `{}`（需至少一个设备接收方） | 同 get |
 | `history.encryption.disable` | `{}` | 同 get |
 | `history.recipient.register` | `{publicKey}`（绑定当前连接的 `deviceId`，幂等，换钥即替换并 `epoch+1`） | `{rid}` |
-| `history.recipient.revoke` | `{rid}` | 同 get |
+| `history.recipient.revoke` | `{rid}`（设备接收方同时封禁该设备，§3.4） | 同 get |
+| `history.device.restore` | `{deviceId}`（解除封禁；未封禁为 `NOT_FOUND`） | 同 get |
 | `history.recovery.set` | `{publicKey}` | `{rid}` |
 | `history.grant.request` | `{}` | `{grantId}` |
 | `history.grant.list` | `{}` | `{grants[]}`（每项附目标 `publicKey`） |
@@ -179,6 +190,27 @@ e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容�
 | `history.keys.list` | `{conversationId?, cursor?, limit≤500}`（默认 500） | `{items:[{conversationId, kid}], nextCursor?}` |
 | `history.keys.wraps` | `{conversationId, kids[≤500], rid?}`（默认调用方 `rid`） | `{wraps: {kid: WrappedKey}}` |
 | `history.grant.fulfill` | `{grantId?, rid, wraps:[{conversationId, kid, wrapped}]（≤500）, complete?}`（最后一批 `complete: true` 结束授权；已有封装跳过） | `{added}` |
+
+除 `history.encryption.get` 外，被封禁设备（§3.4）调用任何命令都返回 `HISTORY_ACCESS_REVOKED`（HTTP 403）。
+
+### 7.1 状态推送：`history.encryption.updated`
+
+接收方、授权、模式或封禁列表每次持久化变化（写入成功后）都向所有 `/v2/ws` 连接广播一条全局服务端事件（不按设备过滤，被封禁设备同样收到，包括针对自己的 `device.restored`）：`{eventId, type: "history.encryption.updated", payload, …}`。payload 为 `{epoch, mode: "off"|"e2e", reason, rid?, deviceId?, grantId?, conversationIds?}`，缺省字段不出现，绝不含公钥或封装密钥。`epoch` 与 `mode` 仅供参考，客户端收到后应重新调用 `history.encryption.get`（或 `history.grant.list`）。没有发生写入的命令（同一公钥重复登记、返回已有待办的 `grant.request`、驳回已结束的授权、重试时全部已存在的封装）不推送。
+
+| `reason` | 触发 | 附带字段 |
+|---|---|---|
+| `mode` | `history.encryption.enable` / `disable` | — |
+| `recipient.registered` | `history.recipient.register`（含换钥） | `rid`、`deviceId` |
+| `recipient.revoked` | `history.recipient.revoke` | `rid`；设备接收方另带 `deviceId`（该设备随之被封禁） |
+| `device.restored` | `history.device.restore` | `deviceId` |
+| `device.revoked` | TUI 经 `devices.json` 吊销设备，或 daemon 自行吊销已不在 `devices.json` 中的设备 | `deviceId`（每台设备一条） |
+| `recovery.set` | `history.recovery.set` | `rid` |
+| `grant.requested` | `history.grant.request` 新建授权 | `grantId`、`rid`、`deviceId` |
+| `grant.dismissed` | `history.grant.dismiss` | `grantId` |
+| `grant.progress` | `history.grant.fulfill` 写入了新封装（含不带 `grantId` 的恢复自授权） | `rid`（目标）、`grantId`（有则带）、`conversationIds`（本批实际新增封装的 v2 会话 id，去重） |
+| `grant.fulfilled` | `history.grant.fulfill` 带 `complete: true` 把授权标为 `fulfilled` | `grantId`、`rid`；同一批若也写入了封装，先推 `grant.progress` 再推本条 |
+
+TUI 在独立进程中改写 `recipients.json`，daemon 按文件戳（mtime + 长度）检测：每 2 秒轮询一次，且每条 `history.*` 命令执行前也检查一次；新出现在 `revokedDevices` 中的设备各推送一条 `device.revoked`。批量履约中途某个会话写入失败时，已写入的会话仍以 `grant.progress` 推送，随后返回错误。
 
 `conversation.retry` 在 e2e 下必须携带 `text` + `content`（客户端从 `retryRequest` 解密所得），或旧式的 `prompt`（解密后的原请求文本），否则 `INVALID_REQUEST`。e2e 下 `last-request.json` 不含提示原文：`request.text` 为空串、内联 `text`/`image` 内容项被移除，只保留 `textMac`（去掉首尾空白后的请求文本的 HMAC；prompt 执行前同样去掉首尾空白，`message.created` 的 `content` 即此形式）、`contentMac`（内联项 JSON 的 HMAC）与文件引用；去掉首尾空白后的 `prompt` 的 HMAC 必须等于 `textMac`（快照是明文时去掉首尾空白后必须等于原文；此前未去空白封存的快照也接受原样 `prompt`），否则 `CONFLICT`。为此 e2e 下用户 `message.created` 的加密 payload 另带 `retryRequest: {text, content}`：去掉首尾空白的原请求文本与原始 `content` 项（内联文本、图片与文件引用，按原顺序）；摘要流不含该字段。客户端重试时把它解密后作为 `{conversationId, text, content}` 发回：`text` 校验 `textMac`，`content` 中的内联项（`text`/`image`）序列化后校验 `contentMac`、文件引用须与快照保留的一致，全部通过后按原顺序重放，因此带内联文本、图片或只选 Skill 的请求同样可以重试。只带 `prompt`（旧客户端）的重试仅在原请求没有内联项时可用，否则返回 `CONFLICT`，提示需要原始内容项。off 模式下快照仍含原文，`prompt` 被忽略。
 

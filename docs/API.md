@@ -216,10 +216,11 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 
 | 命令 | 请求 | 结果 |
 | --- | --- | --- |
-| `history.encryption.get` | `{}` | `{ "mode": "off"\|"e2e", "epoch", "recipients": [...], "myRid"?, "grants": [...] }` |
+| `history.encryption.get` | `{}` | `{ "mode": "off"\|"e2e", "epoch", "recipients": [...], "myRid"?, "myAccess": "active"\|"unregistered"\|"revoked", "grants": [...], "revokedDevices": [{ "deviceId", "revokedAt" }] }`；被封禁设备也可调用 |
 | `history.encryption.enable` / `disable` | `{}` | 同 get；`enable` 需至少一个未吊销的设备接收方，否则 `INVALID_REQUEST` |
 | `history.recipient.register` | `{ "publicKey" }`（X-Wing 公钥 1216 字节，base64url） | `{ "rid" }`；同一公钥幂等；换钥吊销旧 `rid`；已吊销或属于其他接收方的公钥返回 `CONFLICT` |
-| `history.recipient.revoke` | `{ "rid" }` | 同 get；未知 `rid` 为 `NOT_FOUND`，已吊销幂等 |
+| `history.recipient.revoke` | `{ "rid" }` | 同 get；未知 `rid` 为 `NOT_FOUND`，已吊销幂等；吊销设备当前的接收方同时封禁该设备 |
+| `history.device.restore` | `{ "deviceId" }` | 同 get；解除封禁（不恢复旧公钥，设备须登记新公钥并重新申请授权）；设备未被封禁为 `NOT_FOUND` |
 | `history.recovery.set` | `{ "publicKey" }` | `{ "rid" }`；替换（吊销）现有恢复接收方 |
 | `history.grant.request` | `{}` | `{ "grantId" }`；同一接收方已有待办时返回原 `grantId` |
 | `history.grant.list` | `{}` | `{ "grants": [{ "grantId", "rid", "deviceId", "requestedAt", "status", "updatedAt"?, "publicKey" }] }` |
@@ -231,6 +232,10 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 `recipients[]` 项为 `{ "rid", "kind": "device"\|"recovery", "deviceId", "publicKey", "addedAt", "revokedAt" }`（含已吊销项）。授权状态 `status` 为 `pending`、`fulfilled`、`dismissed`、`revoked`（请求方接收方被吊销或换钥）。接收方集合变化（登记、换钥、吊销、恢复密钥替换、设备被吊销）使 `epoch` 加一；切换 mode 不变。
 
 `history.grant.fulfill`：带 `grantId` 时目标 `rid` 必须是该待办授权的接收方（否则 `UNAUTHORIZED`），授权已结束为 `CONFLICT`；不带 `grantId`（恢复密钥导入）时目标只能是调用方自己的 `rid`。每个 `wrapped.rid` 必须等于 `rid`（`INVALID_REQUEST`），每个 `kid` 必须已存在（`NOT_FOUND`），会话须属于调用方；全部校验通过后才写入。目标已有封装的 `kid` 跳过，因此分批重试安全。最后一批带 `complete: true` 把授权标为 `fulfilled`。
+
+设备封禁（规格见 [history-encryption.md](history-encryption.md) §3.4）：吊销某设备当前的接收方（`history.recipient.revoke`）或在 TUI 吊销设备时，该设备进入 `revokedDevices`，除 `history.encryption.get` 外的所有 `history.*` 命令返回 `HISTORY_ACCESS_REVOKED`（HTTP 403），重新配对同一设备身份也不解除，直到另一台未被封禁的设备调用 `history.device.restore`。被封禁设备仍可订阅、回放会话并收到密文。未开启设备认证时命令吊销不封禁。
+
+状态推送：接收方、授权、模式或封禁列表每次持久化变化后，所有 `/v2/ws` 连接（含被封禁设备）都会收到全局事件 `{ "eventId", "type": "history.encryption.updated", "payload": { "epoch", "mode", "reason", "rid"?, "deviceId"?, "grantId"?, "conversationIds"? } }`，不含任何公钥或封装密钥；`reason` 为 `mode`、`recipient.registered`、`recipient.revoked`、`device.restored`、`device.revoked`（TUI 吊销，daemon 2 秒内推送）、`recovery.set`、`grant.requested`、`grant.dismissed`、`grant.progress`（`conversationIds` 为本批新增封装的会话）、`grant.fulfilled`，各字段含义见 history-encryption.md §7.1。客户端收到后重新读取 `history.encryption.get`。
 
 `e2e` 下客户端须声明能解密历史：`/v2/ws` 握手 query 与 `GET /v2/conversations/{id}/events` query 带 `historyEncryption=1`（握手 query 受设备签名覆盖）。未声明的 `conversation.subscribe` 与 HTTP 回放返回 `CLIENT_UPGRADE_REQUIRED`（HTTP 426）。`/v2/version` 的 `historyEncryption` 字段给出后端支持的版本；旧后端对 `history.*` 返回 `UNSUPPORTED`。`history.encryption.enable` 同时触发已有明文历史的后台加密迁移。
 
@@ -1027,6 +1032,7 @@ TUI 配对二维码只携带后端地址、当前首选加密方式和服务端�
 | `codex.item.*` | app-server item/stream 通知映射。 |
 | `codex.plan.*` | app-server plan 通知映射。 |
 | `codex.approval.*` | app-server approval/server-request 映射。 |
+| `history.encryption.updated` | 历史加密密钥状态变化（见「历史加密密钥」）。 |
 | `error` | 通用后端错误事件。 |
 
 ## 错误码
@@ -1043,6 +1049,7 @@ TUI 配对二维码只携带后端地址、当前首选加密方式和服务端�
 | `REMOTE_PERMISSION_DENIED` | 远程服务器拒绝该文件操作（HTTP 403）；与 TodeX 设备认证无关。 |
 | `REMOTE_OPERATION_FAILED` | 其他远程文件操作失败（HTTP 422）。 |
 | `CLIENT_UPGRADE_REQUIRED` | 历史已端到端加密，而客户端未声明 `historyEncryption=1`（HTTP 426）；需升级客户端。 |
+| `HISTORY_ACCESS_REVOKED` | 调用方设备已被封禁历史访问（HTTP 403）：除 `history.encryption.get` 外的 `history.*` 命令均拒绝，需另一台设备调用 `history.device.restore`。 |
 | `STORAGE_LOW` | 数据目录所在磁盘可用空间低于 1 GiB，拒绝新 turn，HTTP 507；释放磁盘空间后重试。运行中的 turn 不受影响。 |
 | `JOURNAL_FULL` | 已停用（history v3 起会话没有体积上限，服务端不再返回），保留供旧客户端映射。 |
 | `EVENT_STREAM_LAGGED` | WebSocket 事件接收端落后，服务端正从 journal 补放；帧无顶层 `id`，`payload.conversationId` 标明会话。 |
