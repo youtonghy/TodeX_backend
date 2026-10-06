@@ -1,0 +1,14 @@
+# Stands in for the `xkbcommon` crate (see the root Cargo.toml's
+# [patch.crates-io]): the same API surface xa11y-linux uses, with
+# libxkbcommon loaded at run time instead of linked, so todex-agentd starts
+# on machines without it (servers, minimal containers) and links without it.
+[package]
+name = "xkbcommon"
+version = "0.9.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+xkbcommon-dl = "0.4"
+xkeysym = "0.2"

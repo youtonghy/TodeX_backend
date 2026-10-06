@@ -107,3 +107,9 @@ opt-level = 3
 # debug builds and tests needlessly slow.
 [profile.dev.package.miniz_oxide]
 opt-level = 3
+
+# xa11y-linux links libxkbcommon, which would make the daemon fail to start
+# (and the Linux release fail to link) where it is not installed; this copy
+# of the API it uses loads the library at run time instead.
+[patch.crates-io]
+xkbcommon = { path = "crates/xkbcommon" }
