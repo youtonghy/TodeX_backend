@@ -384,7 +384,7 @@ jobs:
           echo "artifact_path=dist/${archive_name}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload binary archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.artifact_name }}
           path: |
@@ -414,7 +414,7 @@ jobs:
       contents: write
     steps:
       - name: Download binary archives
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
