@@ -395,10 +395,15 @@ impl ConversationStore {
             ));
         }
         let directory = self.directory(conversation_id)?;
+        let name = segment::segment_name(number);
+        let current = |files: Vec<JournalFile>| files.into_iter().find(|file| file.name == name);
         let before = {
             let _guard = self.lock(conversation_id).await;
-            self.files_locked(conversation_id, &directory).await?
+            current(self.files_locked(conversation_id, &directory).await?)
         };
+        if before.is_none() {
+            return Ok(false);
+        }
         self.sealing.insert(conversation_id.to_owned(), ());
         let path = directory.clone();
         let id = conversation_id.to_owned();
@@ -421,7 +426,8 @@ impl ConversationStore {
         };
         let committed = async {
             let _guard = self.lock(conversation_id).await;
-            if self.files_locked(conversation_id, &directory).await? != before {
+            // Appends may go on; only the segment itself must be unchanged.
+            if current(self.files_locked(conversation_id, &directory).await?) != before {
                 return Ok(false);
             }
             let stop = self.commit_stop();
@@ -429,7 +435,7 @@ impl ConversationStore {
             let temp_seg = prepared.temp_seg.clone();
             let temp_idx = prepared.temp_idx.clone();
             let body = prepared.body.clone();
-            tokio::task::spawn_blocking(move || {
+            let swapped = tokio::task::spawn_blocking(move || {
                 let prepared = segment::PreparedSegment {
                     number,
                     temp_seg,
@@ -439,15 +445,18 @@ impl ConversationStore {
                 };
                 segment::commit_replacement(&path, &prepared, stop)
             })
-            .await
-            .map_err(|error| AppError::Anyhow(error.into()))?
-            .map_err(|error| {
-                AppError::InvalidRequest(format!(
-                    "conversation {conversation_id} journal segment {number} swap failed: {error}"
-                ))
-            })?;
-            // The replay index, digest and tail are rebuildable caches.
+            .await;
+            // Whatever happened, the replay index, digest and tail are
+            // rebuilt and the directory reconciled (finishing or rolling
+            // back an interrupted swap) on next access.
             self.forget_journal_caches_locked(conversation_id);
+            swapped
+                .map_err(|error| AppError::Anyhow(error.into()))?
+                .map_err(|error| {
+                    AppError::InvalidRequest(format!(
+                        "conversation {conversation_id} journal segment {number} swap failed: {error}"
+                    ))
+                })?;
             Ok::<_, AppError>(stop.is_none())
         }
         .await;

@@ -7,10 +7,6 @@
 //! their public keys: it seals history content under a random per-segment key
 //! (DEK) that lives in memory, and wraps that DEK for every recipient device.
 //! It can never unwrap a DEK again; only the test helper does.
-//!
-//! Storage and protocol wiring arrive in later steps, so nothing outside the
-//! tests calls this module yet.
-#![allow(dead_code)]
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chacha20poly1305::{
@@ -131,6 +127,7 @@ impl SegmentKey {
         key
     }
 
+    #[cfg(test)]
     pub(crate) fn from_parts(kid: [u8; KID_LEN], dek: [u8; DEK_LEN]) -> Self {
         Self { kid, dek }
     }

@@ -701,3 +701,18 @@ async fn salvage_keeps_intact_sealed_runs_of_an_e2e_segment() {
     }
     restarted.cleanup();
 }
+
+#[tokio::test]
+async fn a_provider_payload_cannot_pose_as_ciphertext() {
+    let e2e = E2e::new("todex-e2e-reserved", false).await;
+    let id = e2e.create(None).await.id;
+    let forged = json!({"turnId": "t", "$enc": {"v": 1, "kid": "k", "c": "c", "n": 1, "f": "AA"}});
+    e2e.store
+        .append(&id, "provider.event", forged.clone())
+        .await
+        .unwrap();
+    let replayed = e2e.store.event_at(&id, 1).await.unwrap().unwrap();
+    assert!(encrypted_content(&replayed.payload).is_none());
+    assert_eq!(replayed.payload["_$enc"], forged["$enc"]);
+    e2e.cleanup();
+}

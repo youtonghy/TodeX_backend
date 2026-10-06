@@ -20,7 +20,7 @@ use super::digest::JournalDigest;
 use super::maintenance::{available_space, MaintenanceQueue};
 use super::record::{
     add_history_macs, decode_journal_record, encode_record, encrypted_content, seal_event,
-    JOURNAL_COMPACTED_EVENT,
+    ENCRYPTED_FIELD, JOURNAL_COMPACTED_EVENT,
 };
 use super::segment::{
     self, CommitStep, FrameCache, FrameRef, MigrationKey, PreparedSegment, SealPolicy,
@@ -48,6 +48,10 @@ const MAX_REPLAY_LIMIT: usize = 1000;
 /// limit (`docs/history-encryption.md` §1): appends always land, so a
 /// running turn can always finish.
 pub(super) const STORAGE_LOW_BYTES: u64 = 1024 * 1024 * 1024;
+/// Upper bound of one journal line: an encrypted record carries its
+/// payload base64-encoded (4/3) and may add a summary ciphertext, so allow
+/// three payloads plus the envelope.
+const MAX_RECORD_LINE_BYTES: usize = 3 * MAX_EVENT_PAYLOAD_BYTES + 64 * 1024;
 /// Read buffer for the cold-index newline scan.
 const JOURNAL_SCAN_BUFFER_BYTES: usize = 256 * 1024;
 /// The journal is one logical sequence of files ordered by segment number:
@@ -1097,6 +1101,18 @@ impl ConversationStore {
         hub: Option<&ConversationEventHub>,
     ) -> Result<ConversationEvent, AppError> {
         redact_secrets(&mut payload);
+        // `$enc` marks stored ciphertext; a provider payload that happens to
+        // use the key keeps it under another name.
+        if let Some(map) = payload.as_object_mut() {
+            if let Some(value) = map.remove(ENCRYPTED_FIELD) {
+                tracing::warn!(
+                    conversation_id,
+                    event_type,
+                    "renamed a reserved $enc payload key"
+                );
+                map.insert(format!("_{ENCRYPTED_FIELD}"), value);
+            }
+        }
         let bounded = bound_event_payload(&mut payload)?;
         if let Some(original_bytes) = bounded.original_bytes {
             tracing::warn!(
@@ -2796,7 +2812,7 @@ impl ConversationStore {
             return Ok((Some(event), true));
         }
         let path = directory.join(&last.name);
-        let window = (MAX_EVENT_PAYLOAD_BYTES as u64 + 64 * 1024).min(last.bytes);
+        let window = (MAX_RECORD_LINE_BYTES as u64).min(last.bytes);
         let mut file = tokio::fs::File::open(&path).await?;
         file.seek(std::io::SeekFrom::End(-(window as i64))).await?;
         let mut raw = Vec::with_capacity(window as usize);

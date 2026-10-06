@@ -209,7 +209,9 @@ impl DekManager {
         }
     }
 
-    /// The active or retained key `kid`, for repacking a sealed segment.
+    /// The active or retained key `kid` (segment builds take
+    /// [`Self::keys_snapshot`]).
+    #[cfg(test)]
     pub(crate) async fn key_for(
         &self,
         conversation_id: &str,
@@ -525,6 +527,75 @@ mod tests {
                 .code(),
             "CONFLICT"
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_fallback_and_snapshot_keys() {
+        let fixture = Fixture::new();
+        assert!(fixture
+            .deks
+            .fresh_key(&fixture.conversation)
+            .await
+            .unwrap()
+            .is_none());
+        let rid = fixture
+            .recipients
+            .register_device("dev_a", &recipient(1))
+            .unwrap();
+        fixture.recipients.set_mode(HistoryEncryption::E2e).unwrap();
+        // A fresh key is recorded but never becomes the active one.
+        let (fresh, _) = fixture
+            .deks
+            .fresh_key(&fixture.conversation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fixture
+            .deks
+            .keys_snapshot(&fixture.conversation)
+            .await
+            .is_empty());
+        let (active, _) = fixture.current().await;
+        assert_ne!(active, fresh);
+        let kids: Vec<String> = fixture
+            .keyrings
+            .keys(&fixture.conversation)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.kid)
+            .collect();
+        assert_eq!(kids, vec![fresh.clone(), active.clone()]);
+        fixture.deks.rotate(&fixture.conversation).await;
+        let (second, _) = fixture.current().await;
+        let snapshot = fixture.deks.keys_snapshot(&fixture.conversation).await;
+        assert!(snapshot.contains_key(&active) && snapshot.contains_key(&second));
+        // Without recipients the newest key in memory stays usable.
+        fixture.recipients.revoke(&rid).unwrap();
+        assert!(fixture
+            .deks
+            .current_key(&fixture.conversation)
+            .await
+            .is_err());
+        assert!(fixture.deks.fresh_key(&fixture.conversation).await.is_err());
+        assert_eq!(
+            fixture
+                .deks
+                .fallback_key(&fixture.conversation)
+                .await
+                .unwrap()
+                .0,
+            second
+        );
+        fixture
+            .deks
+            .release_sealed(&fixture.conversation, std::slice::from_ref(&second))
+            .await;
+        assert!(fixture
+            .deks
+            .fallback_key(&fixture.conversation)
+            .await
+            .is_none());
     }
 
     #[tokio::test]

@@ -10,9 +10,8 @@
 //!   behind `requestFingerprint` / `textMac`.
 //!
 //! The daemon only ever holds recipient public keys. The conversation store
-//! wiring (encrypting appends with [`DekManager::current_key`]) is a later
-//! step, so parts of this module are not called outside tests yet.
-#![allow(dead_code)]
+//! (`crate::conversation`) seals records with [`DekManager::current_key`],
+//! repacks sealed segments with the keys it still holds and releases them.
 
 mod dek;
 mod fingerprint;
