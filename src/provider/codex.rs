@@ -1058,8 +1058,6 @@ fn is_codex_tool_item(item_type: &str) -> bool {
             | "dynamic_tool_call"
             | "webSearch"
             | "web_search"
-            | "imageView"
-            | "image_view"
             | "collabAgentToolCall"
             | "collab_agent_tool_call"
             | "imageGeneration"
@@ -1583,6 +1581,15 @@ mod tests {
     #[test]
     fn user_message_item_is_not_emitted_as_a_tool() {
         let params = json!({ "item": { "type": "userMessage", "content": [] } });
+        assert!(codex_item_event("item/started", &params, "turn-1").is_none());
+        assert!(codex_item_event("item/completed", &params, "turn-1").is_none());
+    }
+
+    #[test]
+    fn image_view_item_is_not_emitted_as_a_tool() {
+        let params = json!({
+            "item": { "type": "imageView", "path": "/tmp/image.png" }
+        });
         assert!(codex_item_event("item/started", &params, "turn-1").is_none());
         assert!(codex_item_event("item/completed", &params, "turn-1").is_none());
     }
