@@ -16,6 +16,7 @@ mod devices;
 mod error;
 mod event;
 mod external_command;
+mod history_crypto;
 mod kanban_store;
 mod listen_addrs;
 mod local_terminal;

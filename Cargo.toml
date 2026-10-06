@@ -45,6 +45,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# History crypto v1: X-Wing (ML-KEM-768 + X25519, draft-06) device keys.
+x-wing = { version = "0.1.1", features = ["getrandom", "zeroize"] }
 ed25519-dalek = "2"
 russh-sftp = "3.0.1"
 suppaftp = { version = "12", features = ["tokio-rustls-ring"] }
