@@ -3319,7 +3319,10 @@ async fn dispatch_command_inner(
                     owner_id,
                     &request.conversation_id,
                     Some(command.id.clone()),
-                    request.prompt,
+                    // An e2e client returns the decrypted `retryRequest` as
+                    // `text` + `content`; `prompt` is the older text-only form.
+                    request.prompt.or_else(|| request.text.clone()),
+                    request.text.is_some().then_some(request.content),
                 )
                 .await?;
             Ok(

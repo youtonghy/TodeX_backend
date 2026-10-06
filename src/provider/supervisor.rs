@@ -71,6 +71,78 @@ fn saved_request(
     Ok(snapshot)
 }
 
+/// The user `message.created` payload. While the request snapshot is sealed
+/// the backend cannot read the request back, so the encrypted payload also
+/// carries it as `retryRequest` — the trimmed `text` and the original
+/// `content` items — for a client to decrypt and return with
+/// `conversation.retry` (`docs/history-encryption.md` §7). Summaries drop it.
+fn user_message_payload(
+    turn_id: &str,
+    client_request_id: Option<&str>,
+    request_fingerprint: &str,
+    user_text: &str,
+    sealed_request: Option<&ConversationPrompt>,
+) -> Value {
+    let mut payload = json!({
+        "turnId": turn_id,
+        "clientRequestId": client_request_id,
+        "requestFingerprint": request_fingerprint,
+        "role": "user",
+        "content": user_text,
+    });
+    if let Some(request) = sealed_request {
+        payload[crate::conversation::RETRY_REQUEST_KEY] = json!({
+            "text": request.text.trim(),
+            "content": request.content,
+        });
+    }
+    payload
+}
+
+/// The content a retry of a sealed request runs with. The snapshot keeps
+/// only the file references plus a `contentMac` over the inline items
+/// (`text` / `image`, see [`seal_request_snapshot`]), so the client returns
+/// the original items from the decrypted `retryRequest`: their inline part
+/// must match `contentMac` and their file part the kept references.
+/// Without them only a request that had no inline items can be retried.
+fn retry_content_checked(
+    saved: &Value,
+    supplied: Option<Vec<PromptContentRef>>,
+    key: &FingerprintKey,
+) -> Result<Vec<PromptContentRef>, AppError> {
+    let kept = saved.get("content").cloned().unwrap_or_else(|| json!([]));
+    let content_mac = saved.get("contentMac").and_then(Value::as_str);
+    let Some(content) = supplied else {
+        if content_mac.is_some() {
+            return Err(AppError::Conflict(
+                "This request had inline text or images; retry needs the original content items from the decrypted message."
+                    .to_owned(),
+            ));
+        }
+        return Ok(serde_json::from_value(kept)?);
+    };
+    let items = match serde_json::to_value(&content)? {
+        Value::Array(items) => items,
+        _ => Vec::new(),
+    };
+    let (inline, files): (Vec<Value>, Vec<Value>) = items.into_iter().partition(|item| {
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("text" | "image")
+        )
+    });
+    let inline_matches = match content_mac {
+        Some(mac) => key.mac(&Value::Array(inline).to_string()) == mac,
+        None => inline.is_empty(),
+    };
+    if !inline_matches || Value::Array(files) != kept {
+        return Err(AppError::Conflict(
+            "content is not the content of the request being retried".to_owned(),
+        ));
+    }
+    Ok(content)
+}
+
 fn retry_prompt_required() -> AppError {
     AppError::InvalidRequest(
         "conversation.retry needs `prompt` (the decrypted text of the request) while history is end-to-end encrypted".to_owned(),
@@ -1104,6 +1176,7 @@ impl ConversationSupervisor {
         conversation_id: &str,
         client_request_id: Option<String>,
         prompt_text: Option<String>,
+        retry_content: Option<Vec<PromptContentRef>>,
     ) -> Result<String, AppError> {
         self.get_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
@@ -1149,6 +1222,7 @@ impl ConversationSupervisor {
                 ));
             }
             prompt.text = text;
+            prompt.content = retry_content_checked(saved, retry_content, &key)?;
         } else if encrypted {
             let text = prompt_text.ok_or_else(retry_prompt_required)?;
             if text.trim() != prompt.text.trim() {
@@ -1846,14 +1920,14 @@ impl ConversationSupervisor {
             }
         };
 
-        let saved_request = self.store.history_encrypted().and_then(|encrypted| {
-            saved_request(
-                &request_snapshot,
-                fingerprint_key.as_deref().filter(|_| encrypted),
-            )
-        });
-        let saved_request = match saved_request {
-            Ok(saved_request) => saved_request,
+        let sealed_key = self
+            .store
+            .history_encrypted()
+            .map(|encrypted| fingerprint_key.as_deref().filter(|_| encrypted));
+        let saved_request =
+            sealed_key.and_then(|key| Ok((saved_request(&request_snapshot, key)?, key.is_some())));
+        let (saved_request, request_sealed) = match saved_request {
+            Ok(saved) => saved,
             Err(error) => {
                 self.active.remove(conversation_id);
                 return Err(error);
@@ -1869,7 +1943,13 @@ impl ConversationSupervisor {
             .emit(
                 conversation_id,
                 "message.created",
-                json!({ "turnId": turn_id, "clientRequestId": client_request_id, "requestFingerprint": request_fingerprint, "role": "user", "content": user_text }),
+                user_message_payload(
+                    &turn_id,
+                    client_request_id.as_deref(),
+                    &request_fingerprint,
+                    &user_text,
+                    request_sealed.then_some(&request_snapshot),
+                ),
             )
             .await
         {
@@ -3116,13 +3196,64 @@ mod tests {
         // Retry needs the decrypted prompt, and only the original one.
         assert!(matches!(
             supervisor
-                .retry_owned("local", &manifest.id, None, None)
+                .retry_owned("local", &manifest.id, None, None, None)
                 .await,
             Err(AppError::InvalidRequest(_))
         ));
         assert!(matches!(
             supervisor
-                .retry_owned("local", &manifest.id, None, Some("other".to_owned()))
+                .retry_owned("local", &manifest.id, None, Some("other".to_owned()), None)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        // The request had inline content: the text alone no longer passes,
+        // the client returns the `retryRequest` it decrypts from the
+        // user message (the summary leaves it out).
+        assert!(matches!(
+            supervisor
+                .retry_owned(
+                    "local",
+                    &manifest.id,
+                    None,
+                    Some("PROMPT-SECRET".to_owned()),
+                    None
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let device_keys =
+            crate::conversation::e2e_support::client_keys(&keys, &manifest.id, 1).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let user_message = history
+            .iter()
+            .find(|event| event.event_type == "message.created")
+            .unwrap();
+        let view = |summary| {
+            crate::conversation::e2e_support::client_view(
+                &device_keys,
+                std::slice::from_ref(user_message),
+                &serde_json::Map::new(),
+                summary,
+            )
+            .remove(0)
+            .payload
+        };
+        assert!(view(true).get("retryRequest").is_none());
+        let retry_request = view(false)["retryRequest"].clone();
+        assert_eq!(retry_request["text"], "PROMPT-SECRET");
+        let original: Vec<PromptContentRef> =
+            serde_json::from_value(retry_request["content"].clone()).unwrap();
+        assert!(matches!(
+            supervisor
+                .retry_owned(
+                    "local",
+                    &manifest.id,
+                    None,
+                    Some("PROMPT-SECRET".to_owned()),
+                    Some(vec![PromptContentRef::Text {
+                        text: "OTHER".to_owned()
+                    }])
+                )
                 .await,
             Err(AppError::Conflict(_))
         ));
@@ -3131,7 +3262,8 @@ mod tests {
                 "local",
                 &manifest.id,
                 Some("retry-2".to_owned()),
-                Some("PROMPT-SECRET".to_owned()),
+                retry_request["text"].as_str().map(str::to_owned),
+                Some(original),
             )
             .await
             .unwrap();
@@ -3213,7 +3345,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             supervisor
-                .retry_owned("local", &manifest.id, None, None)
+                .retry_owned("local", &manifest.id, None, None, None)
                 .await,
             Err(AppError::Unsupported(_))
         ));
@@ -3252,7 +3384,13 @@ mod tests {
             serde_json::to_value(&request).unwrap()
         );
         supervisor
-            .retry_owned("local", &manifest.id, Some("retry-2".to_owned()), None)
+            .retry_owned(
+                "local",
+                &manifest.id,
+                Some("retry-2".to_owned()),
+                None,
+                None,
+            )
             .await
             .unwrap();
         wait_until_idle(&supervisor).await;
@@ -3275,7 +3413,7 @@ mod tests {
         fs::write(file, "changed attachment").unwrap();
         assert!(matches!(
             supervisor
-                .retry_owned("local", &manifest.id, None, None)
+                .retry_owned("local", &manifest.id, None, None, None)
                 .await,
             Err(AppError::Conflict(_))
         ));

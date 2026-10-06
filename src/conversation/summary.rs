@@ -322,10 +322,21 @@ fn stub_payload(payload: &Map<String, Value>) -> Value {
     Value::Object(stub)
 }
 
+/// Encrypted user messages keep their original request under this key for
+/// `conversation.retry` (`docs/history-encryption.md` §7).
+pub const RETRY_REQUEST_KEY: &str = "retryRequest";
+
 /// `detail=summary` replay: replace the payload of process-only events with a
 /// marker object that preserves classification identity. Returns `false` when
 /// the event is left untouched, so callers can count reduced events.
 pub fn summarize_event(event: &mut ConversationEvent) -> bool {
+    // The original request a user message carries for retries (e2e) is
+    // never shown, only returned with `conversation.retry`.
+    if let Some(payload) = event.payload.as_object_mut() {
+        if payload.remove(RETRY_REQUEST_KEY).is_some() {
+            return true;
+        }
+    }
     let Some(payload) = event.payload.as_object() else {
         return false;
     };
