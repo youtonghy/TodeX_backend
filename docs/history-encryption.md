@@ -51,8 +51,10 @@
 
 - `e2e` 模式下每个会话至多一个活动 DEK，首次加密写入时惰性生成：对所有未吊销接收方（设备 + 恢复）各封装一次，写入 `keyring.json`（fsync）后才能用于加密。
 - 轮换条件：活动分片封存、`epoch` 变化、DEK 使用超过 24 小时、daemon 重启（内存丢失即轮换）。
-- 已轮换但所在分片尚未封存的 DEK 仍留在内存，供封存时重打包；分片封存完成后清零。daemon 崩溃后丢失的 DEK 只影响该分片不能重打包压缩，内容仍可被客户端读取。
-- 会话标题：`manifest.titleEnc = {"kid","ct"}`，以该 `kid` 的 stream 2、counter 0 加密，`kid` 同样登记在 `keyring.json`；`e2e` 下 `manifest.title` 为空串。
+- 已轮换但所在分片尚未封存的 DEK 仍留在内存，供封存时重打包；分片封存完成后清零。daemon 崩溃后丢失的 DEK 只影响该分片不能重打包压缩，内容仍可被客户端读取。活动文件改名封存的同时轮换 DEK，所以一个 DEK 的记录只落在一个分片里。
+- 会话标题：`manifest.titleEnc = {"kid","ct"}`，以该 `kid` 的 stream 2、counter 0 加密，`kid` 同样登记在 `keyring.json`；`e2e` 下省略 `manifest.title`（客户端视同空串）。每次设置标题都用一个只为它生成的新 `kid`（不进入活动 DEK、用后即弃），所以 counter 0 永不在同一 `kid` 下复用。
+- 一次性 DEK：标题与迁移（§8）各自生成新 DEK，同样先对全部接收方封装并写入 keyring。
+- 无接收方：`e2e` 下若没有未吊销的接收方（或 keyring 无法写入），新 DEK 无法生成。此时新 prompt（包括追加队列的投递与 `conversation.retry`）在保存请求快照时被拒绝，返回 `CONFLICT`（「history encryption has no active recipients…」），不写任何内容；已在运行的 turn 继续用内存中最新的 DEK 加密写完。内存中没有任何 DEK（daemon 刚重启）时追加直接失败、记录错误日志，turn 以失败结束（终态事件同样写不进去时由重启恢复关闭），绝不回落为明文。
 
 ### 3.3 新设备与恢复
 
@@ -103,7 +105,19 @@ manifest.json  snapshot.json  provider-state.json  last-request.json  queue.json
 - 帧表与分片表一起从 `.idx` 读入（约每 MiB 原始数据 0.1 KB），不另行懒加载。
 - 封存精简的匹配规则：`message.delta` 需同 turn 内同 `block.id` 的后续 `message.completed`（或列在 `block.supersedes` 中）；没有 block id 的 delta（Claude Code、ACP）一律保留，因为终态记录无法按 id 对应；`tool.updated` 需同 turn 同 `toolCallId`/`block.id` 的后续 `tool.completed`/`tool.failed`，或 ACP 的 `status` 为 `completed`/`failed` 的后续 `tool.updated`（终态 update 本身保留）；`subagent.updated` 需同 `subagentId` 的后续 `subagent.completed`/`failed`/`cancelled`。终态必须在同一分片内。
 - 帧压缩级别 9：真实 64 MiB 会话封存为 4.0–5.9 MiB。
-- `requestFingerprint`/`textMac` 的 HMAC 留给密钥轨；off 模式下 `e` 原样携带已有的 `requestFingerprint`。
+
+### 4.5 实现补充（密钥轨，e2e）
+
+- 行：加密记录写 `e` + `x`，`x` 与线上 `$enc` 逐字节相同（`{v, kid, c, n, s?, f}`）；读取时还原为「信封字段 + `$enc`」，实时推送、回放与 digest 用的都是这一形式。provider payload 自带的顶层 `$enc` 键改名为 `_$enc` 保存，不会被误认为密文。加密行的 base64 使单行最多约为 payload 的 3 倍，尾部读取窗口按此放宽。
+- 内容帧分三组，同一帧不混组：明文（off 或尚未迁移）、`Sealed(kid)`（封存时 DEK 仍在内存：打开事件密文、精简、重新分帧后以 stream 3/4 加密）、`Passthrough`（DEK 已不在内存，或是 fork 的拷贝：帧条目就是事件级 `$enc` 对象，完整流的条目保留 `s` 与 `f`，摘要流的条目在有 `s` 时去掉 `f`）。帧头第 7 字节为标志位，bit 0 表示 passthrough；`.idx` 帧项相应带 `"x": true`。信封帧永远是明文组。
+- 帧 AEAD counter = `段号 << 32 | 帧序号`（帧序号为本分片内同一 `(kid, stream)` 的第几帧）。DEK 通常只覆盖一个分片；段号在高位保证即使同一 `kid` 的帧出现在多个分片里 nonce 也不重复。线上 `frames[id].counter` 直接给出该值。
+- 同一 `Sealed` 段的摘要帧与完整帧覆盖完全相同的记录（一起切帧），因此 `fr.i` 对两者通用。
+- `Sealed` 帧的 CRC-32 覆盖存储的密文（daemon 不能解密），明文与 passthrough 帧覆盖原始数据。
+- 精简只看明文：DEK 在内存时按解密后的 payload 判断，passthrough 记录从不精简，只作为终态参与匹配；被精简记录的 `journal.compacted` 标记进入该记录所在的组（`Sealed` 时同样加密）。
+- 封存提交后，被重打包的 `kid` 调用 `release_sealed` 从内存清零。
+- 分片打捞（`.seg` 或 `.idx` 损坏时重建该分片，见 [conversation-runtime.md](conversation-runtime.md)）从不加密：明文与 passthrough 记录照旧重建，两条帧都通过 CRC 且整段信封都可读的 `Sealed` 段原样拷贝（保留 `kid`、帧序号与 counter），其余记录为 `journal.recordLost`。丢失 `.idx` 的分片因此不会丢失加密内容。
+- 迁移改写既有 `.seg`（§8）时以替换协议提交：新文件先改名为 `events.NNNNNN.idx.next` / `.seg.next` 并 fsync，再依次替换 `.idx`、`.seg`。恢复时 `.idx.next` 仍在说明旧文件完好，删除两个 `.next`；否则新索引已就位，把 `.seg.next` 改名补上。
+- 去重字段（§5.2）：`message.created` 的 `requestFingerprint` 为 `HMAC(fingerprintKey, sha256hex(请求 JSON))`（off 模式写的是 sha256hex 本身，比较时两者都接受）；`control.requested` 的 `requestFingerprint` 为 `HMAC(fingerprintKey, control 对象 JSON)`；带文本的 control 另有 `control.textMac = HMAC(fingerprintKey, text)`。这些在加密前写入 payload，因此信封与密文中的值一致。迁移明文记录时同样换算。
 
 ## 5. 线上格式
 
@@ -116,10 +130,10 @@ manifest.json  snapshot.json  provider-state.json  last-request.json  queue.json
 e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容全部在密文中：
 
 - 通用标识：`turnId`、`clientRequestId`、`requestId`、`permissionId`、`runtimeId`、`operationId`、`itemId`、`messageId`、`toolCallId`、`subagentId`。
-- `role`（`message.*`）、`status`（`provider.runtime`、`turn.*`、`subagent.*`）、`scope`（`permission.*`）。
+- `role`（`message.*`）、`status`（`provider.runtime`、`turn.*`、`subagent.*`）、`scope`（`permission.*`、`tool.awaitingApproval`，决定会话状态是否变化）、`code`（`control.*` 的结果码，不含 message 与 result）。
 - `block`：仅 `{category, id, turnId}`。
 - `control`：仅 `{action, itemId}`；文本类 control 另带 `textMac`。
-- `requestFingerprint`、`textMac`：`HMAC-SHA256(fingerprintKey, 原文)`，`fingerprintKey` 是后端 `history/fingerprint.key`（32 字节，0600）。后端去重只比较 MAC。
+- `requestFingerprint`、`textMac`：`HMAC-SHA256(fingerprintKey, …)`（具体输入见 §4.5），`fingerprintKey` 是后端 `history/fingerprint.key`（32 字节，0600）。后端去重只比较 MAC。
 - `usage` 数值对象（客户端用量统计）、`stopReason`。
 
 ### 5.3 密文字段
@@ -135,9 +149,9 @@ e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容�
 }
 ```
 
-- 事件级（活动分片与实时推送）：`s`/`f` 为 base64url；摘要与完整相同则省略 `s`。`detail=summary` 下发 `s`（缺省时发 `f`），`detail=full` 下发 `f`。
-- 帧级（封存分片）：事件只带 `fr`；分页响应与订阅回放消息顶层附 `frames: { "<帧 id>": {"kid","stream","counter","c","ct"} }`，同一页内去重。帧明文是 payload 数组，`i` 为下标。
-- `c`/`n` 是 AAD 用的原会话与 sequence：fork 复制密文时保留来源值，新会话 sequence 可不同。
+- 事件级（活动分片、passthrough 帧与实时推送）：`s`/`f` 为 base64url；摘要与完整相同则省略 `s`。`detail=summary` 下发 `s`（缺省时发 `f`），`detail=full` 下发 `f`，同一事件不会同时带两者。实时推送按 `full` 下发，与写入 journal 的密文逐字节相同。摘要在写入时由后端用明文算出，回放从不对密文运行摘要。
+- 帧级（`Sealed` 帧）：事件 `$enc` 为 `{v, kid, c, n, fr: {s, f, i}}`（`kid` 为帧的 `kid`，`c`/`n` 为本会话与该事件 sequence），`s`/`f` 是摘要帧与完整帧的 id（不透明字符串，`<分片 id>-<偏移>`，分片重建后不复用）。HTTP 分页响应顶层附 `frames: { "<帧 id>": {"kid","stream","counter","c","ct"} }`，只含所请求 detail 的那一种帧（summary 为 stream 3，full 为 stream 4），同一页内去重；帧在页字节预算中按 base64 长度计一次。WebSocket 每条 `conversation.event` 单独解密，所以凡引用帧的回放消息顶层都附带它所引用的帧（同一帧会在多条消息里重复出现）；大量封存历史应走 HTTP 分页。帧明文是 raw DEFLATE 压缩的 payload JSON 数组，`i` 为下标。
+- `c`/`n` 是 AAD 用的原会话与 sequence：fork 复制密文时保留来源值，新会话 sequence 可不同。fork 复制的帧级记录保留 `fr`，被引用的帧以线上形式存放在 fork 目录的 `frames/<帧 id>.json`，回放时同样放进 `frames`；fork 同时复制来源的 `keyring.json`，客户端用 fork 的会话 id 取封装。
 - 解密后的 payload 整体替换 `payload`（其中已含信封字段）。无法解密（无 DEK、授权未到、校验失败）时 `payload` = 信封字段 + `{"detailLocked": true}`，sequence 照常推进。
 
 ### 5.4 能力协商
@@ -165,10 +179,13 @@ e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容�
 | `history.keys.wraps` | `{conversationId, kids[≤500], rid?}`（默认调用方 `rid`） | `{wraps: {kid: WrappedKey}}` |
 | `history.grant.fulfill` | `{grantId?, rid, wraps:[{conversationId, kid, wrapped}]（≤500）, complete?}`（最后一批 `complete: true` 结束授权；已有封装跳过） | `{added}` |
 
-`conversation.retry` 在 e2e 下必须携带 `prompt`（客户端解密后的原文）。
+`conversation.retry` 在 e2e 下必须携带 `prompt`（客户端解密后的原请求文本），否则 `INVALID_REQUEST`。e2e 下 `last-request.json` 不含提示原文：`request.text` 为空串、内联 `text`/`image` 内容项被移除，只保留 `textMac`、`contentMac`（内联项 JSON 的 HMAC）与文件引用；`prompt` 的 HMAC 必须等于 `textMac`（快照是明文时必须等于原文），否则 `CONFLICT`。重试只带回文件类附件，内联文本与图片不会重发。off 模式下快照仍含原文，`prompt` 被忽略。
+
+control 幂等（`conversation.control` 以 `requestId` 去重）：加密记录只保留 control 对象的 MAC（`requestFingerprint`）与 `turnId`，重复请求按 MAC 判定是否为同一输入。已完成的重复请求返回本进程内存中记住的结果（最多 256 条，只在内存，不落盘）；daemon 重启后返回 `null`，结果仍在客户端可解密的 `control.completed` 事件中。被拒绝的重复请求返回 `Control was rejected (<code>).`（信封中的 `code`），原始错误信息只在密文里。
 
 ## 8. 迁移
 
 - 惰性：启动不批量改写。空闲时后台按体积从大到小把 v2 分片合并为 64 MiB 的 `.seg`；每完成一个分片提交一次，可中断续跑。
-- 开启 e2e 后，后台把已有分片逐个以新 DEK 加密重打包（此期间后端短暂看到这部分明文），完成后清零 DEK。
-- 原文件硬链接到 `journal-v2-backup/`，7 天后清理；开启加密时提示 Time Machine / APFS 快照可能保留旧明文。
+- 开启 e2e 后，后台把已有分片逐个以新 DEK 加密重打包（此期间后端短暂看到这部分明文），完成后清零 DEK。具体顺序（只处理空闲会话，`history.encryption.enable` 会立即触发一次）：活动文件含明文记录时先封存它，封存转换把明文记录以一次性 DEK 加密进 `Sealed` 帧；仍有明文内容帧的既有 `.seg` 逐个以新 DEK 重建并按 §4.5 的替换协议提交；最后加密标题、去掉 `last-request.json` 的提示原文，并在 manifest 写入 `historyEncryptedAt`。每一步单独提交，崩溃后从未完成处继续。之后若在 off 模式下写入明文，`historyEncryptedAt` 被清除，下次开启时再迁移。e2e 下新建且起始为空的会话直接带 `historyEncryptedAt`。
+- 原文件硬链接到 `journal-v2-backup/`，7 天后清理；开启加密时提示 Time Machine / APFS 快照可能保留旧明文。e2e 迁移本身不再生成新的明文备份；开启时 daemon 记录一条警告，说明 `journal-v2-backup/`（7 天内）、`events.corrupt.*` 打捞副本与 Time Machine / APFS 快照仍可能保留旧明文，客户端负责界面提示。
+- 不在本规格保护范围内的文件不迁移：`queue.json`（投递后删除）、`provider-state.json`、provider 自己的 transcript。

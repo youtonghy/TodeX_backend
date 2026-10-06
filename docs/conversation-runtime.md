@@ -221,6 +221,34 @@ are kept (the summary stream is regenerated), the rest become
 `events.corrupt.<ts>.seg`/`.idx`. No repair collapses the journal into one
 file.
 
+End-to-end encrypted history (`history_encryption = "e2e"`,
+`docs/history-encryption.md` §3–§5, §8): every append is sealed under the
+conversation's current DEK at commit time — coalesced stream text when its
+window is journalled — after the payload's deduplication fields are replaced
+by MACs. The journal line keeps only the envelope `e` in plaintext and stores
+the ciphertext as `x`; the event the store returns, folds into the digest
+and publishes on the hub is the same stored form (envelope plus `$enc`), so
+live delivery carries the bytes on disk and the digest needs nothing but
+envelope fields. A record's summary ciphertext is computed from the
+plaintext when it is written; replays never summarize ciphertext and only
+drop the ciphertext the requested detail does not use. Rotating the active
+file also rotates the DEK; the seal converter repacks the sealed file's
+records into encrypted frames with the DEKs still in memory (decrypting,
+slimming and re-framing them), then releases those DEKs; ciphertext whose
+DEK is gone (the daemon restarted) is framed as it is. Sealed frames reach
+clients as ciphertext read straight from the `.seg` (`frames` on HTTP pages
+and on each socket replay message that needs one). With no recipient left,
+new prompts are refused with `CONFLICT` before their turn starts while a
+running turn keeps the newest DEK in memory; without one the append fails
+instead of writing plaintext. The `last-request.json` of an encrypted
+conversation holds no prompt text (`conversation.retry` then needs the
+client's decrypted `prompt`), titles are stored as `titleEnc`, and control
+retries compare MACs (completed results are remembered in memory only). The
+maintenance task migrates existing plaintext of idle conversations when
+encryption is on, one committed segment at a time, and marks the manifest
+`historyEncryptedAt`. Deleting a conversation removes its keyring with its
+directory and forgets its DEKs.
+
 History has no size limit: every append lands, so a running turn can always
 finish, and forks can carry histories of any size. The only gate is on new
 prompts: when the filesystem holding the data directory has less than 1 GiB

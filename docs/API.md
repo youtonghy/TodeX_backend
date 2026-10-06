@@ -232,7 +232,16 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 
 `history.grant.fulfill`：带 `grantId` 时目标 `rid` 必须是该待办授权的接收方（否则 `UNAUTHORIZED`），授权已结束为 `CONFLICT`；不带 `grantId`（恢复密钥导入）时目标只能是调用方自己的 `rid`。每个 `wrapped.rid` 必须等于 `rid`（`INVALID_REQUEST`），每个 `kid` 必须已存在（`NOT_FOUND`），会话须属于调用方；全部校验通过后才写入。目标已有封装的 `kid` 跳过，因此分批重试安全。最后一批带 `complete: true` 把授权标为 `fulfilled`。
 
-`e2e` 下客户端须声明能解密历史：`/v2/ws` 握手 query 与 `GET /v2/conversations/{id}/events` query 带 `historyEncryption=1`（握手 query 受设备签名覆盖）。未声明的 `conversation.subscribe` 与 HTTP 回放返回 `CLIENT_UPGRADE_REQUIRED`（HTTP 426）。`/v2/version` 的 `historyEncryption` 字段给出后端支持的版本；旧后端对 `history.*` 返回 `UNSUPPORTED`。
+`e2e` 下客户端须声明能解密历史：`/v2/ws` 握手 query 与 `GET /v2/conversations/{id}/events` query 带 `historyEncryption=1`（握手 query 受设备签名覆盖）。未声明的 `conversation.subscribe` 与 HTTP 回放返回 `CLIENT_UPGRADE_REQUIRED`（HTTP 426）。`/v2/version` 的 `historyEncryption` 字段给出后端支持的版本；旧后端对 `history.*` 返回 `UNSUPPORTED`。`history.encryption.enable` 同时触发已有明文历史的后台加密迁移。
+
+加密历史的线上形状（细节见 [history-encryption.md](history-encryption.md) §5）：
+
+- 事件 `payload` 只剩信封字段（`turnId`、`role`、`status` 等）加 `$enc`。活动分片与实时事件为事件级 `{ "v": 1, "kid", "c", "n", "s"?, "f"? }`：`detail=summary` 带 `s`（无单独摘要时带 `f`），`detail=full`、实时事件与缺口/滞后补放带 `f`，不会同时出现。封存分片为帧级 `{ "v": 1, "kid", "c", "n", "fr": { "s", "f", "i" } }`。
+- HTTP 回放页顶层附 `frames: { "<帧 id>": { "kid", "stream", "counter", "c", "ct" } }`（只含所请求 detail 的帧，页内去重）；WebSocket 每条引用帧的 `conversation.event` 消息顶层各自附带它需要的 `frames`。
+- 会话 manifest（列表、详情、创建与更新的结果）在加密时不含 `title`，改为 `titleEnc: { "kid", "ct" }`；fork 不继承加密标题（可在 `conversation.fork` 中另给标题）。迁移完成或加密下新建的会话带 `historyEncryptedAt`。
+- `conversation.retry` payload 为 `{ "conversationId", "prompt"? }`：加密时必须带 `prompt`（解密后的原请求文本），缺失为 `INVALID_REQUEST`，与原请求不符为 `CONFLICT`；明文会话忽略该字段。
+- 加密时 `conversation.control` 以同一 `requestId` 重试：同一 control 返回原结果（daemon 重启后为 `null`），被拒绝的返回 `Control was rejected (<code>).`。
+- 没有未吊销接收方时，新 prompt（含队列投递与重试）返回 `CONFLICT`，进行中的 turn 不受影响。
 
 ### Pi 扩展与常驻 runtime
 
