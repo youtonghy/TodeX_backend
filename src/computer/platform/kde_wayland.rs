@@ -93,6 +93,10 @@ fn bus() -> Result<Bus, String> {
     let connection = zbus::blocking::connection::Builder::session()
         .and_then(|builder| builder.method_timeout(CALL_TIMEOUT).build())
         .map_err(|error| format!("cannot connect to the session bus: {error}"))?;
+    // The registry only takes app ids that have a `.desktop` entry.
+    if let Err(error) = ensure_identity() {
+        eprintln!("todex-agentd: cannot install TodeX's app identity: {error}");
+    }
     register_app_id(&connection);
     *bus = Some(connection.clone());
     Ok(connection)
