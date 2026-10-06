@@ -45,7 +45,7 @@ pub(crate) fn open_app(identifier: &str) -> Result<(), String> {
     Err(format!("cannot open {identifier} on this platform"))
 }
 
-pub(crate) fn activate(pid: u32) -> Result<(), String> {
+pub(crate) fn activate(pid: u32, _title: Option<&str>) -> Result<(), String> {
     Err(format!("cannot activate process {pid} on this platform"))
 }
 

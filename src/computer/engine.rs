@@ -492,7 +492,7 @@ impl Engine {
                     }
                     _ => {
                         if let Some(pid) = pid {
-                            platform::activate(pid).map_err(ComputerError::platform)?;
+                            platform::activate(pid, None).map_err(ComputerError::platform)?;
                         }
                         self.input()?
                             .keyboard()
@@ -524,13 +524,14 @@ impl Engine {
                     let _ = provider
                         .as_ref()
                         .map(|provider| provider.activate(&window.element));
-                    platform::activate(window.app.pid).map_err(ComputerError::platform)?;
+                    platform::activate(window.app.pid, Some(&window.title))
+                        .map_err(ComputerError::platform)?;
                 } else {
                     let identifier = args["app"].as_str().unwrap_or_default();
                     let app = platform::running_app(identifier).ok_or_else(|| {
                         ComputerError::invalid(format!("{identifier} is not running"))
                     })?;
-                    platform::activate(app.pid).map_err(ComputerError::platform)?;
+                    platform::activate(app.pid, None).map_err(ComputerError::platform)?;
                 }
                 "background"
             }
@@ -678,7 +679,9 @@ impl Engine {
             match platform::type_into_focused(pid, text, confirmed) {
                 Typed::Inserted => return Ok("background"),
                 Typed::Secure => return Err(sensitive()),
-                Typed::Unsupported => platform::activate(pid).map_err(ComputerError::platform)?,
+                Typed::Unsupported => {
+                    platform::activate(pid, None).map_err(ComputerError::platform)?
+                }
             }
         }
         self.input()?

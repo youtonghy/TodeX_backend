@@ -212,7 +212,7 @@ pub(crate) fn installed_app(identifier: &str) -> Option<Target> {
 
 pub(crate) fn open_app(identifier: &str) -> Result<(), String> {
     if let Some(app) = running_app(identifier) {
-        return activate(app.pid);
+        return activate(app.pid, None);
     }
     // The same resolution `installed_app` checked against the policy.
     let path =
@@ -246,10 +246,16 @@ pub(crate) fn open_app(identifier: &str) -> Result<(), String> {
 /// this attaches to the foreground thread's input once (the documented
 /// workaround). It can still be refused, e.g. while a full-screen app or
 /// an elevated window has the foreground; the error says so.
-pub(crate) fn activate(pid: u32) -> Result<(), String> {
-    let window = top_level_windows()
+pub(crate) fn activate(pid: u32, title: Option<&str>) -> Result<(), String> {
+    let windows: Vec<TopLevel> = top_level_windows()
         .into_iter()
-        .find(|window| window.pid == pid)
+        .filter(|window| window.pid == pid)
+        .collect();
+    // The window titled `title`, else the process's front-most.
+    let window = windows
+        .iter()
+        .find(|window| Some(window.title.as_str()) == title)
+        .or_else(|| windows.first())
         .ok_or_else(|| format!("process {pid} has no visible window"))?;
     let hwnd = window.hwnd;
     // SAFETY: plain window calls on a handle that may have died meanwhile,
@@ -285,7 +291,7 @@ pub(crate) fn activate(pid: u32) -> Result<(), String> {
         if window.title.is_empty() {
             format!("process {pid}")
         } else {
-            window.title
+            window.title.clone()
         }
     ))
 }
@@ -489,7 +495,7 @@ fn with_automation<T>(work: impl FnOnce(&IUIAutomation) -> T) -> Option<T> {
 /// receive the text is a password field and the user has not confirmed.
 /// Otherwise the engine types with `SendInput` ([`Typed::Unsupported`]).
 pub(crate) fn type_into_focused(pid: u32, _text: &str, confirmed: bool) -> Typed {
-    if confirmed || activate(pid).is_err() {
+    if confirmed || activate(pid, None).is_err() {
         // A failed activation surfaces from the engine's own attempt.
         return Typed::Unsupported;
     }

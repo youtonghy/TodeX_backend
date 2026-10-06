@@ -280,7 +280,7 @@ pub(crate) fn installed_app(identifier: &str) -> Option<Target> {
 
 pub(crate) fn open_app(identifier: &str) -> Result<(), String> {
     if let Some(app) = running_app(identifier) {
-        return activate(app.pid);
+        return activate(app.pid, None);
     }
     // The same resolution `installed_app` checked against the policy.
     match resolve_launch(identifier).ok_or_else(|| format!("no app named {identifier}"))? {
@@ -314,15 +314,22 @@ fn window_pids_top_down() -> Vec<u32> {
         .collect()
 }
 
-/// Raises and focuses `pid`'s top-most window through the window manager.
-pub(crate) fn activate(pid: u32) -> Result<(), String> {
+/// Raises and focuses `pid`'s window titled `title` (else its top-most)
+/// through the window manager.
+pub(crate) fn activate(pid: u32, title: Option<&str>) -> Result<(), String> {
     if kde_wayland_session() {
-        return kde_wayland::activate(pid);
+        return kde_wayland::activate(pid, title);
     }
-    let window = client_windows_top_down()
+    let windows: Vec<Window> = client_windows_top_down()
         .map_err(|error| format!("cannot list windows: {error}"))?
         .into_iter()
-        .find(|window| window_pid(*window) == Some(pid))
+        .filter(|window| window_pid(*window) == Some(pid))
+        .collect();
+    let window = windows
+        .iter()
+        .copied()
+        .find(|window| title.is_some() && window_title(*window).as_deref() == title)
+        .or_else(|| windows.first().copied())
         .ok_or_else(|| format!("process {pid} has no window"))?;
     with_x11(|conn, root| {
         let active = atom(conn, b"_NET_ACTIVE_WINDOW")?;
@@ -556,6 +563,24 @@ fn cardinals(conn: &RustConnection, window: Window, property: &[u8]) -> XResult<
         .value32()
         .map(|values| values.collect())
         .unwrap_or_default())
+}
+
+/// `_NET_WM_NAME`, else the legacy `WM_NAME`.
+fn window_title(window: Window) -> Option<String> {
+    with_x11(|conn, _| {
+        for property in [&b"_NET_WM_NAME"[..], b"WM_NAME"] {
+            let property = atom(conn, property)?;
+            let reply = conn
+                .get_property(false, window, property, AtomEnum::ANY, 0, 1 << 12)?
+                .reply()?;
+            if !reply.value.is_empty() {
+                return Ok(Some(String::from_utf8_lossy(&reply.value).into_owned()));
+            }
+        }
+        Ok(None)
+    })
+    .ok()
+    .flatten()
 }
 
 /// Managed windows, top-most first.

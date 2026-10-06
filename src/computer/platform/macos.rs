@@ -290,7 +290,7 @@ pub(crate) fn installed_app(identifier: &str) -> Option<Target> {
 
 pub(crate) fn open_app(identifier: &str) -> Result<(), String> {
     if let Some(app) = running_app(identifier) {
-        return activate(app.pid);
+        return activate(app.pid, None);
     }
     let by_id = identifier.contains('.') && !identifier.ends_with(".app");
     let status = Command::new("open")
@@ -303,7 +303,9 @@ pub(crate) fn open_app(identifier: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn activate(pid: u32) -> Result<(), String> {
+/// Brings the app forward; the window itself was raised through AX
+/// (`AXRaise`), so `_title` is not needed here.
+pub(crate) fn activate(pid: u32, _title: Option<&str>) -> Result<(), String> {
     let app = i32::try_from(pid)
         .ok()
         .and_then(NSRunningApplication::runningApplicationWithProcessIdentifier)

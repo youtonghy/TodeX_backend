@@ -459,12 +459,14 @@ const screens = workspace.screens.map((s) => ({
 return { windows: windows, screens: screens };
 "#;
 
-/// Raises and focuses the top-most window of `input.pid`.
+/// Raises and focuses `input.pid`'s window captioned `input.title`, else
+/// its top-most.
 const ACTIVATE_SCRIPT: &str = r#"
 const mine = workspace.stackingOrder.filter((w) => w && !w.deleted && w.pid === input.pid
     && (w.normalWindow || w.dialog));
 if (mine.length === 0) return false;
-const w = mine[mine.length - 1];
+const titled = input.title === null ? [] : mine.filter((w) => w.caption === input.title);
+const w = titled.length > 0 ? titled[titled.length - 1] : mine[mine.length - 1];
 if (w.minimized) w.minimized = false;
 workspace.activeWindow = w;
 workspace.raiseWindow(w);
@@ -641,9 +643,9 @@ pub(super) fn displays() -> Vec<Display> {
     }
 }
 
-/// Raises and focuses `pid`'s top-most window.
-pub(super) fn activate(pid: u32) -> Result<(), String> {
-    let activated = run_script(ACTIVATE_SCRIPT, &json!({ "pid": pid }))?;
+/// Raises and focuses `pid`'s window titled `title`, else its top-most.
+pub(super) fn activate(pid: u32, title: Option<&str>) -> Result<(), String> {
+    let activated = run_script(ACTIVATE_SCRIPT, &json!({ "pid": pid, "title": title }))?;
     if activated != Json::Bool(true) {
         return Err(format!("process {pid} has no window"));
     }
@@ -1344,7 +1346,7 @@ pub(super) fn paste_text(pid: u32, app_exe: &str, text: &str) -> Result<bool, St
         "setClipboardContents",
         &(text,),
     )?;
-    let pasted = activate(pid).and_then(|()| {
+    let pasted = activate(pid, None).and_then(|()| {
         with_remote(|bus, session| {
             session.key(bus, &Key::Ctrl, true)?;
             let result = session
