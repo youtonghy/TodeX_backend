@@ -9,6 +9,7 @@
 ## 已验证控制
 
 - v2 HTTP 和 WebSocket 入口都要求已注册设备的 Ed25519 请求签名（时间戳窗口 + 一次性 nonce 防重放），并以 device principal 作为 conversation owner；`get_owned`、replay、prompt、cancel、permission response 和 subscription 都执行 owner 校验。设备注册表见 `devices.json`，吊销入口在 TUI `d` 面板与 `x` 重置菜单。
+- 历史加密密钥（[history-encryption.md](history-encryption.md)）：后端只保存接收方 X-Wing 公钥（`history/recipients.json`，0600、目录 0700、原子替换并 fsync，读取时校验属主、权限、大小与每条记录的 `rid = SHA-256(pk)[0..16]`）和按会话的封装 DEK（`conversations/<id>/keyring.json`，0600，按会话加锁）。DEK 只在内存中（`SegmentKey` 释放即清零），先写入并 fsync keyring 才能使用；设备私钥与恢复种子从不上传。`history/fingerprint.key`（32 字节随机，0600，只创建不覆盖）是 `textMac` / `requestFingerprint` 的 HMAC 密钥，属于后端秘密，泄露只暴露这些 MAC 与已知明文的对应。设备吊销（TUI 单台或全部）同时吊销其接收方并推进 `epoch`；钩子失败时 daemon 在下一次访问历史密钥时把 `devices.json` 中已不存在的设备接收方吊销，`history.*` 命令执行时也重新校验设备仍在注册表中。授权履约只接受目标 `rid` 与待办授权一致（或恢复导入时为调用方自身）的封装，后端从不接触明文 DEK。已吊销的公钥不能再次登记。
 - workspace 路径在创建 conversation、catalog 查询、workspace API、终端和旧 Codex adapter 路径统一 canonicalize，并拒绝 workspace root 外的目录、符号链接逃逸和不存在目录。
 - ACP 的 command、args、env 只来自管理员配置的 profile；客户端只能提交 profile 名称。`TODEX_AGENTD_*` 不会被传入 Provider 子进程。
 - Provider 子进程清空环境后只恢复允许的基础变量；stdout 单行上限 4 MiB（超长行不缓冲、丢弃到下一个换行，与非 JSON 行一样每 turn 最多 20 条记为 `provider.event`，preview 脱敏且不超过 512 字节，不再使 turn 失败），stderr 保留窗口 64 KiB，停止时处理 Unix process group。
@@ -52,5 +53,5 @@ TODEX_REAL_E2E=1 TODEX_REAL_ALLOW_BILLABLE=1 TODEX_REAL_PROVIDERS=codex,pi \
 
 ## 剩余事项
 
-1. 生产部署前验证反向代理仅开放 HTTPS/WSS，daemon 仅监听 loopback，`devices.json`、audit 和 provider 登录目录使用最小文件权限。
+1. 生产部署前验证反向代理仅开放 HTTPS/WSS，daemon 仅监听 loopback，`devices.json`、`history/`、audit 和 provider 登录目录使用最小文件权限。
 2. 如果 replay 成为主要 CPU/IO 热点，先用生产规模 journal 做基准，再设计 checkpoint/index；不要以取消完整校验换取未经测量的优化。

@@ -205,6 +205,7 @@ Configuration values are resolved using the following precedence:
 | **Pi Binary** | — | `TODEX_AGENTD_PI_BIN` | `pi` | Path or executable name for Pi CLI. |
 | **Enable Auth** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | Enables fail-closed device-signature authentication. |
 | **Pairing Encryption** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | Required WebSocket encryption (`x25519` or `ml-kem-768`); `none` permits plaintext or optional encryption. Clients must import the matching public key separately from device approval. |
+| **History Encryption** | — | `TODEX_AGENTD_HISTORY_ENCRYPTION` | `off` | Default history mode for a new install (`off` or `e2e`, see [docs/history-encryption.md](docs/history-encryption.md)). Only seeds `history/recipients.json` on its first write; afterwards devices switch the mode with `history.encryption.enable` / `disable`. |
 
 ### Example `config.toml`
 
@@ -214,6 +215,7 @@ Located at `~/.todex-agent/config.toml`:
 host = "127.0.0.1"
 port = 7345
 pairing_encryption = "ml-kem-768"
+# history_encryption = "e2e"
 data_dir = "~/.todex-agent"
 workspace_root = "~/projects"
 # Multiple roots:

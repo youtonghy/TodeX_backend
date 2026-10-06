@@ -43,7 +43,8 @@
 }
 ```
 
-  `epoch` 在接收方集合变化（新增、吊销、恢复密钥替换）时加一。最多一个未吊销的 `recovery` 接收方。设备在 `devices.json` 被吊销时，其接收方同时标记 `revokedAt`。
+  `epoch` 在接收方集合变化（新增、吊销、恢复密钥替换）时加一，切换 `mode` 不变。最多一个未吊销的 `recovery` 接收方；已吊销的公钥不能再次登记（`rid` 由公钥决定，须换新密钥对）。设备在 `devices.json` 被吊销时，其接收方同时标记 `revokedAt`；daemon 访问本文件时也会吊销 `devices.json` 中已不存在的设备的接收方。授权 `status`：`pending`、`fulfilled`、`dismissed`、`revoked`（接收方被吊销或换钥时待办授权转为 `revoked`）。
+  `mode` 的来源：文件不存在时视为 `off`；首次写入时取配置 `history_encryption`（`TODEX_AGENTD_HISTORY_ENCRYPTION`），但仅当该次写入后已有未吊销的设备接收方才为 `e2e`；文件存在后以文件为准，配置不再生效。
 - 每个会话 `keyring.json`（0600，原子替换）：`{"version":1,"keys":[{"kid","createdAt","epoch","wraps":[WrappedKey…]}]}`。授权新设备只向已有 `kid` 追加 `wraps`，不改动分片文件。
 
 ### 3.2 分片密钥生命周期
@@ -129,7 +130,7 @@ e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容�
 
 ### 5.4 能力协商
 
-客户端握手声明 `historyEncryption: 1`。`e2e` 后端拒绝未声明的客户端订阅与回放：`CLIENT_UPGRADE_REQUIRED`。
+客户端握手声明 `historyEncryption: 1`：`/v2/ws` 升级请求与 HTTP 回放请求的 query 带 `historyEncryption=1`（v2 没有握手消息，升级 query 受设备签名覆盖）。`e2e` 后端拒绝未声明的客户端订阅与回放：`CLIENT_UPGRADE_REQUIRED`（HTTP 426）。`/v2/version` 返回 `historyEncryption`（后端支持的版本）。
 
 ## 6. 分片摘要
 
@@ -146,11 +147,11 @@ e2e 下 `payload` 只保留以下明文字段（存在才写），其余内容�
 | `history.recipient.revoke` | `{rid}` | 同 get |
 | `history.recovery.set` | `{publicKey}` | `{rid}` |
 | `history.grant.request` | `{}` | `{grantId}` |
-| `history.grant.list` | `{}` | `{grants[]}` |
+| `history.grant.list` | `{}` | `{grants[]}`（每项附目标 `publicKey`） |
 | `history.grant.dismiss` | `{grantId}` | `{}` |
-| `history.keys.list` | `{conversationId?, cursor?, limit≤500}` | `{items:[{conversationId, kid}], nextCursor?}` |
+| `history.keys.list` | `{conversationId?, cursor?, limit≤500}`（默认 500） | `{items:[{conversationId, kid}], nextCursor?}` |
 | `history.keys.wraps` | `{conversationId, kids[≤500], rid?}`（默认调用方 `rid`） | `{wraps: {kid: WrappedKey}}` |
-| `history.grant.fulfill` | `{grantId?, rid, wraps:[{conversationId, kid, wrapped}]}`（≤500） | `{added}` |
+| `history.grant.fulfill` | `{grantId?, rid, wraps:[{conversationId, kid, wrapped}]（≤500）, complete?}`（最后一批 `complete: true` 结束授权；已有封装跳过） | `{added}` |
 
 `conversation.retry` 在 e2e 下必须携带 `prompt`（客户端解密后的原文）。
 

@@ -187,7 +187,7 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
 
 `conversation.subscribe` 的 `limit` 只是 replay 分页大小。可选 `detail`（`full` 默认 | `summary`）按 HTTP `detail=summary` 同样的规则折叠首次 replay 的过程事件；实时事件与缺口/滞后补放始终完整。可选 `backfillLimit` 限制首次 replay 的事件数：从 `afterSequence` 之后按 sequence 升序最多发送 `backfillLimit` 条，不跳过也不只发最新事件。结果为 `{ "conversationId", "subscribed": true, "nextSequence", "hasMore", "lastSequence" }`：`nextSequence` 是最后一条已 replay 的 sequence（未截断时等于高水位），`hasMore` 表示 `nextSequence` 与 `lastSequence`（订阅时的 journal 高水位）之间仍有未发送事件，实时推送从 `lastSequence` 之后继续。`hasMore: true` 时客户端用 HTTP `afterSequence=nextSequence` 翻页补齐 `(nextSequence, lastSequence]`，服务端不会把这段当作序号缺口补放。两个字段都省略时行为与之前完全一致（`hasMore` 恒为 `false`）。
 
-支持 `conversation.subscribe`、`conversation.unsubscribe`、`conversation.create`、`conversation.prompt`、`conversation.queue.add` / `remove` / `clear` / `resume` / `list`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call` 和 `server.ping`。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
+支持 `conversation.subscribe`、`conversation.unsubscribe`、`conversation.create`、`conversation.prompt`、`conversation.queue.add` / `remove` / `clear` / `resume` / `list`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call`、`server.ping` 和 `history.*`（见下文「历史加密密钥」）。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
 
 每条 socket 最多同时持有 128 个会话订阅，超出后 `conversation.subscribe` 返回 `INVALID_REQUEST`。`conversation.unsubscribe` 的 payload 为 `{ "conversationId": "..." }`，释放该订阅槽位并停止转发任务，幂等且返回 `{ "conversationId", "unsubscribed" }`；订阅任务因补放失败终止时发出的 `server.error` 在 `payload.conversationId` 中携带会话 ID，客户端可据此清理本地订阅记录并重订阅。删除会话（含过期清理）会关闭其广播通道，等同于终止该会话的全部订阅。
 
@@ -207,6 +207,30 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 快照为 `{ "items": [{ "id", "text", "status": "queued", "queuedAt", "contentCount", "skills" }], "paused", "pauseReason", "pauseMessage" }`，不含内联图片数据。每次变化都会追加 `followups.updated` 事件（payload 即快照）；懒加载窗口可能不含最近一次该事件，客户端打开会话或重连后应调用 `conversation.queue.list` 取当前快照。
 
 派发规则：turn 以 `turn.completed` 结束（或原生压缩结束）后，daemon 以队列项的 `itemId` 作为 `clientRequestId` 开始队首，成功后移出队列。`turn.failed` / `turn.cancelled` / `turn.interrupted` 使队列暂停（`pauseReason` 为 `turn_failed` / `turn_cancelled` / `turn_interrupted`）；队首无法开始时保留在队首并暂停（`start_failed`，`pauseMessage` 为原因）；daemon 重启后有待发项的队列暂停（`daemon_restarted`）。暂停期间空闲会话仍可直接 `conversation.prompt`，该 turn 完成后队列保持暂停。
+
+### 历史加密密钥（`history.*`）
+
+规格见 [history-encryption.md](history-encryption.md) §3、§7。所有命令经 `/v2/ws` 发送，任一已注册设备都可调用；调用方身份取自连接的设备签名（`deviceId`），不读 payload。命令执行时设备已被吊销则返回 `UNAUTHENTICATED`。payload 拒绝未知字段，缺省 payload 视为 `{}`。
+
+| 命令 | 请求 | 结果 |
+| --- | --- | --- |
+| `history.encryption.get` | `{}` | `{ "mode": "off"\|"e2e", "epoch", "recipients": [...], "myRid"?, "grants": [...] }` |
+| `history.encryption.enable` / `disable` | `{}` | 同 get；`enable` 需至少一个未吊销的设备接收方，否则 `INVALID_REQUEST` |
+| `history.recipient.register` | `{ "publicKey" }`（X-Wing 公钥 1216 字节，base64url） | `{ "rid" }`；同一公钥幂等；换钥吊销旧 `rid`；已吊销或属于其他接收方的公钥返回 `CONFLICT` |
+| `history.recipient.revoke` | `{ "rid" }` | 同 get；未知 `rid` 为 `NOT_FOUND`，已吊销幂等 |
+| `history.recovery.set` | `{ "publicKey" }` | `{ "rid" }`；替换（吊销）现有恢复接收方 |
+| `history.grant.request` | `{}` | `{ "grantId" }`；同一接收方已有待办时返回原 `grantId` |
+| `history.grant.list` | `{}` | `{ "grants": [{ "grantId", "rid", "deviceId", "requestedAt", "status", "updatedAt"?, "publicKey" }] }` |
+| `history.grant.dismiss` | `{ "grantId" }` | `{}` |
+| `history.keys.list` | `{ "conversationId"?, "cursor"?, "limit"? }`（1–500，默认 500） | `{ "items": [{ "conversationId", "kid" }], "nextCursor"? }` |
+| `history.keys.wraps` | `{ "conversationId", "kids": [≤500], "rid"? }`（默认调用方 `rid`） | `{ "wraps": { "<kid>": { "rid", "kemCt", "wrapped" } } }`，无封装的 `kid` 省略 |
+| `history.grant.fulfill` | `{ "grantId"?, "rid", "wraps": [{ "conversationId", "kid", "wrapped" }]（≤500）, "complete"? }` | `{ "added" }` |
+
+`recipients[]` 项为 `{ "rid", "kind": "device"\|"recovery", "deviceId", "publicKey", "addedAt", "revokedAt" }`（含已吊销项）。授权状态 `status` 为 `pending`、`fulfilled`、`dismissed`、`revoked`（请求方接收方被吊销或换钥）。接收方集合变化（登记、换钥、吊销、恢复密钥替换、设备被吊销）使 `epoch` 加一；切换 mode 不变。
+
+`history.grant.fulfill`：带 `grantId` 时目标 `rid` 必须是该待办授权的接收方（否则 `UNAUTHORIZED`），授权已结束为 `CONFLICT`；不带 `grantId`（恢复密钥导入）时目标只能是调用方自己的 `rid`。每个 `wrapped.rid` 必须等于 `rid`（`INVALID_REQUEST`），每个 `kid` 必须已存在（`NOT_FOUND`），会话须属于调用方；全部校验通过后才写入。目标已有封装的 `kid` 跳过，因此分批重试安全。最后一批带 `complete: true` 把授权标为 `fulfilled`。
+
+`e2e` 下客户端须声明能解密历史：`/v2/ws` 握手 query 与 `GET /v2/conversations/{id}/events` query 带 `historyEncryption=1`（握手 query 受设备签名覆盖）。未声明的 `conversation.subscribe` 与 HTTP 回放返回 `CLIENT_UPGRADE_REQUIRED`（HTTP 426）。`/v2/version` 的 `historyEncryption` 字段给出后端支持的版本；旧后端对 `history.*` 返回 `UNSUPPORTED`。
 
 ### Pi 扩展与常驻 runtime
 
@@ -278,6 +302,7 @@ GET /v2/version
 | `data_dir` | string | 当前数据目录 |
 | `workspace_root` | string | 主 workspace 根目录（根列表第一项） |
 | `workspace_roots` | string[] | 全部已配置的 workspace 根目录 |
+| `historyEncryption` | number | 后端支持的历史加密版本（当前 `1`），见「历史加密密钥」 |
 
 ## Workspace 缓存同步与信任
 
@@ -1006,6 +1031,7 @@ TUI 配对二维码只携带后端地址、当前首选加密方式和服务端�
 | `REMOTE_UNREACHABLE` | 远程主机不可达或连接中断（HTTP 502），会话随之关闭。 |
 | `REMOTE_PERMISSION_DENIED` | 远程服务器拒绝该文件操作（HTTP 403）；与 TodeX 设备认证无关。 |
 | `REMOTE_OPERATION_FAILED` | 其他远程文件操作失败（HTTP 422）。 |
+| `CLIENT_UPGRADE_REQUIRED` | 历史已端到端加密，而客户端未声明 `historyEncryption=1`（HTTP 426）；需升级客户端。 |
 | `JOURNAL_FULL` | 会话 journal 超过新 turn 上限（56 MiB）且压缩无法释放空间，HTTP 507；需新建会话。 |
 | `EVENT_STREAM_LAGGED` | WebSocket 事件接收端落后，服务端正从 journal 补放；帧无顶层 `id`，`payload.conversationId` 标明会话。 |
 | `EVENT_STREAM_CLOSED` | 事件流已关闭。 |
