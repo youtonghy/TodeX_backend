@@ -164,12 +164,17 @@ gate is on new prompts. Once an append or a prompt would push the journal
 past 56 MiB, a compaction pass runs segment by segment: older streaming
 progress records that a terminal record already covers (`message.delta`,
 `thought.delta`, `tool.updated`, `subagent.updated` — everything but the
-newest 16 MiB) are replaced by `journal.compacted` markers: minimal records
-keeping the original sequence, event id, time and provider with payload
+newest 16 MiB) are replaced by `journal.compacted` markers keeping the
+original sequence, event id and time with payload
 `{"reason": "compacted", "originalType", "runStart", "runLength"}` where one
-run shares `runStart`/`runLength`. Each sequence still occupies its line, so
-the cold index and replay cursors stay valid; clients classify the marker as
-an unknown type and render nothing. Any remaining oversized payload strings
+run shares `runStart`/`runLength`. On disk a marker is a compact line
+(`{"sequence", "compacted": {"eventId", "timeUs", "originalType", "runStart",
+"runLength"}}`, ~150 bytes instead of ~350 for a full event, since a full
+envelope is as large as the small delta it replaces); every read expands it
+back to the full event, and a pass re-encodes full-event markers written by
+older builds. Each sequence still occupies its line, so the cold index and
+replay cursors stay valid; clients classify the marker as an unknown type
+and render nothing. Any remaining oversized payload strings
 are then truncated largest-first, oldest files first, until the journal fits
 48 MiB or nothing more can shrink. Only files that actually change are
 rewritten, in place and atomically; adjacent sealed segments that fit one

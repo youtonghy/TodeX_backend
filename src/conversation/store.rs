@@ -65,13 +65,17 @@ const JOURNAL_SEGMENT_BYTES: u64 = 128 * 1024;
 /// forge it: [`validate_event_type`] rejects its upper-case letter.
 const JOURNAL_RECORD_LOST_EVENT: &str = "journal.recordLost";
 /// Marker written in place of each sequence whose record compaction stripped:
-/// it keeps the original sequence, event id, time and provider so line `N`
-/// still carries sequence `N` and no client ever waits on a gap. Its payload
-/// is `{reason, originalType, runStart, runLength}`; consecutive markers
-/// sharing `runStart` describe one stripped run. Appends cannot forge it:
+/// it keeps the original sequence, event id and time so line `N` still
+/// carries sequence `N` and no client ever waits on a gap. Its payload is
+/// `{reason, originalType, runStart, runLength}`; consecutive markers sharing
+/// `runStart` describe one stripped run. Appends cannot forge it:
 /// [`validate_event_type`] rejects the `journal.` prefix, and clients
-/// classify the type as unknown so the markers render nothing.
+/// classify the type as unknown so the markers render nothing. On disk a
+/// marker is a [`CompactedRecord`], not a full event.
 const JOURNAL_COMPACTED_EVENT: &str = "journal.compacted";
+/// Every [`CompactedRecord`] line starts with this; a full event serializes
+/// `schemaVersion` first, so the prefix alone tells the two apart.
+const COMPACTED_RECORD_PREFIX: &[u8] = b"{\"sequence\":";
 /// Streaming progress records whose content is durably repeated by the
 /// stream's terminal record (`*.completed`); compaction replaces them with
 /// [`JOURNAL_COMPACTED_EVENT`] markers since their payloads are dead weight
@@ -83,11 +87,11 @@ const JOURNAL_COMPACT_STRIP_TYPES: &[&str] = &[
     "subagent.updated",
 ];
 /// Lower bound on the serialized size of any journal record (each carries a
-/// 36-byte event id, a 36-byte conversation id and an RFC 3339 time). Salvage
-/// uses it to bound how many sequences a corrupt region can have swallowed,
-/// so a record with a damaged sequence number cannot conjure a huge run of
-/// placeholders.
-const MIN_JOURNAL_RECORD_BYTES: usize = 128;
+/// 36-byte event id plus its sequence and time; full events also a 36-byte
+/// conversation id). Salvage uses it to bound how many sequences a corrupt
+/// region can have swallowed, so a record with a damaged sequence number
+/// cannot conjure a huge run of placeholders.
+const MIN_JOURNAL_RECORD_BYTES: usize = 96;
 /// Replay pages stop adding records once their journal bytes would exceed
 /// this (records reach ~1 MiB, so 1000 of them could otherwise approach the
 /// whole journal). A page always holds at least one record.
@@ -1084,8 +1088,9 @@ impl ConversationStore {
             for (index, (_, start_offset, end_offset)) in
                 offsets[cursor..run_end].iter().enumerate()
             {
-                let event: ConversationEvent = serde_json::from_slice(
+                let event = decode_journal_record(
                     &page[(start_offset - start) as usize..(end_offset - start) as usize],
+                    conversation_id,
                 )?;
                 validate_event(&event, conversation_id, (from + cursor + index + 1) as u64)?;
                 events.push(event);
@@ -1503,7 +1508,7 @@ impl ConversationStore {
         let Some(line) = line else {
             return Ok((None, terminated));
         };
-        let event: ConversationEvent = serde_json::from_slice(line).map_err(|error| {
+        let event = decode_journal_record(line, conversation_id).map_err(|error| {
             AppError::InvalidRequest(format!(
                 "conversation {conversation_id} journal tail is invalid: {error}"
             ))
@@ -2117,6 +2122,82 @@ fn corrupt_copy_path(path: &Path) -> PathBuf {
     ))
 }
 
+/// On-disk form of a [`JOURNAL_COMPACTED_EVENT`] marker. A full event line
+/// spends ~350 bytes on envelope fields, about as much as the streaming
+/// record it replaces, so history made of many small deltas could never
+/// compact below the prompt limit. This form keeps only what the marker
+/// event needs — the conversation id comes from the journal's directory —
+/// and [`decode_journal_record`] expands it back, so replay is unchanged.
+#[derive(serde::Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompactedRecord {
+    sequence: u64,
+    compacted: CompactedRun,
+}
+
+#[derive(serde::Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompactedRun {
+    event_id: String,
+    #[serde(with = "chrono::serde::ts_microseconds")]
+    time_us: DateTime<Utc>,
+    original_type: String,
+    run_start: u64,
+    run_length: u64,
+}
+
+impl CompactedRecord {
+    fn line(
+        original: &ConversationEvent,
+        original_type: &str,
+        run_start: u64,
+        run_length: u64,
+    ) -> Result<Vec<u8>, AppError> {
+        Ok(serde_json::to_vec(&Self {
+            sequence: original.sequence,
+            compacted: CompactedRun {
+                event_id: original.event_id.clone(),
+                time_us: original.time,
+                original_type: original_type.to_owned(),
+                run_start,
+                run_length,
+            },
+        })?)
+    }
+
+    fn into_event(self, conversation_id: &str) -> ConversationEvent {
+        let run = self.compacted;
+        let mut event = ConversationEvent::new(
+            conversation_id,
+            self.sequence,
+            JOURNAL_COMPACTED_EVENT,
+            serde_json::json!({
+                "reason": "compacted",
+                "originalType": run.original_type,
+                "runStart": run.run_start,
+                "runLength": run.run_length,
+            }),
+        );
+        event.event_id = run.event_id;
+        event.time = run.time_us;
+        event
+    }
+}
+
+/// Parse one journal line, expanding a [`CompactedRecord`] into its marker
+/// event. Every journal read goes through here.
+fn decode_journal_record(
+    line: &[u8],
+    conversation_id: &str,
+) -> Result<ConversationEvent, serde_json::Error> {
+    if line.starts_with(COMPACTED_RECORD_PREFIX) {
+        serde_json::from_slice::<CompactedRecord>(line)
+            .map(|record| record.into_event(conversation_id))
+    } else {
+        serde_json::from_slice(line)
+    }
+}
+
 /// One journal file's compaction pass.
 struct CompactedJournalFile {
     /// The rewritten lines (records without newlines) when any unprotected
@@ -2163,7 +2244,7 @@ fn compact_journal_file(
             events.push(None);
             continue;
         }
-        let event: ConversationEvent = serde_json::from_slice(line).map_err(|error| {
+        let event = decode_journal_record(line, conversation_id).map_err(|error| {
             AppError::InvalidRequest(format!(
                 "conversation {conversation_id} journal segment is corrupt: {error}"
             ))
@@ -2186,12 +2267,32 @@ fn compact_journal_file(
     // truncatable bulk: replace each unprotected one with a minimal
     // `journal.compacted` marker that keeps its sequence position. Runs are
     // per file — a stripped run continuing in the next file gets its own
-    // `runStart`.
+    // `runStart`. Markers are never truncation candidates, so their slots
+    // are emptied.
     while index < unprotected.len() {
         let slot = unprotected[index];
         let event = events[slot]
             .as_ref()
             .expect("unprotected slots hold events");
+        if event.event_type == JOURNAL_COMPACTED_EVENT {
+            let marker = events[slot].take().expect("unprotected slots hold events");
+            // Markers written before `CompactedRecord` existed are full
+            // events; re-encode them, keeping their run.
+            if !lines[slot].starts_with(COMPACTED_RECORD_PREFIX) {
+                let payload = &marker.payload;
+                let line = CompactedRecord::line(
+                    &marker,
+                    payload["originalType"].as_str().unwrap_or_default(),
+                    payload["runStart"].as_u64().unwrap_or(marker.sequence),
+                    payload["runLength"].as_u64().unwrap_or(1),
+                )?;
+                *total = *total - lines[slot].len() as u64 + line.len() as u64;
+                lines[slot] = Cow::Owned(line);
+                compacted += 1;
+            }
+            index += 1;
+            continue;
+        }
         if !JOURNAL_COMPACT_STRIP_TYPES.contains(&event.event_type.as_str()) {
             index += 1;
             continue;
@@ -2212,25 +2313,14 @@ fn compact_journal_file(
         let run_length = run_end - index;
         for slot in unprotected[index..run_end].iter().copied() {
             let original = events[slot].take().expect("unprotected slots hold events");
-            let mut marker = ConversationEvent::new(
-                conversation_id,
-                original.sequence,
-                JOURNAL_COMPACTED_EVENT,
-                serde_json::json!({
-                    "reason": "compacted",
-                    "originalType": original.event_type.as_str(),
-                    "runStart": run_start,
-                    "runLength": run_length,
-                }),
-            );
-            marker.event_id.clone_from(&original.event_id);
-            marker.time = original.time;
-            marker.provider = original.provider;
-            marker.raw_type.clone_from(&original.raw_type);
-            let line = serde_json::to_vec(&marker)?;
+            let line = CompactedRecord::line(
+                &original,
+                &original.event_type,
+                run_start,
+                run_length as u64,
+            )?;
             *total = *total - lines[slot].len() as u64 + line.len() as u64;
             lines[slot] = Cow::Owned(line);
-            events[slot] = Some(marker);
             compacted += 1;
         }
         index = run_end;
@@ -2484,7 +2574,7 @@ impl SalvageScan {
     /// `line` is already trimmed and non-empty; `segment`, `start` and `end`
     /// are its file index and byte range (newline excluded).
     fn feed(&mut self, line: &[u8], segment: u32, start: u64, end: u64, conversation_id: &str) {
-        let record = serde_json::from_slice::<ConversationEvent>(line)
+        let record = decode_journal_record(line, conversation_id)
             .ok()
             .filter(|event| {
                 event.sequence >= self.expected
@@ -2774,7 +2864,7 @@ fn scan_journal_offsets(
                 let mut line = vec![0u8; (end - start) as usize];
                 file.seek(SeekFrom::Start(start))?;
                 file.read_exact(&mut line)?;
-                Ok(serde_json::from_slice(&line).ok())
+                Ok(decode_journal_record(&line, conversation_id).ok())
             };
         let count = file_offsets.len() as u64;
         let first_valid = read_record(file_offsets[0])?
@@ -4933,6 +5023,111 @@ mod tests {
         let (manifest, _) = restarted.recover_with_history(&id).await.unwrap();
         assert_eq!(manifest.last_sequence, last + 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_of_small_deltas_compacts_below_the_prompt_limit() {
+        // Each delta line is smaller than a full-event marker would be, so
+        // only the compact on-disk marker frees enough space for the
+        // conversation to accept prompts again.
+        let (root, store, id) = fill_journal(
+            "todex-small-deltas",
+            "message.delta",
+            json!({ "delta": "x".repeat(16), "turnId": "t" }),
+            JOURNAL_PROMPT_LIMIT_BYTES,
+        )
+        .await;
+        store
+            .save_request(&id, &json!({ "turnId": "t2" }))
+            .await
+            .unwrap();
+        let directory = root.join("conversations").join(&id);
+        assert!(
+            journal_bytes(&journal_files(&directory).await.unwrap())
+                <= JOURNAL_COMPACT_TARGET_BYTES
+        );
+        let events = store.complete_history(&id).await.unwrap();
+        let marker = events
+            .iter()
+            .find(|event| event.event_type == JOURNAL_COMPACTED_EVENT)
+            .unwrap();
+        assert_eq!(marker.conversation_id, id);
+        assert_eq!(marker.payload["originalType"], "message.delta");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_re_encodes_full_event_markers() {
+        // Journals compacted before `CompactedRecord` hold full-event
+        // markers; the next pass shrinks them but keeps id, time and run.
+        let (root, store, id) = fill_journal(
+            "todex-legacy-markers",
+            JOURNAL_COMPACTED_EVENT,
+            json!({
+                "reason": "compacted",
+                "originalType": "message.delta",
+                "runStart": 1,
+                "runLength": 7,
+            }),
+            JOURNAL_PROMPT_LIMIT_BYTES,
+        )
+        .await;
+        let before = store.complete_history(&id).await.unwrap();
+        store
+            .save_request(&id, &json!({ "turnId": "t" }))
+            .await
+            .unwrap();
+        let after = store.complete_history(&id).await.unwrap();
+        assert_eq!(after.len(), before.len());
+        let directory = root.join("conversations").join(&id);
+        let oldest = &journal_files(&directory).await.unwrap()[0].name;
+        let first = fs::read(directory.join(oldest)).unwrap();
+        assert!(first.starts_with(COMPACTED_RECORD_PREFIX));
+        for (old, new) in before.iter().zip(&after).take(1000) {
+            assert_eq!(new.event_id, old.event_id);
+            assert_eq!(new.time, old.time);
+            assert_eq!(new.payload, old.payload);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compacted_record_round_trips_its_marker() {
+        let original = ConversationEvent::new("conv", 42, "tool.updated", json!({ "x": 1 }));
+        let line = CompactedRecord::line(&original, &original.event_type, 40, 3).unwrap();
+        assert!(line.starts_with(COMPACTED_RECORD_PREFIX));
+        // The shortest strippable type at sequence 1 still meets the salvage
+        // bound on record size.
+        let shortest = CompactedRecord::line(
+            &ConversationEvent::new("conv", 1, "tool.updated", json!({})),
+            "tool.updated",
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(shortest.len() >= MIN_JOURNAL_RECORD_BYTES);
+        let marker = decode_journal_record(&line, "conv").unwrap();
+        assert_eq!(marker.schema_version, CONVERSATION_SCHEMA_VERSION);
+        assert_eq!(marker.sequence, 42);
+        assert_eq!(marker.event_id, original.event_id);
+        assert_eq!(marker.conversation_id, "conv");
+        assert_eq!(marker.time, original.time);
+        assert_eq!(marker.event_type, JOURNAL_COMPACTED_EVENT);
+        assert_eq!(
+            marker.payload,
+            json!({
+                "reason": "compacted",
+                "originalType": "tool.updated",
+                "runStart": 40,
+                "runLength": 3,
+            })
+        );
+        // Unknown fields mean the line is not a marker this build wrote.
+        assert!(decode_journal_record(
+            br#"{"sequence":1,"compacted":{"eventId":"e","timeUs":0,"originalType":"","runStart":1,"runLength":1,"extra":1}}"#,
+            "conv",
+        )
+        .is_err());
     }
 
     #[tokio::test]
