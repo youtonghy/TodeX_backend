@@ -2103,8 +2103,14 @@ impl ConversationStore {
                                 loaded.segment.first
                             )));
                         }
-                        Err(SegmentError::Io(error)) => return Err(error.into()),
-                        Err(SegmentError::Invalid(reason)) => {
+                        Err(SegmentError::Io(error))
+                            if error.kind() != std::io::ErrorKind::NotFound =>
+                        {
+                            return Err(error.into());
+                        }
+                        Err(reason) => {
+                            // A missing `.idx` is as unusable as a damaged one.
+                            let reason = reason.to_string();
                             tracing::warn!(
                                 conversation_id,
                                 number,
@@ -2555,6 +2561,19 @@ impl ConversationStore {
         if !matches!(committed, Ok(true)) {
             prepared.discard();
         }
+        #[cfg(test)]
+        if committed.is_ok()
+            && self
+                .commit_stop
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+        {
+            // A simulated crash ends the caller like a killed process.
+            return Err(AppError::Conflict(
+                "simulated crash during segment commit".to_owned(),
+            ));
+        }
         committed.map(|_| true)
     }
 
@@ -2675,15 +2694,6 @@ impl ConversationStore {
             .commit_stop
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = step;
-    }
-
-    /// Forget every cached view of a conversation, as a restart would.
-    #[cfg(test)]
-    pub(super) fn forget_caches(&self, conversation_id: &str) {
-        self.index_remove(conversation_id);
-        self.digests.remove(conversation_id);
-        self.tails.remove(conversation_id);
-        self.reconciled.remove(conversation_id);
     }
 
     /// Seal the active file now (as a rotation would) when it holds any
@@ -3740,6 +3750,10 @@ async fn set_owner_only(path: &Path, directory: bool) -> Result<(), AppError> {
     let _ = (path, directory);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "store_v3_tests.rs"]
+mod v3_tests;
 
 #[cfg(test)]
 mod tests {
