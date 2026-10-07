@@ -30,8 +30,8 @@ use crate::{
     error::{AppError, Result},
     event::{EventBus, EventRecord},
     provider::process::{
-        classify_line, kill_process_tree, provider_command, read_bounded_line, ProviderRead,
-        MAX_PROTOCOL_LINE_BYTES,
+        classify_line, kill_process_group, kill_process_tree, provider_command, read_bounded_line,
+        ProviderRead, MAX_PROTOCOL_LINE_BYTES,
     },
     provider::process_registry::{self, TrackedProcess},
 };
@@ -1599,7 +1599,19 @@ pub struct LocalCodexAdapter {
     pending_server_requests: Arc<DashMap<GatewayRequestId, CodexServerRequest>>,
 }
 
-type TrackedChild = (Child, Option<TrackedProcess>);
+/// The app-server and its crash-cleanup record. Dropping it without a stop
+/// (or with the app-server already exited) still kills the process group,
+/// so helpers the app-server started cannot outlive it.
+struct TrackedChild {
+    child: Child,
+    tracked: Option<TrackedProcess>,
+}
+
+impl Drop for TrackedChild {
+    fn drop(&mut self) {
+        kill_process_group(&self.child);
+    }
+}
 
 impl std::fmt::Debug for LocalCodexAdapter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1805,7 +1817,7 @@ impl LocalCodexAdapter {
                 Ok(Self {
                     runtime,
                     idle_state,
-                    child: Arc::new(AsyncMutex::new(Some((child, tracked)))),
+                    child: Arc::new(AsyncMutex::new(Some(TrackedChild { child, tracked }))),
                     stdin: Arc::new(AsyncMutex::new(Some(stdin))),
                     stderr_task: Arc::new(AsyncMutex::new(stderr_task)),
                     store,
@@ -2254,10 +2266,12 @@ impl LocalCodexAdapter {
         })
     }
 
+    /// Stops the app-server and every process in its group. `_force` is
+    /// kept for callers; both kinds of stop kill the group.
     pub async fn stop(
         &self,
         request_id: &str,
-        force: bool,
+        _force: bool,
     ) -> CodexLocalAdapterProcessResult<CodexLocalAdapterRuntime> {
         let mut runtime = self.runtime.lock().await;
         runtime.begin_stopping().map_err(|error| {
@@ -2283,14 +2297,12 @@ impl LocalCodexAdapter {
             task.abort();
             let _ = task.await;
         }
-        if let Some((mut child, tracked)) = self.child.lock().await.take() {
-            if force {
-                kill_process_tree(&mut child).await;
-            } else if let Ok(None) = child.try_wait() {
-                kill_process_tree(&mut child).await;
-            }
-            let _ = child.wait().await;
-            drop(tracked);
+        if let Some(mut owned) = self.child.lock().await.take() {
+            // Always signal the group, also when the app-server itself
+            // already exited: its children would otherwise be left behind.
+            kill_process_tree(&mut owned.child).await;
+            let _ = owned.child.wait().await;
+            owned.tracked.take();
         }
 
         runtime.finish_stopping().map_err(|error| {
@@ -5395,6 +5407,72 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn wait_until_gone(pid: i32, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only checks that the process exists.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_codex_adapter_stop_kills_helpers_of_an_exited_app_server() {
+        let root = unique_tmp_dir("todex-codex-local-adapter-exited");
+        let cwd = root.join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let binary = write_fake_codex_binary(&root, "exit-child").await;
+        let store = CodexGatewayStore::new(root.join("data"));
+        let supervisor = CodexLocalAdapterSupervisor::new(store.clone(), EventBus::new(16));
+        let adapter = supervisor
+            .start(CodexLocalAdapterStartOptions::new(
+                "cdxs_adapter_exited",
+                "local-start-1",
+                cwd,
+                binary.to_string_lossy(),
+            ))
+            .await
+            .unwrap();
+        let helper: i32 = tokio::fs::read_to_string(binary.with_extension("child"))
+            .await
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let leader = adapter.runtime().await.child_process.unwrap().pid as i32;
+        // The `initialized` notification lets the app-server exit.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // Unreaped until the stop, so it shows as a zombie.
+            let zombie = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &leader.to_string()])
+                .output()
+                .map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .starts_with('Z')
+                })
+                .unwrap_or(false);
+            if zombie {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "app-server never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // SAFETY: signal 0 only checks that the process exists.
+        assert_eq!(unsafe { libc::kill(helper, 0) }, 0);
+        let _ = supervisor
+            .stop("cdxs_adapter_exited", "local-stop-1", false)
+            .await;
+        wait_until_gone(helper, "helper of an exited app-server survived the stop").await;
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn local_codex_adapter_supervisor_start_ready_persists_recovered_state() {
         let root = unique_tmp_dir("todex-codex-local-adapter-ready");
@@ -5750,6 +5828,10 @@ mod tests {
             // A non-JSON banner before ready, and a helper process of its own.
             "banner-child" => {
                 "#!/bin/sh\necho 'Codex app-server starting'\nsleep 30 &\necho $! > \"$0.child\"\nprintf '{\"type\":\"codex.control.ready\"}\\n'\nwhile read line; do :; done\n"
+            }
+            // Exits right after ready, leaving its helper running.
+            "exit-child" => {
+                "#!/bin/sh\nsleep 30 &\necho $! > \"$0.child\"\nprintf '{\"type\":\"codex.control.ready\"}\\n'\nwhile read line; do\ncase \"$line\" in\n*'\"method\":\"initialized\"'*) exit 0;;\nesac\ndone\n"
             }
             other => panic!("unknown fake codex mode: {other}"),
         };

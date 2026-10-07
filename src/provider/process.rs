@@ -768,11 +768,21 @@ impl Drop for SpawnedGroup {
 
 /// Kills a [`provider_command`] child and every process in its group.
 pub(crate) async fn kill_process_tree(child: &mut Child) {
+    kill_process_group(child);
+    let _ = child.kill().await;
+}
+
+/// SIGKILLs the process group of a [`provider_command`] child that has not
+/// been reaped yet (its PID, and so its group ID, cannot have been reused).
+/// The group outlives a leader that already exited; a group that is gone
+/// is ignored. Synchronous, for `Drop`.
+pub(crate) fn kill_process_group(child: &Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         signal_process_group(pid, libc::SIGKILL);
     }
-    let _ = child.kill().await;
+    #[cfg(not(unix))]
+    let _ = child;
 }
 
 pub(crate) fn secure_command(program: impl AsRef<OsStr>) -> Command {
