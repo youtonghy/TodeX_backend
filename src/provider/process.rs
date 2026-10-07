@@ -16,7 +16,7 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process_registry::{self, TrackedProcess};
 
-const MAX_PROTOCOL_LINE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_PROTOCOL_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// Bytes of an unparseable provider line kept for diagnostics.
 const UNPARSED_LINE_PREVIEW_BYTES: usize = 512;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
@@ -163,37 +163,10 @@ impl JsonLineProcess {
                 "provider working directory must be absolute".to_owned(),
             ));
         }
-        let mut command = secure_command(&spec.program);
-        command
-            .args(&spec.args)
-            .current_dir(&spec.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let mut command = provider_command(&spec.program);
+        command.args(&spec.args).current_dir(&spec.cwd);
         for (key, value) in &spec.env {
             command.env(key, value);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.as_std_mut().process_group(0);
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::CommandExt;
-            // The kernel kills the provider if the daemon dies without running
-            // destructors. It fires when the spawning *thread* exits; tokio
-            // runtime worker threads live as long as the daemon.
-            // SAFETY: prctl is async-signal-safe and touches no parent state.
-            unsafe {
-                command.as_std_mut().pre_exec(|| {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
         }
 
         let mut child = command.spawn().map_err(|error| {
@@ -736,6 +709,49 @@ fn executable_file(path: &Path) -> bool {
     }
 }
 
+/// A [`secure_command`] for a long-lived provider process with piped stdio:
+/// killed on drop, the leader of its own process group (so stopping it
+/// reaches every child it started) and, on Linux, killed by the kernel if the
+/// daemon dies without running destructors.
+pub(crate) fn provider_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = secure_command(program);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // PR_SET_PDEATHSIG fires when the spawning *thread* exits; tokio
+        // runtime worker threads live as long as the daemon.
+        // SAFETY: prctl is async-signal-safe and touches no parent state.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    command
+}
+
+/// Kills a [`provider_command`] child and every process in its group.
+pub(crate) async fn kill_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        signal_process_group(pid, libc::SIGKILL);
+    }
+    let _ = child.kill().await;
+}
+
 pub(crate) fn secure_command(program: impl AsRef<OsStr>) -> Command {
     let program = program.as_ref();
     let resolved = program
@@ -827,7 +843,7 @@ where
     Ok((output, exceeded))
 }
 
-fn classify_line(line: BoundedLine) -> ProviderRead {
+pub(crate) fn classify_line(line: BoundedLine) -> ProviderRead {
     let mut bytes = match line {
         BoundedLine::Line(bytes) => bytes,
         BoundedLine::Oversized(bytes) => return ProviderRead::Oversized { bytes },

@@ -4,7 +4,6 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, Mutex as StdMutex, OnceLock},
 };
 
@@ -30,7 +29,11 @@ use crate::{
     conversation::redact_secrets,
     error::{AppError, Result},
     event::{EventBus, EventRecord},
-    provider::process::secure_command,
+    provider::process::{
+        classify_line, kill_process_tree, provider_command, read_bounded_line, ProviderRead,
+        MAX_PROTOCOL_LINE_BYTES,
+    },
+    provider::process_registry::{self, TrackedProcess},
 };
 
 use crate::server::protocol::{CodexLocalErrorCode, CodexLocalErrorPayload};
@@ -1587,7 +1590,8 @@ impl CodexLocalAdapterSupervisor {
 pub struct LocalCodexAdapter {
     runtime: Arc<AsyncMutex<CodexLocalAdapterRuntime>>,
     idle_state: Arc<AsyncMutex<LocalCodexAdapterIdleState>>,
-    child: Arc<AsyncMutex<Option<Child>>>,
+    /// The app-server and its crash-cleanup record, dropped once reaped.
+    child: Arc<AsyncMutex<Option<(Child, Option<TrackedProcess>)>>>,
     stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
     stderr_task: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
     store: CodexGatewayStore,
@@ -1677,22 +1681,24 @@ impl LocalCodexAdapter {
         .await?;
         let runtime = Arc::new(AsyncMutex::new(initial_runtime));
 
-        let mut command = secure_command(&options.binary);
+        // Same launch as every provider process: own process group, killed
+        // with the daemon, recorded for crash cleanup.
+        let mut command = provider_command(&options.binary);
         let spawn_result = command
             .arg("app-server")
             .arg("--listen")
             .arg("stdio://")
             .current_dir(&options.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
             .spawn();
         let mut child = match spawn_result {
             Ok(child) => child,
             Err(error) => {
                 return Err(fail_local_start(&store, &runtime, spawn_error(&options, error)).await);
             }
+        };
+        let tracked = match child.id() {
+            Some(pid) => process_registry::track(pid, &options.binary).await,
+            None => None,
         };
 
         let startup_error = |message: String| {
@@ -1767,7 +1773,7 @@ impl LocalCodexAdapter {
                 )
                 .await
                 {
-                    let _ = child.kill().await;
+                    kill_process_tree(&mut child).await;
                     return Err(fail_local_start(&store, &runtime, error).await);
                 }
                 let mut runtime_guard = runtime.lock().await;
@@ -1775,7 +1781,7 @@ impl LocalCodexAdapter {
                     runtime_guard.attach_child_process(CodexLocalAdapterChildProcess { pid })
                 {
                     drop(runtime_guard);
-                    let _ = child.kill().await;
+                    kill_process_tree(&mut child).await;
                     let error = CodexLocalAdapterProcessError::new(
                         CodexLocalErrorCode::UnsupportedAction,
                         error.message,
@@ -1797,7 +1803,7 @@ impl LocalCodexAdapter {
                 Ok(Self {
                     runtime,
                     idle_state,
-                    child: Arc::new(AsyncMutex::new(Some(child))),
+                    child: Arc::new(AsyncMutex::new(Some((child, tracked)))),
                     stdin: Arc::new(AsyncMutex::new(Some(stdin))),
                     stderr_task: Arc::new(AsyncMutex::new(stderr_task)),
                     store,
@@ -1806,11 +1812,11 @@ impl LocalCodexAdapter {
                 })
             }
             StartupOutcome::Ready(Ok(Err(error))) => {
-                let _ = child.kill().await;
+                kill_process_tree(&mut child).await;
                 Err(fail_local_start(&store, &runtime, startup_error(error)).await)
             }
             StartupOutcome::Ready(Err(_)) => {
-                let _ = child.kill().await;
+                kill_process_tree(&mut child).await;
                 let error =
                     startup_error("Codex app-server stdout reader stopped before ready".to_owned());
                 Err(fail_local_start(&store, &runtime, error).await)
@@ -1829,7 +1835,7 @@ impl LocalCodexAdapter {
             StartupOutcome::TimedOut => {
                 let exit_status = child.try_wait().map_err(|error| error.to_string());
                 if !matches!(exit_status, Ok(Some(_))) {
-                    let _ = child.kill().await;
+                    kill_process_tree(&mut child).await;
                 }
                 let (code, message) = match exit_status {
                     Ok(Some(status)) => (
@@ -2275,13 +2281,14 @@ impl LocalCodexAdapter {
             task.abort();
             let _ = task.await;
         }
-        if let Some(mut child) = self.child.lock().await.take() {
+        if let Some((mut child, tracked)) = self.child.lock().await.take() {
             if force {
-                let _ = child.kill().await;
+                kill_process_tree(&mut child).await;
             } else if let Ok(None) = child.try_wait() {
-                let _ = child.kill().await;
+                kill_process_tree(&mut child).await;
             }
             let _ = child.wait().await;
+            drop(tracked);
         }
 
         runtime.finish_stopping().map_err(|error| {
@@ -2504,26 +2511,39 @@ fn spawn_local_stdout_reader(
 ) {
     tokio::spawn(async move {
         let mut ready_tx = Some(ready_tx);
-        let mut lines = BufReader::new(stdout).lines();
+        let mut stdout = BufReader::new(stdout);
+        let mut pending = Vec::new();
+        let mut discarding = None;
         loop {
-            match lines.next_line().await {
+            let line = read_bounded_line(
+                &mut stdout,
+                &mut pending,
+                &mut discarding,
+                MAX_PROTOCOL_LINE_BYTES,
+            )
+            .await;
+            match line {
                 Ok(Some(line)) => {
-                    let value: Value = match serde_json::from_str(&line) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            if let Some(sender) = ready_tx.take() {
-                                let _ = sender.send(Err(error.to_string()));
-                            }
-                            append_reader_error(
-                                &store,
-                                &runtime,
-                                CodexLocalErrorCode::MalformedEvent,
-                                error.to_string(),
-                                Some(&startup_request_id),
-                                "codex.local.turn",
-                            )
-                            .await;
-                            break;
+                    // Banners, stray prints and oversized frames are logged
+                    // and skipped: one bad line must not end the session.
+                    let value = match classify_line(line) {
+                        ProviderRead::Frame(Value::Null) => continue,
+                        ProviderRead::Frame(value) => value,
+                        ProviderRead::Invalid { preview } => {
+                            tracing::warn!(
+                                codex_session_id = %codex_session_id,
+                                preview = %preview,
+                                "skipping Codex app-server stdout line that is not JSON"
+                            );
+                            continue;
+                        }
+                        ProviderRead::Oversized { bytes } => {
+                            tracing::warn!(
+                                codex_session_id = %codex_session_id,
+                                bytes,
+                                "skipping oversized Codex app-server stdout line"
+                            );
+                            continue;
                         }
                     };
                     if structured_ready_event(&value) {
@@ -5327,6 +5347,53 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn local_codex_adapter_skips_bad_lines_and_stops_its_whole_process_group() {
+        let root = unique_tmp_dir("todex-codex-local-adapter-group");
+        let cwd = root.join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let binary = write_fake_codex_binary(&root, "banner-child").await;
+        let store = CodexGatewayStore::new(root.join("data"));
+        let supervisor = CodexLocalAdapterSupervisor::new(store.clone(), EventBus::new(16));
+
+        let adapter = supervisor
+            .start(CodexLocalAdapterStartOptions::new(
+                "cdxs_adapter_group",
+                "local-start-1",
+                cwd,
+                binary.to_string_lossy(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter.runtime().await.state,
+            CodexLocalAdapterLifecycleState::Ready
+        );
+        let helper: i32 = tokio::fs::read_to_string(binary.with_extension("child"))
+            .await
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only checks that the process exists.
+        assert_eq!(unsafe { libc::kill(helper, 0) }, 0);
+
+        supervisor
+            .stop("cdxs_adapter_group", "local-stop-1", false)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(helper, 0) } == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "helper process survived the stop"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn local_codex_adapter_supervisor_start_ready_persists_recovered_state() {
         let root = unique_tmp_dir("todex-codex-local-adapter-ready");
         let cwd = root.join("project");
@@ -5678,6 +5745,10 @@ mod tests {
             }
             "timeout" => "#!/bin/sh\nsleep 2\n",
             "crash" => "#!/bin/sh\nexit 42\n",
+            // A non-JSON banner before ready, and a helper process of its own.
+            "banner-child" => {
+                "#!/bin/sh\necho 'Codex app-server starting'\nsleep 30 &\necho $! > \"$0.child\"\nprintf '{\"type\":\"codex.control.ready\"}\\n'\nwhile read line; do :; done\n"
+            }
             other => panic!("unknown fake codex mode: {other}"),
         };
         tokio::fs::write(&path, script).await.unwrap();
