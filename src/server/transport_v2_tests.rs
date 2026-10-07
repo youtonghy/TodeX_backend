@@ -979,14 +979,18 @@ async fn sealed_tunnel_checks_the_credential_before_reading_the_inner_body() {
         &large,
     );
     let sealed = seal_request(&keys, EncryptionProtocol::X25519, &inner);
-    let response = send(&sealed, Body::from(sealed.body.clone())).await.unwrap();
+    let response = send(&sealed, Body::from(sealed.body.clone()))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let inner = encode_inner(
         &json!({"method": "GET", "path": "/v2/version", "headers": {}}),
         &[],
     );
     let sealed = seal_request(&keys, EncryptionProtocol::X25519, &inner);
-    let response = send(&sealed, Body::from(sealed.body.clone())).await.unwrap();
+    let response = send(&sealed, Body::from(sealed.body.clone()))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
     assert_eq!(open_response(sealed.down, &bytes).status, 200);

@@ -15,8 +15,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use futures_util::StreamExt;
-use tower::ServiceExt;
 use tokio::sync::{Semaphore, SemaphorePermit};
+use tower::ServiceExt;
 use tracing::debug;
 
 use crate::app_state::AppState;
@@ -360,7 +360,10 @@ fn seal_response(response: Response, down: RecordCipher) -> Result<Response, Tra
         }
         let Ok(value) = value.to_str() else {
             // The inner head is JSON text; a non-UTF-8 value cannot travel.
-            debug!(header = name.as_str(), "sealed response dropped a non-text header value");
+            debug!(
+                header = name.as_str(),
+                "sealed response dropped a non-text header value"
+            );
             continue;
         };
         headers
