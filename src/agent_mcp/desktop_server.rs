@@ -849,6 +849,11 @@ mod tests {
             )
             .await
             .unwrap();
+        // A full-access turn, as most tests exercise tools without approval;
+        // tests for other modes record their own.
+        state
+            .agent_mcp
+            .record_turn_mode(&manifest.id, "full-access", "implement");
         let client = client_for(&state, &manifest.id).await;
         (root, state, manifest.id, client)
     }

@@ -211,6 +211,13 @@ impl AuthorizerState {
         locked(&self.modes).get(conversation_id).copied()
     }
 
+    /// The mode side-effect tools follow. No recorded turn (none started in
+    /// this daemon run) asks, like an unknown mode: unknown state never
+    /// skips approval.
+    pub(crate) fn tool_mode(&self, conversation_id: &str) -> ToolMode {
+        self.mode(conversation_id).unwrap_or(ToolMode::Ask)
+    }
+
     /// Conversation deleted, revoked or expired.
     pub(crate) fn forget(&self, conversation_id: &str) {
         locked(&self.modes).remove(conversation_id);
@@ -438,16 +445,16 @@ impl Authorizer<'_> {
         input: Value,
         cancel: &CancelSignal,
     ) -> Result<Option<String>, Denied> {
-        match self.state.mode(conversation_id) {
-            None | Some(ToolMode::Unrestricted) => Ok(None),
-            Some(ToolMode::Plan) => Err(Denied::new(
+        match self.state.tool_mode(conversation_id) {
+            ToolMode::Unrestricted => Ok(None),
+            ToolMode::Plan => Err(Denied::new(
                 "PLAN_MODE",
                 format!(
                     "{tool} changes things and is not available while the conversation is in Plan \
                      mode. Read-only tools still work; describe the step in your plan instead."
                 ),
             )),
-            Some(ToolMode::Ask) => {
+            ToolMode::Ask => {
                 let qualified = format!("{server}.{tool}");
                 let always = |state: &AuthorizerState| {
                     locked(&state.always)
@@ -532,6 +539,7 @@ mod tests {
         state.forget("c1");
         assert!(state.backoff("c1", "app:x").is_none());
         assert_eq!(state.mode("c1"), None);
+        assert_eq!(state.tool_mode("c1"), ToolMode::Ask);
     }
 
     #[test]
