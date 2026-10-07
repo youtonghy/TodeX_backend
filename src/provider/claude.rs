@@ -1734,6 +1734,36 @@ mod tests {
     }
 
     #[test]
+    fn a_usage_limit_reset_that_just_passed_is_now() {
+        use chrono::{TimeZone, Utc};
+
+        let now = Utc.with_ymd_and_hms(2026, 10, 6, 9, 35, 0).unwrap();
+        let text = |clock: &str| format!("You've hit your session limit · resets {clock} (UTC)");
+        // Five minutes ago: the reset just passed, not tomorrow's.
+        assert_eq!(usage_limit_reset(&text("9:30am"), now), Some(now));
+        assert_eq!(usage_limit_reset(&text("9:25am"), now), Some(now));
+        // Older than ten minutes: the next day's.
+        assert_eq!(
+            usage_limit_reset(&text("9:20am"), now),
+            Some(Utc.with_ymd_and_hms(2026, 10, 7, 9, 20, 0).unwrap())
+        );
+        // Just before midnight, read just after it.
+        let after_midnight = Utc.with_ymd_and_hms(2026, 10, 7, 0, 3, 0).unwrap();
+        assert_eq!(
+            usage_limit_reset(&text("11:58pm"), after_midnight),
+            Some(after_midnight)
+        );
+        // A weekly reset that just passed is not next week's.
+        assert_eq!(
+            usage_limit_reset(
+                "You've hit your weekly limit · resets Tue 9:30am (UTC)",
+                now
+            ),
+            Some(now)
+        );
+    }
+
+    #[test]
     fn assistant_quota_limits_are_a_rejected_reset() {
         use chrono::{TimeZone, Utc};
 
@@ -2366,6 +2396,15 @@ fn usage_limit_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     }
 }
 
+/// How far in the past a parsed reset may lie and still mean "now": the
+/// message is only minute-precise and may be read a little after the reset
+/// (or with a skewed clock). Older times are the next day's or week's.
+const RECENT_RESET_GRACE_MINUTES: i64 = 10;
+
+/// The first instant at `hour:minute` (on `weekday`, if given) in `tz` that
+/// is after `now`. A time at most [`RECENT_RESET_GRACE_MINUTES`] ago — the
+/// reset just passed — is `now` instead of a day or week later; callers add
+/// their own minimum wait.
 fn next_zoned<T: TimeZone>(
     tz: &T,
     now: DateTime<Utc>,
@@ -2373,10 +2412,16 @@ fn next_zoned<T: TimeZone>(
     minute: u32,
     weekday: Option<Weekday>,
 ) -> Option<DateTime<Utc>> {
-    let today = now.with_timezone(tz).date_naive();
-    let span = if weekday.is_some() { 8 } else { 2 };
+    let grace = chrono::Duration::minutes(RECENT_RESET_GRACE_MINUTES);
+    // From yesterday, so a reset just before local midnight read just
+    // after it still counts as recent.
+    let yesterday = now
+        .with_timezone(tz)
+        .date_naive()
+        .checked_sub_days(Days::new(1))?;
+    let span = if weekday.is_some() { 9 } else { 3 };
     for day in 0..span {
-        let date = today.checked_add_days(Days::new(day))?;
+        let date = yesterday.checked_add_days(Days::new(day))?;
         if weekday.is_some_and(|weekday| date.weekday() != weekday) {
             continue;
         }
@@ -2395,6 +2440,9 @@ fn next_zoned<T: TimeZone>(
         };
         if utc > now {
             return Some(utc);
+        }
+        if now - utc <= grace {
+            return Some(now);
         }
     }
     None
