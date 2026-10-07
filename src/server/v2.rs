@@ -2745,72 +2745,38 @@ impl SubscriptionWorker {
                             return Some(frame);
                         }
                     }
-                    delivered_through = event.sequence;
                     // The published event is the stored record: the same
                     // ciphertext the journal holds goes out unchanged, encoded
                     // once for every subscription.
                     let text = match live_event_text(&event) {
                         Ok(text) => text,
                         Err(error) => {
-                            warn!(error = %error, "failed to encode live conversation event");
-                            continue;
+                            // Not delivered: replay it from the journal like
+                            // a lagged event, so the client never has a hole.
+                            warn!(
+                                conversation_id,
+                                sequence = event.sequence,
+                                error = %error,
+                                "failed to encode live conversation event; replaying it"
+                            );
+                            match self.recover_lag(&mut delivered_through, 1).await {
+                                Ok(()) => continue,
+                                Err(LiveExit::Closed) => break,
+                                Err(LiveExit::Failed(frame)) => return Some(frame),
+                            }
                         }
                     };
                     if outgoing.send(Outbound::Text(text)).await.is_err() {
                         break;
                     }
+                    delivered_through = event.sequence;
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    if outgoing
-                        .send(stream_lagged_frame(conversation_id, skipped).into())
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    let recovery = async {
-                        let recovery_high_water = conversations
-                            .get_owned(owner_id, conversation_id)
-                            .await?
-                            .last_sequence;
-                        while delivered_through < recovery_high_water {
-                            let replay = conversations
-                                .replay_owned(
-                                    owner_id,
-                                    conversation_id,
-                                    delivered_through,
-                                    page_size,
-                                    ReplayDetail::Full,
-                                )
-                                .await?;
-                            let mut advanced = false;
-                            for mut event in replay.events.into_iter().take_while(|event| {
-                                event.sequence <= recovery_high_water
-                            }) {
-                                delivered_through = event.sequence;
-                                advanced = true;
-                                crate::conversation::present_event(&mut event, false);
-                                let message =
-                                    conversation_event_message("replay", &event, &replay.frames)?;
-                                outgoing
-                                    .send(Outbound::Text(message.text))
-                                    .await
-                                    .map_err(|_| AppError::StreamClosed)?;
-                            }
-                            if !advanced {
-                                return Err(AppError::Conflict(format!(
-                                    "conversation {conversation_id} replay did not reach sequence {recovery_high_water}"
-                                )));
-                            }
-                        }
-                        Ok::<(), AppError>(())
-                    }
-                    .await;
-                    if let Err(error) = recovery {
-                        let mut frame = error_response(None, error);
-                        frame["payload"]["conversationId"] = json!(conversation_id);
-                        return Some(frame);
+                    match self.recover_lag(&mut delivered_through, skipped).await {
+                        Ok(()) => {}
+                        Err(LiveExit::Closed) => break,
+                        Err(LiveExit::Failed(frame)) => return Some(frame),
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -2818,6 +2784,78 @@ impl SubscriptionWorker {
         }
         None
     }
+
+    /// Tells the client `skipped` live events were not delivered, then
+    /// replays the journal from `delivered_through` up to the current last
+    /// sequence.
+    async fn recover_lag(&self, delivered_through: &mut u64, skipped: u64) -> Result<(), LiveExit> {
+        let conversations = &self.conversations;
+        let outgoing = &self.outgoing;
+        let owner_id = &self.owner_id;
+        let conversation_id = &self.conversation_id;
+        let page_size = self.page_size;
+        if outgoing
+            .send(stream_lagged_frame(conversation_id, skipped).into())
+            .await
+            .is_err()
+        {
+            return Err(LiveExit::Closed);
+        }
+        let mut through = *delivered_through;
+        let recovery = async {
+            let recovery_high_water = conversations
+                .get_owned(owner_id, conversation_id)
+                .await?
+                .last_sequence;
+            while through < recovery_high_water {
+                let replay = conversations
+                    .replay_owned(
+                        owner_id,
+                        conversation_id,
+                        through,
+                        page_size,
+                        ReplayDetail::Full,
+                    )
+                    .await?;
+                let mut advanced = false;
+                for mut event in replay.events.into_iter().take_while(|event| {
+                    event.sequence <= recovery_high_water
+                }) {
+                    through = event.sequence;
+                    advanced = true;
+                    crate::conversation::present_event(&mut event, false);
+                    let message =
+                        conversation_event_message("replay", &event, &replay.frames)?;
+                    outgoing
+                        .send(Outbound::Text(message.text))
+                        .await
+                        .map_err(|_| AppError::StreamClosed)?;
+                }
+                if !advanced {
+                    return Err(AppError::Conflict(format!(
+                        "conversation {conversation_id} replay did not reach sequence {recovery_high_water}"
+                    )));
+                }
+            }
+            Ok::<(), AppError>(())
+        }
+        .await;
+        // Events replayed before a failure count as delivered.
+        *delivered_through = through;
+        recovery.map_err(|error| {
+            let mut frame = error_response(None, error);
+            frame["payload"]["conversationId"] = json!(conversation_id);
+            LiveExit::Failed(frame)
+        })
+    }
+}
+
+/// Why live forwarding stopped early.
+enum LiveExit {
+    /// The connection's outgoing queue is gone.
+    Closed,
+    /// Recovery failed; the conversation-scoped error frame to report.
+    Failed(Value),
 }
 
 /// Tells the client a subscription's live stream skipped events that are
