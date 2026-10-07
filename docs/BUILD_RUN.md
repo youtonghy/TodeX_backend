@@ -398,7 +398,7 @@ curl http://127.0.0.1:7345/v2/version
 - 旧 `/v1/ws` 的终端、本地 Codex 控制、Cloud Code、MCP 命令与事件流已并入 `/v2/ws`，同一连接可同时使用 `conversation.*` 与 `terminal.*` / `codex.*` 命令。
 - 断线恢复不再使用 transport hello/chunk/ack 封装：连接建立后发送 `session.resume`，携带客户端持久化的 Codex session cursor，由服务端重放。
 - WebSocket 消息上限统一为 8 MiB（聊天附件 base64 传输需要）。
-- `/v2/version` 与 `/health` 一样免认证，供 daemon 自检使用。
+- `/v2/version` 与 `/health` 一样免认证，供 daemon 自检使用；数据目录与 workspace 根目录只返回给带有效设备签名的请求。
 
 部署顺序：
 

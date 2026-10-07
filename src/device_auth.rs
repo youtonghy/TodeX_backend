@@ -16,12 +16,17 @@
 //! different request. Timestamps are accepted within ±300 seconds and nonces
 //! are single-use within that window.
 use crate::{
-    app_state::AppState, devices::DeviceRegistry, error::AppError, server::websocket::AuthContext,
+    app_state::AppState, devices::DeviceRegistry, error::AppError, listen_addrs::is_loopback_host,
+    server::websocket::AuthContext,
 };
 use axum::{
     body::{to_bytes, Body},
     extract::{Request, State},
-    http::{header::HeaderName, HeaderMap, Method},
+    http::{
+        header::{HeaderName, HOST, ORIGIN},
+        uri::Authority,
+        HeaderMap, Method, Uri,
+    },
     middleware::Next,
     response::Response,
 };
@@ -78,7 +83,8 @@ impl DeviceAuthenticator {
         }
     }
 
-    fn authenticate(
+    /// Full verification for a request whose body is already known.
+    pub(crate) fn authenticate(
         &self,
         method: &Method,
         path: &str,
@@ -86,6 +92,19 @@ impl DeviceAuthenticator {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<AuthContext, AppError> {
+        self.check_credential(headers, query)?
+            .verify(self, method, path, query, body)
+    }
+
+    /// Every check that does not need the request body: the credential is
+    /// present and well formed, fresh, and names a registered device. Runs
+    /// before the body is buffered so anonymous peers cannot make the daemon
+    /// hold large uploads in memory.
+    fn check_credential(
+        &self,
+        headers: &HeaderMap,
+        query: Option<&str>,
+    ) -> Result<PendingCredential, AppError> {
         let credential = Credential::extract(headers, query).ok_or(AppError::Unauthenticated)?;
         let timestamp = credential
             .timestamp
@@ -107,25 +126,11 @@ impl DeviceAuthenticator {
                 .map_err(|_| AppError::Unauthenticated)?,
         )
         .map_err(|_| AppError::Unauthenticated)?;
-        let payload = signed_payload(
-            &credential.device_id,
-            method.as_str(),
-            path,
-            &canonical_query(query),
-            &credential.timestamp,
-            &credential.nonce,
-            body,
-        );
-        // Verify before claiming the nonce so a forged request cannot burn a
-        // nonce belonging to an in-flight legitimate request.
-        key.verify(&payload, &signature)
-            .map_err(|_| AppError::Unauthenticated)?;
-        self.claim_nonce(&credential.device_id, timestamp, &credential.nonce)?;
-        self.registry.touch(&credential.device_id);
-        Ok(AuthContext {
-            principal_id: credential.device_id.clone(),
-            tenant_id: "local".to_owned(),
-            token_id: credential.device_id,
+        Ok(PendingCredential {
+            credential,
+            timestamp,
+            key,
+            signature,
         })
     }
 
@@ -160,9 +165,58 @@ impl DeviceAuthenticator {
     }
 }
 
+/// A credential that passed every body-independent check; the signature over
+/// the body is still unverified.
+struct PendingCredential {
+    credential: Credential,
+    timestamp: u64,
+    key: VerifyingKey,
+    signature: Signature,
+}
+
+impl PendingCredential {
+    fn verify(
+        self,
+        auth: &DeviceAuthenticator,
+        method: &Method,
+        path: &str,
+        query: Option<&str>,
+        body: &[u8],
+    ) -> Result<AuthContext, AppError> {
+        let Self {
+            credential,
+            timestamp,
+            key,
+            signature,
+        } = self;
+        let payload = signed_payload(
+            &credential.device_id,
+            method.as_str(),
+            path,
+            &canonical_query(query),
+            &credential.timestamp,
+            &credential.nonce,
+            body,
+        );
+        // Verify before claiming the nonce so a forged request cannot burn a
+        // nonce belonging to an in-flight legitimate request.
+        key.verify(&payload, &signature)
+            .map_err(|_| AppError::Unauthenticated)?;
+        auth.claim_nonce(&credential.device_id, timestamp, &credential.nonce)?;
+        auth.registry.touch(&credential.device_id);
+        Ok(AuthContext {
+            principal_id: credential.device_id.clone(),
+            tenant_id: "local".to_owned(),
+            token_id: credential.device_id,
+        })
+    }
+}
+
 /// Axum middleware applied to every authenticated route (HTTP and the WS
-/// upgrade). Buffers the body once for the signature hash, verifies the
-/// device credential, then marks the request verified for `require_auth`.
+/// upgrade). Checks the credential headers, then buffers the body once for the
+/// signature hash, verifies it, and marks the request verified for
+/// `require_auth`. Without device auth it only admits same-machine browser
+/// contexts (see [`ensure_local_request`]).
 pub(crate) async fn device_auth_middleware(
     State(state): State<AppState>,
     request: Request,
@@ -174,16 +228,20 @@ pub(crate) async fn device_auth_middleware(
         .headers
         .remove(HeaderName::from_static(VERIFIED_HEADER));
     if !state.config.security.enable_auth {
+        ensure_local_request(&parts.headers, &parts.uri)?;
         return Ok(next.run(Request::from_parts(parts, body)).await);
     }
+    let pending = state
+        .device_auth
+        .check_credential(&parts.headers, parts.uri.query())?;
     let bytes = to_bytes(body, MAX_AUTH_BODY)
         .await
         .map_err(|_| AppError::InvalidRequest("request body is too large".to_owned()))?;
-    let auth = state.device_auth.authenticate(
+    let auth = pending.verify(
+        &state.device_auth,
         &parts.method,
         parts.uri.path(),
         parts.uri.query(),
-        &parts.headers,
         &bytes,
     )?;
     let mut request = Request::from_parts(parts, Body::from(bytes));
@@ -193,6 +251,56 @@ pub(crate) async fn device_auth_middleware(
             .map_err(|_| AppError::Unauthenticated)?,
     );
     Ok(next.run(request).await)
+}
+
+/// Anonymous (`enable_auth = false`) deployments listen on loopback only (see
+/// `Config::ensure_listener_matches_auth`), but any web page the user opens
+/// can still aim a request or WebSocket at loopback. Require a loopback `Host`
+/// (defeats DNS rebinding, where an attacker's name resolves to 127.0.0.1)
+/// and, when the browser sends one, a loopback, `null` (Electron `loadFile`
+/// fetches) or `file://` (Electron `loadFile` WebSockets) `Origin`
+/// (defeats cross-site requests and WebSocket hijacking). Native clients send
+/// no `Origin`.
+pub(crate) fn ensure_local_request(headers: &HeaderMap, uri: &Uri) -> Result<(), AppError> {
+    if !has_loopback_host(headers, uri) {
+        return Err(AppError::Unauthorized(
+            "anonymous access requires a loopback Host".to_owned(),
+        ));
+    }
+    if !headers
+        .get_all(ORIGIN)
+        .iter()
+        .all(|origin| origin.to_str().is_ok_and(is_local_origin))
+    {
+        return Err(AppError::Unauthorized(
+            "anonymous access is limited to local origins".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn has_loopback_host(headers: &HeaderMap, uri: &Uri) -> bool {
+    // HTTP/1.1 carries `Host`; HTTP/2 carries `:authority` in the URI.
+    let authority = match headers.get(HOST) {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<Authority>().ok()),
+        None => uri.authority().cloned(),
+    };
+    authority.is_some_and(|authority| {
+        authority.as_str().rsplit_once('@').is_none() && is_loopback_host(authority.host())
+    })
+}
+
+fn is_local_origin(origin: &str) -> bool {
+    if origin == "null" || origin.starts_with("file://") {
+        return true;
+    }
+    origin.parse::<Uri>().is_ok_and(|uri| {
+        matches!(uri.scheme_str(), Some("http" | "https"))
+            && uri.host().is_some_and(is_loopback_host)
+    })
 }
 
 /// `require_auth` consults the marker written by the middleware. Handlers keep

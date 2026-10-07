@@ -57,7 +57,7 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 
 当前 HTTP 层没有实现 TLS 终止，配置 `enable_tls = true` 时服务会拒绝启动，避免产生“已经启用 TLS”的错误安全假设。生产环境应在可信反向代理终止 TLS，且不应直接暴露明文端口。v2 HTTP 和 WebSocket 都使用设备签名认证：每个请求携带 `x-todex-device-id`、`x-todex-auth-ts`、`x-todex-auth-nonce`、`x-todex-auth-sig` 四个 header（无法设置 header 的客户端使用等价 query 参数 `device_id`、`auth_ts`、`auth_nonce`、`auth_sig`），签名覆盖方法、路径、canonical query、时间戳、nonce 与 body 哈希，见 [设备验证](device-verification.md)。conversation 持久化 owner tenant，所有读取、订阅与变更入口都会校验 tenant。
 
-认证策略是 fail-closed 的：`enable_auth = true` 时匿名 `/v2/ws` 握手直接被拒绝（401），不存在“先连上再限制命令”的匿名模式；`enable_auth = false` 的本地部署才会以本地信任模式接受匿名连接。没有可配置的共享凭据：设备只能通过配对流程登记（见 `POST /v2/device-pairing/*`）。
+认证策略是 fail-closed 的：`enable_auth = true` 时匿名 `/v2/ws` 握手直接被拒绝（401），不存在“先连上再限制命令”的匿名模式；`enable_auth = false` 的本地部署才会以本地信任模式接受匿名连接。关闭认证时监听地址必须是回环地址（`127.0.0.1`、`::1`），否则 daemon 拒绝启动（TUI 也拒绝保存这种监听地址）；匿名请求（HTTP 与 `/v2/ws` 升级）的 `Host` 必须是 `localhost` 或回环 IP（可带端口），`Origin` 若存在须为回环主机的 `http(s)` 源、`null`（Electron `loadFile` 页面的 fetch）或 `file://`（其 WebSocket），否则返回 403 `UNAUTHORIZED`，用于防御 DNS rebinding 与跨站 WebSocket 劫持。开启认证时不做此检查。认证中间件先校验凭证（header 或 query 齐全、时间戳在窗口内、设备已登记）再读取请求体，缺少或无效凭证的请求在读取请求体前即返回 401。没有可配置的共享凭据：设备只能通过配对流程登记（见 `POST /v2/device-pairing/*`）。
 
 ## v2 Conversation API
 
@@ -307,7 +307,7 @@ ok
 GET /v2/version
 ```
 
-该端点与 `/health` 一样不需要认证，供 daemon 自检、客户端连接卡片轮询和客户端版本一致性检测（开发构建 `DEV0.0.0`/`0.0.0` 不参与比较）。
+该端点与 `/health` 一样不需要认证，供 daemon 自检、客户端连接卡片轮询和客户端版本一致性检测（开发构建 `DEV0.0.0`/`0.0.0` 不参与比较）。匿名调用只返回 `name`、`version`、`historyEncryption`；`data_dir`、`workspace_root`、`workspace_roots` 仅在请求带有效设备签名（与其他接口相同的签名方式）时返回，`enable_auth = false` 时仅在请求满足上述本地 `Host`/`Origin` 条件时返回。签名无效或 nonce 重放不会报错，只按匿名处理，便于配对前探测。
 
 响应字段：
 
@@ -315,9 +315,9 @@ GET /v2/version
 | --- | --- | --- |
 | `name` | string | Cargo 包名 |
 | `version` | string | 构建时注入的应用版本；开发构建为 `DEV0.0.0` |
-| `data_dir` | string | 当前数据目录 |
-| `workspace_root` | string | 主 workspace 根目录（根列表第一项） |
-| `workspace_roots` | string[] | 全部已配置的 workspace 根目录 |
+| `data_dir` | string | 当前数据目录（仅鉴权后） |
+| `workspace_root` | string | 主 workspace 根目录（根列表第一项，仅鉴权后） |
+| `workspace_roots` | string[] | 全部已配置的 workspace 根目录（仅鉴权后） |
 | `historyEncryption` | number | 后端支持的历史加密版本（当前 `1`），见「历史加密密钥」 |
 
 ## Workspace 缓存同步与信任
@@ -1044,7 +1044,7 @@ TUI 配对二维码只携带后端地址、当前首选加密方式和服务端�
 | --- | --- |
 | `INVALID_REQUEST` | JSON 格式、字段或消息类型不符合当前协议。 |
 | `UNAUTHENTICATED` | `enable_auth` 开启时未提供有效设备签名（header 或 query 参数），或设备未注册/已吊销、时间戳超窗、nonce 重放。 |
-| `UNAUTHORIZED` | tenant 与认证上下文不匹配。 |
+| `UNAUTHORIZED` | tenant 与认证上下文不匹配；或 `enable_auth = false` 时请求的 `Host`/`Origin` 不是本地来源。 |
 | `UNSUPPORTED` | 请求能力不在当前后端支持范围。 |
 | `REMOTE_AUTH_FAILED` | SFTP/FTP 登录失败（HTTP 403）：提供密码，或先在终端登录以复用共享连接。 |
 | `REMOTE_HOST_KEY_UNVERIFIED` | 远程主机密钥未确认或已变化（HTTP 403）：先在 TodeX 终端中连接一次。 |

@@ -248,7 +248,7 @@ enable_tls = false
 ### HTTP Endpoints (`/v2`)
 
 - `GET /health`: Health status probe.
-- `GET /v2/version`: Returns daemon version, workspace root, and capabilities.
+- `GET /v2/version`: Returns daemon version and capabilities; signed requests also get the data directory and workspace roots.
 - `GET /v2/workspaces`: List cached workspaces for current tenant.
 - `PUT /v2/workspaces`: Merge workspace caches, return canonical workspace IDs, and automatically trust undecided directories within the backend workspace boundary.
 - `GET|PUT /v2/workspaces/{workspaceId}/trust`: Read or explicitly change owner-scoped execution trust. New workspaces are untrusted by default.

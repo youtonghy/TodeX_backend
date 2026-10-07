@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State, WebSocketUpgrade};
-use axum::http::{HeaderMap, Uri};
+use axum::http::{HeaderMap, Method, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -272,12 +272,27 @@ async fn skills(
     Ok(Json(state.catalog.skills(query.provider, workspace).await?))
 }
 
-/// Daemon self-checks and connection cards poll this without a token, matching
-/// the historical `/v1/version` contract. No workspace or file data is exposed.
-pub(super) async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
-    Json(VersionResponse {
-        name: env!("CARGO_PKG_NAME"),
-        version: crate::version::APP_VERSION,
+/// Daemon self-checks and connection cards poll this without a credential,
+/// matching the historical `/v1/version` contract. Anonymous callers only learn
+/// the name and versions; the data directory and workspace roots need a valid
+/// device signature (or, with auth disabled, a request from a local origin).
+/// An invalid or replayed signature is treated as anonymous rather than
+/// rejected so a probe before pairing still sees the daemon.
+pub(super) async fn version(
+    State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Json<VersionResponse> {
+    let trusted = if state.config.security.enable_auth {
+        state
+            .device_auth
+            .authenticate(&method, uri.path(), uri.query(), &headers, &[])
+            .is_ok()
+    } else {
+        device_auth::ensure_local_request(&headers, &uri).is_ok()
+    };
+    let paths = trusted.then(|| VersionPaths {
         data_dir: state.config.data_dir.display().to_string(),
         workspace_root: state.config.primary_workspace_root().display().to_string(),
         workspace_roots: state
@@ -286,6 +301,11 @@ pub(super) async fn version(State(state): State<AppState>) -> Json<VersionRespon
             .iter()
             .map(|root| root.display().to_string())
             .collect(),
+    });
+    Json(VersionResponse {
+        name: env!("CARGO_PKG_NAME"),
+        version: crate::version::APP_VERSION,
+        paths,
         history_encryption: HISTORY_ENCRYPTION_VERSION,
     })
 }
@@ -3614,13 +3634,20 @@ fn error_response(id: Option<String>, error: AppError) -> Value {
 pub(super) struct VersionResponse {
     name: &'static str,
     version: &'static str,
-    data_dir: String,
-    workspace_root: String,
-    workspace_roots: Vec<String>,
+    /// Omitted for anonymous callers.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    paths: Option<VersionPaths>,
     /// History crypto version this backend speaks; clients declare theirs
     /// with `historyEncryption` on `/v2/ws` and history requests.
     #[serde(rename = "historyEncryption")]
     history_encryption: u8,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct VersionPaths {
+    data_dir: String,
+    workspace_root: String,
+    workspace_roots: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5761,6 +5788,14 @@ mod tests {
         let version_body = to_bytes(version.into_body(), 1024 * 1024).await.unwrap();
         let version_json: serde_json::Value = serde_json::from_slice(&version_body).unwrap();
         assert_eq!(version_json["name"], "todex-agentd");
+        assert_eq!(
+            version_json["historyEncryption"],
+            HISTORY_ENCRYPTION_VERSION
+        );
+        // Paths are only for authenticated callers.
+        for field in ["data_dir", "workspace_root", "workspace_roots"] {
+            assert!(version_json.get(field).is_none(), "{field} leaked");
+        }
 
         // Workspace endpoints require a paired device signature.
         let unauthenticated = app
@@ -7738,6 +7773,176 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    async fn anonymous_test_state(root: &Path) -> AppState {
+        let mut state = auth_test_state(root).await;
+        Arc::make_mut(&mut state.config).security.enable_auth = false;
+        state
+    }
+
+    fn local_request(uri: &str, host: Option<&str>, origin: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(host) = host {
+            builder = builder.header("host", host);
+        }
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn anonymous_access_is_limited_to_loopback_host_and_local_origins() {
+        let root = std::env::temp_dir().join(format!("todex-v2-local-origin-{}", Uuid::new_v4()));
+        let app = crate::server::router(anonymous_test_state(&root).await);
+        let status = |host: Option<&'static str>, origin: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                app.oneshot(local_request("/v2/workspaces", host, origin))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        for (host, origin) in [
+            (Some("127.0.0.1:7345"), None),
+            (Some("localhost:7345"), Some("http://localhost:5173")),
+            (Some("[::1]:7345"), Some("http://[::1]:5173")),
+            (Some("127.0.0.1"), Some("https://127.0.0.1")),
+            // Electron `loadFile`: fetch sends `null`, WebSockets `file://`.
+            (Some("127.0.0.1:7345"), Some("null")),
+            (Some("127.0.0.1:7345"), Some("file://")),
+        ] {
+            assert_eq!(
+                status(host, origin).await,
+                StatusCode::OK,
+                "{host:?} {origin:?}"
+            );
+        }
+        for (host, origin) in [
+            // DNS rebinding: the attacker's name resolves to 127.0.0.1.
+            (Some("rebind.attacker.example:7345"), None),
+            (Some("192.168.1.20:7345"), None),
+            (None, None),
+            // Cross-site requests from a page the user has open.
+            (Some("127.0.0.1:7345"), Some("https://attacker.example")),
+            (
+                Some("127.0.0.1:7345"),
+                Some("http://localhost.attacker.example"),
+            ),
+            (Some("127.0.0.1:7345"), Some("chrome-extension://abcdef")),
+            (Some("127.0.0.1:7345"), Some("not an origin")),
+        ] {
+            assert_eq!(
+                status(host, origin).await,
+                StatusCode::FORBIDDEN,
+                "{host:?} {origin:?}"
+            );
+        }
+
+        // `/v2/version` stays reachable but only local callers see paths.
+        let version = |host: &'static str, origin: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(local_request("/v2/version", Some(host), origin))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                serde_json::from_slice::<Value>(
+                    &to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+                )
+                .unwrap()
+            }
+        };
+        assert!(version("127.0.0.1:7345", None).await["data_dir"].is_string());
+        let foreign = version("rebind.attacker.example:7345", None).await;
+        assert_eq!(foreign["name"], "todex-agentd");
+        assert!(foreign.get("data_dir").is_none());
+        assert!(version("127.0.0.1:7345", Some("https://attacker.example"))
+            .await
+            .get("workspace_roots")
+            .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anonymous_websocket_rejects_cross_site_origins() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let root = std::env::temp_dir().join(format!("todex-v2-ws-origin-{}", Uuid::new_v4()));
+        let app = crate::server::router(anonymous_test_state(&root).await);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let connect = |origin: &'static str| async move {
+            let mut request = format!("ws://{addr}/v2/ws").into_client_request().unwrap();
+            request
+                .headers_mut()
+                .insert("origin", origin.parse().unwrap());
+            tokio_tungstenite::connect_async(request).await
+        };
+        assert!(connect("https://attacker.example").await.is_err());
+        let (mut ws, _) = connect("null").await.unwrap();
+        let _ = ws.close(None).await;
+        let (mut ws, _) = connect("http://localhost:5173").await.unwrap();
+        let _ = ws.close(None).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn credentials_are_checked_before_the_body_is_read() {
+        let root = std::env::temp_dir().join(format!("todex-v2-auth-body-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let device = enroll(&root.join("data"));
+        let app = crate::server::router(state);
+        // Reading this body fails, which the middleware would report as
+        // INVALID_REQUEST; UNAUTHENTICATED proves it was never polled.
+        let unread_body = || {
+            Body::from_stream(futures_util::stream::once(async {
+                Err::<axum::body::Bytes, std::io::Error>(std::io::Error::other(
+                    "body must not be read before the credential check",
+                ))
+            }))
+        };
+        let anonymous = Request::post("/v2/git/run")
+            .header("content-type", "application/json")
+            .body(unread_body())
+            .unwrap();
+        let response = app.clone().oneshot(anonymous).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let stranger = TestDevice::new(42);
+        let mut unknown_device = Request::post("/v2/git/run")
+            .header("content-type", "application/json")
+            .body(unread_body())
+            .unwrap();
+        for (name, value) in stranger.sign("POST", "/v2/git/run", b"{}") {
+            unknown_device
+                .headers_mut()
+                .insert(name, value.parse().unwrap());
+        }
+        let response = app.clone().oneshot(unknown_device).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // A registered device gets past the credential check, so its body is
+        // read (and here fails to read).
+        let mut registered = Request::post("/v2/git/run")
+            .header("content-type", "application/json")
+            .body(unread_body())
+            .unwrap();
+        for (name, value) in device.sign("POST", "/v2/git/run", b"{}") {
+            registered
+                .headers_mut()
+                .insert(name, value.parse().unwrap());
+        }
+        let response = app.oneshot(registered).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

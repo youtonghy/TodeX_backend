@@ -239,7 +239,7 @@ enable_tls = false
 ### HTTP 接口 (`/v2`)
 
 - `GET /health`：服务健康检查。
-- `GET /v2/version`：获取服务端版本号、工作区根目录与支持能力。
+- `GET /v2/version`：获取服务端版本号与支持能力；带设备签名的请求另外返回数据目录与工作区根目录。
 - `GET /v2/workspaces`：获取当前租户已缓存的工作区列表。
 - `PUT /v2/workspaces`：合并当前租户的工作区缓存、返回统一的工作区 ID，并自动信任位于后端工作区范围内且尚未做过信任决定的目录。
 - `GET|PUT /v2/workspaces/{workspaceId}/trust`：读取或显式修改按租户隔离的执行信任；新工作区默认不信任。
