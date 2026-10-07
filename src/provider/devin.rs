@@ -16,20 +16,25 @@ use super::acp::{
     AcpRuntimeOptions, FORK_PROBE_TTL, INTERACTIVE_AUTH_TIMEOUT,
 };
 use super::process::{executable_available, redact_sensitive_text, CommandSpec, JsonLineProcess};
+use super::profile::{
+    CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
+    ProviderProfile, SkillInjection, UserConfigFile,
+};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PendingProviderControl, ProviderCapabilities, ProviderCommandDescriptor, ProviderControl,
-    ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
+    PendingProviderControl, PermissionConfigCapabilities, ProviderCapabilities,
+    ProviderCommandDescriptor, ProviderControl, ProviderDescriptor, ProviderDriver,
+    ProviderModelDescriptor,
 };
 
-const MAX_DEVIN_SESSIONS: usize = 32;
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_DEVIN_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
+const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_DRAIN: Duration = Duration::from_millis(1500);
 /// Model/command discovery spawns an authenticated probe process; cache it so
 /// routine client refreshes do not re-authenticate on every query.
-const DISCOVERY_TTL: Duration = Duration::from_secs(300);
+const DISCOVERY_TTL: Duration = PROFILE.discovery_cache_ttl.unwrap();
 /// A sweep cut short by its budget is still cached briefly: re-probing on every
 /// query made each request pay the full ~17s probe under load, while a short
 /// lifetime still lets a later query fill in the missing thinking levels.
@@ -65,6 +70,58 @@ impl DiscoverySnapshot {
         self.fetched_at.elapsed() < ttl
     }
 }
+
+/// What Devin supports and how TodeX adapts to it.
+pub(super) const PROFILE: ProviderProfile = ProviderProfile {
+    kind: ProviderKind::Devin,
+    display_name: "Devin",
+    permission_config: PermissionConfigCapabilities {
+        modes: &["ask", "full-access"],
+        default_mode: "ask",
+        supports_plan: true,
+        sandbox_modes: &[],
+        approval_policies: &[],
+        permission_profiles: &[],
+        enforcement: "agent-policy",
+        description: "Devin session modes over ACP: manual approval (accept-edits) / bypass, plus plan work mode; enforced by the agent, not an operating-system sandbox",
+    },
+    native_fork: false,
+    native_compact: false,
+    native_resume: true,
+    cancel: true,
+    permissions: true,
+    tool_events: true,
+    native_skills: true,
+    native_mcp: true,
+    model_selection: true,
+    image_input: true,
+    image_input_mode: ImageInputMode::Always,
+    mcp_injection: McpInjection::AcpServers,
+    skill_injection: SkillInjection::PromptText,
+    file_attachments: FileAttachmentStyle::AtMention,
+    profile_required: false,
+    recovery_full_scan: false,
+    process_model: ProcessModel::Resident {
+        idle: Some(Duration::from_secs(300)),
+        max_sessions: 32,
+    },
+    discovery_cache_ttl: Some(Duration::from_secs(300)),
+    catalog: CatalogProfile {
+        source: CatalogSource::Filesystem,
+        config_home: ConfigHome {
+            env: None,
+            home_relative: ".config/devin",
+        },
+        project_skills: ".devin/skills",
+        mcp_user_files: &[
+            UserConfigFile::ConfigHome("mcp_config.json"),
+            UserConfigFile::ConfigHome("mcp_config.local.json"),
+        ],
+        mcp_project_files: &[".devin/mcp_config.json", ".devin/mcp_config.local.json"],
+        mcp_user_source: "devin-user",
+        mcp_project_source: "devin-project",
+    },
+};
 
 pub struct DevinDriver {
     binary: String,
@@ -496,7 +553,7 @@ impl ProviderDriver for DevinDriver {
         let available = executable_available(&self.binary);
         ProviderDescriptor {
             id: ProviderKind::Devin,
-            display_name: "Devin",
+            display_name: PROFILE.display_name,
             available,
             unavailable_reason: (!available).then(|| {
                 format!(
@@ -506,21 +563,8 @@ impl ProviderDriver for DevinDriver {
             }),
             profiles: Vec::new(),
             capabilities: ProviderCapabilities {
-                permission_config: super::types::permission_config_capabilities(
-                    ProviderKind::Devin,
-                ),
                 native_fork: self.supports_native_fork(),
-                native_compact: false,
-                native_resume: true,
-                cancel: true,
-                permissions: true,
-                tool_events: true,
-                native_skills: true,
-                native_mcp: true,
-                managed_mcp: false,
-                model_selection: true,
-                image_input: ProviderKind::Devin.supports_image_input(),
-                image_input_mode: ImageInputMode::Always,
+                ..PROFILE.capabilities()
             },
             models: Vec::new(),
         }

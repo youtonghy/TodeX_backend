@@ -14,10 +14,63 @@ use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
+use super::profile::{
+    CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
+    ProviderProfile, SkillInjection, UserConfigFile,
+};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PermissionDecision, PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor,
+    PermissionConfigCapabilities, PermissionDecision, PermissionOutcome, ProviderCommandDescriptor,
     ProviderDescriptor, ProviderDriver, ProviderSessionCommands,
+};
+
+/// What Claude Code supports and how TodeX adapts to it.
+pub(super) const PROFILE: ProviderProfile = ProviderProfile {
+    kind: ProviderKind::ClaudeCode,
+    display_name: "Claude Code",
+    permission_config: PermissionConfigCapabilities {
+        modes: &["ask", "auto", "full-access"],
+        default_mode: "ask",
+        supports_plan: true,
+        sandbox_modes: &["read-only", "workspace-write", "danger-full-access"],
+        approval_policies: &["on-request", "never"],
+        permission_profiles: &["read-only", "workspace-write", "danger-full-access"],
+        enforcement: "agent-policy",
+        description: "Claude default / auto / bypassPermissions and independent plan mode; not an operating-system sandbox. Legacy combinations remain validated.",
+    },
+    native_fork: true,
+    native_compact: false,
+    native_resume: true,
+    cancel: true,
+    permissions: true,
+    tool_events: true,
+    native_skills: true,
+    native_mcp: true,
+    model_selection: true,
+    image_input: true,
+    image_input_mode: ImageInputMode::Always,
+    mcp_injection: McpInjection::ClaudeArgs,
+    skill_injection: SkillInjection::PromptText,
+    file_attachments: FileAttachmentStyle::AtMention,
+    profile_required: false,
+    recovery_full_scan: false,
+    process_model: ProcessModel::PerTurn,
+    discovery_cache_ttl: None,
+    catalog: CatalogProfile {
+        source: CatalogSource::Filesystem,
+        config_home: ConfigHome {
+            env: None,
+            home_relative: ".claude",
+        },
+        project_skills: ".claude/skills",
+        mcp_user_files: &[
+            UserConfigFile::Home(".claude.json"),
+            UserConfigFile::Home(".claude/settings.json"),
+        ],
+        mcp_project_files: &[".mcp.json", ".claude/settings.json"],
+        mcp_user_source: "claude-user",
+        mcp_project_source: "claude-project",
+    },
 };
 
 pub struct ClaudeDriver {
@@ -364,28 +417,12 @@ impl ProviderDriver for ClaudeDriver {
         let available = executable_available(&self.binary);
         ProviderDescriptor {
             id: ProviderKind::ClaudeCode,
-            display_name: "Claude Code",
+            display_name: PROFILE.display_name,
             available,
             unavailable_reason: (!available)
                 .then(|| format!("executable '{}' was not found", self.binary)),
             profiles: Vec::new(),
-            capabilities: ProviderCapabilities {
-                permission_config: super::types::permission_config_capabilities(
-                    ProviderKind::ClaudeCode,
-                ),
-                native_fork: true,
-                native_compact: false,
-                native_resume: true,
-                cancel: true,
-                permissions: true,
-                tool_events: true,
-                native_skills: true,
-                native_mcp: true,
-                managed_mcp: true,
-                model_selection: true,
-                image_input: ProviderKind::ClaudeCode.supports_image_input(),
-                image_input_mode: ImageInputMode::Always,
-            },
+            capabilities: PROFILE.capabilities(),
             models: claude_model_aliases(),
         }
     }
@@ -627,7 +664,8 @@ impl ProviderDriver for ClaudeDriver {
             spec.push_flag_value("--effort", effort)?;
         }
         if let Some(launch) = &context.agent_mcp {
-            spec.args.extend(launch.claude_args().await?);
+            spec.args
+                .extend(super::mcp_injection::claude_args(launch).await?);
         }
 
         let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;

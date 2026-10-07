@@ -7,7 +7,8 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const IDLE_TIMEOUT: Duration = super::PROFILE.process_model.idle_timeout().unwrap();
+const MAX_WORKERS: usize = super::PROFILE.process_model.max_sessions().unwrap();
 
 pub(super) struct Sessions {
     workers: Mutex<HashMap<String, mpsc::Sender<Command>>>,
@@ -39,7 +40,7 @@ impl Sessions {
         let sender = {
             let mut workers = self.workers.lock().await;
             workers.retain(|_, worker| !worker.is_closed());
-            if workers.len() >= 64 && !workers.contains_key(&id) {
+            if workers.len() >= MAX_WORKERS && !workers.contains_key(&id) {
                 return Err(AppError::Unsupported(
                     "Codex has reached the active worker limit; close an idle session first"
                         .to_owned(),

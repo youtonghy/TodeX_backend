@@ -15,14 +15,58 @@ use super::acp::{run_acp_turn_controlled, AcpConnectionState, AcpRuntimeOptions}
 use super::process::{
     executable_available, redact_sensitive_text, run_bounded_command, CommandSpec, JsonLineProcess,
 };
+use super::profile::{
+    CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
+    ProviderProfile, SkillInjection,
+};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PendingProviderControl, ProviderCapabilities, ProviderCommandDescriptor, ProviderControl,
-    ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
+    PendingProviderControl, PermissionConfigCapabilities, ProviderCommandDescriptor,
+    ProviderControl, ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
 };
 
 const INSPECT_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_GROK_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
+const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
+
+/// What Grok Build supports and how TodeX adapts to it.
+pub(super) const PROFILE: ProviderProfile = ProviderProfile {
+    kind: ProviderKind::GrokBuild,
+    display_name: "Grok Build",
+    permission_config: PermissionConfigCapabilities::unsupported(&["ask"]),
+    native_fork: true,
+    native_compact: false,
+    native_resume: true,
+    cancel: true,
+    permissions: true,
+    tool_events: true,
+    native_skills: true,
+    native_mcp: true,
+    model_selection: true,
+    image_input: true,
+    image_input_mode: ImageInputMode::Always,
+    mcp_injection: McpInjection::AcpServers,
+    skill_injection: SkillInjection::PromptText,
+    file_attachments: FileAttachmentStyle::AtMention,
+    profile_required: false,
+    recovery_full_scan: false,
+    process_model: ProcessModel::Resident {
+        idle: Some(Duration::from_secs(300)),
+        max_sessions: 32,
+    },
+    discovery_cache_ttl: None,
+    catalog: CatalogProfile {
+        source: CatalogSource::NativeInspect,
+        ..CatalogProfile::skills_only(
+            ConfigHome {
+                env: Some("GROK_HOME"),
+                home_relative: ".grok",
+            },
+            ".grok/skills",
+        )
+    },
+};
 
 pub struct GrokBuildDriver {
     binary: String,
@@ -221,7 +265,7 @@ impl ProviderDriver for GrokBuildDriver {
         let available = executable_available(&self.binary);
         ProviderDescriptor {
             id: ProviderKind::GrokBuild,
-            display_name: "Grok Build",
+            display_name: PROFILE.display_name,
             available,
             unavailable_reason: (!available).then(|| {
                 format!(
@@ -230,23 +274,7 @@ impl ProviderDriver for GrokBuildDriver {
                 )
             }),
             profiles: Vec::new(),
-            capabilities: ProviderCapabilities {
-                permission_config: super::types::permission_config_capabilities(
-                    ProviderKind::GrokBuild,
-                ),
-                native_fork: true,
-                native_compact: false,
-                native_resume: true,
-                cancel: true,
-                permissions: true,
-                tool_events: true,
-                native_skills: true,
-                native_mcp: true,
-                managed_mcp: false,
-                model_selection: true,
-                image_input: ProviderKind::GrokBuild.supports_image_input(),
-                image_input_mode: ImageInputMode::Always,
-            },
+            capabilities: PROFILE.capabilities(),
             models: Vec::new(),
         }
     }
@@ -308,11 +336,10 @@ impl ProviderDriver for GrokBuildDriver {
                 }
                 handle.clone()
             } else {
-                if sessions.len() >= 32 {
-                    return Err(AppError::ProviderUnavailable(
-                        "Grok resident session limit reached (32); close an idle session"
-                            .to_owned(),
-                    ));
+                if sessions.len() >= MAX_GROK_SESSIONS {
+                    return Err(AppError::ProviderUnavailable(format!(
+                        "Grok resident session limit reached ({MAX_GROK_SESSIONS}); close an idle session"
+                    )));
                 }
                 let (turns, turn_rx) = mpsc::channel(1);
                 let (controls, control_rx) = mpsc::channel(16);
@@ -389,7 +416,7 @@ async fn run_session_actor(
     let mut process: Option<JsonLineProcess> = None;
     let mut connection = AcpConnectionState::default();
     let mut last_sink: Option<DriverEventSink> = None;
-    let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let mut idle_deadline = tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT;
     loop {
         let request = tokio::select! {
             request = turns.recv() => match request { Some(request) => request, None => break },
@@ -460,7 +487,7 @@ async fn run_session_actor(
         if !reusable {
             break;
         }
-        idle_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        idle_deadline = tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT;
     }
     turns.close();
     controls.close();

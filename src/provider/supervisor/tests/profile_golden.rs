@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::provider::golden_support::assert_golden;
+use crate::provider::profile::McpInjection;
 
 const MISSING_BIN: &str = "/nonexistent/todex-golden";
 const ACP_PROFILE: &str = "golden";
@@ -93,7 +94,7 @@ fn error_text(error: AppError) -> Value {
 #[tokio::test]
 async fn providers_snapshot_matches_golden() {
     let (root, _workspace, supervisor) = golden_supervisor("todex-golden-providers", None).await;
-    let providers = supervisor.providers_snapshot().await.unwrap();
+    let providers = serde_json::to_value(supervisor.providers_snapshot().await).unwrap();
     // `/v2/providers` lists every kind once, in `ProviderKind` order.
     let ids: Vec<_> = providers
         .as_array()
@@ -178,8 +179,29 @@ async fn agent_mcp_injection_matrix_is_frozen() {
     for (provider, format) in MCP_INJECTION {
         let launch = supervisor.agent_mcp_for(provider, "conv_golden").await;
         assert_eq!(launch.is_some(), format.is_some(), "{provider:?}");
+        let declared = match profile(provider).mcp_injection {
+            McpInjection::None => None,
+            McpInjection::CodexConfig => Some("codex-config"),
+            McpInjection::AcpServers => Some("acp-servers"),
+            McpInjection::ClaudeArgs => Some("claude-args"),
+        };
+        assert_eq!(declared, format, "{provider:?}");
     }
     let _ = fs::remove_dir_all(root);
+}
+
+/// `managedMcp` used to be a hand-written flag that contradicted injection
+/// (Pi claimed it, ACP agents did not). It now follows the injection matrix;
+/// this is the only intended change to `providers.json`.
+#[test]
+fn managed_mcp_reports_actual_injection() {
+    for (provider, format) in MCP_INJECTION {
+        assert_eq!(
+            profile(provider).capabilities().managed_mcp,
+            format.is_some(),
+            "{provider:?}"
+        );
+    }
 }
 
 /// The supervisor's provider-specific decisions, one row per provider.

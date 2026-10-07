@@ -95,7 +95,7 @@ pub fn supported_agent(value: &str) -> Result<ProviderKind, AppError> {
 }
 
 fn is_additive(agent: ProviderKind) -> bool {
-    matches!(agent, ProviderKind::Pi | ProviderKind::Opencode)
+    matches!(projection(agent), Some(ConfigProjection::Additive(_)))
 }
 
 /// Per-agent config directories, resolved per call so environment overrides
@@ -488,7 +488,7 @@ impl AgentProviderService {
                         backfilled = self.store.backfill_settings(agent, old_id, live).await?;
                     }
                 }
-                let remove_auth = matches!(agent, ProviderKind::Codex | ProviderKind::GrokBuild)
+                let remove_auth = exclusive(agent)?.has_auth_file()
                     && !auth_config::has_auth(&profile.settings_config)
                     && backfilled;
                 write_live(&dirs, agent, &profile.settings_config, remove_auth)?;
@@ -718,18 +718,113 @@ impl AgentProviderService {
     }
 }
 
-// ---------- per-agent live dispatch ----------
+// ---------- native config projection ----------
 
-fn read_live(dirs: &AgentDirs, agent: ProviderKind) -> Result<Option<Value>, AppError> {
+/// How the store is projected into an agent's native config files.
+#[derive(Clone, Copy)]
+enum ConfigProjection {
+    /// One profile is live at a time; activating it rewrites the native files.
+    Exclusive(&'static dyn ExclusiveProjection),
+    /// Every profile lives side by side in the native config; activating one
+    /// only moves the default selection.
+    Additive(&'static dyn AdditiveProjection),
+}
+
+impl ConfigProjection {
+    /// `(base_url, api_key)` for a stored profile's settingsConfig.
+    fn endpoint_credentials(self, settings: &Value) -> (Option<String>, Option<String>) {
+        match self {
+            Self::Exclusive(projection) => projection.endpoint_credentials(settings),
+            Self::Additive(projection) => projection.endpoint_credentials(settings),
+        }
+    }
+}
+
+/// An exclusive agent's live config (Claude, Codex, Grok Build).
+trait ExclusiveProjection: Sync {
+    /// The live config as one `settingsConfig` blob; `None` when absent.
+    fn read_live(&self, dirs: &AgentDirs) -> Result<Option<Value>, AppError>;
+    fn write_live(
+        &self,
+        dirs: &AgentDirs,
+        settings: &Value,
+        remove_auth: bool,
+    ) -> Result<(), AppError>;
+    /// Whether the live config still matches `settings`.
+    fn live_matches(&self, live: &Value, settings: &Value) -> bool;
+    /// Whether credentials live in a separate auth file that switching to a
+    /// profile without credentials may remove.
+    fn has_auth_file(&self) -> bool {
+        false
+    }
+    /// Adjusts `settings` before rewriting the live files for an unchanged
+    /// profile.
+    fn carry_live_auth(
+        &self,
+        _dirs: &AgentDirs,
+        _settings: &mut Value,
+        _stored: &Value,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn masked_settings(&self, settings: &Value) -> Value {
+        mask_json_secrets(settings.clone())
+    }
+    /// TOML tables holding literal header values, for agents whose `config`
+    /// is a TOML document.
+    fn toml_header_tables(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+    fn endpoint_credentials(&self, settings: &Value) -> (Option<String>, Option<String>);
+}
+
+/// An additive agent's provider table (Pi, OpenCode).
+trait AdditiveProjection: Sync {
+    fn provider_nodes(&self, dirs: &AgentDirs) -> Result<Map<String, Value>, AppError>;
+    fn upsert_provider(&self, dirs: &AgentDirs, id: &str, node: &Value) -> Result<(), AppError>;
+    fn remove_provider(&self, dirs: &AgentDirs, id: &str) -> Result<(), AppError>;
+    fn set_default(&self, dirs: &AgentDirs, id: &str, model_id: &str) -> Result<(), AppError>;
+    /// `{providerId, modelId}` of the native default selection, or null.
+    fn default_selection(&self, dirs: &AgentDirs) -> Result<Value, AppError>;
+    /// First declared model id inside a provider node.
+    fn first_model_id(&self, node: &Value) -> Option<String>;
+    fn endpoint_credentials(&self, node: &Value) -> (Option<String>, Option<String>);
+}
+
+/// The projection of `agent`; `None` for agents without managed providers.
+fn projection(agent: ProviderKind) -> Option<ConfigProjection> {
     match agent {
-        ProviderKind::ClaudeCode => claude::read_live(dirs),
-        ProviderKind::Codex => codex::read_live(dirs),
-        ProviderKind::GrokBuild => grok::read_live(dirs),
+        ProviderKind::ClaudeCode => Some(ConfigProjection::Exclusive(&claude::Projection)),
+        ProviderKind::Codex => Some(ConfigProjection::Exclusive(&codex::Projection)),
+        ProviderKind::GrokBuild => Some(ConfigProjection::Exclusive(&grok::Projection)),
+        ProviderKind::Opencode => Some(ConfigProjection::Additive(&opencode::Projection)),
+        ProviderKind::Pi => Some(ConfigProjection::Additive(&pi::Projection)),
+        ProviderKind::Acp | ProviderKind::Devin => None,
+    }
+}
+
+fn exclusive(agent: ProviderKind) -> Result<&'static dyn ExclusiveProjection, AppError> {
+    match projection(agent) {
+        Some(ConfigProjection::Exclusive(projection)) => Ok(projection),
         _ => Err(AppError::Unsupported(format!(
             "{} is not an exclusive-mode agent",
             agent.as_str()
         ))),
     }
+}
+
+fn additive(agent: ProviderKind) -> Result<&'static dyn AdditiveProjection, AppError> {
+    match projection(agent) {
+        Some(ConfigProjection::Additive(projection)) => Ok(projection),
+        _ => Err(AppError::Unsupported(format!(
+            "{} is not an additive-mode agent",
+            agent.as_str()
+        ))),
+    }
+}
+
+fn read_live(dirs: &AgentDirs, agent: ProviderKind) -> Result<Option<Value>, AppError> {
+    exclusive(agent)?.read_live(dirs)
 }
 
 fn write_live(
@@ -738,26 +833,11 @@ fn write_live(
     settings: &Value,
     remove_auth: bool,
 ) -> Result<(), AppError> {
-    match agent {
-        ProviderKind::ClaudeCode => claude::write_live(dirs, settings),
-        ProviderKind::Codex => codex::write_live(dirs, settings, remove_auth),
-        ProviderKind::GrokBuild => grok::write_live(dirs, settings, remove_auth),
-        _ => Err(AppError::Unsupported(format!(
-            "{} is not an exclusive-mode agent",
-            agent.as_str()
-        ))),
-    }
+    exclusive(agent)?.write_live(dirs, settings, remove_auth)
 }
 
 fn additive_nodes(dirs: &AgentDirs, agent: ProviderKind) -> Result<Map<String, Value>, AppError> {
-    match agent {
-        ProviderKind::Opencode => opencode::provider_nodes(dirs),
-        ProviderKind::Pi => pi::provider_nodes(dirs),
-        _ => Err(AppError::Unsupported(format!(
-            "{} is not an additive-mode agent",
-            agent.as_str()
-        ))),
-    }
+    additive(agent)?.provider_nodes(dirs)
 }
 
 fn additive_upsert(
@@ -766,25 +846,11 @@ fn additive_upsert(
     id: &str,
     node: &Value,
 ) -> Result<(), AppError> {
-    match agent {
-        ProviderKind::Opencode => opencode::upsert_provider(dirs, id, node),
-        ProviderKind::Pi => pi::upsert_provider(dirs, id, node),
-        _ => Err(AppError::Unsupported(format!(
-            "{} is not an additive-mode agent",
-            agent.as_str()
-        ))),
-    }
+    additive(agent)?.upsert_provider(dirs, id, node)
 }
 
 fn additive_remove(dirs: &AgentDirs, agent: ProviderKind, id: &str) -> Result<(), AppError> {
-    match agent {
-        ProviderKind::Opencode => opencode::remove_provider(dirs, id),
-        ProviderKind::Pi => pi::remove_provider(dirs, id),
-        _ => Err(AppError::Unsupported(format!(
-            "{} is not an additive-mode agent",
-            agent.as_str()
-        ))),
-    }
+    additive(agent)?.remove_provider(dirs, id)
 }
 
 fn additive_set_default(
@@ -793,75 +859,33 @@ fn additive_set_default(
     id: &str,
     model_id: &str,
 ) -> Result<(), AppError> {
-    match agent {
-        ProviderKind::Opencode => opencode::set_default(dirs, id, model_id),
-        ProviderKind::Pi => pi::set_default(dirs, id, model_id),
-        _ => Err(AppError::Unsupported(format!(
-            "{} is not an additive-mode agent",
-            agent.as_str()
-        ))),
-    }
+    additive(agent)?.set_default(dirs, id, model_id)
 }
 
 /// `{providerId, modelId}` of the native default selection.
 fn additive_selection(dirs: &AgentDirs, agent: ProviderKind) -> Result<Value, AppError> {
-    match agent {
-        ProviderKind::Opencode => {
-            let selection = opencode::default_selection(dirs)?;
-            Ok(match selection {
-                Some((provider, model)) => {
-                    json!({ "providerId": provider, "modelId": model })
-                }
-                None => Value::Null,
-            })
-        }
-        ProviderKind::Pi => {
-            let (provider, model) = pi::default_selection(dirs)?;
-            Ok(match provider {
-                Some(provider) => json!({ "providerId": provider, "modelId": model }),
-                None => Value::Null,
-            })
-        }
-        _ => Err(AppError::Unsupported(format!(
-            "{} is not an additive-mode agent",
-            agent.as_str()
-        ))),
-    }
+    additive(agent)?.default_selection(dirs)
 }
 
 fn additive_first_model(agent: ProviderKind, node: &Value) -> Option<String> {
-    match agent {
-        ProviderKind::Opencode => opencode::first_model_id(node),
-        ProviderKind::Pi => pi::first_model_id(node),
-        _ => None,
-    }
+    additive(agent).ok()?.first_model_id(node)
 }
 
 /// Whether the exclusive live config still matches the current profile.
 fn live_matches(agent: ProviderKind, live: &Value, settings: &Value) -> bool {
-    match agent {
-        ProviderKind::ClaudeCode => live == settings,
-        ProviderKind::Codex => {
-            auth_config::auth_matches(live, settings) && auth_config::config_matches(live, settings)
-        }
-        ProviderKind::GrokBuild => grok::live_matches(live, settings),
-        _ => false,
-    }
+    exclusive(agent).is_ok_and(|projection| projection.live_matches(live, settings))
 }
 
-/// Grok Build refreshes session tokens inside `auth.json` in the background;
-/// rewriting the live files for an unchanged profile keeps the live tokens of
-/// the same account instead of restoring the stored (possibly rotated) ones.
 fn carry_live_auth(
     dirs: &AgentDirs,
     agent: ProviderKind,
     settings: &mut Value,
     stored: &Value,
 ) -> Result<(), AppError> {
-    if agent == ProviderKind::GrokBuild {
-        grok::carry_live_auth(settings, stored, read_live(dirs, agent)?.as_ref());
+    match exclusive(agent) {
+        Ok(projection) => projection.carry_live_auth(dirs, settings, stored),
+        Err(_) => Ok(()),
     }
-    Ok(())
 }
 
 // ---------- secret masking ----------
@@ -910,21 +934,16 @@ fn mask_json_secrets_in_place(item: &mut Value) {
 }
 
 fn mask_agent_settings(agent: ProviderKind, settings: &Value) -> Value {
-    match agent {
-        ProviderKind::Codex => codex::masked_settings(settings),
-        ProviderKind::GrokBuild => grok::masked_settings(settings),
-        _ => mask_json_secrets(settings.clone()),
+    match exclusive(agent) {
+        Ok(projection) => projection.masked_settings(settings),
+        Err(_) => mask_json_secrets(settings.clone()),
     }
 }
 
 /// TOML tables holding literal header values for agents whose `config` is a
 /// TOML document; `None` for agents without one.
 fn toml_header_tables(agent: ProviderKind) -> Option<&'static [&'static str]> {
-    match agent {
-        ProviderKind::Codex => Some(codex::HEADER_TABLES),
-        ProviderKind::GrokBuild => Some(grok::HEADER_TABLES),
-        _ => None,
-    }
+    exclusive(agent).ok()?.toml_header_tables()
 }
 
 fn masked_profile(agent: ProviderKind, profile: &AgentProviderProfile) -> Value {

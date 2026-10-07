@@ -8,8 +8,6 @@ use std::time::Duration;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
 
-use super::{codex, grok, opencode, pi};
-
 const MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MODELS: usize = 500;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,27 +33,9 @@ pub(crate) fn http_client() -> Result<&'static reqwest::Client, AppError> {
 
 /// `(base_url, api_key)` for a stored profile's settingsConfig.
 fn endpoint_credentials(agent: ProviderKind, settings: &Value) -> (Option<String>, Option<String>) {
-    match agent {
-        ProviderKind::Codex => codex::endpoint_credentials(settings),
-        ProviderKind::GrokBuild => grok::endpoint_credentials(settings),
-        ProviderKind::Opencode => opencode::endpoint_credentials(settings),
-        ProviderKind::Pi => pi::endpoint_credentials(settings),
-        ProviderKind::ClaudeCode => {
-            let env = settings.get("env");
-            (
-                env.and_then(|env| env.get("ANTHROPIC_BASE_URL"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                env.and_then(|env| {
-                    env.get("ANTHROPIC_AUTH_TOKEN")
-                        .or_else(|| env.get("ANTHROPIC_API_KEY"))
-                })
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            )
-        }
-        _ => (None, None),
-    }
+    super::projection(agent)
+        .map(|projection| projection.endpoint_credentials(settings))
+        .unwrap_or((None, None))
 }
 
 fn models_url(agent: ProviderKind, base_url: &str) -> String {

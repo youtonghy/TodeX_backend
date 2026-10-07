@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::config::Config;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
+use crate::provider::profile::{CatalogProfile, CatalogSource, UserConfigFile};
 
 const MAX_SKILL_BYTES: u64 = 256 * 1024;
 const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
@@ -156,13 +157,31 @@ impl CatalogService {
         Self { config, home }
     }
 
+    /// The catalog a [`CatalogSource::NativeInspect`] CLI reports about
+    /// itself (only Grok Build has one).
+    async fn native_inspect(
+        &self,
+        provider: ProviderKind,
+        workspace: &Path,
+    ) -> Result<Value, AppError> {
+        match provider {
+            ProviderKind::GrokBuild => {
+                crate::provider::inspect_grok(&self.config.agent, workspace).await
+            }
+            other => Err(AppError::Unsupported(format!(
+                "{} has no native catalog inspection",
+                other.as_str()
+            ))),
+        }
+    }
+
     pub async fn skills(
         &self,
         provider: ProviderKind,
         workspace: PathBuf,
     ) -> Result<SkillCatalog, AppError> {
-        if provider == ProviderKind::GrokBuild {
-            let inspect = crate::provider::inspect_grok(&self.config.agent, &workspace).await?;
+        if catalog_profile(provider).source == CatalogSource::NativeInspect {
+            let inspect = self.native_inspect(provider, &workspace).await?;
             return Ok(SkillCatalog {
                 provider,
                 skills: parse_grok_skills(&inspect, &workspace),
@@ -211,8 +230,8 @@ impl CatalogService {
         provider: ProviderKind,
         workspace: PathBuf,
     ) -> Result<McpCatalog, AppError> {
-        if provider == ProviderKind::GrokBuild {
-            let inspect = crate::provider::inspect_grok(&self.config.agent, &workspace).await?;
+        if catalog_profile(provider).source == CatalogSource::NativeInspect {
+            let inspect = self.native_inspect(provider, &workspace).await?;
             return Ok(McpCatalog {
                 provider,
                 servers: parse_grok_mcp(&inspect, &workspace),
@@ -234,10 +253,11 @@ impl CatalogService {
         workspace: PathBuf,
         resource_id: &str,
     ) -> Result<McpRuntimeTarget, AppError> {
-        if provider == ProviderKind::GrokBuild {
-            return Err(AppError::Unsupported(
-                "Grok Build MCP servers are invoked natively during provider sessions".to_owned(),
-            ));
+        if catalog_profile(provider).source == CatalogSource::NativeInspect {
+            return Err(AppError::Unsupported(format!(
+                "{} MCP servers are invoked natively during provider sessions",
+                crate::provider::profile::profile(provider).display_name
+            )));
         }
         let catalog = self.mcp(provider, workspace.clone()).await?;
         let descriptor = catalog
@@ -358,37 +378,19 @@ fn skill_roots(home: Option<&Path>, workspace: &Path, provider: ProviderKind) ->
     deduplicate_roots(roots)
 }
 
+fn catalog_profile(provider: ProviderKind) -> &'static CatalogProfile {
+    &crate::provider::profile::profile(provider).catalog
+}
+
 fn provider_user_skill_root(home: &Path, provider: ProviderKind) -> PathBuf {
-    match provider {
-        ProviderKind::Acp => home.join(".agents/skills"),
-        ProviderKind::Codex => std::env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".codex"))
-            .join("skills"),
-        ProviderKind::Pi => std::env::var_os("PI_CODING_AGENT_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".pi/agent"))
-            .join("skills"),
-        ProviderKind::ClaudeCode => home.join(".claude/skills"),
-        ProviderKind::GrokBuild => std::env::var_os("GROK_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".grok"))
-            .join("skills"),
-        ProviderKind::Devin => home.join(".config/devin/skills"),
-        ProviderKind::Opencode => home.join(".config/opencode/skills"),
-    }
+    catalog_profile(provider)
+        .config_home
+        .resolve(home)
+        .join("skills")
 }
 
 fn provider_project_skill_root(workspace: &Path, provider: ProviderKind) -> PathBuf {
-    match provider {
-        ProviderKind::Acp => workspace.join(".agents/skills"),
-        ProviderKind::Codex => workspace.join(".codex/skills"),
-        ProviderKind::Pi => workspace.join(".pi/skills"),
-        ProviderKind::ClaudeCode => workspace.join(".claude/skills"),
-        ProviderKind::GrokBuild => workspace.join(".grok/skills"),
-        ProviderKind::Devin => workspace.join(".devin/skills"),
-        ProviderKind::Opencode => workspace.join(".opencode/skills"),
-    }
+    workspace.join(catalog_profile(provider).project_skills)
 }
 
 fn deduplicate_roots(roots: Vec<SourceRoot>) -> Vec<SourceRoot> {
@@ -567,12 +569,6 @@ fn scan_mcp(
     workspace: &Path,
     provider: ProviderKind,
 ) -> Result<Vec<McpServerDescriptor>, AppError> {
-    if matches!(
-        provider,
-        ProviderKind::Acp | ProviderKind::GrokBuild | ProviderKind::Opencode
-    ) {
-        return Ok(Vec::new());
-    }
     let mut descriptors = Vec::new();
     for source in mcp_sources(home, workspace, provider) {
         let metadata = match std::fs::symlink_metadata(&source.path) {
@@ -639,107 +635,36 @@ fn scan_mcp(
     Ok(descriptors)
 }
 
+/// The MCP config files TodeX lists for `provider`; none for providers that
+/// keep their servers elsewhere (ACP agents, OpenCode, Grok's inspection).
 fn mcp_sources(home: Option<&Path>, workspace: &Path, provider: ProviderKind) -> Vec<SourceRoot> {
+    let catalog = catalog_profile(provider);
+    if catalog.source != CatalogSource::Filesystem {
+        return Vec::new();
+    }
     let mut sources = Vec::new();
-    match provider {
-        ProviderKind::Codex => {
-            if let Some(home) = home {
-                let codex_home = std::env::var_os("CODEX_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".codex"));
-                sources.push(SourceRoot {
-                    path: codex_home.join("config.toml"),
-                    scope: CatalogScope::User,
-                    source: "codex-user",
-                    priority: 20,
-                });
-            }
+    if let Some(home) = home {
+        let config_home = catalog.config_home.resolve(home);
+        for file in catalog.mcp_user_files {
+            let path = match file {
+                UserConfigFile::Home(relative) => home.join(relative),
+                UserConfigFile::ConfigHome(relative) => config_home.join(relative),
+            };
             sources.push(SourceRoot {
-                path: workspace.join(".codex/config.toml"),
-                scope: CatalogScope::Project,
-                source: "codex-project",
-                priority: 40,
+                path,
+                scope: CatalogScope::User,
+                source: catalog.mcp_user_source,
+                priority: 20,
             });
         }
-        ProviderKind::ClaudeCode => {
-            if let Some(home) = home {
-                for path in [
-                    home.join(".claude.json"),
-                    home.join(".claude/settings.json"),
-                ] {
-                    sources.push(SourceRoot {
-                        path,
-                        scope: CatalogScope::User,
-                        source: "claude-user",
-                        priority: 20,
-                    });
-                }
-            }
-            for path in [
-                workspace.join(".mcp.json"),
-                workspace.join(".claude/settings.json"),
-            ] {
-                sources.push(SourceRoot {
-                    path,
-                    scope: CatalogScope::Project,
-                    source: "claude-project",
-                    priority: 40,
-                });
-            }
-        }
-        ProviderKind::Pi => {
-            if let Some(home) = home {
-                let pi_home = std::env::var_os("PI_CODING_AGENT_DIR")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".pi/agent"));
-                for path in [pi_home.join("mcp.json"), pi_home.join("settings.json")] {
-                    sources.push(SourceRoot {
-                        path,
-                        scope: CatalogScope::User,
-                        source: "pi-user",
-                        priority: 20,
-                    });
-                }
-            }
-            for path in [workspace.join(".pi/mcp.json"), workspace.join(".mcp.json")] {
-                sources.push(SourceRoot {
-                    path,
-                    scope: CatalogScope::Project,
-                    source: "pi-project",
-                    priority: 40,
-                });
-            }
-        }
-        ProviderKind::Devin => {
-            if let Some(home) = home {
-                let devin_home = home.join(".config/devin");
-                for path in [
-                    devin_home.join("mcp_config.json"),
-                    devin_home.join("mcp_config.local.json"),
-                ] {
-                    sources.push(SourceRoot {
-                        path,
-                        scope: CatalogScope::User,
-                        source: "devin-user",
-                        priority: 20,
-                    });
-                }
-            }
-            for path in [
-                workspace.join(".devin/mcp_config.json"),
-                workspace.join(".devin/mcp_config.local.json"),
-            ] {
-                sources.push(SourceRoot {
-                    path,
-                    scope: CatalogScope::Project,
-                    source: "devin-project",
-                    priority: 40,
-                });
-            }
-        }
-        ProviderKind::Acp => {}
-        ProviderKind::GrokBuild => {}
-        ProviderKind::Opencode => {}
+    }
+    for relative in catalog.mcp_project_files {
+        sources.push(SourceRoot {
+            path: workspace.join(relative),
+            scope: CatalogScope::Project,
+            source: catalog.mcp_project_source,
+            priority: 40,
+        });
     }
     sources
 }

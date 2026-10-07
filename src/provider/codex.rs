@@ -9,14 +9,67 @@ use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
+use super::profile::{
+    CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
+    ProviderProfile, SkillInjection, UserConfigFile,
+};
 use super::types::{
     resolve_execution_config, DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult,
-    ImageInputMode, PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor,
+    ImageInputMode, PermissionConfigCapabilities, PermissionOutcome, ProviderCommandDescriptor,
     ProviderDescriptor, ProviderDriver,
 };
 
 mod capabilities;
 mod runtime;
+
+/// What Codex CLI supports and how TodeX adapts to it.
+pub(super) const PROFILE: ProviderProfile = ProviderProfile {
+    kind: ProviderKind::Codex,
+    display_name: "Codex CLI",
+    permission_config: PermissionConfigCapabilities {
+        modes: &["ask", "auto", "full-access"],
+        default_mode: "ask",
+        supports_plan: true,
+        sandbox_modes: &["read-only", "workspace-write", "danger-full-access"],
+        approval_policies: &["untrusted", "on-request", "never"],
+        permission_profiles: &["read-only", "workspace-write", "danger-full-access"],
+        enforcement: "sandbox",
+        description: "Codex native sandbox and approval controls",
+    },
+    native_fork: true,
+    native_compact: true,
+    native_resume: true,
+    cancel: true,
+    permissions: true,
+    tool_events: true,
+    native_skills: true,
+    native_mcp: true,
+    model_selection: true,
+    image_input: true,
+    image_input_mode: ImageInputMode::Model,
+    mcp_injection: McpInjection::CodexConfig,
+    skill_injection: SkillInjection::Native,
+    file_attachments: FileAttachmentStyle::Native,
+    profile_required: false,
+    recovery_full_scan: false,
+    process_model: ProcessModel::Resident {
+        idle: Some(std::time::Duration::from_secs(300)),
+        max_sessions: 64,
+    },
+    discovery_cache_ttl: None,
+    catalog: CatalogProfile {
+        source: CatalogSource::Filesystem,
+        config_home: ConfigHome {
+            env: Some("CODEX_HOME"),
+            home_relative: ".codex",
+        },
+        project_skills: ".codex/skills",
+        mcp_user_files: &[UserConfigFile::ConfigHome("config.toml")],
+        mcp_project_files: &[".codex/config.toml"],
+        mcp_user_source: "codex-user",
+        mcp_project_source: "codex-project",
+    },
+};
 
 pub struct CodexDriver {
     binary: String,
@@ -194,28 +247,12 @@ impl ProviderDriver for CodexDriver {
         let available = executable_available(&self.binary);
         ProviderDescriptor {
             id: ProviderKind::Codex,
-            display_name: "Codex CLI",
+            display_name: PROFILE.display_name,
             available,
             unavailable_reason: (!available)
                 .then(|| format!("executable '{}' was not found", self.binary)),
             profiles: Vec::new(),
-            capabilities: ProviderCapabilities {
-                permission_config: super::types::permission_config_capabilities(
-                    ProviderKind::Codex,
-                ),
-                native_fork: true,
-                native_compact: true,
-                native_resume: true,
-                cancel: true,
-                permissions: true,
-                tool_events: true,
-                native_skills: true,
-                native_mcp: true,
-                managed_mcp: true,
-                model_selection: true,
-                image_input: ProviderKind::Codex.supports_image_input(),
-                image_input_mode: ImageInputMode::Model,
-            },
+            capabilities: PROFILE.capabilities(),
             models: Vec::new(),
         }
     }
@@ -556,7 +593,7 @@ fn add_agent_mcp_config(params: &mut Value, context: &DriverContext) {
     if !params["config"].is_object() {
         params["config"] = json!({});
     }
-    for (key, value) in launch.codex_configs() {
+    for (key, value) in super::mcp_injection::codex_configs(launch) {
         params["config"][key] = value;
     }
 }

@@ -36,11 +36,14 @@ use super::codex::CodexDriver;
 use super::grok::GrokBuildDriver;
 use super::pi::PiDriver;
 use super::process::same_executable;
+use super::profile::{profile, FileAttachmentStyle, SkillInjection};
+#[cfg(test)]
+use super::types::ProviderDescriptor;
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill,
     DriverTurnResult, ImageInputMode, PermissionBroker, PermissionDecision, PermissionOutcome,
-    ProviderActivity, ProviderCommandDescriptor, ProviderControl, ProviderDescriptor,
-    ProviderDriver, ProviderImageInputCapability, ProviderModelDescriptor,
+    ProviderActivity, ProviderCommandDescriptor, ProviderControl, ProviderDriver,
+    ProviderImageInputCapability, ProviderModelDescriptor, ProviderSnapshot,
 };
 
 mod follow_ups;
@@ -329,12 +332,16 @@ impl DriverRegistry {
         }
     }
 
+    #[cfg(test)]
     pub fn descriptors(&self) -> Vec<ProviderDescriptor> {
+        self.drivers().map(|driver| driver.descriptor()).collect()
+    }
+
+    /// Registered drivers in `ProviderKind` order.
+    fn drivers(&self) -> impl Iterator<Item = &Arc<dyn ProviderDriver>> {
         ProviderKind::ALL
             .iter()
             .filter_map(|provider| self.drivers.get(provider))
-            .map(|driver| driver.descriptor())
-            .collect()
     }
 
     pub fn driver(&self, provider: ProviderKind) -> Result<Arc<dyn ProviderDriver>, AppError> {
@@ -495,16 +502,7 @@ impl ConversationSupervisor {
         provider: ProviderKind,
         conversation_id: &str,
     ) -> Option<AgentMcpLaunch> {
-        let supported = match provider {
-            ProviderKind::Codex
-            | ProviderKind::ClaudeCode
-            | ProviderKind::Acp
-            | ProviderKind::GrokBuild
-            | ProviderKind::Devin
-            | ProviderKind::Opencode => true,
-            ProviderKind::Pi => false,
-        };
-        if !supported {
+        if !profile(provider).managed_mcp() {
             return None;
         }
         self.agent_mcp.as_ref()?.launch(conversation_id).await
@@ -697,12 +695,13 @@ impl ConversationSupervisor {
     /// so trailing informational events (imported Codex history, a provider's
     /// command catalog after a turn) no longer force a full scan. `Failed`
     /// and `Interrupted` still need the terminal tail: a paused workflow is
-    /// `Interrupted` with its turn open. Pi is always scanned: its resident
-    /// runtimes and session-scoped dialogs outlive turns, so only the whole
-    /// journal shows whether one was left open. Any doubt, including an
-    /// unreadable tail, falls back to the full path, which reports it.
+    /// `Interrupted` with its turn open. Providers whose profile asks for
+    /// `recovery_full_scan` (Pi) are always scanned: their resident runtimes
+    /// and session-scoped dialogs outlive turns, so only the whole journal
+    /// shows whether one was left open. Any doubt, including an unreadable
+    /// tail, falls back to the full path, which reports it.
     async fn recovery_is_settled(&self, manifest: &ConversationManifest) -> bool {
-        if manifest.provider == ProviderKind::Pi
+        if profile(manifest.provider).recovery_full_scan
             || matches!(
                 manifest.status,
                 ConversationStatus::Running | ConversationStatus::WaitingPermission
@@ -779,100 +778,21 @@ impl ConversationSupervisor {
         Ok(())
     }
 
+    /// Descriptors without running capability probes.
+    #[cfg(test)]
     pub fn providers(&self) -> Vec<ProviderDescriptor> {
         self.registry.descriptors()
     }
 
-    /// The `/v2/providers` list: each descriptor plus the live control
-    /// capabilities clients gate their actions on.
-    pub async fn providers_snapshot(&self) -> Result<Value, AppError> {
-        let mut providers = serde_json::to_value(self.providers())?;
-        if let Some(items) = providers.as_array_mut() {
-            for provider in items {
-                let provider_id = provider
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                self.refresh_control_capabilities(&provider_id).await;
-                let control_probe = self.control_probe(&provider_id);
-                let live_controls = self.supports_live_controls(&provider_id);
-                let native_queue = self.supports_native_queue(&provider_id);
-                let runtime_stop = self.supports_runtime_stop(&provider_id);
-                let capabilities = provider
-                    .get("capabilities")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                let mut actions = Vec::new();
-                if live_controls {
-                    actions.push("steer");
-                }
-                if native_queue {
-                    actions.push("queue");
-                }
-                if capabilities
-                    .get("cancel")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    actions.push("cancel");
-                    actions.push("interrupt");
-                    actions.push("followUp");
-                    actions.push("retry");
-                    // Resume requires native continuation semantics, not prompt replay.
-                    if provider
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| self.supports_native_fork(id))
-                    {
-                        actions.push("fork");
-                    }
-                    if provider
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| self.supports_native_compact(id))
-                    {
-                        actions.push("compact");
-                    }
-                }
-                if let Some(object) = provider.as_object_mut() {
-                    if let Some(capabilities) = object
-                        .get_mut("capabilities")
-                        .and_then(Value::as_object_mut)
-                    {
-                        capabilities.insert("controlActions".to_owned(), json!(actions));
-                        if let Some(probe) = control_probe {
-                            capabilities.insert("controlProbe".to_owned(), probe);
-                        }
-                        capabilities.insert("steering".to_owned(), json!(live_controls));
-                        capabilities.insert("liveConfiguration".to_owned(), json!(live_controls));
-                        capabilities.insert("followUpQueue".to_owned(), json!(native_queue));
-                        // Every provider can hold follow-ups in the daemon's queue.
-                        capabilities.insert("backendQueue".to_owned(), json!(true));
-                        if runtime_stop {
-                            capabilities.insert("runtimeStop".to_owned(), json!(true));
-                            capabilities.insert("sessionCommands".to_owned(), json!(true));
-                            capabilities.insert("extensionMessages".to_owned(), json!(true));
-                            capabilities.insert(
-                                "extensionUi".to_owned(),
-                                json!([
-                                    "select",
-                                    "confirm",
-                                    "input",
-                                    "editor",
-                                    "notify",
-                                    "setStatus",
-                                    "setWidget",
-                                    "setTitle",
-                                    "set_editor_text"
-                                ]),
-                            );
-                        }
-                    }
-                }
-            }
+    /// The `/v2/providers` list, in `ProviderKind` order. Capability probes
+    /// run first so each entry reflects them.
+    pub async fn providers_snapshot(&self) -> Vec<ProviderSnapshot> {
+        let mut providers = Vec::new();
+        for driver in self.registry.drivers() {
+            driver.refresh_control_capabilities().await;
+            providers.push(ProviderSnapshot::of(driver.as_ref()));
         }
-        Ok(providers)
+        providers
     }
 
     pub fn has_active_turns(&self) -> bool {
@@ -1523,64 +1443,6 @@ impl ConversationSupervisor {
             supervisor.schedule_after_turn(conversation_id, None, "compaction.finished");
         });
         Ok(operation_id)
-    }
-
-    pub fn supports_native_compact(&self, provider: &str) -> bool {
-        provider
-            .parse::<ProviderKind>()
-            .ok()
-            .and_then(|kind| self.registry.driver(kind).ok())
-            .is_some_and(|driver| driver.supports_native_compact())
-    }
-
-    pub fn supports_native_fork(&self, provider: &str) -> bool {
-        provider
-            .parse::<ProviderKind>()
-            .ok()
-            .and_then(|kind| self.registry.driver(kind).ok())
-            .is_some_and(|driver| driver.supports_native_fork())
-    }
-
-    pub async fn refresh_control_capabilities(&self, provider: &str) {
-        if let Some(driver) = provider
-            .parse::<ProviderKind>()
-            .ok()
-            .and_then(|kind| self.registry.driver(kind).ok())
-        {
-            driver.refresh_control_capabilities().await;
-        }
-    }
-
-    pub fn control_probe(&self, provider: &str) -> Option<Value> {
-        provider
-            .parse::<ProviderKind>()
-            .ok()
-            .and_then(|kind| self.registry.driver(kind).ok())
-            .and_then(|driver| driver.control_probe())
-    }
-
-    pub fn supports_live_controls(&self, provider: &str) -> bool {
-        provider
-            .parse::<ProviderKind>()
-            .ok()
-            .and_then(|kind| self.registry.driver(kind).ok())
-            .is_some_and(|driver| driver.supports_live_controls())
-    }
-
-    pub fn supports_native_queue(&self, provider: &str) -> bool {
-        provider
-            .parse::<ProviderKind>()
-            .ok()
-            .and_then(|kind| self.registry.driver(kind).ok())
-            .is_some_and(|driver| driver.supports_native_queue())
-    }
-
-    pub fn supports_runtime_stop(&self, provider: &str) -> bool {
-        provider
-            .parse::<ProviderKind>()
-            .ok()
-            .and_then(|kind| self.registry.driver(kind).ok())
-            .is_some_and(|driver| driver.supports_runtime_stop())
     }
 
     pub async fn stop_runtime_owned(
@@ -2865,7 +2727,7 @@ async fn prepare_prompt_content(
                     ));
                 }
                 let relative = path.strip_prefix(&workspace).unwrap_or(&path);
-                if provider != ProviderKind::Codex {
+                if profile(provider).file_attachments == FileAttachmentStyle::AtMention {
                     text.push(format!("Attached file: @{}", relative.display()));
                 }
                 driver_content.push(DriverPromptContent::File { path, name });
@@ -2902,7 +2764,7 @@ async fn canonical_workspace_file(workspace: &Path, path: PathBuf) -> Result<Pat
 }
 
 fn ensure_image_provider(provider: ProviderKind) -> Result<(), AppError> {
-    if provider == ProviderKind::Acp || provider.supports_image_input() {
+    if profile(provider).accepts_typed_images() {
         Ok(())
     } else {
         Err(AppError::Unsupported(format!(
@@ -2940,7 +2802,7 @@ fn image_mime_type(path: &Path) -> Result<&'static str, AppError> {
 }
 
 /// Whether a running turn executes `binary`, the CLI of `cli_provider`: its
-/// own provider's CLI, or an ACP profile launching the same executable.
+/// own provider's CLI, or a configured profile launching the same executable.
 fn turn_runs_cli(
     agent: &crate::config::AgentConfig,
     turn_provider: ProviderKind,
@@ -2951,7 +2813,7 @@ fn turn_runs_cli(
     if turn_provider == cli_provider {
         return true;
     }
-    if turn_provider != ProviderKind::Acp {
+    if !profile(turn_provider).profile_required {
         return false;
     }
     turn_profile
@@ -2959,17 +2821,16 @@ fn turn_runs_cli(
         .is_some_and(|profile| same_executable(&profile.command, binary))
 }
 
-/// The prompt text a provider receives. Codex loads selected skills natively,
-/// so only the other providers get their instructions inlined.
+/// The prompt text a provider receives: providers that load selected skills
+/// natively get the user text alone, the others the skills inlined.
 fn provider_prompt_text(
     provider: ProviderKind,
     user_text: &str,
     injected: &[(String, String)],
 ) -> String {
-    if provider == ProviderKind::Codex {
-        user_text.to_owned()
-    } else {
-        compose_prompt_with_skills(user_text, injected)
+    match profile(provider).skill_injection {
+        SkillInjection::Native => user_text.to_owned(),
+        SkillInjection::PromptText => compose_prompt_with_skills(user_text, injected),
     }
 }
 
@@ -3065,7 +2926,7 @@ fn normalize_profile(
     requested: Option<String>,
     profiles: &[String],
 ) -> Result<Option<String>, AppError> {
-    if provider != ProviderKind::Acp {
+    if !profile(provider).profile_required {
         if requested.is_some() {
             return Err(AppError::InvalidRequest(
                 "providerProfile is only valid for ACP conversations".to_owned(),

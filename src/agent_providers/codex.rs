@@ -75,3 +75,40 @@ pub fn endpoint_credentials(settings: &Value) -> (Option<String>, Option<String>
 pub fn masked_settings(settings: &Value) -> Value {
     auth_config::masked_settings(settings, HEADER_TABLES)
 }
+
+pub(super) struct Projection;
+
+impl super::ExclusiveProjection for Projection {
+    fn read_live(&self, dirs: &AgentDirs) -> Result<Option<Value>, AppError> {
+        read_live(dirs)
+    }
+
+    fn write_live(
+        &self,
+        dirs: &AgentDirs,
+        settings: &Value,
+        remove_auth: bool,
+    ) -> Result<(), AppError> {
+        write_live(dirs, settings, remove_auth)
+    }
+
+    fn live_matches(&self, live: &Value, settings: &Value) -> bool {
+        auth_config::auth_matches(live, settings) && auth_config::config_matches(live, settings)
+    }
+
+    fn has_auth_file(&self) -> bool {
+        true
+    }
+
+    fn masked_settings(&self, settings: &Value) -> Value {
+        masked_settings(settings)
+    }
+
+    fn toml_header_tables(&self) -> Option<&'static [&'static str]> {
+        Some(HEADER_TABLES)
+    }
+
+    fn endpoint_credentials(&self, settings: &Value) -> (Option<String>, Option<String>) {
+        endpoint_credentials(settings)
+    }
+}

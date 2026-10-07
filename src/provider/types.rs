@@ -46,55 +46,37 @@ pub struct ProviderCapabilities {
     pub image_input_mode: ImageInputMode,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionConfigCapabilities {
-    pub modes: Vec<&'static str>,
+    pub modes: &'static [&'static str],
     pub default_mode: &'static str,
     pub supports_plan: bool,
-    pub sandbox_modes: Vec<&'static str>,
-    pub approval_policies: Vec<&'static str>,
-    pub permission_profiles: Vec<&'static str>,
+    pub sandbox_modes: &'static [&'static str],
+    pub approval_policies: &'static [&'static str],
+    pub permission_profiles: &'static [&'static str],
     pub enforcement: &'static str,
     pub description: &'static str,
 }
 
-pub fn permission_config_capabilities(provider: ProviderKind) -> PermissionConfigCapabilities {
-    match provider {
-        ProviderKind::Codex => PermissionConfigCapabilities {
-            modes: vec!["ask", "auto", "full-access"], default_mode: "ask", supports_plan: true,
-            sandbox_modes: vec!["read-only", "workspace-write", "danger-full-access"],
-            approval_policies: vec!["untrusted", "on-request", "never"],
-            permission_profiles: vec!["read-only", "workspace-write", "danger-full-access"],
-            enforcement: "sandbox", description: "Codex native sandbox and approval controls",
-        },
-        ProviderKind::ClaudeCode => PermissionConfigCapabilities {
-            modes: vec!["ask", "auto", "full-access"], default_mode: "ask", supports_plan: true,
-            sandbox_modes: vec!["read-only", "workspace-write", "danger-full-access"],
-            approval_policies: vec!["on-request", "never"],
-            permission_profiles: vec!["read-only", "workspace-write", "danger-full-access"],
-            enforcement: "agent-policy", description: "Claude default / auto / bypassPermissions and independent plan mode; not an operating-system sandbox. Legacy combinations remain validated.",
-        },
-        ProviderKind::Devin => PermissionConfigCapabilities {
-            modes: vec!["ask", "full-access"], default_mode: "ask", supports_plan: true,
-            sandbox_modes: vec![], approval_policies: vec![], permission_profiles: vec![],
-            enforcement: "agent-policy", description: "Devin session modes over ACP: manual approval (accept-edits) / bypass, plus plan work mode; enforced by the agent, not an operating-system sandbox",
-        },
-        ProviderKind::Opencode => PermissionConfigCapabilities {
-            modes: vec!["ask", "auto", "full-access"], default_mode: "ask", supports_plan: true,
-            sandbox_modes: vec![], approval_policies: vec![], permission_profiles: vec![],
-            enforcement: "agent-policy", description: "OpenCode build/plan session modes over ACP; ask mediates each tool approval, auto/full-access approve client-side",
-        },
-        _ => PermissionConfigCapabilities {
-            modes: vec![if provider == ProviderKind::Pi { "full-access" } else { "ask" }],
-            default_mode: if provider == ProviderKind::Pi { "full-access" } else { "ask" }, supports_plan: false,
-            sandbox_modes: vec![], approval_policies: vec![], permission_profiles: vec![],
-            enforcement: "unsupported", description: "This provider does not expose sandbox or approval overrides through its active protocol.",
-        },
+impl PermissionConfigCapabilities {
+    /// A provider whose active protocol exposes no sandbox or approval
+    /// overrides; `mode` is the only (and default) permission mode.
+    pub const fn unsupported(mode: &'static [&'static str]) -> Self {
+        Self {
+            modes: mode,
+            default_mode: mode[0],
+            supports_plan: false,
+            sandbox_modes: &[],
+            approval_policies: &[],
+            permission_profiles: &[],
+            enforcement: "unsupported",
+            description: "This provider does not expose sandbox or approval overrides through its active protocol.",
+        }
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ImageInputMode {
     Always,
@@ -169,6 +151,112 @@ pub struct ProviderDescriptor {
     pub profiles: Vec<String>,
     pub capabilities: ProviderCapabilities,
     pub models: Vec<ProviderModelDescriptor>,
+}
+
+/// One `/v2/providers` entry: a descriptor plus the live control
+/// capabilities clients gate their actions on.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSnapshot {
+    pub id: ProviderKind,
+    pub display_name: &'static str,
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    pub profiles: Vec<String>,
+    pub capabilities: ProviderCapabilitySnapshot,
+    pub models: Vec<ProviderModelDescriptor>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCapabilitySnapshot {
+    #[serde(flatten)]
+    pub declared: ProviderCapabilities,
+    pub control_actions: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_probe: Option<Value>,
+    pub steering: bool,
+    pub live_configuration: bool,
+    pub follow_up_queue: bool,
+    /// Every provider can hold follow-ups in the daemon's queue.
+    pub backend_queue: bool,
+    #[serde(flatten)]
+    pub resident_runtime: Option<ResidentRuntimeCapabilities>,
+}
+
+/// Published by providers whose resident runtime clients can close, list
+/// commands of and exchange extension messages with.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentRuntimeCapabilities {
+    pub runtime_stop: bool,
+    pub session_commands: bool,
+    pub extension_messages: bool,
+    pub extension_ui: &'static [&'static str],
+}
+
+const EXTENSION_UI: &[&str] = &[
+    "select",
+    "confirm",
+    "input",
+    "editor",
+    "notify",
+    "setStatus",
+    "setWidget",
+    "setTitle",
+    "set_editor_text",
+];
+
+impl ProviderSnapshot {
+    /// Reads the driver's current control capabilities; refresh probes first.
+    pub fn of(driver: &dyn ProviderDriver) -> Self {
+        let descriptor = driver.descriptor();
+        let live_controls = driver.supports_live_controls();
+        let native_queue = driver.supports_native_queue();
+        let mut actions = Vec::new();
+        if live_controls {
+            actions.push("steer");
+        }
+        if native_queue {
+            actions.push("queue");
+        }
+        if descriptor.capabilities.cancel {
+            actions.extend(["cancel", "interrupt", "followUp", "retry"]);
+            // Resume requires native continuation semantics, not prompt replay.
+            if driver.supports_native_fork() {
+                actions.push("fork");
+            }
+            if driver.supports_native_compact() {
+                actions.push("compact");
+            }
+        }
+        Self {
+            id: descriptor.id,
+            display_name: descriptor.display_name,
+            available: descriptor.available,
+            unavailable_reason: descriptor.unavailable_reason,
+            profiles: descriptor.profiles,
+            capabilities: ProviderCapabilitySnapshot {
+                declared: descriptor.capabilities,
+                control_actions: actions,
+                control_probe: driver.control_probe(),
+                steering: live_controls,
+                live_configuration: live_controls,
+                follow_up_queue: native_queue,
+                backend_queue: true,
+                resident_runtime: driver.supports_runtime_stop().then_some(
+                    ResidentRuntimeCapabilities {
+                        runtime_stop: true,
+                        session_commands: true,
+                        extension_messages: true,
+                        extension_ui: EXTENSION_UI,
+                    },
+                ),
+            },
+            models: descriptor.models,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -325,7 +413,7 @@ pub fn resolve_execution_config(
     sandbox: Option<&str>,
     approval: Option<&str>,
 ) -> Result<EffectivePermissionConfig, AppError> {
-    let capabilities = permission_config_capabilities(provider);
+    let capabilities = super::profile::profile(provider).permission_config;
     let work = work_mode.unwrap_or("implement");
     if !matches!(work, "plan" | "implement") {
         return Err(AppError::InvalidRequest("unsupported work mode".to_owned()));
@@ -1496,19 +1584,9 @@ mod tests {
     #[test]
     fn provider_capabilities_publish_image_input_in_camel_case() {
         let value = serde_json::to_value(ProviderCapabilities {
-            permission_config: permission_config_capabilities(ProviderKind::Codex),
-            native_fork: true,
-            native_compact: true,
-            native_resume: true,
-            cancel: true,
-            permissions: true,
-            tool_events: true,
-            native_skills: true,
-            native_mcp: true,
-            managed_mcp: true,
-            model_selection: true,
             image_input: true,
             image_input_mode: ImageInputMode::Always,
+            ..super::super::profile::profile(ProviderKind::Codex).capabilities()
         })
         .unwrap();
 

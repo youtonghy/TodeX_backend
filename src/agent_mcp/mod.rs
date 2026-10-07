@@ -37,7 +37,6 @@ use std::{
 };
 
 use rand_core::{OsRng, RngCore};
-use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -291,7 +290,7 @@ impl AgentMcp {
                     tool_timeout_seconds,
                 })
                 .collect(),
-            claude_config_path: self.claude_config_path(conversation_id),
+            config_file: self.claude_config_path(conversation_id),
         })
     }
 
@@ -368,14 +367,16 @@ fn file_key(conversation_id: &str) -> String {
     hex(&Sha256::digest(conversation_id.as_bytes())[..16])
 }
 
-/// How a provider launches one server's stdio bridge.
+/// How a provider launches one server's stdio bridge. Provider-neutral: each
+/// provider adapter renders it in its own config format
+/// (`crate::provider::mcp_injection`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentMcpServer {
     pub name: &'static str,
     pub command: PathBuf,
     pub env: Vec<(String, String)>,
     /// How long the provider waits for one tool call.
-    tool_timeout_seconds: u64,
+    pub(crate) tool_timeout_seconds: u64,
 }
 
 impl AgentMcpServer {
@@ -383,42 +384,9 @@ impl AgentMcpServer {
         vec![BRIDGE_SUBCOMMAND.to_owned()]
     }
 
-    fn env_map(&self) -> serde_json::Map<String, Value> {
-        self.env
-            .iter()
-            .map(|(name, value)| (name.clone(), Value::String(value.clone())))
-            .collect()
-    }
-
-    /// Codex `config` override (dotted key, so the user's own
-    /// `mcp_servers` table is merged rather than replaced). Tools are
-    /// pre-approved: TodeX grants access itself (per SSH host, or through
-    /// its own permission prompts).
-    pub(crate) fn codex_config(&self) -> (String, Value) {
-        (
-            format!("mcp_servers.{}", self.name),
-            json!({
-                "command": self.command,
-                "args": self.args(),
-                "env": self.env_map(),
-                "default_tools_approval_mode": "approve",
-                "tool_timeout_sec": self.tool_timeout_seconds,
-            }),
-        )
-    }
-
-    /// ACP `McpServerStdio` entry for `session/new|load|resume`.
-    pub(crate) fn acp_server(&self) -> Value {
-        json!({
-            "name": self.name,
-            "command": self.command,
-            "args": self.args(),
-            "env": self
-                .env
-                .iter()
-                .map(|(name, value)| json!({ "name": name, "value": value }))
-                .collect::<Vec<_>>(),
-        })
+    #[cfg(test)]
+    pub(crate) fn codex_config(&self) -> (String, serde_json::Value) {
+        crate::provider::mcp_injection::codex_config(self)
     }
 }
 
@@ -426,67 +394,15 @@ impl AgentMcpServer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentMcpLaunch {
     pub servers: Vec<AgentMcpServer>,
-    claude_config_path: PathBuf,
+    /// Owner-only file for providers that read their MCP config from disk
+    /// (removed on [`AgentMcp::revoke`]).
+    pub(crate) config_file: PathBuf,
 }
 
 impl AgentMcpLaunch {
-    /// Codex `config` overrides, one dotted key per server.
-    pub(crate) fn codex_configs(&self) -> Vec<(String, Value)> {
-        self.servers
-            .iter()
-            .map(AgentMcpServer::codex_config)
-            .collect()
-    }
-
-    /// ACP `mcpServers` for `session/new|load|resume`.
-    pub(crate) fn acp_servers(&self) -> Value {
-        Value::Array(
-            self.servers
-                .iter()
-                .map(AgentMcpServer::acp_server)
-                .collect(),
-        )
-    }
-
-    /// Claude Code arguments. The config goes to an owner-only file rather
-    /// than the command line, where other local users could read the token.
+    #[cfg(test)]
     pub(crate) async fn claude_args(&self) -> Result<Vec<String>, AppError> {
-        let servers: serde_json::Map<String, Value> = self
-            .servers
-            .iter()
-            .map(|server| {
-                (
-                    server.name.to_owned(),
-                    json!({
-                        "type": "stdio",
-                        "command": server.command,
-                        "args": server.args(),
-                        "env": server.env_map(),
-                        "timeout": server.tool_timeout_seconds * 1000,
-                    }),
-                )
-            })
-            .collect();
-        let config = serde_json::to_vec(&json!({ "mcpServers": servers }))?;
-        let path = self.claude_config_path.clone();
-        let written = path.clone();
-        tokio::task::spawn_blocking(move || secure_fs::write_owner_only_atomic(&written, &config))
-            .await
-            .map_err(|error| AppError::Anyhow(error.into()))??;
-        let allowed = self
-            .servers
-            .iter()
-            .map(|server| format!("mcp__{}", server.name))
-            .collect::<Vec<_>>()
-            .join(",");
-        // `=` form: both options are variadic and would otherwise swallow
-        // any argument that follows them.
-        Ok(vec![
-            format!("--mcp-config={}", path.display()),
-            // Server-level permission rules: these tools run without a
-            // Claude prompt.
-            format!("--allowedTools={allowed}"),
-        ])
+        crate::provider::mcp_injection::claude_args(self).await
     }
 }
 
@@ -549,69 +465,6 @@ pub(crate) mod tests {
         assert_eq!(mcp.authenticate(&token_a), None);
         assert!(!config_path.exists());
         assert!(mcp.authenticate(&b.servers[0].env[1].1).is_some());
-    }
-
-    fn server(name: &'static str, url: &str) -> AgentMcpServer {
-        AgentMcpServer {
-            name,
-            command: PathBuf::from("/opt/todex/todex-agentd"),
-            env: vec![
-                (URL_ENV.to_owned(), url.to_owned()),
-                (TOKEN_ENV.to_owned(), "t".to_owned()),
-            ],
-            tool_timeout_seconds: 660,
-        }
-    }
-
-    #[tokio::test]
-    async fn launch_formats_match_each_provider_schema() {
-        let root = std::env::temp_dir().join(format!("todex-agent-mcp-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let launch = AgentMcpLaunch {
-            servers: vec![
-                server("todex_ssh", "http://127.0.0.1:1/ssh"),
-                server("todex_other", "http://127.0.0.1:1/other"),
-            ],
-            claude_config_path: root.join("claude.json"),
-        };
-
-        let codex = launch.codex_configs();
-        assert_eq!(codex.len(), 2);
-        assert_eq!(codex[0].0, "mcp_servers.todex_ssh");
-        assert_eq!(codex[1].0, "mcp_servers.todex_other");
-        assert_eq!(codex[0].1["args"], json!(["agent-mcp-bridge"]));
-        assert_eq!(codex[0].1["env"][TOKEN_ENV], "t");
-        assert_eq!(codex[1].1["env"][URL_ENV], "http://127.0.0.1:1/other");
-        assert_eq!(codex[0].1["default_tools_approval_mode"], "approve");
-        assert_eq!(codex[0].1["tool_timeout_sec"], 660);
-
-        let acp = launch.acp_servers();
-        assert_eq!(acp[0]["name"], "todex_ssh");
-        assert_eq!(acp[1]["name"], "todex_other");
-        assert_eq!(acp[0]["env"][1], json!({ "name": TOKEN_ENV, "value": "t" }));
-        // The typed ACP schema accepts every entry as a stdio server.
-        for entry in acp.as_array().unwrap() {
-            let parsed: agent_client_protocol::schema::v1::McpServer =
-                serde_json::from_value(entry.clone()).unwrap();
-            assert!(matches!(
-                parsed,
-                agent_client_protocol::schema::v1::McpServer::Stdio(_)
-            ));
-        }
-
-        let args = launch.claude_args().await.unwrap();
-        assert_eq!(args[1], "--allowedTools=mcp__todex_ssh,mcp__todex_other");
-        let config: Value = serde_json::from_slice(
-            &std::fs::read(args[0].strip_prefix("--mcp-config=").unwrap()).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(config["mcpServers"]["todex_ssh"]["type"], "stdio");
-        assert_eq!(config["mcpServers"]["todex_ssh"]["timeout"], 660_000);
-        assert_eq!(
-            config["mcpServers"]["todex_other"]["env"][URL_ENV],
-            "http://127.0.0.1:1/other"
-        );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

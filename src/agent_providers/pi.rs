@@ -160,3 +160,39 @@ pub fn endpoint_credentials(node: &Value) -> (Option<String>, Option<String>) {
             .map(str::to_owned),
     )
 }
+
+pub(super) struct Projection;
+
+impl super::AdditiveProjection for Projection {
+    fn provider_nodes(&self, dirs: &AgentDirs) -> Result<Map<String, Value>, AppError> {
+        provider_nodes(dirs)
+    }
+
+    fn upsert_provider(&self, dirs: &AgentDirs, id: &str, node: &Value) -> Result<(), AppError> {
+        upsert_provider(dirs, id, node)
+    }
+
+    fn remove_provider(&self, dirs: &AgentDirs, id: &str) -> Result<(), AppError> {
+        remove_provider(dirs, id)
+    }
+
+    fn set_default(&self, dirs: &AgentDirs, id: &str, model_id: &str) -> Result<(), AppError> {
+        set_default(dirs, id, model_id)
+    }
+
+    fn default_selection(&self, dirs: &AgentDirs) -> Result<Value, AppError> {
+        let (provider, model) = default_selection(dirs)?;
+        Ok(match provider {
+            Some(provider) => json!({ "providerId": provider, "modelId": model }),
+            None => Value::Null,
+        })
+    }
+
+    fn first_model_id(&self, node: &Value) -> Option<String> {
+        first_model_id(node)
+    }
+
+    fn endpoint_credentials(&self, node: &Value) -> (Option<String>, Option<String>) {
+        endpoint_credentials(node)
+    }
+}

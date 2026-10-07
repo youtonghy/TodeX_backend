@@ -15,13 +15,18 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 use super::process::{
     executable_available, provider_exit_error, CommandSpec, JsonLineProcess, ProviderRead,
 };
+use super::profile::{
+    CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
+    ProviderProfile, SkillInjection, UserConfigFile,
+};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PendingProviderControl, PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor,
-    ProviderControl, ProviderDescriptor, ProviderDriver, ProviderSessionCommands,
+    PendingProviderControl, PermissionConfigCapabilities, PermissionOutcome,
+    ProviderCommandDescriptor, ProviderControl, ProviderDescriptor, ProviderDriver,
+    ProviderSessionCommands,
 };
 
-const MAX_PI_SESSIONS: usize = 32;
+const MAX_PI_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
 const PI_UI_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// Pi streams thinking/text a few characters at a time; fragments of one block
 /// are merged (shared window and size limits) so the journal does not store
@@ -30,6 +35,49 @@ const PI_DELTA_TEXT: &[&str] = &["/delta/delta"];
 /// Minimum spacing between `tool_execution_update` snapshots of one tool
 /// call, as for ACP: each carries the whole accumulated `partialResult`.
 const PI_TOOL_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// What Pi supports and how TodeX adapts to it.
+pub(super) const PROFILE: ProviderProfile = ProviderProfile {
+    kind: ProviderKind::Pi,
+    display_name: "Pi",
+    permission_config: PermissionConfigCapabilities::unsupported(&["full-access"]),
+    native_fork: true,
+    native_compact: true,
+    native_resume: true,
+    cancel: true,
+    permissions: false,
+    tool_events: true,
+    native_skills: true,
+    native_mcp: false,
+    model_selection: true,
+    image_input: true,
+    image_input_mode: ImageInputMode::Model,
+    mcp_injection: McpInjection::None,
+    skill_injection: SkillInjection::PromptText,
+    file_attachments: FileAttachmentStyle::AtMention,
+    profile_required: false,
+    recovery_full_scan: true,
+    process_model: ProcessModel::Resident {
+        idle: None,
+        max_sessions: 32,
+    },
+    discovery_cache_ttl: None,
+    catalog: CatalogProfile {
+        source: CatalogSource::Filesystem,
+        config_home: ConfigHome {
+            env: Some("PI_CODING_AGENT_DIR"),
+            home_relative: ".pi/agent",
+        },
+        project_skills: ".pi/skills",
+        mcp_user_files: &[
+            UserConfigFile::ConfigHome("mcp.json"),
+            UserConfigFile::ConfigHome("settings.json"),
+        ],
+        mcp_project_files: &[".pi/mcp.json", ".mcp.json"],
+        mcp_user_source: "pi-user",
+        mcp_project_source: "pi-project",
+    },
+};
 
 pub struct PiDriver {
     binary: String,
@@ -295,27 +343,12 @@ impl ProviderDriver for PiDriver {
         let available = executable_available(&self.binary);
         ProviderDescriptor {
             id: ProviderKind::Pi,
-            display_name: "Pi",
+            display_name: PROFILE.display_name,
             available,
             unavailable_reason: (!available)
                 .then(|| format!("executable '{}' was not found", self.binary)),
             profiles: Vec::new(),
-            capabilities: ProviderCapabilities {
-                permission_config: super::types::permission_config_capabilities(ProviderKind::Pi),
-                native_fork: true,
-                native_compact: true,
-                native_resume: true,
-                cancel: true,
-                // Pi RPC exposes extension dialogs, but not a universal pre-tool approval API.
-                permissions: false,
-                tool_events: true,
-                native_skills: true,
-                native_mcp: false,
-                managed_mcp: true,
-                model_selection: true,
-                image_input: ProviderKind::Pi.supports_image_input(),
-                image_input_mode: ImageInputMode::Model,
-            },
+            capabilities: PROFILE.capabilities(),
             models: Vec::new(),
         }
     }
@@ -447,7 +480,7 @@ impl ProviderDriver for PiDriver {
                 handle.clone()
             } else {
                 if sessions.len() >= MAX_PI_SESSIONS {
-                    return Err(AppError::Conflict("Pi has reached its limit of 32 live sessions; close an idle conversation first".to_owned()));
+                    return Err(AppError::Conflict(format!("Pi has reached its limit of {MAX_PI_SESSIONS} live sessions; close an idle conversation first")));
                 }
                 let process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
                 let (turns, turn_rx) = mpsc::channel(1);

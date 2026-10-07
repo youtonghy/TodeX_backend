@@ -7,10 +7,12 @@ pub(crate) mod codex;
 mod devin;
 mod doctor;
 mod grok;
+pub(crate) mod mcp_injection;
 mod opencode;
 mod pi;
 pub(crate) mod process;
 pub(crate) mod process_registry;
+pub(crate) mod profile;
 mod supervisor;
 pub(crate) mod types;
 

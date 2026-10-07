@@ -46,18 +46,6 @@ impl ProviderKind {
             Self::Opencode => "opencode",
         }
     }
-
-    pub const fn supports_image_input(self) -> bool {
-        matches!(
-            self,
-            Self::Codex
-                | Self::Pi
-                | Self::ClaudeCode
-                | Self::GrokBuild
-                | Self::Devin
-                | Self::Opencode
-        )
-    }
 }
 
 impl std::str::FromStr for ProviderKind {

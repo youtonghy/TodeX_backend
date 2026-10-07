@@ -14,14 +14,18 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 use super::acp::{run_acp_turn_controlled, AcpConnectionState, AcpRuntimeOptions};
 use super::devin::DiscoverySnapshot;
 use super::process::{executable_available, redact_sensitive_text, CommandSpec, JsonLineProcess};
+use super::profile::{
+    CatalogProfile, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel, ProviderProfile,
+    SkillInjection,
+};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PendingProviderControl, ProviderCapabilities, ProviderCommandDescriptor, ProviderControl,
-    ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
+    PendingProviderControl, PermissionConfigCapabilities, ProviderCommandDescriptor,
+    ProviderControl, ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
 };
 
-const MAX_OPENCODE_SESSIONS: usize = 32;
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_OPENCODE_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
+const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_DRAIN: Duration = Duration::from_millis(1500);
@@ -29,6 +33,50 @@ const COMMAND_DRAIN: Duration = Duration::from_millis(1500);
 /// (provider catalogs load there) and up to `COMMAND_DRAIN` waiting for the
 /// command list; the per-model effort sweep itself answers in milliseconds.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// What OpenCode supports and how TodeX adapts to it.
+pub(super) const PROFILE: ProviderProfile = ProviderProfile {
+    kind: ProviderKind::Opencode,
+    display_name: "OpenCode",
+    permission_config: PermissionConfigCapabilities {
+        modes: &["ask", "auto", "full-access"],
+        default_mode: "ask",
+        supports_plan: true,
+        sandbox_modes: &[],
+        approval_policies: &[],
+        permission_profiles: &[],
+        enforcement: "agent-policy",
+        description: "OpenCode build/plan session modes over ACP; ask mediates each tool approval, auto/full-access approve client-side",
+    },
+    native_fork: true,
+    native_compact: false,
+    native_resume: true,
+    cancel: true,
+    permissions: true,
+    tool_events: true,
+    native_skills: true,
+    native_mcp: true,
+    model_selection: true,
+    image_input: true,
+    image_input_mode: ImageInputMode::Always,
+    mcp_injection: McpInjection::AcpServers,
+    skill_injection: SkillInjection::PromptText,
+    file_attachments: FileAttachmentStyle::AtMention,
+    profile_required: false,
+    recovery_full_scan: false,
+    process_model: ProcessModel::Resident {
+        idle: Some(Duration::from_secs(300)),
+        max_sessions: 32,
+    },
+    discovery_cache_ttl: Some(Duration::from_secs(300)),
+    catalog: CatalogProfile::skills_only(
+        ConfigHome {
+            env: None,
+            home_relative: ".config/opencode",
+        },
+        ".opencode/skills",
+    ),
+};
 
 pub struct OpencodeDriver {
     binary: String,
@@ -347,7 +395,7 @@ impl ProviderDriver for OpencodeDriver {
         let available = executable_available(&self.binary);
         ProviderDescriptor {
             id: ProviderKind::Opencode,
-            display_name: "OpenCode",
+            display_name: PROFILE.display_name,
             available,
             unavailable_reason: (!available).then(|| {
                 format!(
@@ -356,23 +404,7 @@ impl ProviderDriver for OpencodeDriver {
                 )
             }),
             profiles: Vec::new(),
-            capabilities: ProviderCapabilities {
-                permission_config: super::types::permission_config_capabilities(
-                    ProviderKind::Opencode,
-                ),
-                native_fork: true,
-                native_compact: false,
-                native_resume: true,
-                cancel: true,
-                permissions: true,
-                tool_events: true,
-                native_skills: true,
-                native_mcp: true,
-                managed_mcp: false,
-                model_selection: true,
-                image_input: ProviderKind::Opencode.supports_image_input(),
-                image_input_mode: ImageInputMode::Always,
-            },
+            capabilities: PROFILE.capabilities(),
             models: Vec::new(),
         }
     }

@@ -1461,7 +1461,7 @@ async fn providers(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     require_auth(&state, &headers)?;
-    let providers = state.conversations.providers_snapshot().await?;
+    let providers = state.conversations.providers_snapshot().await;
     Ok(Json(json!({ "providers": providers })))
 }
 

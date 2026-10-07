@@ -27,10 +27,14 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 use super::process::{
     executable_available, provider_exit_error, redact_sensitive_text, CommandSpec, JsonLineProcess,
 };
+use super::profile::{
+    CatalogProfile, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel, ProviderProfile,
+    SkillInjection,
+};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PendingProviderControl, PermissionOutcome, ProviderCapabilities, ProviderCommandDescriptor,
-    ProviderControl, ProviderDescriptor, ProviderDriver,
+    PendingProviderControl, PermissionConfigCapabilities, PermissionOutcome, ProviderCapabilities,
+    ProviderCommandDescriptor, ProviderControl, ProviderDescriptor, ProviderDriver,
 };
 
 /// Interactive authentication methods (for example browser PKCE) need enough
@@ -42,6 +46,38 @@ pub(super) const FORK_PROBE_TTL: Duration = Duration::from_secs(300);
 /// Capability probes run on `/v2/providers` reads, so a stuck agent must not
 /// stall the endpoint the way a normal control request may.
 const FORK_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What ACP supports and how TodeX adapts to it.
+pub(super) const PROFILE: ProviderProfile = ProviderProfile {
+    kind: ProviderKind::Acp,
+    display_name: "ACP",
+    permission_config: PermissionConfigCapabilities::unsupported(&["ask"]),
+    native_fork: false,
+    native_compact: false,
+    native_resume: true,
+    cancel: true,
+    permissions: true,
+    tool_events: true,
+    native_skills: true,
+    native_mcp: true,
+    model_selection: false,
+    image_input: false,
+    image_input_mode: ImageInputMode::Profile,
+    mcp_injection: McpInjection::AcpServers,
+    skill_injection: SkillInjection::PromptText,
+    file_attachments: FileAttachmentStyle::AtMention,
+    profile_required: true,
+    recovery_full_scan: false,
+    process_model: ProcessModel::PerTurn,
+    discovery_cache_ttl: None,
+    catalog: CatalogProfile::skills_only(
+        ConfigHome {
+            env: None,
+            home_relative: ".agents",
+        },
+        ".agents/skills",
+    ),
+};
 
 pub struct AcpDriver {
     profiles: BTreeMap<String, AcpProfileConfig>,
@@ -110,7 +146,7 @@ impl ProviderDriver for AcpDriver {
             .any(|profile| executable_available(&profile.command));
         ProviderDescriptor {
             id: ProviderKind::Acp,
-            display_name: "ACP",
+            display_name: PROFILE.display_name,
             available,
             unavailable_reason: (!available).then(|| {
                 if self.profiles.is_empty() {
@@ -121,19 +157,8 @@ impl ProviderDriver for AcpDriver {
             }),
             profiles,
             capabilities: ProviderCapabilities {
-                permission_config: super::types::permission_config_capabilities(ProviderKind::Acp),
                 native_fork: self.supports_native_fork(),
-                native_compact: false,
-                native_resume: true,
-                cancel: true,
-                permissions: true,
-                tool_events: true,
-                native_skills: true,
-                native_mcp: true,
-                managed_mcp: false,
-                model_selection: false,
-                image_input: ProviderKind::Acp.supports_image_input(),
-                image_input_mode: ImageInputMode::Profile,
+                ..PROFILE.capabilities()
             },
             models: Vec::new(),
         }
@@ -1375,7 +1400,7 @@ async fn new_acp_session(
 /// Lists TodeX's MCP servers in a `session/new|load|resume` request.
 fn with_agent_mcp(mut request: Value, context: &DriverContext) -> Value {
     if let Some(launch) = &context.agent_mcp {
-        request["mcpServers"] = launch.acp_servers();
+        request["mcpServers"] = super::mcp_injection::acp_servers(launch);
     }
     request
 }
