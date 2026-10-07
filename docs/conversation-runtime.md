@@ -204,11 +204,16 @@ p95 22.93 ms to 3.94 / 4.09 ms. Atomic JSON writes no longer create missing
 parent directories, so a late flush cannot resurrect a deleted conversation.
 
 Journal repair: a final record missing its newline is terminated during
-recovery, and an append to an unterminated journal starts a new line. Corrupt
-plaintext lines with no valid record after them are quarantined to
-`events.corrupt.<ts>.jsonl` and cut off. Interior corruption is salvaged per
-file: the damaged files are backed up to `events.corrupt.<ts>.jsonl`, then
-each is atomically rewritten in place with valid records unchanged and each
+recovery, and an append to an unterminated journal starts a new line. An
+append whose write or sync fails (`ENOSPC`, `EIO`) cuts the active file back
+to its length before the write, drops the cached index, digest and tail, and
+returns the error; a cut that fails too is logged and left to recovery. A
+failed seal (the rename of the active file, e.g. while a scanner holds it on
+Windows) is only logged: the record goes to the active file and the next
+append tries again. Corrupt plaintext lines with no valid record after them
+are quarantined to `events.corrupt.<ts>.jsonl` and cut off. Interior
+corruption is salvaged per file: the damaged files are backed up to
+`events.corrupt.<ts>.jsonl`, then each is atomically rewritten in place with valid records unchanged and each
 lost sequence replaced by a `journal.recordLost` event with payload
 `{"reason": "corrupt", "runStart", "runLength", "backup": "<file>"}`.
 Placeholders of one run share `runStart`/`runLength` and take the previous
@@ -232,7 +237,11 @@ live delivery carries the bytes on disk and the digest needs nothing but
 envelope fields. A record's summary ciphertext is computed from the
 plaintext when it is written; replays never summarize ciphertext and only
 drop the ciphertext the requested detail does not use. Rotating the active
-file also rotates the DEK; the seal converter repacks the sealed file's
+file also rotates the DEK (a seal whose rename fails keeps the file and its
+DEK). A failed append, a recovery that cuts records off the journal and an
+append that finds the manifest ahead of the journal retire the DEK for good,
+not even leaving it as the no-recipient fallback, so a reused sequence is
+never sealed twice under one key. The seal converter repacks the sealed file's
 records into encrypted frames with the DEKs still in memory (decrypting,
 slimming and re-framing them), then releases those DEKs; ciphertext whose
 DEK is gone (the daemon restarted) is framed as it is. Sealed frames reach

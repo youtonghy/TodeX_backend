@@ -9,6 +9,7 @@
 - 保护：TodeX 数据目录被盗、被备份或泄露；事后攻破后端时读取已写入的历史。
 - 不保护：后端运行 agent 时看到的明文（它必须处理模型输出）；provider 自身在后端保存的明文 transcript（`~/.claude/projects`、`~/.codex/sessions` 等）；排队中的追加 prompt（`queue.json`，投递后删除）；元数据（sequence、时间、事件类型、大小、下文 §5.2 的信封字段）。
 - 强制加密之前写下的明文历史不迁移、不改写，标记为 `legacyPlaintext` 后只读（§8）。
+- 范围是机密性，不是顺序与完整性：AEAD 只保证单条事件密文或单个内容帧未被篡改且属于该会话、`kid`、stream 与 counter。封存分片的帧头位置（首 sequence、条数）与信封流（stream 0，明文 raw DEFLATE）不在 AEAD 内，journal 行与帧的先后也没有链式校验；能改写数据目录的人可以删除、截断、重排记录或帧，或改动信封字段而不被发现，只是读不到内容。
 
 ## 2. 密码学原语（history crypto v1）
 
@@ -17,7 +18,7 @@
 - 接收方密钥：X-Wing（ML-KEM-768 + X25519，draft-06，与 CryptoKit `XWingMLKEM768X25519`、noble `ml_kem768_x25519` 互通）。私钥是 32 字节种子，公钥 1216 字节。`rid = SHA-256(pk)[0..16]`。
 - 分片密钥：`kid` 16 字节随机、`dek` 32 字节随机，只在后端内存中存在。
 - 封装：`(ct, ss) = Encaps(pk)`，`kek = HKDF-SHA256(salt=ct, ikm=ss, info="todex-history-v1/wrap"‖kid‖rid)`，`wrapped = ChaCha20-Poly1305(kek, nonce=0¹², aad=info, dek)`。JSON：`{"rid","kemCt","wrapped"}`（base64url 无填充）。
-- 内容：`ChaCha20-Poly1305(dek, nonce=u32be(stream)‖u64be(counter), aad="todex-history-v1/content\0"‖conversationId‖"\0"‖kid‖u32be(stream)‖u64be(counter))`。stream：1 事件摘要、2 事件完整、3 帧摘要、4 帧完整；事件流 counter 为 sequence，帧流 counter 为该 `kid` 下的帧序号。
+- 内容：`ChaCha20-Poly1305(dek, nonce=u32be(stream)‖u64be(counter), aad="todex-history-v1/content\0"‖conversationId‖"\0"‖kid‖u32be(stream)‖u64be(counter))`。stream：1 事件摘要、2 事件完整、3 帧摘要、4 帧完整；事件流 counter 为 sequence，帧流 counter 为 `段号 << 32 | 帧序号`（见 §4.5）。
 
 ## 3. 密钥体系
 
@@ -54,7 +55,8 @@
 
 - 每个会话至多一个活动 DEK，首次加密写入时惰性生成：对所有未吊销接收方（设备 + 恢复）各封装一次，写入 `keyring.json`（fsync）后才能用于加密。
 - 轮换条件：活动分片封存、`epoch` 变化、DEK 使用超过 24 小时、daemon 重启（内存丢失即轮换）。
-- 已轮换但所在分片尚未封存的 DEK 仍留在内存，供封存时重打包；分片封存完成后清零。daemon 崩溃后丢失的 DEK 只影响该分片不能重打包压缩，内容仍可被客户端读取。活动文件改名封存的同时轮换 DEK，所以一个 DEK 的记录只落在一个分片里。
+- 已轮换但所在分片尚未封存的 DEK 仍留在内存，供封存时重打包；分片封存完成后清零。daemon 崩溃后丢失的 DEK 只影响该分片不能重打包压缩，内容仍可被客户端读取。活动文件改名封存的同时轮换 DEK，所以一个 DEK 的记录只落在一个分片里。改名失败（例如 Windows 上文件被安全软件占用）不影响追加：本条记录照常写入原活动文件、沿用原 DEK（没有改名就不轮换），下一次追加再尝试封存。
+- nonce 不复用：同一 sequence 只在同一 DEK 下加密一次。追加写入或 fsync 失败（`ENOSPC`、`EIO`）时，后端尽力把活动文件截回写入前的长度，无论截断是否成功都弃用当前 DEK 后才返回错误；尾部恢复截掉记录（损坏尾部隔离到 `events.corrupt.*`）或追加时发现 manifest 领先 journal，同样先弃用 DEK。被弃用的 DEK 不再作为下文无接收方时的回退密钥，此时若无法生成新 DEK，追加直接失败而不是用旧 DEK 重新加密同一 sequence。
 - 会话标题：`manifest.titleEnc = {"kid","ct"}`，以该 `kid` 的 stream 2、counter 0 加密，`kid` 同样登记在 `keyring.json`；省略 `manifest.title`（客户端视同空串）。每次设置标题都用一个只为它生成的新 `kid`（不进入活动 DEK、用后即弃），所以 counter 0 永不在同一 `kid` 下复用。
 - 一次性 DEK：标题，以及导入外部会话与 fork 时组装中的新会话（草稿目录）各自生成新 DEK，同样先对全部接收方封装并写入 keyring（草稿的 keyring 随目录一起发布）。草稿中的明文记录以该 DEK 按事件流加密（counter = 新会话中的 sequence）；fork 复制的密文保留原 `$enc`，来源的 keyring 先复制进草稿，草稿 DEK 追加其后。这样导入与 fork 得到的会话从第一条记录起完全加密，带 `historyEncryptedAt`。
 - 无接收方：若没有未吊销的接收方（或 keyring 无法写入），新 DEK 无法生成。此时新建会话（含导入与 fork）以及新 prompt（包括追加队列的投递与 `conversation.retry`，在保存请求快照时）被拒绝，返回 `HISTORY_KEY_REQUIRED`（HTTP 409，WS 错误码同名，提示在客户端登记设备密钥），不写任何内容；已在运行的 turn 继续用内存中最新的 DEK 加密写完。内存中没有任何 DEK（daemon 刚重启）时追加直接失败、记录错误日志，turn 以失败结束（终态事件同样写不进去时由重启恢复关闭），绝不回落为明文。
@@ -85,7 +87,7 @@ keyring.json            e2e 才有
 manifest.json  snapshot.json  provider-state.json  last-request.json  queue.json
 ```
 
-活动分片原始大小超过 64 MiB 时封存（改名为 `events.NNNNNN.jsonl`），后台任务转为 `.seg + .idx`：写临时文件 → fsync → rename `.idx` → rename `.seg` → 删除明文分片 → fsync 目录。恢复规则：同号 `.jsonl` 与 `.seg` 并存且 `.idx` 校验通过时删除 `.jsonl`，否则删除 `.seg/.idx` 重做。
+活动分片原始大小超过 64 MiB 时封存（改名为 `events.NNNNNN.jsonl`），后台任务转为 `.seg + .idx`：写临时文件 → fsync → rename `.idx` → rename `.seg` → fsync 目录 → 删除明文分片 → fsync 目录。恢复规则：同号 `.jsonl` 与 `.seg` 并存且 `.idx` 校验通过时删除 `.jsonl`，否则删除 `.seg/.idx` 重做。
 
 ### 4.2 v3 行
 
