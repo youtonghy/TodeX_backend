@@ -298,26 +298,40 @@ impl JsonLineProcess {
         Ok(line.map(classify_line))
     }
 
+    /// Stops the provider and, on Unix, every process in its group.
+    ///
+    /// The group gets SIGTERM and the grace period. Whether or not the leader
+    /// exits in time, the group is then SIGKILLed so children that ignore
+    /// SIGTERM do not outlive it. The leader's exit is observed without
+    /// reaping it: as an unreaped zombie its PID, and so the group ID, cannot
+    /// be reused, so the kill reaches only this provider's processes. It is
+    /// reaped last.
     pub async fn terminate(&mut self) {
         let Some(pid) = self.pid.take() else {
             return;
         };
         #[cfg(unix)]
-        signal_process_group(pid, libc::SIGTERM);
+        {
+            signal_process_group(pid, libc::SIGTERM);
+            let deadline = Instant::now() + GRACEFUL_STOP_TIMEOUT;
+            while !leader_exited(pid) && Instant::now() < deadline {
+                tokio::time::sleep(LEADER_EXIT_POLL).await;
+            }
+            kill_process_group(&self.child);
+            let _ = self.child.start_kill();
+            let _ = self.child.wait().await;
+        }
         #[cfg(not(unix))]
         {
             let _ = pid;
             let _ = self.child.start_kill();
-        }
-
-        if timeout(GRACEFUL_STOP_TIMEOUT, self.child.wait())
-            .await
-            .is_err()
-        {
-            #[cfg(unix)]
-            signal_process_group(pid, libc::SIGKILL);
-            let _ = self.child.start_kill();
-            let _ = self.child.wait().await;
+            if timeout(GRACEFUL_STOP_TIMEOUT, self.child.wait())
+                .await
+                .is_err()
+            {
+                let _ = self.child.start_kill();
+                let _ = self.child.wait().await;
+            }
         }
         self.stderr_task.abort();
         self.tracked = None;
@@ -964,6 +978,33 @@ where
     }
 }
 
+/// How often [`JsonLineProcess::terminate`] checks whether the leader exited.
+#[cfg(unix)]
+const LEADER_EXIT_POLL: Duration = Duration::from_millis(20);
+
+/// Whether child `pid` has exited, without reaping it (`WNOWAIT`), so its
+/// PID stays reserved until the owning `Child` waits for it. An error other
+/// than an interrupted call (no such child) also ends the wait.
+#[cfg(unix)]
+fn leader_exited(pid: u32) -> bool {
+    // SAFETY: an all-zero siginfo_t is a valid value, and waitid writes only
+    // into it. POSIX leaves si_pid zero when WNOHANG finds no state change.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            libc::id_t::from(pid),
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if result == -1 {
+        return std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted;
+    }
+    // SAFETY: waitid succeeded, so the pid field is initialized (or zero).
+    unsafe { info.si_pid() != 0 }
+}
+
 #[cfg(unix)]
 fn signal_process_group(pid: u32, signal: i32) {
     // The child is spawned into a dedicated process group, so a negative PID targets only it.
@@ -1016,6 +1057,47 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let _ = child.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_kills_children_that_ignore_sigterm_after_the_leader_exits() {
+        // The leader exits on SIGTERM at once; its child ignores it.
+        let mut spec = CommandSpec::new("/bin/sh", std::env::temp_dir());
+        spec.args = vec![
+            "-c".to_owned(),
+            r#"trap '' TERM; sleep 30 & trap - TERM; echo "{\"pid\":$!}"; wait"#.to_owned(),
+        ];
+        let mut process = JsonLineProcess::spawn(&spec).await.unwrap();
+        let frame = process.read().await.unwrap().expect("child pid");
+        let child = i32::try_from(frame["pid"].as_i64().unwrap()).unwrap();
+        // Kills the child on any exit from this test.
+        struct Reap(i32);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                // SAFETY: plain kill(2) of the test's own grandchild.
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+            }
+        }
+        let _reap = Reap(child);
+
+        let started = Instant::now();
+        process.terminate().await;
+        assert!(
+            started.elapsed() < GRACEFUL_STOP_TIMEOUT,
+            "the leader exited on SIGTERM, so no full grace period is spent"
+        );
+        assert!(process.child.try_wait().unwrap().is_some());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only checks that the process exists. The child is
+        // reparented when the leader exits, so init reaps it once killed.
+        while unsafe { libc::kill(child, 0) } == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the SIGTERM-ignoring child survived"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[cfg(unix)]
