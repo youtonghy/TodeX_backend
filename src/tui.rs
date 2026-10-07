@@ -198,6 +198,11 @@ struct DevicePairingRequest {
     verification_code: String,
     transport_fingerprint: Option<String>,
     device_name: String,
+    /// Derived from the device key; `None` from an older daemon.
+    device_id: Option<String>,
+    peer_address: String,
+    /// When the device id is on the history block list (`revokedDevices`).
+    revoked_at: Option<chrono::DateTime<Utc>>,
     expires_at: i64,
 }
 
@@ -294,7 +299,10 @@ fn device_display_name(value: &str) -> String {
         .chars()
         .filter(|character| {
             !character.is_control()
-                && !matches!(*character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                && !matches!(
+                    *character,
+                    '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                )
         })
         .take(100)
         .collect()
@@ -719,19 +727,44 @@ impl TuiApp {
             .unwrap_or(self.config.data_dir.as_path());
         match crate::device_pairing::list_device_pairing_requests(data_dir) {
             Ok(requests) => {
+                // Only read the history block list when someone asks to pair.
+                let revoked = if requests.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    crate::history_keys::revoked_devices(data_dir)
+                };
+                let revoked_list = revoked.as_deref().unwrap_or_default();
                 self.device_pairing.replace(
                     requests
                         .into_iter()
                         .map(|request| DevicePairingRequest {
+                            revoked_at: request.device_id.as_ref().and_then(|id| {
+                                revoked_list
+                                    .iter()
+                                    .find(|entry| &entry.device_id == id)
+                                    .map(|entry| entry.revoked_at)
+                            }),
                             request_id: request.request_id,
                             verification_code: request.verification_code,
                             transport_fingerprint: request.transport_fingerprint,
                             device_name: request.device_name,
+                            device_id: request.device_id,
+                            peer_address: request.peer_address,
                             expires_at: i64::try_from(request.expires_at).unwrap_or(i64::MAX),
                         })
                         .collect(),
                 );
                 match crate::devices::list_devices(data_dir) {
+                    Ok(devices) if revoked.is_err() => {
+                        self.device_pairing.replace_devices(devices);
+                        self.device_pairing.error = Some(
+                            self.text(
+                                "Cannot read the history revocation list; check it before approving.",
+                                "无法读取历史吊销列表，请在批准前检查。",
+                            )
+                            .to_owned(),
+                        );
+                    }
                     Ok(devices) => {
                         self.device_pairing.replace_devices(devices);
                         self.device_pairing.error = None;
@@ -903,6 +936,58 @@ impl TuiApp {
         }
     }
 
+    /// The peer address of a pairing request; loopback is marked as this
+    /// machine.
+    fn peer_label(&self, address: &str) -> String {
+        let shown = device_display_name(address);
+        if address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+        {
+            format!("{shown}{}", self.text(" (this machine)", "（本机）"))
+        } else {
+            shown
+        }
+    }
+
+    /// Re-pair and revoked-device warnings for a pending request.
+    fn device_pairing_warnings(&self, request: &DevicePairingRequest) -> Vec<Line<'static>> {
+        let Some(device_id) = request.device_id.as_deref() else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        if self
+            .device_pairing
+            .devices
+            .iter()
+            .any(|device| device.device_id == device_id)
+        {
+            lines.push(Line::styled(
+                self.text(
+                    "! Re-pairing: approving overwrites the existing record of this key.",
+                    "! 重新配对，会覆盖现有记录。",
+                )
+                .to_owned(),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if let Some(revoked_at) = request.revoked_at {
+            let when = revoked_at.format("%Y-%m-%d %H:%M UTC");
+            lines.push(Line::styled(
+                match self.language {
+                    TuiLanguage::English => format!(
+                        "! This device was revoked on {when}. Approving restores API access; its history still needs a restore from another device."
+                    ),
+                    TuiLanguage::Chinese => format!(
+                        "! 该设备曾于 {when} 被吊销。批准后恢复 API 访问，历史仍需另一台设备执行恢复。"
+                    ),
+                },
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines
+    }
+
     fn render_device_pairing(&self, frame: &mut Frame<'_>) {
         self.device_pairing.displayed_request.replace(None);
         let area = centered_area(frame.area(), 88, 24);
@@ -912,7 +997,7 @@ impl TuiApp {
             .title(self.text("Device verification", "设备验证"));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        if inner.width < 36 || inner.height < 18 {
+        if inner.width < 36 || inner.height < 20 {
             frame.render_widget(
                 Paragraph::new(self.text(
                     "Enlarge the terminal to verify the code. Approval is disabled. Esc closes.",
@@ -927,9 +1012,9 @@ impl TuiApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
-                Constraint::Min(4),
-                Constraint::Min(4),
-                Constraint::Min(6),
+                Constraint::Min(3),
+                Constraint::Min(3),
+                Constraint::Min(10),
                 Constraint::Length(2),
             ])
             .split(inner);
@@ -1101,7 +1186,7 @@ impl TuiApp {
                 .saturating_sub(Utc::now().timestamp_millis())
                 .max(0)
                 / 1000;
-            vec![
+            let mut lines = vec![
                 Line::from(self.text("Verification code:", "验证码：").to_owned()),
                 Line::styled(
                     request.verification_code.clone(),
@@ -1109,6 +1194,11 @@ impl TuiApp {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
+            ];
+            // Warnings sit right under the code, so they are on screen
+            // whenever approval is possible.
+            lines.extend(self.device_pairing_warnings(request));
+            lines.extend([
                 // The code also authenticates this transport key; clients show
                 // the same fingerprint after pairing.
                 Line::from(format!(
@@ -1125,14 +1215,29 @@ impl TuiApp {
                 )),
                 Line::from(format!(
                     "{}{}",
-                    self.text("Request: ", "请求："),
-                    device_display_name(&request.request_id)
+                    self.text("Device ID: ", "设备 ID："),
+                    request
+                        .device_id
+                        .as_deref()
+                        .map(device_display_name)
+                        .unwrap_or_else(|| "-".to_owned())
+                )),
+                Line::from(format!(
+                    "{}{}",
+                    self.text("Address: ", "地址："),
+                    self.peer_label(&request.peer_address)
                 )),
                 Line::from(match self.language {
                     TuiLanguage::English => format!("Expires in {remaining}s"),
                     TuiLanguage::Chinese => format!("{remaining} 秒后过期"),
                 }),
-            ]
+                Line::from(format!(
+                    "{}{}",
+                    self.text("Request: ", "请求："),
+                    device_display_name(&request.request_id)
+                )),
+            ]);
+            lines
         } else {
             vec![Line::from(
                 self.text(
@@ -4547,6 +4652,9 @@ mod tests {
             verification_code: "ABCDE-FGHJK".to_owned(),
             transport_fingerprint: Some("0123-4567-89AB-CDEF".to_owned()),
             device_name: "My laptop".to_owned(),
+            device_id: Some("dev_AAAAAAAAAAAAAAAA".to_owned()),
+            peer_address: "192.0.2.4".to_owned(),
+            revoked_at: None,
             expires_at: chrono::Utc::now().timestamp_millis() + 60_000,
         }
     }
@@ -4677,10 +4785,82 @@ mod tests {
         assert!(app.last_error.is_none());
     }
 
+    fn render_pairing(app: &super::TuiApp) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 26)).unwrap();
+        terminal
+            .draw(|frame| app.render_device_pairing(frame))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn pairing_approval_shows_device_id_peer_and_repair_and_revocation_warnings() {
+        let mut app = super::TuiApp::new(crate::config::Config::default());
+        app.language = super::TuiLanguage::English;
+        app.device_pairing.open = true;
+        let mut request = device_request("pending");
+        request.peer_address = "::ffff:127.0.0.1".to_owned();
+        app.device_pairing.replace(vec![request.clone()]);
+        app.device_pairing.navigate(true);
+        let plain = render_pairing(&app);
+        assert!(plain.contains("Device ID: dev_AAAAAAAAAAAAAAAA"), "{plain}");
+        assert!(
+            plain.contains("Address: ::ffff:127.0.0.1 (this machine)"),
+            "{plain}"
+        );
+        assert!(!plain.contains("Re-pairing"));
+        assert!(!plain.contains("revoked on"));
+        // The code was on screen, so approval is possible.
+        assert!(app.device_pairing.displayed_request.borrow().is_some());
+
+        // Same key already registered, and revoked from history earlier.
+        request.peer_address = "192.0.2.4".to_owned();
+        request.revoked_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-09-01T08:30:00Z")
+                .unwrap()
+                .into(),
+        );
+        app.device_pairing.replace(vec![request]);
+        app.device_pairing
+            .replace_devices(vec![crate::devices::DeviceRecord {
+                device_id: "dev_AAAAAAAAAAAAAAAA".to_owned(),
+                name: "Old laptop".to_owned(),
+                public_key: String::new(),
+                paired_at: 0,
+                last_seen_at: None,
+            }]);
+        let warned = render_pairing(&app);
+        assert!(warned.contains("Address: 192.0.2.4"), "{warned}");
+        assert!(!warned.contains("(this machine)"));
+        assert!(
+            warned.contains("Re-pairing: approving overwrites"),
+            "{warned}"
+        );
+        assert!(
+            warned.contains("revoked on 2026-09-01 08:30 UTC"),
+            "{warned}"
+        );
+
+        app.language = super::TuiLanguage::Chinese;
+        // Wide characters leave an empty cell after themselves.
+        let chinese = render_pairing(&app).replace(' ', "");
+        assert!(chinese.contains("重新配对，会覆盖现有记录"), "{chinese}");
+        assert!(chinese.contains("该设备曾于2026-09-01"), "{chinese}");
+    }
+
     #[test]
     fn device_names_cannot_inject_terminal_control_or_bidi_sequences() {
         assert_eq!(
-            super::device_display_name("Laptop\n\r\t\u{1b}\u{202e}test\u{2069}"),
+            super::device_display_name("Laptop\n\r\t\u{1b}\u{202e}te\u{200f}st\u{2069}"),
             "Laptoptest"
         );
         assert_eq!(super::device_display_name(&"a".repeat(200)).len(), 100);

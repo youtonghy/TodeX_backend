@@ -368,6 +368,10 @@ mod tests {
         use crate::history_keys::{system_clock, test_support::recipient, RecipientRegistry};
 
         let (root, registry) = fixture();
+        // No history registry yet: nothing is blocked.
+        assert!(crate::history_keys::revoked_devices(&root)
+            .unwrap()
+            .is_empty());
         let first = registry.register("Phone", &key(7)).unwrap();
         let second = registry.register("Laptop", &key(8)).unwrap();
         let recipients = RecipientRegistry::load(&root, None, system_clock()).unwrap();
@@ -403,6 +407,18 @@ mod tests {
             ]
             .into_iter()
             .collect()
+        );
+        // The TUI's read-only view sees the same block list.
+        let listed = crate::history_keys::revoked_devices(&root)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.device_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            listed,
+            [first.device_id, second.device_id, third.device_id]
+                .into_iter()
+                .collect()
         );
         let _ = fs::remove_dir_all(&root);
     }

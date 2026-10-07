@@ -894,6 +894,16 @@ pub(crate) fn revoke_device_recipients(
     Ok(targets.len())
 }
 
+/// Read-only view of the history block list (`revokedDevices`) for the
+/// TUI's pairing approval, which warns before re-pairing a revoked device. A
+/// missing registry file means no device was ever blocked. Never writes.
+pub(crate) fn revoked_devices(data_dir: &Path) -> Result<Vec<RevokedDevice>> {
+    let path = data_dir.join(HISTORY_DIR).join(FILE_NAME);
+    Ok(read_file(&path)?
+        .map(|file| file.revoked_devices)
+        .unwrap_or_default())
+}
+
 /// `history.grant.request`'s result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RequestedGrant {
