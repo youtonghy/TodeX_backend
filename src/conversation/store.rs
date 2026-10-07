@@ -181,6 +181,10 @@ pub struct ConversationStore {
     journal_write_hold: Arc<std::sync::Mutex<()>>,
     #[cfg(test)]
     journal_writes_started: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test hook: the next journal write stores this many bytes of its line
+    /// and then fails (see [`Self::fail_next_journal_write`]).
+    #[cfg(test)]
+    journal_write_fault: Arc<std::sync::Mutex<Option<usize>>>,
     /// Open streaming-text merge window per conversation. Only touched while
     /// the conversation lock is held, so any other write flushes it first and
     /// journal order matches emission order.
@@ -536,6 +540,8 @@ impl ConversationStore {
             journal_write_hold: Arc::default(),
             #[cfg(test)]
             journal_writes_started: Arc::default(),
+            #[cfg(test)]
+            journal_write_fault: Arc::default(),
         })
     }
 
@@ -605,6 +611,28 @@ impl ConversationStore {
             keys.deks().current_key(conversation_id).await?;
         }
         Ok(())
+    }
+
+    /// Retire the conversation's current DEK for good (see
+    /// [`crate::history_keys::DekManager::abandon`]): a record sealed under it
+    /// may persist without being committed, and its sequence is about to be
+    /// reused. A no-op without history keys or without a key in memory.
+    async fn abandon_record_key(&self, conversation_id: &str) {
+        if let Some(keys) = &self.history {
+            keys.deks().abandon(conversation_id).await;
+        }
+    }
+
+    /// After a journal write failed: [`append_journal_line`] tried to cut
+    /// the partial line off again, but whether it did or not, the sequence
+    /// is reused by the next append, so the key it was sealed under is
+    /// retired. The cached index, digest and tail are dropped so they are
+    /// rebuilt from whatever the file now holds.
+    async fn abandon_failed_append(&self, conversation_id: &str) {
+        self.abandon_record_key(conversation_id).await;
+        self.index_remove(conversation_id);
+        self.digests.remove(conversation_id);
+        self.tails.remove(conversation_id);
     }
 
     /// The DEK the next record of `conversation_id` is sealed under and
@@ -1348,6 +1376,12 @@ impl ConversationStore {
                 manifest.status = status_after_conversation_event(manifest.status, last_event);
                 manifest.updated_at = last_event.time;
             }
+            if journal_sequence < manifest.last_sequence {
+                // The sequences about to be reused were sealed under the
+                // current key and may persist (a quarantine copy, freed
+                // blocks); they must not get a second ciphertext under it.
+                self.abandon_record_key(conversation_id).await;
+            }
             manifest.last_sequence = journal_sequence;
         }
         let mut event = ConversationEvent::new(
@@ -1481,22 +1515,37 @@ impl ConversationStore {
         let hold = (
             self.journal_write_hold.clone(),
             self.journal_writes_started.clone(),
+            self.journal_write_fault.clone(),
         );
-        let (line, metadata) = tokio::task::spawn_blocking(move || {
+        let written = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
-            {
+            let fault = {
                 hold.1.fetch_add(1, Ordering::SeqCst);
                 drop(
                     hold.0
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()),
                 );
-            }
-            append_journal_line(&write_directory, &event_path, created, &line)
+                hold.2
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+            };
+            #[cfg(not(test))]
+            let fault = None;
+            append_journal_line(&write_directory, &event_path, created, &line, fault)
                 .map(|metadata| (line, metadata))
         })
         .await
-        .map_err(blocking_error)??;
+        .map_err(blocking_error)
+        .and_then(|written| written.map_err(AppError::from));
+        let (line, metadata) = match written {
+            Ok(written) => written,
+            Err(error) => {
+                self.abandon_failed_append(conversation_id).await;
+                return Err(error);
+            }
+        };
         let last = files.last_mut().expect("active segment is present");
         last.bytes = metadata.len();
         last.modified = metadata.modified().ok();
@@ -2833,6 +2882,12 @@ impl ConversationStore {
         files: &[JournalFile],
         mut scan: PlainRunScan,
     ) -> Result<(), AppError> {
+        if scan.corrupt_tail.is_some() {
+            // The cut records' sequences are written again by the next
+            // appends while the cut bytes survive in the quarantine copy:
+            // the key that may have sealed them is spent.
+            self.abandon_record_key(conversation_id).await;
+        }
         if let Some((segment, _)) = scan.corrupt_tail {
             if scan.damaged.is_empty() {
                 // Quarantine first: the tail copy must hold the original
@@ -3411,6 +3466,16 @@ impl ConversationStore {
     #[cfg(test)]
     pub(super) fn journal_writes_started(&self) -> usize {
         self.journal_writes_started.load(Ordering::SeqCst)
+    }
+
+    /// Make the next journal write store `stored` bytes of its line and then
+    /// fail, as a write interrupted by `ENOSPC` or `EIO` would.
+    #[cfg(test)]
+    pub(super) fn fail_next_journal_write(&self, stored: usize) {
+        *self
+            .journal_write_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stored);
     }
 
     /// Stop segment commits after `step`, simulating a crash.
@@ -4613,11 +4678,18 @@ fn stored_record(
 /// call. A file this append creates is made owner-only and its directory
 /// entry synced before the record is written. Returns the file's metadata
 /// after the write.
+///
+/// A write or sync that fails (`ENOSPC`, `EIO`) may still have left part or
+/// all of the line in the file, so the file is cut back to its length before
+/// the write; the caller retires the key the line was sealed under either
+/// way. `fault` is a test hook: `Some(n)` stores `n` bytes of the line and
+/// then fails as such a write would. Production passes `None`.
 fn append_journal_line(
     directory: &Path,
     path: &Path,
     created: bool,
     line: &[u8],
+    fault: Option<usize>,
 ) -> std::io::Result<std::fs::Metadata> {
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
@@ -4631,8 +4703,34 @@ fn append_journal_line(
     }
     #[cfg(not(unix))]
     let _ = directory;
-    file.write_all(line)?;
-    file.sync_data()?;
+    let length = file.metadata()?.len();
+    let mut write = || {
+        if let Some(stored) = fault {
+            file.write_all(&line[..stored.min(line.len())])?;
+            return Err(std::io::Error::other("injected journal write failure"));
+        }
+        file.write_all(line)?;
+        file.sync_data()
+    };
+    if let Err(error) = write() {
+        // A handle of its own: Windows does not let an append-only handle
+        // change the file's length.
+        let cut = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| {
+                file.set_len(length)?;
+                file.sync_data()
+            });
+        if let Err(cut) = cut {
+            tracing::error!(
+                path = %path.display(),
+                error = %cut,
+                "could not cut a failed conversation journal write back off; recovery quarantines it"
+            );
+        }
+        return Err(error);
+    }
     file.metadata()
 }
 

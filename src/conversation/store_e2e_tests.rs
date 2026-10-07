@@ -973,6 +973,79 @@ fn journal_records(path: &Path) -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn a_failed_append_is_cut_off_and_its_key_retired() {
+    let e2e = E2e::new("todex-e2e-failed-append", true).await;
+    let id = e2e.create(None).await.id;
+    let first = e2e
+        .store
+        .append(&id, "turn.started", json!({"turnId": "t"}))
+        .await
+        .unwrap();
+    let kid = first.payload["$enc"]["kid"].clone();
+    let journal = e2e.store.directory(&id).unwrap().join(EVENTS_FILE);
+    let before = fs::read(&journal).unwrap();
+    // The disk fills up part-way through sequence 2's line.
+    e2e.store.fail_next_journal_write(40);
+    let error = e2e
+        .store
+        .append(
+            &id,
+            "tool.updated",
+            json!({"turnId": "t", "output": "lost"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "IO_ERROR");
+    assert_eq!(fs::read(&journal).unwrap(), before);
+    // Sequence 2 is sealed again, under a key that never sealed it before.
+    let second = e2e
+        .store
+        .append(
+            &id,
+            "tool.updated",
+            json!({"turnId": "t", "output": "kept"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.sequence, 2);
+    assert_ne!(second.payload["$enc"]["kid"], kid);
+    assert_eq!(journal_records(&journal).len(), 2);
+    let keys = e2e.client_keys(&id).await;
+    let (events, frames) = history(&e2e.store, &id, ReplayDetail::Full).await;
+    assert_eq!(events.len(), 2);
+    let plain = crate::conversation::e2e_support::decrypt(&keys, &events[1], &frames)
+        .expect("record is sealed");
+    assert_eq!(plain["output"], "kept");
+
+    // With no recipient left a running turn keeps its key, but not once a
+    // write under it failed: the append is refused instead.
+    let rid = crate::history_keys::encode_id(&recipient(1).rid());
+    e2e.keys.recipients().revoke(&rid, "local").unwrap();
+    let third = e2e
+        .store
+        .append(&id, "tool.updated", json!({"turnId": "t"}))
+        .await
+        .unwrap();
+    assert_eq!(third.payload["$enc"]["kid"], second.payload["$enc"]["kid"]);
+    let before = fs::read(&journal).unwrap();
+    // A write that reached the disk whole but failed to sync.
+    e2e.store.fail_next_journal_write(usize::MAX);
+    e2e.store
+        .append(&id, "tool.updated", json!({"turnId": "t"}))
+        .await
+        .unwrap_err();
+    assert_eq!(fs::read(&journal).unwrap(), before);
+    let refused = e2e
+        .store
+        .append(&id, "turn.completed", json!({"turnId": "t"}))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), "HISTORY_KEY_REQUIRED");
+    assert_eq!(fs::read(&journal).unwrap(), before);
+    e2e.cleanup();
+}
+
+#[tokio::test]
 async fn a_failed_seal_keeps_appending_to_the_active_file() {
     let e2e = E2e::new("todex-e2e-failed-seal", true).await;
     let id = e2e.create(None).await.id;
@@ -1028,5 +1101,51 @@ async fn a_failed_seal_keeps_appending_to_the_active_file() {
             .collect::<Vec<_>>(),
         (1..=appended).collect::<Vec<_>>()
     );
+    e2e.cleanup();
+}
+
+#[tokio::test]
+async fn recovery_that_cuts_the_journal_retires_the_key() {
+    let e2e = E2e::new("todex-e2e-cut-tail", true).await;
+    let id = e2e.create(None).await.id;
+    let journal = e2e.store.directory(&id).unwrap().join(EVENTS_FILE);
+    let append = |output: &'static str| {
+        let store = e2e.store.clone();
+        let id = id.clone();
+        async move {
+            store
+                .append(
+                    &id,
+                    "tool.updated",
+                    json!({"turnId": "t", "output": output}),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let kid = |event: &ConversationEvent| event.payload["$enc"]["kid"].clone();
+    append("one").await;
+    let second = append("two").await;
+    // A torn line after the last record: replay quarantines and cuts it.
+    let mut file = fs::OpenOptions::new().append(true).open(&journal).unwrap();
+    std::io::Write::write_all(&mut file, b"{\"s\":3,\"x\":{\"kid\"").unwrap();
+    drop(file);
+    let (events, _) = history(&e2e.store, &id, ReplayDetail::Summary).await;
+    assert_eq!(events.len(), 2);
+    let third = append("three").await;
+    assert_eq!(third.sequence, 3);
+    assert_ne!(kid(&third), kid(&second));
+    // The journal loses its last record behind the store's back: the manifest
+    // is ahead, and sequence 3 is sealed again under yet another key.
+    let bytes = fs::read(&journal).unwrap();
+    let end = bytes[..bytes.len() - 1]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .unwrap();
+    fs::write(&journal, &bytes[..=end]).unwrap();
+    let again = append("three again").await;
+    assert_eq!(again.sequence, 3);
+    assert_ne!(kid(&again), kid(&third));
+    assert_eq!(journal_records(&journal).len(), 3);
     e2e.cleanup();
 }

@@ -4,7 +4,9 @@
 //! encrypted write: generated, wrapped for every active recipient and
 //! recorded in `keyring.json` (fsynced) before it is handed out. It rotates
 //! when the recipient epoch changes, after 24 hours, when the active segment
-//! is sealed ([`DekManager::rotate`]) and on restart (nothing is persisted).
+//! is sealed ([`DekManager::rotate`]), when a record sealed under it may
+//! persist uncommitted ([`DekManager::abandon`]) and on restart (nothing is
+//! persisted).
 //! Rotated keys stay in memory until their segment has been sealed and
 //! repacked ([`DekManager::release_sealed`]); `SegmentKey` zeroizes on drop.
 
@@ -226,6 +228,22 @@ impl DekManager {
     pub(crate) async fn rotate(&self, conversation_id: &str) {
         if let Some(slot) = self.existing_slot(conversation_id) {
             slot.lock().await.retire_active();
+        }
+    }
+
+    /// Ends the active key because a record sealed under it may persist
+    /// without having been committed: an append that failed part-way, or
+    /// journal records that tail recovery cut off. The next record reuses
+    /// that sequence, so its counter (and nonce) under this key is spent.
+    /// Unlike [`Self::rotate`] the key also stops being the
+    /// [`Self::fallback_key`]: when no new key can be created the next
+    /// append fails rather than reusing the nonce. The key stays available
+    /// to segment builds.
+    pub(crate) async fn abandon(&self, conversation_id: &str) {
+        if let Some(slot) = self.existing_slot(conversation_id) {
+            let mut keys = slot.lock().await;
+            keys.retire_active();
+            keys.newest = None;
         }
     }
 
@@ -616,6 +634,40 @@ mod tests {
             .deks
             .release_sealed(&fixture.conversation, std::slice::from_ref(&second))
             .await;
+        assert!(fixture
+            .deks
+            .fallback_key(&fixture.conversation)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_key_is_never_the_fallback() {
+        let fixture = Fixture::new();
+        let rid = fixture
+            .recipients
+            .register_device("dev_a", &recipient(1))
+            .unwrap()
+            .value;
+        let (abandoned, _) = fixture.current().await;
+        fixture.deks.abandon(&fixture.conversation).await;
+        // Segment builds can still open its records…
+        assert!(fixture
+            .deks
+            .keys_snapshot(&fixture.conversation)
+            .await
+            .contains_key(&abandoned));
+        // …but nothing new is sealed under it: a fresh key replaces it, and
+        // without recipients there is no key at all.
+        let (next, _) = fixture.current().await;
+        assert_ne!(next, abandoned);
+        fixture.deks.abandon(&fixture.conversation).await;
+        fixture.recipients.revoke(&rid, "local").unwrap();
+        assert!(fixture
+            .deks
+            .current_key(&fixture.conversation)
+            .await
+            .is_err());
         assert!(fixture
             .deks
             .fallback_key(&fixture.conversation)
