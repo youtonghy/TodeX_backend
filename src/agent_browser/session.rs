@@ -29,6 +29,13 @@ const MAX_WAIT_MS: u64 = 10_000;
 /// next frame only after the ack.
 const FRAME_INTERVAL: Duration = Duration::from_millis(66);
 const SCREENCAST_QUALITY: u8 = 60;
+/// A popup whose address is not known when it opens is let run with its
+/// navigations intercepted; one that loads nothing within this long is
+/// closed.
+const POPUP_GRACE: Duration = Duration::from_secs(5);
+
+/// One CDP command: method, params, session.
+type Command = (&'static str, Value, Option<String>);
 
 /// Permissions agent pages never get (no prompt reaches anyone).
 const DENIED_PERMISSIONS: &[&str] = &[
@@ -59,6 +66,13 @@ pub(crate) struct Tab {
     screencasting: bool,
 }
 
+/// A popup of an agent tab, running only until its first navigation.
+#[derive(Clone)]
+struct PendingPopup {
+    target_id: String,
+    opener_session: String,
+}
+
 /// What the event loop needs to know about a tab without awaiting.
 #[derive(Clone)]
 struct SessionInfo {
@@ -72,6 +86,8 @@ pub(crate) struct Running {
     process: Mutex<Option<Process>>,
     pub tabs: tokio::sync::Mutex<HashMap<String, Tab>>,
     sessions: Mutex<HashMap<String, SessionInfo>>,
+    /// Popup session → its pending popup.
+    popups: Mutex<HashMap<String, PendingPopup>>,
     pub last_used: Mutex<Instant>,
     frames: Weak<Frames>,
 }
@@ -87,6 +103,7 @@ impl Running {
             process: Mutex::new(Some(process)),
             tabs: tokio::sync::Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+            popups: Mutex::new(HashMap::new()),
             last_used: Mutex::new(Instant::now()),
             frames,
         });
@@ -106,9 +123,17 @@ impl Running {
                 )
                 .await;
         }
+        // Every new page is attached and paused before it loads anything,
+        // so a popup is judged (and closed) before it can make a request;
+        // other pages are resumed right away.
         cdp.call(
-            "Target.setDiscoverTargets",
-            json!({ "discover": true }),
+            "Target.setAutoAttach",
+            json!({
+                "autoAttach": true,
+                "waitForDebuggerOnStart": true,
+                "flatten": true,
+                "filter": [{ "type": "page" }]
+            }),
             None,
         )
         .await?;
@@ -167,6 +192,9 @@ impl Running {
                     .as_deref()
                     .and_then(|session| running.session_info(session));
                 match (event.method.as_str(), session) {
+                    ("Fetch.requestPaused", _)
+                        if running
+                            .fold_pending_popup(&event.params, event.session_id.as_deref()) => {}
                     ("Fetch.requestPaused", info) => {
                         let params = &event.params;
                         let request_id =
@@ -209,11 +237,16 @@ impl Running {
                             event.session_id.as_deref(),
                         );
                     }
-                    ("Target.targetCreated", _) => running.fold_popup(&event.params),
+                    ("Target.attachedToTarget", _) => running.fold_popup(&event.params),
                     ("Target.detachedFromTarget", _) => {
                         // The window was closed (by the person at the host,
                         // or a crash): the conversation has no tab now.
                         if let Some(session_id) = event.params["sessionId"].as_str() {
+                            running
+                                .popups
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .remove(session_id);
                             let removed = running
                                 .sessions
                                 .lock()
@@ -233,34 +266,83 @@ impl Running {
         });
     }
 
-    /// Popups stay in the agent's tab: local ones load there, the rest
-    /// are refused.
-    fn fold_popup(&self, params: &Value) {
-        let info = &params["targetInfo"];
-        let opener = info["openerId"].as_str().unwrap_or_default();
-        if opener.is_empty() || info["type"] != "page" {
-            return;
+    /// A page the browser-wide auto-attach paused (`Target.attachedToTarget`
+    /// on the browser session). Popups of an agent tab stay in that tab:
+    /// local ones load there, the rest are refused, and the popup closes
+    /// without having loaded anything. Any other page is resumed.
+    fn fold_popup(self: &Arc<Self>, params: &Value) {
+        let opener = params["targetInfo"]["openerId"]
+            .as_str()
+            .unwrap_or_default();
+        let opener_session = (!opener.is_empty())
+            .then(|| {
+                self.sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .find(|(_, session)| session.target_id == opener)
+                    .map(|(id, _)| id.clone())
+            })
+            .flatten();
+        let (commands, pending) = attached_target(params, opener_session.as_deref());
+        if let Some(pending) = pending {
+            let session_id = params["sessionId"].as_str().unwrap_or_default().to_owned();
+            self.popups
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(session_id.clone(), pending);
+            // Loads nothing: it goes anyway.
+            let weak = Arc::downgrade(self);
+            tokio::spawn(async move {
+                tokio::time::sleep(POPUP_GRACE).await;
+                let Some(running) = weak.upgrade() else {
+                    return;
+                };
+                let stale = running
+                    .popups
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&session_id);
+                if let Some(popup) = stale {
+                    running.cdp.notify(
+                        "Target.closeTarget",
+                        json!({ "targetId": popup.target_id }),
+                        None,
+                    );
+                }
+            });
         }
-        let Some(opener_session) = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .find(|(_, session)| session.target_id == opener)
-            .map(|(id, _)| id.clone())
-        else {
-            return;
+        self.send(commands);
+    }
+
+    /// The first navigation of a pending popup: refused there, and folded
+    /// into the opener's tab. False when `session_id` is no pending popup.
+    fn fold_pending_popup(&self, params: &Value, session_id: Option<&str>) -> bool {
+        let Some(popup) = session_id.and_then(|session_id| {
+            self.popups
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(session_id)
+        }) else {
+            return false;
         };
-        let target_id = info["targetId"].as_str().unwrap_or_default();
-        let url = info["url"].as_str().unwrap_or_default();
-        self.cdp
-            .notify("Target.closeTarget", json!({ "targetId": target_id }), None);
-        if policy::popup(url) == Popup::LoadInTab {
-            self.cdp.notify(
-                "Page.navigate",
-                json!({ "url": url }),
-                Some(&opener_session),
-            );
+        let mut commands = vec![(
+            "Fetch.failRequest",
+            json!({ "requestId": params["requestId"], "errorReason": "Aborted" }),
+            session_id.map(str::to_owned),
+        )];
+        commands.extend(fold_commands(
+            &popup.target_id,
+            params["request"]["url"].as_str().unwrap_or_default(),
+            &popup.opener_session,
+        ));
+        self.send(commands);
+        true
+    }
+
+    fn send(&self, commands: Vec<Command>) {
+        for (method, body, session) in commands {
+            self.cdp.notify(method, body, session.as_deref());
         }
     }
 
@@ -962,6 +1044,65 @@ impl Running {
     }
 }
 
+/// The CDP commands for a target auto-attach reported (`opener_session`
+/// is the agent tab that opened it, if one did), and the pending popup to
+/// track when its address is not known yet.
+fn attached_target(
+    params: &Value,
+    opener_session: Option<&str>,
+) -> (Vec<Command>, Option<PendingPopup>) {
+    let info = &params["targetInfo"];
+    let session_id = params["sessionId"].as_str().unwrap_or_default().to_owned();
+    let waiting = params["waitingForDebugger"] == true && !session_id.is_empty();
+    let resume = || {
+        (
+            "Runtime.runIfWaitingForDebugger",
+            json!({}),
+            Some(session_id.clone()),
+        )
+    };
+    let Some(opener_session) = opener_session.filter(|_| info["type"] == "page") else {
+        // Not an agent tab's popup (the agent's own tabs, pages the person
+        // opened): let it run.
+        return (waiting.then(resume).into_iter().collect(), None);
+    };
+    let target_id = info["targetId"].as_str().unwrap_or_default();
+    let url = info["url"].as_str().unwrap_or_default();
+    if !waiting || !(url.is_empty() || url == "about:blank") {
+        return (fold_commands(target_id, url, opener_session), None);
+    }
+    // `window.open(url)` reports no address yet: let it run with its
+    // navigations intercepted, and fold the first one.
+    (
+        vec![
+            (
+                "Fetch.enable",
+                json!({ "patterns": [{ "resourceType": "Document", "requestStage": "Request" }] }),
+                Some(session_id.clone()),
+            ),
+            resume(),
+        ],
+        Some(PendingPopup {
+            target_id: target_id.to_owned(),
+            opener_session: opener_session.to_owned(),
+        }),
+    )
+}
+
+/// Closes popup `target_id` and loads `url` in the opener's tab when it is
+/// a local page.
+fn fold_commands(target_id: &str, url: &str, opener_session: &str) -> Vec<Command> {
+    let mut commands = vec![("Target.closeTarget", json!({ "targetId": target_id }), None)];
+    if policy::popup(url) == Popup::LoadInTab {
+        commands.push((
+            "Page.navigate",
+            json!({ "url": url }),
+            Some(opener_session.to_owned()),
+        ));
+    }
+    commands
+}
+
 /// CDP key data for named keys: (key, code, keyCode, text).
 fn named_key(name: &str) -> Option<(&'static str, &'static str, u32, Option<&'static str>)> {
     Some(match name {
@@ -986,6 +1127,78 @@ fn named_key(name: &str) -> Option<(&'static str, &'static str, u32, Option<&'st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paused_targets_are_judged_before_they_run() {
+        let attached = |opener: &str, url: &str, waiting: bool| {
+            json!({
+                "sessionId": "S-new",
+                "waitingForDebugger": waiting,
+                "targetInfo": { "targetId": "T-new", "type": "page", "url": url, "openerId": opener }
+            })
+        };
+        let close = ("Target.closeTarget", json!({ "targetId": "T-new" }), None);
+        let resume = (
+            "Runtime.runIfWaitingForDebugger",
+            json!({}),
+            Some("S-new".to_owned()),
+        );
+        // A popup with a local address: closed unrun, loaded in the tab.
+        let (commands, pending) = attached_target(
+            &attached("T-agent", "http://localhost:5173/x", true),
+            Some("S-agent"),
+        );
+        assert!(pending.is_none());
+        assert_eq!(
+            commands,
+            vec![
+                close.clone(),
+                (
+                    "Page.navigate",
+                    json!({ "url": "http://localhost:5173/x" }),
+                    Some("S-agent".to_owned())
+                ),
+            ]
+        );
+        // A remote address: closed, never resumed or loaded.
+        let (commands, pending) = attached_target(
+            &attached("T-agent", "https://example.com/", true),
+            Some("S-agent"),
+        );
+        assert_eq!((commands, pending.is_none()), (vec![close.clone()], true));
+        // No address yet (`window.open(url)`): runs with its navigations
+        // intercepted, tracked as pending.
+        for url in ["", "about:blank"] {
+            let (commands, pending) =
+                attached_target(&attached("T-agent", url, true), Some("S-agent"));
+            assert_eq!(commands[0].0, "Fetch.enable");
+            assert_eq!(commands[0].2.as_deref(), Some("S-new"));
+            assert_eq!(commands[1], resume);
+            let pending = pending.unwrap();
+            assert_eq!(
+                (pending.target_id.as_str(), pending.opener_session.as_str()),
+                ("T-new", "S-agent")
+            );
+        }
+        // Its first navigation is then folded like a known address.
+        assert_eq!(
+            fold_commands("T-new", "https://example.com/", "S-agent"),
+            vec![close.clone()]
+        );
+        assert_eq!(
+            fold_commands("T-new", "http://127.0.0.1:3000/", "S-agent").len(),
+            2
+        );
+        // Not an agent tab's popup: resumed, nothing else.
+        for opener in ["", "T-person"] {
+            let (commands, pending) =
+                attached_target(&attached(opener, "https://example.com/", true), None);
+            assert_eq!((commands, pending.is_none()), (vec![resume.clone()], true));
+        }
+        // Already running (an explicit attach): left alone.
+        let (commands, pending) = attached_target(&attached("", "about:blank", false), None);
+        assert!(commands.is_empty() && pending.is_none());
+    }
 
     #[test]
     fn named_keys_map_to_cdp_key_data() {

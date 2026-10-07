@@ -4276,8 +4276,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agent_tool_mode_lasts_only_while_a_turn_runs() {
-        let (root, store, supervisor, workspace) =
-            control_fixture("todex-agent-tool-mode").await;
+        let (root, store, supervisor, workspace) = control_fixture("todex-agent-tool-mode").await;
         let ssh = crate::ssh::tests::fixture("Host web\n").await;
         let agent_mcp = crate::agent_mcp::tests::registry(ssh.service.clone(), &root).await;
         let supervisor = supervisor.with_agent_mcp(agent_mcp.clone());
