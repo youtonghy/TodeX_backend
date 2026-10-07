@@ -1591,13 +1591,15 @@ pub struct LocalCodexAdapter {
     runtime: Arc<AsyncMutex<CodexLocalAdapterRuntime>>,
     idle_state: Arc<AsyncMutex<LocalCodexAdapterIdleState>>,
     /// The app-server and its crash-cleanup record, dropped once reaped.
-    child: Arc<AsyncMutex<Option<(Child, Option<TrackedProcess>)>>>,
+    child: Arc<AsyncMutex<Option<TrackedChild>>>,
     stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
     stderr_task: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
     store: CodexGatewayStore,
     events: EventBus,
     pending_server_requests: Arc<DashMap<GatewayRequestId, CodexServerRequest>>,
 }
+
+type TrackedChild = (Child, Option<TrackedProcess>);
 
 impl std::fmt::Debug for LocalCodexAdapter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
