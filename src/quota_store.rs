@@ -65,10 +65,14 @@ impl QuotaStore {
     }
 }
 
-/// Reset instant of a snapshot whose plan limit is reached: Claude reports
-/// `status: "rejected"`, Codex a window at 100 %. The latest reset among the
-/// full windows decides; a rejection without one falls back to the top-level
-/// `resetsAt`. `None` when nothing is exhausted or no reset time is known.
+/// Reset instant of a snapshot whose plan limit is reached. A snapshot that
+/// reports a `status` (Claude) is exhausted only when it is `"rejected"`: a
+/// window at 100 % with `allowed` / `allowed_warning` still serves requests,
+/// for example from extra usage. Without a status (Codex), some window must be
+/// at 100 % and the account must not be drawing on overage. The latest reset
+/// among the full windows decides; a rejection without one falls back to the
+/// top-level `resetsAt`. `None` when nothing is exhausted or no reset time is
+/// known.
 fn exhausted_until(payload: &Value) -> Option<DateTime<Utc>> {
     let windows = payload
         .get("windows")
@@ -85,13 +89,14 @@ fn exhausted_until(payload: &Value) -> Option<DateTime<Utc>> {
         })
         .filter_map(|window| reset_instant(window.get("resetsAt")?))
         .max();
-    let rejected = payload.get("status").and_then(Value::as_str) == Some("rejected");
-    full_window_reset.or_else(|| {
-        rejected
-            .then(|| payload.pointer("/raw/resetsAt"))
-            .flatten()
-            .and_then(reset_instant)
-    })
+    match payload.get("status").and_then(Value::as_str) {
+        Some("rejected") => {
+            full_window_reset.or_else(|| payload.pointer("/raw/resetsAt").and_then(reset_instant))
+        }
+        Some(_) => None,
+        None if payload.get("isUsingOverage").and_then(Value::as_bool) == Some(true) => None,
+        None => full_window_reset,
+    }
 }
 
 /// Providers report epoch seconds; accept milliseconds as well.
@@ -176,6 +181,33 @@ mod tests {
             })),
             None
         );
+    }
+
+    #[test]
+    fn a_reported_status_decides_and_overage_is_not_exhaustion() {
+        let full = json!([{ "id": "five_hour", "usedPercent": 100.0, "resetsAt": 1791279000 }]);
+        // Claude still serves requests past 100 % unless it says rejected.
+        for status in ["allowed", "allowed_warning"] {
+            assert_eq!(
+                exhausted_until(&json!({ "status": status, "windows": full })),
+                None,
+                "{status}"
+            );
+        }
+        // Without a status, a full window drawing on overage keeps going.
+        assert_eq!(
+            exhausted_until(&json!({ "isUsingOverage": true, "windows": full })),
+            None
+        );
+        let reset = Utc.timestamp_opt(1791279000, 0).single();
+        for payload in [
+            json!({ "isUsingOverage": false, "windows": full }),
+            json!({ "status": null, "isUsingOverage": null, "windows": full }),
+            // A rejection counts even while overage was in use.
+            json!({ "status": "rejected", "isUsingOverage": true, "windows": full }),
+        ] {
+            assert_eq!(exhausted_until(&payload), reset, "{payload}");
+        }
     }
 
     #[test]
