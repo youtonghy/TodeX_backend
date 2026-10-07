@@ -130,7 +130,10 @@ const DIGEST_CACHE_ENTRIES: usize = 256;
 const BLOCKING_ENCODE_BYTES: usize = 64 * 1024;
 
 /// A string-keyed LRU. Like the index cache it is only touched under the
-/// conversation lock and the mutex is never held across an await.
+/// conversation lock and the mutex is never held across an await. The mutex
+/// is shared by every conversation, so `with` closures stay short: large
+/// values are stored behind an `Arc` and readers clone the `Arc`, never the
+/// value, under the lock.
 pub(super) struct LruMap<V>(std::sync::Mutex<LruCache<String, V>>);
 
 impl<V> LruMap<V> {
@@ -211,7 +214,10 @@ pub struct ConversationStore {
 struct CachedDigest {
     /// Fingerprint of the journal files the digest describes in full.
     files: Vec<JournalFile>,
-    digest: JournalDigest,
+    /// Shared so a reader takes a reference under the cache mutex and runs
+    /// outside it; appends fold in place (`Arc::make_mut`, no copy once the
+    /// readers are done).
+    digest: Arc<JournalDigest>,
 }
 
 struct CachedManifest {
@@ -465,7 +471,8 @@ struct JournalTail {
     name: String,
     bytes: u64,
     modified: Option<std::time::SystemTime>,
-    event: ConversationEvent,
+    /// Shared so a cache hit clones the event outside the cache mutex.
+    event: Arc<ConversationEvent>,
 }
 
 fn blocking_error(error: tokio::task::JoinError) -> AppError {
@@ -1375,7 +1382,7 @@ impl ConversationStore {
                 if cached.files != pre_write_files {
                     return false;
                 }
-                cached.digest.apply(&event);
+                Arc::make_mut(&mut cached.digest).apply(&event);
                 cached.files = files;
                 true
             })
@@ -1389,7 +1396,7 @@ impl ConversationStore {
                 name: EVENTS_FILE.to_owned(),
                 bytes: metadata.len(),
                 modified: metadata.modified().ok(),
-                event: event.clone(),
+                event: Arc::new(event.clone()),
             },
         );
 
@@ -1598,20 +1605,17 @@ impl ConversationStore {
             self.digests.remove(conversation_id);
             return Ok(read(&JournalDigest::default()));
         }
-        // `read` runs on the entry it found or built: the bounded cache may
-        // evict it again before a later lookup.
-        let mut read = Some(read);
-        if let Some(result) = self
+        // `read` runs on the entry it found or built (the bounded cache may
+        // evict it again before a later lookup), outside the cache mutex.
+        if let Some(digest) = self
             .digests
             .with(conversation_id, |cached| {
-                (cached.files == files)
-                    .then(|| read.take().expect("read runs once")(&cached.digest))
+                (cached.files == files).then(|| Arc::clone(&cached.digest))
             })
             .flatten()
         {
-            return Ok(result);
+            return Ok(read(&digest));
         }
-        let read = read.expect("read has not run");
         self.digests.remove(conversation_id);
         let index_files =
             |store: &Self| store.index_get(conversation_id, |index| index.files.clone());
@@ -1692,7 +1696,7 @@ impl ConversationStore {
                     conversation_id,
                     CachedDigest {
                         files: start_files,
-                        digest,
+                        digest: Arc::new(digest),
                     },
                 );
                 return Ok(result);
@@ -1910,7 +1914,7 @@ impl ConversationStore {
                     name: files[file].name.clone(),
                     bytes: files[file].bytes,
                     modified: files[file].modified,
-                    event,
+                    event: Arc::new(event),
                 },
             );
         }
@@ -2659,7 +2663,7 @@ impl ConversationStore {
                             name: files[file].name.clone(),
                             bytes: files[file].bytes,
                             modified: files[file].modified,
-                            event,
+                            event: Arc::new(event),
                         },
                     );
                 }
@@ -2879,10 +2883,10 @@ impl ConversationStore {
         // newline-terminated (appends, recovery, the cold scan).
         let cached = self.tails.with(conversation_id, |tail| {
             (tail.name == last.name && tail.bytes == last.bytes && tail.modified == last.modified)
-                .then(|| tail.event.clone())
+                .then(|| Arc::clone(&tail.event))
         });
         if let Some(event) = cached.flatten() {
-            return Ok((Some(event), true));
+            return Ok((Some(ConversationEvent::clone(&event)), true));
         }
         if last.is_sealed_segment() {
             let number = last.number().unwrap_or_default();
@@ -2903,7 +2907,7 @@ impl ConversationStore {
                     name: last.name.clone(),
                     bytes: last.bytes,
                     modified: last.modified,
-                    event: event.clone(),
+                    event: Arc::new(event.clone()),
                 },
             );
             return Ok((Some(event), true));
