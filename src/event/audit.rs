@@ -1,48 +1,92 @@
-//! Append-only audit trail at `$DATA_DIR/audit/audit.jsonl`.
+//! Append-only audit trails under `$DATA_DIR/audit/`.
+//!
+//! [`AuditLog::default`] writes `audit.jsonl` (authorization, Git, Codex,
+//! provider decisions, ...). [`AuditLog::terminal`] writes
+//! `audit-terminal.jsonl`: terminal input and resize are audited per
+//! message, so they get their own file and size budget and cannot rotate the
+//! main trail away.
 //!
 //! One file handle stays open between writes; it is reopened when the target
 //! path changes or after a failed write. Past [`MAX_AUDIT_FILE_BYTES`] the
-//! file rotates to `audit.jsonl.1` (older files shift up to
-//! [`RETAINED_AUDIT_FILES`]; the oldest is deleted). Every record is synced
-//! before `append` returns, on the blocking pool so async workers never wait
-//! on the disk.
+//! file rotates to `<name>.1` (older files shift up to
+//! [`RETAINED_AUDIT_FILES`]; the oldest is replaced). A rotation that fails
+//! is logged and retried later; meanwhile records keep going to the live
+//! file, so a stuck rotation neither fails writes nor deletes old files.
+//! Every record is synced before `append` returns, on the blocking pool so
+//! async workers never wait on the disk.
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tracing::warn;
 
 use super::EventRecord;
 use crate::error::AppError;
 
 const AUDIT_FILE_NAME: &str = "audit.jsonl";
+const TERMINAL_AUDIT_FILE_NAME: &str = "audit-terminal.jsonl";
 /// The live file rotates once a write would take it past this size.
 const MAX_AUDIT_FILE_BYTES: u64 = 16 * 1024 * 1024;
-/// Rotated files kept beside the live one (`audit.jsonl.1` is the newest).
+/// Rotated files kept beside the live one (`<name>.1` is the newest).
 const RETAINED_AUDIT_FILES: usize = 3;
+/// After a failed rotation, appends go to the live file for this long
+/// before rotation is tried again.
+const ROTATION_RETRY_DELAY: Duration = Duration::from_secs(60);
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AuditLog {
+    file_name: &'static str,
     open: Arc<Mutex<Option<OpenAuditFile>>>,
+}
+
+impl Default for AuditLog {
+    /// The main trail, `audit.jsonl`.
+    fn default() -> Self {
+        Self::with_file_name(AUDIT_FILE_NAME)
+    }
 }
 
 struct OpenAuditFile {
     path: PathBuf,
     file: fs::File,
     len: u64,
+    /// Set after a failed rotation: do not try again before this instant.
+    rotation_retry_at: Option<Instant>,
 }
 
 impl AuditLog {
+    /// The terminal trail, `audit-terminal.jsonl`.
+    pub fn terminal() -> Self {
+        Self::with_file_name(TERMINAL_AUDIT_FILE_NAME)
+    }
+
+    fn with_file_name(file_name: &'static str) -> Self {
+        Self {
+            file_name,
+            open: Arc::default(),
+        }
+    }
+
     /// Appends `event` as one JSON line under `data_dir/audit` and syncs it.
     pub async fn append(&self, data_dir: &Path, event: &EventRecord) -> Result<(), AppError> {
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
         let directory = data_dir.join("audit");
         let open = self.open.clone();
+        let file_name = self.file_name;
         tokio::task::spawn_blocking(move || {
             // A panic while holding the lock leaves at worst a stale handle,
             // which the path/len checks below tolerate.
             let mut open = open.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let result = append_line(&mut open, &directory, &line, MAX_AUDIT_FILE_BYTES);
+            let result = append_line(
+                &mut open,
+                &directory,
+                file_name,
+                &line,
+                MAX_AUDIT_FILE_BYTES,
+            );
             if result.is_err() {
                 // Reopen on the next write instead of reusing a handle in an
                 // unknown state.
@@ -59,18 +103,34 @@ impl AuditLog {
 fn append_line(
     open: &mut Option<OpenAuditFile>,
     directory: &Path,
+    file_name: &str,
     line: &[u8],
     max_bytes: u64,
 ) -> io::Result<()> {
-    let path = directory.join(AUDIT_FILE_NAME);
+    let path = directory.join(file_name);
     if open.as_ref().is_none_or(|current| current.path != path) {
-        *open = Some(open_audit_file(directory, path)?);
+        *open = Some(open_audit_file(directory, path.clone())?);
     }
     let current = open.as_mut().expect("audit file was just opened");
-    if current.len > 0 && current.len + line.len() as u64 > max_bytes {
+    let rotation_due = current.len > 0
+        && current.len + line.len() as u64 > max_bytes
+        && current
+            .rotation_retry_at
+            .is_none_or(|retry_at| Instant::now() >= retry_at);
+    if rotation_due {
+        // Close the handle first: Windows cannot rename an open file.
         *open = None;
-        rotate(directory)?;
-        *open = Some(open_audit_file(directory, directory.join(AUDIT_FILE_NAME))?);
+        let rotated = rotate(directory, file_name);
+        let mut reopened = open_audit_file(directory, path)?;
+        if let Err(error) = rotated {
+            warn!(
+                file = file_name,
+                error = %error,
+                "audit log rotation failed; appending to the live file"
+            );
+            reopened.rotation_retry_at = Some(Instant::now() + ROTATION_RETRY_DELAY);
+        }
+        *open = Some(reopened);
     }
     let current = open.as_mut().expect("audit file is open");
     current.file.write_all(line)?;
@@ -92,26 +152,51 @@ fn open_audit_file(directory: &Path, path: PathBuf) -> io::Result<OpenAuditFile>
     // Files written by older daemons may predate the 0600 mode.
     crate::secure_fs::set_owner_only(&path, false)?;
     let len = file.metadata()?.len();
-    Ok(OpenAuditFile { path, file, len })
+    Ok(OpenAuditFile {
+        path,
+        file,
+        len,
+        rotation_retry_at: None,
+    })
 }
 
-/// Shifts `audit.jsonl.N` to `.N+1` (dropping the oldest) and moves the live
-/// file to `.1`.
-fn rotate(directory: &Path) -> io::Result<()> {
-    let rotated = |index: usize| directory.join(format!("{AUDIT_FILE_NAME}.{index}"));
-    match fs::remove_file(rotated(RETAINED_AUDIT_FILES)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+/// Moves the live file aside first, then shifts `<name>.N` to `.N+1` (the
+/// rename replaces, and so drops, the oldest) and puts the live file at
+/// `.1`. Nothing is deleted before the live file is known to be movable,
+/// and a failure moves it back so writes continue where they were.
+fn rotate(directory: &Path, file_name: &str) -> io::Result<()> {
+    let live = directory.join(file_name);
+    let rotated = |index: usize| directory.join(format!("{file_name}.{index}"));
+    let staged = directory.join(format!("{file_name}.rotating"));
+    // A staged file left by an earlier failure would be overwritten.
+    if fs::symlink_metadata(&staged).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} is in the way", staged.display()),
+        ));
     }
-    for index in (1..RETAINED_AUDIT_FILES).rev() {
-        match fs::rename(rotated(index), rotated(index + 1)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+    fs::rename(&live, &staged)?;
+    let shifted = (1..RETAINED_AUDIT_FILES)
+        .rev()
+        .try_for_each(
+            |index| match fs::rename(rotated(index), rotated(index + 1)) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        )
+        .and_then(|()| fs::rename(&staged, rotated(1)));
+    if let Err(error) = shifted {
+        if let Err(restore) = fs::rename(&staged, &live) {
+            warn!(
+                file = file_name,
+                error = %restore,
+                "could not move the staged audit log back; it stays beside the live file"
+            );
         }
+        return Err(error);
     }
-    fs::rename(directory.join(AUDIT_FILE_NAME), rotated(1))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -159,10 +244,10 @@ mod tests {
         let temp = temp_dir();
         let directory = temp.join("audit");
         let mut open = None;
-        let line = b"0123456789\n";
+        let line: &[u8] = b"0123456789\n";
         // Two lines per file: 12 lines leave the live file plus 3 rotations.
         for _ in 0..12 {
-            append_line(&mut open, &directory, line, 22).unwrap();
+            append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
         }
         assert_eq!(
             fs::read(directory.join("audit.jsonl")).unwrap().len(),
@@ -183,9 +268,9 @@ mod tests {
         let temp = temp_dir();
         let directory = temp.join("audit");
         let mut open = None;
-        append_line(&mut open, &directory, b"first\n", 1024).unwrap();
+        append_line(&mut open, &directory, AUDIT_FILE_NAME, b"first\n", 1024).unwrap();
         let other = temp.join("other");
-        append_line(&mut open, &other, b"second\n", 1024).unwrap();
+        append_line(&mut open, &other, AUDIT_FILE_NAME, b"second\n", 1024).unwrap();
         assert_eq!(
             fs::read_to_string(other.join("audit.jsonl")).unwrap(),
             "second\n"
@@ -194,6 +279,90 @@ mod tests {
             fs::read_to_string(directory.join("audit.jsonl")).unwrap(),
             "first\n"
         );
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn a_failed_rotation_keeps_writing_and_keeps_old_files() {
+        let temp = temp_dir();
+        let directory = temp.join("audit");
+        fs::create_dir_all(&directory).unwrap();
+        let line: &[u8] = b"0123456789\n";
+        fs::write(directory.join("audit.jsonl"), [line, line].concat()).unwrap();
+        fs::write(directory.join("audit.jsonl.1"), b"one\n").unwrap();
+        // `.2` cannot be moved onto the file `.3`: the shift fails.
+        fs::create_dir_all(directory.join("audit.jsonl.2/inside")).unwrap();
+        fs::write(directory.join("audit.jsonl.3"), b"three\n").unwrap();
+
+        let mut open = None;
+        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
+        // The retry delay keeps the next write from rotating again.
+        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
+        assert_eq!(
+            fs::read(directory.join("audit.jsonl")).unwrap(),
+            [line, line, line, line].concat()
+        );
+        assert_eq!(fs::read(directory.join("audit.jsonl.1")).unwrap(), b"one\n");
+        assert!(directory.join("audit.jsonl.2/inside").is_dir());
+        assert_eq!(
+            fs::read(directory.join("audit.jsonl.3")).unwrap(),
+            b"three\n"
+        );
+        assert!(!directory.join("audit.jsonl.rotating").exists());
+        assert!(open.as_ref().unwrap().rotation_retry_at.is_some());
+
+        // Once the obstacle is gone, the next due rotation succeeds.
+        fs::remove_dir_all(directory.join("audit.jsonl.2")).unwrap();
+        open.as_mut().unwrap().rotation_retry_at = Some(Instant::now());
+        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
+        assert_eq!(fs::read(directory.join("audit.jsonl")).unwrap(), line);
+        assert_eq!(
+            fs::read(directory.join("audit.jsonl.1")).unwrap(),
+            [line, line, line, line].concat()
+        );
+        assert_eq!(fs::read(directory.join("audit.jsonl.2")).unwrap(), b"one\n");
+        assert_eq!(
+            fs::read(directory.join("audit.jsonl.3")).unwrap(),
+            b"three\n"
+        );
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn a_live_file_that_cannot_move_is_not_rotated() {
+        let temp = temp_dir();
+        let directory = temp.join("audit");
+        fs::create_dir_all(&directory).unwrap();
+        let line: &[u8] = b"0123456789\n";
+        fs::write(directory.join("audit.jsonl"), [line, line].concat()).unwrap();
+        fs::write(directory.join("audit.jsonl.3"), b"three\n").unwrap();
+        // A leftover staged file blocks the first step.
+        fs::create_dir_all(directory.join("audit.jsonl.rotating")).unwrap();
+        let mut open = None;
+        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
+        assert_eq!(
+            fs::read(directory.join("audit.jsonl")).unwrap(),
+            [line, line, line].concat()
+        );
+        assert_eq!(
+            fs::read(directory.join("audit.jsonl.3")).unwrap(),
+            b"three\n"
+        );
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn terminal_records_have_their_own_file() {
+        let temp = temp_dir();
+        AuditLog::default().append(&temp, &record(1)).await.unwrap();
+        AuditLog::terminal()
+            .append(&temp, &record(2))
+            .await
+            .unwrap();
+        let main = fs::read_to_string(temp.join("audit/audit.jsonl")).unwrap();
+        let terminal = fs::read_to_string(temp.join("audit/audit-terminal.jsonl")).unwrap();
+        assert!(main.contains("\"index\":1") && !main.contains("\"index\":2"));
+        assert!(terminal.contains("\"index\":2") && !terminal.contains("\"index\":1"));
         let _ = fs::remove_dir_all(&temp);
     }
 }

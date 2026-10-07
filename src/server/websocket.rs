@@ -1622,7 +1622,7 @@ async fn authorize_terminal_request(
                 "protocol": "todex-terminal.v1",
             }),
         );
-        append_audit_event(state, &event).await?;
+        append_terminal_audit_event(state, &event).await?;
         return Ok(());
     };
 
@@ -1645,7 +1645,7 @@ async fn authorize_terminal_request(
                 "protocol": "todex-terminal.v1",
             }),
         );
-        append_audit_event(state, &event).await?;
+        append_terminal_audit_event(state, &event).await?;
         return Err(AppError::Unauthorized("tenant mismatch".to_owned()));
     }
 
@@ -1667,7 +1667,7 @@ async fn authorize_terminal_request(
             "protocol": "todex-terminal.v1",
         }),
     );
-    append_audit_event(state, &event).await?;
+    append_terminal_audit_event(state, &event).await?;
     Ok(())
 }
 
@@ -1815,6 +1815,18 @@ pub(crate) async fn append_audit_event(
     event: &EventRecord,
 ) -> Result<(), AppError> {
     state.audit_log.append(&state.config.data_dir, event).await
+}
+
+/// Appends a `terminal.audit` record to `$DATA_DIR/audit/audit-terminal.jsonl`,
+/// which rotates on its own budget (see [`crate::event::AuditLog::terminal`]).
+async fn append_terminal_audit_event(
+    state: &AppState,
+    event: &EventRecord,
+) -> Result<(), AppError> {
+    state
+        .terminal_audit_log
+        .append(&state.config.data_dir, event)
+        .await
 }
 
 fn truncate_snapshot_text(text: String, max_bytes: usize) -> String {

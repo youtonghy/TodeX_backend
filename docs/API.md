@@ -587,7 +587,7 @@ Content-Type: application/json
 
 Git 进程不经过 shell，stdin 关闭并设置 `GIT_TERMINAL_PROMPT=0`；子进程只继承必要的基础运行环境，不继承 `TODEX_AGENTD_*` 或 `GIT_DIR`/`GIT_WORK_TREE` 等路径覆盖变量。所有命令显式关闭 fsmonitor 与 untracked cache，差异统计禁用 external diff/textconv。写操作会再次确认 worktree、git-dir 和 git-common-dir 全部位于 `workspace_roots` 内，拒绝写入相关 Git 元数据树中的符号链接和 object alternates，并使用 daemon 管理的空 hooks 目录、关闭 commit/push 签名和 `ext`/`file` transport；local 与 worktree 级配置都会展开 `include` 后检查，包含 clean/process filter、askpass、local credential helper、`core.sshCommand`、自定义 GPG program、自定义 remote helper 或仓库级 URL 重写时直接拒绝。仓库远端仅接受 HTTP(S)、SSH、Git URL 与 SCP-like SSH 写法；daemon 账户自己的全局 credential/SSH 配置仍可用于正常的非本地远端推送。同一 daemon 内的 Git 写操作串行执行，排队超过 2 秒返回 `409 CONFLICT`，单次写请求总计超过 120 秒返回 `GIT_PARTIAL_SUCCESS`，提醒客户端状态可能已改变、刷新后再决定后续动作。每条命令 15 秒超时；超时、输出超限或外层请求取消都会终止 Git 进程组并回收直接子进程。完整进程组清理依赖 Unix，因此非 Unix 平台的 Git 写 API 返回 `501 UNSUPPORTED`；Git 扫描仍可使用。
 
-会改变仓库的 Git 请求（`/v2/git/run` 与 `/v2/git/operation`）通过认证、schema 与路径校验并进入 Git 执行阶段后，会尝试写入 `$TODEX_AGENTD_DATA_DIR/audit/audit.jsonl` 的 `git.audit` 事件；只读接口（scan、status、log、workspace、diff、pull-request）不写审计。审计记录只包含动作、路径、结果码和输出长度，不记录提交说明。无效 token、无效 JSON/action 和路径校验失败发生在审计事件创建之前。Git 副作用完成后的审计 I/O 失败会记录 daemon 警告，但不会把已经成功的操作伪装成失败响应。`audit.jsonl`（0600）由 daemon 常驻句柄追加并逐条 fsync，超过 16 MiB 时轮转为 `audit.jsonl.1`…`.3`（最多保留 3 份旧文件）；审计记录只写文件，不进入 WebSocket 事件流。
+会改变仓库的 Git 请求（`/v2/git/run` 与 `/v2/git/operation`）通过认证、schema 与路径校验并进入 Git 执行阶段后，会尝试写入 `$TODEX_AGENTD_DATA_DIR/audit/audit.jsonl` 的 `git.audit` 事件；只读接口（scan、status、log、workspace、diff、pull-request）不写审计。审计记录只包含动作、路径、结果码和输出长度，不记录提交说明。无效 token、无效 JSON/action 和路径校验失败发生在审计事件创建之前。Git 副作用完成后的审计 I/O 失败会记录 daemon 警告，但不会把已经成功的操作伪装成失败响应。`audit.jsonl`（0600）由 daemon 常驻句柄追加并逐条 fsync，超过 16 MiB 时轮转为 `audit.jsonl.1`…`.3`（最多保留 3 份旧文件；先把活动文件移开再依次后移旧文件，轮转失败时记录 warn 并继续追加到活动文件，约 60 秒后重试，不会让写入失败或删除旧轮转文件）；审计记录只写文件，不进入 WebSocket 事件流。终端审计（`terminal.audit`，每条 `terminal.start` / `input` / `resize` / `stop` / `status` 一条）写入独立的 `audit-terminal.jsonl`，按同样规则独立轮转与计额，无法挤掉 `audit.jsonl` 中的 Git、Codex 等审计；它同样逐条 fsync 且 fail-closed（写入失败则拒绝该终端操作）。
 
 Git API 使用以下错误码（均为统一 JSON 错误 envelope 的 `code` 字段）：`GIT_UNAVAILABLE`、`GIT_REPOSITORY_NOT_FOUND`、`GIT_COMMAND_FAILED`、`GIT_PARTIAL_SUCCESS`、`GIT_COMMAND_TIMED_OUT`、`GIT_OUTPUT_LIMIT_EXCEEDED`、`GIT_PROCESS_ERROR`、`GIT_SCAN_LIMIT_EXCEEDED`、`UNSUPPORTED`。`GIT_PARTIAL_SUCCESS` 表示 `commit-push` 已创建本地提交但后续 push 失败，或写请求触及总时限而无法证明仓库/远端完全未变；客户端必须刷新仓库状态且不得自动重试提交。路径越界仍返回通用的 `WORKSPACE_PATH_OUTSIDE_ROOT`。
 
@@ -736,7 +736,7 @@ TUI 配对二维码只携带后端地址、当前首选加密方式和服务端�
 }
 ```
 
-设备签名认证当前映射到租户 `local`，认证主体是 `deviceId`（由设备公钥派生）。请求 payload 中的 `tenantId` 必须与认证上下文匹配。鉴权结果会写入 `$TODEX_AGENTD_DATA_DIR/audit/audit.jsonl`（不再广播，客户端从未收到过审计事件），审计记录中的 `token_id`/`principal_id` 即 `deviceId`。
+设备签名认证当前映射到租户 `local`，认证主体是 `deviceId`（由设备公钥派生）。请求 payload 中的 `tenantId` 必须与认证上下文匹配。鉴权结果会写入 `$TODEX_AGENTD_DATA_DIR/audit/audit.jsonl`（终端操作写入 `audit-terminal.jsonl`；不再广播，客户端从未收到过审计事件），审计记录中的 `token_id`/`principal_id` 即 `deviceId`。
 
 ### Codex 原生控制范围
 

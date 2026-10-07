@@ -69,6 +69,9 @@ pub struct AppState {
     /// Open SFTP/FTP file sessions; in memory only.
     pub(crate) remote_files: RemoteSessions,
     pub(crate) audit_log: crate::event::AuditLog,
+    /// Terminal audit (`audit-terminal.jsonl`), kept apart so per-message
+    /// terminal records cannot rotate the main trail away.
+    pub(crate) terminal_audit_log: crate::event::AuditLog,
     websocket_connections: Arc<AtomicUsize>,
 }
 
@@ -181,6 +184,7 @@ impl AppState {
             agent_desktop,
             remote_files: RemoteSessions::default(),
             audit_log,
+            terminal_audit_log: crate::event::AuditLog::terminal(),
             websocket_connections,
         })
     }
