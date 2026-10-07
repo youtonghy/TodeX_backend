@@ -15,6 +15,7 @@ use agent_client_protocol::schema::{
     ProtocolVersion,
 };
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 
@@ -1732,13 +1733,23 @@ pub(super) async fn handle_acp_message(
     auto_approve: AutoApprove,
     connection: &mut AcpConnectionState,
 ) -> Result<(), AppError> {
-    let Some(method) = message.get("method").and_then(Value::as_str) else {
+    if message.get("method").and_then(Value::as_str).is_none() {
         return Ok(());
-    };
-    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    }
     if is_client_request(&message) {
         return handle_client_request(process, &message, sink, cancel, auto_approve).await;
     }
+    // Updates arrive at streaming rates: move the params out instead of
+    // cloning them.
+    let mut message = message;
+    let params = message
+        .get_mut("params")
+        .map(Value::take)
+        .unwrap_or(Value::Null);
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if provider == ProviderKind::GrokBuild && is_grok_update_method(method) {
         if !emit_stream_updates {
             return Ok(());
@@ -1759,7 +1770,8 @@ pub(super) async fn handle_acp_message(
         }
     }
     if method == "session/update" {
-        let notification = serde_json::from_value::<SessionNotification>(params.clone());
+        // Validates the shape only; the fields below are read from `params`.
+        let notification = SessionNotification::deserialize(&params);
         if let Err(error) = notification {
             if provider == ProviderKind::GrokBuild {
                 sink.emit(
@@ -1783,7 +1795,11 @@ pub(super) async fn handle_acp_message(
                 "invalid ACP session update: {error}"
             )));
         }
-        let update = params.get("update").cloned().unwrap_or(Value::Null);
+        let mut params = params;
+        let update = params
+            .get_mut("update")
+            .map(Value::take)
+            .unwrap_or(Value::Null);
         let update_type = update
             .get("sessionUpdate")
             .and_then(Value::as_str)

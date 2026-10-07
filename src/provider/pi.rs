@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +28,9 @@ use super::types::{
 };
 
 const MAX_PI_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
+/// A resident Pi process with no turn, query, background event or open
+/// dialog for this long is stopped; the next turn resumes its session file.
+const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
 const PI_UI_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// Pi streams thinking/text a few characters at a time; fragments of one block
 /// are merged (shared window and size limits) so the journal does not store
@@ -59,7 +62,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     profile_required: false,
     recovery_full_scan: true,
     process_model: ProcessModel::Resident {
-        idle: None,
+        idle: Some(Duration::from_secs(300)),
         max_sessions: 32,
     },
     discovery_cache_ttl: Some(Duration::from_secs(60)),
@@ -83,6 +86,11 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
 pub struct PiDriver {
     binary: String,
     sessions: Arc<Mutex<HashMap<String, PiSessionHandle>>>,
+    /// Conversations whose process is being spawned. Reserved under the
+    /// sessions lock, so the spawn itself runs without holding it.
+    starting: std::sync::Mutex<HashSet<String>>,
+    /// How long a resident process may sit without activity.
+    idle_timeout: Duration,
     models: CatalogCache<Vec<super::types::ProviderModelDescriptor>>,
     commands: CatalogCache<Vec<ProviderCommandDescriptor>>,
 }
@@ -101,6 +109,21 @@ struct PiSessionRequest {
     response: oneshot::Sender<Result<Vec<ProviderCommandDescriptor>, AppError>>,
 }
 
+/// Releases a conversation's spawn reservation in [`PiDriver::starting`].
+struct StartingReservation<'a> {
+    starting: &'a std::sync::Mutex<HashSet<String>>,
+    conversation_id: &'a str,
+}
+
+impl Drop for StartingReservation<'_> {
+    fn drop(&mut self) {
+        self.starting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(self.conversation_id);
+    }
+}
+
 struct PiTurnRequest {
     context: DriverContext,
     prompt: DriverPrompt,
@@ -113,6 +136,8 @@ impl PiDriver {
         Self {
             binary: config.pi_bin.clone(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            starting: std::sync::Mutex::new(HashSet::new()),
+            idle_timeout: SESSION_IDLE_TIMEOUT,
             models: CatalogCache::new(PROFILE.discovery_cache_ttl),
             commands: CatalogCache::new(PROFILE.discovery_cache_ttl),
         }
@@ -479,7 +504,7 @@ impl ProviderDriver for PiDriver {
         }
 
         let conversation_id = context.manifest.id.clone();
-        let handle = {
+        let existing = {
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|_, handle| !handle.turns.is_closed());
             if let Some(handle) = sessions.get(&conversation_id) {
@@ -488,11 +513,34 @@ impl ProviderDriver for PiDriver {
                         "Pi runtime is closing; retry after it stops".to_owned(),
                     ));
                 }
-                handle.clone()
+                Some(handle.clone())
             } else {
-                if sessions.len() >= MAX_PI_SESSIONS {
+                let mut starting = self
+                    .starting
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if starting.contains(&conversation_id) {
+                    return Err(AppError::Conflict(
+                        "Pi runtime is starting; retry after it is ready".to_owned(),
+                    ));
+                }
+                if sessions.len() + starting.len() >= MAX_PI_SESSIONS {
                     return Err(AppError::Conflict(format!("Pi has reached its limit of {MAX_PI_SESSIONS} live sessions; close an idle conversation first")));
                 }
+                starting.insert(conversation_id.clone());
+                None
+            }
+        };
+        let handle = match existing {
+            Some(handle) => handle,
+            None => {
+                // Spawning takes a while; other conversations keep using the
+                // sessions map meanwhile. The reservation is released on every
+                // exit, including cancellation.
+                let _reservation = StartingReservation {
+                    starting: &self.starting,
+                    conversation_id: &conversation_id,
+                };
                 let process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
                 let (turns, turn_rx) = mpsc::channel(1);
                 let (controls, control_rx) = mpsc::channel(32);
@@ -514,8 +562,12 @@ impl ProviderDriver for PiDriver {
                     control_rx,
                     request_rx,
                     shutdown_rx,
+                    self.idle_timeout,
                 ));
-                sessions.insert(conversation_id.clone(), handle.clone());
+                self.sessions
+                    .lock()
+                    .await
+                    .insert(conversation_id.clone(), handle.clone());
                 handle
             }
         };
@@ -538,6 +590,24 @@ impl ProviderDriver for PiDriver {
             .await
             .map_err(|_| AppError::ProviderUnavailable("Pi session worker stopped".to_owned()))?
     }
+}
+
+/// The JSON length of `value`, counted without building the string.
+fn serialized_len(value: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // Writing a Value to an infallible sink cannot fail.
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
 }
 
 async fn pi_commands(response: &Value) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
@@ -672,6 +742,7 @@ async fn pi_session_worker(
     mut controls: mpsc::Receiver<PendingProviderControl>,
     mut requests: mpsc::Receiver<PiSessionRequest>,
     mut shutdown: watch::Receiver<Option<String>>,
+    idle_timeout: Duration,
 ) {
     let (_idle_cancel, idle_cancel) = watch::channel(false);
     let mut rpc = PiRpc::new(&mut process, Some(session_sink.clone()), idle_cancel);
@@ -685,14 +756,20 @@ async fn pi_session_worker(
         )
         .await;
     let mut reason = "process_exited".to_owned();
+    let mut idle_deadline = tokio::time::Instant::now() + idle_timeout;
     if ready.is_ok() {
         loop {
             if let Some(requested) = shutdown.borrow().clone() {
                 reason = requested;
                 break;
             }
+            let can_idle_stop = rpc.dialogs.is_empty() && rpc.session_dialogs.is_empty();
             let turn = tokio::select! {
                 turn = turns.recv() => match turn { Some(turn) => turn, None => { reason = "session_closed".to_owned(); break; } },
+                _ = tokio::time::sleep_until(idle_deadline), if can_idle_stop => {
+                    reason = "idle_timeout".to_owned();
+                    break;
+                }
                 _ = shutdown.changed() => {
                     reason = shutdown.borrow().clone().unwrap_or_else(|| "session_closed".to_owned());
                     break;
@@ -702,6 +779,7 @@ async fn pi_session_worker(
                     continue;
                 }
                 request = requests.recv() => {
+                    idle_deadline = tokio::time::Instant::now() + idle_timeout;
                     if let Some(request) = request {
                         if let Err(error) = handle_pi_session_request(&mut rpc, request).await {
                             tracing::warn!(error = %error, "Pi session query lost synchronization");
@@ -712,6 +790,7 @@ async fn pi_session_worker(
                     continue;
                 }
                 frame = rpc.next_event() => {
+                    idle_deadline = tokio::time::Instant::now() + idle_timeout;
                     match frame {
                         Ok(frame) => {
                             if let Err(error) = emit_pi_idle_frame(&mut rpc, frame).await {
@@ -815,6 +894,7 @@ async fn pi_session_worker(
             if closing {
                 break;
             }
+            idle_deadline = tokio::time::Instant::now() + idle_timeout;
         }
     } else {
         reason = "persistence_error".to_owned();
@@ -1066,8 +1146,7 @@ async fn run_pi_turn(
     // State/configuration responses can be interleaved with background output.
     // These frames predate this prompt and must keep their session scope even
     // when the worker accepted the next turn before draining its idle buffer.
-    while let Some(event) = rpc.events.pop_front() {
-        rpc.buffered_bytes = rpc.buffered_bytes.saturating_sub(event.to_string().len());
+    while let Some(event) = rpc.pop_buffered() {
         emit_pi_idle_frame(rpc, event).await?;
     }
     rpc.reusable = false;
@@ -1614,6 +1693,8 @@ struct PiRpc<'a> {
     cancel: Option<watch::Receiver<bool>>,
     shutdown: Option<watch::Receiver<Option<String>>>,
     events: VecDeque<Value>,
+    /// Serialized size of each buffered event, in `events` order.
+    event_sizes: VecDeque<usize>,
     dialogs: JoinSet<Result<Value, AppError>>,
     session_dialogs: JoinSet<Result<Value, AppError>>,
     dialog_cancel: watch::Sender<bool>,
@@ -1680,6 +1761,7 @@ impl<'a> PiRpc<'a> {
             cancel: Some(cancel),
             shutdown: None,
             events: VecDeque::new(),
+            event_sizes: VecDeque::new(),
             dialogs: JoinSet::new(),
             session_dialogs: JoinSet::new(),
             dialog_cancel,
@@ -2138,24 +2220,31 @@ impl<'a> PiRpc<'a> {
                 }
             }
             // Bound unexpected notifications while a provider withholds its response.
-            self.buffered_bytes = self
-                .buffered_bytes
-                .saturating_add(message.to_string().len());
+            let size = serialized_len(&message);
+            self.buffered_bytes = self.buffered_bytes.saturating_add(size);
             if self.events.len() >= 1024 || self.buffered_bytes > 16 * 1024 * 1024 {
                 return Err(AppError::ProviderUnavailable(
                     "Pi exceeded the event buffer limit before its control response".to_owned(),
                 ));
             }
             self.events.push_back(message);
+            self.event_sizes.push_back(size);
         }
+    }
+
+    /// The oldest buffered event, releasing its share of the buffer budget.
+    fn pop_buffered(&mut self) -> Option<Value> {
+        let event = self.events.pop_front()?;
+        let size = self.event_sizes.pop_front().unwrap_or(0);
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(size);
+        Some(event)
     }
 
     async fn next_event(&mut self) -> Result<Value, AppError> {
         if self.cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
             return Err(AppError::TurnCancelled);
         }
-        if let Some(event) = self.events.pop_front() {
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(event.to_string().len());
+        if let Some(event) = self.pop_buffered() {
             if !pi_frame_is_mergeable_delta(&event) {
                 self.flush_pending_delta().await?;
             }
@@ -2347,8 +2436,7 @@ async fn wait_for_pi_abort(
             .await?;
         // Preserve output produced while aborting, but do not turn those frames
         // into a second execution or replay the cancelled input.
-        while let Some(event) = rpc.events.pop_front() {
-            rpc.buffered_bytes = rpc.buffered_bytes.saturating_sub(event.to_string().len());
+        while let Some(event) = rpc.pop_buffered() {
             emit_pi_idle_frame(rpc, event).await?;
         }
         Ok(state)
@@ -2876,6 +2964,8 @@ mod tests {
                 driver: Arc::new(PiDriver {
                     binary: script.display().to_string(),
                     sessions: Arc::new(Mutex::new(HashMap::new())),
+                    starting: std::sync::Mutex::new(HashSet::new()),
+                    idle_timeout: SESSION_IDLE_TIMEOUT,
                     models: CatalogCache::new(None),
                     commands: CatalogCache::new(None),
                 }),
@@ -2997,6 +3087,30 @@ mod tests {
             self.driver.shutdown().await;
             tokio::fs::remove_dir_all(self.root).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn idle_resident_runtime_stops_and_the_next_turn_reopens_it() {
+        let mut fixture = Fixture::new().await;
+        Arc::get_mut(&mut fixture.driver).unwrap().idle_timeout = Duration::from_millis(200);
+        fixture.run("pure", "one").await.unwrap();
+        fixture
+            .wait_event(|event| {
+                event.event_type == "provider.runtime"
+                    && event.payload.get("reason") == Some(&json!("idle_timeout"))
+            })
+            .await;
+        assert!(fixture
+            .driver
+            .sessions
+            .lock()
+            .await
+            .values()
+            .all(|handle| handle.turns.is_closed()));
+        fixture.run("pure", "two").await.unwrap();
+        assert_eq!(fixture.launches().await, 2);
+        fixture.finish().await;
     }
 
     #[tokio::test]

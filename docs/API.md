@@ -252,7 +252,7 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 
 ### Pi 扩展与常驻 runtime
 
-Pi 在回合之间持续读取 RPC stdout，支持后台通知、消息、工具进度、压缩与扩展表单。`provider.runtime` 事件包含 `provider`、`runtimeId`、`scope: "session"`、`status: "ready" | "stopped"`，停止时附带 `reason`。回合成功、纯扩展命令，以及经 `abort` ACK、清队列 ACK 和 idle 状态确认的取消均保留进程；协议失步会关闭进程，不自动重放输入。每个 daemon 最多保留 32 个 Pi runtime，达到上限后拒绝新建，已有会话不会被静默淘汰；没有自动 idle 过期。
+Pi 在回合之间持续读取 RPC stdout，支持后台通知、消息、工具进度、压缩与扩展表单。`provider.runtime` 事件包含 `provider`、`runtimeId`、`scope: "session"`、`status: "ready" | "stopped"`，停止时附带 `reason`。回合成功、纯扩展命令，以及经 `abort` ACK、清队列 ACK 和 idle 状态确认的取消均保留进程；协议失步会关闭进程，不自动重放输入。每个 daemon 最多保留 32 个 Pi runtime，达到上限后拒绝新建，已有会话不会被静默淘汰。runtime 在 300 秒内没有回合、会话查询、后台事件且没有未决扩展对话框时自动停止（`reason: "idle_timeout"`），下一回合以 `--session` 重新打开同一原生会话。
 
 `conversation.runtime.stop` 的 payload 为 `{ "conversationId": "..." }`，与 HTTP `/runtime/stop` 等价，关闭 Pi 进程及待答表单，保留会话日志与原生 session 信息。`conversation.cancel` / `conversation.stop` 仅取消当前回合。撤销工作区信任、删除工作区或会话、会话过期与 daemon 关闭也会停止对应 runtime。daemon 重启时补记旧 runtime 的停止事件，并将未答表单标记为取消；session 表单不会把空闲会话改成运行中。
 

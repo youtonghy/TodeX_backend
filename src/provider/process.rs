@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -148,7 +148,8 @@ pub struct JsonLineProcess {
     stdout_pending: Vec<u8>,
     /// Bytes skipped so far of an oversized line whose end has not arrived.
     stdout_discarding: Option<usize>,
-    stderr: Arc<Mutex<Vec<u8>>>,
+    /// The last MAX_STDERR_BYTES of stderr, as a ring buffer.
+    stderr: Arc<Mutex<VecDeque<u8>>>,
     stderr_task: JoinHandle<()>,
     pid: Option<u32>,
     /// Crash-recovery record; dropped once the process group is gone.
@@ -219,7 +220,7 @@ impl JsonLineProcess {
         let stderr_reader = child.stderr.take().ok_or_else(|| {
             AppError::ProviderUnavailable("provider process did not expose stderr".to_owned())
         })?;
-        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr = Arc::new(Mutex::new(VecDeque::new()));
         let stderr_task = tokio::spawn(drain_stderr(stderr_reader, stderr.clone()));
 
         Ok(Self {
@@ -478,8 +479,8 @@ pub async fn run_bounded_command(
 
 pub async fn provider_exit_error(process: &JsonLineProcess, message: &str) -> AppError {
     let excerpt = {
-        let buffer = process.stderr.lock().await;
-        stderr_excerpt(&buffer)
+        let mut buffer = process.stderr.lock().await;
+        stderr_excerpt(buffer.make_contiguous())
     };
     match excerpt {
         Some(excerpt) => AppError::ProviderUnavailable(format!("{message}: {excerpt}")),
@@ -789,7 +790,7 @@ pub(crate) fn secure_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
-async fn drain_stderr(stderr: tokio::process::ChildStderr, destination: Arc<Mutex<Vec<u8>>>) {
+async fn drain_stderr(stderr: tokio::process::ChildStderr, destination: Arc<Mutex<VecDeque<u8>>>) {
     let mut reader = stderr;
     let mut chunk = [0_u8; 4096];
     loop {
@@ -797,11 +798,11 @@ async fn drain_stderr(stderr: tokio::process::ChildStderr, destination: Arc<Mute
             Ok(0) | Err(_) => break,
             Ok(count) => {
                 let mut destination = destination.lock().await;
-                destination.extend_from_slice(&chunk[..count]);
-                if destination.len() > MAX_STDERR_BYTES {
-                    let excess = destination.len() - MAX_STDERR_BYTES;
-                    destination.drain(..excess);
-                }
+                destination.extend(&chunk[..count]);
+                // A ring buffer: dropping the oldest bytes is O(dropped), not
+                // a shift of the whole tail per chunk.
+                let excess = destination.len().saturating_sub(MAX_STDERR_BYTES);
+                destination.drain(..excess);
             }
         }
     }

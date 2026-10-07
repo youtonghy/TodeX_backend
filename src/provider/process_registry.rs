@@ -3,7 +3,9 @@
 //! While a server is active, every provider it spawns is recorded in
 //! `<data_dir>/provider_processes.json`; the next start kills each recorded
 //! group whose leader is still the recorded process, identified by PID *and*
-//! start time so a reused PID is never signalled. The file also names the
+//! start time so a reused PID is never signalled (read from the kernel on
+//! macOS and Linux; `ps` elsewhere and for records of older daemons). The file
+//! is rewritten off the async runtime, newest snapshot last. It also names the
 //! server that owns it; while that server is still alive a second server on
 //! the same data directory neither reaps nor takes over its records.
 //!
@@ -47,7 +49,8 @@ mod unix {
     pub(super) struct ProcessRecord {
         pub(super) pid: u32,
         pub(super) pgid: u32,
-        /// `ps -o lstart=` in UTC, compared verbatim.
+        /// [`start_time`]: kernel-reported where available, else
+        /// `ps -o lstart=` in UTC; compared verbatim.
         pub(super) start_time: String,
         /// The executable as configured, for diagnostics only.
         pub(super) program: String,
@@ -74,8 +77,20 @@ mod unix {
     pub(super) struct ProcessRegistry {
         path: PathBuf,
         owner: Option<RegistryOwner>,
-        records: Mutex<Vec<ProcessRecord>>,
+        records: Mutex<Records>,
+        /// Generation of the snapshot last written; writers hold it, so an
+        /// older snapshot never replaces a newer one.
+        written: Mutex<u64>,
     }
+
+    #[derive(Default)]
+    struct Records {
+        /// Bumped on every change.
+        generation: u64,
+        list: Vec<ProcessRecord>,
+    }
+
+    type Snapshot = (u64, Vec<ProcessRecord>);
 
     /// Removes its record when the provider process has been reaped or killed.
     pub(crate) struct TrackedProcess {
@@ -85,7 +100,22 @@ mod unix {
 
     impl Drop for TrackedProcess {
         fn drop(&mut self) {
-            self.registry.remove(self.pid);
+            let Some(snapshot) = self.registry.edit(|records| {
+                let before = records.len();
+                records.retain(|record| record.pid != self.pid);
+                records.len() != before
+            }) else {
+                return;
+            };
+            let registry = self.registry.clone();
+            // Dropped on a runtime thread when a provider exits: write the
+            // file from the blocking pool instead of stalling the runtime.
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn_blocking(move || registry.write(snapshot));
+                }
+                Err(_) => registry.write(snapshot),
+            }
         }
     }
 
@@ -120,9 +150,15 @@ mod unix {
         let registry = Arc::new(ProcessRegistry {
             path,
             owner,
-            records: Mutex::new(Vec::new()),
+            records: Mutex::new(Records::default()),
+            written: Mutex::new(0),
         });
-        registry.persist(&[]);
+        let initial = registry.clone();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || initial.write((0, Vec::new()))).await
+        {
+            tracing::warn!(error = %error, "failed to reset the provider process registry");
+        }
         *ACTIVE
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(registry);
@@ -143,7 +179,8 @@ mod unix {
             Arc::new(Self {
                 path,
                 owner,
-                records: Mutex::new(Vec::new()),
+                records: Mutex::new(Records::default()),
+                written: Mutex::new(0),
             })
         }
 
@@ -152,52 +189,68 @@ mod unix {
             pid: u32,
             program: &str,
         ) -> Option<TrackedProcess> {
-            let Some(start_time) = process_start_time(pid).await else {
+            let Some(start_time) = start_time(pid).await else {
                 tracing::warn!(
                     pid,
                     "could not read the provider's start time; it will not be reaped after a crash"
                 );
                 return None;
             };
-            let mut records = self.lock();
-            records.retain(|record| record.pid != pid);
-            records.push(ProcessRecord {
-                pid,
-                // Providers are spawned with process_group(0).
-                pgid: pid,
-                start_time,
-                program: program.to_owned(),
+            let snapshot = self.edit(|records| {
+                records.retain(|record| record.pid != pid);
+                records.push(ProcessRecord {
+                    pid,
+                    // Providers are spawned with process_group(0).
+                    pgid: pid,
+                    start_time,
+                    program: program.to_owned(),
+                });
+                true
             });
-            self.persist(&records);
-            drop(records);
+            if let Some(snapshot) = snapshot {
+                let registry = self.clone();
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || registry.write(snapshot)).await
+                {
+                    tracing::warn!(error = %error, "failed to persist the provider process registry");
+                }
+            }
             Some(TrackedProcess {
                 registry: self,
                 pid,
             })
         }
 
-        fn remove(&self, pid: u32) {
-            let mut records = self.lock();
-            let before = records.len();
-            records.retain(|record| record.pid != pid);
-            if records.len() != before {
-                self.persist(&records);
-            }
-        }
-
-        fn lock(&self) -> std::sync::MutexGuard<'_, Vec<ProcessRecord>> {
-            self.records
+        /// Applies `change` to the records; returns the new snapshot when it
+        /// changed anything.
+        fn edit(&self, change: impl FnOnce(&mut Vec<ProcessRecord>) -> bool) -> Option<Snapshot> {
+            let mut records = self
+                .records
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !change(&mut records.list) {
+                return None;
+            }
+            records.generation += 1;
+            Some((records.generation, records.list.clone()))
         }
 
-        /// Failing to persist only weakens crash cleanup; the provider itself
-        /// is unaffected, so the error is logged rather than propagated.
-        fn persist(&self, records: &[ProcessRecord]) {
+        /// Writes `snapshot` unless a newer one was written already. Blocking:
+        /// call from the blocking pool. Failing to persist only weakens crash
+        /// cleanup; the provider itself is unaffected, so the error is logged
+        /// rather than propagated.
+        fn write(&self, (generation, records): Snapshot) {
+            let mut written = self
+                .written
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if generation < *written {
+                return;
+            }
             let file = RegistryFile {
                 schema_version: SCHEMA_VERSION,
                 owner: self.owner.clone(),
-                processes: records.to_vec(),
+                processes: records,
             };
             if let Err(error) = write_private_atomic(&self.path, &file) {
                 tracing::warn!(
@@ -206,6 +259,7 @@ mod unix {
                     "failed to persist the provider process registry"
                 );
             }
+            *written = generation;
         }
     }
 
@@ -236,7 +290,7 @@ mod unix {
     /// This server as a registry owner, or `None` if its start time can't be read.
     async fn current_owner() -> Option<RegistryOwner> {
         let pid = std::process::id();
-        let start_time = process_start_time(pid).await?;
+        let start_time = start_time(pid).await?;
         Some(RegistryOwner { pid, start_time })
     }
 
@@ -262,16 +316,15 @@ mod unix {
         };
         if let Some(owner) = file.owner {
             let alive = owner.pid != std::process::id()
-                && process_start_time(owner.pid).await.as_deref()
-                    == Some(owner.start_time.as_str());
+                && start_time_matches(owner.pid, &owner.start_time).await;
             if alive {
                 return Err(owner);
             }
         }
         let mut reaped = 0;
         for record in file.processes {
-            match process_start_time(record.pid).await {
-                Some(start_time) if start_time == record.start_time => {
+            match start_time_matches(record.pid, &record.start_time).await {
+                true => {
                     // SAFETY: kill(2) with a negative PID signals the recorded
                     // process group, whose leader was just verified above.
                     let result = unsafe { libc::kill(-(record.pgid as i32), libc::SIGKILL) };
@@ -286,13 +339,81 @@ mod unix {
                         );
                     }
                 }
-                _ => tracing::debug!(
+                false => tracing::debug!(
                     pid = record.pid,
                     "provider process from a previous run already exited"
                 ),
             }
         }
         Ok(reaped)
+    }
+
+    /// Prefix of start times read from the kernel; others came from `ps`.
+    const KERNEL_START_TIME: &str = "kernel:";
+
+    /// The process's start time, or `None` if it does not exist. Read from
+    /// the kernel where possible: spawning `ps` for every provider launch
+    /// costs a process per spawn.
+    pub(super) async fn start_time(pid: u32) -> Option<String> {
+        match kernel_start_time(pid) {
+            Some(start_time) => Some(start_time),
+            None if cfg!(any(target_os = "macos", target_os = "linux")) => None,
+            None => process_start_time(pid).await,
+        }
+    }
+
+    /// Whether `pid` is still the process recorded with `recorded`, in
+    /// whichever format that record was written.
+    async fn start_time_matches(pid: u32, recorded: &str) -> bool {
+        if recorded.starts_with(KERNEL_START_TIME) {
+            kernel_start_time(pid).as_deref() == Some(recorded)
+        } else {
+            process_start_time(pid).await.as_deref() == Some(recorded)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn kernel_start_time(pid: u32) -> Option<String> {
+        let pid = libc::c_int::try_from(pid).ok()?;
+        // SAFETY: proc_bsdinfo is plain old data; proc_pidinfo fills at most
+        // `size` bytes of it and reports how many it wrote.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        (written == size).then(|| {
+            format!(
+                "{KERNEL_START_TIME}{}.{:06}",
+                info.pbi_start_tvsec, info.pbi_start_tvusec
+            )
+        })
+    }
+
+    /// Field 22 of `/proc/<pid>/stat` (start time in clock ticks since boot),
+    /// qualified by the boot id so it cannot match after a reboot.
+    #[cfg(target_os = "linux")]
+    fn kernel_start_time(pid: u32) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name may contain spaces and parentheses; fields resume
+        // after the last ')', starting with field 3 (state).
+        let ticks = stat
+            .get(stat.rfind(')')? + 1..)?
+            .split_whitespace()
+            .nth(19)?;
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        Some(format!("{KERNEL_START_TIME}{}:{ticks}", boot_id.trim()))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn kernel_start_time(_pid: u32) -> Option<String> {
+        None
     }
 
     /// The process's start time as printed by `ps`, or `None` if it does not
@@ -323,7 +444,7 @@ mod tests {
     use std::time::Duration;
 
     use super::unix::{
-        process_start_time, reap_orphans, ProcessRecord, ProcessRegistry, RegistryOwner,
+        process_start_time, reap_orphans, start_time, ProcessRecord, ProcessRegistry, RegistryOwner,
     };
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
@@ -396,6 +517,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kernel_start_times_identify_live_processes_without_ps() {
+        let mut child = spawn_group_leader();
+        let recorded = start_time(child.id()).await.unwrap();
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(recorded.starts_with("kernel:"), "{recorded}");
+        }
+        assert_eq!(
+            start_time(child.id()).await.as_deref(),
+            Some(recorded.as_str())
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(start_time(child.id()).await, None);
+    }
+
+    #[tokio::test]
     async fn tracked_processes_are_recorded_until_released() {
         let root = temp_dir("todex-provider-registry");
         let path = root.join("provider_processes.json");
@@ -408,12 +545,20 @@ mod tests {
         assert_eq!(recorded["processes"][0]["pgid"], child.id());
         assert_eq!(
             recorded["processes"][0]["startTime"],
-            process_start_time(child.id()).await.unwrap()
+            start_time(child.id()).await.unwrap()
         );
         drop(tracked);
-        let released: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(released["processes"], serde_json::json!([]));
+        // The release is written from the blocking pool.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let released: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            if released["processes"] == serde_json::json!([]) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{released}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         child.kill().unwrap();
         child.wait().unwrap();
@@ -428,7 +573,7 @@ mod tests {
         let mut provider = spawn_group_leader();
         let owner = RegistryOwner {
             pid: owner_process.id(),
-            start_time: process_start_time(owner_process.id()).await.unwrap(),
+            start_time: start_time(owner_process.id()).await.unwrap(),
         };
         let registry = ProcessRegistry::new(path.clone(), Some(owner.clone()));
         let tracked = registry
