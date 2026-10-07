@@ -1,17 +1,17 @@
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::watch;
 
 use crate::config::AgentConfig;
 use crate::conversation::{ProviderKind, ProviderState};
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
-use super::acp::{run_acp_turn_controlled, AcpConnectionState, AcpRuntimeOptions};
+use super::acp::AcpRuntimeOptions;
 use super::discovery::CatalogCache;
 use super::process::{
     executable_available, redact_sensitive_text, run_bounded_command, CommandSpec, JsonLineProcess,
@@ -20,11 +20,12 @@ use super::profile::{
     CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
     ProviderProfile, SkillInjection,
 };
+use super::resident::{allowlisted_environment, initialize_acp, ResidentLaunch, ResidentSessions};
 use super::rpc::{FailureWording, RpcClient, RpcPeer};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PendingProviderControl, PermissionConfigCapabilities, ProviderCommandDescriptor,
-    ProviderControl, ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
+    PermissionConfigCapabilities, ProviderCommandDescriptor, ProviderControl, ProviderDescriptor,
+    ProviderDriver, ProviderModelDescriptor,
 };
 
 const INSPECT_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -38,8 +39,6 @@ const GROK_RPC: RpcPeer = RpcPeer {
     result_optional: false,
     classify_error: None,
 };
-const MAX_GROK_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
-const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
 
 /// What Grok Build supports and how TodeX adapts to it.
 pub(super) const PROFILE: ProviderProfile = ProviderProfile {
@@ -83,27 +82,9 @@ pub struct GrokBuildDriver {
     binary: String,
     auth_method: Option<String>,
     env_allowlist: Vec<String>,
-    sessions: Mutex<HashMap<String, GrokSessionHandle>>,
+    sessions: ResidentSessions,
     models: CatalogCache<Vec<ProviderModelDescriptor>>,
     commands: CatalogCache<Vec<ProviderCommandDescriptor>>,
-}
-
-#[derive(Clone)]
-struct GrokSessionHandle {
-    workspace: PathBuf,
-    turns: mpsc::Sender<GrokTurn>,
-    controls: mpsc::Sender<PendingProviderControl>,
-    shutdown: watch::Sender<bool>,
-    stopped: watch::Receiver<bool>,
-}
-
-struct GrokTurn {
-    context: DriverContext,
-    prompt: DriverPrompt,
-    sink: DriverEventSink,
-    cancel: watch::Receiver<bool>,
-    launch_permit: WorkspaceTrustPermit,
-    respond_to: oneshot::Sender<Result<DriverTurnResult, AppError>>,
 }
 
 impl GrokBuildDriver {
@@ -112,7 +93,7 @@ impl GrokBuildDriver {
             binary: config.grok_bin.clone(),
             auth_method: config.grok_auth_method.clone(),
             env_allowlist: config.grok_env_allowlist.clone(),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: ResidentSessions::new(&PROFILE, "Grok"),
             models: CatalogCache::new(PROFILE.discovery_cache_ttl),
             commands: CatalogCache::new(PROFILE.discovery_cache_ttl),
         }
@@ -168,60 +149,17 @@ impl ProviderDriver for GrokBuildDriver {
         request_id: &str,
         control: ProviderControl,
     ) -> Result<Value, AppError> {
-        let handle = self
-            .sessions
-            .lock()
+        self.sessions
+            .control(conversation_id, expected_turn_id, request_id, control)
             .await
-            .get(conversation_id)
-            .cloned()
-            .ok_or_else(|| AppError::InvalidRequest("Grok session is not active".to_owned()))?;
-        let (respond_to, response) = oneshot::channel();
-        handle
-            .controls
-            .try_send(PendingProviderControl {
-                expected_turn_id: expected_turn_id.to_owned(),
-                request_id: request_id.to_owned(),
-                control,
-                respond_to,
-            })
-            .map_err(|_| {
-                AppError::ProviderUnavailable(
-                    "Grok control channel is unavailable or full".to_owned(),
-                )
-            })?;
-        tokio::time::timeout(Duration::from_secs(20), response)
-            .await
-            .map_err(|_| {
-                AppError::ProviderUnavailable("Grok control acknowledgement timed out".to_owned())
-            })?
-            .map_err(|_| {
-                AppError::ProviderUnavailable(
-                    "Grok turn ended before control acknowledgement".to_owned(),
-                )
-            })?
     }
 
     async fn shutdown_session(&self, conversation_id: &str) {
-        let handle = self.sessions.lock().await.remove(conversation_id);
-        if let Some(handle) = handle {
-            stop_session(handle).await;
-        }
+        self.sessions.stop(conversation_id).await;
     }
 
     async fn shutdown(&self) {
-        let handles: Vec<_> = self
-            .sessions
-            .lock()
-            .await
-            .drain()
-            .map(|(_, handle)| handle)
-            .collect();
-        for handle in &handles {
-            let _ = handle.shutdown.send(true);
-        }
-        for handle in handles {
-            stop_session(handle).await;
-        }
+        self.sessions.stop_all().await;
     }
 
     fn supports_native_fork(&self) -> bool {
@@ -343,191 +281,37 @@ impl ProviderDriver for GrokBuildDriver {
         cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
-        let conversation_id = context.manifest.id.clone();
-        let handle = {
-            let mut sessions = self.sessions.lock().await;
-            sessions.retain(|_, handle| !handle.turns.is_closed());
-            if let Some(handle) = sessions.get(&conversation_id) {
-                if handle.workspace != context.manifest.workspace {
-                    return Err(AppError::InvalidRequest(
-                        "Grok resident session workspace changed".to_owned(),
-                    ));
-                }
-                handle.clone()
-            } else {
-                if sessions.len() >= MAX_GROK_SESSIONS {
-                    return Err(AppError::ProviderUnavailable(format!(
-                        "Grok resident session limit reached ({MAX_GROK_SESSIONS}); close an idle session"
-                    )));
-                }
-                let (turns, turn_rx) = mpsc::channel(1);
-                let (controls, control_rx) = mpsc::channel(16);
-                let (shutdown, shutdown_rx) = watch::channel(false);
-                let (stopped_tx, stopped) = watch::channel(false);
-                let handle = GrokSessionHandle {
-                    workspace: context.manifest.workspace.clone(),
-                    turns,
-                    controls,
-                    shutdown,
-                    stopped,
-                };
-                let spec = self.command_spec(&context.manifest.workspace, Some(&prompt))?;
-                let runtime = AcpRuntimeOptions {
-                    authenticate: true,
-                    auth_method: self.auth_method.clone(),
-                    auth_meta: Some(json!({ "headless": true })),
-                    auth_timeout: None,
-                    suppress_load_replay: true,
-                    allow_cli_config_fallback: true,
-                    request_ask_mode: true,
-                    legacy_model_state: true,
-                    allow_unadvertised_images: true,
-                    snake_case_image_mime: false,
-                };
-                tokio::spawn(run_session_actor(
-                    spec,
-                    runtime,
-                    turn_rx,
-                    control_rx,
-                    shutdown_rx,
-                    stopped_tx,
-                ));
-                sessions.insert(conversation_id, handle.clone());
-                handle
-            }
-        };
-        let (respond_to, response) = oneshot::channel();
-        handle
-            .turns
-            .send(GrokTurn {
+        self.sessions
+            .run_turn(
                 context,
                 prompt,
                 sink,
                 cancel,
                 launch_permit,
-                respond_to,
-            })
+                |context, prompt| {
+                    Ok(ResidentLaunch {
+                        spec: self.command_spec(&context.manifest.workspace, Some(prompt))?,
+                        runtime: AcpRuntimeOptions {
+                            authenticate: true,
+                            auth_method: self.auth_method.clone(),
+                            auth_meta: Some(json!({ "headless": true })),
+                            auth_timeout: None,
+                            suppress_load_replay: true,
+                            allow_cli_config_fallback: true,
+                            request_ask_mode: true,
+                            legacy_model_state: true,
+                            allow_unadvertised_images: true,
+                            snake_case_image_mime: false,
+                        },
+                    })
+                },
+            )
             .await
-            .map_err(|_| {
-                AppError::ProviderUnavailable("Grok session closed before turn started".to_owned())
-            })?;
-        response.await.map_err(|_| {
-            AppError::ProviderUnavailable("Grok session stopped before turn completed".to_owned())
-        })?
     }
-}
-
-async fn stop_session(mut handle: GrokSessionHandle) {
-    let _ = handle.shutdown.send(true);
-    if !*handle.stopped.borrow() {
-        let _ = tokio::time::timeout(Duration::from_secs(6), handle.stopped.changed()).await;
-    }
-}
-
-async fn run_session_actor(
-    spec: CommandSpec,
-    runtime: AcpRuntimeOptions,
-    mut turns: mpsc::Receiver<GrokTurn>,
-    mut controls: mpsc::Receiver<PendingProviderControl>,
-    mut shutdown: watch::Receiver<bool>,
-    stopped: watch::Sender<bool>,
-) {
-    let mut process: Option<JsonLineProcess> = None;
-    let mut connection = AcpConnectionState::default();
-    let mut last_sink: Option<DriverEventSink> = None;
-    let mut idle_deadline = tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT;
-    loop {
-        let request = tokio::select! {
-            request = turns.recv() => match request { Some(request) => request, None => break },
-            _ = shutdown.changed() => break,
-            _ = tokio::time::sleep_until(idle_deadline) => break,
-            control = controls.recv() => {
-                if let Some(control) = control { let _ = control.respond_to.send(Err(AppError::InvalidRequest("Grok has no active turn".to_owned()))); }
-                continue;
-            }
-            notification = async { match process.as_mut() { Some(process) => process.read().await, None => std::future::pending().await } } => {
-                match notification {
-                    Ok(Some(message)) => {
-                        if let Some(process) = process.as_mut() {
-                            if let Some(id) = message.get("id").filter(|_| message.get("method").is_some()) {
-                                if process.send(&json!({"jsonrpc":"2.0","id":id,"error":{"code":-32800,"message":"no active turn"}})).await.is_err() { break; }
-                            } else if let Some(sink) = &last_sink {
-                                super::acp::observe_config_options(&mut connection, &message);
-                                let (_tx, mut cancel) = watch::channel(false);
-                                if super::acp::handle_acp_message(process, message, sink, &mut cancel, ProviderKind::GrokBuild, true, super::acp::AutoApprove::Mediate, &mut connection).await.is_err() { break; }
-                            }
-                        }
-                    }
-                    _ => break,
-                }
-                continue;
-            }
-        };
-        let GrokTurn {
-            context,
-            prompt,
-            sink,
-            mut cancel,
-            launch_permit,
-            respond_to,
-        } = request;
-        if process.is_none() {
-            match JsonLineProcess::spawn_trusted(&spec, launch_permit).await {
-                Ok(spawned) => process = Some(spawned),
-                Err(error) => {
-                    let _ = respond_to.send(Err(error));
-                    break;
-                }
-            }
-        } else {
-            drop(launch_permit);
-        }
-        let mut options = runtime.clone();
-        // A reused process cannot apply a new CLI fallback; require a protocol ACK.
-        if last_sink.is_some() {
-            options.allow_cli_config_fallback = false;
-        }
-        let result = tokio::select! {
-            result = run_acp_turn_controlled(process.as_mut().unwrap(), context, prompt, &sink, &mut cancel, options, &mut connection, Some(&mut controls)) => result,
-            _ = shutdown.changed() => { let _ = respond_to.send(Err(AppError::TurnCancelled)); break; }
-        };
-        let reusable = result.as_ref().is_ok_and(|result| !result.cancelled);
-        last_sink = Some(sink);
-        while let Ok(control) = controls.try_recv() {
-            let _ = control.respond_to.send(Err(AppError::InvalidRequest(
-                "Grok turn already ended".to_owned(),
-            )));
-        }
-        if !reusable {
-            turns.close();
-            controls.close();
-        }
-        let _ = respond_to.send(result);
-        if !reusable {
-            break;
-        }
-        idle_deadline = tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT;
-    }
-    turns.close();
-    controls.close();
-    if let Some(process) = process.as_mut() {
-        process.terminate().await;
-    }
-    let _ = stopped.send(true);
 }
 
 async fn initialize_process(process: &mut JsonLineProcess) -> Result<Value, AppError> {
-    let result = control_request(process, "initialize", "initialize", json!({
-        "protocolVersion":1,
-        "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"configOptions":{}}},
-        "clientInfo":{"name":"todex-agentd","title":"TodeX 2.0","version":crate::version::APP_VERSION},
-    })).await?;
-    if result.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
-        return Err(AppError::Unsupported(
-            "Grok negotiated an unsupported ACP protocol version".to_owned(),
-        ));
-    }
-    Ok(result)
+    initialize_acp(process, GROK_RPC, None, Some(DIAGNOSTIC_TIMEOUT)).await
 }
 
 async fn control_request(
@@ -606,27 +390,10 @@ fn grok_command_spec(
 }
 
 fn grok_environment(allowlist: &[String]) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::from([
-        ("GROK_DISABLE_AUTOUPDATER".to_owned(), "1".to_owned()),
-        ("NO_COLOR".to_owned(), "1".to_owned()),
-    ]);
-    for key in allowlist {
-        if !valid_env_name(key) || key.starts_with("TODEX_AGENTD_") {
-            continue;
-        }
-        if let Ok(value) = std::env::var(key) {
-            env.insert(key.clone(), value);
-        }
-    }
-    env
-}
-
-fn valid_env_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    chars
-        .next()
-        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    allowlisted_environment(
+        &[("GROK_DISABLE_AUTOUPDATER", "1"), ("NO_COLOR", "1")],
+        allowlist,
+    )
 }
 
 fn parse_models(initialize: &Value) -> Vec<ProviderModelDescriptor> {
@@ -734,6 +501,8 @@ pub(super) fn parse_commands(initialize: &Value) -> Vec<ProviderCommandDescripto
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -767,13 +536,6 @@ mod tests {
         let commands = parse_commands(&initialize);
         assert_eq!(commands[0].name, "repo:review");
         assert_eq!(commands[0].argument_hint.as_deref(), Some("[path]"));
-    }
-
-    #[test]
-    fn environment_names_are_strict_and_todex_configuration_is_not_forwarded() {
-        assert!(valid_env_name("XAI_API_KEY"));
-        assert!(!valid_env_name("XAI-API-KEY"));
-        assert!(!valid_env_name("1SECRET"));
     }
 
     #[test]
@@ -856,7 +618,7 @@ mod tests {
                 binary: binary.to_string_lossy().to_string(),
                 auth_method: None,
                 env_allowlist: vec![],
-                sessions: Mutex::new(HashMap::new()),
+                sessions: ResidentSessions::new(&PROFILE, "Grok"),
                 models: CatalogCache::new(None),
                 commands: CatalogCache::new(None),
             });

@@ -14,6 +14,7 @@ mod pi;
 pub(crate) mod process;
 pub(crate) mod process_registry;
 pub(crate) mod profile;
+mod resident;
 mod rpc;
 mod supervisor;
 pub(crate) mod types;

@@ -1,32 +1,31 @@
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::watch;
 
 use crate::config::AgentConfig;
 use crate::conversation::{ProviderKind, ProviderState};
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
-use super::acp::{run_acp_turn_controlled, AcpConnectionState, AcpRuntimeOptions};
+use super::acp::AcpRuntimeOptions;
 use super::discovery::{DiscoveryCache, DiscoveryKey, DiscoverySnapshot};
 use super::process::{executable_available, CommandSpec, JsonLineProcess};
 use super::profile::{
     CatalogProfile, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel, ProviderProfile,
     SkillInjection,
 };
+use super::resident::{allowlisted_environment, initialize_acp, ResidentLaunch, ResidentSessions};
 use super::rpc::{FailureWording, RpcClient, RpcPeer};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PendingProviderControl, PermissionConfigCapabilities, ProviderCommandDescriptor,
-    ProviderControl, ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
+    PermissionConfigCapabilities, ProviderCommandDescriptor, ProviderControl, ProviderDescriptor,
+    ProviderDriver, ProviderModelDescriptor,
 };
 
-const MAX_OPENCODE_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
-const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 const OPENCODE_RPC: RpcPeer = RpcPeer {
     name: "OpenCode",
@@ -90,26 +89,8 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
 pub struct OpencodeDriver {
     binary: String,
     env_allowlist: Vec<String>,
-    sessions: Mutex<HashMap<String, OpencodeSessionHandle>>,
+    sessions: ResidentSessions,
     discovery: DiscoveryCache<DiscoveryKey, DiscoverySnapshot>,
-}
-
-#[derive(Clone)]
-struct OpencodeSessionHandle {
-    workspace: PathBuf,
-    turns: mpsc::Sender<OpencodeTurn>,
-    controls: mpsc::Sender<PendingProviderControl>,
-    shutdown: watch::Sender<bool>,
-    stopped: watch::Receiver<bool>,
-}
-
-struct OpencodeTurn {
-    context: DriverContext,
-    prompt: DriverPrompt,
-    sink: DriverEventSink,
-    cancel: watch::Receiver<bool>,
-    launch_permit: WorkspaceTrustPermit,
-    respond_to: oneshot::Sender<Result<DriverTurnResult, AppError>>,
 }
 
 impl OpencodeDriver {
@@ -117,7 +98,7 @@ impl OpencodeDriver {
         Self {
             binary: config.opencode_bin.clone(),
             env_allowlist: config.opencode_env_allowlist.clone(),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: ResidentSessions::new(&PROFILE, "OpenCode"),
             discovery: DiscoveryCache::new(),
         }
     }
@@ -329,46 +310,13 @@ impl ProviderDriver for OpencodeDriver {
         request_id: &str,
         control: ProviderControl,
     ) -> Result<Value, AppError> {
-        let handle = self
-            .sessions
-            .lock()
+        self.sessions
+            .control(conversation_id, expected_turn_id, request_id, control)
             .await
-            .get(conversation_id)
-            .cloned()
-            .ok_or_else(|| AppError::InvalidRequest("OpenCode session is not active".to_owned()))?;
-        let (respond_to, response) = oneshot::channel();
-        handle
-            .controls
-            .try_send(PendingProviderControl {
-                expected_turn_id: expected_turn_id.to_owned(),
-                request_id: request_id.to_owned(),
-                control,
-                respond_to,
-            })
-            .map_err(|_| {
-                AppError::ProviderUnavailable(
-                    "OpenCode control channel is unavailable or full".to_owned(),
-                )
-            })?;
-        tokio::time::timeout(CONTROL_TIMEOUT, response)
-            .await
-            .map_err(|_| {
-                AppError::ProviderUnavailable(
-                    "OpenCode control acknowledgement timed out".to_owned(),
-                )
-            })?
-            .map_err(|_| {
-                AppError::ProviderUnavailable(
-                    "OpenCode turn ended before control acknowledgement".to_owned(),
-                )
-            })?
     }
 
     async fn shutdown_session(&self, conversation_id: &str) {
-        let handle = self.sessions.lock().await.remove(conversation_id);
-        if let Some(handle) = handle {
-            stop_session(handle).await;
-        }
+        self.sessions.stop(conversation_id).await;
     }
 
     async fn shutdown_session_with_reason(&self, conversation_id: &str, _reason: &str) {
@@ -387,19 +335,7 @@ impl ProviderDriver for OpencodeDriver {
     }
 
     async fn shutdown(&self) {
-        let handles: Vec<_> = self
-            .sessions
-            .lock()
-            .await
-            .drain()
-            .map(|(_, handle)| handle)
-            .collect();
-        for handle in &handles {
-            let _ = handle.shutdown.send(true);
-        }
-        for handle in handles {
-            stop_session(handle).await;
-        }
+        self.sessions.stop_all().await;
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -497,186 +433,26 @@ impl ProviderDriver for OpencodeDriver {
         cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
-        let conversation_id = context.manifest.id.clone();
-        let handle = {
-            let mut sessions = self.sessions.lock().await;
-            sessions.retain(|_, handle| !handle.turns.is_closed());
-            if let Some(handle) = sessions.get(&conversation_id) {
-                if handle.workspace != context.manifest.workspace {
-                    return Err(AppError::InvalidRequest(
-                        "OpenCode resident session workspace changed".to_owned(),
-                    ));
-                }
-                handle.clone()
-            } else {
-                if sessions.len() >= MAX_OPENCODE_SESSIONS {
-                    return Err(AppError::ProviderUnavailable(
-                        "OpenCode resident session limit reached (32); close an idle session"
-                            .to_owned(),
-                    ));
-                }
-                let (turns, turn_rx) = mpsc::channel(1);
-                let (controls, control_rx) = mpsc::channel(16);
-                let (shutdown, shutdown_rx) = watch::channel(false);
-                let (stopped_tx, stopped) = watch::channel(false);
-                let handle = OpencodeSessionHandle {
-                    workspace: context.manifest.workspace.clone(),
-                    turns,
-                    controls,
-                    shutdown,
-                    stopped,
-                };
-                let spec = self.command_spec(&context.manifest.workspace);
-                let runtime = self.runtime_options();
-                tokio::spawn(run_session_actor(
-                    spec,
-                    runtime,
-                    turn_rx,
-                    control_rx,
-                    shutdown_rx,
-                    stopped_tx,
-                ));
-                sessions.insert(conversation_id, handle.clone());
-                handle
-            }
-        };
-        let (respond_to, response) = oneshot::channel();
-        handle
-            .turns
-            .send(OpencodeTurn {
+        self.sessions
+            .run_turn(
                 context,
                 prompt,
                 sink,
                 cancel,
                 launch_permit,
-                respond_to,
-            })
-            .await
-            .map_err(|_| {
-                AppError::ProviderUnavailable(
-                    "OpenCode session closed before turn started".to_owned(),
-                )
-            })?;
-        response.await.map_err(|_| {
-            AppError::ProviderUnavailable(
-                "OpenCode session stopped before turn completed".to_owned(),
+                |context, _prompt| {
+                    Ok(ResidentLaunch {
+                        spec: self.command_spec(&context.manifest.workspace),
+                        runtime: self.runtime_options(),
+                    })
+                },
             )
-        })?
+            .await
     }
-}
-
-async fn stop_session(mut handle: OpencodeSessionHandle) {
-    let _ = handle.shutdown.send(true);
-    if !*handle.stopped.borrow() {
-        let _ = tokio::time::timeout(Duration::from_secs(6), handle.stopped.changed()).await;
-    }
-}
-
-async fn run_session_actor(
-    spec: CommandSpec,
-    runtime: AcpRuntimeOptions,
-    mut turns: mpsc::Receiver<OpencodeTurn>,
-    mut controls: mpsc::Receiver<PendingProviderControl>,
-    mut shutdown: watch::Receiver<bool>,
-    stopped: watch::Sender<bool>,
-) {
-    let mut process: Option<JsonLineProcess> = None;
-    let mut connection = AcpConnectionState::default();
-    let mut last_sink: Option<DriverEventSink> = None;
-    let mut idle_deadline = tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT;
-    loop {
-        let request = tokio::select! {
-            request = turns.recv() => match request { Some(request) => request, None => break },
-            _ = shutdown.changed() => break,
-            _ = tokio::time::sleep_until(idle_deadline) => break,
-            control = controls.recv() => {
-                if let Some(control) = control { let _ = control.respond_to.send(Err(AppError::InvalidRequest("OpenCode has no active turn".to_owned()))); }
-                continue;
-            }
-            notification = async { match process.as_mut() { Some(process) => process.read().await, None => std::future::pending().await } } => {
-                match notification {
-                    Ok(Some(message)) => {
-                        if let Some(process) = process.as_mut() {
-                            if let Some(id) = message.get("id").filter(|_| message.get("method").is_some()) {
-                                if process.send(&json!({"jsonrpc":"2.0","id":id,"error":{"code":-32800,"message":"no active turn"}})).await.is_err() { break; }
-                            } else if let Some(sink) = &last_sink {
-                                super::acp::observe_config_options(&mut connection, &message);
-                                let (_tx, mut cancel) = watch::channel(false);
-                                if super::acp::handle_acp_message(process, message, sink, &mut cancel, ProviderKind::Opencode, true, super::acp::AutoApprove::Mediate, &mut connection).await.is_err() { break; }
-                            }
-                        }
-                    }
-                    _ => break,
-                }
-                continue;
-            }
-        };
-        let OpencodeTurn {
-            context,
-            prompt,
-            sink,
-            mut cancel,
-            launch_permit,
-            respond_to,
-        } = request;
-        if process.is_none() {
-            match JsonLineProcess::spawn_trusted(&spec, launch_permit).await {
-                Ok(spawned) => process = Some(spawned),
-                Err(error) => {
-                    let _ = respond_to.send(Err(error));
-                    break;
-                }
-            }
-        } else {
-            drop(launch_permit);
-        }
-        let result = tokio::select! {
-            result = run_acp_turn_controlled(process.as_mut().unwrap(), context, prompt, &sink, &mut cancel, runtime.clone(), &mut connection, Some(&mut controls)) => result,
-            _ = shutdown.changed() => { let _ = respond_to.send(Err(AppError::TurnCancelled)); break; }
-        };
-        let reusable = result.as_ref().is_ok_and(|result| !result.cancelled);
-        last_sink = Some(sink);
-        while let Ok(control) = controls.try_recv() {
-            let _ = control.respond_to.send(Err(AppError::InvalidRequest(
-                "OpenCode turn already ended".to_owned(),
-            )));
-        }
-        if !reusable {
-            turns.close();
-            controls.close();
-        }
-        let _ = respond_to.send(result);
-        if !reusable {
-            break;
-        }
-        idle_deadline = tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT;
-    }
-    turns.close();
-    controls.close();
-    if let Some(process) = process.as_mut() {
-        process.terminate().await;
-    }
-    let _ = stopped.send(true);
 }
 
 async fn initialize_process(process: &mut JsonLineProcess) -> Result<Value, AppError> {
-    let result = control_request(
-        process,
-        "initialize",
-        "initialize",
-        json!({
-        "protocolVersion":1,
-        "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"configOptions":{}}},
-        "clientInfo":{"name":"todex-agentd","title":"TodeX 2.0","version":crate::version::APP_VERSION},
-        }),
-        None,
-    ).await?;
-    if result.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
-        return Err(AppError::Unsupported(
-            "OpenCode negotiated an unsupported ACP protocol version".to_owned(),
-        ));
-    }
-    Ok(result)
+    initialize_acp(process, OPENCODE_RPC, None, None).await
 }
 
 async fn control_request(
@@ -705,31 +481,16 @@ async fn control_request_updates(
 }
 
 fn opencode_environment(allowlist: &[String]) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::from([
-        ("NO_COLOR".to_owned(), "1".to_owned()),
-        ("OPENCODE_DISABLE_AUTOUPDATE".to_owned(), "1".to_owned()),
-    ]);
-    for key in allowlist {
-        if !valid_env_name(key) || key.starts_with("TODEX_AGENTD_") {
-            continue;
-        }
-        if let Ok(value) = std::env::var(key) {
-            env.insert(key.clone(), value);
-        }
-    }
-    env
-}
-
-fn valid_env_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    chars
-        .next()
-        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    allowlisted_environment(
+        &[("NO_COLOR", "1"), ("OPENCODE_DISABLE_AUTOUPDATE", "1")],
+        allowlist,
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -785,7 +546,7 @@ mod tests {
             let driver = std::sync::Arc::new(OpencodeDriver {
                 binary: binary.to_string_lossy().to_string(),
                 env_allowlist: vec![],
-                sessions: Mutex::new(HashMap::new()),
+                sessions: ResidentSessions::new(&PROFILE, "OpenCode"),
                 discovery: DiscoveryCache::new(),
             });
             let store = crate::conversation::ConversationStore::new(root.join("data"))

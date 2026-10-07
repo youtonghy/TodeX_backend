@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::watch;
 
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
@@ -12,8 +12,8 @@ use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{
-    declares_session_fork, run_acp_turn_controlled, select_auth_method, AcpConnectionState,
-    AcpRuntimeOptions, FORK_PROBE_TTL, INTERACTIVE_AUTH_TIMEOUT,
+    declares_session_fork, select_auth_method, AcpRuntimeOptions, FORK_PROBE_TTL,
+    INTERACTIVE_AUTH_TIMEOUT,
 };
 use super::discovery::{DiscoveryCache, DiscoveryKey, DiscoverySnapshot};
 use super::process::{executable_available, CommandSpec, JsonLineProcess};
@@ -21,17 +21,14 @@ use super::profile::{
     CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
     ProviderProfile, SkillInjection, UserConfigFile,
 };
+use super::resident::{allowlisted_environment, initialize_acp, ResidentLaunch, ResidentSessions};
 use super::rpc::{FailureWording, RpcClient, RpcPeer};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PendingProviderControl, PermissionConfigCapabilities, ProviderCapabilities,
-    ProviderCommandDescriptor, ProviderControl, ProviderDescriptor, ProviderDriver,
-    ProviderModelDescriptor,
+    PermissionConfigCapabilities, ProviderCapabilities, ProviderCommandDescriptor, ProviderControl,
+    ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
 };
 
-const MAX_DEVIN_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
-const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Budget for the headless `initialize` that probes fork support.
 const FORK_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEVIN_RPC: RpcPeer = RpcPeer {
@@ -115,30 +112,12 @@ pub struct DevinDriver {
     api_key_env: Option<String>,
     cli_credentials: bool,
     env_allowlist: Vec<String>,
-    sessions: Mutex<HashMap<String, DevinSessionHandle>>,
+    sessions: ResidentSessions,
     discovery: DiscoveryCache<DiscoveryKey, DiscoverySnapshot>,
     /// Cached `sessionCapabilities.fork` probe: Devin exposes session forking
     /// over ACP only once the installed CLI implements `session/fork`, so the
     /// advertised capability tracks the installed binary.
     fork_probe: DiscoveryCache<(), bool>,
-}
-
-#[derive(Clone)]
-struct DevinSessionHandle {
-    workspace: PathBuf,
-    turns: mpsc::Sender<DevinTurn>,
-    controls: mpsc::Sender<PendingProviderControl>,
-    shutdown: watch::Sender<bool>,
-    stopped: watch::Receiver<bool>,
-}
-
-struct DevinTurn {
-    context: DriverContext,
-    prompt: DriverPrompt,
-    sink: DriverEventSink,
-    cancel: watch::Receiver<bool>,
-    launch_permit: WorkspaceTrustPermit,
-    respond_to: oneshot::Sender<Result<DriverTurnResult, AppError>>,
 }
 
 impl DevinDriver {
@@ -149,7 +128,7 @@ impl DevinDriver {
             api_key_env: config.devin_api_key_env.clone(),
             cli_credentials: cli_credentials_enabled(),
             env_allowlist: config.devin_env_allowlist.clone(),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: ResidentSessions::new(&PROFILE, "Devin"),
             discovery: DiscoveryCache::new(),
             fork_probe: DiscoveryCache::new(),
         }
@@ -377,44 +356,13 @@ impl ProviderDriver for DevinDriver {
         request_id: &str,
         control: ProviderControl,
     ) -> Result<Value, AppError> {
-        let handle = self
-            .sessions
-            .lock()
+        self.sessions
+            .control(conversation_id, expected_turn_id, request_id, control)
             .await
-            .get(conversation_id)
-            .cloned()
-            .ok_or_else(|| AppError::InvalidRequest("Devin session is not active".to_owned()))?;
-        let (respond_to, response) = oneshot::channel();
-        handle
-            .controls
-            .try_send(PendingProviderControl {
-                expected_turn_id: expected_turn_id.to_owned(),
-                request_id: request_id.to_owned(),
-                control,
-                respond_to,
-            })
-            .map_err(|_| {
-                AppError::ProviderUnavailable(
-                    "Devin control channel is unavailable or full".to_owned(),
-                )
-            })?;
-        tokio::time::timeout(CONTROL_TIMEOUT, response)
-            .await
-            .map_err(|_| {
-                AppError::ProviderUnavailable("Devin control acknowledgement timed out".to_owned())
-            })?
-            .map_err(|_| {
-                AppError::ProviderUnavailable(
-                    "Devin turn ended before control acknowledgement".to_owned(),
-                )
-            })?
     }
 
     async fn shutdown_session(&self, conversation_id: &str) {
-        let handle = self.sessions.lock().await.remove(conversation_id);
-        if let Some(handle) = handle {
-            stop_session(handle).await;
-        }
+        self.sessions.stop(conversation_id).await;
     }
 
     async fn shutdown_session_with_reason(&self, conversation_id: &str, _reason: &str) {
@@ -433,19 +381,7 @@ impl ProviderDriver for DevinDriver {
     }
 
     async fn shutdown(&self) {
-        let handles: Vec<_> = self
-            .sessions
-            .lock()
-            .await
-            .drain()
-            .map(|(_, handle)| handle)
-            .collect();
-        for handle in &handles {
-            let _ = handle.shutdown.send(true);
-        }
-        for handle in handles {
-            stop_session(handle).await;
-        }
+        self.sessions.stop_all().await;
     }
 
     async fn refresh_control_capabilities(&self) {
@@ -577,184 +513,34 @@ impl ProviderDriver for DevinDriver {
         cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
-        let conversation_id = context.manifest.id.clone();
-        let handle = {
-            let mut sessions = self.sessions.lock().await;
-            sessions.retain(|_, handle| !handle.turns.is_closed());
-            if let Some(handle) = sessions.get(&conversation_id) {
-                if handle.workspace != context.manifest.workspace {
-                    return Err(AppError::InvalidRequest(
-                        "Devin resident session workspace changed".to_owned(),
-                    ));
-                }
-                handle.clone()
-            } else {
-                if sessions.len() >= MAX_DEVIN_SESSIONS {
-                    return Err(AppError::ProviderUnavailable(
-                        "Devin resident session limit reached (32); close an idle session"
-                            .to_owned(),
-                    ));
-                }
-                let (turns, turn_rx) = mpsc::channel(1);
-                let (controls, control_rx) = mpsc::channel(16);
-                let (shutdown, shutdown_rx) = watch::channel(false);
-                let (stopped_tx, stopped) = watch::channel(false);
-                let handle = DevinSessionHandle {
-                    workspace: context.manifest.workspace.clone(),
-                    turns,
-                    controls,
-                    shutdown,
-                    stopped,
-                };
-                let spec = self.command_spec(&context.manifest.workspace);
-                let runtime = self.runtime_options()?;
-                tokio::spawn(run_session_actor(
-                    spec,
-                    runtime,
-                    turn_rx,
-                    control_rx,
-                    shutdown_rx,
-                    stopped_tx,
-                ));
-                sessions.insert(conversation_id, handle.clone());
-                handle
-            }
-        };
-        let (respond_to, response) = oneshot::channel();
-        handle
-            .turns
-            .send(DevinTurn {
+        self.sessions
+            .run_turn(
                 context,
                 prompt,
                 sink,
                 cancel,
                 launch_permit,
-                respond_to,
-            })
+                |context, _prompt| {
+                    Ok(ResidentLaunch {
+                        spec: self.command_spec(&context.manifest.workspace),
+                        runtime: self.runtime_options()?,
+                    })
+                },
+            )
             .await
-            .map_err(|_| {
-                AppError::ProviderUnavailable("Devin session closed before turn started".to_owned())
-            })?;
-        response.await.map_err(|_| {
-            AppError::ProviderUnavailable("Devin session stopped before turn completed".to_owned())
-        })?
     }
-}
-
-async fn stop_session(mut handle: DevinSessionHandle) {
-    let _ = handle.shutdown.send(true);
-    if !*handle.stopped.borrow() {
-        let _ = tokio::time::timeout(Duration::from_secs(6), handle.stopped.changed()).await;
-    }
-}
-
-async fn run_session_actor(
-    spec: CommandSpec,
-    runtime: AcpRuntimeOptions,
-    mut turns: mpsc::Receiver<DevinTurn>,
-    mut controls: mpsc::Receiver<PendingProviderControl>,
-    mut shutdown: watch::Receiver<bool>,
-    stopped: watch::Sender<bool>,
-) {
-    let mut process: Option<JsonLineProcess> = None;
-    let mut connection = AcpConnectionState::default();
-    let mut last_sink: Option<DriverEventSink> = None;
-    let mut idle_deadline = tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT;
-    loop {
-        let request = tokio::select! {
-            request = turns.recv() => match request { Some(request) => request, None => break },
-            _ = shutdown.changed() => break,
-            _ = tokio::time::sleep_until(idle_deadline) => break,
-            control = controls.recv() => {
-                if let Some(control) = control { let _ = control.respond_to.send(Err(AppError::InvalidRequest("Devin has no active turn".to_owned()))); }
-                continue;
-            }
-            notification = async { match process.as_mut() { Some(process) => process.read().await, None => std::future::pending().await } } => {
-                match notification {
-                    Ok(Some(message)) => {
-                        if let Some(process) = process.as_mut() {
-                            if let Some(id) = message.get("id").filter(|_| message.get("method").is_some()) {
-                                if process.send(&json!({"jsonrpc":"2.0","id":id,"error":{"code":-32800,"message":"no active turn"}})).await.is_err() { break; }
-                            } else if let Some(sink) = &last_sink {
-                                super::acp::observe_config_options(&mut connection, &message);
-                                let (_tx, mut cancel) = watch::channel(false);
-                                if super::acp::handle_acp_message(process, message, sink, &mut cancel, ProviderKind::Devin, true, super::acp::AutoApprove::Mediate, &mut connection).await.is_err() { break; }
-                            }
-                        }
-                    }
-                    _ => break,
-                }
-                continue;
-            }
-        };
-        let DevinTurn {
-            context,
-            prompt,
-            sink,
-            mut cancel,
-            launch_permit,
-            respond_to,
-        } = request;
-        if process.is_none() {
-            match JsonLineProcess::spawn_trusted(&spec, launch_permit).await {
-                Ok(spawned) => process = Some(spawned),
-                Err(error) => {
-                    let _ = respond_to.send(Err(error));
-                    break;
-                }
-            }
-        } else {
-            drop(launch_permit);
-        }
-        let result = tokio::select! {
-            result = run_acp_turn_controlled(process.as_mut().unwrap(), context, prompt, &sink, &mut cancel, runtime.clone(), &mut connection, Some(&mut controls)) => result,
-            _ = shutdown.changed() => { let _ = respond_to.send(Err(AppError::TurnCancelled)); break; }
-        };
-        let reusable = result.as_ref().is_ok_and(|result| !result.cancelled);
-        last_sink = Some(sink);
-        while let Ok(control) = controls.try_recv() {
-            let _ = control.respond_to.send(Err(AppError::InvalidRequest(
-                "Devin turn already ended".to_owned(),
-            )));
-        }
-        if !reusable {
-            turns.close();
-            controls.close();
-        }
-        let _ = respond_to.send(result);
-        if !reusable {
-            break;
-        }
-        idle_deadline = tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT;
-    }
-    turns.close();
-    controls.close();
-    if let Some(process) = process.as_mut() {
-        process.terminate().await;
-    }
-    let _ = stopped.send(true);
 }
 
 async fn initialize_process(process: &mut JsonLineProcess) -> Result<Value, AppError> {
-    let result = control_request(
+    // `cognition.ai/subagentSupport` opts this client into the
+    // `cognition.ai/subagent_*` `_meta` markers on `session/update`.
+    initialize_acp(
         process,
-        "initialize",
-        "initialize",
-        json!({
-        "protocolVersion":1,
-        // `cognition.ai/subagentSupport` opts this client into the
-        // `cognition.ai/subagent_*` `_meta` markers on `session/update`.
-        "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"configOptions":{}},"_meta":{"cognition.ai/subagentSupport":true}},
-        "clientInfo":{"name":"todex-agentd","title":"TodeX 2.0","version":crate::version::APP_VERSION},
-        }),
+        DEVIN_RPC,
+        Some(json!({ "cognition.ai/subagentSupport": true })),
         None,
-    ).await?;
-    if result.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
-        return Err(AppError::Unsupported(
-            "Devin negotiated an unsupported ACP protocol version".to_owned(),
-        ));
-    }
-    Ok(result)
+    )
+    .await
 }
 
 async fn control_request(
@@ -783,24 +569,7 @@ async fn control_request_updates(
 }
 
 fn devin_environment(allowlist: &[String]) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::from([("NO_COLOR".to_owned(), "1".to_owned())]);
-    for key in allowlist {
-        if !valid_env_name(key) || key.starts_with("TODEX_AGENTD_") {
-            continue;
-        }
-        if let Ok(value) = std::env::var(key) {
-            env.insert(key.clone(), value);
-        }
-    }
-    env
-}
-
-fn valid_env_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    chars
-        .next()
-        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    allowlisted_environment(&[("NO_COLOR", "1")], allowlist)
 }
 
 /// Bookkeeping for one discovery `devin acp` process. Every `session/new`
@@ -1260,7 +1029,7 @@ mod tests {
             api_key_env: None,
             cli_credentials: false,
             env_allowlist: Vec::new(),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: ResidentSessions::new(&PROFILE, "Devin"),
             discovery: DiscoveryCache::new(),
             fork_probe: DiscoveryCache::new(),
         };
@@ -1274,7 +1043,7 @@ mod tests {
                 api_key_env: None,
                 cli_credentials: false,
                 env_allowlist: Vec::new(),
-                sessions: Mutex::new(HashMap::new()),
+                sessions: ResidentSessions::new(&PROFILE, "Devin"),
                 discovery: DiscoveryCache::new(),
                 fork_probe: DiscoveryCache::new(),
             }
@@ -1297,7 +1066,7 @@ mod tests {
             api_key_env: None,
             cli_credentials: false,
             env_allowlist: Vec::new(),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: ResidentSessions::new(&PROFILE, "Devin"),
             discovery: DiscoveryCache::new(),
             fork_probe: DiscoveryCache::new(),
         };
@@ -1331,7 +1100,7 @@ mod tests {
             api_key_env: None,
             cli_credentials: false,
             env_allowlist: Vec::new(),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: ResidentSessions::new(&PROFILE, "Devin"),
             discovery: DiscoveryCache::new(),
             fork_probe: DiscoveryCache::new(),
         };
@@ -1426,7 +1195,7 @@ mod tests {
             api_key_env: None,
             cli_credentials: false,
             env_allowlist: Vec::new(),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: ResidentSessions::new(&PROFILE, "Devin"),
             discovery: DiscoveryCache::new(),
             fork_probe: DiscoveryCache::new(),
         };
