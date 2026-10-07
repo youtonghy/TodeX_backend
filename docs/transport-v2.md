@@ -249,7 +249,10 @@ derived keys).
   and the socket loops) and `server::sealed` (the tunnel). Business handlers
   only see JSON text and plain HTTP requests.
 - Keys live inside the AEAD (wiped on drop); transcripts, shared secrets and
-  derived keys are `Zeroizing`.
+  derived keys are `Zeroizing`. pqcrypto-mlkem's `SharedSecret` is a plain
+  `Copy` array without zeroize support, so the backend overwrites its own
+  copy with a volatile write after copying it out; the temporary that
+  `decapsulate` fills inside the crate cannot be reached.
 - WebSocket: protocol problems answer before the upgrade (`tv` other than
   `2` is `426 PROTOCOL_UPGRADE_REQUIRED`; a protocol other than the server's
   `pairing_encryption` is `403`). Malformed handshake material (bad base64,

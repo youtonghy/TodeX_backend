@@ -26,6 +26,22 @@ pub(crate) const NONCE_LENGTH: usize = 32;
 const KEY_LENGTH: usize = 32;
 const ML_KEM_768_CIPHERTEXT_LENGTH: usize = 1088;
 
+/// pqcrypto-mlkem 0.1's `SharedSecret` is a plain `Copy` byte array: it does
+/// not zeroize on drop and offers no mutable access. Overwrite the copy we
+/// own in place with a volatile write of an all-zero secret. Copies the
+/// crate makes internally (the FFI output inside `decapsulate`, on its own
+/// stack frame) are out of reach; the stack is reused by later calls.
+fn wipe_ml_kem_shared_secret(shared: &mut mlkem768::SharedSecret) {
+    let Ok(zero) = mlkem768::SharedSecret::from_bytes(&[0_u8; 32]) else {
+        // Unreachable for ML-KEM-768 (32-byte secrets); nothing to wipe with.
+        return;
+    };
+    // SAFETY: `shared` is a valid, aligned, exclusive reference and `zero`
+    // is a valid value of the same type, which has no `Drop` to skip.
+    unsafe { std::ptr::write_volatile(shared, zero) };
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Inputs to the key schedule, shared by WebSocket and REST.
 pub(crate) struct KeyScheduleInput<'a> {
     pub label: &'a str,
@@ -109,7 +125,11 @@ impl PairingKeys {
                 if bool::from(shared.as_bytes().ct_eq(&[0_u8; 32])) {
                     return Err(TransportCryptoError::new("x25519 shared secret is zero"));
                 }
-                Ok(Zeroizing::new(*shared.as_bytes()))
+                // x25519-dalek's `SharedSecret` zeroizes itself on drop; copy
+                // straight into the zeroizing buffer (no stack temporary).
+                let mut out = Zeroizing::new([0_u8; 32]);
+                out.copy_from_slice(shared.as_bytes());
+                Ok(out)
             }
             EncryptionProtocol::MlKem768 => {
                 if client_material.len() != ML_KEM_768_CIPHERTEXT_LENGTH {
@@ -117,12 +137,16 @@ impl PairingKeys {
                 }
                 let ciphertext = mlkem768::Ciphertext::from_bytes(client_material)
                     .map_err(|_| TransportCryptoError::new("ml-kem-768 ciphertext"))?;
-                let shared = mlkem768::decapsulate(&ciphertext, &self.ml_kem_secret);
-                let shared: [u8; 32] = shared
-                    .as_bytes()
-                    .try_into()
-                    .map_err(|_| TransportCryptoError::new("ml-kem-768 shared secret length"))?;
-                Ok(Zeroizing::new(shared))
+                let mut shared = mlkem768::decapsulate(&ciphertext, &self.ml_kem_secret);
+                let mut out = Zeroizing::new([0_u8; 32]);
+                let copied = if shared.as_bytes().len() == out.len() {
+                    out.copy_from_slice(shared.as_bytes());
+                    Ok(out)
+                } else {
+                    Err(TransportCryptoError::new("ml-kem-768 shared secret length"))
+                };
+                wipe_ml_kem_shared_secret(&mut shared);
+                copied
             }
         }
     }
