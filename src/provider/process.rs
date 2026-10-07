@@ -78,6 +78,20 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
+    /// Appends `flag value` as two argv entries. `value` comes from the client
+    /// (model ids, reasoning efforts); one starting with `-` would be parsed by
+    /// the provider CLI as another option, so it is rejected instead.
+    pub(crate) fn push_flag_value(&mut self, flag: &str, value: &str) -> Result<(), AppError> {
+        if value.starts_with('-') {
+            return Err(AppError::InvalidRequest(format!(
+                "{flag} value must not start with '-'"
+            )));
+        }
+        self.args.push(flag.to_owned());
+        self.args.push(value.to_owned());
+        Ok(())
+    }
+
     pub fn new(program: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
@@ -122,7 +136,7 @@ impl ProviderRead {
     }
 }
 
-enum BoundedLine {
+pub(crate) enum BoundedLine {
     Line(Vec<u8>),
     Oversized(usize),
 }
@@ -504,7 +518,27 @@ fn stderr_excerpt(buffer: &[u8]) -> Option<String> {
     Some(format!("...{kept}"))
 }
 
-pub(super) fn redact_sensitive_text(input: &str) -> String {
+/// Well-known credential prefixes redacted wherever they start a token:
+/// OpenAI/Anthropic (`sk-`, `sk-ant-`), GitHub (`ghp_`, `gho_`, `ghu_`,
+/// `ghs_`, `ghr_`, `github_pat_`) and AWS access key ids (`AKIA`).
+const TOKEN_PREFIXES: [&str; 8] = [
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "AKIA",
+];
+/// Shorter tails are ordinary words (`sk-learn`, `ghs_x`), not credentials.
+const MIN_TOKEN_TAIL: usize = 16;
+
+fn is_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')
+}
+
+pub(crate) fn redact_sensitive_text(input: &str) -> String {
     let mut output = input.to_owned();
     for prefix in ["xai-", "Bearer "] {
         let mut search_from = 0;
@@ -518,10 +552,38 @@ pub(super) fn redact_sensitive_text(input: &str) -> String {
             search_from = start + "[REDACTED]".len();
         }
     }
+    // After `Bearer `: its value scan stops at `]` and would split a
+    // `[REDACTED]` left by this pass.
+    for prefix in TOKEN_PREFIXES {
+        redact_prefixed_tokens(&mut output, prefix);
+    }
     for key in ["api_key", "access_token", "refresh_token", "authorization"] {
         redact_json_string_value(&mut output, key);
     }
     output
+}
+
+/// Replaces `prefix` plus its token tail with `[REDACTED]` when the prefix
+/// starts a word and the tail is long enough to be a credential.
+fn redact_prefixed_tokens(output: &mut String, prefix: &str) {
+    let mut search_from = 0;
+    while let Some(relative) = output[search_from..].find(prefix) {
+        let start = search_from + relative;
+        let value_start = start + prefix.len();
+        let value_end = output[value_start..]
+            .find(|ch: char| !is_token_char(ch))
+            .map_or(output.len(), |offset| value_start + offset);
+        let at_boundary = !output[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_token_char);
+        if at_boundary && value_end - value_start >= MIN_TOKEN_TAIL {
+            output.replace_range(start..value_end, "[REDACTED]");
+            search_from = start + "[REDACTED]".len();
+        } else {
+            search_from = value_start;
+        }
+    }
 }
 
 fn redact_json_string_value(output: &mut String, key: &str) {
@@ -659,6 +721,8 @@ pub(crate) fn secure_command(program: impl AsRef<OsStr>) -> Command {
         .and_then(resolve_executable)
         .unwrap_or_else(|| PathBuf::from(program));
     let mut command = Command::new(resolved);
+    // Only the allowlist below reaches the child, so daemon secrets such as
+    // TODEX_AGENTD_* never do; no per-variable removal is needed.
     command.env_clear();
     for key in [
         "PATH",
@@ -699,11 +763,6 @@ pub(crate) fn secure_command(program: impl AsRef<OsStr>) -> Command {
     ] {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
-        }
-    }
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("TODEX_AGENTD_") {
-            command.env_remove(key);
         }
     }
     command
@@ -785,7 +844,7 @@ fn unparsed_line_preview(bytes: &[u8]) -> String {
 /// Reads one newline-terminated line of at most `max_bytes` (plus the newline).
 /// A longer line is consumed to its end without being buffered and reported as
 /// `Oversized` with its length excluding the trailing newline.
-async fn read_bounded_line<R>(
+pub(crate) async fn read_bounded_line<R>(
     reader: &mut R,
     output: &mut Vec<u8>,
     discarding: &mut Option<usize>,
@@ -971,6 +1030,47 @@ mod tests {
         assert!(!redacted.contains("token-value"));
         assert!(!redacted.contains("raw-secret"));
         assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn well_known_credential_formats_are_redacted() {
+        let secrets = [
+            "sk-proj-abcdefghijklmnop0123",
+            "sk-ant-api03-abcdefghijklmnop_0123",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "github_pat_11ABCDEFG0123456789_abcdefghij",
+            "AKIAIOSFODNN7EXAMPLE",
+        ];
+        for secret in secrets {
+            let redacted = redact_sensitive_text(&format!("auth failed key={secret}, retry"));
+            assert_eq!(redacted, "auth failed key=[REDACTED], retry", "{secret}");
+        }
+        // Words that merely contain or start like a prefix stay readable.
+        for text in [
+            "task-abcdefghijklmnopqrstuvwxyz",
+            "sk-learn",
+            "MASKAKIAIOSFODNN7EXAMPLE",
+        ] {
+            assert_eq!(redact_sensitive_text(text), text);
+        }
+        // Existing formats keep their redacted shape.
+        assert_eq!(
+            redact_sensitive_text("Authorization: Bearer sk-ant-abcdefghijklmnop0123"),
+            "Authorization: [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn flag_values_that_look_like_options_are_rejected() {
+        let mut spec = CommandSpec::new("claude", "/tmp");
+        spec.push_flag_value("--model", "claude-sonnet-4-6")
+            .unwrap();
+        assert_eq!(spec.args, ["--model", "claude-sonnet-4-6"]);
+        let error = spec
+            .push_flag_value("--effort", "--dangerously-skip-permissions")
+            .unwrap_err();
+        assert!(matches!(error, AppError::InvalidRequest(_)));
+        assert_eq!(spec.args.len(), 2, "rejected values add nothing");
     }
 
     #[cfg(unix)]

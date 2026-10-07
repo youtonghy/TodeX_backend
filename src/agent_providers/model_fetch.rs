@@ -2,6 +2,7 @@
 //! the daemon: clients receive the model list without ever seeing the key.
 
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::conversation::ProviderKind;
@@ -11,6 +12,26 @@ use super::{codex, grok, opencode, pi};
 
 const MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MODELS: usize = 500;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Process-wide client for model catalog requests, so each listing reuses the
+/// connection pool and TLS setup. Redirects are not followed: reqwest only
+/// strips `Authorization` on a cross-host redirect, not `x-api-key`. Callers
+/// still set a per-request timeout.
+pub(crate) fn http_client() -> Result<&'static reqwest::Client, AppError> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| {
+            AppError::ProviderUnavailable(format!("HTTP client unavailable: {error}"))
+        })?;
+    Ok(CLIENT.get_or_init(|| client))
+}
 
 /// `(base_url, api_key)` for a stored profile's settingsConfig.
 fn endpoint_credentials(agent: ProviderKind, settings: &Value) -> (Option<String>, Option<String>) {
@@ -63,7 +84,7 @@ pub async fn fetch_models(agent: ProviderKind, settings: &Value) -> Result<Value
         })?;
     let url = models_url(agent, &base_url);
 
-    let mut request = reqwest::Client::new().get(&url);
+    let mut request = http_client()?.get(&url);
     if let Some(key) = api_key.filter(|key| !key.is_empty()) {
         request = request
             .header("authorization", format!("Bearer {key}"))

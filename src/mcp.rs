@@ -9,14 +9,20 @@ use rmcp::transport::{
 };
 use rmcp::ServiceExt;
 use serde_json::Value;
+use tokio::io::{AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::catalog::{McpRuntimeTarget, McpToolDescriptor, McpTransport};
 use crate::error::AppError;
+use crate::provider::process::{read_bounded_line, redact_sensitive_text, BoundedLine};
 
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest stderr line of a user MCP server written to the daemon log.
+const STDERR_LINE_BYTES: usize = 2048;
+/// Stderr lines logged per server process; the rest is drained unlogged.
+const STDERR_MAX_LINES: usize = 200;
 
 #[derive(Debug)]
 pub struct McpCallResult {
@@ -113,16 +119,66 @@ fn stdio_transport(target: &McpRuntimeTarget) -> Result<TokioChildProcess, AppEr
         }
         command.env(key, value);
     }
-    TokioChildProcess::builder(command)
-        .stderr(Stdio::inherit())
+    // stderr is captured rather than inherited: user servers print tokens
+    // and request dumps there, which must not reach the daemon log verbatim.
+    let (transport, stderr) = TokioChildProcess::builder(command)
+        .stderr(Stdio::piped())
         .spawn()
-        .map(|(transport, _)| transport)
         .map_err(|error| {
             AppError::InvalidRequest(format!(
                 "failed to start mcp server {}: {error}",
                 target.descriptor.name
             ))
-        })
+        })?;
+    if let Some(stderr) = stderr {
+        let server = target.descriptor.name.clone();
+        tokio::spawn(async move {
+            forward_stderr(stderr, |line| {
+                tracing::info!(mcp_server = %server, "mcp server stderr: {line}");
+            })
+            .await;
+        });
+    }
+    Ok(transport)
+}
+
+/// Passes each stderr line, redacted and bounded, to `emit` until the pipe
+/// closes. Lines past [`STDERR_MAX_LINES`] are still read so the server never
+/// blocks on a full pipe.
+async fn forward_stderr(stderr: impl AsyncRead + Unpin, mut emit: impl FnMut(String)) {
+    let mut reader = BufReader::new(stderr);
+    let (mut buffer, mut discarding) = (Vec::new(), None);
+    let mut lines = 0_usize;
+    loop {
+        let line =
+            match read_bounded_line(&mut reader, &mut buffer, &mut discarding, STDERR_LINE_BYTES)
+                .await
+            {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to read mcp server stderr");
+                    break;
+                }
+            };
+        let text = match line {
+            BoundedLine::Line(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let text = text.trim_end();
+                if text.is_empty() {
+                    continue;
+                }
+                redact_sensitive_text(text)
+            }
+            BoundedLine::Oversized(bytes) => format!("[{bytes}-byte line omitted]"),
+        };
+        lines += 1;
+        if lines < STDERR_MAX_LINES {
+            emit(text);
+        } else if lines == STDERR_MAX_LINES {
+            emit("[further stderr output omitted]".to_owned());
+        }
+    }
 }
 
 fn inherit_base_env(command: &mut Command) {
@@ -316,6 +372,22 @@ while True:
             .expect("call tool");
         assert!(!result.is_error);
         assert!(result.content.to_string().contains("pong"));
+    }
+
+    #[tokio::test]
+    async fn stderr_is_redacted_bounded_and_capped() {
+        let long = "x".repeat(STDERR_LINE_BYTES + 1);
+        let mut input = format!("starting\n\nkey=sk-ant-abcdefghijklmnop0123\n{long}\n");
+        for index in 0..STDERR_MAX_LINES {
+            input.push_str(&format!("line {index}\n"));
+        }
+        let mut lines = Vec::new();
+        forward_stderr(input.as_bytes(), |line| lines.push(line)).await;
+        assert_eq!(lines[0], "starting");
+        assert_eq!(lines[1], "key=[REDACTED]");
+        assert_eq!(lines[2], format!("[{}-byte line omitted]", long.len()));
+        assert_eq!(lines.len(), STDERR_MAX_LINES);
+        assert_eq!(lines.last().unwrap(), "[further stderr output omitted]");
     }
 
     #[tokio::test]

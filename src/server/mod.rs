@@ -71,7 +71,7 @@ fn cors_layer(host: &str) -> CorsLayer {
     }
 }
 
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let normalized = host.trim().trim_matches(['[', ']']);
     normalized.eq_ignore_ascii_case("localhost")
         || normalized

@@ -62,6 +62,9 @@ const EVENT_COMMAND_LIMIT: usize = 4096;
 /// calls cannot fill the conversation journal. The agent still receives up
 /// to [`OUTPUT_LIMIT`].
 const EVENT_OUTPUT_LIMIT: usize = 64 * 1024;
+// The output tap stops at OUTPUT_LIMIT per stream; the recorder can only
+// notice (and report) a cut when it sees more than it records.
+const _: () = assert!(EVENT_OUTPUT_LIMIT < OUTPUT_LIMIT);
 /// Live output is batched into events at this cadence or size.
 const OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const OUTPUT_FLUSH_BYTES: usize = 16 * 1024;

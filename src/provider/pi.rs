@@ -428,12 +428,10 @@ impl ProviderDriver for PiDriver {
             "--approve".to_owned(),
         ];
         if let Some(model) = &prompt.model {
-            spec.args.push("--model".to_owned());
-            spec.args.push(model.clone());
+            spec.push_flag_value("--model", model)?;
         }
         if let Some(effort) = &prompt.reasoning_effort {
-            spec.args.push("--thinking".to_owned());
-            spec.args.push(effort.clone());
+            spec.push_flag_value("--thinking", effort)?;
         }
 
         let conversation_id = context.manifest.id.clone();

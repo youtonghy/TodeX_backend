@@ -171,9 +171,10 @@ pub(crate) struct OutputChunk {
 }
 
 /// Runs a command whose output beyond the limit is dropped (and reported as
-/// truncated) instead of failing the run, and sends every chunk read from
-/// stdout and stderr to `tap` as it arrives, before truncation. The tap is dropped when the run ends (or
-/// is cancelled), so a receiver loop ends with it.
+/// truncated) instead of failing the run, and sends the kept stdout and stderr
+/// bytes to `tap` as they arrive, so the tap holds at most the output limit
+/// per stream. The tap is dropped when the run ends (or is cancelled), so a
+/// receiver loop ends with it.
 pub(crate) async fn run_streaming(
     command: Command,
     stdin: Option<Vec<u8>>,
@@ -335,11 +336,16 @@ where
             break;
         }
         if let Some((tap, stream)) = tap {
-            // A receiver that went away only stops observation, not the run.
-            let _ = tap.send(OutputChunk {
-                stream,
-                bytes: buffer[..read].to_vec(),
-            });
+            // Only the kept bytes are sent, so a slow receiver queues at most
+            // `limit` per stream however much the child prints. A receiver
+            // that went away only stops observation, not the run.
+            let kept = read.min(limit - output.len());
+            if kept > 0 {
+                let _ = tap.send(OutputChunk {
+                    stream,
+                    bytes: buffer[..kept].to_vec(),
+                });
+            }
         }
         if output.len().saturating_add(read) > limit {
             if overflow == Overflow::Fail {
@@ -421,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_run_truncates_the_result_but_taps_everything() {
+    async fn streaming_run_truncates_the_result_and_taps_only_kept_output() {
         let mut command = secure_command("/bin/sh");
         command.args(["-c", "yes | head -c 100000; printf ab >&2; exit 4"]);
         prepare_captured(&mut command, false);
@@ -440,7 +446,7 @@ mod tests {
                 OutputStream::Stderr => stderr.extend(chunk.bytes),
             }
         }
-        assert_eq!(stdout, 100_000, "the tap sees output past the limit");
+        assert_eq!(stdout, 16, "the tap stops at the output limit");
         assert_eq!(stderr, b"ab");
 
         let mut command = secure_command("/bin/sh");

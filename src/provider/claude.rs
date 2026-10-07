@@ -306,6 +306,47 @@ fn claude_model_family(id: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Upper bound for the gateway `/v1/models` request; discovery falls back to
+/// the built-in aliases rather than holding up the model picker.
+const CLAUDE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The managed provider (live settings.json env) wins over the daemon's own
+/// process environment so the catalog follows the active account.
+fn claude_discovery_env(key: &str) -> Option<String> {
+    crate::agent_providers::claude_live_env(key).or_else(|| {
+        std::env::var(key)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+/// `{base}/v1/models`, or `None` when discovery must not send credentials
+/// there: anything but https is only allowed for a loopback gateway.
+fn claude_discovery_url(base: &str) -> Option<reqwest::Url> {
+    let url = match reqwest::Url::parse(&format!("{}/v1/models", base.trim().trim_end_matches('/')))
+    {
+        Ok(url) => url,
+        Err(error) => {
+            tracing::warn!(%error, "ignoring invalid ANTHROPIC_BASE_URL for model discovery");
+            return None;
+        }
+    };
+    let loopback = url.host_str().is_some_and(crate::server::is_loopback_host);
+    match url.scheme() {
+        "https" => Some(url),
+        "http" if loopback => Some(url),
+        scheme => {
+            // Host and scheme only: the URL itself may carry userinfo.
+            tracing::warn!(
+                scheme,
+                host = url.host_str().unwrap_or_default(),
+                "skipping Claude model discovery: a non-loopback ANTHROPIC_BASE_URL must use https"
+            );
+            None
+        }
+    }
+}
+
 impl ClaudeDriver {
     pub fn new(config: &AgentConfig) -> Self {
         Self {
@@ -351,25 +392,23 @@ impl ProviderDriver for ClaudeDriver {
         &self,
         _workspace: &Path,
     ) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
-        // The managed provider (live settings.json env) wins over the daemon's
-        // own process environment so the catalog follows the active account.
-        let Some(base) =
-            crate::agent_providers::claude_live_env("ANTHROPIC_BASE_URL").or_else(|| {
-                std::env::var("ANTHROPIC_BASE_URL")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            })
-        else {
+        let Some(base) = claude_discovery_env("ANTHROPIC_BASE_URL") else {
             return Ok(claude_model_aliases());
         };
-        let url = format!("{}/v1/models", base.trim_end_matches('/'));
-        let request = reqwest::Client::new().get(url);
-        let request = match crate::agent_providers::claude_live_env("ANTHROPIC_AUTH_TOKEN")
-            .or_else(|| std::env::var("ANTHROPIC_AUTH_TOKEN").ok())
-            .filter(|value| !value.trim().is_empty())
-        {
-            Some(token) => request.header("x-api-key", token),
-            None => request,
+        let Some(url) = claude_discovery_url(&base) else {
+            return Ok(claude_model_aliases());
+        };
+        let request = crate::agent_providers::http_client()?
+            .get(url)
+            .timeout(CLAUDE_DISCOVERY_TIMEOUT);
+        // Same headers Claude Code itself sends: ANTHROPIC_AUTH_TOKEN as a
+        // bearer token, taking precedence over ANTHROPIC_API_KEY (x-api-key).
+        let request = if let Some(token) = claude_discovery_env("ANTHROPIC_AUTH_TOKEN") {
+            request.bearer_auth(token)
+        } else if let Some(key) = claude_discovery_env("ANTHROPIC_API_KEY") {
+            request.header("x-api-key", key)
+        } else {
+            request
         };
         let response = request
             .header("anthropic-version", "2023-06-01")
@@ -580,12 +619,10 @@ impl ProviderDriver for ClaudeDriver {
         }
         spec.args.push(requested_session_id.clone());
         if let Some(model) = &prompt.model {
-            spec.args.push("--model".to_owned());
-            spec.args.push(model.clone());
+            spec.push_flag_value("--model", model)?;
         }
         if let Some(effort) = &prompt.reasoning_effort {
-            spec.args.push("--effort".to_owned());
-            spec.args.push(effort.clone());
+            spec.push_flag_value("--effort", effort)?;
         }
         if let Some(launch) = &context.agent_mcp {
             spec.args.extend(launch.claude_args().await?);
@@ -758,9 +795,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        claude_command_catalog, claude_frame_limit_reset, claude_model_aliases,
-        claude_model_family, claude_permission_details, claude_question_details,
-        claude_question_response, claude_quota_event, claude_result_error,
+        claude_command_catalog, claude_discovery_url, claude_frame_limit_reset,
+        claude_model_aliases, claude_model_family, claude_permission_details,
+        claude_question_details, claude_question_response, claude_quota_event, claude_result_error,
         claude_transcript_loadable, claude_user_content, handle_stream_event, usage_limit_reset,
         BackgroundTasks, ClaudeSubagents, ClaudeToolCalls,
     };
@@ -771,6 +808,31 @@ mod tests {
     use crate::provider::types::{
         DriverPrompt, DriverPromptContent, PermissionDecision, PermissionOutcome,
     };
+
+    #[test]
+    fn model_discovery_requires_https_except_on_loopback() {
+        assert_eq!(
+            claude_discovery_url("https://gw.example.com/")
+                .unwrap()
+                .as_str(),
+            "https://gw.example.com/v1/models"
+        );
+        for base in [
+            "http://127.0.0.1:8080",
+            "http://localhost:4000",
+            "http://[::1]:9",
+        ] {
+            assert!(claude_discovery_url(base).is_some(), "{base}");
+        }
+        for base in [
+            "http://gw.example.com",
+            "http://192.168.1.20:8080",
+            "ftp://gw.example.com",
+            "not a url",
+        ] {
+            assert!(claude_discovery_url(base).is_none(), "{base}");
+        }
+    }
 
     #[tokio::test]
     async fn stream_text_and_tool_json_merge_per_content_block() {

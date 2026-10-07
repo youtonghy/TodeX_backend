@@ -17,6 +17,7 @@ mod opencode;
 mod pi;
 mod store;
 
+pub(crate) use model_fetch::http_client;
 pub use store::AgentProviderProfile;
 use store::{AgentProviderBucket, AgentProviderStore};
 

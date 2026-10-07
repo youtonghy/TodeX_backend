@@ -59,12 +59,16 @@ impl GrokBuildDriver {
         }
     }
 
-    fn command_spec(&self, workspace: &Path, prompt: Option<&DriverPrompt>) -> CommandSpec {
+    fn command_spec(
+        &self,
+        workspace: &Path,
+        prompt: Option<&DriverPrompt>,
+    ) -> Result<CommandSpec, AppError> {
         grok_command_spec(&self.binary, &self.env_allowlist, workspace, prompt)
     }
 
     async fn initialize(&self, workspace: &Path) -> Result<Value, AppError> {
-        let mut process = JsonLineProcess::spawn(&self.command_spec(workspace, None)).await?;
+        let mut process = JsonLineProcess::spawn(&self.command_spec(workspace, None)?).await?;
         let result = initialize_process(&mut process).await;
         process.terminate().await;
         result
@@ -176,7 +180,7 @@ impl ProviderDriver for GrokBuildDriver {
             .as_deref()
             .ok_or_else(|| AppError::InvalidRequest("Grok session has not started".to_owned()))?;
         let mut process = JsonLineProcess::spawn_trusted(
-            &self.command_spec(&context.manifest.workspace, None),
+            &self.command_spec(&context.manifest.workspace, None)?,
             launch_permit,
         )
         .await?;
@@ -258,7 +262,7 @@ impl ProviderDriver for GrokBuildDriver {
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
-        let mut process = JsonLineProcess::spawn(&self.command_spec(workspace, None)).await?;
+        let mut process = JsonLineProcess::spawn(&self.command_spec(workspace, None)?).await?;
         let result = async {
             let initialize = initialize_process(&mut process).await?;
             self.authenticate(&mut process, &initialize).await?;
@@ -321,7 +325,7 @@ impl ProviderDriver for GrokBuildDriver {
                     shutdown,
                     stopped,
                 };
-                let spec = self.command_spec(&context.manifest.workspace, Some(&prompt));
+                let spec = self.command_spec(&context.manifest.workspace, Some(&prompt))?;
                 let runtime = AcpRuntimeOptions {
                     authenticate: true,
                     auth_method: self.auth_method.clone(),
@@ -536,7 +540,7 @@ fn grok_command_spec(
     env_allowlist: &[String],
     workspace: &Path,
     prompt: Option<&DriverPrompt>,
-) -> CommandSpec {
+) -> Result<CommandSpec, AppError> {
     let mut spec = CommandSpec::new(binary, workspace);
     spec.args = vec![
         "--no-auto-update".to_owned(),
@@ -544,16 +548,14 @@ fn grok_command_spec(
         "--no-leader".to_owned(),
     ];
     if let Some(model) = prompt.and_then(|prompt| prompt.model.as_deref()) {
-        spec.args.push("--model".to_owned());
-        spec.args.push(model.to_owned());
+        spec.push_flag_value("--model", model)?;
     }
     if let Some(effort) = prompt.and_then(|prompt| prompt.reasoning_effort.as_deref()) {
-        spec.args.push("--reasoning-effort".to_owned());
-        spec.args.push(effort.to_owned());
+        spec.push_flag_value("--reasoning-effort", effort)?;
     }
     spec.args.push("stdio".to_owned());
     spec.env = grok_environment(env_allowlist);
-    spec
+    Ok(spec)
 }
 
 fn grok_environment(allowlist: &[String]) -> BTreeMap<String, String> {
@@ -751,7 +753,7 @@ mod tests {
             sandbox_mode: None,
             approval_policy: None,
         };
-        let spec = grok_command_spec("grok", &[], Path::new("/tmp"), Some(&prompt));
+        let spec = grok_command_spec("grok", &[], Path::new("/tmp"), Some(&prompt)).unwrap();
         assert_eq!(
             spec.args,
             [

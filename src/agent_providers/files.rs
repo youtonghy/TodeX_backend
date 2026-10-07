@@ -99,33 +99,9 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     #[cfg(not(unix))]
     let _ = created;
 
-    let tmp_path = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("config"),
-        uuid::Uuid::new_v4().simple()
-    ));
-    let write = || -> Result<(), AppError> {
-        fs::write(&tmp_path, bytes).map_err(AppError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
-                .map_err(AppError::Io)?;
-        }
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path).map_err(AppError::Io)?;
-        }
-        fs::rename(&tmp_path, path).map_err(AppError::Io)?;
-        Ok(())
-    };
-    let result = write();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    result
+    // The temp file is created 0600 from the start, so the secrets it holds
+    // are never readable under a permissive umask, even briefly.
+    crate::secure_fs::write_owner_only_atomic(path, bytes).map_err(AppError::Io)
 }
 
 pub fn write_json_pretty(path: &Path, value: &Value) -> Result<(), AppError> {
@@ -244,6 +220,26 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_private_replaces_readable_file_with_owner_only_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_dir();
+        let path = root.join("settings.json");
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_private(&path, br#"{"env":{"ANTHROPIC_API_KEY":"secret"}}"#).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            1,
+            "no temp file left behind"
+        );
     }
 
     #[test]
