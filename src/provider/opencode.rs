@@ -11,7 +11,7 @@ use crate::conversation::{ProviderKind, ProviderState};
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
-use super::acp::AcpRuntimeOptions;
+use super::acp::{AcpQuirks, AcpRuntimeOptions, PromptUsage, PLAIN_ACP};
 use super::discovery::{DiscoveryCache, DiscoveryKey, DiscoverySnapshot};
 use super::process::{executable_available, CommandSpec, JsonLineProcess};
 use super::profile::{
@@ -41,6 +41,19 @@ const COMMAND_DRAIN: Duration = Duration::from_millis(1500);
 /// (provider catalogs load there) and up to `COMMAND_DRAIN` waiting for the
 /// command list; the per-model effort sweep itself answers in milliseconds.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Where OpenCode deviates from plain ACP.
+pub(super) const ACP_QUIRKS: AcpQuirks = AcpQuirks {
+    client_side_approval: true,
+    prefer_resume: true,
+    control_commands: Some(super::acp::opencode_control_commands),
+    prompt_usage: PromptUsage::ResultUsage,
+    command_updates: true,
+    usage_updates: true,
+    effort_config: "effort",
+    session_mode: Some(super::acp::opencode_session_mode),
+    ..PLAIN_ACP
+};
 
 /// What OpenCode supports and how TodeX adapts to it.
 pub(super) const PROFILE: ProviderProfile = ProviderProfile {

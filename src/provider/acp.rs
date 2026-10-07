@@ -102,6 +102,98 @@ pub(super) struct AcpRuntimeOptions {
     pub snake_case_image_mime: bool,
 }
 
+/// How one ACP agent deviates from plain ACP. Each ACP-based driver declares
+/// its own (`ACP_QUIRKS`); configured ACP profiles use [`PLAIN_ACP`].
+#[derive(Clone, Copy)]
+pub(super) struct AcpQuirks {
+    /// Opts into `cognition.ai/subagent_*` markers on initialize and maps
+    /// them to subagent events and tool ownership.
+    pub subagents: bool,
+    /// `auto`/`full-access` are approved client side instead of asking.
+    pub client_side_approval: bool,
+    /// Reattach with `session/resume` (no history replay) when advertised.
+    pub prefer_resume: bool,
+    /// A stored session the agent cannot load (held by another process or
+    /// deleted) is replaced by a fresh one instead of failing the turn.
+    pub recreate_unloadable_session: bool,
+    /// Native requests for a live control; `None` when the agent has none.
+    pub control_commands: Option<ControlCommands>,
+    /// Where the prompt response reports turn usage.
+    pub prompt_usage: PromptUsage,
+    /// Extension notifications handled ahead of `session/update`.
+    pub extension_updates: Option<ExtensionUpdates>,
+    /// Malformed `session/update`s are journalled as provider events instead
+    /// of failing the turn.
+    pub lenient_updates: bool,
+    /// `available_commands_update` announces the command catalog.
+    pub command_updates: bool,
+    /// `usage_update` reports usage while the turn runs.
+    pub usage_updates: bool,
+    /// `current_mode_update` confirms the session mode.
+    pub mode_updates: bool,
+    /// Agent-internal updates and notifications with this prefix are dropped.
+    pub private_prefix: Option<&'static str>,
+    /// Restricts authentication to methods that run without interaction;
+    /// the hint tells the user how to sign in instead.
+    pub headless_auth: Option<HeadlessAuth>,
+    /// Config option id of the reasoning effort.
+    pub effort_config: &'static str,
+    /// The `mode` config option requested for a prompt.
+    pub session_mode: Option<fn(&DriverPrompt) -> Option<&'static str>>,
+}
+
+/// Whether an auth method runs headless, and the sign-in hint otherwise.
+pub(super) type HeadlessAuth = (fn(&str) -> bool, &'static str);
+
+pub(super) type ControlCommands =
+    fn(&PendingProviderControl, &str) -> Result<Vec<(String, Value)>, AppError>;
+
+#[derive(Clone, Copy)]
+pub(super) enum PromptUsage {
+    None,
+    /// `result.usage` of the prompt response, ACP-style counters.
+    ResultUsage,
+    /// Grok's prompt metadata `usage`/`promptUsage` ledger.
+    GrokMetadata,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ExtensionUpdates {
+    pub is_update_method: fn(&str) -> bool,
+    /// Maps an update to a dedicated event (subagent activity).
+    pub activity: fn(&Value) -> Option<(&'static str, Value)>,
+}
+
+/// A configured ACP profile: the protocol as specified.
+pub(super) const PLAIN_ACP: AcpQuirks = AcpQuirks {
+    subagents: false,
+    client_side_approval: false,
+    prefer_resume: false,
+    recreate_unloadable_session: false,
+    control_commands: None,
+    prompt_usage: PromptUsage::None,
+    extension_updates: None,
+    lenient_updates: false,
+    command_updates: false,
+    usage_updates: false,
+    mode_updates: false,
+    private_prefix: None,
+    headless_auth: None,
+    effort_config: "reasoning_effort",
+    session_mode: None,
+};
+
+fn quirks(provider: ProviderKind) -> &'static AcpQuirks {
+    match provider {
+        ProviderKind::GrokBuild => &super::grok::ACP_QUIRKS,
+        ProviderKind::Devin => &super::devin::ACP_QUIRKS,
+        ProviderKind::Opencode => &super::opencode::ACP_QUIRKS,
+        ProviderKind::Acp | ProviderKind::Codex | ProviderKind::Pi | ProviderKind::ClaudeCode => {
+            &PLAIN_ACP
+        }
+    }
+}
+
 impl AcpDriver {
     pub fn new(config: &AgentConfig) -> Self {
         Self {
@@ -451,16 +543,15 @@ fn initialize_request(provider: ProviderKind) -> InitializeRequest {
         ClientSessionCapabilities::new().config_options(SessionConfigOptionsCapabilities::new()),
     );
     InitializeRequest::new(ProtocolVersion::V1)
-        .client_capabilities(match provider {
-            // Devin only streams subagent lifecycle (`subagent_started` /
-            // `subagent_completed`) and ownership (`subagent_context`) markers
-            // to clients that opt in through `clientCapabilities._meta`.
-            ProviderKind::Devin => {
-                let mut meta = serde_json::Map::new();
-                meta.insert("cognition.ai/subagentSupport".to_owned(), Value::Bool(true));
-                capabilities.meta(meta)
-            }
-            _ => capabilities,
+        .client_capabilities(if quirks(provider).subagents {
+            // Subagent lifecycle (`subagent_started` / `subagent_completed`)
+            // and ownership (`subagent_context`) markers only stream to
+            // clients that opt in through `clientCapabilities._meta`.
+            let mut meta = serde_json::Map::new();
+            meta.insert("cognition.ai/subagentSupport".to_owned(), Value::Bool(true));
+            capabilities.meta(meta)
+        } else {
+            capabilities
         })
         .client_info(
             Implementation::new("todex-agentd", crate::version::APP_VERSION).title("TodeX 2.0"),
@@ -548,9 +639,12 @@ pub(super) enum AutoApprove {
 
 impl AutoApprove {
     fn for_turn(provider: ProviderKind, permission_mode: Option<&str>) -> Self {
-        match (provider, permission_mode) {
-            (ProviderKind::Opencode, Some("auto")) => Self::Once,
-            (ProviderKind::Opencode, Some("full-access")) => Self::Always,
+        if !quirks(provider).client_side_approval {
+            return Self::Mediate;
+        }
+        match permission_mode {
+            Some("auto") => Self::Once,
+            Some("full-access") => Self::Always,
             _ => Self::Mediate,
         }
     }
@@ -684,9 +778,10 @@ async fn run_acp_turn_steps(
     } else {
         match context.provider_state.native_session_id.clone() {
             Some(session_id) => {
-                // OpenCode's `session/resume` attaches without replaying history;
-                // TodeX keeps its own event log, so prefer it over session/load.
-                let can_resume = provider == ProviderKind::Opencode
+                // `session/resume` attaches without replaying history; TodeX
+                // keeps its own event log, so agents that prefer it skip
+                // session/load.
+                let can_resume = quirks(provider).prefer_resume
                     && initialize_value
                         .pointer("/agentCapabilities/sessionCapabilities/resume")
                         .is_some();
@@ -749,7 +844,7 @@ async fn run_acp_turn_steps(
                     // turn — but only when the agent itself answered: a local
                     // failure (journal full, write error) must surface as-is.
                     Err(error)
-                        if provider == ProviderKind::Devin
+                        if quirks(provider).recreate_unloadable_session
                             && matches!(
                                 error,
                                 AppError::Conflict(_) | AppError::ProviderUnavailable(_)
@@ -1093,12 +1188,19 @@ fn control_commands(
     request: &PendingProviderControl,
     session_id: &str,
 ) -> Result<Vec<(String, Value)>, AppError> {
-    if provider == ProviderKind::Devin {
-        return devin_control_commands(&request.control, session_id);
+    match quirks(provider).control_commands {
+        Some(commands) => commands(request, session_id),
+        None => Err(AppError::Unsupported(
+            "This ACP agent has no live controls".to_owned(),
+        )),
     }
-    if provider == ProviderKind::Opencode {
-        return opencode_control_commands(&request.control, session_id);
-    }
+}
+
+/// Grok Build: `_x.ai/interject` steering and config-option changes.
+pub(super) fn grok_control_commands(
+    request: &PendingProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
     match &request.control {
         ProviderControl::Steer { text } => Ok(vec![(
             "_x.ai/interject".to_owned(),
@@ -1124,7 +1226,14 @@ fn control_commands(
     }
 }
 
-fn opencode_control_commands(
+pub(super) fn opencode_control_commands(
+    request: &PendingProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
+    opencode_control_requests(&request.control, session_id)
+}
+
+fn opencode_control_requests(
     control: &ProviderControl,
     session_id: &str,
 ) -> Result<Vec<(String, Value)>, AppError> {
@@ -1157,7 +1266,14 @@ fn opencode_control_commands(
     }
 }
 
-fn devin_control_commands(
+pub(super) fn devin_control_commands(
+    request: &PendingProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
+    devin_control_requests(&request.control, session_id)
+}
+
+fn devin_control_requests(
     control: &ProviderControl,
     session_id: &str,
 ) -> Result<Vec<(String, Value)>, AppError> {
@@ -1392,7 +1508,7 @@ fn acp_tool_output_text(update: &Value) -> Option<String> {
     }
 }
 
-fn is_grok_update_method(method: &str) -> bool {
+pub(super) fn is_grok_update_method(method: &str) -> bool {
     matches!(
         extension_method(method),
         "session/update" | "x.ai/session_notification" | "x.ai/session/update"
@@ -1423,7 +1539,8 @@ async fn emit_prompt_metadata(
     sink.emit("provider.event", json!({
         "provider": provider.as_str(), "providerMethod": "session/prompt/result", "metadata": metadata,
     })).await?;
-    if matches!(provider, ProviderKind::Devin | ProviderKind::Opencode) {
+    let prompt_usage = quirks(provider).prompt_usage;
+    if matches!(prompt_usage, PromptUsage::ResultUsage) {
         if let Some(usage) = message
             .pointer("/result/usage")
             .filter(|value| value.is_object())
@@ -1439,7 +1556,7 @@ async fn emit_prompt_metadata(
             .await?;
         }
     }
-    if provider == ProviderKind::GrokBuild {
+    if matches!(prompt_usage, PromptUsage::GrokMetadata) {
         if let Some(usage) = metadata
             .get("usage")
             .or_else(|| metadata.get("promptUsage"))
@@ -1750,11 +1867,15 @@ pub(super) async fn handle_acp_message(
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if provider == ProviderKind::GrokBuild && is_grok_update_method(method) {
+    let quirks = quirks(provider);
+    if let Some(extension) = quirks
+        .extension_updates
+        .filter(|extension| (extension.is_update_method)(method))
+    {
         if !emit_stream_updates {
             return Ok(());
         }
-        if let Some((event, payload)) = grok_activity_event(&params) {
+        if let Some((event, payload)) = (extension.activity)(&params) {
             sink.emit(event, payload).await?;
             return Ok(());
         }
@@ -1773,7 +1894,7 @@ pub(super) async fn handle_acp_message(
         // Validates the shape only; the fields below are read from `params`.
         let notification = SessionNotification::deserialize(&params);
         if let Err(error) = notification {
-            if provider == ProviderKind::GrokBuild {
+            if quirks.lenient_updates {
                 sink.emit(
                     "provider.event",
                     json!({"provider":provider.as_str(),"providerMethod":method,"metadata":params}),
@@ -1817,7 +1938,7 @@ pub(super) async fn handle_acp_message(
         {
             return Ok(());
         }
-        if provider == ProviderKind::Devin {
+        if quirks.subagents {
             if let Some((event_type, payload)) =
                 devin_subagent_update(update_type, &update, params.get("sessionId"), connection)
             {
@@ -1878,7 +1999,7 @@ pub(super) async fn handle_acp_message(
                 // A subagent's own tool calls carry `subagent_context`; tag
                 // them before caching/throttling so queued snapshots keep
                 // ownership.
-                if provider == ProviderKind::Devin {
+                if quirks.subagents {
                     if let Some(agent_id) = devin_subagent_context(&update) {
                         normalized["subagentId"] = json!(agent_id);
                     }
@@ -1931,12 +2052,7 @@ pub(super) async fn handle_acp_message(
                 "turn.configuration",
                 json!({"provider":provider_id,"source":"provider-confirmed","effectiveConfig":update.get("configOptions").and_then(config_effective),"metadata":update}),
             ),
-            "available_commands_update"
-                if matches!(
-                    provider,
-                    ProviderKind::GrokBuild | ProviderKind::Devin | ProviderKind::Opencode
-                ) =>
-            {
+            "available_commands_update" if quirks.command_updates => {
                 let commands = super::grok::parse_commands(
                     &json!({"_meta":{"availableCommands":update.get("availableCommands")}}),
                 );
@@ -1954,13 +2070,13 @@ pub(super) async fn handle_acp_message(
                     json!({ "provider": provider_id, "commands": commands, "metadata":update }),
                 )
             }
-            "usage_update" if matches!(provider, ProviderKind::Devin | ProviderKind::Opencode) => (
+            "usage_update" if quirks.usage_updates => (
                 "usage.updated",
                 json!({ "provider": provider_id, "source": "provider", "scope": "turn",
                     "aggregation": "snapshot", "final": false,
                     "usage": normalize_devin_usage(&update), "metadata": update }),
             ),
-            "current_mode_update" if provider == ProviderKind::Devin => (
+            "current_mode_update" if quirks.mode_updates => (
                 "turn.configuration",
                 json!({ "provider": provider_id, "source": "provider-confirmed",
                     "effectiveConfig": { "mode": update.get("currentModeId"), "source": "provider-confirmed" },
@@ -1970,7 +2086,10 @@ pub(super) async fn handle_acp_message(
             // Devin streams internal telemetry (`_cognition.ai/output` MCP logs,
             // `thinking_complete`, `turn_stats`) as custom session updates; they
             // carry no client-actionable state.
-            _ if provider == ProviderKind::Devin && update_type.starts_with("_cognition.") => {
+            _ if quirks
+                .private_prefix
+                .is_some_and(|prefix| update_type.starts_with(prefix)) =>
+            {
                 return Ok(())
             }
             _ => (
@@ -1978,7 +2097,7 @@ pub(super) async fn handle_acp_message(
                 json!({ "provider": provider_id, "providerMethod": method, "metadata": update }),
             ),
         };
-        if provider == ProviderKind::Devin {
+        if quirks.subagents {
             if let Some(agent_id) = devin_subagent_context(&update) {
                 payload["subagentId"] = json!(agent_id);
             }
@@ -2005,7 +2124,10 @@ pub(super) async fn handle_acp_message(
                 "error": { "code": -32601, "message": "client capability is not supported" }
             }))
             .await?;
-    } else if !(provider == ProviderKind::Devin && method.starts_with("_cognition.")) {
+    } else if !quirks
+        .private_prefix
+        .is_some_and(|prefix| method.starts_with(prefix))
+    {
         // Devin emits MCP/server log lines as `_cognition.ai/*` notifications;
         // they are agent-internal and must not reach the client timeline.
         sink.emit(
@@ -2350,7 +2472,7 @@ fn devin_subagent_update(
     ))
 }
 
-fn grok_activity_event(params: &Value) -> Option<(&'static str, Value)> {
+pub(super) fn grok_activity_event(params: &Value) -> Option<(&'static str, Value)> {
     let update = params.get("update")?;
     let kind = update.get("sessionUpdate")?.as_str()?;
     let event = match kind {
@@ -2738,15 +2860,17 @@ pub(super) fn select_auth_method(
             provider.as_str()
         )));
     }
-    if provider == ProviderKind::GrokBuild && !is_grok_headless_auth_method(selected) {
-        return Err(AppError::ProviderUnavailable(format!(
-            "authentication method '{selected}' requires interaction; run `grok login` first or configure XAI_API_KEY"
-        )));
+    if let Some((headless, hint)) = quirks(provider).headless_auth {
+        if !headless(selected) {
+            return Err(AppError::ProviderUnavailable(format!(
+                "authentication method '{selected}' requires interaction; {hint}"
+            )));
+        }
     }
     Ok(Some(selected.to_owned()))
 }
 
-fn is_grok_headless_auth_method(method: &str) -> bool {
+pub(super) fn is_grok_headless_auth_method(method: &str) -> bool {
     matches!(method, "cached_token" | "xai.api_key")
 }
 
@@ -2782,22 +2906,15 @@ async fn apply_requested_config(
         .await?;
         return Ok(None);
     }
-    // OpenCode names its per-model thinking-level option `effort` and Devin
-    // calls it `thought_level`; other ACP profiles use `reasoning_effort`.
-    let effort_id = match context.provider {
-        ProviderKind::Opencode => "effort",
-        ProviderKind::Devin => "thought_level",
-        _ => "reasoning_effort",
-    };
+    // Agents name the per-model thinking-level option differently (OpenCode
+    // `effort`, Devin `thought_level`, plain ACP `reasoning_effort`).
+    let quirks = quirks(context.provider);
     let mut requested_configs = vec![
         ("model", prompt.model.as_deref()),
-        (effort_id, prompt.reasoning_effort.as_deref()),
+        (quirks.effort_config, prompt.reasoning_effort.as_deref()),
     ];
-    if context.provider == ProviderKind::Devin {
-        requested_configs.push(("mode", devin_session_mode(prompt)));
-    }
-    if context.provider == ProviderKind::Opencode {
-        requested_configs.push(("mode", Some(opencode_session_mode(prompt))));
+    if let Some(session_mode) = quirks.session_mode {
+        requested_configs.push(("mode", session_mode(prompt)));
     }
     let mut current_options = options.map(<[SessionConfigOption]>::to_vec);
     for (config_id, requested) in requested_configs {
@@ -2857,7 +2974,7 @@ async fn apply_requested_config(
 
 /// Devin session modes map the product permission modes onto its native
 /// ask / accept-edits / plan / bypass selector. Plan work always wins.
-fn devin_session_mode(prompt: &DriverPrompt) -> Option<&'static str> {
+pub(super) fn devin_session_mode(prompt: &DriverPrompt) -> Option<&'static str> {
     if prompt.work_mode.as_deref() == Some("plan") {
         return Some("plan");
     }
@@ -2874,12 +2991,12 @@ fn devin_session_mode(prompt: &DriverPrompt) -> Option<&'static str> {
 
 /// OpenCode session modes are only build/plan; always restate the mode so a
 /// session left in plan mode returns to build on the next implement turn.
-fn opencode_session_mode(prompt: &DriverPrompt) -> &'static str {
-    if prompt.work_mode.as_deref() == Some("plan") {
+pub(super) fn opencode_session_mode(prompt: &DriverPrompt) -> Option<&'static str> {
+    Some(if prompt.work_mode.as_deref() == Some("plan") {
         "plan"
     } else {
         "build"
-    }
+    })
 }
 
 async fn apply_legacy_model_config(
@@ -3159,7 +3276,7 @@ mod tests {
 
     #[test]
     fn devin_controls_use_plain_string_config_values() {
-        let commands = devin_control_commands(
+        let commands = devin_control_requests(
             &ProviderControl::Configure {
                 model: Some("claude-opus-5-low".to_owned()),
                 reasoning_effort: None,
@@ -3172,7 +3289,7 @@ mod tests {
         assert_eq!(commands[0].1["configId"], "model");
         assert_eq!(commands[0].1["value"], "claude-opus-5-low");
         assert!(matches!(
-            devin_control_commands(
+            devin_control_requests(
                 &ProviderControl::Steer {
                     text: "redirect".to_owned()
                 },
@@ -3180,7 +3297,7 @@ mod tests {
             ),
             Err(AppError::Unsupported(_))
         ));
-        let effort = devin_control_commands(
+        let effort = devin_control_requests(
             &ProviderControl::Configure {
                 model: None,
                 reasoning_effort: Some("high".to_owned()),
@@ -3193,7 +3310,7 @@ mod tests {
         assert_eq!(effort[0].1["configId"], "thought_level");
         assert_eq!(effort[0].1["value"], "high");
         assert!(matches!(
-            devin_control_commands(&ProviderControl::QueueList, "devin-native"),
+            devin_control_requests(&ProviderControl::QueueList, "devin-native"),
             Err(AppError::Unsupported(_))
         ));
     }

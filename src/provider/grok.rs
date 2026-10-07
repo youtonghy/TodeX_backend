@@ -11,7 +11,7 @@ use crate::conversation::{ProviderKind, ProviderState};
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
-use super::acp::AcpRuntimeOptions;
+use super::acp::{AcpQuirks, AcpRuntimeOptions, ExtensionUpdates, PromptUsage, PLAIN_ACP};
 use super::discovery::CatalogCache;
 use super::process::{
     executable_available, redact_sensitive_text, run_bounded_command, CommandSpec, JsonLineProcess,
@@ -38,6 +38,23 @@ const GROK_RPC: RpcPeer = RpcPeer {
     jsonrpc_field: true,
     result_optional: false,
     classify_error: None,
+};
+
+/// Where Grok Build deviates from plain ACP.
+pub(super) const ACP_QUIRKS: AcpQuirks = AcpQuirks {
+    control_commands: Some(super::acp::grok_control_commands),
+    prompt_usage: PromptUsage::GrokMetadata,
+    extension_updates: Some(ExtensionUpdates {
+        is_update_method: super::acp::is_grok_update_method,
+        activity: super::acp::grok_activity_event,
+    }),
+    lenient_updates: true,
+    command_updates: true,
+    headless_auth: Some((
+        super::acp::is_grok_headless_auth_method,
+        "run `grok login` first or configure XAI_API_KEY",
+    )),
+    ..PLAIN_ACP
 };
 
 /// What Grok Build supports and how TodeX adapts to it.

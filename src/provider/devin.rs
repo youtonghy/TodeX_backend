@@ -12,8 +12,8 @@ use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{
-    declares_session_fork, select_auth_method, AcpRuntimeOptions, FORK_PROBE_TTL,
-    INTERACTIVE_AUTH_TIMEOUT,
+    declares_session_fork, select_auth_method, AcpQuirks, AcpRuntimeOptions, PromptUsage,
+    FORK_PROBE_TTL, INTERACTIVE_AUTH_TIMEOUT, PLAIN_ACP,
 };
 use super::discovery::{DiscoveryCache, DiscoveryKey, DiscoverySnapshot};
 use super::process::{executable_available, CommandSpec, JsonLineProcess};
@@ -53,6 +53,22 @@ const THOUGHT_LEVEL_PROBE_LANES: usize = 8;
 const THOUGHT_LEVEL_PROBE_BUDGET: Duration = Duration::from_secs(15);
 /// Probe sessions are deleted best-effort right before the process exits.
 const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Where Devin deviates from plain ACP.
+pub(super) const ACP_QUIRKS: AcpQuirks = AcpQuirks {
+    subagents: true,
+    recreate_unloadable_session: true,
+    control_commands: Some(super::acp::devin_control_commands),
+    prompt_usage: PromptUsage::ResultUsage,
+    command_updates: true,
+    usage_updates: true,
+    mode_updates: true,
+    // MCP/server logs and telemetry (`_cognition.ai/*`) are agent-internal.
+    private_prefix: Some("_cognition."),
+    effort_config: "thought_level",
+    session_mode: Some(super::acp::devin_session_mode),
+    ..PLAIN_ACP
+};
 
 /// What Devin supports and how TodeX adapts to it.
 pub(super) const PROFILE: ProviderProfile = ProviderProfile {
