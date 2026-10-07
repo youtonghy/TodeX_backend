@@ -185,7 +185,9 @@ impl ConversationSupervisor {
         front: bool,
     ) -> Result<FollowUpAddOutcome, AppError> {
         validate_item_id(item_id)?;
-        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        // Legacy plaintext history is read-only: refused before queue.json
+        // is touched.
+        let manifest = self.writable_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         prompt.client_request_id = Some(item_id.to_owned());
         let mut queue = self.load_follow_ups(conversation_id).await?;
@@ -290,7 +292,7 @@ impl ConversationSupervisor {
         owner_id: &str,
         conversation_id: &str,
     ) -> Result<Value, AppError> {
-        self.get_owned(owner_id, conversation_id).await?;
+        self.writable_owned(owner_id, conversation_id).await?;
         let snapshot = {
             let _request_guard = self.request_gate(conversation_id).lock_owned().await;
             let mut queue = self.load_follow_ups(conversation_id).await?;

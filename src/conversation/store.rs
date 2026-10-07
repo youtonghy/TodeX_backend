@@ -23,7 +23,7 @@ use super::record::{
     ENCRYPTED_FIELD, JOURNAL_COMPACTED_EVENT,
 };
 use super::segment::{
-    self, CommitStep, FrameCache, FrameRef, MigrationKey, PreparedSegment, SealPolicy,
+    self, CommitStep, FrameCache, FrameRef, PreparedSegment, SealPolicy,
     SealedSegment, SegmentError, SegmentReader, JOURNAL_RECORD_LOST_EVENT,
 };
 use super::{
@@ -31,7 +31,6 @@ use super::{
     ConversationManifest, ConversationReplay, ConversationSnapshot, ProviderState,
     CONVERSATION_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES,
 };
-use crate::config::HistoryEncryption;
 use crate::history_crypto::{self, ContentStream, SegmentKey};
 use crate::history_keys::{FingerprintKey, HistoryKeys};
 
@@ -42,7 +41,7 @@ const SNAPSHOT_FILE: &str = "snapshot.json";
 const PROVIDER_STATE_FILE: &str = "provider-state.json";
 /// Prompts waiting for the running turn to finish; never copied by fork.
 const FOLLOW_UP_QUEUE_FILE: &str = "queue.json";
-const MAX_REPLAY_LIMIT: usize = 1000;
+pub(super) const MAX_REPLAY_LIMIT: usize = 1000;
 /// New prompts are refused with `STORAGE_LOW` while the filesystem holding
 /// the data directory has less than this free. History itself has no size
 /// limit (`docs/history-encryption.md` §1): appends always land, so a
@@ -207,8 +206,9 @@ pub struct ConversationStore {
     pub(super) sealing: Arc<DashMap<String, ()>>,
     /// Conversations with sealed plaintext waiting for conversion.
     pub(super) maintenance: Arc<MaintenanceQueue>,
-    /// History encryption keys (`None`: plaintext only, as in most tests).
-    /// See `docs/history-encryption.md` §3 and [`Self::with_history_keys`].
+    /// History encryption keys. Always set in production ([`Self::open`]);
+    /// only storage unit tests build a keyless, plaintext store
+    /// ([`Self::new`]). See `docs/history-encryption.md` §3.
     pub(super) history: Option<HistoryKeys>,
     /// Test override for the free-space probe (`u64::MAX`: none).
     free_space_override: Arc<AtomicU64>,
@@ -495,7 +495,21 @@ fn segment_error(conversation_id: &str, number: u64, error: SegmentError) -> App
 }
 
 impl ConversationStore {
+    /// The production store: every new record, title and request snapshot
+    /// is end-to-end encrypted with `keys` (`docs/history-encryption.md`).
+    /// Plaintext history written by older versions stays readable.
+    pub async fn open(data_dir: PathBuf, keys: HistoryKeys) -> Result<Self, AppError> {
+        Self::build(data_dir, Some(keys)).await
+    }
+
+    /// A keyless store that journals plaintext, for storage unit tests only:
+    /// production code cannot build one.
+    #[cfg(test)]
     pub async fn new(data_dir: PathBuf) -> Result<Self, AppError> {
+        Self::build(data_dir, None).await
+    }
+
+    async fn build(data_dir: PathBuf, history: Option<HistoryKeys>) -> Result<Self, AppError> {
         let root = data_dir.join("conversations");
         tokio::fs::create_dir_all(&root).await?;
         set_owner_only(&root, true).await?;
@@ -514,7 +528,7 @@ impl ConversationStore {
             reconciled: Arc::new(DashMap::new()),
             sealing: Arc::new(DashMap::new()),
             maintenance: Arc::new(MaintenanceQueue::default()),
-            history: None,
+            history,
             free_space_override: Arc::new(AtomicU64::new(u64::MAX)),
             #[cfg(test)]
             commit_stop: Arc::new(std::sync::Mutex::new(None)),
@@ -555,27 +569,17 @@ impl ConversationStore {
         self.index_cache().pop(conversation_id);
     }
 
-    /// Encrypt history with `keys` (`docs/history-encryption.md`). While
-    /// their mode is `e2e` every new record is sealed under the
-    /// conversation's current DEK, titles are stored as `titleEnc`, sealed
-    /// segments are repacked into encrypted frames and older plaintext is
-    /// migrated in the background.
+    /// Give a keyless test store history keys (what [`Self::open`] does).
+    #[cfg(test)]
     pub fn with_history_keys(mut self, keys: HistoryKeys) -> Self {
         self.history = Some(keys);
         self
     }
 
-    /// The history encryption mode now (`off` without keys).
-    pub(super) fn history_mode(&self) -> Result<HistoryEncryption, AppError> {
-        match &self.history {
-            Some(keys) => keys.recipients().mode(),
-            None => Ok(HistoryEncryption::Off),
-        }
-    }
-
-    /// Whether new history is encrypted now.
-    pub fn history_encrypted(&self) -> Result<bool, AppError> {
-        Ok(self.history_mode()? == HistoryEncryption::E2e)
+    /// Whether new history is encrypted: always in production, never in a
+    /// keyless test store.
+    pub fn history_encrypted(&self) -> bool {
+        self.history.is_some()
     }
 
     /// The key behind `requestFingerprint` / `textMac` MACs, for comparing
@@ -588,21 +592,24 @@ impl ConversationStore {
             .transpose()
     }
 
-    /// With history encryption on, new work must be able to encrypt what it
-    /// writes: this creates (or confirms) the conversation's current DEK and
-    /// fails with `CONFLICT` when no recipient is left to wrap it for, so a
-    /// prompt is refused before its turn starts (§3.2). Turns already
-    /// running keep their key; see [`Self::record_key`].
+    /// New work must be able to encrypt what it writes: this refuses a
+    /// legacy plaintext conversation (`HISTORY_READ_ONLY`, see
+    /// [`Self::ensure_not_legacy`]), then creates (or confirms) the
+    /// conversation's current DEK and fails with `HISTORY_KEY_REQUIRED` when
+    /// no recipient is left to wrap it for, so a prompt is refused before its
+    /// turn starts (§3.2). Turns already running keep their key; see
+    /// [`Self::record_key`].
     pub async fn ensure_history_writable(&self, conversation_id: &str) -> Result<(), AppError> {
         if let Some(keys) = &self.history {
+            self.ensure_not_legacy(conversation_id).await?;
             keys.deks().current_key(conversation_id).await?;
         }
         Ok(())
     }
 
     /// The DEK the next record of `conversation_id` is sealed under and
-    /// the fingerprint key; `None` while encryption is off. When no new DEK
-    /// can be had (every recipient revoked, the keyring unwritable) a
+    /// the fingerprint key; `None` only in a keyless test store. When no new
+    /// DEK can be had (every recipient revoked, the keyring unwritable) a
     /// running turn keeps encrypting under the newest DEK still in memory;
     /// with none left the append fails rather than writing plaintext.
     async fn record_key(
@@ -613,8 +620,7 @@ impl ConversationStore {
             return Ok(None);
         };
         let (kid, key) = match keys.deks().current_key(conversation_id).await {
-            Ok(None) => return Ok(None),
-            Ok(Some(current)) => current,
+            Ok(current) => current,
             Err(error) => match keys.deks().fallback_key(conversation_id).await {
                 Some(previous) => {
                     tracing::error!(
@@ -628,7 +634,7 @@ impl ConversationStore {
                     tracing::error!(
                         conversation_id,
                         error = %error,
-                        "history encryption is on but no key is available; refusing to journal plaintext"
+                        "no history key is available; refusing to journal plaintext"
                     );
                     return Err(error);
                 }
@@ -637,9 +643,9 @@ impl ConversationStore {
         Ok(Some((kid, key, keys.fingerprint()?)))
     }
 
-    /// e2e: `manifest.titleEnc` for `title` (§3.2): stream 2, counter 0,
-    /// under a fresh DEK of its own, so a new title never reuses a nonce.
-    /// `None` while encryption is off.
+    /// `manifest.titleEnc` for `title` (§3.2): stream 2, counter 0, under a
+    /// fresh DEK of its own, so a new title never reuses a nonce. `None`
+    /// only in a keyless test store.
     async fn seal_title(
         &self,
         conversation_id: &str,
@@ -648,9 +654,7 @@ impl ConversationStore {
         let Some(keys) = &self.history else {
             return Ok(None);
         };
-        let Some((kid, key)) = keys.deks().fresh_key(conversation_id).await? else {
-            return Ok(None);
-        };
+        let (kid, key) = keys.deks().fresh_key(conversation_id).await?;
         let sealed = history_crypto::seal(
             &key,
             conversation_id,
@@ -664,8 +668,8 @@ impl ConversationStore {
         }))
     }
 
-    /// Set (or clear) the manifest title: plaintext while encryption is off,
-    /// `titleEnc` with an empty `title` while it is on.
+    /// Set (or clear) the manifest title: `titleEnc` with an empty `title`
+    /// (plaintext only in a keyless test store).
     pub(super) async fn apply_title(
         &self,
         manifest: &mut ConversationManifest,
@@ -706,10 +710,11 @@ impl ConversationStore {
         }
         let mut draft = self.begin_conversation(&manifest).await?;
         let filled = async {
-            for event in &events {
-                draft.writer.write(event).await?;
-                manifest.status = status_after_conversation_event(manifest.status, event);
+            for event in events {
+                manifest.status = status_after_conversation_event(manifest.status, &event);
                 manifest.last_sequence = event.sequence;
+                let stored = self.draft_event(&mut draft, event, false).await?;
+                draft.writer.write(&stored).await?;
             }
             Ok(())
         }
@@ -723,6 +728,9 @@ impl ConversationStore {
     /// maps each source event to the record at the given new sequence;
     /// `trailer` receives the number copied and returns the events written
     /// after them. Only events present when the copy starts are copied.
+    /// Copied ciphertext keeps its `$enc` (the source's keys are copied
+    /// along); every plaintext record — new trailer events included — is
+    /// encrypted under the new conversation's own key.
     pub async fn create_from_journal(
         &self,
         source_id: &str,
@@ -741,6 +749,12 @@ impl ConversationStore {
         let mut draft = self.begin_conversation(&manifest).await?;
         let temporary = draft.temporary.clone();
         let filled = async {
+            // Copied ciphertext stays readable through the fork's own id:
+            // its keys are the source's. Copied first, so the draft's own key
+            // (see [`Self::draft_event`]) is added to it rather than replaced.
+            if let Some(keys) = &self.history {
+                keys.keyrings().copy_into(source_id, &temporary).await?;
+            }
             let mut after = 0u64;
             let mut copied = 0u64;
             while after < end {
@@ -757,7 +771,8 @@ impl ConversationStore {
                     validate_event(&next, &manifest.id, copied)?;
                     manifest.status = status_after_conversation_event(manifest.status, &next);
                     manifest.last_sequence = next.sequence;
-                    draft.writer.write(&next).await?;
+                    let stored = self.draft_event(&mut draft, next, true).await?;
+                    draft.writer.write(&stored).await?;
                 }
                 if !page.has_more {
                     break;
@@ -767,12 +782,8 @@ impl ConversationStore {
                 validate_event(&next, &manifest.id, manifest.last_sequence + 1)?;
                 manifest.status = status_after_conversation_event(manifest.status, &next);
                 manifest.last_sequence = next.sequence;
-                draft.writer.write(&next).await?;
-            }
-            // Copied ciphertext stays readable through the fork's own id:
-            // its keys are the source's.
-            if let Some(keys) = &self.history {
-                keys.keyrings().copy_into(source_id, &temporary).await?;
+                let stored = self.draft_event(&mut draft, next, false).await?;
+                draft.writer.write(&stored).await?;
             }
             Ok(())
         }
@@ -781,12 +792,50 @@ impl ConversationStore {
             .await
     }
 
+    /// The stored form of `event` in a draft: sealed under the draft's own
+    /// one-off key (created on first use and recorded in the draft's
+    /// keyring, which moves into place with the directory). Ciphertext copied
+    /// from another conversation (`copied`) keeps its `$enc`. Unchanged in a
+    /// keyless test store.
+    async fn draft_event(
+        &self,
+        draft: &mut ConversationDraft,
+        mut event: ConversationEvent,
+        copied: bool,
+    ) -> Result<ConversationEvent, AppError> {
+        let Some(keys) = &self.history else {
+            return Ok(event);
+        };
+        if copied && encrypted_content(&event.payload).is_some() {
+            return Ok(event);
+        }
+        rename_reserved_encrypted_field(&event.conversation_id, &event.event_type, &mut event.payload);
+        if draft.seal.is_none() {
+            let (kid, key) = keys
+                .deks()
+                .draft_key(&event.conversation_id, &draft.temporary)
+                .await?;
+            draft.seal = Some(DraftSeal {
+                kid,
+                key: Arc::new(key),
+                fingerprint: keys.fingerprint()?,
+            });
+        }
+        let seal = draft.seal.as_ref().expect("the draft key was just set");
+        add_history_macs(&event.event_type, &mut event.payload, &seal.fingerprint);
+        seal_event(&event, &seal.kid, &seal.key)
+    }
+
     /// A private temporary directory with an empty journal writer; see
-    /// [`Self::publish_conversation`].
+    /// [`Self::publish_conversation`]. Refused with `HISTORY_KEY_REQUIRED`
+    /// when no recipient could read the new conversation.
     async fn begin_conversation(
         &self,
         manifest: &ConversationManifest,
     ) -> Result<ConversationDraft, AppError> {
+        if let Some(keys) = &self.history {
+            keys.deks().ensure_recipients()?;
+        }
         if tokio::fs::try_exists(self.directory(&manifest.id)?).await? {
             return Err(AppError::Conflict(format!(
                 "conversation {} already exists",
@@ -805,7 +854,11 @@ impl ConversationStore {
         }
         .await;
         match created {
-            Ok(writer) => Ok(ConversationDraft { temporary, writer }),
+            Ok(writer) => Ok(ConversationDraft {
+                temporary,
+                writer,
+                seal: None,
+            }),
             Err(error) => {
                 let _ = tokio::fs::remove_dir_all(&temporary).await;
                 Err(error)
@@ -826,20 +879,23 @@ impl ConversationStore {
         request: Option<Value>,
     ) -> Result<ConversationManifest, AppError> {
         manifest.storage_version = Some(super::model::STORAGE_VERSION);
-        // With history encryption on the title is sealed once the
-        // conversation directory (and so its keyring) exists; until then
-        // no plaintext title is written. A conversation that starts empty
-        // under encryption is entirely encrypted from its first record.
-        let encrypting = self.history_encrypted()?;
+        // The title is sealed once the conversation directory (and so its
+        // keyring) exists; until then no plaintext title is written. Every
+        // record of the draft was encrypted ([`Self::draft_event`]), so the
+        // conversation is entirely encrypted from its first record.
+        let encrypting = self.history_encrypted();
         let title = if encrypting {
             manifest.title.take()
         } else {
             None
         };
-        if encrypting && !draft.writer.wrote_records() {
+        if encrypting {
             manifest.history_encrypted_at = Some(Utc::now());
+            manifest.legacy_plaintext = false;
         }
-        let ConversationDraft { temporary, writer } = draft;
+        let ConversationDraft {
+            temporary, writer, ..
+        } = draft;
         let create_result = async {
             filled?;
             let sealed = writer.finish().await?;
@@ -946,6 +1002,10 @@ impl ConversationStore {
     ) -> Result<ConversationManifest, AppError> {
         let _guard = self.lock(conversation_id).await;
         let mut manifest = self.get_unlocked(conversation_id).await?;
+        if title.is_some() && manifest.legacy_plaintext {
+            // Archiving stays allowed; a new title would be a write.
+            return Err(AppError::HistoryReadOnly);
+        }
         if let Some(title) = title {
             let title = title
                 .map(|value| value.trim().chars().take(200).collect::<String>())
@@ -1187,11 +1247,6 @@ impl ConversationStore {
             .map(|_| ())
     }
 
-    /// Whether an open merge window holds unjournalled stream text.
-    pub(super) fn has_pending_delta(&self, conversation_id: &str) -> bool {
-        self.pending_deltas.contains_key(conversation_id)
-    }
-
     async fn append_inner(
         &self,
         conversation_id: &str,
@@ -1234,18 +1289,7 @@ impl ConversationStore {
         hub: Option<&ConversationEventHub>,
     ) -> Result<ConversationEvent, AppError> {
         redact_secrets(&mut payload);
-        // `$enc` marks stored ciphertext; a provider payload that happens to
-        // use the key keeps it under another name.
-        if let Some(map) = payload.as_object_mut() {
-            if let Some(value) = map.remove(ENCRYPTED_FIELD) {
-                tracing::warn!(
-                    conversation_id,
-                    event_type,
-                    "renamed a reserved $enc payload key"
-                );
-                map.insert(format!("_{ENCRYPTED_FIELD}"), value);
-            }
-        }
+        rename_reserved_encrypted_field(conversation_id, &event_type, &mut payload);
         let bounded = bound_event_payload(&mut payload)?;
         if let Some(original_bytes) = bounded.original_bytes {
             tracing::warn!(
@@ -1265,6 +1309,11 @@ impl ConversationStore {
         }
         let directory = self.directory(conversation_id)?;
         let mut manifest = self.get_unlocked(conversation_id).await?;
+        if manifest.legacy_plaintext {
+            // Legacy plaintext history is read-only (§8); every writer that
+            // reaches the journal is refused here as a last line of defence.
+            return Err(AppError::HistoryReadOnly);
+        }
         let persisted_status = manifest.status;
         // One directory listing serves the tail check and the write below;
         // nothing else changes the journal while the lock is held.
@@ -1363,11 +1412,6 @@ impl ConversationStore {
         // (envelope plus `$enc`) is what is journalled, published and
         // folded into the digest.
         let key = self.record_key(conversation_id).await?;
-        if key.is_none() {
-            // Plaintext from here on: the conversation is no longer
-            // entirely encrypted.
-            manifest.history_encrypted_at = None;
-        }
         // Large payloads are sealed and encoded on the blocking pool; the
         // conversation lock is still held, so journal order is unchanged.
         let (event, record) = if bounded.bytes >= BLOCKING_ENCODE_BYTES {
@@ -3132,47 +3176,16 @@ impl ConversationStore {
     }
 
     /// The keys a segment build of `conversation_id` may use: every DEK
-    /// still in memory (their records are repacked into sealed frames), and
-    /// while encryption is on and the conversation is not known to be fully
-    /// encrypted, a fresh key its plaintext records are sealed under (§8).
-    /// Without that key plaintext simply stays plaintext; the migration
-    /// pass retries it.
+    /// still in memory (their records are repacked into sealed frames).
+    /// Plaintext records (legacy history, keyless test stores) stay
+    /// plaintext.
     pub(super) async fn seal_policy(&self, conversation_id: &str) -> SealPolicy {
         let Some(keys) = &self.history else {
             return SealPolicy::default();
         };
-        let mut policy = SealPolicy {
+        SealPolicy {
             keys: keys.deks().keys_snapshot(conversation_id).await,
-            migrate: None,
-        };
-        let encrypted = self
-            .get(conversation_id)
-            .await
-            .is_ok_and(|manifest| manifest.history_encrypted_at.is_some());
-        if encrypted || !matches!(self.history_mode(), Ok(HistoryEncryption::E2e)) {
-            return policy;
         }
-        let fresh = match keys.deks().fresh_key(conversation_id).await {
-            Ok(fresh) => fresh,
-            Err(error) => {
-                tracing::warn!(conversation_id, error = %error, "no key to encrypt plaintext history while sealing; it stays plaintext for now");
-                return policy;
-            }
-        };
-        match (fresh, keys.fingerprint()) {
-            (Some((kid, key)), Ok(fingerprint)) => {
-                policy.migrate = Some(MigrationKey {
-                    kid,
-                    key: Arc::new(key),
-                    fingerprint,
-                });
-            }
-            (None, _) => {}
-            (Some(_), Err(error)) => {
-                tracing::warn!(conversation_id, error = %error, "history fingerprint key unavailable while sealing; plaintext stays plaintext for now");
-            }
-        }
-        policy
     }
 
     /// Publish a built segment if its sources are unchanged and update the
@@ -3299,43 +3312,6 @@ impl ConversationStore {
         self.tails.remove(conversation_id);
     }
 
-    /// Ask the maintenance task to encrypt existing plaintext history now
-    /// (history encryption was just enabled, §8). Plaintext outside the
-    /// journal is not touched: migration backups keep theirs until they
-    /// expire, and filesystem snapshots are out of reach.
-    pub fn request_history_migration(&self) {
-        tracing::warn!(
-            "history encryption enabled: existing plaintext history is re-encrypted in the \
-             background; journal-v2-backup/ copies (deleted after 7 days), events.corrupt.* \
-             salvage copies and Time Machine / APFS snapshots may still hold old plaintext"
-        );
-        self.maintenance.request_migration();
-    }
-
-    /// Replace the prompt text of `last-request.json` with its MAC (see
-    /// [`seal_request_snapshot`]). Callers hold the conversation lock.
-    pub(super) async fn seal_last_request_locked(
-        &self,
-        conversation_id: &str,
-    ) -> Result<(), AppError> {
-        let path = self.directory(conversation_id)?.join(LAST_REQUEST_FILE);
-        if !tokio::fs::try_exists(&path).await? {
-            return Ok(());
-        }
-        let mut saved: Value = read_json(&path, "conversation request snapshot").await?;
-        let Some(request) = saved.get_mut("request") else {
-            return Ok(());
-        };
-        if request.get("textMac").is_some() {
-            return Ok(());
-        }
-        let key = self.fingerprint_key()?.ok_or_else(|| {
-            AppError::Conflict("history fingerprint key is unavailable".to_owned())
-        })?;
-        seal_request_snapshot(request, &key);
-        write_atomic_json(&path, &saved).await
-    }
-
     /// Seal the active file now, as a rotation would.
     #[cfg(test)]
     pub async fn seal_active_for_tests(&self, conversation_id: &str) -> Result<(), AppError> {
@@ -3379,7 +3355,8 @@ impl ConversationStore {
     }
 
     /// Seal the active file now (as a rotation would) when it holds any
-    /// record, so migration can convert it. Callers hold the lock.
+    /// record. Callers hold the lock.
+    #[cfg(test)]
     pub(super) async fn seal_active_locked(&self, conversation_id: &str) -> Result<(), AppError> {
         let directory = self.directory(conversation_id)?;
         let files = self.files_locked(conversation_id, &directory).await?;
@@ -3589,6 +3566,30 @@ async fn rotate_journal(
 struct ConversationDraft {
     temporary: PathBuf,
     writer: PlainJournalWriter,
+    /// The draft's own key, once a record needed it.
+    seal: Option<DraftSeal>,
+}
+
+/// See [`ConversationStore::draft_event`].
+struct DraftSeal {
+    kid: String,
+    key: Arc<SegmentKey>,
+    fingerprint: Arc<FingerprintKey>,
+}
+
+/// `$enc` marks stored ciphertext; a provider payload that happens to use
+/// the key keeps it under another name.
+fn rename_reserved_encrypted_field(conversation_id: &str, event_type: &str, payload: &mut Value) {
+    if let Some(map) = payload.as_object_mut() {
+        if let Some(value) = map.remove(ENCRYPTED_FIELD) {
+            tracing::warn!(
+                conversation_id,
+                event_type,
+                "renamed a reserved $enc payload key"
+            );
+            map.insert(format!("_{ENCRYPTED_FIELD}"), value);
+        }
+    }
 }
 
 /// Writes v3 records into a new conversation's temporary directory,
@@ -3615,11 +3616,6 @@ impl PlainJournalWriter {
             bytes: 0,
             sealed: 0,
         })
-    }
-
-    /// Whether any record was written.
-    fn wrote_records(&self) -> bool {
-        self.bytes > 0 || self.sealed > 0
     }
 
     async fn write(&mut self, event: &ConversationEvent) -> Result<(), AppError> {

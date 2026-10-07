@@ -1063,12 +1063,6 @@ impl ConversationSupervisor {
         self.store.get(conversation_id).await
     }
 
-    /// History encryption was enabled: encrypt existing plaintext history
-    /// in the background now (§8).
-    pub fn request_history_migration(&self) {
-        self.store.request_history_migration();
-    }
-
     pub async fn get_owned(
         &self,
         owner_id: &str,
@@ -1079,6 +1073,19 @@ impl ConversationSupervisor {
         Ok(manifest)
     }
 
+    /// [`Self::get_owned`] for an operation that writes history: legacy
+    /// plaintext conversations are read-only (`HISTORY_READ_ONLY`,
+    /// docs/history-encryption.md §8).
+    pub async fn writable_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationManifest, AppError> {
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        self.store.ensure_not_legacy(conversation_id).await?;
+        Ok(manifest)
+    }
+
     pub async fn update_metadata_owned(
         &self,
         owner_id: &str,
@@ -1086,7 +1093,12 @@ impl ConversationSupervisor {
         title: Option<Option<String>>,
         archived: Option<bool>,
     ) -> Result<ConversationManifest, AppError> {
-        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        // Archiving only touches the manifest; renaming writes a new title.
+        let manifest = if title.is_some() {
+            self.writable_owned(owner_id, conversation_id).await?
+        } else {
+            self.get_owned(owner_id, conversation_id).await?
+        };
         let updated = self
             .store
             .update_metadata(&manifest.id, title, archived)
@@ -1202,7 +1214,7 @@ impl ConversationSupervisor {
         prompt_text: Option<String>,
         retry_content: Option<Vec<PromptContentRef>>,
     ) -> Result<String, AppError> {
-        self.get_owned(owner_id, conversation_id).await?;
+        self.writable_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         let latest = match self
             .store
@@ -1230,7 +1242,7 @@ impl ConversationSupervisor {
         }
         let saved = &snapshot["request"];
         let mut prompt: ConversationPrompt = serde_json::from_value(saved.clone())?;
-        let encrypted = self.store.history_encrypted()?;
+        let encrypted = self.store.history_encrypted();
         if let Some(text_mac) = saved.get("textMac").and_then(Value::as_str) {
             let text = prompt_text.ok_or_else(retry_prompt_required)?;
             let key = self.store.fingerprint_key()?.ok_or_else(|| {
@@ -1267,7 +1279,9 @@ impl ConversationSupervisor {
         title: Option<String>,
     ) -> Result<ConversationManifest, AppError> {
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
-        let source = self.get_owned(owner_id, conversation_id).await?;
+        // A fork of legacy plaintext history would copy plaintext into a
+        // writable conversation.
+        let source = self.writable_owned(owner_id, conversation_id).await?;
         let driver = self.registry.driver(source.provider)?;
         // ACP-family drivers learn fork support by probing the installed
         // agent; refresh so a direct conversation.fork does not fail on an
@@ -1367,7 +1381,7 @@ impl ConversationSupervisor {
         client_request_id: &str,
     ) -> Result<String, AppError> {
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
-        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        let manifest = self.writable_owned(owner_id, conversation_id).await?;
         let driver = self.registry.driver(manifest.provider)?;
         if !driver.supports_native_compact() {
             return Err(AppError::Unsupported(
@@ -1479,7 +1493,7 @@ impl ConversationSupervisor {
         request_id: &str,
         control: ProviderControl,
     ) -> Result<Value, AppError> {
-        self.get_owned(owner_id, conversation_id).await?;
+        self.writable_owned(owner_id, conversation_id).await?;
         let guard = self.request_gate(conversation_id).lock_owned().await;
         let manifest = self.get_owned(owner_id, conversation_id).await?;
         self.workspace_trust
@@ -1652,7 +1666,7 @@ impl ConversationSupervisor {
         conversation_id: &str,
         prompt: ConversationPrompt,
     ) -> Result<String, AppError> {
-        self.get_owned(owner_id, conversation_id).await?;
+        self.writable_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         self.prompt_inner(owner_id, conversation_id, prompt).await
     }
@@ -1670,6 +1684,9 @@ impl ConversationSupervisor {
         conversation_id: &str,
         prompt: ConversationPrompt,
     ) -> Result<String, AppError> {
+        // Every prompt path (direct, retry, queue delivery) passes here;
+        // `save_request` checks again under the conversation lock.
+        self.store.ensure_not_legacy(conversation_id).await?;
         let request_fingerprint = prompt_fingerprint(&prompt)?;
         let request_snapshot = prompt.clone();
         let fingerprint_key = self.store.fingerprint_key()?;
@@ -1884,12 +1901,11 @@ impl ConversationSupervisor {
             }
         };
 
-        let sealed_key = self
-            .store
-            .history_encrypted()
-            .map(|encrypted| fingerprint_key.as_deref().filter(|_| encrypted));
-        let saved_request =
-            sealed_key.and_then(|key| Ok((saved_request(&request_snapshot, key)?, key.is_some())));
+        let sealed_key = fingerprint_key
+            .as_deref()
+            .filter(|_| self.store.history_encrypted());
+        let saved_request = saved_request(&request_snapshot, sealed_key)
+            .map(|saved| (saved, sealed_key.is_some()));
         let (saved_request, request_sealed) = match saved_request {
             Ok(saved) => saved,
             Err(error) => {
@@ -2372,7 +2388,7 @@ impl ConversationSupervisor {
         permission_id: &str,
         decision: PermissionDecision,
     ) -> Result<(), AppError> {
-        ensure_owner(&self.store.get(conversation_id).await?, owner_id)?;
+        self.writable_owned(owner_id, conversation_id).await?;
         self.permissions
             .resolve(conversation_id, permission_id, device_id, decision)
             .await

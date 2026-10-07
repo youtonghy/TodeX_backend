@@ -72,6 +72,18 @@ pub enum AppError {
     /// still allowed until another device restores it.
     #[error("history access was revoked for this device; another device must restore it")]
     HistoryAccessRevoked,
+    /// No active history recipient: nothing new can be encrypted, so writes
+    /// that would add history (new prompts, new conversations) are refused
+    /// until a client registers its device key (docs/history-encryption.md
+    /// §3.2).
+    #[error(
+        "conversation history is end-to-end encrypted and no device key is registered; register a device key in the client (history.recipient.register)"
+    )]
+    HistoryKeyRequired,
+    /// The conversation is legacy unencrypted history (`legacyPlaintext`):
+    /// it can be read, archived and deleted, never written.
+    #[error("this conversation is legacy unencrypted history and is read-only")]
+    HistoryReadOnly,
     /// The disk holding the data directory is nearly full; new turns are
     /// refused until space is freed.
     #[error("storage is low: {0}")]
@@ -131,6 +143,8 @@ impl AppError {
             Self::ProtocolUpgradeRequired(_) => "PROTOCOL_UPGRADE_REQUIRED",
             Self::TransportCryptoFailed => "TRANSPORT_CRYPTO_FAILED",
             Self::HistoryAccessRevoked => "HISTORY_ACCESS_REVOKED",
+            Self::HistoryKeyRequired => "HISTORY_KEY_REQUIRED",
+            Self::HistoryReadOnly => "HISTORY_READ_ONLY",
             Self::StorageLow(_) => "STORAGE_LOW",
             Self::ProviderUnavailable(_) => "PROVIDER_UNAVAILABLE",
             Self::RemoteAuthFailed(_) => "REMOTE_AUTH_FAILED",
@@ -176,6 +190,7 @@ impl IntoResponse for AppError {
             }
             Self::TransportCryptoFailed => StatusCode::BAD_REQUEST,
             Self::HistoryAccessRevoked => StatusCode::FORBIDDEN,
+            Self::HistoryKeyRequired | Self::HistoryReadOnly => StatusCode::CONFLICT,
             Self::ProviderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             // Not 401: clients treat that as a failed device signature.
             Self::RemoteAuthFailed(_) | Self::RemoteHostKeyUnverified(_) => StatusCode::FORBIDDEN,

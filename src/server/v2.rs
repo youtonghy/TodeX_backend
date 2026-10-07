@@ -20,7 +20,6 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::warn;
 
 use crate::app_state::AppState;
-use crate::config::HistoryEncryption;
 use crate::conversation::{
     ConversationEvent, ConversationManifest, ConversationSubscription, ProviderKind, ReplayDetail,
 };
@@ -103,8 +102,6 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "server.ping"
             | "session.resume"
             | "history.encryption.get"
-            | "history.encryption.enable"
-            | "history.encryption.disable"
             | "history.recipient.register"
             | "history.recipient.revoke"
             | "history.recovery.set"
@@ -1839,7 +1836,6 @@ async fn replay_conversation(
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
     ensure_history_client(
-        &state,
         query
             .history_encryption
             .is_some_and(|version| version >= HISTORY_ENCRYPTION_VERSION),
@@ -2087,10 +2083,11 @@ fn declares_history_encryption(query: Option<&str>) -> bool {
         })
 }
 
-/// With history encryption on, history only goes to clients that declared
-/// they can decrypt it; older clients get `CLIENT_UPGRADE_REQUIRED`.
-fn ensure_history_client(state: &AppState, declared: bool) -> Result<(), AppError> {
-    if declared || state.history_keys.recipients().mode()? == HistoryEncryption::Off {
+/// History is always end-to-end encrypted, so it only goes to clients that
+/// declared they can decrypt it; older clients get `CLIENT_UPGRADE_REQUIRED`.
+/// Legacy plaintext conversations included: one client protocol for all.
+fn ensure_history_client(declared: bool) -> Result<(), AppError> {
+    if declared {
         return Ok(());
     }
     Err(AppError::ClientUpgradeRequired(
@@ -2928,7 +2925,7 @@ async fn start_subscription(
 ) -> Result<Option<Value>, AppError> {
     let request: SubscribeRequest = Deserialize::deserialize(&command.payload)?;
     let summary = summary_detail(request.detail.as_deref())?;
-    ensure_history_client(state, subscriptions.history_encryption)?;
+    ensure_history_client(subscriptions.history_encryption)?;
     state
         .conversations
         .get_owned(owner_id, &request.conversation_id)

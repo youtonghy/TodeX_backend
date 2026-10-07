@@ -22,6 +22,7 @@ pub struct ManagedServer {
     migration_task: Option<JoinHandle<()>>,
     /// Journal segment conversion, v2 migration and backup cleanup.
     maintenance_task: Option<JoinHandle<()>>,
+    legacy_scan_task: Option<JoinHandle<()>>,
     /// Pushes history key changes made by other processes (the TUI).
     history_watch_task: Option<JoinHandle<()>>,
 }
@@ -125,6 +126,7 @@ impl ManagedServer {
         });
         let migration_task = Some(state.spawn_legacy_conversation_migration());
         let maintenance_task = Some(state.spawn_journal_maintenance());
+        let legacy_scan_task = state.spawn_legacy_history_scan();
         let history_watch_task = Some(server::spawn_history_watch(state.clone()));
 
         Ok(Self {
@@ -136,6 +138,7 @@ impl ManagedServer {
             retention_task,
             migration_task,
             maintenance_task,
+            legacy_scan_task,
             history_watch_task,
         })
     }
@@ -167,6 +170,9 @@ impl ManagedServer {
         if let Some(task) = self.maintenance_task.take() {
             task.abort();
         }
+        if let Some(task) = self.legacy_scan_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.history_watch_task.take() {
             task.abort();
         }
@@ -190,6 +196,9 @@ impl ManagedServer {
             task.abort();
         }
         if let Some(task) = self.maintenance_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.legacy_scan_task.take() {
             task.abort();
         }
         if let Some(task) = self.history_watch_task.take() {

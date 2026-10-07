@@ -15,7 +15,6 @@ use dashmap::DashMap;
 
 use super::{encode_id, keyring::KeyEntry, Clock, KeyringStore, RecipientRegistry};
 use crate::{
-    config::HistoryEncryption,
     error::AppError,
     history_crypto::{self, SegmentKey},
 };
@@ -70,28 +69,24 @@ impl DekManager {
     }
 
     /// The key to encrypt the next record of `conversation_id` with, as
-    /// `(kid, key)`; `None` while history encryption is off. A new key is
-    /// durable in the keyring before this returns it. Fails when no
-    /// recipient is active, since nobody could read the result.
+    /// `(kid, key)`. A new key is durable in the keyring before this returns
+    /// it. Fails with `HISTORY_KEY_REQUIRED` when no recipient is active,
+    /// since nobody could read the result.
     pub(crate) async fn current_key(
         &self,
         conversation_id: &str,
-    ) -> Result<Option<(String, Arc<SegmentKey>)>> {
+    ) -> Result<(String, Arc<SegmentKey>)> {
         // Validates the id before it becomes a map key.
         self.keyrings.path(conversation_id)?;
         let recipients = self.recipients.active_recipients()?;
         let slot = self.slot(conversation_id);
         let mut keys = slot.lock().await;
-        if recipients.mode == HistoryEncryption::Off {
-            keys.retire_active();
-            return Ok(None);
-        }
         let now = (self.clock)();
         if let Some(active) = &keys.active {
             let age = now.signed_duration_since(active.created_at);
             // A clock that moved backwards also rotates.
             if active.epoch == recipients.epoch && age >= Duration::zero() && age < MAX_DEK_AGE {
-                return Ok(Some((active.kid.clone(), active.key.clone())));
+                return Ok((active.kid.clone(), active.key.clone()));
             }
         }
         keys.retire_active();
@@ -124,24 +119,48 @@ impl DekManager {
             epoch: recipients.epoch,
             created_at: now,
         });
-        Ok(Some((kid, key)))
+        Ok((kid, key))
     }
 
     /// A one-off key for content that must never share a nonce with the
-    /// event streams — an encrypted title (stream 2, counter 0) or a
-    /// migrated segment's frames. Like [`Self::current_key`] it is wrapped
-    /// for every active recipient and durable in the keyring before it is
-    /// returned, but it is not kept: the caller drops (and so zeroizes) it.
-    /// `None` while history encryption is off.
-    pub(crate) async fn fresh_key(
+    /// event streams — an encrypted title (stream 2, counter 0). Like
+    /// [`Self::current_key`] it is wrapped for every active recipient and
+    /// durable in the keyring before it is returned, but it is not kept: the
+    /// caller drops (and so zeroizes) it.
+    pub(crate) async fn fresh_key(&self, conversation_id: &str) -> Result<(String, SegmentKey)> {
+        let path = self.keyrings.path(conversation_id)?;
+        self.new_key_at(conversation_id, path).await
+    }
+
+    /// A one-off key for a conversation still being assembled in the
+    /// private `directory` (an import or fork before it is published): it is
+    /// recorded in `directory/keyring.json`, which moves with the directory.
+    /// The caller seals the draft's records under it (event streams, counter
+    /// = sequence) and drops it when the draft is done.
+    pub(crate) async fn draft_key(
         &self,
         conversation_id: &str,
-    ) -> Result<Option<(String, SegmentKey)>> {
+        directory: &std::path::Path,
+    ) -> Result<(String, SegmentKey)> {
         self.keyrings.path(conversation_id)?;
-        let recipients = self.recipients.active_recipients()?;
-        if recipients.mode == HistoryEncryption::Off {
-            return Ok(None);
+        self.new_key_at(conversation_id, directory.join(super::keyring::FILE_NAME))
+            .await
+    }
+
+    /// `HISTORY_KEY_REQUIRED` unless some recipient could read new history.
+    pub(crate) fn ensure_recipients(&self) -> Result<()> {
+        if self.recipients.active_recipients()?.keys.is_empty() {
+            return Err(no_recipients());
         }
+        Ok(())
+    }
+
+    async fn new_key_at(
+        &self,
+        conversation_id: &str,
+        path: std::path::PathBuf,
+    ) -> Result<(String, SegmentKey)> {
+        let recipients = self.recipients.active_recipients()?;
         if recipients.keys.is_empty() {
             return Err(no_recipients());
         }
@@ -153,8 +172,9 @@ impl DekManager {
             .map(|recipient| history_crypto::wrap(&key, recipient))
             .collect::<Result<Vec<_>>>()?;
         self.keyrings
-            .add_key(
+            .add_key_at(
                 conversation_id,
+                path,
                 KeyEntry {
                     kid: kid.clone(),
                     created_at: (self.clock)(),
@@ -163,7 +183,7 @@ impl DekManager {
                 },
             )
             .await?;
-        Ok(Some((kid, key)))
+        Ok((kid, key))
     }
 
     /// The newest key of `conversation_id` still in memory, active or
@@ -276,14 +296,11 @@ impl DekManager {
     }
 }
 
-/// `CONFLICT`: nobody could read what would be encrypted. New prompts are
-/// refused with it; see `ConversationStore::ensure_history_writable`.
+/// `HISTORY_KEY_REQUIRED`: nobody could read what would be encrypted. New
+/// prompts and conversations are refused with it; see
+/// `ConversationStore::ensure_history_writable`.
 fn no_recipients() -> AppError {
-    AppError::Conflict(
-        "history encryption has no active recipients; register a device key \
-         (history.recipient.register) or disable history encryption"
-            .to_owned(),
-    )
+    AppError::HistoryKeyRequired
 }
 
 #[cfg(test)]

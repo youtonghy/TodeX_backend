@@ -6,8 +6,11 @@
 //! exists and that each wrap targets the granted recipient, and can never
 //! read what it stores.
 //!
-//! Every persisted change to recipients, grants, the mode or the device block
-//! list is announced to every `/v2/ws` connection as a global
+//! History is always end-to-end encrypted: there is no mode switch
+//! (`history.encryption.enable` / `disable` are gone and answered as unknown
+//! commands), and `mode` is always `"e2e"`.
+//!
+//! Every persisted change to recipients, grants or the device block list is announced to every `/v2/ws` connection as a global
 //! `history.encryption.updated` event (docs/history-encryption.md §7.1),
 //! published only after the write succeeded and never carrying key
 //! material. Blocked devices (`revokedDevices`) get `HISTORY_ACCESS_REVOKED`
@@ -19,22 +22,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::app_state::AppState;
-use crate::config::HistoryEncryption;
 use crate::error::AppError;
 use crate::event::EventRecord;
 use crate::history_crypto::{RecipientPublicKey, WrappedKey, KID_LEN, RECIPIENT_ID_LEN};
 use crate::history_keys::{
-    decode_id, GrantRecord, RecipientKind, RecipientsSnapshot, Written, MAX_BATCH,
+    decode_id, GrantRecord, RecipientKind, RecipientsSnapshot, Written, HISTORY_MODE, MAX_BATCH,
 };
 
 /// The global server event announcing a history key state change.
 pub(super) const UPDATED_EVENT: &str = "history.encryption.updated";
 
 /// Every `history.*` command; `is_v2_native_command` lists the same names.
-pub(super) const HISTORY_COMMANDS: [&str; 13] = [
+pub(super) const HISTORY_COMMANDS: [&str; 11] = [
     "history.encryption.get",
-    "history.encryption.enable",
-    "history.encryption.disable",
     "history.recipient.register",
     "history.recipient.revoke",
     "history.recovery.set",
@@ -137,20 +137,6 @@ pub(super) async fn dispatch(
     match command_type {
         "history.encryption.get" => {
             parse::<Empty>(payload)?;
-            encryption_state(state, device_id)
-        }
-        "history.encryption.enable" | "history.encryption.disable" => {
-            parse::<Empty>(payload)?;
-            let mode = if command_type == "history.encryption.enable" {
-                HistoryEncryption::E2e
-            } else {
-                HistoryEncryption::Off
-            };
-            let applied = registry.set_mode(mode)?;
-            publish(state, applied.written, Updated::new("mode")).await;
-            if mode == HistoryEncryption::E2e {
-                state.conversations.request_history_migration();
-            }
             encryption_state(state, device_id)
         }
         "history.recipient.register" => {
@@ -305,7 +291,7 @@ async fn fulfill(
                     "complete requires a grantId".to_owned(),
                 ));
             }
-            if registry.device_rid(device_id)?.as_deref() != Some(request.rid.as_str()) {
+            if !registry.device_owns(device_id, &request.rid)? {
                 return Err(AppError::Unauthorized(
                     "without a grantId, wraps may only target the caller's own recipient"
                         .to_owned(),
@@ -442,7 +428,8 @@ pub(crate) fn spawn_history_watch(state: AppState) -> tokio::task::JoinHandle<()
 #[serde(rename_all = "camelCase")]
 struct Updated {
     epoch: u64,
-    mode: HistoryEncryption,
+    /// Always `"e2e"`; kept for clients that still read it.
+    mode: &'static str,
     reason: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     rid: Option<String>,
@@ -458,7 +445,7 @@ impl Updated {
     fn new(reason: &'static str) -> Self {
         Self {
             epoch: 0,
-            mode: HistoryEncryption::Off,
+            mode: HISTORY_MODE,
             reason,
             rid: None,
             device_id: None,
@@ -490,7 +477,6 @@ async fn publish(state: &AppState, written: Option<Written>, mut update: Updated
         return;
     };
     update.epoch = written.epoch;
-    update.mode = written.mode;
     match serde_json::to_value(&update) {
         Ok(payload) => {
             state
@@ -505,9 +491,12 @@ async fn publish(state: &AppState, written: Option<Written>, mut update: Updated
 /// `{mode, epoch, recipients[], myRid?, myAccess, grants[], revokedDevices[]}`.
 fn encryption_state(state: &AppState, device_id: &str) -> Result<Value, AppError> {
     let snapshot = state.history_keys.recipients().snapshot()?;
+    // The newest key of the caller (with device auth off every client is
+    // `local` and may have registered its own).
     let my_rid = snapshot
         .recipients
         .iter()
+        .rev()
         .find(|record| {
             record.revoked_at.is_none()
                 && record.kind == RecipientKind::Device
@@ -529,7 +518,7 @@ fn encryption_state(state: &AppState, device_id: &str) -> Result<Value, AppError
         .map(|entry| json!({ "deviceId": entry.device_id, "revokedAt": entry.revoked_at }))
         .collect::<Vec<_>>();
     let mut response = json!({
-        "mode": snapshot.mode,
+        "mode": HISTORY_MODE,
         "epoch": snapshot.epoch,
         "recipients": snapshot.recipients,
         "grants": grants_json(&snapshot),

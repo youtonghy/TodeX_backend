@@ -1,8 +1,8 @@
 //! History key system: who may read encrypted conversation history and the
 //! keys that make it readable (docs/history-encryption.md §3, §5.2, §7).
 //!
-//! - [`RecipientRegistry`] (`$DATA_DIR/history/recipients.json`): the
-//!   persisted mode, recipient devices, the recovery key, the epoch and grants.
+//! - [`RecipientRegistry`] (`$DATA_DIR/history/recipients.json`): recipient
+//!   devices, the recovery key, the epoch and grants.
 //! - [`KeyringStore`] (`conversations/<id>/keyring.json`): every segment key
 //!   id of a conversation and its DEK wrapped for each recipient.
 //! - [`DekManager`]: the in-memory DEKs used to encrypt new history.
@@ -28,14 +28,14 @@ use std::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 
-use crate::{config::HistoryEncryption, devices::DeviceRegistry, error::AppError, secure_fs};
+use crate::{devices::DeviceRegistry, error::AppError, secure_fs};
 
 pub(crate) use dek::DekManager;
 pub(crate) use fingerprint::FingerprintKey;
 pub(crate) use keyring::KeyringStore;
 pub(crate) use recipients::{
     revoke_device_recipients, DeviceRevocation, GrantRecord, RecipientKind, RecipientRegistry,
-    RecipientsSnapshot, Written,
+    RecipientsSnapshot, Written, HISTORY_MODE,
 };
 
 type Result<T> = std::result::Result<T, AppError>;
@@ -63,24 +63,19 @@ pub(crate) struct HistoryKeys {
 }
 
 impl HistoryKeys {
-    /// `default_mode` seeds `recipients.json` on its first write only (see
-    /// [`RecipientRegistry`]). `devices` is the paired-device registry when
-    /// device auth is on: recipients of devices missing from it are revoked.
-    pub(crate) fn load(
-        data_dir: &Path,
-        default_mode: HistoryEncryption,
-        devices: Option<DeviceRegistry>,
-    ) -> Result<Self> {
-        Self::load_with_clock(data_dir, default_mode, devices, system_clock())
+    /// `devices` is the paired-device registry when device auth is on:
+    /// recipients of devices missing from it are revoked. Without it (auth
+    /// off) every client is the `local` device.
+    pub(crate) fn load(data_dir: &Path, devices: Option<DeviceRegistry>) -> Result<Self> {
+        Self::load_with_clock(data_dir, devices, system_clock())
     }
 
     pub(crate) fn load_with_clock(
         data_dir: &Path,
-        default_mode: HistoryEncryption,
         devices: Option<DeviceRegistry>,
         clock: Clock,
     ) -> Result<Self> {
-        let recipients = RecipientRegistry::load(data_dir, default_mode, devices, clock.clone())?;
+        let recipients = RecipientRegistry::load(data_dir, devices, clock.clone())?;
         let keyrings = KeyringStore::new(data_dir);
         let deks = DekManager::new(recipients.clone(), keyrings.clone(), clock);
         Ok(Self {

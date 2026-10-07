@@ -129,14 +129,13 @@ impl AppState {
         let agent_desktop = AgentDesktop::load(&config.data_dir).await?;
         let agent_mcp = AgentMcp::new(&config.data_dir, ssh.clone(), agent_desktop.clone()).await?;
         let devices = DeviceRegistry::load(&config.data_dir)?;
+        crate::config::warn_retired_history_encryption(&config.data_dir);
         let history_keys = HistoryKeys::load(
             &config.data_dir,
-            crate::config::load_history_encryption(&config.data_dir)?,
             config.security.enable_auth.then(|| devices.clone()),
         )?;
-        let conversation_store = ConversationStore::new(config.data_dir.clone())
-            .await?
-            .with_history_keys(history_keys.clone());
+        let conversation_store =
+            ConversationStore::open(config.data_dir.clone(), history_keys.clone()).await?;
         let conversation_hub = ConversationEventHub::default();
         let quota = QuotaStore::default();
         let conversations = ConversationSupervisor::new_with_execution_gate(
@@ -216,10 +215,17 @@ impl AppState {
         })
     }
 
-    /// Background conversion of sealed journal files, lazy v2 → v3
-    /// migration and migration-backup cleanup.
+    /// Background conversion of sealed journal files and migration-backup
+    /// cleanup.
     pub(crate) fn spawn_journal_maintenance(&self) -> JoinHandle<()> {
         self.conversation_store.spawn_maintenance()
+    }
+
+    /// The one-time scan marking legacy plaintext conversations read-only
+    /// (docs/history-encryption.md §8); `None` once it has completed.
+    pub(crate) fn spawn_legacy_history_scan(&self) -> Option<JoinHandle<()>> {
+        self.conversation_store
+            .spawn_legacy_scan(self.config.data_dir.clone())
     }
 
     pub fn increment_websocket_connections(&self) -> usize {

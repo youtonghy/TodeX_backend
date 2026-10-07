@@ -1,13 +1,11 @@
-//! `$DATA_DIR/history/recipients.json`: the persisted history encryption
-//! mode and everyone who can read encrypted history.
+//! `$DATA_DIR/history/recipients.json`: everyone who can read encrypted
+//! history. History is always end-to-end encrypted; the file's retired
+//! `mode` field is ignored on read and always written as `"e2e"` (so an
+//! older daemon reading it keeps encrypting).
 //!
-//! Mode precedence: until the file exists the mode is `off` (nobody could
-//! read encrypted history yet). The first write creates it with the
-//! configured default (`history_encryption` / `TODEX_AGENTD_HISTORY_ENCRYPTION`)
-//! when that write leaves at least one active device recipient, otherwise
-//! `off`. From then on the file is authoritative; the configured default is
-//! ignored and devices change the mode with `history.encryption.enable` /
-//! `disable`.
+//! With device auth off every connection is the same `local` device, so
+//! `local` may hold several active recipients (one per client key pair);
+//! with auth on a device's new key replaces its previous one.
 //!
 //! The TUI revokes devices from another process, so like `devices.json` the
 //! file is reloaded whenever its stamp changes. When device auth is on, a
@@ -33,8 +31,7 @@ use super::{
     HISTORY_DIR,
 };
 use crate::{
-    config::HistoryEncryption, devices::DeviceRegistry, error::AppError,
-    history_crypto::RecipientPublicKey, secure_fs,
+    devices::DeviceRegistry, error::AppError, history_crypto::RecipientPublicKey, secure_fs,
 };
 
 type Result<T> = std::result::Result<T, AppError>;
@@ -124,11 +121,35 @@ pub(crate) struct RevokedDevice {
     pub revoked_by: String,
 }
 
+/// The retired `mode` field of `recipients.json`: any stored value (`off`
+/// included) is accepted and ignored; it is always written as `"e2e"`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RetiredMode;
+
+impl Serialize for RetiredMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(HISTORY_MODE)
+    }
+}
+
+impl<'de> Deserialize<'de> for RetiredMode {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self)
+    }
+}
+
+/// The only history mode (`history.encryption.get` / `.updated` `mode`).
+pub(crate) const HISTORY_MODE: &str = "e2e";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecipientsFile {
     version: u8,
-    mode: HistoryEncryption,
+    #[serde(default)]
+    mode: RetiredMode,
     epoch: u64,
     recipients: Vec<RecipientRecord>,
     grants: Vec<GrantRecord>,
@@ -142,7 +163,7 @@ impl Default for RecipientsFile {
     fn default() -> Self {
         Self {
             version: FILE_VERSION,
-            mode: HistoryEncryption::Off,
+            mode: RetiredMode,
             epoch: 0,
             recipients: Vec::new(),
             grants: Vec::new(),
@@ -154,7 +175,6 @@ impl Default for RecipientsFile {
 /// A consistent view for `history.encryption.get`.
 #[derive(Clone, Debug)]
 pub(crate) struct RecipientsSnapshot {
-    pub mode: HistoryEncryption,
     pub epoch: u64,
     pub recipients: Vec<RecipientRecord>,
     pub grants: Vec<GrantRecord>,
@@ -164,7 +184,6 @@ pub(crate) struct RecipientsSnapshot {
 /// The registry state a successful write left behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Written {
-    pub mode: HistoryEncryption,
     pub epoch: u64,
 }
 
@@ -185,7 +204,6 @@ pub(crate) struct ExternalRevocation {
 
 /// What a new DEK is wrapped for.
 pub(crate) struct ActiveRecipients {
-    pub mode: HistoryEncryption,
     pub epoch: u64,
     pub keys: Vec<RecipientPublicKey>,
 }
@@ -193,7 +211,6 @@ pub(crate) struct ActiveRecipients {
 struct Inner {
     path: PathBuf,
     file: RecipientsFile,
-    exists: bool,
     stamp: Option<FileStamp>,
     /// Unreported [`ExternalRevocation`]s, oldest first, bounded.
     external: Vec<ExternalRevocation>,
@@ -204,7 +221,6 @@ struct Inner {
 #[derive(Clone)]
 pub(crate) struct RecipientRegistry {
     inner: Arc<Mutex<Inner>>,
-    default_mode: HistoryEncryption,
     devices: Option<DeviceRegistry>,
     clock: Clock,
 }
@@ -212,7 +228,6 @@ pub(crate) struct RecipientRegistry {
 impl RecipientRegistry {
     pub(crate) fn load(
         data_dir: &Path,
-        default_mode: HistoryEncryption,
         devices: Option<DeviceRegistry>,
         clock: Clock,
     ) -> Result<Self> {
@@ -222,12 +237,10 @@ impl RecipientRegistry {
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 path,
-                exists: loaded.is_some(),
                 file: loaded.unwrap_or_default(),
                 stamp,
                 external: Vec::new(),
             })),
-            default_mode,
             devices,
             clock,
         })
@@ -236,7 +249,6 @@ impl RecipientRegistry {
     pub(crate) fn snapshot(&self) -> Result<RecipientsSnapshot> {
         self.update(|file, _| {
             Ok(RecipientsSnapshot {
-                mode: file.mode,
                 epoch: file.epoch,
                 recipients: file.recipients.clone(),
                 grants: file.grants.clone(),
@@ -258,21 +270,12 @@ impl RecipientRegistry {
         Ok(std::mem::take(&mut self.lock()?.external))
     }
 
-    /// The current mode and epoch.
+    /// The current epoch.
     pub(crate) fn state(&self) -> Result<Written> {
-        self.update(|file, _| {
-            Ok(Written {
-                mode: file.mode,
-                epoch: file.epoch,
-            })
-        })
+        self.update(|file, _| Ok(Written { epoch: file.epoch }))
     }
 
-    pub(crate) fn mode(&self) -> Result<HistoryEncryption> {
-        self.update(|file, _| Ok(file.mode))
-    }
-
-    /// Mode, epoch and the parsed public keys of every unrevoked recipient
+    /// The epoch and the parsed public keys of every unrevoked recipient
     /// (devices and recovery).
     pub(crate) fn active_recipients(&self) -> Result<ActiveRecipients> {
         self.update(|file, _| {
@@ -283,19 +286,28 @@ impl RecipientRegistry {
                 .map(|record| RecipientPublicKey::from_base64url(&record.public_key))
                 .collect::<Result<Vec<_>>>()?;
             Ok(ActiveRecipients {
-                mode: file.mode,
                 epoch: file.epoch,
                 keys,
             })
         })
     }
 
-    /// The active recipient id registered by `device_id`.
+    /// The newest active recipient id registered by `device_id` (with
+    /// device auth off `local` may have several; see [`Self::device_owns`]).
     pub(crate) fn device_rid(&self, device_id: &str) -> Result<Option<String>> {
         self.update(|file, _| {
             Ok(file
                 .active_device(device_id)
                 .map(|record| record.rid.clone()))
+        })
+    }
+
+    /// Whether `rid` is an active recipient registered by `device_id`.
+    pub(crate) fn device_owns(&self, device_id: &str, rid: &str) -> Result<bool> {
+        self.update(|file, _| {
+            Ok(file.active(rid).is_some_and(|record| {
+                record.kind == RecipientKind::Device && record.device_id.as_deref() == Some(device_id)
+            }))
         })
     }
 
@@ -312,8 +324,11 @@ impl RecipientRegistry {
         }
     }
 
-    /// Registers `key` for `device_id`. The same key again is a no-op; a new
-    /// key revokes the device's previous one. Either change bumps the epoch.
+    /// Registers `key` for `device_id`. The same key again is a no-op. With
+    /// device auth on a new key revokes the device's previous one; with it
+    /// off every client is the same `local` device, so each client's key is
+    /// added alongside the others (revocation is by `rid`). A new key bumps
+    /// the epoch.
     pub(crate) fn register_device(
         &self,
         device_id: &str,
@@ -321,6 +336,7 @@ impl RecipientRegistry {
     ) -> Result<Applied<String>> {
         let rid = encode_id(&key.rid());
         let public_key = encode_id(&key.to_bytes());
+        let replaces_previous = self.devices.is_some();
         self.apply(|file, now| {
             file.ensure_access(device_id)?;
             if let Some(existing) = file.recipients.iter().find(|record| record.rid == rid) {
@@ -335,11 +351,13 @@ impl RecipientRegistry {
                     )),
                 };
             }
-            if let Some(previous) = file
-                .active_device(device_id)
-                .map(|record| record.rid.clone())
-            {
-                file.revoke(&previous, now);
+            if replaces_previous {
+                if let Some(previous) = file
+                    .active_device(device_id)
+                    .map(|record| record.rid.clone())
+                {
+                    file.revoke(&previous, now);
+                }
             }
             file.add(RecipientRecord {
                 rid: rid.clone(),
@@ -416,19 +434,6 @@ impl RecipientRegistry {
                     "device {device_id} is not blocked from history access"
                 )));
             }
-            Ok(())
-        })
-    }
-
-    /// `e2e` requires at least one active device recipient.
-    pub(crate) fn set_mode(&self, mode: HistoryEncryption) -> Result<Applied<()>> {
-        self.apply(|file, _| {
-            if mode == HistoryEncryption::E2e && !file.has_active_device() {
-                return Err(invalid(
-                    "history encryption requires a registered device recipient; call history.recipient.register first",
-                ));
-            }
-            file.mode = mode;
             Ok(())
         })
     }
@@ -543,17 +548,8 @@ impl RecipientRegistry {
         let value = operation(&mut file, now)?;
         let mut written = None;
         if file != inner.file {
-            if !inner.exists && self.default_mode == HistoryEncryption::E2e {
-                // First write: seed the configured default (see module docs).
-                if file.has_active_device() {
-                    file.mode = HistoryEncryption::E2e;
-                }
-            }
             file.prune()?;
-            let state = Written {
-                mode: file.mode,
-                epoch: file.epoch,
-            };
+            let state = Written { epoch: file.epoch };
             inner.write(file)?;
             inner.report(reconciled, state);
             written = Some(state);
@@ -622,7 +618,6 @@ impl Inner {
         let stamp = file_stamp(&self.path);
         if stamp != self.stamp {
             let loaded = read_file(&self.path)?;
-            let exists = loaded.is_some();
             let loaded = loaded.unwrap_or_default();
             let blocked = loaded
                 .revoked_devices
@@ -631,10 +626,8 @@ impl Inner {
                 .map(|entry| entry.device_id.clone())
                 .collect::<Vec<_>>();
             let state = Written {
-                mode: loaded.mode,
                 epoch: loaded.epoch,
             };
-            self.exists = exists;
             self.file = loaded;
             self.stamp = stamp;
             self.report(blocked, state);
@@ -657,7 +650,6 @@ impl Inner {
     fn write(&mut self, file: RecipientsFile) -> Result<()> {
         write_file(&self.path, &file)?;
         self.file = file;
-        self.exists = true;
         self.stamp = file_stamp(&self.path);
         Ok(())
     }
@@ -670,8 +662,9 @@ impl RecipientsFile {
             .find(|record| record.rid == rid && record.is_active())
     }
 
+    /// The newest active recipient of `device_id`.
     fn active_device(&self, device_id: &str) -> Option<&RecipientRecord> {
-        self.recipients.iter().find(|record| {
+        self.recipients.iter().rev().find(|record| {
             record.is_active()
                 && record.kind == RecipientKind::Device
                 && record.device_id.as_deref() == Some(device_id)
@@ -709,12 +702,6 @@ impl RecipientsFile {
             revoked_by: revoked_by.to_owned(),
         });
         true
-    }
-
-    fn has_active_device(&self) -> bool {
-        self.recipients
-            .iter()
-            .any(|record| record.is_active() && record.kind == RecipientKind::Device)
     }
 
     fn grant(&self, grant_id: &str) -> Result<&GrantRecord> {
@@ -787,7 +774,9 @@ impl RecipientsFile {
             return Err(invalid("unsupported history recipient registry file"));
         }
         let mut rids = std::collections::HashSet::new();
-        let mut active_devices = std::collections::HashSet::new();
+        // Several active recipients may share a device id: with device auth
+        // off every client is `local` (see [`RecipientRegistry::register_device`]).
+        let mut active_devices = 0;
         let mut active_recovery = 0;
         for record in &self.recipients {
             let key =
@@ -797,9 +786,7 @@ impl RecipientsFile {
             }
             match (record.kind, record.device_id.as_deref()) {
                 (RecipientKind::Device, Some(device_id)) if !device_id.is_empty() => {
-                    if record.is_active() && !active_devices.insert(device_id) {
-                        return Err(corrupt());
-                    }
+                    active_devices += usize::from(record.is_active());
                 }
                 (RecipientKind::Recovery, None) => {
                     active_recovery += usize::from(record.is_active());
@@ -807,7 +794,7 @@ impl RecipientsFile {
                 _ => return Err(corrupt()),
             }
         }
-        if active_recovery > 1 || active_devices.len() > MAX_ACTIVE_RECIPIENTS {
+        if active_recovery > 1 || active_devices > MAX_ACTIVE_RECIPIENTS {
             return Err(corrupt());
         }
         let mut blocked = std::collections::HashSet::new();

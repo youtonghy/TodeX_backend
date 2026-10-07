@@ -58,12 +58,11 @@ use sha2::{Digest as _, Sha256};
 
 use super::digest::JournalDigest;
 use super::record::{
-    add_history_macs, compacted_marker, decode_journal_record, encode_envelope, encrypted_content,
+    compacted_marker, decode_journal_record, encode_envelope, encrypted_content,
     open_event, parse_record, record_bytes, ENCRYPTED_FIELD, JOURNAL_COMPACTED_EVENT,
 };
 use super::{summarize_event, ConversationEvent, ProviderKind};
 use crate::history_crypto::{self, ContentStream, SegmentKey};
-use crate::history_keys::FingerprintKey;
 
 const SEGMENT_MAGIC: &[u8; 8] = b"TDXSEG1\n";
 const SEGMENT_ID_BYTES: usize = 16;
@@ -231,8 +230,8 @@ pub(super) struct SegmentIndexBody {
 }
 
 impl SegmentIndexBody {
-    /// Whether any content is stored as plaintext: what end-to-end
-    /// migration still has to re-encrypt.
+    /// Whether any content is stored as plaintext.
+    #[cfg(test)]
     pub fn has_plain_content(&self) -> bool {
         self.frames
             .iter()
@@ -862,14 +861,6 @@ impl SlimPlan {
     }
 }
 
-/// A fresh DEK end-to-end migration seals plaintext records under, with the
-/// fingerprint key their deduplication fields are MAC'd with first.
-pub(super) struct MigrationKey {
-    pub kid: String,
-    pub key: Arc<SegmentKey>,
-    pub fingerprint: Arc<FingerprintKey>,
-}
-
 /// The keys a segment build may encrypt with. Default: none (plaintext and
 /// ciphertext are framed as they are).
 #[derive(Default)]
@@ -877,9 +868,6 @@ pub(super) struct SealPolicy {
     /// DEKs still in memory, by kid: event ciphertext under them is opened
     /// and repacked into sealed frames.
     pub keys: HashMap<String, Arc<SegmentKey>>,
-    /// History encryption is on: plaintext records are sealed under this
-    /// key.
-    pub migrate: Option<MigrationKey>,
 }
 
 /// Content of one record handed to [`SegmentBuilder::push`].
@@ -935,25 +923,10 @@ impl SealPolicy {
                 },
             };
         }
-        match &self.migrate {
-            Some(migrate) => {
-                let mut stored = event;
-                add_history_macs(
-                    &stored.event_type,
-                    &mut stored.payload,
-                    &migrate.fingerprint,
-                );
-                Classified {
-                    view: Some(stored.clone()),
-                    stored,
-                    group: FrameGroup::Sealed(migrate.kid.clone()),
-                }
-            }
-            None => Classified {
-                view: Some(event.clone()),
-                stored: event,
-                group: FrameGroup::Plain,
-            },
+        Classified {
+            view: Some(event.clone()),
+            stored: event,
+            group: FrameGroup::Plain,
         }
     }
 
@@ -977,11 +950,7 @@ impl SealPolicy {
 
     /// Every key a frame may be sealed under.
     fn sealing_keys(&self) -> HashMap<String, Arc<SegmentKey>> {
-        let mut keys = self.keys.clone();
-        if let Some(migrate) = &self.migrate {
-            keys.insert(migrate.kid.clone(), migrate.key.clone());
-        }
-        keys
+        self.keys.clone()
     }
 }
 
@@ -1610,107 +1579,6 @@ fn envelope_event(line: &[u8], conversation_id: &str) -> Result<ConversationEven
         .map_err(invalid)
 }
 
-/// Rewrite intact segment `number` with `policy` (end-to-end migration):
-/// plaintext content is sealed under the migration key, ciphertext whose
-/// DEK is in memory is repacked, sealed runs are copied as they are. No
-/// slimming happens again. Blocking.
-pub(super) fn rebuild_segment(
-    directory: &Path,
-    conversation_id: &str,
-    number: u64,
-    policy: &SealPolicy,
-) -> Result<PreparedSegment, SegmentError> {
-    let loaded = load_index(directory, number)?;
-    let segment = loaded.segment;
-    let mut file = std::fs::File::open(directory.join(segment_name(number)))?;
-    let mut builder = SegmentBuilder::create(directory, conversation_id, number, policy)?;
-    let result = (|| -> Result<(), SegmentError> {
-        let mut decoded: [Option<(u64, DecodedFrame)>; 2] = [None, None];
-        let mut item = |file: &mut std::fs::File,
-                        slot: usize,
-                        entry: &FrameEntry,
-                        sequence: u64|
-         -> Result<Vec<u8>, SegmentError> {
-            if decoded[slot]
-                .as_ref()
-                .is_none_or(|(offset, _)| *offset != entry.offset)
-            {
-                decoded[slot] = Some((entry.offset, load_frame(file, entry)?));
-            }
-            let (_, frame) = decoded[slot].as_ref().expect("frame was just loaded");
-            frame
-                .item((sequence - entry.first) as usize)
-                .map(<[u8]>::to_vec)
-                .ok_or_else(|| invalid(format!("frame lacks sequence {sequence}")))
-        };
-        let mut sequence = segment.first;
-        while sequence <= segment.last {
-            let envelope_entry = segment
-                .frame(STREAM_ENVELOPE, sequence)
-                .cloned()
-                .ok_or_else(|| invalid(format!("no envelope holds sequence {sequence}")))?;
-            let full = segment
-                .frame(STREAM_FULL, sequence)
-                .cloned()
-                .ok_or_else(|| invalid(format!("no content holds sequence {sequence}")))?;
-            if full.kid.is_some() {
-                let summary = segment
-                    .frame(STREAM_SUMMARY, sequence)
-                    .cloned()
-                    .ok_or_else(|| invalid("sealed run lacks its summary frame"))?;
-                let summary_bytes = read_sealed(&mut file, &summary)?;
-                let full_bytes = read_sealed(&mut file, &full)?;
-                let end = full.first + u64::from(full.count);
-                builder.push_verbatim((summary, summary_bytes), (full, full_bytes))?;
-                while sequence < end {
-                    let entry = segment
-                        .frame(STREAM_ENVELOPE, sequence)
-                        .cloned()
-                        .ok_or_else(|| invalid("no envelope holds a sealed record"))?;
-                    let line = item(&mut file, 0, &entry, sequence)?;
-                    let event = envelope_event(&line, conversation_id)?;
-                    builder.observe(&event);
-                    builder.push(&event, Item::Verbatim)?;
-                    sequence += 1;
-                }
-                continue;
-            }
-            let line = item(&mut file, 0, &envelope_entry, sequence)?;
-            let content = item(&mut file, 1, &full, sequence)?;
-            let record = parse_record(&line)?;
-            let payload = if full.passthrough {
-                let encrypted: Map<String, Value> = serde_json::from_slice(&content)?;
-                let mut payload = record.envelope().clone();
-                payload.insert(ENCRYPTED_FIELD.to_owned(), Value::Object(encrypted));
-                Value::Object(payload)
-            } else {
-                serde_json::from_slice(&content)?
-            };
-            let event = record
-                .into_event(conversation_id, Some(payload))
-                .map_err(invalid)?;
-            if event.sequence != sequence {
-                return Err(invalid(format!(
-                    "envelope frame holds sequence {} where {sequence} belongs",
-                    event.sequence
-                )));
-            }
-            let classified = policy.classify(event, conversation_id);
-            builder.observe(&classified.stored);
-            push_classified(&mut builder, classified)?;
-            sequence += 1;
-        }
-        Ok(())
-    })();
-    match result {
-        Ok(()) => builder.finish(Vec::new()),
-        Err(error) => {
-            builder.abandon();
-            Err(error)
-        }
-    }
-}
-
 /// Atomically publish a prepared segment (§4.1): `.idx` then `.seg` are
 /// renamed into place, then the plaintext sources are deleted and the
 /// directory synced. `step` lets crash tests stop after any step. Blocking;
@@ -1752,45 +1620,12 @@ pub(super) fn commit_prepared(
     Ok(())
 }
 
-/// Suffix of a replacement segment's files while [`commit_replacement`]
-/// swaps them in.
+/// Suffix of a replacement segment's files while the retired end-to-end
+/// migration of older versions swapped them in; reconciliation still
+/// finishes or rolls back such a swap a crash interrupted.
 const REPLACEMENT_SUFFIX: &str = ".next";
 
-/// Replace existing segment `number` with a rebuild of it (end-to-end
-/// migration), crash-safely: both new files are first renamed to
-/// `events.NNNNNN.idx.next` / `.seg.next` and synced, then `.idx` and
-/// `.seg` are replaced in that order. [`reconcile_directory`] finishes or
-/// rolls back an interrupted swap: while `.idx.next` exists the old pair is
-/// intact and the `.next` files are dropped; once it is gone the new index
-/// is in place and `.seg.next` is renamed after it. Blocking; callers hold
-/// the conversation lock.
-pub(super) fn commit_replacement(
-    directory: &Path,
-    prepared: &PreparedSegment,
-    stop_after: Option<CommitStep>,
-) -> Result<(), SegmentError> {
-    let stop = |step: CommitStep| stop_after == Some(step);
-    let number = prepared.number;
-    let next = |name: String| directory.join(format!("{name}{REPLACEMENT_SUFFIX}"));
-    std::fs::rename(&prepared.temp_idx, next(index_name(number)))?;
-    std::fs::rename(&prepared.temp_seg, next(segment_name(number)))?;
-    sync_directory_blocking(directory)?;
-    if stop(CommitStep::Written) {
-        return Ok(());
-    }
-    std::fs::rename(next(index_name(number)), directory.join(index_name(number)))?;
-    if stop(CommitStep::IndexRenamed) {
-        return Ok(());
-    }
-    std::fs::rename(
-        next(segment_name(number)),
-        directory.join(segment_name(number)),
-    )?;
-    sync_directory_blocking(directory)?;
-    Ok(())
-}
-
-/// Step boundaries of [`commit_prepared`] and [`commit_replacement`], for
+/// Step boundaries of [`commit_prepared`], for
 /// crash-injection tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CommitStep {
@@ -1817,7 +1652,7 @@ pub(super) struct Reconciled {
 }
 
 /// Restore the §4.1 invariants after a crash. An interrupted
-/// [`commit_replacement`] is finished or rolled back first. Then for every
+/// replacement swap of an older version is finished or rolled back first. Then for every
 /// `.seg`/`.idx`: an `.idx` without its `.seg` is removed; a pair whose
 /// plaintext sources still exist is kept (and the sources removed) only
 /// when the whole `.seg` hashes to its index, otherwise the pair is

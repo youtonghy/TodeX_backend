@@ -104,11 +104,18 @@ pub struct ConversationManifest {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_version: Option<u32>,
-    /// Set once every record, the title and the request snapshot are
-    /// stored encrypted (new conversations under history encryption, or the
-    /// end of the background migration, §8); cleared by a plaintext append.
+    /// Set when every record, the title and the request snapshot are stored
+    /// encrypted (every conversation created since history encryption became
+    /// mandatory; older ones may carry it from the retired migration).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_encrypted_at: Option<DateTime<Utc>>,
+    /// Legacy unencrypted history (a plaintext record, title or request
+    /// snapshot), found by the one-time startup scan or on first write
+    /// (`docs/history-encryption.md` §8). Such a conversation is read-only:
+    /// reading, archiving and deleting stay allowed, every write fails with
+    /// `HISTORY_READ_ONLY`. Omitted while `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_plaintext: bool,
 }
 
 /// `manifest.titleEnc`: the UTF-8 title sealed under `kid` with history
@@ -145,6 +152,7 @@ impl ConversationManifest {
             updated_at: now,
             storage_version: None,
             history_encrypted_at: None,
+            legacy_plaintext: false,
         }
     }
 }

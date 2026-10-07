@@ -79,6 +79,18 @@ impl KeyringStore {
     /// Records a new key. The conversation directory must exist and `kid`
     /// must be new; returns once the keyring is fsynced.
     pub(crate) async fn add_key(&self, conversation_id: &str, entry: KeyEntry) -> Result<()> {
+        let path = self.path(conversation_id)?;
+        self.add_key_at(conversation_id, path, entry).await
+    }
+
+    /// [`Self::add_key`] into the keyring file at `path`: the conversation's
+    /// own, or that of its draft directory before it is published.
+    pub(crate) async fn add_key_at(
+        &self,
+        conversation_id: &str,
+        path: PathBuf,
+        entry: KeyEntry,
+    ) -> Result<()> {
         decode_id::<KID_LEN>(&entry.kid, "history key id")?;
         let mut rids = HashSet::new();
         if entry.wraps.len() > MAX_WRAPS_PER_KEY
@@ -86,7 +98,6 @@ impl KeyringStore {
         {
             return Err(invalid("history key wraps must name distinct recipients"));
         }
-        let path = self.path(conversation_id)?;
         let lock = self.lock_for(conversation_id);
         let _guard = lock.lock().await;
         blocking(move || {
