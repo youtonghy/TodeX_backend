@@ -272,7 +272,7 @@ GET /v2/catalog/skills/{resourceId}?provider=claude-code&workspace=/home/user/pr
 GET /v2/catalog/mcp?provider=claude-code&workspace=/home/user/projects/demo
 ```
 
-Catalog 只读取 Provider 的用户级和项目级原生配置，项目级同名资源优先。Skill 正文只能通过后端生成的 `resourceId` 读取；MCP 响应仅返回名称、来源、scope、transport、active 状态以及可选的 tools/authStatus/error，不返回 command、args、env、URL 或凭据。后端不提供安装、启停、删除或改写接口。实际 MCP 调用使用 `mcp.call`，由 daemon 按内部配置执行。`mcp.call` 的结果整体写入 `mcp.completed`/`mcp.failed` 事件，因此序列化后超过 512 KiB（单事件上限的一半）时会被截断：按顺序保留放得下的内容块，第一个放不下的文本块截短，其他放不下的块换成一条说明，丢弃 `structuredContent`，结果带 `truncated: true` 并以一条说明文字结尾。`mcp.refresh` 的工具列表每个服务器最多 512 个，描述最多 4096 字（截断处以 `…` 结尾）。
+Catalog 只读取 Provider 的用户级和项目级原生配置，项目级同名资源优先。Skill 正文只能通过后端生成的 `resourceId` 读取；MCP 响应仅返回名称、来源、scope、transport、active 状态以及可选的 tools/authStatus/error，不返回 command、args、env、URL 或凭据。后端不提供安装、启停、删除或改写接口。实际 MCP 调用使用 `mcp.call`，由 daemon 按内部配置执行。`mcp.call` 的结果整体写入 `mcp.completed`/`mcp.failed` 事件，因此序列化后超过 512 KiB（单事件上限的一半）时会被截断：按顺序保留放得下的内容块，第一个放不下的文本块截短，其他放不下的块换成一条说明，顶层字段只保留 `isError` 与 `resultType`（丢弃 `structuredContent`、`_meta` 及其他未知字段），结果带 `truncated: true` 并以一条说明文字结尾。这一上限在结果完整读入后才施加：stdio 服务器的每条 JSON-RPC 消息（一行）另有 16 MiB 的读取上限，超过即断开连接、调用失败（错误说明超过上限）；HTTP 服务器的响应在读入时没有单独的大小上限。`mcp.refresh` 的工具列表每个服务器最多 512 个，描述最多 4096 字（截断处以 `…` 结尾）。
 
 ### Conversation Folder 与旧数据迁移
 

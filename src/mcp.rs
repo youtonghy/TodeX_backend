@@ -1,16 +1,21 @@
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rmcp::model::{CallToolRequestParams, ClientInfo};
+use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::{
-    streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
-    TokioChildProcess,
+    async_rw::AsyncRwTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    StreamableHttpClientTransport, Transport,
 };
-use rmcp::ServiceExt;
+use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
-use tokio::io::{AsyncRead, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncRead, BufReader, ReadBuf};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
 use crate::catalog::{McpRuntimeTarget, McpToolDescriptor, McpTransport};
@@ -28,6 +33,12 @@ const STDERR_MAX_LINES: usize = 200;
 const MAX_RESULT_BYTES: usize = crate::conversation::MAX_EVENT_PAYLOAD_BYTES / 2;
 /// Room kept for the truncation note itself.
 const RESULT_NOTE_BYTES: usize = 1024;
+/// Longest JSON-RPC line read from a stdio server. Results are bounded to
+/// [`MAX_RESULT_BYTES`] only after they are read; this caps the memory one
+/// message can take before that.
+const MAX_STDIO_LINE_BYTES: usize = 16 * 1024 * 1024;
+/// How long a closed stdio server may take to exit before it is killed.
+const STDIO_EXIT_WAIT: Duration = Duration::from_secs(3);
 /// Tools and description length kept from one server's `tools/list`.
 const MAX_LISTED_TOOLS: usize = 512;
 const MAX_TOOL_DESCRIPTION_CHARS: usize = 4096;
@@ -66,14 +77,15 @@ pub async fn call_tool(
 
 async fn stdio_tools(target: &McpRuntimeTarget) -> Result<Vec<McpToolDescriptor>, AppError> {
     let transport = stdio_transport(target)?;
+    let oversized = transport.oversized.clone();
     let mut client = timeout(INITIALIZE_TIMEOUT, ClientInfo::default().serve(transport))
         .await
         .map_err(|_| mcp_timeout(target, "initialize"))?
-        .map_err(|error| mcp_error(target, "initialize", error))?;
+        .map_err(|error| stdio_error(target, "initialize", error, &oversized))?;
     let result = timeout(INITIALIZE_TIMEOUT, client.list_tools(None))
         .await
         .map_err(|_| mcp_timeout(target, "tools/list"))?
-        .map_err(|error| mcp_error(target, "tools/list", error));
+        .map_err(|error| stdio_error(target, "tools/list", error, &oversized));
     close_client(&mut client).await;
     Ok(tool_descriptors(target, result?.tools))
 }
@@ -85,10 +97,11 @@ async fn stdio_call(
 ) -> Result<McpCallResult, AppError> {
     let arguments = call_arguments(arguments)?;
     let transport = stdio_transport(target)?;
+    let oversized = transport.oversized.clone();
     let mut client = timeout(INITIALIZE_TIMEOUT, ClientInfo::default().serve(transport))
         .await
         .map_err(|_| mcp_timeout(target, "initialize"))?
-        .map_err(|error| mcp_error(target, "initialize", error))?;
+        .map_err(|error| stdio_error(target, "initialize", error, &oversized))?;
     let result = timeout(
         CALL_TIMEOUT,
         client
@@ -96,12 +109,113 @@ async fn stdio_call(
     )
     .await
     .map_err(|_| mcp_timeout(target, "tools/call"))?
-    .map_err(|error| mcp_error(target, "tools/call", error));
+    .map_err(|error| stdio_error(target, "tools/call", error, &oversized));
     close_client(&mut client).await;
     convert_call_result(result?)
 }
 
-fn stdio_transport(target: &McpRuntimeTarget) -> Result<TokioChildProcess, AppError> {
+/// A stdio MCP server process: stdin/stdout carry JSON-RPC lines of at
+/// most [`MAX_STDIO_LINE_BYTES`]; the process is killed when dropped or
+/// when it does not exit soon after the transport closes.
+struct StdioServer {
+    child: Child,
+    transport: AsyncRwTransport<RoleClient, LineCapped<ChildStdout>, ChildStdin>,
+    /// Set when the server sent a line over the cap (the transport ended).
+    oversized: Arc<AtomicBool>,
+}
+
+impl Transport<RoleClient> for StdioServer {
+    type Error = std::io::Error;
+
+    fn send(
+        &mut self,
+        item: TxJsonRpcMessage<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.transport.send(item)
+    }
+
+    fn receive(
+        &mut self,
+    ) -> impl std::future::Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
+        self.transport.receive()
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.transport.close().await?;
+        match timeout(STDIO_EXIT_WAIT, self.child.wait()).await {
+            Ok(status) => status.map(drop),
+            Err(_) => self.child.kill().await,
+        }
+    }
+}
+
+/// Fails the read once a line (bytes since the last `\n`) exceeds `limit`,
+/// so a server cannot make the reader buffer an unbounded message.
+struct LineCapped<R> {
+    inner: R,
+    line: usize,
+    limit: usize,
+    exceeded: Arc<AtomicBool>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for LineCapped<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        if this.exceeded.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(line_too_long(this.limit)));
+        }
+        let before = buf.filled().len();
+        std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        let mut line = this.line;
+        for byte in &buf.filled()[before..] {
+            if *byte == b'\n' {
+                line = 0;
+            } else {
+                line += 1;
+                if line > this.limit {
+                    // A failed read hands out no bytes.
+                    buf.set_filled(before);
+                    this.exceeded.store(true, Ordering::Relaxed);
+                    return Poll::Ready(Err(line_too_long(this.limit)));
+                }
+            }
+        }
+        this.line = line;
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn line_too_long(limit: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("mcp server sent a message over {limit} bytes"),
+    )
+}
+
+/// An rmcp error from a stdio server, naming the size cap when that is
+/// what ended the connection.
+fn stdio_error(
+    target: &McpRuntimeTarget,
+    operation: &str,
+    error: impl std::fmt::Display,
+    oversized: &AtomicBool,
+) -> AppError {
+    if oversized.load(Ordering::Relaxed) {
+        mcp_error(
+            target,
+            operation,
+            format!("the server sent a message over {MAX_STDIO_LINE_BYTES} bytes"),
+        )
+    } else {
+        mcp_error(target, operation, error)
+    }
+}
+
+fn stdio_transport(target: &McpRuntimeTarget) -> Result<StdioServer, AppError> {
     let Some(program) = target.command.first() else {
         return Err(AppError::InvalidRequest(format!(
             "mcp server {} is missing a command",
@@ -122,16 +236,31 @@ fn stdio_transport(target: &McpRuntimeTarget) -> Result<TokioChildProcess, AppEr
     }
     // stderr is captured rather than inherited: user servers print tokens
     // and request dumps there, which must not reach the daemon log verbatim.
-    let (transport, stderr) = TokioChildProcess::builder(command)
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            AppError::InvalidRequest(format!(
-                "failed to start mcp server {}: {error}",
-                target.descriptor.name
-            ))
-        })?;
-    if let Some(stderr) = stderr {
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| {
+        AppError::InvalidRequest(format!(
+            "failed to start mcp server {}: {error}",
+            target.descriptor.name
+        ))
+    })?;
+    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        return Err(AppError::InvalidRequest(format!(
+            "mcp server {} has no stdio pipes",
+            target.descriptor.name
+        )));
+    };
+    let oversized = Arc::new(AtomicBool::new(false));
+    let stdout = LineCapped {
+        inner: stdout,
+        line: 0,
+        limit: MAX_STDIO_LINE_BYTES,
+        exceeded: oversized.clone(),
+    };
+    if let Some(stderr) = child.stderr.take() {
         let server = target.descriptor.name.clone();
         tokio::spawn(async move {
             forward_stderr(stderr, |line| {
@@ -140,7 +269,11 @@ fn stdio_transport(target: &McpRuntimeTarget) -> Result<TokioChildProcess, AppEr
             .await;
         });
     }
-    Ok(transport)
+    Ok(StdioServer {
+        child,
+        transport: AsyncRwTransport::new_client(stdout, stdin),
+        oversized,
+    })
 }
 
 /// Passes each stderr line, redacted and bounded, to `emit` until the pipe
@@ -320,21 +453,29 @@ fn json_len(value: &Value) -> usize {
 /// A serialized `CallToolResult` of at most `limit` bytes. Over the limit,
 /// content blocks are kept in order while they fit, the first text block
 /// that does not is cut, other blocks that do not are replaced by a note,
-/// `structuredContent` is dropped, and the result says so (`truncated` and
-/// a closing text block).
+/// every top-level field but `isError` and `resultType` is dropped
+/// (`structuredContent`, `_meta`, unknown fields), and the result says so
+/// (`truncated` and a closing text block).
 fn bound_result(result: Value, limit: usize) -> Value {
     let total = json_len(&result);
     if total <= limit {
         return result;
     }
-    let Value::Object(mut object) = result else {
+    let Value::Object(mut result) = result else {
         return serde_json::json!({ "content": [], "truncated": true });
     };
-    let blocks = match object.remove("content") {
+    let blocks = match result.remove("content") {
         Some(Value::Array(blocks)) => blocks,
         _ => Vec::new(),
     };
-    object.remove("structuredContent");
+    // Only the small, known fields survive: `_meta`, `structuredContent`
+    // and anything unknown could be as large as the rest.
+    let mut object = serde_json::Map::new();
+    for key in ["isError", "resultType"] {
+        if let Some(value) = result.remove(key).filter(|value| json_len(value) <= 64) {
+            object.insert(key.to_owned(), value);
+        }
+    }
     let mut budget = limit
         .saturating_sub(RESULT_NOTE_BYTES)
         .saturating_sub(json_len(&Value::Object(object.clone())));
@@ -462,6 +603,22 @@ mod tests {
             .unwrap()
             .contains("TodeX truncated this MCP result"));
 
+        // `_meta` and unknown fields cannot carry the size past the limit.
+        let padded = serde_json::json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "_meta": { "blob": "m".repeat(10_000) },
+            "extra": "e".repeat(10_000),
+            "resultType": "complete",
+            "isError": false
+        });
+        let bounded = bound_result(padded, limit);
+        assert!(json_len(&bounded) <= limit, "{}", json_len(&bounded));
+        assert!(bounded.get("_meta").is_none());
+        assert!(bounded.get("extra").is_none());
+        assert_eq!(bounded["resultType"], "complete");
+        assert_eq!(bounded["isError"], false);
+        assert_eq!(bounded["content"][0]["text"], "ok");
+
         // A huge non-text block becomes a note.
         let image = serde_json::json!({
             "content": [{ "type": "image", "data": "A".repeat(10_000), "mimeType": "image/png" }]
@@ -536,6 +693,27 @@ while True:
             .expect("call tool");
         assert!(!result.is_error);
         assert!(result.content.to_string().contains("pong"));
+    }
+
+    #[tokio::test]
+    async fn stdio_lines_over_the_cap_end_the_read() {
+        use tokio::io::AsyncReadExt;
+        let read = |input: &'static [u8], limit: usize| async move {
+            let exceeded = Arc::new(AtomicBool::new(false));
+            let mut capped = LineCapped {
+                inner: input,
+                line: 0,
+                limit,
+                exceeded: exceeded.clone(),
+            };
+            let mut out = Vec::new();
+            let result = capped.read_to_end(&mut out).await;
+            (result.is_ok(), exceeded.load(Ordering::Relaxed))
+        };
+        assert_eq!(read(b"1234\n12345\n123", 5).await, (true, false));
+        assert_eq!(read(b"123456\n", 5).await, (false, true));
+        assert_eq!(read(b"12\n1234567", 5).await, (false, true));
+        assert_eq!(read(b"\n\n\n", 0).await, (true, false));
     }
 
     #[tokio::test]
