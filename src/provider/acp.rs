@@ -3651,7 +3651,7 @@ mod tests {
 
         let mut types = Vec::new();
         while let Ok(event) = events.try_recv() {
-            types.push(event.event_type);
+            types.push(event.event_type.clone());
         }
         assert_eq!(types, ["provider.commands.updated"]);
         process.terminate().await;
@@ -3964,7 +3964,7 @@ mod tests {
 
         let mut payloads = Vec::new();
         while let Ok(event) = events.try_recv() {
-            payloads.push((event.event_type, event.payload));
+            payloads.push((event.event_type.clone(), event.payload.clone()));
         }
         let results: Vec<_> = payloads
             .iter()

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
@@ -11,7 +12,7 @@ use crate::{
         CodexLocalAdapterRuntime, CodexLocalAdapterStartOptions,
     },
     error::AppError,
-    event::EventRecord,
+    event::{EventRecord, PublishedEvent},
     local_terminal::{
         TerminalInputOptions, TerminalResizeOptions, TerminalStartOptions, TerminalStatusOptions,
         TerminalStopOptions,
@@ -24,6 +25,8 @@ use crate::{
     },
     workspace_paths::validate_workspace_directory_text,
 };
+
+use super::ws::socket::Outbound;
 
 const TRANSPORT_HELLO_REPLAY_LIMIT: usize = 80;
 const TRANSPORT_HELLO_MAX_SESSIONS: usize = 12;
@@ -51,6 +54,13 @@ pub(super) struct LegacyEventScope {
     codex_sessions: HashSet<String>,
     terminals: HashSet<String>,
     delivered_cursors: std::collections::BTreeMap<String, u64>,
+}
+
+#[cfg(test)]
+impl LegacyEventScope {
+    pub(super) fn insert_terminal_for_test(&mut self, terminal_id: &str) {
+        self.terminals.insert(terminal_id.to_owned());
+    }
 }
 
 #[derive(Default)]
@@ -314,7 +324,7 @@ pub(super) async fn resume_session_cursors(
     state: &AppState,
     event_scope: &tokio::sync::RwLock<LegacyEventScope>,
     cursors: &std::collections::BTreeMap<String, u64>,
-    outgoing: &tokio::sync::mpsc::Sender<Value>,
+    outgoing: &tokio::sync::mpsc::Sender<Outbound>,
 ) -> Result<Vec<String>, AppError> {
     // Holding this connection's scope lock also buffers its live bus forwarding.
     // Replay goes only to this sender, never back into the shared event bus.
@@ -353,7 +363,7 @@ pub(super) async fn resume_session_cursors(
 
 async fn replay_gateway_to_connection(
     state: &AppState,
-    outgoing: &tokio::sync::mpsc::Sender<Value>,
+    outgoing: &tokio::sync::mpsc::Sender<Outbound>,
     session_id: &str,
     mut cursor: u64,
     high_water: u64,
@@ -376,9 +386,9 @@ async fn replay_gateway_to_connection(
             }
             cursor = record.cursor;
             outgoing
-                .send(serde_json::to_value(ServerEvent::from(
-                    gateway_event_record(record),
-                ))?)
+                .send(Outbound::Text(
+                    serde_json::to_string(&ServerEvent::from(gateway_event_record(record)))?.into(),
+                ))
                 .await
                 .map_err(|_| AppError::StreamClosed)?;
         }
@@ -394,8 +404,8 @@ async fn replay_gateway_to_connection(
 pub(super) async fn forward_legacy_event(
     state: &AppState,
     event_scope: &tokio::sync::RwLock<LegacyEventScope>,
-    outgoing: &tokio::sync::mpsc::Sender<Value>,
-    event: EventRecord,
+    outgoing: &tokio::sync::mpsc::Sender<Outbound>,
+    event: Arc<PublishedEvent>,
 ) -> Result<(), AppError> {
     let mut scope = event_scope.write().await;
     if !legacy_event_is_visible(&event, &scope) {
@@ -426,7 +436,7 @@ pub(super) async fn forward_legacy_event(
                 }
             }
             outgoing
-                .send(serde_json::to_value(ServerEvent::from(event.clone()))?)
+                .send(Outbound::Text(legacy_wire_text(&event)?))
                 .await
                 .map_err(|_| AppError::StreamClosed)?;
             scope
@@ -436,15 +446,21 @@ pub(super) async fn forward_legacy_event(
         }
     }
     outgoing
-        .send(serde_json::to_value(ServerEvent::from(event))?)
+        .send(Outbound::Text(legacy_wire_text(&event)?))
         .await
         .map_err(|_| AppError::StreamClosed)
+}
+
+/// The record as a legacy `ServerEvent`, encoded once per published record
+/// and shared by every connection that forwards it.
+pub(super) fn legacy_wire_text(event: &PublishedEvent) -> Result<Arc<str>, AppError> {
+    Ok(event.wire_text(|record| serde_json::to_string(&ServerEvent::from(record.clone())))?)
 }
 
 pub(super) async fn recover_legacy_lag(
     state: &AppState,
     event_scope: &tokio::sync::RwLock<LegacyEventScope>,
-    outgoing: &tokio::sync::mpsc::Sender<Value>,
+    outgoing: &tokio::sync::mpsc::Sender<Outbound>,
 ) -> Result<(), AppError> {
     let mut scope = event_scope.write().await;
     for session_id in scope.codex_sessions.clone() {
@@ -466,45 +482,25 @@ pub(super) async fn recover_legacy_lag(
     Ok(())
 }
 
-pub(super) fn legacy_event_is_visible(event: &EventRecord, scope: &LegacyEventScope) -> bool {
+pub(super) fn legacy_event_is_visible(event: &PublishedEvent, scope: &LegacyEventScope) -> bool {
     if event.event_type.ends_with(".audit")
         || event.event_type == "server.error"
         || event.event_type.starts_with("server.websocket.")
     {
         return false;
     }
+    // The scope id was extracted once when the record was published.
     if event.event_type.starts_with("codex.") {
-        return find_string_field(&event.payload, &["codexSessionId", "codex_session_id"], 0)
+        return event
+            .scope_id()
             .is_some_and(|id| scope.codex_sessions.contains(id));
     }
     if event.event_type.starts_with("terminal.") {
-        return find_string_field(&event.payload, &["terminalId", "terminal_id"], 0)
-            .or(event.pane_id.as_deref())
+        return event
+            .scope_id()
             .is_some_and(|id| scope.terminals.contains(id));
     }
     true
-}
-
-fn find_string_field<'a>(value: &'a Value, keys: &[&str], depth: usize) -> Option<&'a str> {
-    if depth > 8 {
-        return None;
-    }
-    match value {
-        Value::Object(object) => {
-            for key in keys {
-                if let Some(value) = object.get(*key).and_then(Value::as_str) {
-                    return Some(value);
-                }
-            }
-            object
-                .values()
-                .find_map(|value| find_string_field(value, keys, depth + 1))
-        }
-        Value::Array(values) => values
-            .iter()
-            .find_map(|value| find_string_field(value, keys, depth + 1)),
-        _ => None,
-    }
 }
 
 async fn dispatch(
@@ -2032,7 +2028,7 @@ mod tests {
         },
         config::{AgentConfig, Config, SecurityConfig},
         error::AppError,
-        event::EventRecord,
+        event::{EventRecord, PublishedEvent},
         server::protocol::{
             ClientMessage, ClientMessageKind, CodexCloudTaskApplyRequest,
             CodexCloudTaskCreateRequest, CodexGatewayAction, CodexGatewayControlRequest,
@@ -2104,8 +2100,14 @@ mod tests {
             json!({ "codexSessionId": "cdxs_injected" }),
         );
         let scope = scope.read().await;
-        assert!(legacy_event_is_visible(&allowed, &scope));
-        assert!(!legacy_event_is_visible(&rejected, &scope));
+        assert!(legacy_event_is_visible(
+            &PublishedEvent::new(allowed),
+            &scope
+        ));
+        assert!(!legacy_event_is_visible(
+            &PublishedEvent::new(rejected),
+            &scope
+        ));
         drop(scope);
 
         let mut terminal_message: ClientMessage = serde_json::from_value(json!({
@@ -3160,7 +3162,7 @@ mod tests {
             loop {
                 let event = events.recv().await.expect("receive event");
                 if event.event_type.starts_with("codex.") && event.event_type != "codex.audit" {
-                    return event.event_type;
+                    return event.event_type.clone();
                 }
             }
         })
@@ -3701,7 +3703,7 @@ mod tests {
             loop {
                 let event = events.recv().await.expect("receive event");
                 if event.event_type.starts_with("codex.mcp.") {
-                    return event.event_type;
+                    return event.event_type.clone();
                 }
             }
         })
@@ -3827,7 +3829,7 @@ mod tests {
         assert_eq!(sessions, vec![session]);
         for expected in 1..=165 {
             assert_eq!(
-                incoming.recv().await.unwrap()["payload"]["cursor"],
+                incoming.recv().await.unwrap().into_value()["payload"]["cursor"],
                 expected
             );
         }
@@ -3840,7 +3842,9 @@ mod tests {
             &state,
             &scope,
             &outgoing,
-            super::gateway_event_record(records.pop().unwrap()),
+            Arc::new(PublishedEvent::new(super::gateway_event_record(
+                records.pop().unwrap(),
+            ))),
         )
         .await
         .unwrap();
@@ -3865,17 +3869,23 @@ mod tests {
             &state,
             &scope,
             &outgoing,
-            super::gateway_event_record(newest),
+            Arc::new(PublishedEvent::new(super::gateway_event_record(newest))),
         )
         .await
         .unwrap();
-        assert_eq!(incoming.recv().await.unwrap()["payload"]["cursor"], 166);
-        assert_eq!(incoming.recv().await.unwrap()["payload"]["cursor"], 167);
+        assert_eq!(
+            incoming.recv().await.unwrap().into_value()["payload"]["cursor"],
+            166
+        );
+        assert_eq!(
+            incoming.recv().await.unwrap().into_value()["payload"]["cursor"],
+            167
+        );
         super::forward_legacy_event(
             &state,
             &scope,
             &outgoing,
-            super::gateway_event_record(missed),
+            Arc::new(PublishedEvent::new(super::gateway_event_record(missed))),
         )
         .await
         .unwrap();
@@ -3891,7 +3901,10 @@ mod tests {
         super::recover_legacy_lag(&state, &scope, &outgoing)
             .await
             .unwrap();
-        assert_eq!(incoming.recv().await.unwrap()["payload"]["cursor"], 168);
+        assert_eq!(
+            incoming.recv().await.unwrap().into_value()["payload"]["cursor"],
+            168
+        );
     }
 
     async fn test_state() -> AppState {
@@ -3950,9 +3963,9 @@ mod tests {
     }
 
     async fn wait_for_event<F>(
-        rx: &mut tokio::sync::broadcast::Receiver<EventRecord>,
+        rx: &mut tokio::sync::broadcast::Receiver<Arc<PublishedEvent>>,
         predicate: F,
-    ) -> EventRecord
+    ) -> Arc<PublishedEvent>
     where
         F: Fn(&EventRecord) -> bool,
     {

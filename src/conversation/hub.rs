@@ -1,25 +1,52 @@
+use std::ops::Deref;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use tokio::sync::broadcast;
 
 use super::ConversationEvent;
+use crate::event::WireCache;
 
 /// Every event is journaled before it is published, so a lagging receiver
 /// recovers from the journal; a small ring keeps the per-channel preallocation
 /// cheap.
 const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
+/// A published event as every live receiver gets it: one shared copy (a
+/// receiver clones the `Arc`, not the payload) plus the single wire encoding
+/// all `/v2/ws` subscriptions send.
+#[derive(Debug)]
+pub struct PublishedConversationEvent {
+    event: ConversationEvent,
+    wire: WireCache,
+}
+
+impl PublishedConversationEvent {
+    pub fn wire(&self) -> &WireCache {
+        &self.wire
+    }
+}
+
+impl Deref for PublishedConversationEvent {
+    type Target = ConversationEvent;
+
+    fn deref(&self) -> &ConversationEvent {
+        &self.event
+    }
+}
+
+pub type SharedConversationEvent = Arc<PublishedConversationEvent>;
+
 /// Live fan-out of conversation events. A channel exists only while someone
 /// listens: `subscribe` creates it, and it is reclaimed once its last receiver
 /// is gone (see [`ConversationSubscription`] and `publish`).
 #[derive(Clone, Default)]
 pub struct ConversationEventHub {
-    channels: Arc<DashMap<String, broadcast::Sender<ConversationEvent>>>,
+    channels: Arc<DashMap<String, broadcast::Sender<SharedConversationEvent>>>,
 }
 
 impl ConversationEventHub {
-    pub fn subscribe(&self, conversation_id: &str) -> broadcast::Receiver<ConversationEvent> {
+    pub fn subscribe(&self, conversation_id: &str) -> broadcast::Receiver<SharedConversationEvent> {
         // Subscribe while holding the entry lock so `release` cannot remove
         // the channel between its creation and the receiver being counted.
         self.channels
@@ -34,7 +61,7 @@ impl ConversationEventHub {
     pub fn track(
         &self,
         conversation_id: &str,
-        receiver: broadcast::Receiver<ConversationEvent>,
+        receiver: broadcast::Receiver<SharedConversationEvent>,
     ) -> ConversationSubscription {
         ConversationSubscription {
             hub: self.clone(),
@@ -61,6 +88,10 @@ impl ConversationEventHub {
         else {
             return;
         };
+        let event = Arc::new(PublishedConversationEvent {
+            event,
+            wire: WireCache::default(),
+        });
         // Every receiver is gone (e.g. dropped without `track`): reclaim.
         if let Err(broadcast::error::SendError(event)) = sender.send(event) {
             self.release(&event.conversation_id);
@@ -88,11 +119,11 @@ pub struct ConversationSubscription {
     conversation_id: String,
     /// Always `Some` until `drop`, which must drop the receiver before
     /// checking the channel's receiver count.
-    receiver: Option<broadcast::Receiver<ConversationEvent>>,
+    receiver: Option<broadcast::Receiver<SharedConversationEvent>>,
 }
 
 impl ConversationSubscription {
-    pub async fn recv(&mut self) -> Result<ConversationEvent, broadcast::error::RecvError> {
+    pub async fn recv(&mut self) -> Result<SharedConversationEvent, broadcast::error::RecvError> {
         match self.receiver.as_mut() {
             Some(receiver) => receiver.recv().await,
             None => Err(broadcast::error::RecvError::Closed),

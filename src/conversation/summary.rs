@@ -382,6 +382,17 @@ pub fn present_event(event: &mut ConversationEvent, summary: bool) {
     }
 }
 
+/// Whether `present_event(event, false)` would change `event`: only an
+/// encrypted payload carrying both ciphertexts does. Lets a shared live
+/// event be encoded without cloning it.
+pub fn full_presentation_changes(event: &ConversationEvent) -> bool {
+    event
+        .payload
+        .get(super::record::ENCRYPTED_FIELD)
+        .and_then(Value::as_object)
+        .is_some_and(|encrypted| encrypted.contains_key("f") && encrypted.contains_key("s"))
+}
+
 /// The entries of a page's `frames` that `event` refers to (`$enc.fr`),
 /// for a message carrying that one event.
 pub fn event_frames(event: &ConversationEvent, frames: &Map<String, Value>) -> Map<String, Value> {

@@ -41,7 +41,7 @@ use super::git;
 use super::history_keys;
 use super::websocket::{self, AuthContext};
 use super::ws::codec::{self as ws_socket_codec, WsTransport};
-use super::ws::socket::{self as ws_socket, send_with_deadline, SendFailure};
+use super::ws::socket::{self as ws_socket, send_with_deadline, FrameSlots, Outbound, SendFailure};
 
 /// Maximum WebSocket message size for the unified `/v2/ws` socket (8MB).
 /// Matches MAX_LEGACY_WS_MESSAGE_BYTES: chat attachments travel as base64
@@ -1961,17 +1961,66 @@ fn replay_detail(summary: bool) -> ReplayDetail {
 /// conversation carries the ciphertext frames it refers to beside it
 /// (top-level `frames`, §5.3), since each socket message is decrypted on
 /// its own.
-fn conversation_event_frame(
+/// Wire shape of a `conversation.event` message, serialized straight to text
+/// (no intermediate `Value`).
+#[derive(Serialize)]
+struct ConversationEventMessage<'a> {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    delivery: &'a str,
+    payload: &'a ConversationEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frames: Option<&'a serde_json::value::RawValue>,
+}
+
+/// A `conversation.event` message ready to queue, plus the bytes of the
+/// sealed frames it repeats (the backfill budget counts these).
+struct EncodedEventMessage {
+    text: Arc<str>,
+    frame_bytes: usize,
+}
+
+fn conversation_event_message(
     delivery: &str,
     event: &ConversationEvent,
     frames: &serde_json::Map<String, Value>,
-) -> Value {
-    let mut frame = json!({ "type": "conversation.event", "delivery": delivery, "payload": event });
+) -> Result<EncodedEventMessage, AppError> {
     let referenced = crate::conversation::event_frames(event, frames);
-    if !referenced.is_empty() {
-        frame["frames"] = Value::Object(referenced);
-    }
-    frame
+    let referenced = if referenced.is_empty() {
+        None
+    } else {
+        Some(serde_json::value::to_raw_value(&referenced)?)
+    };
+    let text = serde_json::to_string(&ConversationEventMessage {
+        message_type: "conversation.event",
+        delivery,
+        payload: event,
+        frames: referenced.as_deref(),
+    })?;
+    Ok(EncodedEventMessage {
+        text: text.into(),
+        frame_bytes: referenced.as_ref().map_or(0, |frames| frames.get().len()),
+    })
+}
+
+/// The live `conversation.event` text for a published event, encoded by the
+/// first subscription that forwards it and shared by all others.
+fn live_event_text(
+    event: &crate::conversation::SharedConversationEvent,
+) -> Result<Arc<str>, AppError> {
+    Ok(event.wire().get_or_encode(|| {
+        let mut presented: std::borrow::Cow<'_, ConversationEvent> =
+            std::borrow::Cow::Borrowed(event);
+        if crate::conversation::full_presentation_changes(event) {
+            crate::conversation::present_event(presented.to_mut(), false);
+        }
+        serde_json::to_string(&ConversationEventMessage {
+            message_type: "conversation.event",
+            delivery: "live",
+            payload: &presented,
+            frames: None,
+        })
+    })?)
 }
 
 /// Shared `detail` switch of HTTP event pages and websocket backfill:
@@ -2119,8 +2168,11 @@ fn ensure_history_client(state: &AppState, declared: bool) -> Result<(), AppErro
 
 /// Queues a frame for the send task. The read loop tears the connection down
 /// on failure instead of blocking behind a peer that stopped reading.
-async fn queue_frame(outgoing: &mpsc::Sender<Value>, value: Value) -> Result<(), SendFailure> {
-    let result = send_with_deadline(WS_QUEUE_SEND_TIMEOUT, outgoing.send(value)).await;
+async fn queue_frame(
+    outgoing: &mpsc::Sender<Outbound>,
+    message: impl Into<Outbound>,
+) -> Result<(), SendFailure> {
+    let result = send_with_deadline(WS_QUEUE_SEND_TIMEOUT, outgoing.send(message.into())).await;
     if result == Err(SendFailure::Stalled) {
         warn!(
             timeout_secs = WS_QUEUE_SEND_TIMEOUT.as_secs(),
@@ -2172,8 +2224,10 @@ async fn handle_socket(
 
     let (sender, mut receiver) = socket.split();
     let mut event_rx = state.events.subscribe();
-    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Value>(256);
-    let (send_task, close_handle) = ws_socket::spawn_sender(sender, sealer, outgoing_rx);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Outbound>(256);
+    let browser_frames = FrameSlots::default();
+    let (send_task, close_handle) =
+        ws_socket::spawn_sender(sender, sealer, outgoing_rx, browser_frames.clone());
 
     let event_scope = Arc::new(tokio::sync::RwLock::new(
         websocket::LegacyEventScope::default(),
@@ -2193,7 +2247,9 @@ async fn handle_socket(
                     )
                     .await
                     {
-                        let _ = bus_outgoing_tx.send(error_response(None, error)).await;
+                        let _ = bus_outgoing_tx
+                            .send(error_response(None, error).into())
+                            .await;
                         break;
                     }
                 }
@@ -2205,14 +2261,16 @@ async fn handle_socket(
                     )
                     .await
                     {
-                        let _ = bus_outgoing_tx.send(error_response(None, error)).await;
+                        let _ = bus_outgoing_tx
+                            .send(error_response(None, error).into())
+                            .await;
                         break;
                     }
                     // Non-journal legacy surfaces (e.g. terminal output) still need an explicit signal.
                     if let Ok(value) = serde_json::to_value(websocket::direct_error_event(
                         AppError::StreamLagged(skipped),
                     )) {
-                        if bus_outgoing_tx.send(value).await.is_err() {
+                        if bus_outgoing_tx.send(value.into()).await.is_err() {
                             break;
                         }
                     }
@@ -2221,7 +2279,7 @@ async fn handle_socket(
                     if let Ok(value) =
                         serde_json::to_value(websocket::direct_error_event(AppError::StreamClosed))
                     {
-                        let _ = bus_outgoing_tx.send(value).await;
+                        let _ = bus_outgoing_tx.send(value.into()).await;
                     }
                     break;
                 }
@@ -2263,7 +2321,7 @@ async fn handle_socket(
                 let response = handle_agent_desktop_frame(
                     &state,
                     &auth,
-                    &outgoing_tx,
+                    &browser_frames,
                     &mut browser_watches,
                     &frame,
                 )
@@ -2404,14 +2462,14 @@ async fn handle_socket(
 }
 
 /// `agentBrowser.watch { conversationId }` streams the conversation's
-/// agent browser tab as `agentBrowser.frame` (latest frame wins: frames
-/// that do not fit in the outgoing queue are dropped); `agentBrowser.unwatch`
-/// stops it. The executor frames of older desktops are answered without
+/// agent browser tab as `agentBrowser.frame` through the connection's
+/// latest-wins frame slots (an unsent frame is replaced by a newer one; the
+/// final `closed` frame is never dropped); `agentBrowser.unwatch` stops it. The executor frames of older desktops are answered without
 /// effect: the browser runs in the daemon now.
 async fn handle_agent_desktop_frame(
     state: &AppState,
     auth: &AuthContext,
-    outgoing: &mpsc::Sender<Value>,
+    frames: &FrameSlots,
     watches: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     frame: &Value,
 ) -> Option<Value> {
@@ -2430,6 +2488,7 @@ async fn handle_agent_desktop_frame(
                 if let Some(watch) = watches.remove(&conversation_id) {
                     watch.abort();
                 }
+                frames.remove(&conversation_id);
                 return id.map(|id| json!({ "id": id, "type": "server.result", "payload": { "watching": false } }));
             }
             if let Err(error) = state
@@ -2450,7 +2509,7 @@ async fn handle_agent_desktop_frame(
                     ));
                 }
                 let browser = state.agent_desktop.browser().clone();
-                let outgoing = outgoing.clone();
+                let frames = frames.clone();
                 let watched = conversation_id.clone();
                 let task = tokio::spawn(async move {
                     let mut watch = browser.watch(&watched).await;
@@ -2473,10 +2532,10 @@ async fn handle_agent_desktop_frame(
                                 "payload": { "conversationId": watched, "closed": true },
                             }),
                         };
-                        match outgoing.try_send(message) {
-                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                            Err(mpsc::error::TrySendError::Closed(_)) => break,
-                        }
+                        // Serialized here, off the send task; `Text` keeps
+                        // the frame as is.
+                        let message = Outbound::Text(message.to_string().into());
+                        frames.put(&watched, message);
                         if watch.frames.changed().await.is_err() {
                             break;
                         }
@@ -2557,7 +2616,7 @@ struct BackfillProgress {
 /// ack carrying the request id, then live events.
 struct SubscriptionWorker {
     conversations: ConversationSupervisor,
-    outgoing: mpsc::Sender<Value>,
+    outgoing: mpsc::Sender<Outbound>,
     active: Arc<Mutex<HashSet<String>>>,
     answered: Arc<AtomicBool>,
     owner_id: String,
@@ -2655,10 +2714,8 @@ impl SubscriptionWorker {
                 .take_while(|event| event.sequence <= backfill_end)
             {
                 crate::conversation::present_event(&mut event, self.summary);
-                let frame = conversation_event_frame("replay", &event, &replay.frames);
-                let carried = frame
-                    .get("frames")
-                    .map_or(0, |frames| frames.to_string().len());
+                let message = conversation_event_message("replay", &event, &replay.frames)?;
+                let carried = message.frame_bytes;
                 if carried > 0
                     && frame_bytes > 0
                     && frame_bytes + carried > MAX_WS_BACKFILL_FRAME_BYTES
@@ -2668,7 +2725,7 @@ impl SubscriptionWorker {
                 frame_bytes += carried;
                 replay_cursor = event.sequence;
                 advanced = true;
-                queue_frame(&self.outgoing, frame)
+                queue_frame(&self.outgoing, Outbound::Text(message.text))
                     .await
                     .map_err(|_| AppError::StreamClosed)?;
             }
@@ -2726,12 +2783,13 @@ impl SubscriptionWorker {
                                         ));
                                     }
                                     crate::conversation::present_event(&mut missing, false);
+                                    let message = conversation_event_message(
+                                        "replay",
+                                        &missing,
+                                        &replay.frames,
+                                    )?;
                                     outgoing
-                                        .send(conversation_event_frame(
-                                            "replay",
-                                            &missing,
-                                            &replay.frames,
-                                        ))
+                                        .send(Outbound::Text(message.text))
                                         .await
                                         .map_err(|_| AppError::StreamClosed)?;
                                     delivered_through = missing.sequence;
@@ -2754,21 +2812,23 @@ impl SubscriptionWorker {
                     }
                     delivered_through = event.sequence;
                     // The published event is the stored record: the same
-                    // ciphertext the journal holds goes out unchanged.
-                    let mut event = event;
-                    crate::conversation::present_event(&mut event, false);
-                    if outgoing
-                        .send(json!({ "type": "conversation.event", "delivery": "live", "payload": event }))
-                        .await
-                        .is_err()
-                    {
+                    // ciphertext the journal holds goes out unchanged, encoded
+                    // once for every subscription.
+                    let text = match live_event_text(&event) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            warn!(error = %error, "failed to encode live conversation event");
+                            continue;
+                        }
+                    };
+                    if outgoing.send(Outbound::Text(text)).await.is_err() {
                         break;
                     }
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     if outgoing
-                        .send(stream_lagged_frame(conversation_id, skipped))
+                        .send(stream_lagged_frame(conversation_id, skipped).into())
                         .await
                         .is_err()
                     {
@@ -2796,12 +2856,10 @@ impl SubscriptionWorker {
                                 delivered_through = event.sequence;
                                 advanced = true;
                                 crate::conversation::present_event(&mut event, false);
+                                let message =
+                                    conversation_event_message("replay", &event, &replay.frames)?;
                                 outgoing
-                                    .send(conversation_event_frame(
-                                        "replay",
-                                        &event,
-                                        &replay.frames,
-                                    ))
+                                    .send(Outbound::Text(message.text))
                                     .await
                                     .map_err(|_| AppError::StreamClosed)?;
                             }
@@ -2843,7 +2901,7 @@ fn stream_lagged_frame(conversation_id: &str, skipped: u64) -> Value {
 
 async fn dispatch_command(
     state: &AppState,
-    outgoing: &mpsc::Sender<Value>,
+    outgoing: &mpsc::Sender<Outbound>,
     subscriptions: &mut WsSubscriptions,
     event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
     owner_id: &str,
@@ -2890,7 +2948,7 @@ async fn dispatch_command(
 /// Returns an immediate payload only for a duplicate subscribe.
 async fn start_subscription(
     state: &AppState,
-    outgoing: &mpsc::Sender<Value>,
+    outgoing: &mpsc::Sender<Outbound>,
     subscriptions: &mut WsSubscriptions,
     owner_id: &str,
     command: &V2Command,
@@ -2952,7 +3010,7 @@ async fn start_subscription(
 
 async fn dispatch_command_inner(
     state: &AppState,
-    outgoing: &mpsc::Sender<Value>,
+    outgoing: &mpsc::Sender<Outbound>,
     subscriptions: &mut WsSubscriptions,
     event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
     owner_id: &str,
@@ -3823,14 +3881,16 @@ mod tests {
 
     #[tokio::test]
     async fn queue_send_distinguishes_a_full_queue_from_a_closed_one() {
-        let (outgoing, receiver) = mpsc::channel::<Value>(1);
-        send_with_deadline(Duration::from_millis(20), outgoing.send(json!(1)))
+        let (outgoing, receiver) = mpsc::channel::<Outbound>(1);
+        send_with_deadline(Duration::from_millis(20), outgoing.send(json!(1).into()))
             .await
             .unwrap();
-        let full = send_with_deadline(Duration::from_millis(20), outgoing.send(json!(2))).await;
+        let full =
+            send_with_deadline(Duration::from_millis(20), outgoing.send(json!(2).into())).await;
         assert_eq!(full, Err(SendFailure::Stalled));
         drop(receiver);
-        let closed = send_with_deadline(Duration::from_millis(20), outgoing.send(json!(3))).await;
+        let closed =
+            send_with_deadline(Duration::from_millis(20), outgoing.send(json!(3).into())).await;
         assert_eq!(closed, Err(SendFailure::Closed));
     }
 
@@ -4598,7 +4658,8 @@ mod tests {
         let received = tokio::time::timeout(Duration::from_secs(1), future_events.recv())
             .await
             .expect("future-cursor subscription should receive a live event")
-            .expect("future-cursor subscription channel should remain open");
+            .expect("future-cursor subscription channel should remain open")
+            .into_value();
         assert_eq!(received["payload"]["sequence"], 5);
         assert_eq!(received["delivery"], "live");
         // A late publisher must not make a persisted predecessor disappear.
@@ -4616,7 +4677,8 @@ mod tests {
             let received = tokio::time::timeout(Duration::from_secs(1), future_events.recv())
                 .await
                 .unwrap()
-                .unwrap();
+                .unwrap()
+                .into_value();
             assert_eq!(received["payload"]["sequence"], expected);
             assert_eq!(
                 received["delivery"],
@@ -4759,7 +4821,8 @@ mod tests {
         let received = tokio::time::timeout(Duration::from_secs(1), events.recv())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .into_value();
         assert_eq!(received["delivery"], "live");
         assert_eq!(received["payload"]["sequence"], 7);
         assert_eq!(received["payload"]["payload"]["result"], "x".repeat(4096));
@@ -7098,8 +7161,8 @@ mod tests {
     /// the backfill frames queued before it.
     async fn subscribe_and_collect(
         state: &AppState,
-        outgoing: &mpsc::Sender<Value>,
-        events: &mut mpsc::Receiver<Value>,
+        outgoing: &mpsc::Sender<Outbound>,
+        events: &mut mpsc::Receiver<Outbound>,
         subscriptions: &mut WsSubscriptions,
         id: &str,
         payload: Value,
@@ -7130,7 +7193,8 @@ mod tests {
             let frame = tokio::time::timeout(Duration::from_secs(5), events.recv())
                 .await
                 .expect("subscribe response timeout")
-                .expect("outgoing queue open");
+                .expect("outgoing queue open")
+                .into_value();
             if frame["id"] == id {
                 return (frames, frame);
             }
@@ -7296,7 +7360,8 @@ mod tests {
             let frame = tokio::time::timeout(Duration::from_secs(5), events.recv())
                 .await
                 .unwrap()
-                .unwrap();
+                .unwrap()
+                .into_value();
             if frame["id"] == "sub-1" {
                 break frame;
             }
@@ -7329,7 +7394,8 @@ mod tests {
         let received = tokio::time::timeout(Duration::from_secs(1), events.recv())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .into_value();
         assert_eq!(received["delivery"], "live");
         assert_eq!(received["payload"]["sequence"], 22);
 
@@ -7398,7 +7464,10 @@ mod tests {
         assert!(!hub.has_channel(&manifest.id));
 
         // The cancelled subscribe is answered exactly once, as a result.
-        let cancelled = events.try_recv().expect("pending subscribe is answered");
+        let cancelled = events
+            .try_recv()
+            .expect("pending subscribe is answered")
+            .into_value();
         assert_eq!(cancelled["id"], "sub");
         assert_eq!(cancelled["type"], "server.result");
         assert_eq!(cancelled["payload"]["subscribed"], false);
@@ -7440,7 +7509,8 @@ mod tests {
             let frame = tokio::time::timeout(Duration::from_secs(5), events.recv())
                 .await
                 .expect("lagged subscription keeps delivering")
-                .unwrap();
+                .unwrap()
+                .into_value();
             if frame["type"] == "server.error" {
                 lag_frame = Some(frame);
                 continue;
@@ -7493,7 +7563,10 @@ mod tests {
         assert!(deferred.is_none());
         // The conversation disappears before its backfill starts.
         store.delete(&manifest.id).await.unwrap();
-        outgoing.send(json!({ "type": "filler" })).await.unwrap();
+        outgoing
+            .send(json!({ "type": "filler" }).into())
+            .await
+            .unwrap();
         drop(permits);
 
         // The slot is free before the failure can reach the client.
@@ -7504,11 +7577,12 @@ mod tests {
         })
         .await
         .expect("a failed subscription releases its slot before reporting");
-        assert_eq!(events.recv().await.unwrap()["type"], "filler");
+        assert_eq!(events.recv().await.unwrap().into_value()["type"], "filler");
         let failure = tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .into_value();
         assert_eq!(failure["id"], "sub");
         assert_eq!(failure["type"], "server.error");
         let retry = dispatch_command(
@@ -8035,7 +8109,7 @@ mod tests {
     /// `dispatch_command_inner` future would get its own stack slot.
     async fn history_command(
         state: &AppState,
-        outgoing: &mpsc::Sender<Value>,
+        outgoing: &mpsc::Sender<Outbound>,
         subscriptions: &mut WsSubscriptions,
         event_scope: &Arc<tokio::sync::RwLock<websocket::LegacyEventScope>>,
         device_id: &str,
@@ -8341,7 +8415,7 @@ mod tests {
     /// Drains the pending `history.encryption.updated` payloads and checks
     /// that none carries key material.
     fn history_updates(
-        events: &mut tokio::sync::broadcast::Receiver<crate::event::EventRecord>,
+        events: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<crate::event::PublishedEvent>>,
     ) -> Vec<Value> {
         let allowed = [
             "epoch",
@@ -8366,7 +8440,7 @@ mod tests {
                 let key = crate::history_keys::test_support::public_key_text(byte);
                 assert!(!text.contains(&key[..64]), "public key in {text}");
             }
-            updates.push(event.payload);
+            updates.push(event.payload.clone());
         }
         updates
     }
@@ -9018,7 +9092,8 @@ mod tests {
             let message = tokio::time::timeout(Duration::from_secs(5), received.recv())
                 .await
                 .unwrap()
-                .unwrap();
+                .unwrap()
+                .into_value();
             if message["type"] == "server.result" {
                 break;
             }
@@ -9143,6 +9218,180 @@ mod tests {
             let view = client_view(&keys, &events, &frames, detail == "summary");
             let payloads: Vec<Value> = view.into_iter().map(|event| event.payload).collect();
             assert_eq!(json!(payloads), committed[wanted], "{detail}");
+        }
+    }
+
+    #[test]
+    fn live_event_text_is_encoded_once_and_keeps_only_the_full_ciphertext() {
+        let hub = crate::conversation::ConversationEventHub::default();
+        let mut first = hub.subscribe("conversation-1");
+        let mut second = hub.subscribe("conversation-1");
+        hub.publish(ConversationEvent::new(
+            "conversation-1",
+            1,
+            "agent.message.completed",
+            json!({ "$enc": { "f": "full-ciphertext", "s": "summary-ciphertext" } }),
+        ));
+        let first = live_event_text(&first.try_recv().unwrap()).unwrap();
+        let second = live_event_text(&second.try_recv().unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let message: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(message["type"], "conversation.event");
+        assert_eq!(message["delivery"], "live");
+        assert_eq!(message["payload"]["sequence"], 1);
+        assert_eq!(
+            message["payload"]["payload"]["$enc"],
+            json!({ "f": "full-ciphertext" })
+        );
+        assert!(message.get("frames").is_none());
+    }
+
+    #[test]
+    fn conversation_event_message_counts_the_frames_it_carries() {
+        let event = ConversationEvent::new(
+            "conversation-1",
+            3,
+            "agent.message.completed",
+            json!({ "$enc": { "fr": { "s": "frame-s" } } }),
+        );
+        let mut frames = serde_json::Map::new();
+        frames.insert("frame-s".to_owned(), json!({ "ct": "x".repeat(100) }));
+        frames.insert("unrelated".to_owned(), json!({ "ct": "y" }));
+        let message = conversation_event_message("replay", &event, &frames).unwrap();
+        let value: Value = serde_json::from_str(&message.text).unwrap();
+        assert_eq!(value["delivery"], "replay");
+        assert_eq!(value["payload"]["sequence"], 3);
+        assert_eq!(value["frames"].as_object().unwrap().len(), 1);
+        assert_eq!(message.frame_bytes, value["frames"].to_string().len());
+        let plain = ConversationEvent::new("conversation-1", 4, "fixture", json!({}));
+        let message = conversation_event_message("replay", &plain, &frames).unwrap();
+        assert_eq!(message.frame_bytes, 0);
+        assert!(!message.text.contains("\"frames\""));
+    }
+
+    /// Opt-in fan-out measurement: 100 subscribers × 1000 events, each turned
+    /// into the text a `/v2/ws` connection seals, once through the replaced
+    /// per-connection path (clone, `json!`, serialize) and once through the
+    /// shared encoding. Run with
+    /// `cargo test --release --bin todex-agentd -- --ignored measure_fan_out --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_fan_out() {
+        const SUBSCRIBERS: usize = 100;
+        const EVENTS: u64 = 1000;
+        let text = "lorem ipsum dolor sit amet ".repeat(40);
+        let report = |label: &str, elapsed: Duration, encodings: usize, bytes: usize| {
+            println!(
+                "{label}: {SUBSCRIBERS} subscribers x {EVENTS} events in {elapsed:?} ({:.2} us/delivery), {encodings} serializations, {bytes} wire bytes",
+                elapsed.as_secs_f64() * 1e6 / (SUBSCRIBERS as f64 * EVENTS as f64)
+            );
+        };
+        let conversation_event = |sequence: u64| {
+            ConversationEvent::new(
+                "conversation-1",
+                sequence,
+                "agent.message.delta",
+                json!({
+                    "itemId": "item-1",
+                    "turnId": "turn-1",
+                    "delta": text,
+                    "metadata": { "source": "provider", "index": sequence, "tags": ["a", "b"] },
+                }),
+            )
+        };
+        for shared in [false, true] {
+            let hub = crate::conversation::ConversationEventHub::default();
+            let mut receivers: Vec<_> = (0..SUBSCRIBERS)
+                .map(|_| hub.subscribe("conversation-1"))
+                .collect();
+            let started = std::time::Instant::now();
+            let (mut encodings, mut bytes) = (0, 0);
+            for sequence in 1..=EVENTS {
+                hub.publish(conversation_event(sequence));
+                let mut first: Option<Arc<str>> = None;
+                for receiver in &mut receivers {
+                    let event = receiver.try_recv().expect("event delivered");
+                    let wire: Arc<str> = if shared {
+                        live_event_text(&event).unwrap()
+                    } else {
+                        let mut event = ConversationEvent::clone(&event);
+                        crate::conversation::present_event(&mut event, false);
+                        json!({ "type": "conversation.event", "delivery": "live", "payload": event })
+                            .to_string()
+                            .into()
+                    };
+                    if !first
+                        .as_ref()
+                        .is_some_and(|first| Arc::ptr_eq(first, &wire))
+                    {
+                        encodings += 1;
+                    }
+                    first.get_or_insert(wire.clone());
+                    bytes += wire.len();
+                }
+            }
+            let label = if shared {
+                "conversation shared"
+            } else {
+                "conversation per-connection"
+            };
+            report(label, started.elapsed(), encodings, bytes);
+        }
+        for shared in [false, true] {
+            let bus = crate::event::EventBus::new(4096);
+            let mut receivers: Vec<_> = (0..SUBSCRIBERS).map(|_| bus.subscribe()).collect();
+            let mut scope = websocket::LegacyEventScope::default();
+            scope.insert_terminal_for_test("term_1");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let started = std::time::Instant::now();
+            let (mut encodings, mut bytes) = (0, 0);
+            for _ in 1..=EVENTS {
+                let record = crate::event::EventRecord::new(
+                    "terminal.output",
+                    None,
+                    None,
+                    Some("term_1".to_owned()),
+                    json!({ "terminalId": "term_1", "stream": "stdout", "data": text, "pty": true }),
+                );
+                runtime.block_on(bus.publish(record));
+                let mut first: Option<Arc<str>> = None;
+                for receiver in &mut receivers {
+                    let event = receiver.try_recv().expect("event delivered");
+                    let wire: Arc<str> = if shared {
+                        assert!(websocket::legacy_event_is_visible(&event, &scope));
+                        websocket::legacy_wire_text(&event).unwrap()
+                    } else {
+                        // The replaced path: a record copy per connection,
+                        // a recursive scope scan, `Value`, then text.
+                        let copy = crate::event::PublishedEvent::new(
+                            crate::event::EventRecord::clone(&event),
+                        );
+                        assert!(websocket::legacy_event_is_visible(&copy, &scope));
+                        serde_json::to_value(super::super::protocol::ServerEvent::from(
+                            crate::event::EventRecord::clone(&copy),
+                        ))
+                        .unwrap()
+                        .to_string()
+                        .into()
+                    };
+                    if !first
+                        .as_ref()
+                        .is_some_and(|first| Arc::ptr_eq(first, &wire))
+                    {
+                        encodings += 1;
+                    }
+                    first.get_or_insert(wire.clone());
+                    bytes += wire.len();
+                }
+            }
+            let label = if shared {
+                "event bus shared"
+            } else {
+                "event bus per-connection"
+            };
+            report(label, started.elapsed(), encodings, bytes);
         }
     }
 }

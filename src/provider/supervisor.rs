@@ -2370,7 +2370,7 @@ impl ConversationSupervisor {
     pub fn subscribe(
         &self,
         conversation_id: &str,
-    ) -> tokio::sync::broadcast::Receiver<crate::conversation::ConversationEvent> {
+    ) -> tokio::sync::broadcast::Receiver<crate::conversation::SharedConversationEvent> {
         self.hub.subscribe(conversation_id)
     }
 
