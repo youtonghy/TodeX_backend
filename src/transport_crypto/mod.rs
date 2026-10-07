@@ -5,18 +5,14 @@
 //! - Transport v2 (`docs/transport-v2.md`): [`handshake`] (key agreement and
 //!   key schedule), [`channel`] (sealed records and WebSocket frames) and
 //!   [`envelope`] (REST record streams and the inner request/response).
-//! - [`legacy`]: the v1 `todex.crypto.v1` WebSocket wrapper, accepted while
-//!   clients migrate.
 pub(crate) mod channel;
 pub(crate) mod envelope;
 pub(crate) mod handshake;
-mod legacy;
 pub(crate) mod pairing_browser;
 #[cfg(test)]
 mod vector_tests;
 
 pub(crate) use channel::TransportCryptoError;
-pub use legacy::TransportCryptoSession;
 
 use std::net::IpAddr;
 use std::path::Path;

@@ -924,9 +924,10 @@ exit 3
     #[tokio::test]
     async fn route_rejects_remote_peers_browsers_and_bad_tokens() {
         let harness = harness().await;
-        let app = || crate::server::router(harness.state.clone());
+        let app = || crate::server::loopback_test_router(harness.state.clone());
         let status = |request: Request| async { app().oneshot(request).await.unwrap().status() };
 
+        // Remote peers are already stopped by the transport v2 enforcement.
         assert_eq!(
             status(mcp_request(
                 "192.168.1.9:5000",
@@ -934,7 +935,7 @@ exit 3
                 initialize()
             ))
             .await,
-            StatusCode::FORBIDDEN
+            StatusCode::UPGRADE_REQUIRED
         );
         let mut browser = mcp_request("127.0.0.1:5000", Some(&harness.token), initialize());
         browser
@@ -983,7 +984,7 @@ exit 3
         use rmcp::ServiceExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = crate::server::router(harness.state.clone());
+        let app = crate::server::loopback_test_router(harness.state.clone());
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -1283,7 +1284,7 @@ exit 3
             .await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = crate::server::router(harness.state.clone());
+        let app = crate::server::loopback_test_router(harness.state.clone());
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -1329,7 +1330,7 @@ exit 3
         let harness = harness().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = crate::server::router(harness.state.clone());
+        let app = crate::server::loopback_test_router(harness.state.clone());
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -1449,7 +1450,7 @@ exit 3
         let harness = harness().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = crate::server::router(harness.state.clone());
+        let app = crate::server::loopback_test_router(harness.state.clone());
         tokio::spawn(async move {
             axum::serve(
                 listener,

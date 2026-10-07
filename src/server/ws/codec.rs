@@ -1,10 +1,8 @@
-//! Frame codecs for `/v2/ws`. Three transports implement the same pair of
+//! Frame codecs for `/v2/ws`. Both transports implement the same pair of
 //! traits, so the read/write loops and the business dispatcher never branch
 //! on encryption:
 //!
 //! - plaintext: JSON text frames (loopback peers);
-//! - transport v1 (`todex.crypto.v1`): JSON-wrapped encrypted text frames,
-//!   accepted while clients migrate;
 //! - transport v2 (`docs/transport-v2.md`): a text hello from the server,
 //!   then sealed binary frames in both directions.
 use axum::extract::ws::{Message, WebSocket};
@@ -18,9 +16,7 @@ use crate::config::PairingEncryption;
 use crate::error::AppError;
 use crate::transport_crypto::channel::{SecureChannel, WsFrameOpener, WsFrameSealer};
 use crate::transport_crypto::handshake::{decode_b64url, NONCE_LENGTH, WS_LABEL};
-use crate::transport_crypto::{
-    query_value, EncryptionProtocol, TransportCryptoError, TransportCryptoSession,
-};
+use crate::transport_crypto::{query_value, EncryptionProtocol, TransportCryptoError};
 
 /// What one received WebSocket message means to the read loop.
 pub(crate) enum Inbound {
@@ -48,7 +44,7 @@ pub(crate) struct WsCodec {
     pub sealer: Box<dyn FrameSealer>,
     pub opener: Box<dyn FrameOpener>,
     pub protocol: Option<EncryptionProtocol>,
-    /// `0` plaintext, `1` legacy, `2` transport v2.
+    /// `0` plaintext, `2` transport v2.
     pub transport_version: u8,
 }
 
@@ -73,32 +69,6 @@ impl FrameOpener for PlainOpener {
             Message::Text(text) => Inbound::Text(text.to_string()),
             other => control(other),
         })
-    }
-}
-
-struct V1Sealer(TransportCryptoSession);
-impl FrameSealer for V1Sealer {
-    fn seal(&mut self, text: &str) -> Result<Message, TransportCryptoError> {
-        self.0
-            .encrypt_server_text(text)
-            .map(|text| Message::Text(text.into()))
-            .map_err(|_| TransportCryptoError::new("v1 frame seal"))
-    }
-}
-
-struct V1Opener(TransportCryptoSession);
-impl FrameOpener for V1Opener {
-    fn open(&mut self, message: Message) -> Result<Inbound, TransportCryptoError> {
-        match message {
-            // A frame that fails to decrypt (tampered, replayed, out of
-            // order) leaves the receive counter unusable: close.
-            Message::Text(text) => self
-                .0
-                .decrypt_client_text(&text)
-                .map(Inbound::Text)
-                .map_err(|_| TransportCryptoError::new("v1 frame open")),
-            other => Ok(control(other)),
-        }
     }
 }
 
@@ -132,15 +102,6 @@ impl WsCodec {
         }
     }
 
-    fn legacy(session: TransportCryptoSession) -> Self {
-        Self {
-            protocol: Some(session.protocol()),
-            sealer: Box::new(V1Sealer(session.clone())),
-            opener: Box::new(V1Opener(session)),
-            transport_version: 1,
-        }
-    }
-
     fn v2(channel: SecureChannel, protocol: EncryptionProtocol) -> Self {
         Self {
             sealer: Box::new(V2Sealer(channel.sealer)),
@@ -154,7 +115,6 @@ impl WsCodec {
 /// The transport an upgrade request asked for, checked before the upgrade.
 pub(crate) enum WsTransport {
     Plaintext,
-    Legacy(TransportCryptoSession),
     V2(V2Offer),
 }
 
@@ -168,9 +128,10 @@ pub(crate) struct V2Offer {
 
 impl WsTransport {
     /// Reads `tv`, `enc` and the handshake material from the (signed)
-    /// upgrade query. Protocol-level problems answer before the upgrade:
-    /// an unknown `tv` is `426 PROTOCOL_UPGRADE_REQUIRED`, a protocol other
-    /// than the server's required one is refused like in v1.
+    /// upgrade query. Protocol-level problems answer before the upgrade: an
+    /// unknown `tv` or a v1 `enc=` without `tv` is `426
+    /// PROTOCOL_UPGRADE_REQUIRED`; plaintext while the server requires
+    /// encryption, or a protocol other than the required one, is `403`.
     pub(crate) fn negotiate(
         state: &AppState,
         headers: &HeaderMap,
@@ -178,17 +139,23 @@ impl WsTransport {
     ) -> Result<Self, AppError> {
         let required = state.config.pairing_encryption;
         let Some(version) = query_value(query, "tv") else {
-            return Ok(
-                match TransportCryptoSession::from_headers_and_query(
-                    &state.pairing_keys,
-                    required,
-                    headers,
-                    query,
-                )? {
-                    Some(session) => Self::Legacy(session),
-                    None => Self::Plaintext,
-                },
-            );
+            // Transport v1 (`enc=` without `tv`) is retired.
+            if query_value(query, "enc").is_some_and(|enc| enc != "none")
+                || headers
+                    .get("x-todex-encryption")
+                    .is_some_and(|value| value.as_bytes() != b"none")
+            {
+                return Err(AppError::ProtocolUpgradeRequired(
+                    "transport v1 is retired; connect with tv=2".to_owned(),
+                ));
+            }
+            if required != PairingEncryption::None {
+                return Err(AppError::Unauthorized(format!(
+                    "Encryption public-key transfer verification is incomplete; server requires {} transport encryption",
+                    required.as_str()
+                )));
+            }
+            return Ok(Self::Plaintext);
         };
         if version != "2" {
             return Err(AppError::ProtocolUpgradeRequired(format!(
@@ -227,7 +194,6 @@ impl WsTransport {
     ) -> Option<WsCodec> {
         let offer = match self {
             Self::Plaintext => return Some(WsCodec::plaintext()),
-            Self::Legacy(session) => return Some(WsCodec::legacy(session)),
             Self::V2(offer) => offer,
         };
         let mut server_nonce = [0_u8; NONCE_LENGTH];

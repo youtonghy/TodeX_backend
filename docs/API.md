@@ -59,6 +59,8 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 
 认证策略是 fail-closed 的：`enable_auth = true` 时匿名 `/v2/ws` 握手直接被拒绝（401），不存在“先连上再限制命令”的匿名模式；`enable_auth = false` 的本地部署才会以本地信任模式接受匿名连接。关闭认证时监听地址必须是回环地址（`127.0.0.1`、`::1`），否则 daemon 拒绝启动（TUI 也拒绝保存这种监听地址）；匿名请求（HTTP 与 `/v2/ws` 升级）的 `Host` 必须是 `localhost` 或回环 IP（可带端口），`Origin` 若存在须为回环主机的 `http(s)` 源、`null`（Electron `loadFile` 页面的 fetch）或 `file://`（其 WebSocket），否则返回 403 `UNAUTHORIZED`，用于防御 DNS rebinding 与跨站 WebSocket 劫持。开启认证时不做此检查。认证中间件先校验凭证（header 或 query 齐全、时间戳在窗口内、设备已登记）再读取请求体，缺少或无效凭证的请求在读取请求体前即返回 401。没有可配置的共享凭据：设备只能通过配对流程登记（见 `POST /v2/device-pairing/*`）。
 
+非回环对端只能经 transport v2 访问 API（见 [transport-v2.md](transport-v2.md)）：直接可达的只有 `/health`、`/v2/transport-policy`、`/v2/version`、`/v2/device-pairing/*`、`/v2/sealed` 和带 `tv=2` 的 `/v2/ws`，其余请求（包括未知路径）返回 426 `PROTOCOL_UPGRADE_REQUIRED`；经 `/v2/sealed` 隧道的内层请求视为已走 v2。回环对端仍可使用明文 REST 与 WebSocket。监听非回环地址时 `pairing_encryption` 不能为 `none`，否则 daemon 拒绝启动（TUI 也拒绝保存这种组合）。
+
 ## v2 Conversation API
 
 Provider 标识为 `acp`、`codex`、`pi`、`claude-code`、`grok-build`、`devin`、`opencode`（创建请求也接受 `grok` / `grok_build`、`devin-cli` / `devin_cli` 与 `open-code` / `open_code` 别名）。未指定时使用 `[agent].default_agent`，默认是 `codex`。ACP 必须使用后端 `config.toml` 中预配置的 `providerProfile`；客户端不能提交任意 command、args 或 env。
@@ -705,11 +707,10 @@ Computer Use 由 daemon 在**自己所在的主机**上执行（`src/computer`�
 
 ## WebSocket 协议
 
-业务消息都是 JSON 文本。帧格式取决于握手选择的传输（`src/server/ws/codec.rs` 中三种 codec，业务分发只接触 JSON）：
+业务消息都是 JSON 文本。帧格式取决于握手选择的传输（`src/server/ws/codec.rs` 中的 codec，业务分发只接触 JSON）：
 
 - 明文（回环对端）：文本帧即 JSON，二进制帧忽略。
 - transport v2（`tv=2`）：升级后服务端先发一条文本 hello `{"type":"todex.transport.hello","version":2,"serverNonce":"<b64url 32B>"}`，客户端收到前不得发送；之后双向都是二进制帧 `u64_be(i) || XChaCha20-Poly1305 密文`。完整规范见 [transport-v2.md](transport-v2.md)。
-- transport v1（`todex.crypto.v1`，迁移期间暂留）：业务 JSON 包装在加密文本帧中。
 
 连接示例：
 
@@ -718,7 +719,7 @@ Computer Use 由 daemon 在**自己所在的主机**上执行（`src/computer`�
 TUI 配对二维码只携带后端地址、当前首选加密方式和服务端公钥，不携带任何访问凭据——设备身份一律走 `/v2/device-pairing` 配对流程登记。
 
 - transport v2：`ws://.../v2/ws?tv=2&enc=<x25519|ml-kem-768>&client_nonce=<b64url 32B>&client_key=<b64url>`（ML-KEM-768 用 `ciphertext=<b64url>` 代替 `client_key`），再加设备签名参数。会话密钥由 HKDF-SHA256 从共享秘密与 transcript（含签名凭证里的 `device_id`，关闭认证时为空串、双方 nonce）派生，每个方向独立密钥与严格递增计数器，服务端 nonce 每次连接新鲜生成，重放握手不会得到相同密钥。`tv` 不是 `2` 时升级前返回 426 `PROTOCOL_UPGRADE_REQUIRED`；协议与服务端 `pairing_encryption` 不符返回 403；握手材料畸形、帧解密失败、计数器不连续或 hello 之后收到文本帧时以 close code `4400`、reason `transport crypto failure` 关闭，不带细节。
-- transport v1：`?enc=x25519&client_key=...` 或 `?enc=ml-kem-768&ciphertext=...`（无 `tv`）。v1 密钥只取决于客户端材料，服务端在 600 秒（设备签名时间窗的两倍）内拒绝重复的握手材料；登记表最多 65,536 条，满时新握手返回 `RESOURCE_EXHAUSTED`，旧条目过期后自动恢复，不再需要重启 daemon。帧解密失败时以 `4400` 关闭连接。
+- transport v1（`todex.crypto.v1`，`enc=` 而无 `tv`）已停用：升级前返回 426 `PROTOCOL_UPGRADE_REQUIRED`。不带 `enc` 的明文握手只接受回环对端，且服务端 `pairing_encryption` 必须为 `none`（否则 403）。
 
 兼容端点已移除：`/v1/ws` 与 `/v1/*` HTTP 不再注册，访问返回 404。旧客户端必须升级。
 
@@ -1077,7 +1078,7 @@ TUI 配对二维码只携带后端地址、当前首选加密方式和服务端�
 | `REMOTE_UNREACHABLE` | 远程主机不可达或连接中断（HTTP 502），会话随之关闭。 |
 | `REMOTE_PERMISSION_DENIED` | 远程服务器拒绝该文件操作（HTTP 403）；与 TodeX 设备认证无关。 |
 | `REMOTE_OPERATION_FAILED` | 其他远程文件操作失败（HTTP 422）。 |
-| `PROTOCOL_UPGRADE_REQUIRED` | 请求使用了已停用的协议（HTTP 426）：`/v2/ws` 的 `tv` 不是 `2`，或配对 `create` 仍提交 `clientPublicKey`（配对 v2）；需升级客户端。 |
+| `PROTOCOL_UPGRADE_REQUIRED` | 请求使用了已停用的协议（HTTP 426）：非回环对端绕过 transport v2 直接访问、`/v2/ws` 的 `tv` 不是 `2` 或仍用 v1 `enc=`，或配对 `create` 仍提交 `clientPublicKey`（配对 v2）；需升级客户端。 |
 | `TRANSPORT_CRYPTO_FAILED` | `POST /v2/sealed` 的外层无法打开（HTTP 400），不含细节；WebSocket 上对应 close code `4400`。 |
 | `CLIENT_UPGRADE_REQUIRED` | 历史已端到端加密，而客户端未声明 `historyEncryption=1`（HTTP 426）；需升级客户端。 |
 | `HISTORY_ACCESS_REVOKED` | 调用方设备已被封禁历史访问（HTTP 403）：除 `history.encryption.get` 外的 `history.*` 命令均拒绝，需另一台设备调用 `history.device.restore`。 |

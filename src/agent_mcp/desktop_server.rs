@@ -871,7 +871,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = crate::server::router(state.clone());
+        let app = crate::server::loopback_test_router(state.clone());
         tokio::spawn(async move {
             axum::serve(
                 listener,

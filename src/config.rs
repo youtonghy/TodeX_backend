@@ -372,10 +372,16 @@ impl Config {
 
     /// Without device authentication only this machine may reach the daemon,
     /// so a non-loopback listener is refused instead of serving every network
-    /// peer anonymously.
+    /// peer anonymously. Non-loopback peers must use transport v2, which
+    /// needs a pairing key, so such a listener also needs
+    /// `pairing_encryption` other than `none`.
     pub fn ensure_listener_matches_auth(&self) -> anyhow::Result<()> {
-        ensure_listener_matches_auth(&self.host, self.security.enable_auth)
-            .map_err(anyhow::Error::msg)
+        ensure_listener_matches_auth(
+            &self.host,
+            self.security.enable_auth,
+            self.pairing_encryption,
+        )
+        .map_err(anyhow::Error::msg)
     }
 
     /// The first configured root; `workspace_roots` is never empty after load.
@@ -432,15 +438,29 @@ impl Config {
 
 /// Shared by startup and the TUI host editor; see
 /// [`Config::ensure_listener_matches_auth`].
-pub fn ensure_listener_matches_auth(host: &str, enable_auth: bool) -> Result<(), String> {
-    if enable_auth || crate::listen_addrs::is_loopback_host(host) {
+pub fn ensure_listener_matches_auth(
+    host: &str,
+    enable_auth: bool,
+    pairing_encryption: PairingEncryption,
+) -> Result<(), String> {
+    if crate::listen_addrs::is_loopback_host(host) {
         return Ok(());
     }
-    Err(format!(
-        "device authentication is disabled (security.enable_auth = false) but the listener \
-         {host} is not a loopback address; bind to 127.0.0.1 or ::1, or enable device \
-         authentication"
-    ))
+    if !enable_auth {
+        return Err(format!(
+            "device authentication is disabled (security.enable_auth = false) but the listener \
+             {host} is not a loopback address; bind to 127.0.0.1 or ::1, or enable device \
+             authentication"
+        ));
+    }
+    if pairing_encryption == PairingEncryption::None {
+        return Err(format!(
+            "transport encryption is disabled (pairing_encryption = \"none\") but the listener \
+             {host} is not a loopback address; remote clients must use encrypted transport \
+             v2, so choose x25519 or ml-kem-768, or bind to 127.0.0.1 or ::1"
+        ));
+    }
+    Ok(())
 }
 
 impl Default for Config {
@@ -848,19 +868,28 @@ mod tests {
 
     #[test]
     fn disabled_auth_requires_a_loopback_listener() {
+        let none = PairingEncryption::None;
+        let x25519 = PairingEncryption::X25519;
         for host in ["127.0.0.1", "::1", "[::1]"] {
-            assert!(
-                super::ensure_listener_matches_auth(host, false).is_ok(),
-                "{host}"
-            );
+            for (auth, encryption) in [(false, none), (true, none), (false, x25519)] {
+                assert!(
+                    super::ensure_listener_matches_auth(host, auth, encryption).is_ok(),
+                    "{host}"
+                );
+            }
         }
         for host in ["0.0.0.0", "::", "192.168.1.20"] {
-            let error = super::ensure_listener_matches_auth(host, false).unwrap_err();
+            let error = super::ensure_listener_matches_auth(host, false, x25519).unwrap_err();
             assert!(error.contains("enable_auth = false"), "{error}");
-            assert!(
-                super::ensure_listener_matches_auth(host, true).is_ok(),
-                "{host}"
-            );
+            // Remote peers must use transport v2, which needs a pairing key.
+            let error = super::ensure_listener_matches_auth(host, true, none).unwrap_err();
+            assert!(error.contains("pairing_encryption"), "{error}");
+            for encryption in [x25519, PairingEncryption::MlKem768] {
+                assert!(
+                    super::ensure_listener_matches_auth(host, true, encryption).is_ok(),
+                    "{host}"
+                );
+            }
         }
         let config = Config {
             host: "0.0.0.0".to_owned(),

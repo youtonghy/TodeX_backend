@@ -1,6 +1,7 @@
 mod agent_desktop;
 mod agent_providers;
 mod device_pairing;
+mod enforcement;
 mod git;
 mod history_keys;
 pub mod protocol;
@@ -39,9 +40,22 @@ pub fn router(state: AppState) -> Router {
     // the tunnel itself, so nesting is impossible.
     api.clone()
         .merge(sealed::routes(api, state.clone()))
+        // Inside CORS, so browsers can read the 426.
+        .layer(axum::middleware::from_fn(enforcement::enforce_transport_v2))
         .layer(compression_layer())
         .layer(cors_layer(&state.config.host))
         .layer(TraceLayer::new_for_http())
+}
+
+/// The router as in-process tests drive it with `oneshot`: without a served
+/// connection there is no peer address, which the transport enforcement
+/// treats as remote, so these requests come from a mocked loopback peer
+/// (an explicit `ConnectInfo` extension still wins).
+#[cfg(test)]
+pub(crate) fn loopback_test_router(state: AppState) -> Router {
+    router(state).layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+    ))
 }
 
 /// Responses below this size are sent as-is; gzip framing would not pay off.

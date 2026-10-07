@@ -715,3 +715,168 @@ async fn sealed_tunnel_filters_headers_marks_requests_and_streams_bodies() {
     let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
     assert_eq!(open_response(down, &bytes).status, 404);
 }
+
+async fn oneshot_status(app: &Router, request: Request) -> (StatusCode, Bytes) {
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    (
+        status,
+        to_bytes(response.into_body(), 1 << 20).await.unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn non_loopback_peers_only_reach_bootstrap_routes_and_transport_v2() {
+    let server = TestServer::start(PairingEncryption::X25519).await;
+    let keys = server.state.pairing_keys.clone();
+    let device = TestDevice::new(33);
+    device.enroll(&server.root.join("data"));
+    let app = super::router(server.state.clone());
+    let remote: SocketAddr = "192.0.2.9:5555".parse().unwrap();
+    let loopback: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let mapped: SocketAddr = "[::ffff:127.0.0.1]:5555".parse().unwrap();
+    let signed_get = |peer: Option<SocketAddr>, uri: &str| {
+        let mut builder = Request::builder().uri(uri);
+        for (name, value) in device.sign("GET", uri, &[]) {
+            builder = builder.header(name, value);
+        }
+        if let Some(peer) = peer {
+            builder = builder.extension(ConnectInfo(peer));
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+
+    // Direct REST: loopback (also IPv4-mapped) passes, remote or unknown
+    // peers get 426.
+    for peer in [loopback, mapped] {
+        assert_eq!(
+            oneshot_status(&app, signed_get(Some(peer), "/v2/workspaces"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    for peer in [Some(remote), None] {
+        let (status, body) = oneshot_status(&app, signed_get(peer, "/v2/workspaces")).await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "PROTOCOL_UPGRADE_REQUIRED");
+    }
+    // A plain WebSocket upgrade, or a v1 one, from a remote peer.
+    for uri in ["/v2/ws", "/v2/ws?enc=x25519"] {
+        assert_eq!(
+            oneshot_status(&app, signed_get(Some(remote), uri)).await.0,
+            StatusCode::UPGRADE_REQUIRED
+        );
+    }
+    // Bootstrap routes stay direct.
+    for uri in ["/health", "/v2/transport-policy", "/v2/version"] {
+        let request = Request::builder()
+            .uri(uri)
+            .extension(ConnectInfo(remote))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            oneshot_status(&app, request).await.0,
+            StatusCode::OK,
+            "{uri}"
+        );
+    }
+    let create = Request::builder()
+        .method("POST")
+        .uri("/v2/device-pairing/create")
+        .header("content-type", "application/json")
+        .extension(ConnectInfo(remote))
+        .body(Body::from(
+            json!({
+                "clientCommitment": encode_b64(&[1; 32]),
+                "deviceName": "remote",
+                "devicePublicKey": device.public_key_b64(),
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(oneshot_status(&app, create).await.0, StatusCode::OK);
+    // A tv=2 upgrade passes the filter (this one-shot request cannot
+    // actually upgrade, so the WebSocket extractor rejects it instead).
+    let tv2 = signed_get(Some(remote), "/v2/ws?tv=2&enc=x25519");
+    assert_ne!(
+        oneshot_status(&app, tv2).await.0,
+        StatusCode::UPGRADE_REQUIRED
+    );
+
+    // The tunnel works for the remote peer; its inner request is marked as
+    // arriving through v2 and reaches the authenticated route.
+    let inner = signed_inner(&device, "GET", "/v2/workspaces", &[]);
+    let sealed = seal_request(&keys, EncryptionProtocol::X25519, &inner);
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/v2/sealed")
+        .extension(ConnectInfo(remote));
+    for (name, value) in &sealed.headers {
+        request = request.header(*name, value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::from(sealed.body)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(open_response(sealed.down, &bytes).status, 200);
+}
+
+#[tokio::test]
+async fn websocket_without_tv_is_plaintext_only_and_transport_v1_is_retired() {
+    let server = TestServer::start(PairingEncryption::X25519).await;
+    let device = TestDevice::new(34);
+    device.enroll(&server.root.join("data"));
+    let keys = server.state.pairing_keys.clone();
+    let offer = ws_offer(&keys, EncryptionProtocol::X25519);
+    let v1 = offer.query.replace("tv=2&", "");
+    let status = |result: Result<_, tokio_tungstenite::tungstenite::Error>| match result {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => response.status().as_u16(),
+        Ok(_) => 101,
+        Err(other) => panic!("{other}"),
+    };
+    assert_eq!(
+        status(tokio_tungstenite::connect_async(signed_ws_url(server.address, &device, &v1)).await),
+        426
+    );
+    // Loopback plaintext keeps today's rule: refused while the server
+    // requires encryption.
+    assert_eq!(
+        status(
+            tokio_tungstenite::connect_async(signed_ws_url(server.address, &device, "enc=none"))
+                .await
+        ),
+        403
+    );
+
+    let plain = TestServer::start(PairingEncryption::None).await;
+    device.enroll(&plain.root.join("data"));
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(signed_ws_url(plain.address, &device, "enc=none"))
+            .await
+            .unwrap();
+    socket
+        .send(Message::Text(
+            json!({"id": "plain", "type": "server.ping", "payload": {}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+                let message: Value = serde_json::from_str(&text).unwrap();
+                if message["id"] == "plain" {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+}

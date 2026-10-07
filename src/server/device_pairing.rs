@@ -157,7 +157,7 @@ mod tests {
             ..crate::config::Config::default()
         };
         let state = AppState::new(config.clone()).await.unwrap();
-        let app = super::super::router(state);
+        let app = super::super::loopback_test_router(state);
         let client = StaticSecret::from([7; 32]);
         let client_public = PublicKey::from(&client);
         let device = crate::device_auth::test_support::TestDevice::new(21);

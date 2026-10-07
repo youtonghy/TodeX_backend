@@ -1911,8 +1911,12 @@ impl TuiApp {
             } => match validate_host(&value).and_then(|host| {
                 // The daemon refuses to start on this combination; reject it
                 // here so the saved config never holds it.
-                crate::config::ensure_listener_matches_auth(&host, self.config.security.enable_auth)
-                    .map(|()| host)
+                crate::config::ensure_listener_matches_auth(
+                    &host,
+                    self.config.security.enable_auth,
+                    self.config.pairing_encryption,
+                )
+                .map(|()| host)
             }) {
                 Ok(host) => {
                     self.config.host = host;
@@ -1945,6 +1949,19 @@ impl TuiApp {
                 }
             },
             EditMode::Encryption { value } => {
+                // Same rule as the host editor: never save a configuration
+                // the daemon refuses to start with.
+                if let Err(error) = crate::config::ensure_listener_matches_auth(
+                    &self.config.host,
+                    self.config.security.enable_auth,
+                    value,
+                ) {
+                    self.last_error = Some(error);
+                    self.notice = self
+                        .text("Transport encryption was not changed.", "传输加密未更改。")
+                        .to_owned();
+                    return Ok(());
+                }
                 self.config.pairing_encryption = value;
                 let subject = self
                     .text(

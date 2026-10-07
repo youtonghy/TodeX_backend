@@ -562,7 +562,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let app = crate::server::router(state);
+        let app = crate::server::loopback_test_router(state);
         let device = TestDevice::new(23);
         device.enroll(&root.join("data"));
         let uri = "/v2/remote/connections/missing/upload?path=%2Ftmp%2Fx.bin&offset=0";

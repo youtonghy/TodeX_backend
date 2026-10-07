@@ -223,11 +223,24 @@ fn inner_request(
     }
     // Only the peer address carries over: the inner request gets no other
     // outer extension (body limits, matched route, ...).
-    if let Some(connect_info) = outer_extensions.get::<ConnectInfo<SocketAddr>>() {
-        request.extensions_mut().insert(*connect_info);
+    if let Some(peer) = peer_address(outer_extensions) {
+        request.extensions_mut().insert(ConnectInfo(peer));
     }
     request.extensions_mut().insert(ArrivedViaTransportV2);
     Ok(request)
+}
+
+/// The peer address the way the `ConnectInfo` extractor resolves it: the
+/// served connection's, or axum's test-only `MockConnectInfo`.
+pub(crate) fn peer_address(extensions: &axum::http::Extensions) -> Option<SocketAddr> {
+    extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| *peer)
+        .or_else(|| {
+            extensions
+                .get::<axum::extract::connect_info::MockConnectInfo<SocketAddr>>()
+                .map(|mock| mock.0)
+        })
 }
 
 /// `200 application/vnd.todex.sealed` whose body is the inner response

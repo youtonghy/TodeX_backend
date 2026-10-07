@@ -3910,7 +3910,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let app = crate::server::router(state.clone());
+        let app = crate::server::loopback_test_router(state.clone());
         let device = enroll(&root.join("data"));
         let request = |device: Option<&TestDevice>, operation: Value| {
             let body = json!({"workspacePath":workspace, "operation":operation}).to_string();
@@ -4166,7 +4166,7 @@ mod tests {
         .await
         .unwrap();
         let device = enroll(&root.join("data"));
-        let app = crate::server::router(state.clone());
+        let app = crate::server::loopback_test_router(state.clone());
 
         let unauthenticated = app
             .clone()
@@ -4405,7 +4405,7 @@ mod tests {
         .await
         .unwrap();
         let device = enroll(&root.join("data"));
-        let app = crate::server::router(state.clone());
+        let app = crate::server::loopback_test_router(state.clone());
         let manifest = state
             .conversations
             .create_owned(
@@ -4836,7 +4836,7 @@ mod tests {
             .await
             .unwrap();
         let device = enroll(&root.join("data"));
-        let app = crate::server::router(state.clone());
+        let app = crate::server::loopback_test_router(state.clone());
         let manifest = state
             .conversations
             .create_owned(
@@ -5348,7 +5348,7 @@ mod tests {
         .await
         .unwrap();
         let device = enroll(&root.join("data"));
-        let app = crate::server::router(state);
+        let app = crate::server::loopback_test_router(state);
 
         let version = app
             .clone()
@@ -5568,7 +5568,7 @@ mod tests {
         .await
         .unwrap();
         let device = enroll(&root.join("data"));
-        let app = crate::server::router(state);
+        let app = crate::server::loopback_test_router(state);
 
         // `/v2/version` mirrors the unauthenticated daemon self-check contract.
         let version = app
@@ -6257,7 +6257,7 @@ mod tests {
         .await
         .unwrap();
         let device = enroll(&root.join("data"));
-        let app = crate::server::router(state);
+        let app = crate::server::loopback_test_router(state);
 
         let workspace_entry = |name: &str, path: &Path| {
             json!({
@@ -6474,7 +6474,7 @@ mod tests {
             .set_owned("local", &workspace, true)
             .await
             .unwrap();
-        let app = crate::server::router(state.clone());
+        let app = crate::server::loopback_test_router(state.clone());
         let device = enroll(&root.join("data"));
 
         let scan = app
@@ -6798,7 +6798,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let app = crate::server::router(state);
+        let app = crate::server::loopback_test_router(state);
 
         for (method, path) in [
             ("GET", "/v1/version"),
@@ -6895,7 +6895,7 @@ mod tests {
         }
 
         let device = enroll(&root.join("data"));
-        let app = crate::server::router(state);
+        let app = crate::server::loopback_test_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -7021,7 +7021,7 @@ mod tests {
         // Token-less deployments keep the historical local trust model: the
         // handshake succeeds under the synthetic `local` principal.
         let state = AppState::new(base.clone()).await.unwrap();
-        let app = crate::server::router(state);
+        let app = crate::server::loopback_test_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -7052,7 +7052,7 @@ mod tests {
         let state = AppState::new(secured).await.unwrap();
         let device = enroll(&secured_data_dir);
         let other = TestDevice::new(23);
-        let app = crate::server::router(state);
+        let app = crate::server::loopback_test_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -7592,7 +7592,7 @@ mod tests {
     #[tokio::test]
     async fn anonymous_access_is_limited_to_loopback_host_and_local_origins() {
         let root = std::env::temp_dir().join(format!("todex-v2-local-origin-{}", Uuid::new_v4()));
-        let app = crate::server::router(anonymous_test_state(&root).await);
+        let app = crate::server::loopback_test_router(anonymous_test_state(&root).await);
         let status = |host: Option<&'static str>, origin: Option<&'static str>| {
             let app = app.clone();
             async move {
@@ -7670,7 +7670,7 @@ mod tests {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
         let root = std::env::temp_dir().join(format!("todex-v2-ws-origin-{}", Uuid::new_v4()));
-        let app = crate::server::router(anonymous_test_state(&root).await);
+        let app = crate::server::loopback_test_router(anonymous_test_state(&root).await);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -7696,7 +7696,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("todex-v2-auth-body-{}", Uuid::new_v4()));
         let state = auth_test_state(&root).await;
         let device = enroll(&root.join("data"));
-        let app = crate::server::router(state);
+        let app = crate::server::loopback_test_router(state);
         // Reading this body fails, which the middleware would report as
         // INVALID_REQUEST; UNAUTHENTICATED proves it was never polled.
         let unread_body = || {
@@ -7747,7 +7747,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("todex-v2-browser-watch-{}", Uuid::new_v4()));
         let state = auth_test_state(&root).await;
         let device = enroll(&root.join("data"));
-        let app = crate::server::router(state.clone());
+        let app = crate::server::loopback_test_router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -7814,7 +7814,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("todex-v2-agent-desktop-{}", Uuid::new_v4()));
         let state = auth_test_state(&root).await;
         let device = enroll(&root.join("data"));
-        let app = crate::server::router(state.clone());
+        let app = crate::server::loopback_test_router(state.clone());
         let send = |request: Request<Body>| {
             let app = app.clone();
             async move {
@@ -8836,7 +8836,7 @@ mod tests {
         registry
             .set_mode(crate::config::HistoryEncryption::E2e)
             .unwrap();
-        let app = crate::server::router(state.clone());
+        let app = crate::server::loopback_test_router(state.clone());
         let store = state.conversation_store();
         // Created through the store: no `conversation.created` record, whose
         // workspace path would differ between runs.

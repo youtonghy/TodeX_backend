@@ -145,10 +145,6 @@ and no further detail.
 
 ## Enforcement
 
-> Backend status: `/v2/transport-policy` already advertises
-> `transportVersion: 2`; the route restrictions, the startup check and the
-> removal of transport v1 land once every client has migrated.
-
 - `/v2/transport-policy` adds `"transportVersion": 2`.
 - A non-loopback listener with `pairing_encryption = "none"` is a startup
   error. Loopback listeners may keep `none`.
@@ -284,12 +280,19 @@ derived keys).
   commitment discards the request; a second reveal answers `409 CONFLICT`.
   `poll` and `cancel` before `reveal` answer `401`.
 
-## Transport v1 during the migration
+## Enforcement in the backend
 
-Until the enforcement step lands, `/v2/ws` still accepts the v1
-`enc=<protocol>&client_key|ciphertext=...` upgrade without `tv`. Its keys
-depend only on the client material, so the server remembers used handshakes
-for twice the device-auth clock window (600 s) and refuses a repeat; entries
-age out, and a full registry (65,536 entries) fails new handshakes with
-`RESOURCE_EXHAUSTED` until entries expire instead of permanently. A v1 frame
-that does not decrypt closes the connection with `4400`.
+- `server::enforcement` runs inside CORS (so browsers can read the 426)
+  for every route, including unknown ones. The peer is the served
+  connection's address; a request without one is treated as remote.
+  IPv4-mapped loopback addresses count as loopback.
+- Inner tunnel requests carry `ArrivedViaTransportV2` and the outer peer
+  address; they run through the router without the enforcement layer.
+- `/v2/device-pairing/*` stays direct: clients pair before they have a
+  pinned key and never call it through the tunnel.
+- Startup (`Config::ensure_listener_matches_auth`, also used by the TUI host
+  and encryption editors) refuses a non-loopback listener with
+  `pairing_encryption = "none"`.
+- Transport v1 is removed: an `enc=<protocol>` upgrade without `tv` (or an
+  `x-todex-encryption` header other than `none`) answers `426`. A loopback
+  plaintext upgrade still needs `pairing_encryption = "none"`, as before.
