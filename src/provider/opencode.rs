@@ -201,7 +201,7 @@ impl OpencodeDriver {
     /// together, so sharing a cached probe per workspace turns two 4-8s cold
     /// spawns into one; the cache makes the second query wait for the first.
     async fn discovery_snapshot(&self, workspace: &Path) -> Result<DiscoverySnapshot, AppError> {
-        let key = DiscoveryKey::new(&self.binary, workspace);
+        let key = DiscoveryKey::new(&self.binary, workspace).await;
         self.discovery
             .get_or_fetch(&key, || async {
                 let (mut process, session, updates) = self.session_probe(workspace).await?;

@@ -331,7 +331,7 @@ impl DevinDriver {
     /// catalog; reuse it briefly so independent client queries share a single
     /// spawn (and a single interactive authentication when no key is set).
     async fn discovery_snapshot(&self, workspace: &Path) -> Result<DiscoverySnapshot, AppError> {
-        let key = DiscoveryKey::new(&self.binary, workspace);
+        let key = DiscoveryKey::new(&self.binary, workspace).await;
         self.discovery
             .get_or_fetch(&key, || async {
                 let (mut process, session, updates) = self.session_probe(workspace).await?;
@@ -437,7 +437,7 @@ impl ProviderDriver for DevinDriver {
         let result = async {
             let initialize = initialize_process(&mut process).await?;
             let capable = declares_session_fork(&initialize);
-            self.fork_probe.insert(&(), capable, FORK_PROBE_TTL).await;
+            self.fork_probe.insert(&(), capable, FORK_PROBE_TTL);
             if !capable {
                 return Err(AppError::Unsupported(
                     "Devin does not declare sessionCapabilities.fork".to_owned(),
@@ -1136,14 +1136,11 @@ mod tests {
             commands: Vec::new(),
             complete: false,
         };
-        driver
-            .discovery
-            .insert(
-                &DiscoveryKey::new(&driver.binary, &workspace),
-                snapshot,
-                DISCOVERY_TTL,
-            )
-            .await;
+        driver.discovery.insert(
+            &DiscoveryKey::new(&driver.binary, &workspace).await,
+            snapshot,
+            DISCOVERY_TTL,
+        );
         let models = driver.discover_models(&workspace).await.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "swe-2-high");
@@ -1250,7 +1247,7 @@ mod tests {
         }
         assert!(driver
             .discovery
-            .is_fresh(&DiscoveryKey::new(&driver.binary, &root)));
+            .is_fresh(&DiscoveryKey::new(&driver.binary, &root).await));
 
         assert_eq!(
             fixture_calls(&root, "session/new").len(),

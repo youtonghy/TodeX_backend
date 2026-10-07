@@ -306,8 +306,7 @@ impl ProviderDriver for AcpDriver {
             let initialize = acp_control_response(&mut process, &request_id).await?;
             let capable = declares_session_fork(&initialize);
             self.fork_probe
-                .insert(&profile_name, capable, FORK_PROBE_TTL)
-                .await;
+                .insert(&profile_name, capable, FORK_PROBE_TTL);
             if !capable {
                 return Err(AppError::Unsupported(
                     "ACP agent does not declare sessionCapabilities.fork".to_owned(),

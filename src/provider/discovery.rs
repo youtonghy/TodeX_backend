@@ -6,7 +6,8 @@
 //! at once. [`DiscoveryCache`] keeps each result for a TTL and runs at most
 //! one fetch per key at a time (single-flight): concurrent callers for the
 //! same key wait for the running fetch, other keys proceed in parallel.
-//! Failures are not cached.
+//! A failure is handed to the callers that waited for it but not cached
+//! for later ones.
 //!
 //! Keys carry what invalidates a result besides time: the workspace, the
 //! managed provider configuration revision
@@ -34,7 +35,47 @@ struct Entry<V> {
     expires: Instant,
 }
 
-type Slot<V> = Arc<tokio::sync::Mutex<Option<Entry<V>>>>;
+/// What a fetch for one key left behind.
+struct Stored<V> {
+    entry: Option<Entry<V>>,
+    /// The latest failure and when it happened. Shared only with callers
+    /// that were already waiting for that fetch, never with later ones.
+    failure: Option<(Instant, AppError)>,
+}
+
+impl<V> Default for Stored<V> {
+    fn default() -> Self {
+        Self {
+            entry: None,
+            failure: None,
+        }
+    }
+}
+
+struct SlotState<V> {
+    /// Read without waiting, so a running fetch never hides the last value.
+    stored: Mutex<Stored<V>>,
+    /// Held by the running fetch: one fetch per key at a time.
+    flight: tokio::sync::Mutex<()>,
+}
+
+type Slot<V> = Arc<SlotState<V>>;
+
+impl<V: Clone> SlotState<V> {
+    fn stored(&self) -> std::sync::MutexGuard<'_, Stored<V>> {
+        self.stored
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn fresh(&self, now: Instant) -> Option<V> {
+        self.stored()
+            .entry
+            .as_ref()
+            .filter(|entry| entry.expires > now)
+            .map(|entry| entry.value.clone())
+    }
+}
 
 pub(super) struct DiscoveryCache<K, V> {
     slots: Mutex<HashMap<K, Slot<V>>>,
@@ -53,6 +94,14 @@ impl<K: Clone + Eq + Hash, V: Clone> DiscoveryCache<K, V> {
         Self::default()
     }
 
+    fn existing(&self, key: &K) -> Option<Slot<V>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .cloned()
+    }
+
     fn slot(&self, key: &K) -> Slot<V> {
         let mut slots = self
             .slots
@@ -67,77 +116,115 @@ impl<K: Clone + Eq + Hash, V: Clone> DiscoveryCache<K, V> {
             slots.retain(|_, slot| {
                 Arc::strong_count(slot) > 1
                     || slot
-                        .try_lock()
-                        .map(|entry| entry.as_ref().is_some_and(|entry| entry.expires > now))
-                        .unwrap_or(true)
+                        .stored()
+                        .entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.expires > now)
             });
         }
-        slots.entry(key.clone()).or_default().clone()
+        slots
+            .entry(key.clone())
+            .or_insert_with(|| {
+                Arc::new(SlotState {
+                    stored: Mutex::new(Stored::default()),
+                    flight: tokio::sync::Mutex::new(()),
+                })
+            })
+            .clone()
     }
 
     /// The cached value for `key`, or the result of `fetch`, which returns
-    /// the value with its time to live.
+    /// the value with its time to live. Callers that waited for a fetch that
+    /// failed get its error instead of running the fetch again; if the
+    /// running fetch is cancelled, the next waiter fetches.
     pub(super) async fn get_or_fetch<F, Fut>(&self, key: &K, fetch: F) -> Result<V, AppError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(V, Duration), AppError>>,
     {
         let slot = self.slot(key);
-        let mut entry = slot.lock().await;
-        if let Some(cached) = entry
-            .as_ref()
-            .filter(|entry| entry.expires > Instant::now())
-        {
-            return Ok(cached.value.clone());
+        let waiting_since = Instant::now();
+        if let Some(value) = slot.fresh(waiting_since) {
+            return Ok(value);
         }
-        let (value, ttl) = fetch().await?;
-        *entry = Some(Entry {
-            value: value.clone(),
-            expires: Instant::now() + ttl,
-        });
-        Ok(value)
+        let _flight = slot.flight.lock().await;
+        {
+            let stored = slot.stored();
+            if let Some(entry) = stored
+                .entry
+                .as_ref()
+                .filter(|entry| entry.expires > Instant::now())
+            {
+                return Ok(entry.value.clone());
+            }
+            if let Some((_, error)) = stored
+                .failure
+                .as_ref()
+                .filter(|(failed_at, _)| *failed_at >= waiting_since)
+            {
+                return Err(shared_error(error));
+            }
+        }
+        match fetch().await {
+            Ok((value, ttl)) => {
+                let mut stored = slot.stored();
+                stored.entry = Some(Entry {
+                    value: value.clone(),
+                    expires: Instant::now() + ttl,
+                });
+                stored.failure = None;
+                Ok(value)
+            }
+            Err(error) => {
+                slot.stored().failure = Some((Instant::now(), shared_error(&error)));
+                Err(error)
+            }
+        }
     }
 
-    /// The last value stored for `key`, even if it expired, unless a fetch
-    /// is running for it right now.
+    /// The last value stored for `key`, even if it expired or a fetch for it
+    /// is running.
     pub(super) fn peek(&self, key: &K) -> Option<V> {
-        let slot = self
-            .slots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(key)?
-            .clone();
-        let entry = slot.try_lock().ok()?;
-        entry.as_ref().map(|entry| entry.value.clone())
+        self.existing(key)?
+            .stored()
+            .entry
+            .as_ref()
+            .map(|entry| entry.value.clone())
     }
 
     /// Whether `key` holds an unexpired value.
     pub(super) fn is_fresh(&self, key: &K) -> bool {
-        let Some(slot) = self
-            .slots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(key)
-            .cloned()
-        else {
-            return false;
-        };
-        slot.try_lock()
-            .map(|entry| {
-                entry
-                    .as_ref()
-                    .is_some_and(|entry| entry.expires > Instant::now())
-            })
-            .unwrap_or(false)
+        self.existing(key)
+            .is_some_and(|slot| slot.fresh(Instant::now()).is_some())
     }
 
     /// Stores `value` for `key` outside a fetch (a result learned on the way).
-    pub(super) async fn insert(&self, key: &K, value: V, ttl: Duration) {
-        let slot = self.slot(key);
-        *slot.lock().await = Some(Entry {
+    pub(super) fn insert(&self, key: &K, value: V, ttl: Duration) {
+        self.slot(key).stored().entry = Some(Entry {
             value,
             expires: Instant::now() + ttl,
         });
+    }
+}
+
+/// A copy of `error` for callers that shared the failed fetch. `AppError` is
+/// not `Clone` (it wraps I/O errors); variants a fetch reports are copied
+/// as-is, anything else keeps its message as a provider failure.
+fn shared_error(error: &AppError) -> AppError {
+    match error {
+        AppError::ProviderUnavailable(detail) => AppError::ProviderUnavailable(detail.clone()),
+        AppError::Unsupported(detail) => AppError::Unsupported(detail.clone()),
+        AppError::InvalidRequest(detail) => AppError::InvalidRequest(detail.clone()),
+        AppError::Conflict(detail) => AppError::Conflict(detail.clone()),
+        AppError::NotFound(detail) => AppError::NotFound(detail.clone()),
+        AppError::Unauthorized(detail) => AppError::Unauthorized(detail.clone()),
+        AppError::WorkspaceTrustRequired(detail) => {
+            AppError::WorkspaceTrustRequired(detail.clone())
+        }
+        AppError::ResourceExhausted(detail) => AppError::ResourceExhausted(detail.clone()),
+        AppError::Unauthenticated => AppError::Unauthenticated,
+        AppError::TurnCancelled => AppError::TurnCancelled,
+        other => AppError::ProviderUnavailable(other.to_string()),
     }
 }
 
@@ -177,12 +264,20 @@ pub(super) struct DiscoveryKey {
 
 impl DiscoveryKey {
     /// The key for `binary` run in `workspace` under the current managed
-    /// configuration.
-    pub(super) fn new(binary: &str, workspace: &Path) -> Self {
+    /// configuration. Resolving the CLI walks PATH and stats the file, so it
+    /// runs on the blocking pool.
+    pub(super) async fn new(binary: &str, workspace: &Path) -> Self {
+        let program = binary.to_owned();
+        let cli = tokio::task::spawn_blocking(move || super::process::executable_stamp(&program))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %error, "CLI stamp lookup failed");
+                None
+            });
         Self {
             workspace: workspace.to_path_buf(),
             revision: crate::agent_providers::config_revision(),
-            cli: super::process::executable_stamp(binary),
+            cli,
         }
     }
 }
@@ -214,7 +309,7 @@ impl<V: Clone> CatalogCache<V> {
             return fetch.await;
         };
         self.cache
-            .get_or_fetch(&DiscoveryKey::new(binary, workspace), || async move {
+            .get_or_fetch(&DiscoveryKey::new(binary, workspace).await, || async move {
                 Ok((fetch.await?, ttl))
             })
             .await
@@ -288,12 +383,108 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(190));
     }
 
-    #[test]
-    fn keys_follow_the_managed_config_revision() {
+    #[tokio::test]
+    async fn keys_follow_the_managed_config_revision() {
         let workspace = Path::new("/tmp");
-        let before = DiscoveryKey::new("/nonexistent/cli", workspace);
+        let before = DiscoveryKey::new("/nonexistent/cli", workspace).await;
         crate::agent_providers::bump_config_revision();
-        assert_ne!(before, DiscoveryKey::new("/nonexistent/cli", workspace));
+        assert_ne!(
+            before,
+            DiscoveryKey::new("/nonexistent/cli", workspace).await
+        );
+    }
+
+    #[tokio::test]
+    async fn peek_reads_the_stored_value_while_a_refresh_runs() {
+        let cache = Arc::new(DiscoveryCache::<&'static str, bool>::new());
+        cache.insert(&"k", true, Duration::ZERO);
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let refresh = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                cache
+                    .get_or_fetch(&"k", || async move {
+                        let _ = held.await;
+                        Ok((false, Duration::from_secs(60)))
+                    })
+                    .await
+            }
+        });
+        while !cache
+            .existing(&"k")
+            .is_some_and(|slot| slot.flight.try_lock().is_err())
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cache.peek(&"k"), Some(true));
+        assert!(!cache.is_fresh(&"k"));
+        release.send(()).unwrap();
+        assert!(!refresh.await.unwrap().unwrap());
+        assert_eq!(cache.peek(&"k"), Some(false));
+    }
+
+    #[tokio::test]
+    async fn waiters_share_a_failure_but_later_callers_fetch_again() {
+        let cache = Arc::new(DiscoveryCache::<&'static str, usize>::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let failing = |calls: Arc<AtomicUsize>| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Err::<(usize, Duration), _>(AppError::Unsupported("no catalog".to_owned()))
+        };
+        let (a, b, c) = tokio::join!(
+            cache.get_or_fetch(&"k", || failing(calls.clone())),
+            cache.get_or_fetch(&"k", || failing(calls.clone())),
+            cache.get_or_fetch(&"k", || failing(calls.clone())),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for result in [a, b, c] {
+            assert!(matches!(result, Err(AppError::Unsupported(detail)) if detail == "no catalog"));
+        }
+        assert_eq!(
+            cache
+                .get_or_fetch(&"k", || async { Ok((5, Duration::from_secs(60))) })
+                .await
+                .unwrap(),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_fetch_lets_the_next_waiter_fetch() {
+        let cache = Arc::new(DiscoveryCache::<&'static str, usize>::new());
+        let leader = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                cache
+                    .get_or_fetch(&"k", || {
+                        std::future::pending::<Result<(usize, Duration), AppError>>()
+                    })
+                    .await
+            }
+        });
+        while !cache
+            .existing(&"k")
+            .is_some_and(|slot| slot.flight.try_lock().is_err())
+        {
+            tokio::task::yield_now().await;
+        }
+        let follower = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                cache
+                    .get_or_fetch(&"k", || async { Ok((9, Duration::from_secs(60))) })
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        leader.abort();
+        let value = tokio::time::timeout(Duration::from_secs(5), follower)
+            .await
+            .expect("follower hung after the leader was cancelled")
+            .unwrap()
+            .unwrap();
+        assert_eq!(value, 9);
     }
 
     #[tokio::test]
