@@ -292,12 +292,15 @@ pub(crate) fn installed_app(identifier: &str) -> Option<Target> {
 }
 
 pub(crate) fn open_app(identifier: &str) -> Result<(), String> {
-    if let Some(app) = running_app(identifier) {
+    // The same resolution `installed_app` checked against the policy, then
+    // launched by that bundle id (not by name, which `open -a` may resolve
+    // to another app).
+    let app = installed_app(identifier).ok_or_else(|| format!("no app named {identifier}"))?;
+    if app.pid != 0 {
         return activate(app.pid, None);
     }
-    let by_id = identifier.contains('.') && !identifier.ends_with(".app");
     let status = Command::new("open")
-        .args([if by_id { "-b" } else { "-a" }, identifier])
+        .args(["-b", &app.id])
         .status()
         .map_err(|error| format!("could not run open: {error}"))?;
     if !status.success() {
