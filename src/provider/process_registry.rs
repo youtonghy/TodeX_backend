@@ -207,18 +207,21 @@ mod unix {
                 });
                 true
             });
+            // Owns the record from here: if this future is dropped while the
+            // write below runs, the record is removed again.
+            let tracked = TrackedProcess {
+                registry: self.clone(),
+                pid,
+            };
             if let Some(snapshot) = snapshot {
-                let registry = self.clone();
+                let registry = self;
                 if let Err(error) =
                     tokio::task::spawn_blocking(move || registry.write(snapshot)).await
                 {
                     tracing::warn!(error = %error, "failed to persist the provider process registry");
                 }
             }
-            Some(TrackedProcess {
-                registry: self,
-                pid,
-            })
+            Some(tracked)
         }
 
         /// Applies `change` to the records; returns the new snapshot when it
@@ -557,6 +560,38 @@ mod tests {
                 break;
             }
             assert!(tokio::time::Instant::now() < deadline, "{released}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_track_leaves_no_record_behind() {
+        let root = temp_dir("todex-provider-registry-cancel");
+        let path = root.join("provider_processes.json");
+        let registry = ProcessRegistry::new(path.clone(), None);
+        let mut child = spawn_group_leader();
+        // Cancelled while the record is being written (or just after).
+        let _ = tokio::time::timeout(
+            Duration::ZERO,
+            registry.clone().track(child.id(), "fixture"),
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let recorded = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            if recorded
+                .as_ref()
+                .is_some_and(|file| file["processes"] == serde_json::json!([]))
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{recorded:?}");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 

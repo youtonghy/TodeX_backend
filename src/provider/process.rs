@@ -180,6 +180,9 @@ impl JsonLineProcess {
             }
         })?;
         let pid = child.id();
+        // Until `Self` owns the child, an abandoned spawn (cancelled while
+        // tracking, or failed below) must still kill the whole group.
+        let group = SpawnedGroup(pid);
         let tracked = match pid {
             Some(pid) => process_registry::track(pid, &spec.program).await,
             None => None,
@@ -195,6 +198,7 @@ impl JsonLineProcess {
         })?;
         let stderr = Arc::new(Mutex::new(VecDeque::new()));
         let stderr_task = tokio::spawn(drain_stderr(stderr_reader, stderr.clone()));
+        group.disarm();
 
         Ok(Self {
             child,
@@ -743,6 +747,25 @@ pub(crate) fn provider_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// Kills a just-spawned [`provider_command`] child's process group on drop
+/// unless disarmed; `kill_on_drop` alone reaches only the group leader.
+struct SpawnedGroup(Option<u32>);
+
+impl SpawnedGroup {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for SpawnedGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0 {
+            signal_process_group(pid, libc::SIGKILL);
+        }
+    }
+}
+
 /// Kills a [`provider_command`] child and every process in its group.
 pub(crate) async fn kill_process_tree(child: &mut Child) {
     #[cfg(unix)]
@@ -957,6 +980,32 @@ mod tests {
             reads.push(classify_line(line));
         }
         reads
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_abandoned_spawn_kills_the_whole_process_group() {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = provider_command("sh")
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .spawn()
+            .unwrap();
+        let group = SpawnedGroup(child.id());
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).await.unwrap();
+        let grandchild: i32 = line.trim().parse().unwrap();
+        drop(group);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only checks that the process exists.
+        while unsafe { libc::kill(grandchild, 0) } == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild survived"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = child.wait().await;
     }
 
     #[cfg(unix)]
