@@ -5,7 +5,9 @@
 //! A prompt names who may answer ([`Answerer`]): any paired device (a
 //! `permission.requested` like a provider's tool approval), or only the
 //! person at the daemon's host (a native dialog there). Concurrent asks for
-//! the same thing in one conversation ask once; a declined or unanswered
+//! the same thing in one conversation ask once, except one-action
+//! confirmations ([`Prompt::once`]), which each get their own answer; a
+//! declined or unanswered
 //! prompt is not shown again for [`DECLINE_BACKOFF`], so a looping agent
 //! cannot flood anyone with dialogs. Cancelling the tool call ends the wait.
 //!
@@ -125,6 +127,23 @@ pub(super) struct Prompt {
     pub details: Value,
     /// `permission.requested` options ([`Answerer::AnyDevice`]).
     pub options: Value,
+    /// Approves one action only (see [`action_key`]): its host dialog is
+    /// never shared with another caller and an answer nobody waited for
+    /// is dropped instead of kept for the next ask.
+    pub once: bool,
+}
+
+/// The key of a one-action prompt: `base` plus a digest of what exactly
+/// would run, so declines back off per action and no other action can be
+/// mistaken for this one.
+pub(super) fn action_key(base: &str, action: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(action.to_string().as_bytes());
+    let hex: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{base}:{hex}")
 }
 
 /// The tool call was abandoned (the client cancelled the request).
@@ -251,6 +270,13 @@ impl AuthorizerState {
     }
 }
 
+fn dialog_stays() -> Denied {
+    Denied::new(
+        "CANCELLED",
+        "the call was cancelled; the dialog on the host stays until answered",
+    )
+}
+
 /// The prompts of one MCP call.
 pub(super) struct Authorizer<'a> {
     pub state: &'a Arc<AuthorizerState>,
@@ -372,22 +398,21 @@ impl Authorizer<'_> {
         cancel: &CancelSignal,
     ) -> Result<Approval, Denied> {
         let key = prompt_key(conversation_id, &prompt.key);
-        let late = locked(&self.state.late_answers)
-            .remove(&key)
-            .filter(|(at, _)| at.elapsed() < LATE_ANSWER_TTL)
-            .map(|(_, answer)| answer);
+        let late = if prompt.once {
+            None
+        } else {
+            locked(&self.state.late_answers)
+                .remove(&key)
+                .filter(|(at, _)| at.elapsed() < LATE_ANSWER_TTL)
+                .map(|(_, answer)| answer)
+        };
         let answer = match late {
             Some(answer) => answer,
             None => {
-                let mut answer = self.host_dialog(key, prompt);
+                let mut answer = self.host_dialog(key, prompt, cancel).await?;
                 let waited = tokio::select! {
                     result = answer.wait_for(Option::is_some) => result.map(|answer| (*answer).flatten()).ok(),
-                    () = cancel.cancelled() => {
-                        return Err(Denied::new(
-                            "CANCELLED",
-                            "the call was cancelled; the dialog on the host stays until answered",
-                        ));
-                    }
+                    () = cancel.cancelled() => return Err(dialog_stays()),
                 };
                 // The dialog task always sends before it ends.
                 waited.unwrap_or(None)
@@ -410,13 +435,43 @@ impl Authorizer<'_> {
     }
 
     /// The host dialog for `key`: the one already on screen, or a new one.
-    fn host_dialog(&self, key: String, prompt: Prompt) -> watch::Receiver<Option<HostAnswer>> {
-        let mut dialogs = locked(&self.state.host_dialogs);
-        if let Some(answer) = dialogs.get(&key) {
-            return answer.clone();
+    /// A one-action prompt never takes over another caller's dialog: it
+    /// waits until that one is answered (so dialogs do not stack), then
+    /// shows its own.
+    async fn host_dialog(
+        &self,
+        key: String,
+        prompt: Prompt,
+        cancel: &CancelSignal,
+    ) -> Result<watch::Receiver<Option<HostAnswer>>, Denied> {
+        loop {
+            let mut on_screen = {
+                let mut dialogs = locked(&self.state.host_dialogs);
+                match dialogs.get(&key) {
+                    Some(answer) if !prompt.once => return Ok(answer.clone()),
+                    Some(answer) => answer.clone(),
+                    None => {
+                        let (sender, receiver) = watch::channel(None);
+                        dialogs.insert(key.clone(), receiver.clone());
+                        self.show_host_dialog(key, prompt, sender);
+                        return Ok(receiver);
+                    }
+                }
+            };
+            tokio::select! {
+                // Answered (or its task ended): look again.
+                _ = on_screen.wait_for(Option::is_some) => {}
+                () = cancel.cancelled() => return Err(dialog_stays()),
+            }
         }
-        let (sender, receiver) = watch::channel(None);
-        dialogs.insert(key.clone(), receiver.clone());
+    }
+
+    fn show_host_dialog(
+        &self,
+        key: String,
+        prompt: Prompt,
+        sender: watch::Sender<Option<HostAnswer>>,
+    ) {
         let state = self.state.clone();
         let computer = self.desktop.computer();
         tokio::spawn(async move {
@@ -425,12 +480,11 @@ impl Authorizer<'_> {
                 .confirm(prompt.title, prompt.message, CONFIRM_TIMEOUT)
                 .await;
             locked(&state.host_dialogs).remove(&key);
-            if sender.send(Some(answer)).is_err() {
+            if sender.send(Some(answer)).is_err() && !prompt.once {
                 // Everyone gave up waiting: keep it for the next ask.
                 locked(&state.late_answers).insert(key, (Instant::now(), answer));
             }
         });
-        receiver
     }
 
     /// The gate for a tool with side effects, by the conversation's
@@ -491,6 +545,7 @@ impl Authorizer<'_> {
                                 { "id": "allow_always", "kind": "allow_always", "name": "Always allow in this conversation" },
                                 { "id": "reject_once", "kind": "reject_once", "name": "Reject" }
                             ]),
+                            once: false,
                         },
                         cancel,
                     )

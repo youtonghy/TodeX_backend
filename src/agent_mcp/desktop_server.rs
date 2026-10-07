@@ -26,7 +26,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
-    authorizer::{Answerer, Authorizer, CancelSignal, Prompt, CONFIRM_TIMEOUT},
+    authorizer::{
+        action_key, Answerer, Authorizer, CancelSignal, Prompt, ToolMode, CONFIRM_TIMEOUT,
+    },
     desktop_computer::{self, ComputerCall},
     registry::{
         self, parse, schema, tool_error, untrusted, BoxFuture, Invocation, Prepared, ToolEntry,
@@ -370,7 +372,8 @@ fn browser_tools() -> Vec<ToolEntry<DesktopTools, DesktopCall>> {
                 format!(
                     "Open this conversation's browser tab and load a URL. The browser runs on the computer \
                      the TodeX backend runs on, so localhost is that computer; the user watches it live and \
-                     approves the first use. {page_note}"
+                     approves the first use. Loading a page can change things, so this is unavailable in \
+                     Plan mode and approved per call in ask mode. {page_note}"
                 ),
                 schema(json!({
                     "type": "object",
@@ -380,7 +383,7 @@ fn browser_tools() -> Vec<ToolEntry<DesktopTools, DesktopCall>> {
                 })),
             )
             .with_annotations(ToolAnnotations::new().read_only(false).open_world(false)),
-            false,
+            true,
             prepare_open,
         ),
         entry(
@@ -576,6 +579,7 @@ impl DesktopTools {
             Err(error) => return tool_error(format!("cannot read the conversation: {error}")),
         };
         let browser = desktop.browser().clone();
+        let may_reload = self.authorizer().state.tool_mode(conversation_id) != ToolMode::Plan;
         let invoke = |args: Value| {
             let browser = browser.clone();
             let workspace = workspace.clone();
@@ -585,7 +589,7 @@ impl DesktopTools {
             let cancelled = context.ct.clone();
             async move {
                 tokio::select! {
-                    result = tokio::time::timeout(timeout, browser.invoke(&conversation_id, &workspace, tool, &args)) => {
+                    result = tokio::time::timeout(timeout, browser.invoke(&conversation_id, &workspace, tool, &args, may_reload)) => {
                         result.unwrap_or_else(|_| Err(BrowserError::new("TIMEOUT", format!("{tool} took longer than {timeout:?}"))))
                     }
                     () = cancelled.cancelled() => Err(BrowserError::new("CANCELLED", "the call was cancelled")),
@@ -747,6 +751,7 @@ impl DesktopTools {
                         { "id": "allow", "kind": "allow_always", "name": "Allow for this conversation" },
                         { "id": "reject", "kind": "reject_once", "name": "Deny" }
                     ]),
+                    once: false,
                 },
                 cancel,
             )
@@ -794,7 +799,10 @@ impl DesktopTools {
             .ask(
                 conversation_id,
                 Prompt {
-                    key: "sensitive:browser".to_owned(),
+                    key: action_key(
+                        "sensitive:browser",
+                        &json!({ "tool": call.tool, "args": call.args, "reason": reason }),
+                    ),
                     answerer: Answerer::AnyDevice,
                     kind: ACTION_KIND,
                     message: title.clone(),
@@ -804,6 +812,7 @@ impl DesktopTools {
                         { "id": "allow", "kind": "allow_once", "name": "Allow once" },
                         { "id": "reject", "kind": "reject_once", "name": "Deny" }
                     ]),
+                    once: true,
                 },
                 cancel,
             )
@@ -1485,6 +1494,19 @@ mod tests {
             text(&refused)
         );
         assert_eq!(acts(&seen), 0);
+        // Opening loads a page, which can change things too.
+        let open = call(
+            &client,
+            "browser_open",
+            json!({ "url": "http://localhost:5173/" }),
+        )
+        .await;
+        assert!(text(&open).starts_with("PLAN_MODE"), "{}", text(&open));
+        assert!(!seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(tool, _)| tool == "browser_open"));
         let snapshot = call(&client, "browser_snapshot", json!({})).await;
         assert_ne!(snapshot.is_error, Some(true), "{}", text(&snapshot));
         assert!(
@@ -1665,6 +1687,7 @@ mod tests {
             message: "m".into(),
             details: Value::Null,
             options: Value::Null,
+            once: false,
         };
 
         // The call is cancelled while the dialog is up: it returns now.
@@ -1714,6 +1737,128 @@ mod tests {
         let late = authorizer.ask(&conversation_id, prompt(), &cancel).await;
         assert!(late.is_ok(), "{late:?}");
         assert_eq!(fake.confirmations.lock().unwrap().len(), 2);
+        let _ = client.cancel().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_action_host_prompts_never_share_or_reuse_an_answer() {
+        use super::super::authorizer::{action_key, Answerer, CancelSignal, Prompt};
+        let (root, state, conversation_id, client) = harness().await;
+        let fake = Arc::new(FakeComputer::default());
+        state
+            .agent_desktop
+            .set_computer(crate::computer::Computer::with_host(fake.clone()));
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *fake.hold.lock().unwrap() = Some(hold.clone());
+        let authorizer = state.agent_mcp.authorizer(&state.conversations);
+        let typed = |text: &str| {
+            action_key(
+                "sensitive:computer",
+                &json!({ "tool": "computer_act", "args": { "action": "type", "text": text } }),
+            )
+        };
+        assert_ne!(typed("a"), typed("b"));
+        assert_eq!(typed("a"), typed("a"));
+        let prompt = |key: String, title: &str| Prompt {
+            key,
+            answerer: Answerer::Host,
+            kind: "desktop_computer_action",
+            title: title.into(),
+            message: "m".into(),
+            details: Value::Null,
+            options: Value::Null,
+            once: true,
+        };
+        let shown = |count: usize| {
+            let fake = fake.clone();
+            async move {
+                for _ in 0..500 {
+                    if fake.confirmations.lock().unwrap().len() >= count {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                panic!("expected {count} dialogs");
+            }
+        };
+
+        // Cancelled while its dialog is up; the same action asked again
+        // waits for that dialog to go, then shows its own.
+        let (cancel_tx, cancel) = CancelSignal::manual();
+        let (first, ()) = tokio::join!(
+            authorizer.ask(&conversation_id, prompt(typed("a"), "a"), &cancel),
+            async {
+                shown(1).await;
+                let _ = cancel_tx.send(true);
+            }
+        );
+        assert_eq!(first.unwrap_err().code, "CANCELLED");
+        let (_keep, cancel) = CancelSignal::manual();
+        let (second, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                authorizer.ask(&conversation_id, prompt(typed("a"), "a"), &cancel),
+                async {
+                    // The orphaned dialog says yes: that answer is not
+                    // taken by the waiting call.
+                    fake.answers.lock().unwrap().push_back(Some(true));
+                    hold.notify_one();
+                    shown(2).await;
+                    fake.answers.lock().unwrap().push_back(Some(false));
+                    hold.notify_one();
+                }
+            )
+        })
+        .await
+        .expect("the second dialog is answered");
+        assert_eq!(second.unwrap_err().code, "DECLINED");
+        assert_eq!(fake.confirmations.lock().unwrap().len(), 2);
+
+        // An answer nobody waited for is dropped, not kept for later.
+        state.agent_mcp.clear_declines_for_tests(&conversation_id);
+        let (cancel_tx, cancel) = CancelSignal::manual();
+        let (gone, ()) = tokio::join!(
+            authorizer.ask(&conversation_id, prompt(typed("b"), "b"), &cancel),
+            async {
+                shown(3).await;
+                let _ = cancel_tx.send(true);
+            }
+        );
+        assert_eq!(gone.unwrap_err().code, "CANCELLED");
+        fake.answers.lock().unwrap().push_back(Some(true));
+        hold.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!state
+            .agent_mcp
+            .authorizer_state()
+            .has_late_answer(&conversation_id, &typed("b")));
+
+        // Two different actions at once: two dialogs, two answers.
+        let (_keep, cancel) = CancelSignal::manual();
+        let (one, two, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                authorizer.ask(&conversation_id, prompt(typed("c"), "c"), &cancel),
+                authorizer.ask(&conversation_id, prompt(typed("d"), "d"), &cancel),
+                async {
+                    shown(5).await;
+                    fake.answers
+                        .lock()
+                        .unwrap()
+                        .extend([Some(true), Some(false)]);
+                    hold.notify_one();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    hold.notify_one();
+                }
+            )
+        })
+        .await
+        .expect("both dialogs are answered");
+        assert_eq!(fake.confirmations.lock().unwrap().len(), 5);
+        assert_eq!(
+            [one.is_ok(), two.is_ok()].iter().filter(|ok| **ok).count(),
+            1,
+            "{one:?} {two:?}"
+        );
         let _ = client.cancel().await;
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1779,7 +1924,7 @@ mod tests {
         assert_eq!(
             registry_of_tools().side_effects(),
             [
-                ("browser_open", false),
+                ("browser_open", true),
                 ("browser_navigate", true),
                 ("browser_snapshot", false),
                 ("browser_act", true),

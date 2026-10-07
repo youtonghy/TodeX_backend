@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
-    authorizer::{Answerer, CancelSignal, Denied, Prompt},
+    authorizer::{action_key, Answerer, CancelSignal, Denied, Prompt},
     desktop_server::{DesktopCall, DesktopTools},
     registry::{
         parse, schema, tool_error, untrusted, Handler, Invocation, Prepared, ToolEntry,
@@ -531,7 +531,7 @@ impl DesktopTools {
                         break;
                     }
                     match self
-                        .confirm_app(conversation_id, &app_id, &name, &call.summary, cancel)
+                        .confirm_app(conversation_id, &app_id, &name, &call, cancel)
                         .await
                     {
                         Ok(device) => {
@@ -551,7 +551,7 @@ impl DesktopTools {
                 "SENSITIVE_ACTION" if !confirmed => {
                     let reason = error.message.clone();
                     match self
-                        .confirm_action(conversation_id, &call.summary, &reason, cancel)
+                        .confirm_action(conversation_id, &call, &reason, cancel)
                         .await
                     {
                         Ok(device) => {
@@ -673,6 +673,7 @@ impl DesktopTools {
             message,
             details: Value::Null,
             options: Value::Null,
+            once: false,
         };
         journal("requested", None).await;
         match authorizer.ask(conversation_id, prompt, cancel).await {
@@ -708,24 +709,25 @@ impl DesktopTools {
         conversation_id: &str,
         bundle_id: &str,
         name: &str,
-        summary: &str,
+        call: &ComputerCall,
         cancel: &CancelSignal,
     ) -> Result<String, Denied> {
-        let (title, message) = app_prompt(bundle_id, name, summary);
-        self.confirm_on_host(
-            conversation_id,
-            format!("app:{bundle_id}"),
-            title,
-            message,
-            cancel,
-        )
-        .await
-        .map_err(|denied| {
-            denied.or_declined(format!(
-                "the user declined control of {}.",
-                app_label(bundle_id, name)
-            ))
-        })
+        let (title, message) = app_prompt(bundle_id, name, &call.summary);
+        // An unidentified target is approved for this action only.
+        let once = bundle_id.is_empty();
+        let key = if once {
+            action_key("app:", &json!({ "tool": call.tool, "args": call.args }))
+        } else {
+            format!("app:{bundle_id}")
+        };
+        self.confirm_on_host(conversation_id, key, once, title, message, cancel)
+            .await
+            .map_err(|denied| {
+                denied.or_declined(format!(
+                    "the user declined control of {}.",
+                    app_label(bundle_id, name)
+                ))
+            })
     }
 
     /// One action the host flagged as sensitive (typing into a password
@@ -733,20 +735,19 @@ impl DesktopTools {
     async fn confirm_action(
         &self,
         conversation_id: &str,
-        summary: &str,
+        call: &ComputerCall,
         reason: &str,
         cancel: &CancelSignal,
     ) -> Result<String, Denied> {
+        let summary = &call.summary;
         let (title, message) = action_prompt(summary, reason);
-        self.confirm_on_host(
-            conversation_id,
-            "sensitive:computer".to_owned(),
-            title,
-            message,
-            cancel,
-        )
-        .await
-        .map_err(|denied| denied.or_declined(format!("the user declined: {summary}.")))
+        let key = action_key(
+            "sensitive:computer",
+            &json!({ "tool": call.tool, "args": call.args, "reason": reason }),
+        );
+        self.confirm_on_host(conversation_id, key, true, title, message, cancel)
+            .await
+            .map_err(|denied| denied.or_declined(format!("the user declined: {summary}.")))
     }
 
     /// A host dialog; returns the answering device ([`HOST_DEVICE_ID`]).
@@ -754,6 +755,7 @@ impl DesktopTools {
         &self,
         conversation_id: &str,
         key: String,
+        once: bool,
         title: String,
         message: String,
         cancel: &CancelSignal,
@@ -769,6 +771,7 @@ impl DesktopTools {
                     message,
                     details: Value::Null,
                     options: Value::Null,
+                    once,
                 },
                 cancel,
             )

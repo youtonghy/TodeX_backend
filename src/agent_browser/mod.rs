@@ -473,12 +473,15 @@ impl AgentBrowser {
 
     /// Runs one `browser_*` tool for a conversation of `workspace`
     /// (`{ id, path }`). Results have the shape the agent tools expect.
+    /// `may_reload` allows reopening a tab closed for being idle (which
+    /// loads its page again); it is false in Plan mode.
     pub(crate) async fn invoke(
         &self,
         conversation_id: &str,
         workspace: &Value,
         tool: &str,
         args: &Value,
+        may_reload: bool,
     ) -> Result<Value, BrowserError> {
         #[cfg(test)]
         if let Some(responder) = self
@@ -512,14 +515,26 @@ impl AgentBrowser {
         if running.is_none() {
             if let Some(url) = parked {
                 // Closed for being idle: reopen where it was (and keep the
-                // URL for the next try if that fails).
-                if let Err(error) = self.open(conversation_id, workspace, &url).await {
+                // URL for the next try if that cannot happen now).
+                let keep = |url: String| {
                     self.inner
                         .parked
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .entry(conversation_id.to_owned())
                         .or_insert(url);
+                };
+                if !may_reload {
+                    keep(url);
+                    return Err(BrowserError::new(
+                        "PLAN_MODE",
+                        "This conversation's tab was closed for being idle; reopening it loads \
+                         the page again, which is not done in Plan mode. It reopens on the first \
+                         browser call outside Plan mode.",
+                    ));
+                }
+                if let Err(error) = self.open(conversation_id, workspace, &url).await {
+                    keep(url);
                     return Err(error);
                 }
                 running = self.running_for(conversation_id).await;
@@ -588,27 +603,53 @@ impl AgentBrowser {
         let running = self.ensure_running(&profile).await?;
         running.touch_tab(conversation_id).await;
         if running.tab(conversation_id).await.is_err() {
-            let open = self
-                .inner
-                .tabs
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len();
-            if open >= MAX_TABS {
-                return Err(BrowserError::new(
-                    "TAB_LIMIT",
-                    format!("At most {MAX_TABS} agent browser tabs can be open on this computer."),
-                ));
+            let reserved = self.reserve_tab(conversation_id, &profile)?;
+            if let Err(error) = running.open_tab(conversation_id).await {
+                if reserved {
+                    self.release_tab(conversation_id, &profile);
+                }
+                return Err(error);
             }
-            running.open_tab(conversation_id).await?;
-            self.inner
-                .tabs
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(conversation_id.to_owned(), profile);
             self.sync_screencast(conversation_id).await;
         }
         running.load(conversation_id, url).await
+    }
+
+    /// Claims one of the [`MAX_TABS`] slots for the conversation's tab in
+    /// `profile` before it is opened, so concurrent opens cannot exceed the
+    /// limit. Returns whether a new slot was taken (the conversation had
+    /// none), which [`Self::release_tab`] gives back if opening fails.
+    fn reserve_tab(&self, conversation_id: &str, profile: &str) -> Result<bool, BrowserError> {
+        let mut tabs = self
+            .inner
+            .tabs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let new = !tabs.contains_key(conversation_id);
+        if new && tabs.len() >= MAX_TABS {
+            return Err(BrowserError::new(
+                "TAB_LIMIT",
+                format!("At most {MAX_TABS} agent browser tabs can be open on this computer."),
+            ));
+        }
+        tabs.insert(conversation_id.to_owned(), profile.to_owned());
+        Ok(new)
+    }
+
+    /// Gives back a slot from [`Self::reserve_tab`] whose tab did not open
+    /// (unless the conversation has since moved to another profile).
+    fn release_tab(&self, conversation_id: &str, profile: &str) {
+        let mut tabs = self
+            .inner
+            .tabs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if tabs
+            .get(conversation_id)
+            .is_some_and(|owner| owner == profile)
+        {
+            tabs.remove(conversation_id);
+        }
     }
 
     /// The conversation's tab goes away (close, revoke, deletion).
@@ -785,6 +826,75 @@ fn display_problem() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tab_slots_are_reserved_before_opening_and_given_back_on_failure() {
+        let root = std::env::temp_dir().join(format!("todex-browser-{}", uuid::Uuid::new_v4()));
+        let browser = AgentBrowser::load(&root).unwrap();
+        // Concurrent opens: exactly MAX_TABS win a slot.
+        let won = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..MAX_TABS * 2)
+                .map(|index| {
+                    let browser = &browser;
+                    scope.spawn(move || browser.reserve_tab(&format!("c{index}"), "p").is_ok())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|won| *won)
+                .count()
+        });
+        assert_eq!(won, MAX_TABS);
+        let holder = (0..MAX_TABS * 2)
+            .map(|index| format!("c{index}"))
+            .find(|id| browser.inner.tabs.lock().unwrap().contains_key(id))
+            .unwrap();
+        // A conversation that already holds a slot reuses it.
+        assert!(!browser.reserve_tab(&holder, "p").unwrap());
+        assert_eq!(
+            browser.reserve_tab("late", "p").unwrap_err().code,
+            "TAB_LIMIT"
+        );
+        // A failed open gives the slot back.
+        browser.release_tab(&holder, "p");
+        assert!(browser.reserve_tab("late", "p").unwrap());
+        // Not when the conversation moved to another profile meanwhile.
+        browser.reserve_tab("late", "q").unwrap();
+        browser.release_tab("late", "p");
+        assert!(browser.inner.tabs.lock().unwrap().contains_key("late"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn an_idle_closed_tab_is_not_reloaded_in_plan_mode() {
+        let root = std::env::temp_dir().join(format!("todex-browser-{}", uuid::Uuid::new_v4()));
+        let browser = AgentBrowser::load(&root).unwrap();
+        browser
+            .inner
+            .parked
+            .lock()
+            .unwrap()
+            .insert("c".into(), "http://localhost:5173/".into());
+        let workspace = json!({ "id": "w", "path": "/w" });
+        let error = browser
+            .invoke("c", &workspace, "browser_snapshot", &json!({}), false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "PLAN_MODE");
+        // Kept for the first call outside Plan mode.
+        assert_eq!(
+            browser
+                .inner
+                .parked
+                .lock()
+                .unwrap()
+                .get("c")
+                .map(String::as_str),
+            Some("http://localhost:5173/")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn frames_reach_watchers_and_end_with_the_last_one() {
