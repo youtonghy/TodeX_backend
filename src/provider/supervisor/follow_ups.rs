@@ -652,15 +652,17 @@ impl ConversationSupervisor {
 
     /// A turn completed, so the plan window is open again. A pending
     /// continuation would repeat work the user already went on with by hand:
-    /// drop it and lift the wait. The continuation backoff starts over, and a
-    /// pause left on an emptied queue (continuations given up) is lifted so
-    /// it does not hold later additions.
+    /// drop it and lift the wait. The pause left when continuations were
+    /// given up is lifted too, and the continuation count starts over.
     async fn settle_rate_limit_after_completion(&self, conversation_id: &str) {
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         let result = async {
             let mut queue = self.load_follow_ups(conversation_id).await?;
             let mut changed = false;
-            if queue.rate_limited() {
+            let gave_up = queue.rate_limit_failures >= MAX_RATE_LIMIT_CONTINUATIONS
+                && queue.paused
+                && queue.pause_reason.as_deref() == Some("turn_failed");
+            if queue.rate_limited() || gave_up {
                 queue
                     .items
                     .retain(|item| !item.id.starts_with(RATE_LIMIT_CONTINUE_PREFIX));
@@ -669,10 +671,6 @@ impl ConversationSupervisor {
             }
             if queue.rate_limit_failures != 0 {
                 queue.rate_limit_failures = 0;
-                changed = true;
-            }
-            if queue.paused && queue.items.is_empty() {
-                queue.unpause();
                 changed = true;
             }
             if !changed {

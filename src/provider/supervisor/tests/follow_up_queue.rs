@@ -751,15 +751,23 @@ async fn continuations_stop_after_three_consecutive_limits() {
     sleep(Duration::from_millis(200)).await;
     assert_eq!(gate.prompts().len(), 4);
 
-    // A completed turn starts the count over and lifts the stale pause.
+    // A completed turn starts the count over and lifts that pause, so what
+    // was queued behind it runs.
     supervisor
         .prompt(&manifest.id, "manual".to_owned(), None)
         .await
         .unwrap();
     gate.wait_for_prompts(5).await;
+    add(&supervisor, &manifest.id, "later", queued_prompt("later")).await;
+    gate.release();
+    gate.wait_for_prompts(6).await;
+    assert_eq!(gate.prompts()[5], "later");
     gate.release();
     wait_until_idle(&supervisor).await;
-    let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| q["paused"] == false).await;
+    let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| {
+        q["paused"] == false && q["items"].as_array().unwrap().is_empty()
+    })
+    .await;
     assert!(snapshot["pauseReason"].is_null());
     let saved = store.follow_up_queue(&manifest.id).await.unwrap().unwrap();
     assert!(saved.get("rateLimitFailures").is_none(), "{saved}");

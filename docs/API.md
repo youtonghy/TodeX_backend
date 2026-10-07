@@ -218,7 +218,7 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 
 - 用尽判定：快照带 `status` 时只有 `status: "rejected"` 算用尽（`allowed` / `allowed_warning` 即使某窗口达到 100 % 也不算）；不带 `status` 时需某窗口 `usedPercent` ≥ 100 且 `isUsingOverage` 不为 `true`。
 - 等待下限：`resumeAt` = max(窗口重置时间, 现在 + 60 秒)，重置时间已过去时也至少等 60 秒。Claude 只在错误文本中给出重置时刻（如 "resets 5:30pm (UTC)"）时，解析出的时刻早于现在但不超过 10 分钟按"现在"处理（再套 60 秒下限），不再顺延到次日或下周。
-- 退避与上限：续写项本身再次因用尽失败时，第 n 次（n 从 1 起）等待 max(重置时间, 现在 + 60 秒 × 2^(n−1))。连续 3 个续写项都因用尽失败后不再插入续写项，队列以 `turn_failed` 暂停（队列为空时也暂停），`pauseMessage` 说明已停止自动续写；计数随 `queue.json` 持久化，重启不清零，任一 turn 以 `turn.completed` 结束时清零，此时只剩这一暂停的空队列也一并解除暂停。
+- 退避与上限：续写项本身再次因用尽失败时，第 n 次（n 从 1 起）等待 max(重置时间, 现在 + 60 秒 × 2^(n−1))。连续 3 个续写项都因用尽失败后不再插入续写项，队列以 `turn_failed` 暂停（队列为空时也暂停），`pauseMessage` 说明已停止自动续写；计数随 `queue.json` 持久化，重启不清零，任一 turn 以 `turn.completed` 结束时清零，这一暂停也随之解除（窗口已恢复，此前排在其后的项照常开始）。
 - 用户持有的暂停：队列已因 `turn_cancelled` / `start_failed` / `daemon_restarted` 暂停时（例如暂停期间手动发送的 prompt 遇到额度用尽），续写项照常插到队首，但 `pauseReason` 不变、不设定时器，`resumeAt` 照常下发仅供显示；用户 `resume` 后从续写项开始。
 
 ### 历史加密密钥（`history.*`）
