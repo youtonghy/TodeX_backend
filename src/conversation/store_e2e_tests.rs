@@ -2,7 +2,8 @@
 //! (`docs/history-encryption.md`): what reaches the disk, what replays and
 //! live events carry, sealing, restarts and migration. Kept beside
 //! `store.rs` so they reach its private items. Decryption uses the test
-//! recipient seeds, standing in for a client.
+//! recipient seeds, standing in for a client. Legacy plaintext history is
+//! written by a keyless store, as older versions wrote it.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -25,6 +26,9 @@ pub(super) fn temp_dir(prefix: &str) -> PathBuf {
 }
 
 /// A data directory with one recipient device (seed 1) and its store.
+/// `encrypted: false` starts with a keyless store writing plaintext, as
+/// versions before mandatory encryption did; [`Self::restart`] always comes
+/// back with keys.
 pub(super) struct E2e {
     pub root: PathBuf,
     pub keys: HistoryKeys,
@@ -34,27 +38,25 @@ pub(super) struct E2e {
 impl E2e {
     pub async fn new(prefix: &str, encrypted: bool) -> Self {
         let root = temp_dir(prefix);
-        let keys = HistoryKeys::load(&root, HistoryEncryption::Off, None).unwrap();
+        let keys = HistoryKeys::load(&root, None).unwrap();
         keys.recipients()
             .register_device("dev_a", &recipient(1))
             .unwrap();
-        if encrypted {
-            keys.recipients().set_mode(HistoryEncryption::E2e).unwrap();
-        }
-        let store = ConversationStore::new(root.clone())
-            .await
-            .unwrap()
-            .with_history_keys(keys.clone());
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let store = if encrypted {
+            store.with_history_keys(keys.clone())
+        } else {
+            store
+        };
         Self { root, keys, store }
     }
 
     /// A restarted daemon: same files, no DEK in memory.
     pub async fn restart(&self) -> Self {
-        let keys = HistoryKeys::load(&self.root, HistoryEncryption::Off, None).unwrap();
-        let store = ConversationStore::new(self.root.clone())
+        let keys = HistoryKeys::load(&self.root, None).unwrap();
+        let store = ConversationStore::open(self.root.clone(), keys.clone())
             .await
-            .unwrap()
-            .with_history_keys(keys.clone());
+            .unwrap();
         Self {
             root: self.root.clone(),
             keys,
@@ -453,11 +455,10 @@ async fn a_restart_before_sealing_keeps_event_ciphertext_readable() {
     restarted.cleanup();
 }
 
-#[tokio::test]
-async fn enabling_encryption_migrates_plaintext_history_through_crashes() {
-    let e2e = E2e::new("todex-e2e-migrate", false).await;
+/// A legacy conversation: plaintext title, records and request snapshot,
+/// with one plaintext segment sealed.
+async fn legacy_conversation(e2e: &E2e) -> String {
     let id = e2e.create(Some(SECRETS[4])).await.id;
-    // Ends with a completed turn: migration only touches idle conversations.
     for index in 0..880 {
         let (event_type, mut payload) = mixed_payload(index);
         if index == 0 {
@@ -468,99 +469,254 @@ async fn enabling_encryption_migrates_plaintext_history_through_crashes() {
     e2e.store
         .save_request(
             &id,
-            &json!({"turnId": "turn_0", "request": {"text": SECRETS[0], "content": [
-                {"type": "text", "text": SECRETS[1]},
-                {"type": "file", "path": "/tmp/notes.md"}]}, "files": []}),
+            &json!({"turnId": "turn_0", "request": {"text": SECRETS[0]}, "files": []}),
         )
         .await
         .unwrap();
-    // One plaintext segment is sealed while encryption is off.
     assert!(e2e.store.seal_next(&id).await.unwrap());
-    let before = e2e.store.complete_history(&id).await.unwrap();
-    let directory = e2e.store.directory(&id).unwrap();
-    assert!(contains(&all_bytes(&directory), SECRETS[0]));
+    id
+}
 
-    e2e.keys
-        .recipients()
-        .set_mode(HistoryEncryption::E2e)
+/// Every file of a conversation except its manifest and snapshot, which
+/// the legacy scan may rewrite.
+fn journal_bytes(directory: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut files = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            let name = path.file_name().unwrap().to_string_lossy();
+            name != MANIFEST_FILE && name != SNAPSHOT_FILE
+        })
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_string_lossy().to_string(),
+                fs::read(&path).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn legacy_plaintext_history_is_marked_once_and_left_untouched() {
+    let legacy_writer = E2e::new("todex-e2e-legacy", false).await;
+    let legacy = legacy_conversation(&legacy_writer).await;
+    // Plaintext only in a title or only in the request snapshot.
+    let titled = legacy_writer.create(Some("plain title")).await.id;
+    let requested = legacy_writer.create(None).await.id;
+    legacy_writer
+        .store
+        .save_request(&requested, &json!({"request": {"text": "plain"}}))
+        .await
         .unwrap();
-    let age = |store: &ConversationStore| {
-        let store = store.clone();
-        let id = id.clone();
-        async move {
-            let _guard = store.lock(&id).await;
-            let mut manifest = store.get_unlocked(&id).await.unwrap();
-            manifest.updated_at = Utc::now() - chrono::TimeDelta::hours(1);
-            store.persist_manifest_locked(&manifest).await.unwrap();
-        }
-    };
-    // (f) A crash in every step of re-encrypting the plaintext segment,
-    // then one while converting the sealed active file.
-    let mut daemon = e2e;
-    for step in [CommitStep::Written, CommitStep::IndexRenamed] {
-        daemon.store.set_commit_stop(Some(step));
-        assert!(daemon.store.reencrypt_segment(&id, 1).await.is_err());
-        daemon.store.set_commit_stop(None);
-        let restarted = daemon.restart().await;
-        let keys = restarted.client_keys(&id).await;
-        let (events, frames) = history(&restarted.store, &id, ReplayDetail::Full).await;
-        assert_same_or_marker_payloads(&client_view(&keys, &events, &frames, false), &before);
-        daemon = restarted;
-    }
-    age(&daemon.store).await;
+    // Never used: nothing plaintext, so it is not legacy.
+    let empty = legacy_writer.create(None).await.id;
+    // Plaintext followed by encrypted records (encryption switched on
+    // without the retired migration).
+    let mixed = legacy_writer.create(None).await.id;
+    legacy_writer
+        .store
+        .append(&mixed, "message.created", json!({"role": "user", "content": SECRETS[1]}))
+        .await
+        .unwrap();
+    let directory = legacy_writer.store.directory(&legacy).unwrap();
+    let legacy_files = journal_bytes(&directory);
+    let before = legacy_writer.store.complete_history(&legacy).await.unwrap();
+
+    let daemon = legacy_writer.restart().await;
     daemon
         .store
-        .set_commit_stop(Some(CommitStep::SegmentRenamed));
-    assert!(daemon.store.encrypt_conversation(&id).await.is_err());
-    daemon.store.set_commit_stop(None);
-    let daemon = daemon.restart().await;
-    age(&daemon.store).await;
-    assert!(daemon.store.encrypt_conversation(&id).await.unwrap());
-
-    let manifest = daemon.store.get(&id).await.unwrap();
-    assert!(manifest.history_encrypted_at.is_some());
-    assert!(manifest.title.is_none() && manifest.title_enc.is_some());
-    let disk = all_bytes(&directory);
-    for secret in [SECRETS[0], SECRETS[1], SECRETS[4]] {
-        assert!(!contains(&disk, secret), "{secret} is still on disk");
-    }
-    let saved = daemon.store.last_request(&id).await.unwrap().unwrap();
-    assert_eq!(saved["request"]["text"], "");
+        .append(&mixed, "message.completed", json!({"role": "assistant", "content": "x"}))
+        .await
+        .unwrap();
+    // Created encrypted: decided from the start.
+    let encrypted = daemon.create(Some("secret title")).await.id;
+    daemon
+        .store
+        .append(&encrypted, "message.created", json!({"role": "user", "content": "hi"}))
+        .await
+        .unwrap();
+    assert!(daemon
+        .store
+        .get(&encrypted)
+        .await
+        .unwrap()
+        .history_encrypted_at
+        .is_some());
+    // An interrupted earlier pass already decided one conversation.
     assert_eq!(
-        saved["request"]["content"],
-        json!([{"type": "file", "path": "/tmp/notes.md"}])
+        daemon.store.ensure_not_legacy(&titled).await.unwrap_err().code(),
+        "HISTORY_READ_ONLY"
     );
-    let fingerprint = daemon.keys.fingerprint().unwrap();
-    assert_eq!(saved["request"]["textMac"], fingerprint.mac(SECRETS[0]));
-    for file in journal_files(&directory).await.unwrap() {
-        if let Some(number) = segment::numbered(&file.name, ".seg") {
-            let loaded = segment::load_index(&directory, number).unwrap();
-            assert!(!loaded.body.has_plain_content(), "{}", file.name);
+
+    let scan = daemon.store.scan_legacy(&daemon.root).await.unwrap();
+    assert_eq!(
+        scan,
+        crate::conversation::legacy::LegacyScan {
+            conversations: 6,
+            already_decided: 2,
+            marked_legacy: 3,
+            marked_encrypted: 1,
+            failed: 0,
+            skipped: false,
         }
+    );
+    for (id, expected) in [
+        (&legacy, true),
+        (&titled, true),
+        (&requested, true),
+        (&mixed, true),
+        (&empty, false),
+        (&encrypted, false),
+    ] {
+        let manifest = daemon.store.get(id).await.unwrap();
+        assert_eq!(manifest.legacy_plaintext, expected, "{id}");
+        assert_eq!(manifest.history_encrypted_at.is_some(), !expected, "{id}");
+        let wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(wire.get("legacyPlaintext").is_some(), expected, "{id}");
     }
-    let keys = daemon.client_keys(&id).await;
-    let (full, frames) = history(&daemon.store, &id, ReplayDetail::Full).await;
-    assert!(full
-        .iter()
-        .all(|event| encrypted_content(&event.payload).is_some()));
-    assert_same_or_marker_payloads(&client_view(&keys, &full, &frames, false), &before);
-    // Migration is idempotent.
-    assert!(daemon.store.encrypt_conversation(&id).await.unwrap());
+    // Nothing of the legacy conversation was rewritten and it reads as
+    // before.
+    assert_eq!(journal_bytes(&directory), legacy_files);
+    let after = daemon.store.complete_history(&legacy).await.unwrap();
+    assert_eq!(after.len(), before.len());
+    for (after, before) in after.iter().zip(&before) {
+        assert_eq!(after.payload, before.payload);
+    }
+    // The marker makes later passes skip; a restart keeps the flags.
+    assert!(daemon.root.join(crate::conversation::legacy::LEGACY_SCAN_MARKER).exists());
+    let restarted = daemon.restart().await;
+    assert!(restarted.store.scan_legacy(&restarted.root).await.unwrap().skipped);
+    assert!(restarted.store.get(&legacy).await.unwrap().legacy_plaintext);
+    restarted.cleanup();
+}
+
+#[tokio::test]
+async fn legacy_conversations_are_read_only() {
+    let legacy_writer = E2e::new("todex-e2e-read-only", false).await;
+    let id = legacy_conversation(&legacy_writer).await;
+    let daemon = legacy_writer.restart().await;
+    let store = &daemon.store;
+    let last_sequence = store.get(&id).await.unwrap().last_sequence;
+    // Decided on the first write attempt, before any scan ran.
+    let read_only = |result: Result<(), AppError>| {
+        assert_eq!(result.unwrap_err().code(), "HISTORY_READ_ONLY");
+    };
+    read_only(store.ensure_history_writable(&id).await);
+    read_only(
+        store
+            .save_request(&id, &json!({"request": {"text": "new"}}))
+            .await,
+    );
+    read_only(store.append(&id, "turn.started", json!({"turnId": "t"})).await.map(|_| ()));
+    read_only(
+        store
+            .update_metadata(&id, Some(Some("renamed".to_owned())), None)
+            .await
+            .map(|_| ()),
+    );
+    assert_eq!(store.get(&id).await.unwrap().last_sequence, last_sequence);
+    // Reading, archiving and deleting stay allowed.
+    let page = store.replay(&id, 0, 10).await.unwrap();
+    assert_eq!(page.events[0].payload["text"], SECRETS[0]);
+    let archived = store.update_metadata(&id, None, Some(true)).await.unwrap();
+    assert!(archived.archived_at.is_some() && archived.legacy_plaintext);
+    assert_eq!(archived.title.as_deref(), Some(SECRETS[4]));
+    let restored = store.update_metadata(&id, None, Some(false)).await.unwrap();
+    assert!(restored.archived_at.is_none());
+    store.delete(&id).await.unwrap();
     daemon.cleanup();
 }
 
-fn assert_same_or_marker_payloads(after: &[ConversationEvent], before: &[ConversationEvent]) {
-    assert_eq!(after.len(), before.len());
-    for (after, before) in after.iter().zip(before) {
-        assert_eq!(after.sequence, before.sequence);
-        assert_eq!(after.event_id, before.event_id);
-        if after.event_type == JOURNAL_COMPACTED_EVENT
-            || before.event_type == JOURNAL_COMPACTED_EVENT
-        {
-            continue;
-        }
-        assert_eq!(after.payload, before.payload, "sequence {}", after.sequence);
+#[tokio::test]
+async fn imports_and_fork_trailers_are_encrypted() {
+    let e2e = E2e::new("todex-e2e-import", true).await;
+    let manifest = ConversationManifest::new(
+        ProviderKind::Codex,
+        e2e.root.clone(),
+        Some(SECRETS[4].to_owned()),
+        None,
+    );
+    let id = manifest.id.clone();
+    let events = (1..=3)
+        .map(|sequence| {
+            ConversationEvent::new(
+                &id,
+                sequence,
+                "message.created",
+                json!({"role": "user", "content": format!("{}-{sequence}", SECRETS[0])}),
+            )
+        })
+        .collect::<Vec<_>>();
+    let imported = e2e
+        .store
+        .create_with_history(manifest, events.clone(), None, None)
+        .await
+        .unwrap();
+    assert!(imported.history_encrypted_at.is_some() && !imported.legacy_plaintext);
+    assert!(imported.title.is_none() && imported.title_enc.is_some());
+    let directory = e2e.store.directory(&id).unwrap();
+    assert!(!contains(&all_bytes(&directory), SECRETS[0]));
+    assert!(!contains(&all_bytes(&directory), SECRETS[4]));
+    let keys = e2e.client_keys(&id).await;
+    let (stored, frames) = history(&e2e.store, &id, ReplayDetail::Full).await;
+    let view = client_view(&keys, &stored, &frames, false);
+    assert_eq!(view.len(), 3);
+    for (seen, original) in view.iter().zip(&events) {
+        assert_eq!(seen.payload["content"], original.payload["content"]);
     }
+    // Writable: new appends continue the conversation.
+    e2e.store.ensure_history_writable(&id).await.unwrap();
+    e2e.store
+        .append(&id, "turn.started", json!({"turnId": "t"}))
+        .await
+        .unwrap();
+
+    // A fork copies the ciphertext and encrypts its own trailer.
+    let fork = ConversationManifest::new(ProviderKind::Codex, e2e.root.clone(), None, None);
+    let fork_id = fork.id.clone();
+    let copy_id = fork_id.clone();
+    let trailer_id = fork_id.clone();
+    let fork = e2e
+        .store
+        .create_from_journal(
+            &id,
+            fork,
+            None,
+            None,
+            move |event, sequence| {
+                ConversationEvent::new(&copy_id, sequence, event.event_type, event.payload)
+            },
+            move |copied| {
+                vec![ConversationEvent::new(
+                    &trailer_id,
+                    copied + 1,
+                    "conversation.forked",
+                    json!({"sourceConversationId": SECRETS[2]}),
+                )]
+            },
+        )
+        .await
+        .unwrap();
+    assert!(fork.history_encrypted_at.is_some() && !fork.legacy_plaintext);
+    assert!(!contains(
+        &all_bytes(&e2e.store.directory(&fork_id).unwrap()),
+        SECRETS[2]
+    ));
+    let fork_keys = e2e.client_keys(&fork_id).await;
+    let (forked, frames) = history(&e2e.store, &fork_id, ReplayDetail::Full).await;
+    assert!(forked
+        .iter()
+        .all(|event| encrypted_content(&event.payload).is_some()));
+    let view = client_view(&fork_keys, &forked, &frames, false);
+    assert_eq!(view.last().unwrap().payload["sourceConversationId"], SECRETS[2]);
+    assert_eq!(view[0].payload["content"], events[0].payload["content"]);
+    // The startup scan agrees: nothing here is legacy.
+    let scan = e2e.store.scan_legacy(&e2e.root).await.unwrap();
+    assert_eq!((scan.already_decided, scan.marked_legacy), (2, 0));
+    e2e.cleanup();
 }
 
 #[tokio::test]
@@ -581,7 +737,7 @@ async fn running_turns_keep_their_key_when_recipients_disappear() {
         .save_request(&id, &json!({"turnId": "t2"}))
         .await
         .unwrap_err();
-    assert_eq!(refused.code(), "CONFLICT");
+    assert_eq!(refused.code(), "HISTORY_KEY_REQUIRED");
     // …while the running turn keeps encrypting under its last key.
     let next = e2e
         .store
@@ -597,7 +753,22 @@ async fn running_turns_keep_their_key_when_recipients_disappear() {
         .append(&id, "turn.started", json!({"turnId": "t3"}))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), "CONFLICT");
+    assert_eq!(error.code(), "HISTORY_KEY_REQUIRED");
+    // Nor can a new conversation be created.
+    assert_eq!(
+        restarted
+            .store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                restarted.root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        "HISTORY_KEY_REQUIRED"
+    );
     let directory = restarted.store.directory(&id).unwrap();
     let lines = fs::read_to_string(directory.join(EVENTS_FILE)).unwrap();
     assert_eq!(lines.lines().count(), 2);

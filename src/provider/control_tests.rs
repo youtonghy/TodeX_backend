@@ -83,17 +83,10 @@ impl Harness {
             .await
             .unwrap();
         if encrypted {
-            let keys = crate::history_keys::HistoryKeys::load(
-                &config.data_dir,
-                crate::config::HistoryEncryption::Off,
-                None,
-            )
+            let keys = crate::history_keys::HistoryKeys::load(&config.data_dir, None)
             .unwrap();
             keys.recipients()
                 .register_device("dev_a", &crate::history_keys::test_support::recipient(1))
-                .unwrap();
-            keys.recipients()
-                .set_mode(crate::config::HistoryEncryption::E2e)
                 .unwrap();
             store = store.with_history_keys(keys);
         }

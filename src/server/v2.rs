@@ -2558,6 +2558,9 @@ struct SubscriptionWorker {
     page_size: usize,
     backfill_limit: Option<usize>,
     summary: bool,
+    /// The conversation is legacy plaintext history (read-only); echoed in
+    /// the ack so a client can disable its composer right away.
+    legacy_plaintext: bool,
 }
 
 impl SubscriptionWorker {
@@ -2569,7 +2572,7 @@ impl SubscriptionWorker {
         };
         let terminal_frame = match backfill {
             Ok(progress) => {
-                let ack = json!({
+                let mut ack = json!({
                     "id": self.request_id,
                     "type": "server.result",
                     "payload": {
@@ -2580,6 +2583,9 @@ impl SubscriptionWorker {
                         "lastSequence": progress.high_water,
                     },
                 });
+                if self.legacy_plaintext {
+                    ack["payload"]["legacyPlaintext"] = json!(true);
+                }
                 let delivered = queue_frame(&self.outgoing, ack).await.is_ok();
                 self.answered
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -2926,7 +2932,7 @@ async fn start_subscription(
     let request: SubscribeRequest = Deserialize::deserialize(&command.payload)?;
     let summary = summary_detail(request.detail.as_deref())?;
     ensure_history_client(subscriptions.history_encryption)?;
-    state
+    let manifest = state
         .conversations
         .get_owned(owner_id, &request.conversation_id)
         .await?;
@@ -2965,6 +2971,7 @@ async fn start_subscription(
         page_size: request.limit.unwrap_or(500),
         backfill_limit: request.backfill_limit,
         summary,
+        legacy_plaintext: manifest.legacy_plaintext,
     };
     let handle = tokio::spawn(worker.run(receiver, subscriptions.backfill_permits.clone()));
     let task = SubscriptionTask {
@@ -8223,7 +8230,6 @@ mod tests {
             .deks()
             .current_key(&conversation)
             .await
-            .unwrap()
             .unwrap();
         let listed = run!(&a, "history.keys.list", json!({})).unwrap();
         assert_eq!(
@@ -8517,7 +8523,6 @@ mod tests {
                     .deks()
                     .current_key(conversation)
                     .await
-                    .unwrap()
                     .unwrap(),
             );
         }
@@ -8699,7 +8704,6 @@ mod tests {
             .deks()
             .current_key(conversation)
             .await
-            .unwrap()
             .unwrap();
         assert_ne!(&new_kid, kid);
         let for_b = run!(
@@ -8739,7 +8743,6 @@ mod tests {
             .deks()
             .current_key(conversation)
             .await
-            .unwrap()
             .unwrap();
         assert_ne!(fresh_kid, new_kid);
         let mine = run!(
@@ -8837,9 +8840,6 @@ mod tests {
         registry
             .register_device(&device.device_id, &recipient(1))
             .unwrap();
-        registry
-            .set_mode(crate::config::HistoryEncryption::E2e)
-            .unwrap();
         let refused = dispatch_command(
             &state,
             &outgoing,
@@ -8885,9 +8885,6 @@ mod tests {
                 &device.device_id,
                 &crate::history_keys::test_support::recipient(1),
             )
-            .unwrap();
-        registry
-            .set_mode(crate::config::HistoryEncryption::E2e)
             .unwrap();
         let app = crate::server::loopback_test_router(state.clone());
         let store = state.conversation_store();

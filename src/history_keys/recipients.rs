@@ -911,97 +911,119 @@ mod tests {
     use super::*;
     use crate::history_keys::{system_clock, test_support::*};
 
-    fn registry(root: &Path, default_mode: HistoryEncryption) -> RecipientRegistry {
-        RecipientRegistry::load(root, default_mode, None, system_clock()).unwrap()
+    /// Device auth off: every client is the `local` device.
+    fn registry(root: &Path) -> RecipientRegistry {
+        RecipientRegistry::load(root, None, system_clock()).unwrap()
     }
 
     #[test]
     fn register_replace_and_revoke_bump_the_epoch() {
         let root = temp_dir("registry");
-        let registry = registry(&root, HistoryEncryption::Off);
+        let (devices, a) = paired(&root, 1);
+        let (_, b) = paired(&root, 2);
+        let registry = RecipientRegistry::load(&root, Some(devices), system_clock()).unwrap();
         let snapshot = registry.snapshot().unwrap();
-        assert_eq!((snapshot.mode, snapshot.epoch), (HistoryEncryption::Off, 0));
+        assert_eq!(snapshot.epoch, 0);
         assert!(!root.join(HISTORY_DIR).join(FILE_NAME).exists());
 
-        let first = registry
-            .register_device("dev_a", &recipient(1))
-            .unwrap()
-            .value;
+        let first = registry.register_device(&a, &recipient(1)).unwrap().value;
         assert_eq!(registry.snapshot().unwrap().epoch, 1);
         // Same key again: idempotent, no epoch change.
         assert_eq!(
-            registry
-                .register_device("dev_a", &recipient(1))
-                .unwrap()
-                .value,
+            registry.register_device(&a, &recipient(1)).unwrap().value,
             first
         );
         assert_eq!(registry.snapshot().unwrap().epoch, 1);
         // Another device cannot claim the key.
         assert_eq!(
             registry
-                .register_device("dev_b", &recipient(1))
+                .register_device(&b, &recipient(1))
                 .unwrap_err()
                 .code(),
             "CONFLICT"
         );
 
-        // A new key replaces the device's old one: revoke + add.
-        let second = registry
-            .register_device("dev_a", &recipient(2))
-            .unwrap()
-            .value;
+        // With device auth a new key replaces the device's old one.
+        let second = registry.register_device(&a, &recipient(2)).unwrap().value;
         let snapshot = registry.snapshot().unwrap();
         assert_eq!(snapshot.epoch, 3);
-        assert_eq!(registry.device_rid("dev_a").unwrap(), Some(second.clone()));
+        assert_eq!(registry.device_rid(&a).unwrap(), Some(second.clone()));
         assert!(!registry.is_active(&first).unwrap());
         // A revoked key cannot come back.
         assert_eq!(
             registry
-                .register_device("dev_a", &recipient(1))
+                .register_device(&a, &recipient(1))
                 .unwrap_err()
                 .code(),
             "CONFLICT"
         );
 
         assert_eq!(
-            registry
-                .revoke(&second, "dev_admin")
-                .unwrap()
-                .value
-                .as_deref(),
-            Some("dev_a")
+            registry.revoke(&second, &b).unwrap().value.as_deref(),
+            Some(a.as_str())
         );
-        assert!(registry
-            .revoke(&second, "dev_admin")
-            .unwrap()
-            .written
-            .is_none());
+        assert!(registry.revoke(&second, &b).unwrap().written.is_none());
         assert_eq!(registry.snapshot().unwrap().epoch, 4);
         assert_eq!(
-            registry.revoke("missing", "dev_admin").unwrap_err().code(),
+            registry.revoke("missing", &b).unwrap_err().code(),
             "NOT_FOUND"
         );
-        assert_eq!(registry.device_rid("dev_a").unwrap(), None);
+        assert_eq!(registry.device_rid(&a).unwrap(), None);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn recovery_is_single_and_enable_needs_a_device() {
+    fn anonymous_clients_keep_their_own_keys() {
+        let root = temp_dir("anonymous");
+        let registry = registry(&root);
+        // Two clients of the same `local` device each register a key.
+        let first = registry.register_device("local", &recipient(1)).unwrap().value;
+        let second = registry.register_device("local", &recipient(2)).unwrap().value;
+        assert!(registry.is_active(&first).unwrap());
+        assert!(registry.is_active(&second).unwrap());
+        assert_eq!(registry.snapshot().unwrap().epoch, 2);
+        assert_eq!(registry.active_recipients().unwrap().keys.len(), 2);
+        assert!(registry.device_owns("local", &first).unwrap());
+        assert!(registry.device_owns("local", &second).unwrap());
+        assert!(!registry.device_owns("dev_other", &first).unwrap());
+        // The newest key is the device's default rid.
+        assert_eq!(registry.device_rid("local").unwrap(), Some(second.clone()));
+        // The file with two active `local` recipients reloads.
+        let reloaded = self::registry(&root);
+        assert_eq!(reloaded.active_recipients().unwrap().keys.len(), 2);
+        // Revocation is by rid and blocks nobody (auth off).
+        registry.revoke(&second, "local").unwrap();
+        assert!(registry.is_active(&first).unwrap());
+        assert!(!registry.is_active(&second).unwrap());
+        assert_eq!(registry.device_rid("local").unwrap(), Some(first));
+        registry.ensure_access("local").unwrap();
+        // The retired mode is written as "e2e" for older daemons.
+        let raw = std::fs::read_to_string(root.join(HISTORY_DIR).join(FILE_NAME)).unwrap();
+        assert!(raw.contains("\"mode\": \"e2e\""), "{raw}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_retired_off_mode_on_file_is_ignored() {
+        let root = temp_dir("retired-mode");
+        let registry = registry(&root);
+        registry.register_device("local", &recipient(1)).unwrap();
+        let path = root.join(HISTORY_DIR).join(FILE_NAME);
+        let raw = std::fs::read_to_string(&path).unwrap().replace("\"e2e\"", "\"off\"");
+        write_private_file(&path, raw.as_bytes()).unwrap();
+        let reloaded = self::registry(&root);
+        assert_eq!(reloaded.active_recipients().unwrap().keys.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_is_single() {
         let root = temp_dir("recovery");
-        let registry = registry(&root, HistoryEncryption::Off);
+        let registry = registry(&root);
         let recovery = registry.set_recovery(&recipient(9)).unwrap().value;
         assert_eq!(
             registry.set_recovery(&recipient(9)).unwrap().value,
             recovery
-        );
-        // Recovery alone cannot enable encryption.
-        assert_eq!(
-            registry
-                .set_mode(HistoryEncryption::E2e)
-                .unwrap_err()
-                .code(),
-            "INVALID_REQUEST"
         );
         let replacement = registry.set_recovery(&recipient(10)).unwrap().value;
         let snapshot = registry.snapshot().unwrap();
@@ -1022,46 +1044,16 @@ mod tests {
         );
 
         registry.register_device("dev_a", &recipient(1)).unwrap();
-        registry.set_mode(HistoryEncryption::E2e).unwrap();
         let active = registry.active_recipients().unwrap();
-        assert_eq!(active.mode, HistoryEncryption::E2e);
         assert_eq!(active.keys.len(), 2);
-        // Mode changes do not touch the epoch.
         assert_eq!(active.epoch, 4);
-        registry.set_mode(HistoryEncryption::Off).unwrap();
-        assert_eq!(registry.mode().unwrap(), HistoryEncryption::Off);
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn configured_default_only_seeds_a_new_file() {
-        let root = temp_dir("default");
-        let registry = registry(&root, HistoryEncryption::E2e);
-        assert_eq!(registry.mode().unwrap(), HistoryEncryption::Off);
-        // The first write without a device keeps `off`.
-        registry.set_recovery(&recipient(9)).unwrap();
-        assert_eq!(registry.mode().unwrap(), HistoryEncryption::Off);
-        registry.register_device("dev_a", &recipient(1)).unwrap();
-        assert_eq!(registry.mode().unwrap(), HistoryEncryption::Off);
-
-        let fresh = temp_dir("default-fresh");
-        let registry =
-            super::RecipientRegistry::load(&fresh, HistoryEncryption::E2e, None, system_clock())
-                .unwrap();
-        registry.register_device("dev_a", &recipient(1)).unwrap();
-        assert_eq!(registry.mode().unwrap(), HistoryEncryption::E2e);
-        // The persisted mode wins over the default afterwards.
-        registry.set_mode(HistoryEncryption::Off).unwrap();
-        let reloaded = self::registry(&fresh, HistoryEncryption::E2e);
-        assert_eq!(reloaded.mode().unwrap(), HistoryEncryption::Off);
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(fresh);
     }
 
     #[test]
     fn grants_follow_their_recipient() {
         let root = temp_dir("grants");
-        let registry = registry(&root, HistoryEncryption::Off);
+        let registry = registry(&root);
         assert_eq!(
             registry.request_grant("dev_b").unwrap_err().code(),
             "INVALID_REQUEST"
@@ -1105,7 +1097,7 @@ mod tests {
     #[test]
     fn device_revocation_reaches_the_registry() {
         let root = temp_dir("device-hook");
-        let registry = registry(&root, HistoryEncryption::Off);
+        let registry = registry(&root);
         let a = registry
             .register_device("dev_a", &recipient(1))
             .unwrap()
@@ -1151,10 +1143,7 @@ mod tests {
         let device = devices
             .register("Phone", &signing.verifying_key().to_bytes())
             .unwrap();
-        let registry = RecipientRegistry::load(
-            &root,
-            HistoryEncryption::Off,
-            Some(devices.clone()),
+        let registry = RecipientRegistry::load(&root, Some(devices.clone()),
             system_clock(),
         )
         .unwrap();
@@ -1192,7 +1181,7 @@ mod tests {
         let (devices, a) = paired(&root, 1);
         let (_, b) = paired(&root, 2);
         let registry =
-            RecipientRegistry::load(&root, HistoryEncryption::Off, Some(devices), system_clock())
+            RecipientRegistry::load(&root, Some(devices), system_clock())
                 .unwrap();
         let rid_a = registry.register_device(&a, &recipient(1)).unwrap().value;
         let rid_b = registry.register_device(&b, &recipient(2)).unwrap().value;
@@ -1251,7 +1240,7 @@ mod tests {
     #[test]
     fn a_blocked_device_never_keeps_an_active_recipient() {
         let root = temp_dir("block-normalize");
-        let registry = registry(&root, HistoryEncryption::Off);
+        let registry = registry(&root);
         let rid = registry
             .register_device("dev_a", &recipient(1))
             .unwrap()
@@ -1276,10 +1265,7 @@ mod tests {
         let root = temp_dir("external");
         let (devices, a) = paired(&root, 1);
         let (_, b) = paired(&root, 2);
-        let registry = RecipientRegistry::load(
-            &root,
-            HistoryEncryption::Off,
-            Some(devices.clone()),
+        let registry = RecipientRegistry::load(&root, Some(devices.clone()),
             system_clock(),
         )
         .unwrap();
@@ -1325,7 +1311,7 @@ mod tests {
     #[test]
     fn the_block_list_never_drops_entries() {
         let root = temp_dir("block-unbounded");
-        let registry = registry(&root, HistoryEncryption::Off);
+        let registry = registry(&root);
         registry.register_device("dev_a", &recipient(1)).unwrap();
         let ids = (0..300).map(|n| format!("dev_{n}")).collect::<Vec<_>>();
         revoke_device_recipients(&root, DeviceRevocation::All(&ids)).unwrap();
@@ -1339,7 +1325,7 @@ mod tests {
             );
         }
         // A reload validates and keeps every entry.
-        let reloaded = self::registry(&root, HistoryEncryption::Off);
+        let reloaded = self::registry(&root);
         assert_eq!(reloaded.snapshot().unwrap().revoked_devices.len(), 302);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1347,14 +1333,14 @@ mod tests {
     #[test]
     fn files_without_revoked_devices_still_load() {
         let root = temp_dir("compat");
-        let registry = registry(&root, HistoryEncryption::Off);
+        let registry = registry(&root);
         registry.register_device("dev_a", &recipient(1)).unwrap();
         let path = root.join(HISTORY_DIR).join(FILE_NAME);
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         // An empty list is not written, so older daemons can still read it.
         assert!(raw.get("revokedDevices").is_none());
-        let reloaded = self::registry(&root, HistoryEncryption::Off);
+        let reloaded = self::registry(&root);
         assert!(reloaded.snapshot().unwrap().revoked_devices.is_empty());
         assert!(reloaded.device_rid("dev_a").unwrap().is_some());
 
@@ -1374,7 +1360,7 @@ mod tests {
     #[test]
     fn registry_file_is_private_and_validated() {
         let root = temp_dir("file");
-        let registry = registry(&root, HistoryEncryption::Off);
+        let registry = registry(&root);
         registry.register_device("dev_a", &recipient(1)).unwrap();
         let path = root.join(HISTORY_DIR).join(FILE_NAME);
         #[cfg(unix)]

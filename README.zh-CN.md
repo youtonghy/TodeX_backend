@@ -198,7 +198,7 @@ cargo run -- daemon autostart enable   # status / disable 查询或取消
 | **Pi 可执行文件**    | — | `TODEX_AGENTD_PI_BIN` | `pi` | Pi CLI 路径或命令名称。 |
 | **启用认证** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | 是否启用 Fail-closed 设备签名认证。 |
 | **配对加密方式** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | 配对加密算法（`none`、`x25519`、`ml-kem-768`）。监听非回环地址时不能为 `none`。 |
-| **历史加密** | — | `TODEX_AGENTD_HISTORY_ENCRYPTION` | `off` | 新安装的会话历史加密默认值（`off`、`e2e`，见 [docs/history-encryption.md](docs/history-encryption.md)）。只在首次写入 `history/recipients.json` 时生效，之后由设备通过 `history.encryption.enable` / `disable` 切换。 |
+| **历史加密** | — | `TODEX_AGENTD_HISTORY_ENCRYPTION` | 始终 `e2e` | 已作废：会话历史始终端到端加密（见 [docs/history-encryption.md](docs/history-encryption.md)）。该变量或 `config.toml` 中 `history_encryption` 的任何值都只记一条警告后忽略。写入需要至少一台客户端登记设备密钥；旧版本写下的明文会话仍可读取，但只读。 |
 
 ### `config.toml` 配置示例
 
@@ -208,7 +208,6 @@ cargo run -- daemon autostart enable   # status / disable 查询或取消
 host = "127.0.0.1"
 port = 7345
 pairing_encryption = "ml-kem-768"
-# history_encryption = "e2e"
 data_dir = "~/.todex-agent"
 workspace_root = "~/projects"
 

@@ -326,9 +326,7 @@ mod tests {
             let now = Arc::new(Mutex::new(Utc::now()));
             let clock_now = now.clone();
             let clock: Clock = Arc::new(move || *clock_now.lock().unwrap());
-            let recipients =
-                RecipientRegistry::load(&root, HistoryEncryption::Off, None, clock.clone())
-                    .unwrap();
+            let recipients = RecipientRegistry::load(&root, None, clock.clone()).unwrap();
             let keyrings = KeyringStore::new(&root);
             let deks = DekManager::new(recipients.clone(), keyrings.clone(), clock);
             Self {
@@ -346,11 +344,7 @@ mod tests {
         }
 
         async fn current(&self) -> (String, Arc<SegmentKey>) {
-            self.deks
-                .current_key(&self.conversation)
-                .await
-                .unwrap()
-                .unwrap()
+            self.deks.current_key(&self.conversation).await.unwrap()
         }
     }
 
@@ -361,14 +355,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_key_while_encryption_is_off() {
+    async fn no_key_without_a_recipient() {
         let fixture = Fixture::new();
-        assert!(fixture
-            .deks
-            .current_key(&fixture.conversation)
-            .await
-            .unwrap()
-            .is_none());
+        for code in [
+            fixture
+                .deks
+                .current_key(&fixture.conversation)
+                .await
+                .unwrap_err()
+                .code(),
+            fixture
+                .deks
+                .fresh_key(&fixture.conversation)
+                .await
+                .unwrap_err()
+                .code(),
+            fixture.deks.ensure_recipients().unwrap_err().code(),
+        ] {
+            assert_eq!(code, "HISTORY_KEY_REQUIRED");
+        }
         assert!(fixture
             .keyrings
             .keys(&fixture.conversation)
@@ -379,6 +384,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn draft_keys_land_in_the_draft_keyring() {
+        let fixture = Fixture::new();
+        fixture
+            .recipients
+            .register_device("dev_a", &recipient(1))
+            .unwrap();
+        let draft = fixture.root.join("conversations").join(".draft");
+        std::fs::create_dir_all(&draft).unwrap();
+        let (kid, _) = fixture
+            .deks
+            .draft_key(&fixture.conversation, &draft)
+            .await
+            .unwrap();
+        let written = std::fs::read_to_string(draft.join(super::super::keyring::FILE_NAME)).unwrap();
+        assert!(written.contains(&kid));
+        // Nothing went to the conversation's own keyring or into memory.
+        assert!(fixture
+            .keyrings
+            .keys(&fixture.conversation)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(fixture
+            .deks
+            .keys_snapshot(&fixture.conversation)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn new_key_is_persisted_and_unwrappable_before_use() {
         let fixture = Fixture::new();
         fixture
@@ -386,7 +421,6 @@ mod tests {
             .register_device("dev_a", &recipient(1))
             .unwrap();
         fixture.recipients.set_recovery(&recipient(9)).unwrap();
-        fixture.recipients.set_mode(HistoryEncryption::E2e).unwrap();
 
         let (kid, key) = fixture.current().await;
         let keys = fixture.keyrings.keys(&fixture.conversation).await.unwrap();
@@ -434,7 +468,6 @@ mod tests {
             .recipients
             .register_device("dev_a", &recipient(1))
             .unwrap();
-        fixture.recipients.set_mode(HistoryEncryption::E2e).unwrap();
         let (first, _) = fixture.current().await;
 
         // Age: still valid just before 24 h, rotated at 24 h.
@@ -511,30 +544,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabling_retires_the_key_and_no_recipients_fails() {
+    async fn revoking_the_last_recipient_fails() {
         let fixture = Fixture::new();
         let rid = fixture
             .recipients
             .register_device("dev_a", &recipient(1))
             .unwrap()
             .value;
-        fixture.recipients.set_mode(HistoryEncryption::E2e).unwrap();
-        let (first, _) = fixture.current().await;
-        fixture.recipients.set_mode(HistoryEncryption::Off).unwrap();
-        assert!(fixture
-            .deks
-            .current_key(&fixture.conversation)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(fixture
-            .deks
-            .key_for(&fixture.conversation, &first)
-            .await
-            .is_some());
-        fixture.recipients.set_mode(HistoryEncryption::E2e).unwrap();
-        assert_ne!(fixture.current().await.0, first);
-
+        fixture.current().await;
         fixture.recipients.revoke(&rid, "local").unwrap();
         assert_eq!(
             fixture
@@ -543,31 +560,23 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code(),
-            "CONFLICT"
+            "HISTORY_KEY_REQUIRED"
         );
     }
 
     #[tokio::test]
     async fn fresh_fallback_and_snapshot_keys() {
         let fixture = Fixture::new();
-        assert!(fixture
-            .deks
-            .fresh_key(&fixture.conversation)
-            .await
-            .unwrap()
-            .is_none());
         let rid = fixture
             .recipients
             .register_device("dev_a", &recipient(1))
             .unwrap()
             .value;
-        fixture.recipients.set_mode(HistoryEncryption::E2e).unwrap();
         // A fresh key is recorded but never becomes the active one.
         let (fresh, _) = fixture
             .deks
             .fresh_key(&fixture.conversation)
             .await
-            .unwrap()
             .unwrap();
         assert!(fixture
             .deks
@@ -624,7 +633,6 @@ mod tests {
             .recipients
             .register_device("dev_a", &recipient(1))
             .unwrap();
-        fixture.recipients.set_mode(HistoryEncryption::E2e).unwrap();
         // The conversation directory is gone: nothing may be encrypted.
         let missing = uuid::Uuid::new_v4().to_string();
         assert_eq!(

@@ -3038,17 +3038,10 @@ mod tests {
     ) {
         let root = temp_dir(label);
         let data_dir = root.join("data");
-        let keys = crate::history_keys::HistoryKeys::load(
-            &data_dir,
-            crate::config::HistoryEncryption::Off,
-            None,
-        )
+        let keys = crate::history_keys::HistoryKeys::load(&data_dir, None)
         .unwrap();
         keys.recipients()
             .register_device("dev_a", &crate::history_keys::test_support::recipient(1))
-            .unwrap();
-        keys.recipients()
-            .set_mode(crate::config::HistoryEncryption::E2e)
             .unwrap();
         let (root, store, supervisor, workspace) =
             control_fixture_keyed_at(root, false, false, Some(keys.clone())).await;

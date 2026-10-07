@@ -220,9 +220,8 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 
 | 命令 | 请求 | 结果 |
 | --- | --- | --- |
-| `history.encryption.get` | `{}` | `{ "mode": "off"\|"e2e", "epoch", "recipients": [...], "myRid"?, "myAccess": "active"\|"unregistered"\|"revoked", "grants": [...], "revokedDevices": [{ "deviceId", "revokedAt" }] }`；被封禁设备也可调用 |
-| `history.encryption.enable` / `disable` | `{}` | 同 get；`enable` 需至少一个未吊销的设备接收方，否则 `INVALID_REQUEST` |
-| `history.recipient.register` | `{ "publicKey" }`（X-Wing 公钥 1216 字节，base64url） | `{ "rid" }`；同一公钥幂等；换钥吊销旧 `rid`；已吊销或属于其他接收方的公钥返回 `CONFLICT` |
+| `history.encryption.get` | `{}` | `{ "mode": "e2e", "epoch", "recipients": [...], "myRid"?, "myAccess": "active"\|"unregistered"\|"revoked", "grants": [...], "revokedDevices": [{ "deviceId", "revokedAt" }] }`；`mode` 恒为 `"e2e"`；被封禁设备也可调用 |
+| `history.recipient.register` | `{ "publicKey" }`（X-Wing 公钥 1216 字节，base64url） | `{ "rid" }`；同一公钥幂等；开启设备认证时换钥吊销旧 `rid`，未开启时（所有连接都是 `local`）每个客户端的公钥并存、各自按 `rid` 吊销；已吊销或属于其他接收方的公钥返回 `CONFLICT` |
 | `history.recipient.revoke` | `{ "rid" }` | 同 get；未知 `rid` 为 `NOT_FOUND`，已吊销幂等；吊销设备当前的接收方同时封禁该设备 |
 | `history.device.restore` | `{ "deviceId" }` | 同 get；解除封禁（不恢复旧公钥，设备须登记新公钥并重新申请授权）；设备未被封禁为 `NOT_FOUND` |
 | `history.recovery.set` | `{ "publicKey" }` | `{ "rid" }`；替换（吊销）现有恢复接收方 |
@@ -233,22 +232,26 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 | `history.keys.wraps` | `{ "conversationId", "kids": [≤500], "rid"? }`（默认调用方 `rid`） | `{ "wraps": { "<kid>": { "rid", "kemCt", "wrapped" } } }`，无封装的 `kid` 省略 |
 | `history.grant.fulfill` | `{ "grantId"?, "rid", "wraps": [{ "conversationId", "kid", "wrapped" }]（≤500）, "complete"? }` | `{ "added" }` |
 
-`recipients[]` 项为 `{ "rid", "kind": "device"\|"recovery", "deviceId", "publicKey", "addedAt", "revokedAt" }`（含已吊销项）。授权状态 `status` 为 `pending`、`fulfilled`、`dismissed`、`revoked`（请求方接收方被吊销或换钥）。接收方集合变化（登记、换钥、吊销、恢复密钥替换、设备被吊销）使 `epoch` 加一；切换 mode 不变。
+`recipients[]` 项为 `{ "rid", "kind": "device"\|"recovery", "deviceId", "publicKey", "addedAt", "revokedAt" }`（含已吊销项）。授权状态 `status` 为 `pending`、`fulfilled`、`dismissed`、`revoked`（请求方接收方被吊销或换钥）。接收方集合变化（登记、换钥、吊销、恢复密钥替换、设备被吊销）使 `epoch` 加一。
+
+历史始终端到端加密：`history.encryption.enable` / `disable` 已删除，旧客户端调用时按未知命令处理；配置 `history_encryption` 与环境变量 `TODEX_AGENTD_HISTORY_ENCRYPTION` 已作废，读到任何值只记一条警告。没有未吊销的接收方时，新建会话、prompt、追加、重试等写入返回 `HISTORY_KEY_REQUIRED`（HTTP 409），客户端应提示用户在客户端登记设备密钥（`history.recipient.register`）。未开启设备认证时 `myRid` 与 `history.keys.wraps` 的缺省 `rid` 取 `local` 最新登记的公钥，多个客户端并存时应显式传自己的 `rid`。
 
 `history.grant.fulfill`：带 `grantId` 时目标 `rid` 必须是该待办授权的接收方（否则 `UNAUTHORIZED`），授权已结束为 `CONFLICT`；不带 `grantId`（恢复密钥导入）时目标只能是调用方自己的 `rid`。每个 `wrapped.rid` 必须等于 `rid`（`INVALID_REQUEST`），每个 `kid` 必须已存在（`NOT_FOUND`），会话须属于调用方；全部校验通过后才写入。目标已有封装的 `kid` 跳过，因此分批重试安全。最后一批带 `complete: true` 把授权标为 `fulfilled`。
 
 设备封禁（规格见 [history-encryption.md](history-encryption.md) §3.4）：吊销某设备当前的接收方（`history.recipient.revoke`）或在 TUI 吊销设备时，该设备进入 `revokedDevices`，除 `history.encryption.get` 外的所有 `history.*` 命令返回 `HISTORY_ACCESS_REVOKED`（HTTP 403），重新配对同一设备身份也不解除，直到另一台未被封禁的设备调用 `history.device.restore`。被封禁设备仍可订阅、回放会话并收到密文。未开启设备认证时命令吊销不封禁。
 
-状态推送：接收方、授权、模式或封禁列表每次持久化变化后，所有 `/v2/ws` 连接（含被封禁设备）都会收到全局事件 `{ "eventId", "type": "history.encryption.updated", "payload": { "epoch", "mode", "reason", "rid"?, "deviceId"?, "grantId"?, "conversationIds"? } }`，不含任何公钥或封装密钥；`reason` 为 `mode`、`recipient.registered`、`recipient.revoked`、`device.restored`、`device.revoked`（TUI 吊销，daemon 2 秒内推送）、`recovery.set`、`grant.requested`、`grant.dismissed`、`grant.progress`（`conversationIds` 为本批新增封装的会话）、`grant.fulfilled`，各字段含义见 history-encryption.md §7.1。客户端收到后重新读取 `history.encryption.get`。
+状态推送：接收方、授权、模式或封禁列表每次持久化变化后，所有 `/v2/ws` 连接（含被封禁设备）都会收到全局事件 `{ "eventId", "type": "history.encryption.updated", "payload": { "epoch", "mode", "reason", "rid"?, "deviceId"?, "grantId"?, "conversationIds"? } }`，不含任何公钥或封装密钥；`mode` 恒为 `"e2e"`；`reason` 为 `recipient.registered`、`recipient.revoked`、`device.restored`、`device.revoked`（TUI 吊销，daemon 2 秒内推送）、`recovery.set`、`grant.requested`、`grant.dismissed`、`grant.progress`（`conversationIds` 为本批新增封装的会话）、`grant.fulfilled`，各字段含义见 history-encryption.md §7.1。客户端收到后重新读取 `history.encryption.get`。
 
-`e2e` 下客户端须声明能解密历史：`/v2/ws` 握手 query 与 `GET /v2/conversations/{id}/events` query 带 `historyEncryption=1`（握手 query 受设备签名覆盖）。未声明的 `conversation.subscribe` 与 HTTP 回放返回 `CLIENT_UPGRADE_REQUIRED`（HTTP 426）。`/v2/version` 的 `historyEncryption` 字段给出后端支持的版本；旧后端对 `history.*` 返回 `UNSUPPORTED`。`history.encryption.enable` 同时触发已有明文历史的后台加密迁移。
+客户端须声明能解密历史：`/v2/ws` 握手 query 与 `GET /v2/conversations/{id}/events` query 带 `historyEncryption=1`（握手 query 受设备签名覆盖）。未声明的 `conversation.subscribe` 与 HTTP 回放返回 `CLIENT_UPGRADE_REQUIRED`（HTTP 426）。`/v2/version` 的 `historyEncryption` 字段给出后端支持的版本；旧后端对 `history.*` 返回 `UNSUPPORTED`。旧版明文会话（`legacyPlaintext`）同样只发给已声明的客户端。
+
+旧版明文历史（规格见 [history-encryption.md](history-encryption.md) §8）：强制加密之前写下、含任何明文记录、明文标题或明文请求快照的会话，manifest 带 `legacyPlaintext: true`（为 `false` 时省略），出现在会话列表、详情、创建/更新结果中，`conversation.subscribe` 的结果也带 `legacyPlaintext: true`。这类会话保持原样不迁移、不改写，并且只读：可读取、订阅、回放、导出、归档/取消归档与删除；prompt/followUp、`conversation.retry`、`conversation.queue.add`/`resume`、`conversation.compact`、`conversation.fork`、改名（`PATCH` 的 `title`）、权限应答与 `conversation.control` 均返回 `HISTORY_READ_ONLY`（HTTP 409），队列被拒绝时不写入 `queue.json`。daemon 启动后在后台一次性扫描所有会话写入该标记（不阻塞读取与 `/health`），尚未扫描到的会话在第一次写入尝试时当场判定。
 
 加密历史的线上形状（细节见 [history-encryption.md](history-encryption.md) §5）：
 
 - 事件 `payload` 只剩信封字段（`turnId`、`role`、`status` 等）加 `$enc`。活动分片与实时事件为事件级 `{ "v": 1, "kid", "c", "n", "s"?, "f"? }`：`detail=summary` 带 `s`（无单独摘要时带 `f`），`detail=full`、实时事件与缺口/滞后补放带 `f`，不会同时出现。封存分片为帧级 `{ "v": 1, "kid", "c", "n", "fr": { "s", "f", "i" } }`。
 - HTTP 回放页顶层附 `frames: { "<帧 id>": { "kid", "stream", "counter", "c", "ct" } }`（只含所请求 detail 的帧，页内去重）；WebSocket 每条引用帧的 `conversation.event` 消息顶层各自附带它需要的 `frames`；一次订阅补放累计携带超过 16 MiB 帧数据时提前结束并返回 `hasMore: true`，其余走 HTTP 分页。
-- 会话 manifest（列表、详情、创建与更新的结果）在加密时不含 `title`，改为 `titleEnc: { "kid", "ct" }`；fork 不继承加密标题（可在 `conversation.fork` 中另给标题）。迁移完成或加密下新建的会话带 `historyEncryptedAt`。
-- `conversation.retry` payload 为 `{ "conversationId", "text"?, "content"?, "prompt"? }`：加密时客户端发回从用户 `message.created` 解密得到的 `retryRequest`（`text` 与 `content`），两者均按原请求的 MAC 校验后重放；旧式只带 `prompt` 仅适用于没有内联文本或图片的请求。缺失为 `INVALID_REQUEST`，与原请求不符为 `CONFLICT`；明文会话忽略这些字段。
+- 会话 manifest（列表、详情、创建与更新的结果）在加密时不含 `title`，改为 `titleEnc: { "kid", "ct" }`；fork 不继承加密标题（可在 `conversation.fork` 中另给标题）。确认完全加密的会话（新建、导入或 fork 的会话从一开始即是）带 `historyEncryptedAt`；旧版明文会话带 `legacyPlaintext: true`。
+- `conversation.retry` payload 为 `{ "conversationId", "text"?, "content"?, "prompt"? }`：加密时客户端发回从用户 `message.created` 解密得到的 `retryRequest`（`text` 与 `content`），两者均按原请求的 MAC 校验后重放；旧式只带 `prompt` 仅适用于没有内联文本或图片的请求。缺失为 `INVALID_REQUEST`，与原请求不符为 `CONFLICT`；未加密的快照（仅旧版只读会话才有）忽略这些字段。
 - 加密时 `conversation.control` 以同一 `requestId` 重试：同一 control 返回原结果（daemon 重启后为 `null`），被拒绝的返回 `Control was rejected (<code>).`。
 - 没有未吊销接收方时，新 prompt（含队列投递与重试）返回 `CONFLICT`，进行中的 turn 不受影响。
 
@@ -285,7 +288,7 @@ $DATA_DIR/conversations/<uuid-v4>/
   provider-state.json
 ```
 
-journal 存储格式为 history v3（规格见 `docs/history-encryption.md` §4）：按段号排列的封存分片（`events.NNNNNN.seg` + `.idx`，或短暂存在、等待转换的 `events.NNNNNN.jsonl`），随后是唯一可写的 `events.jsonl`；`events.jsonl` 超过 64 MiB 后在下一次追加前被改名为下一个段号，后台任务把它转为 raw DEFLATE 分帧的 `.seg`。新写入的行是短键 v3 记录，旧 v2 行照常读取；WebSocket 与 HTTP 返回的事件形状与 v2 完全相同。sequence 从 1 连续递增；损坏按文件（明文）或按分片（`.seg`）处理，以 `journal.recordLost` 占位，不再坍缩成单个文件。封存时，已有同 id 终态记录的 `message.delta`、`tool.updated`、`subagent.updated` 换成 `journal.compacted` 标记（sequence、eventId、time 不变）。旧 v2 会话在空闲时于后台按体积从大到小迁移，原文件硬链接到会话目录下 `journal-v2-backup/` 保留 7 天；迁移完成的 manifest 带 `storageVersion: 3`，旧版 daemon 无法读取。
+journal 存储格式为 history v3（规格见 `docs/history-encryption.md` §4）：按段号排列的封存分片（`events.NNNNNN.seg` + `.idx`，或短暂存在、等待转换的 `events.NNNNNN.jsonl`），随后是唯一可写的 `events.jsonl`；`events.jsonl` 超过 64 MiB 后在下一次追加前被改名为下一个段号，后台任务把它转为 raw DEFLATE 分帧的 `.seg`。新写入的行是短键 v3 记录，旧 v2 行照常读取；WebSocket 与 HTTP 返回的事件形状与 v2 完全相同。sequence 从 1 连续递增；损坏按文件（明文）或按分片（`.seg`）处理，以 `journal.recordLost` 占位，不再坍缩成单个文件。封存时，已有同 id 终态记录的 `message.delta`、`tool.updated`、`subagent.updated` 换成 `journal.compacted` 标记（sequence、eventId、time 不变）。旧 v2 会话不再迁移，按原样读取（它们都是旧版明文历史，只读，见「历史加密密钥」）；旧版本迁移留下的 `journal-v2-backup/` 在 7 天后删除。新会话的 manifest 带 `storageVersion: 3`，旧版 daemon 无法读取。
 
 `events.jsonl` 是规范事件日志，sequence 从 1 连续递增；每次追加以 fsync 后的 journal 行为唯一提交点。manifest 缓存在内存中：创建、状态变化、元数据更新、强制置状态，以及会改变 manifest 的恢复时立即写 `manifest.json` 与 `snapshot.json`（与 journal 一致的 manifest 在启动恢复时不重写）；仅 `lastSequence`、`updatedAt` 变化时最多延迟 2 秒写 `manifest.json`，关闭时刷盘，崩溃后从 journal 重建。journal 修复：末条记录缺少换行时恢复阶段补上；明文文件中间损坏时先把受损文件备份为 `events.corrupt.<ts>.jsonl`，再原子重写这些文件，有效记录原样保留，每个丢失的 sequence 以 `journal.recordLost` 占位（payload `{ "reason": "corrupt", "runStart", "runLength", "backup" }`，同一段丢失共享 `runStart`/`runLength`，客户端可合并显示；普通追加无法伪造该事件类型）；末尾损坏仍隔离到备份文件后截断。`journal.compacted` 标记的 payload 为 `{ "reason": "compacted", "originalType", "runStart", "runLength" }`，同一剥离段共享 `runStart`/`runLength`；旧版本压缩写入的紧凑行 `{"sequence", "compacted": {...}}` 仍按原样读取。客户端把该类型按未知事件处理、不产生时间线条目。daemon 就绪后会在后台复制迁移旧 `$DATA_DIR/codex_gateway/sessions`；旧文件不修改，迁移可重复执行，并会去除 approval response 和常见 secret 字段。迁移失败会记录日志并在下次启动时重试，不阻塞 API 可用性。
 
@@ -1080,6 +1083,8 @@ TUI 配对二维码只携带后端地址、当前首选加密方式和服务端�
 | `PROTOCOL_UPGRADE_REQUIRED` | 请求使用了已停用的协议（HTTP 426）：非回环对端绕过 transport v2 直接访问、`/v2/ws` 的 `tv` 不是 `2` 或仍用 v1 `enc=`，或配对 `create` 仍提交 `clientPublicKey`（配对 v2）；需升级客户端。 |
 | `TRANSPORT_CRYPTO_FAILED` | `POST /v2/sealed` 的外层无法打开（HTTP 400），不含细节；WebSocket 上对应 close code `4400`。 |
 | `CLIENT_UPGRADE_REQUIRED` | 历史已端到端加密，而客户端未声明 `historyEncryption=1`（HTTP 426）；需升级客户端。 |
+| `HISTORY_KEY_REQUIRED` | 没有可读取新历史的接收方（HTTP 409）：新建会话、prompt、追加与重试等写入被拒绝，不写任何内容；在客户端登记设备密钥（`history.recipient.register`）后重试。 |
+| `HISTORY_READ_ONLY` | 会话为旧版未加密历史（`legacyPlaintext`），只读（HTTP 409）：可读取、归档与删除，不能再写入。 |
 | `HISTORY_ACCESS_REVOKED` | 调用方设备已被封禁历史访问（HTTP 403）：除 `history.encryption.get` 外的 `history.*` 命令均拒绝，需另一台设备调用 `history.device.restore`。 |
 | `STORAGE_LOW` | 数据目录所在磁盘可用空间低于 1 GiB，拒绝新 turn，HTTP 507；释放磁盘空间后重试。运行中的 turn 不受影响。 |
 | `JOURNAL_FULL` | 已停用（history v3 起会话没有体积上限，服务端不再返回），保留供旧客户端映射。 |

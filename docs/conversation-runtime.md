@@ -221,8 +221,8 @@ are kept (the summary stream is regenerated), the rest become
 `events.corrupt.<ts>.seg`/`.idx`. No repair collapses the journal into one
 file.
 
-End-to-end encrypted history (`history_encryption = "e2e"`,
-`docs/history-encryption.md` §3–§5, §8): every append is sealed under the
+End-to-end encrypted history (always on, `docs/history-encryption.md`
+§3–§5, §8): every append is sealed under the
 conversation's current DEK at commit time — coalesced stream text when its
 window is journalled — after the payload's deduplication fields are replaced
 by MACs. The journal line keeps only the envelope `e` in plaintext and stores
@@ -238,15 +238,19 @@ slimming and re-framing them), then releases those DEKs; ciphertext whose
 DEK is gone (the daemon restarted) is framed as it is. Sealed frames reach
 clients as ciphertext read straight from the `.seg` (`frames` on HTTP pages
 and on each socket replay message that needs one). With no recipient left,
-new prompts are refused with `CONFLICT` before their turn starts while a
+new prompts and new conversations are refused with `HISTORY_KEY_REQUIRED`
+before anything is written while a
 running turn keeps the newest DEK in memory; without one the append fails
 instead of writing plaintext. The `last-request.json` of an encrypted
 conversation holds no prompt text (`conversation.retry` then needs the
 client's decrypted `prompt`), titles are stored as `titleEnc`, and control
-retries compare MACs (completed results are remembered in memory only). The
-maintenance task migrates existing plaintext of idle conversations when
-encryption is on, one committed segment at a time, and marks the manifest
-`historyEncryptedAt`. Deleting a conversation removes its keyring with its
+retries compare MACs (completed results are remembered in memory only). Imports and forks
+are assembled encrypted: plaintext records of the draft are sealed under a
+one-off key recorded in the draft's keyring, copied ciphertext keeps its
+`$enc`. Plaintext history from older versions is never migrated: a one-time
+startup scan (or the first write attempt) marks it `legacyPlaintext` and
+the conversation becomes read-only (`HISTORY_READ_ONLY`); fully encrypted
+conversations carry `historyEncryptedAt`. Deleting a conversation removes its keyring with its
 directory and forgets its DEKs.
 
 History has no size limit: every append lands, so a running turn can always

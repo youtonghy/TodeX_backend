@@ -188,6 +188,20 @@ impl AppState {
         })
     }
 
+    /// [`Self::new`] plus a history recovery recipient (seed
+    /// [`TEST_HISTORY_RECIPIENT`]) so conversations can be written: history
+    /// is always end-to-end encrypted and a store without a recipient
+    /// refuses writes with `HISTORY_KEY_REQUIRED`. Tests read the content
+    /// back with `conversation::e2e_support`.
+    #[cfg(test)]
+    pub(crate) async fn new_for_tests(config: Config) -> Result<Self> {
+        let state = Self::new(config).await?;
+        state.history_keys.recipients().set_recovery(
+            &crate::history_keys::test_support::recipient(TEST_HISTORY_RECIPIENT),
+        )?;
+        Ok(state)
+    }
+
     #[cfg(test)]
     pub(crate) fn conversation_store(&self) -> &ConversationStore {
         &self.conversation_store
@@ -238,6 +252,11 @@ impl AppState {
             .saturating_sub(1)
     }
 }
+
+/// Seed byte of the recipient [`AppState::new_for_tests`] registers
+/// (`history_keys::test_support::recipient`).
+#[cfg(test)]
+pub(crate) const TEST_HISTORY_RECIPIENT: u8 = 0xE2;
 
 async fn set_owner_only_directory(path: &std::path::Path) -> Result<()> {
     #[cfg(unix)]

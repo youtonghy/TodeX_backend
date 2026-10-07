@@ -1,5 +1,5 @@
 //! History v3 storage tests: sealing, crash recovery, segment salvage,
-//! migration and the storage floor. Kept beside `store.rs` so they reach its
+//! reading v2 journals and the storage floor. Kept beside `store.rs` so they reach its
 //! private items.
 
 use std::fs;
@@ -7,8 +7,7 @@ use std::fs;
 use serde_json::json;
 
 use super::*;
-use crate::conversation::maintenance::BACKUP_DIR;
-use crate::conversation::{ConversationStatus, ProviderKind};
+use crate::conversation::ProviderKind;
 
 fn temp_dir(prefix: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
@@ -520,103 +519,38 @@ async fn write_v2_conversation(root: &Path, count: u64, per_file: u64) -> String
 }
 
 #[tokio::test]
-async fn v2_journals_migrate_with_a_backup_and_resume_after_a_kill() {
-    let root = temp_dir("todex-v3-migrate");
+async fn v2_journals_stay_readable_and_are_never_rewritten() {
+    let root = temp_dir("todex-v3-v2-legacy");
     let id = write_v2_conversation(&root, 1_000, 150).await;
     let directory = root.join("conversations").join(&id);
-    let reference = ConversationStore::new(root.clone()).await.unwrap();
-    let before = reference.complete_history(&id).await.unwrap();
-    let digest = reference.digest(&id, Clone::clone).await.unwrap();
-    let originals: Vec<(String, Vec<u8>)> = dir_names(&directory)
-        .into_iter()
-        .filter(|name| name.ends_with(".jsonl"))
-        .map(|name| {
-            let bytes = fs::read(directory.join(&name)).unwrap();
-            (name, bytes)
-        })
-        .collect();
-    drop(reference);
-
-    // First run is "killed" right after its first segment is renamed.
-    let store = ConversationStore::new(root.clone()).await.unwrap();
-    store.set_commit_stop(Some(CommitStep::SegmentRenamed));
-    assert!(store.migrate_conversation(&id).await.is_err());
-    store.set_commit_stop(None);
-    drop(store);
-    // The backup is complete before anything is rewritten.
-    let backup = directory.join(BACKUP_DIR);
-    assert!(backup.join("backup.json").exists());
-    let backed_up: usize = dir_names(&backup)
-        .iter()
-        .filter(|name| name.ends_with(".jsonl"))
-        .count();
-    assert_eq!(backed_up, originals.len());
-
-    let store = ConversationStore::new(root.clone()).await.unwrap();
-    assert!(store.migrate_conversation(&id).await.unwrap());
-    let manifest = store.get(&id).await.unwrap();
-    assert_eq!(
-        manifest.storage_version,
-        Some(super::super::model::STORAGE_VERSION)
-    );
-    let names = dir_names(&directory);
-    assert!(
-        !names
-            .iter()
-            .any(|name| name.ends_with(".jsonl") && name != EVENTS_FILE),
-        "{names:?}"
-    );
-    let after = store.complete_history(&id).await.unwrap();
-    assert_same_or_marker(&after, &before);
-    assert_eq!(store.digest(&id, Clone::clone).await.unwrap(), digest);
-    // Hard links keep the original bytes.
-    let mut backed: Vec<Vec<u8>> = Vec::new();
-    for (name, bytes) in &originals {
-        let name = if name == EVENTS_FILE {
-            dir_names(&backup)
-                .into_iter()
-                .find(|candidate| {
-                    candidate.ends_with(".jsonl") && !originals.iter().any(|(o, _)| o == candidate)
-                })
-                .unwrap()
-        } else {
-            name.clone()
-        };
-        let copy = fs::read(backup.join(&name)).unwrap();
-        assert_eq!(&copy, bytes);
-        backed.push(copy);
-    }
-    // A migrated conversation is not migrated again.
-    assert!(store.migrate_conversation(&id).await.unwrap());
-
-    // Backups expire after a week.
-    store.remove_expired_backups().await.unwrap();
-    assert!(backup.exists());
-    fs::write(
-        backup.join("backup.json"),
-        serde_json::to_vec(&json!({"createdAt": Utc::now() - chrono::TimeDelta::days(8)})).unwrap(),
-    )
-    .unwrap();
-    store.remove_expired_backups().await.unwrap();
-    assert!(!backup.exists());
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn busy_conversations_are_not_migrated() {
-    let root = temp_dir("todex-v3-busy");
-    let id = write_v2_conversation(&root, 300, 100).await;
-    let store = ConversationStore::new(root.clone()).await.unwrap();
-    store
-        .set_status(&id, ConversationStatus::Running)
-        .await
+    let originals = |directory: &Path| {
+        let mut files = dir_names(directory)
+            .into_iter()
+            .filter(|name| name.ends_with(".jsonl"))
+            .map(|name| {
+                let bytes = fs::read(directory.join(&name)).unwrap();
+                (name, bytes)
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    };
+    let before = originals(&directory);
+    let keys = crate::history_keys::HistoryKeys::load(&root, None).unwrap();
+    keys.recipients()
+        .register_device("local", &crate::history_keys::test_support::recipient(1))
         .unwrap();
-    assert!(!store.migrate_conversation(&id).await.unwrap());
-    assert!(!root
-        .join("conversations")
-        .join(&id)
-        .join(BACKUP_DIR)
-        .exists());
+    let store = ConversationStore::open(root.clone(), keys).await.unwrap();
+    let history = store.complete_history(&id).await.unwrap();
+    assert_eq!(history.len(), 1_000);
+    assert_eq!(history[999].sequence, 1_000);
+    let scan = store.scan_legacy(&root).await.unwrap();
+    assert_eq!(scan.marked_legacy, 1);
+    assert!(store.get(&id).await.unwrap().legacy_plaintext);
+    // Maintenance has nothing to do with it: no conversion was queued, and
+    // the read path never rewrote the v2 files.
+    assert_eq!(originals(&directory), before);
+    assert!(!directory.join("journal-v2-backup").exists());
     fs::remove_dir_all(root).unwrap();
 }
 
