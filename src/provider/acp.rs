@@ -24,13 +24,12 @@ use crate::conversation::ProviderKind;
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
-use super::process::{
-    executable_available, provider_exit_error, redact_sensitive_text, CommandSpec, JsonLineProcess,
-};
+use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::profile::{
     CatalogProfile, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel, ProviderProfile,
     SkillInjection,
 };
+use super::rpc::{safe_error_text, FailureWording, RpcClient, RpcPeer};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
     PendingProviderControl, PermissionConfigCapabilities, PermissionOutcome, ProviderCapabilities,
@@ -296,30 +295,18 @@ impl ProviderDriver for AcpDriver {
                 initialize_request(ProviderKind::Acp),
             )
             .await?;
-            loop {
-                let Some(message) = process.read().await? else {
-                    break Err(
-                        provider_exit_error(&process, "ACP agent closed during initialize").await,
-                    );
-                };
-                if jsonrpc_id(&message) != Some(request_id.as_str()) {
-                    continue;
-                }
-                if let Some(error) = message.get("error") {
-                    break Err(AppError::ProviderUnavailable(format!(
-                        "ACP initialize failed: {}",
-                        safe_error_text(error)
-                    )));
-                }
-                let response: InitializeResponse =
-                    serde_json::from_value(message.get("result").cloned().unwrap_or(Value::Null))
-                        .map_err(|error| {
-                        AppError::InvalidRequest(format!(
-                            "invalid ACP initialize response: {error}"
-                        ))
-                    })?;
-                break Ok(response.agent_capabilities.prompt_capabilities.image);
-            }
+            let peer = RpcPeer {
+                failure: FailureWording::Method,
+                closed: "ACP agent closed during initialize",
+                ..ACP_RPC
+            };
+            let result = RpcClient::new(&mut process, peer)
+                .response(&request_id, "initialize", None, None)
+                .await?;
+            let response: InitializeResponse = serde_json::from_value(result).map_err(|error| {
+                AppError::InvalidRequest(format!("invalid ACP initialize response: {error}"))
+            })?;
+            Ok(response.agent_capabilities.prompt_capabilities.image)
         }
         .await;
         process.terminate().await;
@@ -442,42 +429,32 @@ async fn acp_control_response(
     process: &mut JsonLineProcess,
     request_id: &str,
 ) -> Result<Value, AppError> {
-    let deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
-    loop {
-        let Some(message) = process.read_control_until(deadline).await? else {
-            return Err(provider_exit_error(process, "ACP agent closed stdout").await);
-        };
-        if message.is_null() {
-            continue;
-        }
-        if jsonrpc_id(&message) == Some(request_id) {
-            if let Some(error) = message.get("error") {
-                let locked = error
-                    .pointer("/data/cognition.ai~1errorKind")
-                    .and_then(Value::as_str)
-                    == Some("session_locked");
-                if locked {
-                    return Err(AppError::Conflict(
-                        "ACP session is open in another process".to_owned(),
-                    ));
-                }
-                return Err(AppError::ProviderUnavailable(format!(
-                    "ACP request {request_id} failed: {}",
-                    safe_error_text(error)
-                )));
-            }
-            return Ok(message.get("result").cloned().unwrap_or(Value::Null));
-        }
-        if let Some(id) = message
-            .get("id")
-            .filter(|_| message.get("method").is_some())
-        {
-            process
-                .send(&json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"client capability is not supported outside a turn"}}))
-                .await?;
-        }
-    }
+    let method = request_id.split(':').next().unwrap_or(request_id);
+    RpcClient::new(process, ACP_RPC)
+        .response(request_id, method, None, None)
+        .await
 }
+
+/// Devin marks a session opened by another process (a stale lock or the
+/// Devin app's resident ACP host) with a structured kind; surface it
+/// distinctly so the caller can recover.
+fn session_locked_error(error: &Value) -> Option<AppError> {
+    (error
+        .pointer("/data/cognition.ai~1errorKind")
+        .and_then(Value::as_str)
+        == Some("session_locked"))
+    .then(|| AppError::Conflict("ACP session is open in another process".to_owned()))
+}
+
+const ACP_RPC: RpcPeer = RpcPeer {
+    name: "ACP",
+    failure: FailureWording::RequestId,
+    closed: "ACP agent closed stdout",
+    decline: Some("client capability is not supported outside a turn"),
+    jsonrpc_field: true,
+    result_optional: true,
+    classify_error: Some(session_locked_error),
+};
 
 fn initialize_request(provider: ProviderKind) -> InitializeRequest {
     let capabilities = ClientCapabilities::new().session(
@@ -1681,26 +1658,8 @@ async fn wait_for_response_with_timeout(
         if message.is_null() {
             continue;
         }
-        if jsonrpc_id(&message) == Some(request_id) {
-            if let Some(error) = message.get("error") {
-                // Devin marks a session opened by another process (a stale lock
-                // or the Devin app's resident ACP host) with a structured kind;
-                // surface it distinctly so the caller can recover.
-                let locked = error
-                    .pointer("/data/cognition.ai~1errorKind")
-                    .and_then(Value::as_str)
-                    == Some("session_locked");
-                if locked {
-                    return Err(AppError::Conflict(
-                        "ACP session is open in another process".to_owned(),
-                    ));
-                }
-                return Err(AppError::ProviderUnavailable(format!(
-                    "ACP request {request_id} failed: {}",
-                    safe_error_text(error)
-                )));
-            }
-            return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+        if let Some(outcome) = ACP_RPC.outcome(&message, request_id, request_id) {
+            return outcome;
         }
         let waits_for_user = message.get("id").is_some()
             && message
@@ -3121,7 +3080,7 @@ async fn send_request(
     method: &str,
     params: impl serde::Serialize,
 ) -> Result<String, AppError> {
-    let id = format!("{method}:{}", uuid::Uuid::new_v4().simple());
+    let id = super::rpc::fresh_id(method);
     process
         .send(&json!({
             "jsonrpc": "2.0",
@@ -3149,19 +3108,6 @@ async fn send_notification(
 
 fn jsonrpc_id(message: &Value) -> Option<&str> {
     message.get("id").and_then(Value::as_str)
-}
-
-fn safe_error_text(error: &Value) -> String {
-    redact_sensitive_text(
-        error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("provider returned an error")
-            .chars()
-            .take(500)
-            .collect::<String>()
-            .as_str(),
-    )
 }
 
 #[cfg(test)]

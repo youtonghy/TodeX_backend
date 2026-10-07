@@ -15,11 +15,12 @@ use super::acp::{
     declares_session_fork, run_acp_turn_controlled, select_auth_method, AcpConnectionState,
     AcpRuntimeOptions, FORK_PROBE_TTL, INTERACTIVE_AUTH_TIMEOUT,
 };
-use super::process::{executable_available, redact_sensitive_text, CommandSpec, JsonLineProcess};
+use super::process::{executable_available, CommandSpec, JsonLineProcess};
 use super::profile::{
     CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
     ProviderProfile, SkillInjection, UserConfigFile,
 };
+use super::rpc::{FailureWording, RpcClient, RpcPeer};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
     PendingProviderControl, PermissionConfigCapabilities, ProviderCapabilities,
@@ -30,7 +31,17 @@ use super::types::{
 const MAX_DEVIN_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
 const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
-const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Budget for the headless `initialize` that probes fork support.
+const FORK_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEVIN_RPC: RpcPeer = RpcPeer {
+    name: "Devin",
+    failure: FailureWording::Method,
+    closed: "Devin closed stdout during control request",
+    decline: Some("client capability is not supported during control request"),
+    jsonrpc_field: true,
+    result_optional: false,
+    classify_error: None,
+};
 const COMMAND_DRAIN: Duration = Duration::from_millis(1500);
 /// Model/command discovery spawns an authenticated probe process; cache it so
 /// routine client refreshes do not re-authenticate on every query.
@@ -246,7 +257,7 @@ impl DevinDriver {
                 "authenticate",
                 "authenticate",
                 params,
-                self.auth_timeout()?.unwrap_or(DIAGNOSTIC_TIMEOUT),
+                self.auth_timeout()?,
             )
             .await?;
         }
@@ -267,7 +278,7 @@ impl DevinDriver {
             process.terminate().await;
             result
         };
-        match tokio::time::timeout(DIAGNOSTIC_TIMEOUT, run).await {
+        match tokio::time::timeout(FORK_PROBE_TIMEOUT, run).await {
             Ok(Ok(capable)) => capable,
             Ok(Err(error)) => {
                 tracing::debug!(error = %error, "Devin fork capability probe failed");
@@ -299,7 +310,7 @@ impl DevinDriver {
                 "session/new",
                 json!({ "cwd": workspace, "mcpServers": [] }),
                 &mut updates,
-                DIAGNOSTIC_TIMEOUT,
+                None,
             )
             .await?;
             response
@@ -524,7 +535,7 @@ impl ProviderDriver for DevinDriver {
                 "fork",
                 "session/fork",
                 json!({ "sessionId": source, "cwd": context.manifest.workspace }),
-                DIAGNOSTIC_TIMEOUT,
+                None,
             )
             .await?;
             let forked = response
@@ -769,7 +780,7 @@ async fn initialize_process(process: &mut JsonLineProcess) -> Result<Value, AppE
         "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"configOptions":{}},"_meta":{"cognition.ai/subagentSupport":true}},
         "clientInfo":{"name":"todex-agentd","title":"TodeX 2.0","version":crate::version::APP_VERSION},
         }),
-        DIAGNOSTIC_TIMEOUT,
+        None,
     ).await?;
     if result.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
         return Err(AppError::Unsupported(
@@ -784,10 +795,11 @@ async fn control_request(
     id: &str,
     method: &str,
     params: Value,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<Value, AppError> {
-    let mut updates = Vec::new();
-    control_request_updates(process, id, method, params, &mut updates, timeout).await
+    RpcClient::new(process, DEVIN_RPC)
+        .request(id, method, params, timeout)
+        .await
 }
 
 async fn control_request_updates(
@@ -796,30 +808,11 @@ async fn control_request_updates(
     method: &str,
     params: Value,
     updates: &mut Vec<Value>,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<Value, AppError> {
-    process
-        .send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-        .await?;
-    tokio::time::timeout(timeout, async {
-        loop {
-            let Some(message) = process.read().await? else {
-                return Err(AppError::ProviderUnavailable("Devin closed stdout during control request".to_owned()));
-            };
-            if message.get("id").and_then(Value::as_str) == Some(id) {
-                if let Some(error) = message.get("error") {
-                    return Err(AppError::ProviderUnavailable(format!("Devin {method} failed: {}", safe_message(error))));
-                }
-                return message.get("result").cloned().ok_or_else(|| AppError::InvalidRequest("Devin control response has no result".to_owned()));
-            }
-            if message.get("method").and_then(Value::as_str) == Some("session/update") {
-                updates.push(message.get("params").cloned().unwrap_or(Value::Null));
-            }
-            if let Some(request_id) = message.get("id").filter(|_| message.get("method").is_some()) {
-                process.send(&json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"client capability is not supported during control request"}})).await?;
-            }
-        }
-    }).await.map_err(|_| AppError::ProviderUnavailable(format!("Devin {method} timed out")))?
+    RpcClient::new(process, DEVIN_RPC)
+        .request_collecting(id, method, params, timeout, updates)
+        .await
 }
 
 fn devin_environment(allowlist: &[String]) -> BTreeMap<String, String> {
@@ -1177,15 +1170,6 @@ fn parse_devin_commands(updates: &[Value]) -> Vec<ProviderCommandDescriptor> {
             super::grok::parse_commands(&json!({ "_meta": { "availableCommands": commands } }))
         })
         .unwrap_or_default()
-}
-
-fn safe_message(value: &Value) -> String {
-    redact_sensitive_text(
-        value
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("provider returned an error"),
-    )
 }
 
 #[cfg(test)]

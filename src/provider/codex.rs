@@ -13,6 +13,7 @@ use super::profile::{
     CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
     ProviderProfile, SkillInjection, UserConfigFile,
 };
+use super::rpc::{id_matches, safe_error_text, FailureWording, RpcClient, RpcPeer};
 use super::types::{
     resolve_execution_config, DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult,
     ImageInputMode, PermissionConfigCapabilities, PermissionOutcome, ProviderCommandDescriptor,
@@ -179,7 +180,7 @@ impl ProviderDriver for CodexDriver {
                         return Err(AppError::TurnCancelled);
                     }
                 }.ok_or_else(|| AppError::ProviderUnavailable("Codex closed during compaction".to_owned()))?;
-                if jsonrpc_id_matches(&message, "compact") {
+                if id_matches(&message, "compact") {
                     if let Some(error) = message.get("error") { return Err(AppError::ProviderUnavailable(format!("Codex compaction failed: {}", safe_error_text(error)))); }
                     acknowledged = message.get("result").is_some();
                 }
@@ -443,26 +444,29 @@ async fn read_rpc_response_cancellable(
 }
 
 async fn read_rpc_response(process: &mut JsonLineProcess, id: &str) -> Result<Value, AppError> {
-    let deadline = tokio::time::Instant::now() + super::process::control_timeout()?;
-    loop {
-        let Some(value) = process.read_control_until(deadline).await? else {
-            return Err(provider_exit_error(process, "Codex app-server closed stdout").await);
-        };
-        if jsonrpc_id_matches(&value, id) {
-            if let Some(error) = value.get("error") {
-                return Err(AppError::ProviderUnavailable(format!(
-                    "Codex app-server request failed: {}",
-                    safe_error_text(error)
-                )));
-            }
-            return value.get("result").cloned().ok_or_else(|| {
-                AppError::ProviderUnavailable(
-                    "Codex app-server response did not include a result".to_owned(),
-                )
-            });
-        }
-    }
+    RpcClient::new(process, CODEX_RPC)
+        .response(id, id, None, None)
+        .await
 }
+
+/// Requests inside a turn are named by id.
+const CODEX_TURN_RPC: RpcPeer = RpcPeer {
+    name: "Codex",
+    failure: FailureWording::RequestId,
+    ..CODEX_RPC
+};
+
+/// Codex app-server: JSON-RPC without the `jsonrpc` field. Out of a turn,
+/// server requests are left unanswered.
+const CODEX_RPC: RpcPeer = RpcPeer {
+    name: "Codex app-server",
+    failure: FailureWording::Request,
+    closed: "Codex app-server closed stdout",
+    decline: None,
+    jsonrpc_field: false,
+    result_optional: false,
+    classify_error: None,
+};
 
 async fn prepare_codex_thread(
     process: &mut JsonLineProcess,
@@ -709,9 +713,8 @@ async fn wait_for_response(
             message = process.read_frame() => {
                 let Some(message) = sink.provider_frame(message?).await? else { return Err(provider_exit_error(process, "Codex app-server closed stdout").await); };
                 if message.is_null() { continue; }
-                if jsonrpc_id_matches(&message, request_id) {
-                    if let Some(error) = message.get("error") { return Err(AppError::ProviderUnavailable(format!("Codex request {request_id} failed: {}",safe_error_text(error)))); }
-                    response = Some(message.get("result").cloned().ok_or_else(||AppError::InvalidRequest(format!("Codex response {request_id} did not contain a result")))?);
+                if let Some(outcome) = CODEX_TURN_RPC.outcome(&message, request_id, request_id) {
+                    response = Some(outcome?);
                     continue;
                 }
                 if let (Some(id),Some(method)) = (message.get("id"),message.get("method").and_then(Value::as_str)) {
@@ -1315,14 +1318,6 @@ fn codex_turn_failure(message: &Value) -> AppError {
     AppError::ProviderUnavailable(detail)
 }
 
-fn jsonrpc_id_matches(message: &Value, expected: &str) -> bool {
-    message.get("id").is_some_and(|id| match id {
-        Value::String(value) => value == expected,
-        Value::Number(value) => value.to_string() == expected,
-        _ => false,
-    })
-}
-
 fn jsonrpc_id_text(id: &Value) -> Result<String, AppError> {
     match id {
         Value::String(value) => Ok(value.clone()),
@@ -1331,16 +1326,6 @@ fn jsonrpc_id_text(id: &Value) -> Result<String, AppError> {
             "Codex request id must be a string or number".to_owned(),
         )),
     }
-}
-
-fn safe_error_text(error: &Value) -> String {
-    error
-        .as_str()
-        .or_else(|| error.get("message").and_then(Value::as_str))
-        .unwrap_or("provider returned an error")
-        .chars()
-        .take(500)
-        .collect()
 }
 
 #[cfg(test)]
@@ -1647,8 +1632,8 @@ mod tests {
 
     #[test]
     fn request_ids_accept_strings_and_numbers_without_quoting() {
-        assert!(jsonrpc_id_matches(&json!({ "id": "42" }), "42"));
-        assert!(jsonrpc_id_matches(&json!({ "id": 42 }), "42"));
+        assert!(id_matches(&json!({ "id": "42" }), "42"));
+        assert!(id_matches(&json!({ "id": 42 }), "42"));
         assert_eq!(jsonrpc_id_text(&json!("request-1")).unwrap(), "request-1");
         assert_eq!(jsonrpc_id_text(&json!(42)).unwrap(), "42");
         assert!(jsonrpc_id_text(&Value::Null).is_err());

@@ -13,11 +13,12 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{run_acp_turn_controlled, AcpConnectionState, AcpRuntimeOptions};
 use super::devin::DiscoverySnapshot;
-use super::process::{executable_available, redact_sensitive_text, CommandSpec, JsonLineProcess};
+use super::process::{executable_available, CommandSpec, JsonLineProcess};
 use super::profile::{
     CatalogProfile, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel, ProviderProfile,
     SkillInjection,
 };
+use super::rpc::{FailureWording, RpcClient, RpcPeer};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
     PendingProviderControl, PermissionConfigCapabilities, ProviderCommandDescriptor,
@@ -27,7 +28,15 @@ use super::types::{
 const MAX_OPENCODE_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
 const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
-const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENCODE_RPC: RpcPeer = RpcPeer {
+    name: "OpenCode",
+    failure: FailureWording::Method,
+    closed: "OpenCode closed stdout during control request",
+    decline: Some("client capability is not supported during control request"),
+    jsonrpc_field: true,
+    result_optional: false,
+    classify_error: None,
+};
 const COMMAND_DRAIN: Duration = Duration::from_millis(1500);
 /// A cold probe spends ~0.5s spawning `opencode acp`, 3-6s in `session/new`
 /// (provider catalogs load there) and up to `COMMAND_DRAIN` waiting for the
@@ -147,7 +156,7 @@ impl OpencodeDriver {
                 "session/new",
                 json!({ "cwd": workspace, "mcpServers": [] }),
                 &mut updates,
-                DIAGNOSTIC_TIMEOUT,
+                None,
             )
             .await?;
             response
@@ -250,7 +259,7 @@ async fn probe_efforts(
             "probe:model",
             "session/set_config_option",
             json!({"sessionId": session_id, "configId": "model", "value": model.id}),
-            CONTROL_TIMEOUT,
+            Some(CONTROL_TIMEOUT),
         )
         .await;
         let Ok(response) = response else {
@@ -300,7 +309,7 @@ async fn close_probe_session(process: &mut JsonLineProcess, session: &Value) {
         "session:close",
         "session/close",
         json!({ "sessionId": session_id }),
-        DIAGNOSTIC_TIMEOUT,
+        None,
     )
     .await;
 }
@@ -437,7 +446,7 @@ impl ProviderDriver for OpencodeDriver {
                 "fork",
                 "session/fork",
                 json!({"sessionId": source, "cwd": context.manifest.workspace}),
-                DIAGNOSTIC_TIMEOUT,
+                None,
             )
             .await?;
             let id = response
@@ -658,7 +667,7 @@ async fn initialize_process(process: &mut JsonLineProcess) -> Result<Value, AppE
         "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"configOptions":{}}},
         "clientInfo":{"name":"todex-agentd","title":"TodeX 2.0","version":crate::version::APP_VERSION},
         }),
-        DIAGNOSTIC_TIMEOUT,
+        None,
     ).await?;
     if result.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
         return Err(AppError::Unsupported(
@@ -673,10 +682,11 @@ async fn control_request(
     id: &str,
     method: &str,
     params: Value,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<Value, AppError> {
-    let mut updates = Vec::new();
-    control_request_updates(process, id, method, params, &mut updates, timeout).await
+    RpcClient::new(process, OPENCODE_RPC)
+        .request(id, method, params, timeout)
+        .await
 }
 
 async fn control_request_updates(
@@ -685,30 +695,11 @@ async fn control_request_updates(
     method: &str,
     params: Value,
     updates: &mut Vec<Value>,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<Value, AppError> {
-    process
-        .send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-        .await?;
-    tokio::time::timeout(timeout, async {
-        loop {
-            let Some(message) = process.read().await? else {
-                return Err(AppError::ProviderUnavailable("OpenCode closed stdout during control request".to_owned()));
-            };
-            if message.get("id").and_then(Value::as_str) == Some(id) {
-                if let Some(error) = message.get("error") {
-                    return Err(AppError::ProviderUnavailable(format!("OpenCode {method} failed: {}", safe_message(error))));
-                }
-                return message.get("result").cloned().ok_or_else(|| AppError::InvalidRequest("OpenCode control response has no result".to_owned()));
-            }
-            if message.get("method").and_then(Value::as_str) == Some("session/update") {
-                updates.push(message.get("params").cloned().unwrap_or(Value::Null));
-            }
-            if let Some(request_id) = message.get("id").filter(|_| message.get("method").is_some()) {
-                process.send(&json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"client capability is not supported during control request"}})).await?;
-            }
-        }
-    }).await.map_err(|_| AppError::ProviderUnavailable(format!("OpenCode {method} timed out")))?
+    RpcClient::new(process, OPENCODE_RPC)
+        .request_collecting(id, method, params, timeout, updates)
+        .await
 }
 
 fn opencode_environment(allowlist: &[String]) -> BTreeMap<String, String> {
@@ -733,15 +724,6 @@ fn valid_env_name(value: &str) -> bool {
         .next()
         .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-}
-
-fn safe_message(value: &Value) -> String {
-    redact_sensitive_text(
-        value
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("provider returned an error"),
-    )
 }
 
 #[cfg(test)]

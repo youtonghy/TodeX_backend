@@ -10,7 +10,8 @@ use super::{
     codex::CodexDriver,
     opencode::OpencodeDriver,
     pi::PiDriver,
-    process::{redact_sensitive_text, run_bounded_command, CommandSpec},
+    process::{run_bounded_command, CommandSpec},
+    rpc::safe_text,
     types::ProviderDriver,
 };
 
@@ -187,7 +188,7 @@ async fn inspect_provider(
             report.stages.push(fail_stage(
                 "models",
                 "PROTOCOL_HANDSHAKE_FAILED",
-                safe_message(&error.to_string()),
+                safe_text(&error.to_string()),
                 started,
             ));
         }
@@ -250,7 +251,7 @@ async fn inspect_provider(
             report.stages.push(fail_stage(
                 "commands",
                 "PROTOCOL_HANDSHAKE_FAILED",
-                safe_message(&error.to_string()),
+                safe_text(&error.to_string()),
                 started,
             ));
         }
@@ -272,16 +273,16 @@ async fn probe_command(binary: &str, args: &[&str], workspace: &Path) -> Result<
     spec.args = args.iter().map(|arg| (*arg).to_owned()).collect();
     let output = run_bounded_command(&spec, MAX_DIAGNOSTIC_BYTES, PROBE_TIMEOUT)
         .await
-        .map_err(|error| safe_message(&error.to_string()))?;
+        .map_err(|error| safe_text(&error.to_string()))?;
     if !output.success {
         let detail = if output.stderr.is_empty() {
             String::from_utf8_lossy(&output.stdout).into_owned()
         } else {
             String::from_utf8_lossy(&output.stderr).into_owned()
         };
-        return Err(safe_message(&detail));
+        return Err(safe_text(&detail));
     }
-    Ok(safe_message(&String::from_utf8_lossy(&output.stdout)))
+    Ok(safe_text(&String::from_utf8_lossy(&output.stdout)))
 }
 
 fn pass_stage(name: &'static str, message: String, started: Instant) -> ProbeStage {
@@ -313,13 +314,6 @@ fn elapsed_millis(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-fn safe_message(message: &str) -> String {
-    redact_sensitive_text(message.trim())
-        .chars()
-        .take(500)
-        .collect()
-}
-
 async fn set_owner_only_directory(path: &Path) -> Result<(), AppError> {
     #[cfg(unix)]
     {
@@ -338,7 +332,7 @@ mod tests {
     #[test]
     fn safe_message_redacts_and_bounds_diagnostics() {
         let value = format!("Bearer secret {}", "x".repeat(700));
-        let safe = safe_message(&value);
+        let safe = safe_text(&value);
         assert!(!safe.contains("secret"));
         assert!(safe.chars().count() <= 500);
     }

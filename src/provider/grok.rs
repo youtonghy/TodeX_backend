@@ -19,6 +19,7 @@ use super::profile::{
     CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
     ProviderProfile, SkillInjection,
 };
+use super::rpc::{FailureWording, RpcClient, RpcPeer};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
     PendingProviderControl, PermissionConfigCapabilities, ProviderCommandDescriptor,
@@ -27,6 +28,15 @@ use super::types::{
 
 const INSPECT_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(8);
+const GROK_RPC: RpcPeer = RpcPeer {
+    name: "Grok",
+    failure: FailureWording::Method,
+    closed: "Grok closed stdout during control request",
+    decline: Some("client capability is not supported during control request"),
+    jsonrpc_field: true,
+    result_optional: false,
+    classify_error: None,
+};
 const MAX_GROK_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
 const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
 
@@ -517,25 +527,9 @@ async fn control_request(
     method: &str,
     params: Value,
 ) -> Result<Value, AppError> {
-    process
-        .send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-        .await?;
-    tokio::time::timeout(DIAGNOSTIC_TIMEOUT, async {
-        loop {
-            let Some(message) = process.read().await? else {
-                return Err(AppError::ProviderUnavailable("Grok closed stdout during control request".to_owned()));
-            };
-            if message.get("id").and_then(Value::as_str) == Some(id) {
-                if let Some(error) = message.get("error") {
-                    return Err(AppError::ProviderUnavailable(format!("Grok {method} failed: {}", safe_message(error))));
-                }
-                return message.get("result").cloned().ok_or_else(|| AppError::InvalidRequest("Grok control response has no result".to_owned()));
-            }
-            if let Some(id) = message.get("id") {
-                process.send(&json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"client capability is not supported during control request"}})).await?;
-            }
-        }
-    }).await.map_err(|_| AppError::ProviderUnavailable(format!("Grok {method} timed out")))?
+    RpcClient::new(process, GROK_RPC)
+        .request(id, method, params, Some(DIAGNOSTIC_TIMEOUT))
+        .await
 }
 
 pub(crate) async fn inspect_grok(
@@ -710,15 +704,6 @@ pub(super) fn parse_commands(initialize: &Value) -> Vec<ProviderCommandDescripto
             })
         })
         .collect()
-}
-
-fn safe_message(value: &Value) -> String {
-    redact_sensitive_text(
-        value
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("provider returned an error"),
-    )
 }
 
 #[cfg(test)]
