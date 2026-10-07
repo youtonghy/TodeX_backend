@@ -383,11 +383,6 @@ impl AgentMcpServer {
     pub(crate) fn args(&self) -> Vec<String> {
         vec![BRIDGE_SUBCOMMAND.to_owned()]
     }
-
-    #[cfg(test)]
-    pub(crate) fn codex_config(&self) -> (String, serde_json::Value) {
-        crate::provider::mcp_injection::codex_config(self)
-    }
 }
 
 /// Every server injected into one conversation's provider.
@@ -397,13 +392,6 @@ pub struct AgentMcpLaunch {
     /// Owner-only file for providers that read their MCP config from disk
     /// (removed on [`AgentMcp::revoke`]).
     pub(crate) config_file: PathBuf,
-}
-
-impl AgentMcpLaunch {
-    #[cfg(test)]
-    pub(crate) async fn claude_args(&self) -> Result<Vec<String>, AppError> {
-        crate::provider::mcp_injection::claude_args(self).await
-    }
 }
 
 #[cfg(test)]
@@ -458,7 +446,9 @@ pub(crate) mod tests {
         assert_eq!(mcp.authenticate(&token_a[..63]), None);
         assert_eq!(mcp.authenticate(&format!("{token_a}0")), None);
 
-        let args = a.claude_args().await.unwrap();
+        let args = crate::provider::mcp_injection::claude_args(&a)
+            .await
+            .unwrap();
         let config_path = PathBuf::from(args[0].strip_prefix("--mcp-config=").unwrap());
         assert!(config_path.is_file());
         mcp.revoke("conv_a").await;

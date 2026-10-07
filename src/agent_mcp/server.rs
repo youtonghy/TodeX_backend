@@ -1254,7 +1254,9 @@ exit 3
             .launch(&harness.conversation_id)
             .await
             .unwrap();
-        let args = launch.claude_args().await.unwrap();
+        let args = crate::provider::mcp_injection::claude_args(&launch)
+            .await
+            .unwrap();
         PathBuf::from(args[0].strip_prefix("--mcp-config=").unwrap())
     }
 
@@ -1356,7 +1358,7 @@ exit 3
             .unwrap()
             .join("todex-agentd");
         server.env[0].1 = format!("http://{addr}{ROUTE}");
-        let (key, value) = server.codex_config();
+        let (key, value) = crate::provider::mcp_injection::codex_config(&server);
 
         let codex_home = harness.root.join("codex-home");
         std::fs::create_dir_all(&codex_home).unwrap();
@@ -1499,7 +1501,11 @@ exit 3
                 "--model",
                 "todex-nonexistent-model",
             ])
-            .args(launch.claude_args().await.unwrap())
+            .args(
+                crate::provider::mcp_injection::claude_args(&launch)
+                    .await
+                    .unwrap(),
+            )
             .arg("hi")
             .current_dir(&harness.root)
             .output()
