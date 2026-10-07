@@ -11,6 +11,10 @@ session = args[args.index('--session') + 1] if '--session' in args else args[arg
 if session == 'missing':
     print('No session found matching missing', file=sys.stderr)
     sys.exit(1)
+if os.path.exists('pi-ignore-term'):
+    # Lets tests observe a runtime that is still stopping.
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 with open('pi-launches', 'a') as marker:
     marker.write(json.dumps(args) + '\n')
 model = {'provider': 'fixture', 'id': 'text', 'input': ['text', 'image'], 'reasoning': True}

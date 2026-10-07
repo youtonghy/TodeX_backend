@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -31,6 +32,9 @@ const MAX_PI_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
 /// A resident Pi process with no turn, query, background event or open
 /// dialog for this long is stopped; the next turn resumes its session file.
 const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
+/// How long a turn waits for a stopping resident process (flush, dialog
+/// closure and graceful termination) before reopening the session.
+const PI_STOP_WAIT: Duration = Duration::from_secs(10);
 const PI_UI_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// Pi streams thinking/text a few characters at a time; fragments of one block
 /// are merged (shared window and size limits) so the journal does not store
@@ -88,9 +92,12 @@ pub struct PiDriver {
     sessions: Arc<Mutex<HashMap<String, PiSessionHandle>>>,
     /// Conversations whose process is being spawned. Reserved under the
     /// sessions lock, so the spawn itself runs without holding it.
-    starting: std::sync::Mutex<HashSet<String>>,
+    starting: std::sync::Mutex<HashMap<String, PendingStart>>,
     /// How long a resident process may sit without activity.
     idle_timeout: Duration,
+    /// Holds spawns until released, so tests can act while one is in flight.
+    #[cfg(test)]
+    spawn_gate: Option<Arc<tokio::sync::Semaphore>>,
     models: CatalogCache<Vec<super::types::ProviderModelDescriptor>>,
     commands: CatalogCache<Vec<ProviderCommandDescriptor>>,
 }
@@ -101,7 +108,27 @@ struct PiSessionHandle {
     controls: mpsc::Sender<PendingProviderControl>,
     requests: mpsc::Sender<PiSessionRequest>,
     shutdown: watch::Sender<Option<String>>,
+    /// Set by the worker once it has decided to stop on its own (idle,
+    /// process exit, protocol error). New turns wait for it to finish.
+    stopping: Arc<AtomicBool>,
     runtime_id: String,
+}
+
+/// A spawn in progress. Closing paths record their reason here and wait
+/// for the spawn to finish; the new runtime is then shut down at once.
+struct PendingStart {
+    close_reason: Option<String>,
+    /// Dropped with the entry, which wakes every subscribed waiter.
+    done: watch::Sender<()>,
+}
+
+impl PendingStart {
+    fn new() -> Self {
+        Self {
+            close_reason: None,
+            done: watch::channel(()).0,
+        }
+    }
 }
 
 struct PiSessionRequest {
@@ -111,7 +138,7 @@ struct PiSessionRequest {
 
 /// Releases a conversation's spawn reservation in [`PiDriver::starting`].
 struct StartingReservation<'a> {
-    starting: &'a std::sync::Mutex<HashSet<String>>,
+    starting: &'a std::sync::Mutex<HashMap<String, PendingStart>>,
     conversation_id: &'a str,
 }
 
@@ -128,7 +155,22 @@ struct PiTurnRequest {
     context: DriverContext,
     prompt: DriverPrompt,
     cancel: watch::Receiver<bool>,
-    result: oneshot::Sender<Result<DriverTurnResult, AppError>>,
+    result: oneshot::Sender<PiTurnReply>,
+}
+
+enum PiTurnReply {
+    Finished(Result<DriverTurnResult, AppError>),
+    /// The worker stopped before starting this turn. `retry` is false when
+    /// the stop was requested, so the turn must not reopen the runtime.
+    NotStarted {
+        context: DriverContext,
+        prompt: DriverPrompt,
+        retry: bool,
+    },
+}
+
+fn pi_closing_error() -> AppError {
+    AppError::Conflict("Pi runtime is closing; retry after it stops".to_owned())
 }
 
 impl PiDriver {
@@ -136,8 +178,10 @@ impl PiDriver {
         Self {
             binary: config.pi_bin.clone(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            starting: std::sync::Mutex::new(HashSet::new()),
+            starting: std::sync::Mutex::new(HashMap::new()),
             idle_timeout: SESSION_IDLE_TIMEOUT,
+            #[cfg(test)]
+            spawn_gate: None,
             models: CatalogCache::new(PROFILE.discovery_cache_ttl),
             commands: CatalogCache::new(PROFILE.discovery_cache_ttl),
         }
@@ -146,7 +190,26 @@ impl PiDriver {
     async fn close_session(&self, conversation_id: &str, reason: &str) -> Option<String> {
         // Keep the handle in the map until shutdown completes so a new turn
         // cannot open a second process against the same native session file.
-        let handle = self.sessions.lock().await.get(conversation_id).cloned()?;
+        let handle = loop {
+            let mut spawned = {
+                let sessions = self.sessions.lock().await;
+                if let Some(handle) = sessions.get(conversation_id) {
+                    break handle.clone();
+                }
+                let mut starting = self
+                    .starting
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let pending = starting.get_mut(conversation_id)?;
+                pending
+                    .close_reason
+                    .get_or_insert_with(|| reason.to_owned());
+                pending.done.subscribe()
+            };
+            // The spawn inserts its handle (already told to stop) or fails;
+            // either way the entry is dropped, which ends this wait.
+            let _ = spawned.changed().await;
+        };
         handle.shutdown.send_replace(Some(reason.to_owned()));
         handle.turns.closed().await;
         let mut sessions = self.sessions.lock().await;
@@ -274,6 +337,23 @@ impl ProviderDriver for PiDriver {
     }
 
     async fn shutdown(&self) {
+        let spawning: Vec<_> = {
+            let _sessions = self.sessions.lock().await;
+            self.starting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values_mut()
+                .map(|pending| {
+                    pending
+                        .close_reason
+                        .get_or_insert_with(|| "daemon_shutdown".to_owned());
+                    pending.done.subscribe()
+                })
+                .collect()
+        };
+        for mut spawned in spawning {
+            let _ = spawned.changed().await;
+        }
         let sessions = std::mem::take(&mut *self.sessions.lock().await);
         for handle in sessions.values() {
             handle
@@ -504,91 +584,157 @@ impl ProviderDriver for PiDriver {
         }
 
         let conversation_id = context.manifest.id.clone();
-        let existing = {
-            let mut sessions = self.sessions.lock().await;
-            sessions.retain(|_, handle| !handle.turns.is_closed());
-            if let Some(handle) = sessions.get(&conversation_id) {
-                if handle.shutdown.borrow().is_some() {
-                    return Err(AppError::Conflict(
-                        "Pi runtime is closing; retry after it stops".to_owned(),
-                    ));
-                }
-                Some(handle.clone())
-            } else {
-                let mut starting = self
-                    .starting
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if starting.contains(&conversation_id) {
-                    return Err(AppError::Conflict(
-                        "Pi runtime is starting; retry after it is ready".to_owned(),
-                    ));
-                }
-                if sessions.len() + starting.len() >= MAX_PI_SESSIONS {
-                    return Err(AppError::Conflict(format!("Pi has reached its limit of {MAX_PI_SESSIONS} live sessions; close an idle conversation first")));
-                }
-                starting.insert(conversation_id.clone());
-                None
+        let mut context = context;
+        let mut prompt = prompt;
+        let mut launch_permit = Some(launch_permit);
+        let mut retried = false;
+        loop {
+            enum Slot {
+                Running(PiSessionHandle),
+                Stopping(PiSessionHandle),
+                Spawn,
             }
-        };
-        let handle = match existing {
-            Some(handle) => handle,
-            None => {
-                // Spawning takes a while; other conversations keep using the
-                // sessions map meanwhile. The reservation is released on every
-                // exit, including cancellation.
-                let _reservation = StartingReservation {
-                    starting: &self.starting,
-                    conversation_id: &conversation_id,
-                };
-                let process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
-                let (turns, turn_rx) = mpsc::channel(1);
-                let (controls, control_rx) = mpsc::channel(32);
-                let (requests, request_rx) = mpsc::channel(16);
-                let (shutdown, shutdown_rx) = watch::channel(None);
-                let runtime_id = format!("pi-runtime-{}", uuid::Uuid::new_v4().simple());
-                let session_sink = sink.clone().for_runtime(runtime_id.clone());
-                let handle = PiSessionHandle {
-                    turns,
-                    controls,
-                    requests,
-                    shutdown,
-                    runtime_id,
-                };
-                tokio::spawn(pi_session_worker(
-                    process,
-                    session_sink,
-                    turn_rx,
-                    control_rx,
-                    request_rx,
-                    shutdown_rx,
-                    self.idle_timeout,
-                ));
-                self.sessions
-                    .lock()
-                    .await
-                    .insert(conversation_id.clone(), handle.clone());
-                handle
+            let slot = {
+                let mut sessions = self.sessions.lock().await;
+                sessions.retain(|_, handle| !handle.turns.is_closed());
+                if let Some(handle) = sessions.get(&conversation_id) {
+                    if handle.shutdown.borrow().is_some() {
+                        return Err(pi_closing_error());
+                    }
+                    if handle.stopping.load(Ordering::Acquire) {
+                        Slot::Stopping(handle.clone())
+                    } else {
+                        Slot::Running(handle.clone())
+                    }
+                } else {
+                    let mut starting = self
+                        .starting
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if starting.contains_key(&conversation_id) {
+                        return Err(AppError::Conflict(
+                            "Pi runtime is starting; retry after it is ready".to_owned(),
+                        ));
+                    }
+                    if sessions.len() + starting.len() >= MAX_PI_SESSIONS {
+                        return Err(AppError::Conflict(format!("Pi has reached its limit of {MAX_PI_SESSIONS} live sessions; close an idle conversation first")));
+                    }
+                    starting.insert(conversation_id.clone(), PendingStart::new());
+                    Slot::Spawn
+                }
+            };
+            let handle = match slot {
+                Slot::Running(handle) => handle,
+                Slot::Stopping(handle) => {
+                    // The worker stopped on its own (usually idle). Wait for
+                    // its process to exit so the session file is never shared,
+                    // then reopen; the closed handle is pruned above.
+                    tokio::time::timeout(PI_STOP_WAIT, handle.turns.closed())
+                        .await
+                        .map_err(|_| pi_closing_error())?;
+                    continue;
+                }
+                Slot::Spawn => {
+                    // Spawning takes a while; other conversations keep using
+                    // the sessions map meanwhile. The reservation is released
+                    // on every exit, including cancellation.
+                    let _reservation = StartingReservation {
+                        starting: &self.starting,
+                        conversation_id: &conversation_id,
+                    };
+                    // The permit authorizes one launch; a second one within
+                    // the same turn means the new process died immediately.
+                    let Some(permit) = launch_permit.take() else {
+                        return Err(pi_closing_error());
+                    };
+                    #[cfg(test)]
+                    if let Some(gate) = &self.spawn_gate {
+                        let _ = gate.acquire().await;
+                    }
+                    let process = JsonLineProcess::spawn_trusted(&spec, permit).await?;
+                    let (turns, turn_rx) = mpsc::channel(1);
+                    let (controls, control_rx) = mpsc::channel(32);
+                    let (requests, request_rx) = mpsc::channel(16);
+                    let (shutdown, shutdown_rx) = watch::channel(None);
+                    let stopping = Arc::new(AtomicBool::new(false));
+                    let runtime_id = format!("pi-runtime-{}", uuid::Uuid::new_v4().simple());
+                    let session_sink = sink.clone().for_runtime(runtime_id.clone());
+                    let handle = PiSessionHandle {
+                        turns,
+                        controls,
+                        requests,
+                        shutdown,
+                        stopping: stopping.clone(),
+                        runtime_id,
+                    };
+                    tokio::spawn(pi_session_worker(
+                        process,
+                        session_sink,
+                        turn_rx,
+                        control_rx,
+                        request_rx,
+                        shutdown_rx,
+                        stopping,
+                        self.idle_timeout,
+                    ));
+                    let mut sessions = self.sessions.lock().await;
+                    // A close that arrived during the spawn found only the
+                    // reservation; honor it now that there is a handle.
+                    let close_reason = self
+                        .starting
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&conversation_id)
+                        .and_then(|pending| pending.close_reason.clone());
+                    let closing = close_reason.is_some();
+                    if closing {
+                        handle.shutdown.send_replace(close_reason);
+                    }
+                    sessions.insert(conversation_id.clone(), handle.clone());
+                    if closing {
+                        return Err(pi_closing_error());
+                    }
+                    handle
+                }
+            };
+            let (result, response) = oneshot::channel();
+            handle
+                .turns
+                .send(PiTurnRequest {
+                    context,
+                    prompt,
+                    cancel: cancel.clone(),
+                    result,
+                })
+                .await
+                .map_err(|_| {
+                    AppError::ProviderUnavailable(
+                        "Pi session closed before accepting the turn".to_owned(),
+                    )
+                })?;
+            match response.await {
+                Ok(PiTurnReply::Finished(result)) => return result,
+                Ok(PiTurnReply::NotStarted {
+                    context: returned_context,
+                    prompt: returned_prompt,
+                    retry,
+                }) => {
+                    // The turn raced the worker's own stop and never reached
+                    // Pi, so reopening the session once cannot repeat it.
+                    if !retry || retried {
+                        return Err(pi_closing_error());
+                    }
+                    retried = true;
+                    context = returned_context;
+                    prompt = returned_prompt;
+                }
+                Err(_) => {
+                    return Err(AppError::ProviderUnavailable(
+                        "Pi session worker stopped".to_owned(),
+                    ))
+                }
             }
-        };
-        let (result, response) = oneshot::channel();
-        handle
-            .turns
-            .send(PiTurnRequest {
-                context,
-                prompt,
-                cancel: cancel.clone(),
-                result,
-            })
-            .await
-            .map_err(|_| {
-                AppError::ProviderUnavailable(
-                    "Pi session closed before accepting the turn".to_owned(),
-                )
-            })?;
-        response
-            .await
-            .map_err(|_| AppError::ProviderUnavailable("Pi session worker stopped".to_owned()))?
+        }
     }
 }
 
@@ -742,6 +888,7 @@ async fn pi_session_worker(
     mut controls: mpsc::Receiver<PendingProviderControl>,
     mut requests: mpsc::Receiver<PiSessionRequest>,
     mut shutdown: watch::Receiver<Option<String>>,
+    stopping: Arc<AtomicBool>,
     idle_timeout: Duration,
 ) {
     let (_idle_cancel, idle_cancel) = watch::channel(false);
@@ -764,16 +911,15 @@ async fn pi_session_worker(
                 break;
             }
             let can_idle_stop = rpc.dialogs.is_empty() && rpc.session_dialogs.is_empty();
+            // Biased: a requested shutdown wins, then a waiting turn, and the
+            // idle deadline only when nothing else is ready.
             let turn = tokio::select! {
-                turn = turns.recv() => match turn { Some(turn) => turn, None => { reason = "session_closed".to_owned(); break; } },
-                _ = tokio::time::sleep_until(idle_deadline), if can_idle_stop => {
-                    reason = "idle_timeout".to_owned();
-                    break;
-                }
+                biased;
                 _ = shutdown.changed() => {
                     reason = shutdown.borrow().clone().unwrap_or_else(|| "session_closed".to_owned());
                     break;
                 }
+                turn = turns.recv() => match turn { Some(turn) => turn, None => { reason = "session_closed".to_owned(); break; } },
                 control = controls.recv() => {
                     if let Some(control) = control { let _ = control.respond_to.send(Err(AppError::Conflict("Pi turn is no longer active".to_owned()))); }
                     continue;
@@ -806,6 +952,10 @@ async fn pi_session_worker(
                         }
                     }
                     continue;
+                }
+                _ = tokio::time::sleep_until(idle_deadline), if can_idle_stop => {
+                    reason = "idle_timeout".to_owned();
+                    break;
                 }
             };
             if let Err(error) = rpc.flush_streamed().await {
@@ -890,7 +1040,7 @@ async fn pi_session_worker(
                 }
             }
             rpc.end_turn();
-            let _ = turn.result.send(result);
+            let _ = turn.result.send(PiTurnReply::Finished(result));
             if closing {
                 break;
             }
@@ -899,6 +1049,9 @@ async fn pi_session_worker(
     } else {
         reason = "persistence_error".to_owned();
     }
+    // From here on new turns wait for this worker to finish instead of
+    // queueing behind a process that is about to be terminated.
+    stopping.store(true, Ordering::Release);
     if let Err(error) = rpc.flush_streamed().await {
         tracing::warn!(error = %error, "failed to persist Pi background text");
     }
@@ -929,10 +1082,15 @@ async fn pi_session_worker(
             .response
             .send(Err(AppError::Conflict("Pi session closed".to_owned())));
     }
+    // A turn queued before `stopping` was visible never reached Pi; hand it
+    // back so the caller can reopen the session unless a stop was requested.
+    let retry = shutdown.borrow().is_none();
     while let Ok(turn) = turns.try_recv() {
-        let _ = turn
-            .result
-            .send(Err(AppError::Conflict("Pi session closed".to_owned())));
+        let _ = turn.result.send(PiTurnReply::NotStarted {
+            context: turn.context,
+            prompt: turn.prompt,
+            retry,
+        });
     }
 }
 
@@ -2964,8 +3122,9 @@ mod tests {
                 driver: Arc::new(PiDriver {
                     binary: script.display().to_string(),
                     sessions: Arc::new(Mutex::new(HashMap::new())),
-                    starting: std::sync::Mutex::new(HashSet::new()),
+                    starting: std::sync::Mutex::new(HashMap::new()),
                     idle_timeout: SESSION_IDLE_TIMEOUT,
+                    spawn_gate: None,
                     models: CatalogCache::new(None),
                     commands: CatalogCache::new(None),
                 }),
@@ -2984,16 +3143,7 @@ mod tests {
             self.start_cancellable(scenario, turn).await.0
         }
 
-        async fn start_cancellable(
-            &self,
-            scenario: &str,
-            turn: &str,
-        ) -> (
-            tokio::task::JoinHandle<Result<DriverTurnResult, AppError>>,
-            watch::Sender<bool>,
-        ) {
-            use crate::conversation::ConversationEventHub;
-            let driver = self.driver.clone();
+        async fn turn_parts(&self, scenario: &str, turn: &str) -> (DriverContext, DriverPrompt) {
             let context = DriverContext {
                 manifest: self.manifest.clone(),
                 provider_state: self.store.provider_state(&self.manifest.id).await.unwrap(),
@@ -3012,6 +3162,20 @@ mod tests {
                 sandbox_mode: None,
                 approval_policy: None,
             };
+            (context, prompt)
+        }
+
+        async fn start_cancellable(
+            &self,
+            scenario: &str,
+            turn: &str,
+        ) -> (
+            tokio::task::JoinHandle<Result<DriverTurnResult, AppError>>,
+            watch::Sender<bool>,
+        ) {
+            use crate::conversation::ConversationEventHub;
+            let driver = self.driver.clone();
+            let (context, prompt) = self.turn_parts(scenario, turn).await;
             let sink = DriverEventSink::new(
                 self.store.clone(),
                 ConversationEventHub::default(),
@@ -4139,6 +4303,7 @@ mod tests {
                     controls,
                     requests,
                     shutdown,
+                    stopping: Arc::default(),
                     runtime_id: format!("occupied-{index}"),
                 },
             );
@@ -4207,6 +4372,130 @@ mod tests {
             .retain(|id, _| id == &fixture.manifest.id);
         drop(receivers);
         fixture.run("pure", "still-usable").await.unwrap();
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_stopping(driver: &PiDriver, conversation_id: &str) -> PiSessionHandle {
+        for _ in 0..300 {
+            if let Some(handle) = driver.sessions.lock().await.get(conversation_id) {
+                if handle.stopping.load(Ordering::Acquire) && !handle.turns.is_closed() {
+                    return handle.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("Pi runtime never started stopping");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_turn_during_an_idle_stop_waits_and_reopens_the_session() {
+        let mut fixture = Fixture::new().await;
+        Arc::get_mut(&mut fixture.driver).unwrap().idle_timeout = Duration::from_millis(200);
+        // The process ignores SIGTERM, so the stop holds for the graceful
+        // window with the handle still registered.
+        tokio::fs::write(fixture.root.join("pi-ignore-term"), b"")
+            .await
+            .unwrap();
+        fixture.run("pure", "one").await.unwrap();
+        let stopping = wait_until_stopping(&fixture.driver, &fixture.manifest.id).await;
+        // A turn already queued when the worker began stopping is handed back
+        // unstarted rather than dropped.
+        let (context, prompt) = fixture.turn_parts("pure", "queued").await;
+        let (_cancel, cancel) = watch::channel(false);
+        let (result, reply) = oneshot::channel();
+        stopping
+            .turns
+            .send(PiTurnRequest {
+                context,
+                prompt,
+                cancel,
+                result,
+            })
+            .await
+            .unwrap();
+        // A new turn waits for the stop instead of failing.
+        let next = fixture.start("pure", "two").await;
+        match tokio::time::timeout(Duration::from_secs(10), reply)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            PiTurnReply::NotStarted { prompt, retry, .. } => {
+                assert!(retry);
+                assert_eq!(prompt.turn_id, "queued");
+            }
+            PiTurnReply::Finished(result) => panic!("queued turn ran: {result:?}"),
+        }
+        tokio::time::timeout(Duration::from_secs(15), next)
+            .await
+            .expect("turn after idle stop hung")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixture.launches().await, 2);
+        tokio::fs::remove_file(fixture.root.join("pi-ignore-term"))
+            .await
+            .unwrap();
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn closing_a_session_while_its_process_spawns_stops_the_new_runtime() {
+        let mut fixture = Fixture::new().await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        Arc::get_mut(&mut fixture.driver).unwrap().spawn_gate = Some(gate.clone());
+        let turn = fixture.start("pure", "one").await;
+        for _ in 0..300 {
+            if fixture
+                .driver
+                .starting
+                .lock()
+                .unwrap()
+                .contains_key(&fixture.manifest.id)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let driver = fixture.driver.clone();
+        let conversation_id = fixture.manifest.id.clone();
+        let stop = tokio::spawn(async move { driver.stop_runtime(&conversation_id).await });
+        for _ in 0..300 {
+            let recorded = fixture
+                .driver
+                .starting
+                .lock()
+                .unwrap()
+                .get(&fixture.manifest.id)
+                .is_some_and(|pending| pending.close_reason.is_some());
+            if recorded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!stop.is_finished(), "close returned before the spawn ended");
+        gate.add_permits(1);
+        let error = tokio::time::timeout(Duration::from_secs(10), turn)
+            .await
+            .expect("turn hung")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("closing"), "{error}");
+        let stopped = tokio::time::timeout(Duration::from_secs(10), stop)
+            .await
+            .expect("close hung")
+            .unwrap()
+            .unwrap();
+        assert!(stopped["runtimeId"].is_string(), "{stopped}");
+        assert!(fixture.driver.sessions.lock().await.is_empty());
+        fixture
+            .wait_event(|event| {
+                event.event_type == "provider.runtime"
+                    && event.payload.get("reason") == Some(&json!("user_closed"))
+            })
+            .await;
         fixture.finish().await;
     }
 }
