@@ -187,7 +187,6 @@ async fn append_transfer_audit(
         }),
     );
     websocket::append_audit_event(state, &event).await?;
-    state.events.publish(event).await;
     Ok(())
 }
 

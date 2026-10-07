@@ -750,23 +750,12 @@ pub(super) async fn git_scan(
     headers: HeaderMap,
     Query(query): Query<super::protocol::GitScanQuery>,
 ) -> Result<Json<super::protocol::GitScanResponse>, AppError> {
-    let auth = require_auth(&state, &headers)?;
+    require_auth(&state, &headers)?;
     let workspace =
         validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
-    let result = git::scan(&state.config.workspace_roots, &workspace).await;
-    let audit = append_git_audit(
-        &state,
-        &auth,
-        "scan",
-        &workspace,
-        None,
-        if result.is_ok() { "allow" } else { "deny" },
-        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
-        result.as_ref().ok().map(|value| value.repositories.len()),
-        None,
-    )
-    .await;
-    combine_git_result(result.map(Json), audit)
+    git::scan(&state.config.workspace_roots, &workspace)
+        .await
+        .map(Json)
 }
 
 pub(super) async fn git_run(
@@ -829,23 +818,12 @@ pub(super) async fn git_status(
     headers: HeaderMap,
     Query(query): Query<super::protocol::GitScanQuery>,
 ) -> Result<Json<super::protocol::GitStatusResponse>, AppError> {
-    let auth = require_auth(&state, &headers)?;
+    require_auth(&state, &headers)?;
     let workspace =
         validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
-    let result = git::status::read(&state.config.workspace_roots, &workspace).await;
-    let audit = append_git_audit(
-        &state,
-        &auth,
-        "status",
-        &workspace,
-        None,
-        if result.is_ok() { "allow" } else { "deny" },
-        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
-        None,
-        None,
-    )
-    .await;
-    combine_git_result(result.map(Json), audit)
+    git::status::read(&state.config.workspace_roots, &workspace)
+        .await
+        .map(Json)
 }
 
 pub(super) async fn git_log(
@@ -853,29 +831,17 @@ pub(super) async fn git_log(
     headers: HeaderMap,
     Query(query): Query<super::protocol::GitLogQuery>,
 ) -> Result<Json<super::protocol::GitLogResponse>, AppError> {
-    let auth = require_auth(&state, &headers)?;
+    require_auth(&state, &headers)?;
     let workspace =
         validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
-    let result = git::log::read(
+    git::log::read(
         &state.config.workspace_roots,
         &workspace,
         query.skip,
         query.limit,
     )
-    .await;
-    let audit = append_git_audit(
-        &state,
-        &auth,
-        "log",
-        &workspace,
-        None,
-        if result.is_ok() { "allow" } else { "deny" },
-        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
-        None,
-        None,
-    )
-    .await;
-    combine_git_result(result.map(Json), audit)
+    .await
+    .map(Json)
 }
 
 pub(super) async fn git_workspace(
@@ -883,23 +849,12 @@ pub(super) async fn git_workspace(
     headers: HeaderMap,
     Query(query): Query<super::protocol::GitScanQuery>,
 ) -> Result<Json<super::protocol::GitWorkspaceResponse>, AppError> {
-    let auth = require_auth(&state, &headers)?;
+    require_auth(&state, &headers)?;
     let workspace =
         validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
-    let result = git::workspace::snapshot(&state.config.workspace_roots, &workspace).await;
-    let audit = append_git_audit(
-        &state,
-        &auth,
-        "workspace",
-        &workspace,
-        None,
-        if result.is_ok() { "allow" } else { "deny" },
-        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
-        None,
-        None,
-    )
-    .await;
-    combine_git_result(result.map(Json), audit)
+    git::workspace::snapshot(&state.config.workspace_roots, &workspace)
+        .await
+        .map(Json)
 }
 
 pub(super) async fn git_diff(
@@ -907,23 +862,12 @@ pub(super) async fn git_diff(
     headers: HeaderMap,
     Query(query): Query<super::protocol::GitDiffQuery>,
 ) -> Result<Json<super::protocol::GitDiffResponse>, AppError> {
-    let auth = require_auth(&state, &headers)?;
+    require_auth(&state, &headers)?;
     let workspace =
         validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
-    let result = git::diff::file(&state.config.workspace_roots, &workspace, &query.path).await;
-    let audit = append_git_audit(
-        &state,
-        &auth,
-        "diff",
-        &workspace,
-        None,
-        if result.is_ok() { "allow" } else { "deny" },
-        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
-        None,
-        None,
-    )
-    .await;
-    combine_git_result(result.map(Json), audit)
+    git::diff::file(&state.config.workspace_roots, &workspace, &query.path)
+        .await
+        .map(Json)
 }
 
 pub(super) async fn git_pull_request(
@@ -931,23 +875,12 @@ pub(super) async fn git_pull_request(
     headers: HeaderMap,
     Query(query): Query<super::protocol::GitScanQuery>,
 ) -> Result<Json<super::protocol::GitPullRequestResponse>, AppError> {
-    let auth = require_auth(&state, &headers)?;
+    require_auth(&state, &headers)?;
     let workspace =
         validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
-    let result = git::pull_request::summary(&state.config.workspace_roots, &workspace).await;
-    let audit = append_git_audit(
-        &state,
-        &auth,
-        "pull-request",
-        &workspace,
-        None,
-        if result.is_ok() { "allow" } else { "deny" },
-        result.as_ref().err().map(AppError::code).unwrap_or("OK"),
-        None,
-        None,
-    )
-    .await;
-    combine_git_result(result.map(Json), audit)
+    git::pull_request::summary(&state.config.workspace_roots, &workspace)
+        .await
+        .map(Json)
 }
 
 pub(super) async fn git_operation(
@@ -1697,7 +1630,6 @@ async fn append_cli_audit(
         }),
     );
     websocket::append_audit_event(state, &event).await?;
-    state.events.publish(event).await;
     Ok(())
 }
 
@@ -3439,7 +3371,6 @@ async fn append_git_audit(
         }),
     );
     websocket::append_audit_event(state, &event).await?;
-    state.events.publish(event).await;
     Ok(())
 }
 
@@ -6817,6 +6748,8 @@ mod tests {
         assert!(audit.contains("git.audit"));
         assert!(audit.contains("commit"));
         assert!(audit.contains("partial"));
+        // Read-only Git endpoints (here: scan) are not audited.
+        assert!(!audit.contains("\"action\":\"scan\""));
         let _ = fs::remove_dir_all(root);
     }
 

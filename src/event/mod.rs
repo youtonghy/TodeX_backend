@@ -1,5 +1,7 @@
+pub mod audit;
 pub mod bus;
 
+pub use audit::AuditLog;
 pub use bus::EventBus;
 
 use std::ops::Deref;

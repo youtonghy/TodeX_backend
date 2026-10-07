@@ -68,7 +68,7 @@ pub struct AppState {
     pub agent_desktop: AgentDesktop,
     /// Open SFTP/FTP file sessions; in memory only.
     pub(crate) remote_files: RemoteSessions,
-    pub(crate) audit_write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) audit_log: crate::event::AuditLog,
     websocket_connections: Arc<AtomicUsize>,
 }
 
@@ -153,7 +153,7 @@ impl AppState {
         let device_pairing =
             DevicePairingRegistry::new(&config.data_dir, config.security.enable_auth, devices)?;
         let websocket_connections = Arc::new(AtomicUsize::new(0));
-        let audit_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let audit_log = crate::event::AuditLog::default();
 
         Ok(Self {
             config,
@@ -180,7 +180,7 @@ impl AppState {
             agent_mcp,
             agent_desktop,
             remote_files: RemoteSessions::default(),
-            audit_write_lock,
+            audit_log,
             websocket_connections,
         })
     }

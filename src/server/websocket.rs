@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
 use crate::{
@@ -1624,7 +1623,6 @@ async fn authorize_terminal_request(
             }),
         );
         append_audit_event(state, &event).await?;
-        state.events.publish(event).await;
         return Ok(());
     };
 
@@ -1648,7 +1646,6 @@ async fn authorize_terminal_request(
             }),
         );
         append_audit_event(state, &event).await?;
-        state.events.publish(event).await;
         return Err(AppError::Unauthorized("tenant mismatch".to_owned()));
     }
 
@@ -1671,7 +1668,6 @@ async fn authorize_terminal_request(
         }),
     );
     append_audit_event(state, &event).await?;
-    state.events.publish(event).await;
     Ok(())
 }
 
@@ -1809,41 +1805,16 @@ async fn audit_codex_decision(
         }),
     );
     append_audit_event(state, &event).await?;
-    state.events.publish(event).await;
     Ok(())
 }
 
+/// Appends an audit record to `$DATA_DIR/audit/audit.jsonl`. Audit records
+/// are not published on the event bus: no client receives them.
 pub(crate) async fn append_audit_event(
     state: &AppState,
     event: &EventRecord,
 ) -> Result<(), AppError> {
-    let _guard = state.audit_write_lock.lock().await;
-    let dir = state.config.data_dir.join("audit");
-    tokio::fs::create_dir_all(&dir).await?;
-    let path = dir.join("audit.jsonl");
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await?;
-    set_owner_only_file(&path).await?;
-    let mut line = serde_json::to_vec(event)?;
-    line.push(b'\n');
-    file.write_all(&line).await?;
-    file.flush().await?;
-    file.sync_data().await?;
-    Ok(())
-}
-
-async fn set_owner_only_file(path: &std::path::Path) -> Result<(), AppError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    state.audit_log.append(&state.config.data_dir, event).await
 }
 
 fn truncate_snapshot_text(text: String, max_bytes: usize) -> String {
@@ -2145,11 +2116,10 @@ mod tests {
         .await
         .expect("unauthenticated local codex status should be allowed");
 
-        let audit = wait_for_event(&mut events, |event| {
+        let audit = find_audit(&state, |event| {
             event.event_type == "codex.audit"
                 && payload_str(&event.payload, "request_id") == Some("local-status-open")
-        })
-        .await;
+        });
         assert_eq!(payload_str(&audit.payload, "decision"), Some("allow"));
         assert_eq!(
             payload_str(&audit.payload, "reason_code"),
@@ -2197,11 +2167,10 @@ mod tests {
         .await
         .expect("authenticated local codex start should spawn adapter");
 
-        let audit = wait_for_event(&mut events, |event| {
+        let audit = find_audit(&state, |event| {
             event.event_type == "codex.audit"
                 && payload_str(&event.payload, "request_id") == Some("local-start-allow")
-        })
-        .await;
+        });
         assert_eq!(payload_str(&audit.payload, "decision"), Some("allow"));
         assert_eq!(
             payload_str(&audit.payload, "reason_code"),
@@ -2983,7 +2952,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authenticated_local_codex_tenant_mismatch_is_denied_before_unsupported() {
         let state = test_state().await;
-        let mut events = state.events.subscribe();
         let auth = AuthContext {
             principal_id: "dev_test".to_owned(),
             tenant_id: "other".to_owned(),
@@ -3009,12 +2977,11 @@ mod tests {
         .expect_err("tenant mismatch must fail before unsupported");
         assert_eq!(error.code(), "UNAUTHORIZED");
 
-        let audit = wait_for_event(&mut events, |event| {
+        let audit = find_audit(&state, |event| {
             event.event_type == "codex.audit"
                 && payload_str(&event.payload, "request_id")
                     == Some("local-unsupported-tenant-mismatch")
-        })
-        .await;
+        });
         assert_eq!(payload_str(&audit.payload, "decision"), Some("deny"));
         assert_eq!(
             payload_str(&audit.payload, "reason_code"),
@@ -3046,7 +3013,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unauthenticated_codex_control_is_denied_and_audited() {
         let state = test_state().await;
-        let mut events = state.events.subscribe();
         let message = codex_control_message("deny-1", "cdxs_denied", "local");
 
         let error = dispatch(message, &state, None)
@@ -3054,11 +3020,10 @@ mod tests {
             .expect_err("configured auth token must reject unauthenticated control");
         assert!(matches!(error, AppError::Unauthenticated));
 
-        let audit = wait_for_event(&mut events, |event| {
+        let audit = find_audit(&state, |event| {
             event.event_type == "codex.audit"
                 && payload_str(&event.payload, "request_id") == Some("deny-1")
-        })
-        .await;
+        });
         assert_eq!(payload_str(&audit.payload, "decision"), Some("deny"));
         assert_eq!(
             payload_str(&audit.payload, "reason_code"),
@@ -3087,11 +3052,10 @@ mod tests {
             .await
             .expect("authorized control should pass");
 
-        let audit = wait_for_event(&mut events, |event| {
+        let audit = find_audit(&state, |event| {
             event.event_type == "codex.audit"
                 && payload_str(&event.payload, "request_id") == Some("allow-1")
-        })
-        .await;
+        });
         assert_eq!(payload_str(&audit.payload, "decision"), Some("allow"));
         assert_eq!(
             payload_str(&audit.payload, "reason_code"),
@@ -3151,11 +3115,10 @@ mod tests {
         assert_eq!(error.code(), "UNSUPPORTED");
         assert!(error.to_string().contains("invocation proof"));
 
-        let audit = wait_for_event(&mut events, |event| {
+        let audit = find_audit(&state, |event| {
             event.event_type == "codex.audit"
                 && payload_str(&event.payload, "request_id") == Some("thread-start-1")
-        })
-        .await;
+        });
         assert_eq!(payload_str(&audit.payload, "decision"), Some("allow"));
 
         let no_success = tokio::time::timeout(Duration::from_millis(200), async {
@@ -3628,22 +3591,18 @@ mod tests {
             .to_string()
             .contains("HTTP adapter invocation proof"));
 
-        let mut audit_actions = Vec::new();
-        timeout(Duration::from_secs(2), async {
-            while audit_actions.len() < 2 {
-                let event = events.recv().await.expect("receive event");
-                if event.event_type == "codex.audit" {
-                    audit_actions.push(payload_str(&event.payload, "action").map(str::to_owned));
-                } else if event.event_type.starts_with("codex.cloudTask.") {
-                    panic!(
-                        "cloud placeholder emitted success event {}",
-                        event.event_type
-                    );
-                }
-            }
-        })
-        .await
-        .expect("cloud audit events should be published without success events");
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !event.event_type.starts_with("codex.cloudTask."),
+                "cloud placeholder emitted success event {}",
+                event.event_type
+            );
+        }
+        let audit_actions: Vec<_> = audit_records(&state)
+            .into_iter()
+            .filter(|event| event.event_type == "codex.audit")
+            .map(|event| payload_str(&event.payload, "action").map(str::to_owned))
+            .collect();
         assert_eq!(
             audit_actions,
             vec![
@@ -3688,11 +3647,10 @@ mod tests {
         assert_eq!(error.code(), "UNSUPPORTED");
         assert!(error.to_string().contains("invocation proof"));
 
-        let audit = wait_for_event(&mut events, |event| {
+        let audit = find_audit(&state, |event| {
             event.event_type == "codex.audit"
                 && payload_str(&event.payload, "request_id") == Some("mcp-tool-1")
-        })
-        .await;
+        });
         assert_eq!(
             payload_str(&audit.payload, "action"),
             Some("codex.mcp.tool.call")
@@ -3725,7 +3683,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tenant_mismatch_is_denied_and_audited() {
         let state = test_state().await;
-        let mut events = state.events.subscribe();
         let message = codex_control_message("tenant-1", "cdxs_wrong_tenant", "other");
         let auth = AuthContext {
             principal_id: "dev_test".to_owned(),
@@ -3738,11 +3695,10 @@ mod tests {
             .expect_err("tenant mismatch must fail");
         assert_eq!(error.code(), "UNAUTHORIZED");
 
-        let audit = wait_for_event(&mut events, |event| {
+        let audit = find_audit(&state, |event| {
             event.event_type == "codex.audit"
                 && payload_str(&event.payload, "request_id") == Some("tenant-1")
-        })
-        .await;
+        });
         assert_eq!(payload_str(&audit.payload, "decision"), Some("deny"));
         assert_eq!(
             payload_str(&audit.payload, "reason_code"),
@@ -3960,6 +3916,23 @@ mod tests {
                 action: CodexGatewayAction::Control,
             }),
         }
+    }
+
+    /// Audit records are written to `audit.jsonl` (synced) before the
+    /// request returns; they are not published on the event bus.
+    fn audit_records(state: &AppState) -> Vec<EventRecord> {
+        let text =
+            std::fs::read_to_string(state.config.data_dir.join("audit/audit.jsonl")).unwrap();
+        text.lines()
+            .map(|line| serde_json::from_str(line).expect("audit line is a record"))
+            .collect()
+    }
+
+    fn find_audit(state: &AppState, predicate: impl Fn(&EventRecord) -> bool) -> EventRecord {
+        audit_records(state)
+            .into_iter()
+            .find(|event| predicate(event))
+            .expect("audit record should be written")
     }
 
     async fn wait_for_event<F>(
