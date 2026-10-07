@@ -13,8 +13,12 @@
 //! parameters, each side re-encoded with strict percent encoding, sorted by
 //! (key, value), joined with `&`. Because the signature binds method, path,
 //! query and body, a captured credential header cannot be replayed against a
-//! different request. Timestamps are accepted within ±300 seconds and nonces
-//! are single-use within that window.
+//! different request. Timestamps are accepted within ±300 seconds and never
+//! before the daemon started (a restart forgets the nonce cache, so older
+//! credentials could otherwise replay); a rejected timestamp answers
+//! `401 AUTH_TIMESTAMP_REJECTED` with the server time. Nonces are single-use
+//! within that window, at most [`NONCE_DEVICE_LIMIT`] per device. Signatures
+//! are checked with `verify_strict`.
 use crate::{
     app_state::AppState, devices::DeviceRegistry, error::AppError, listen_addrs::is_loopback_host,
     server::websocket::AuthContext,
@@ -31,10 +35,10 @@ use axum::{
     response::Response,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -63,23 +67,83 @@ pub(crate) const MAX_CLOCK_SKEW_SECS: u64 = 300;
 /// Bodies are buffered once for hashing. Matches the largest route-level body
 /// limit in the v2 router (workspace file writes are ~12 MiB).
 pub(crate) const MAX_AUTH_BODY: usize = 32 * 1024 * 1024;
+/// Claimed nonces one device may hold within the window; more answers that
+/// device `429 RATE_LIMITED` without affecting others.
+const NONCE_DEVICE_LIMIT: usize = 8_192;
+/// Last-resort bound over all devices.
 const NONCE_CACHE_LIMIT: usize = 65_536;
 
-/// `device_id` → `(timestamp, nonce)` claims within the acceptance window.
-type NonceCache = Arc<Mutex<HashMap<String, VecDeque<(u64, String)>>>>;
+/// Claimed `(timestamp, nonce)` pairs within the acceptance window.
+/// `by_time` orders every claim by its timestamp, so expiry is one ordered
+/// sweep across all devices; a claim with a future timestamp (up to the
+/// skew) only delays its own eviction, never anyone else's.
+#[derive(Default)]
+struct NonceCache {
+    by_time: BTreeSet<(u64, String, String)>,
+    by_device: HashMap<String, HashSet<String>>,
+}
+
+impl NonceCache {
+    /// Drops every claim whose timestamp is before `window_start`.
+    fn evict_before(&mut self, window_start: u64) {
+        while let Some(first) = self.by_time.first() {
+            if first.0 >= window_start {
+                break;
+            }
+            let Some((_, device_id, nonce)) = self.by_time.pop_first() else {
+                break;
+            };
+            if let Some(nonces) = self.by_device.get_mut(&device_id) {
+                nonces.remove(&nonce);
+                if nonces.is_empty() {
+                    self.by_device.remove(&device_id);
+                }
+            }
+        }
+    }
+
+    fn claim(&mut self, device_id: &str, timestamp: u64, nonce: &str) -> Result<(), AppError> {
+        let held = self.by_device.get(device_id);
+        if held.is_some_and(|nonces| nonces.contains(nonce)) {
+            return Err(AppError::Unauthenticated);
+        }
+        if held.is_some_and(|nonces| nonces.len() >= NONCE_DEVICE_LIMIT) {
+            return Err(AppError::RateLimited {
+                message: "too many signed requests from this device; retry later".to_owned(),
+                retry_after_secs: 1,
+            });
+        }
+        if self.by_time.len() >= NONCE_CACHE_LIMIT {
+            return Err(AppError::ResourceExhausted(
+                "device auth nonce cache is full; retry later".to_owned(),
+            ));
+        }
+        self.by_device
+            .entry(device_id.to_owned())
+            .or_default()
+            .insert(nonce.to_owned());
+        self.by_time
+            .insert((timestamp, device_id.to_owned(), nonce.to_owned()));
+        Ok(())
+    }
+}
 
 /// Device registry plus the in-memory single-use nonce window.
 #[derive(Clone)]
 pub(crate) struct DeviceAuthenticator {
     registry: DeviceRegistry,
-    seen: NonceCache,
+    seen: Arc<Mutex<NonceCache>>,
+    /// Unix seconds when this daemon started; earlier credentials are
+    /// refused because the nonce cache does not survive a restart.
+    boot_secs: u64,
 }
 
 impl DeviceAuthenticator {
     pub(crate) fn new(registry: DeviceRegistry) -> Self {
         Self {
             registry,
-            seen: Arc::new(Mutex::new(HashMap::new())),
+            seen: Arc::new(Mutex::new(NonceCache::default())),
+            boot_secs: unix_secs(),
         }
     }
 
@@ -111,8 +175,8 @@ impl DeviceAuthenticator {
             .parse::<u64>()
             .map_err(|_| AppError::Unauthenticated)?;
         let now = unix_secs();
-        if now.abs_diff(timestamp) > MAX_CLOCK_SKEW_SECS {
-            return Err(AppError::Unauthenticated);
+        if now.abs_diff(timestamp) > MAX_CLOCK_SKEW_SECS || timestamp < self.boot_secs {
+            return Err(AppError::AuthTimestampRejected { server_time: now });
         }
         let Some(record) = self.registry.get(&credential.device_id)? else {
             return Err(AppError::Unauthenticated);
@@ -152,27 +216,10 @@ impl DeviceAuthenticator {
             return Err(AppError::Unauthenticated);
         }
         let mut seen = self.seen.lock().map_err(|_| AppError::Unauthenticated)?;
-        // Entries whose timestamp fell out of the acceptance window can never
+        // Claims whose timestamp fell out of the acceptance window can never
         // be valid again; evict by current time, across every device.
-        let window_start = unix_secs().saturating_sub(MAX_CLOCK_SKEW_SECS);
-        let mut total = 0usize;
-        for queue in seen.values_mut() {
-            while queue.front().is_some_and(|(ts, _)| *ts < window_start) {
-                queue.pop_front();
-            }
-            total += queue.len();
-        }
-        if total >= NONCE_CACHE_LIMIT {
-            return Err(AppError::ResourceExhausted(
-                "device auth nonce cache is full; retry later".to_owned(),
-            ));
-        }
-        let entries = seen.entry(device_id.to_owned()).or_default();
-        if entries.iter().any(|(_, value)| value == nonce) {
-            return Err(AppError::Unauthenticated);
-        }
-        entries.push_back((timestamp, nonce.to_owned()));
-        Ok(())
+        seen.evict_before(unix_secs().saturating_sub(MAX_CLOCK_SKEW_SECS));
+        seen.claim(device_id, timestamp, nonce)
     }
 }
 
@@ -211,7 +258,9 @@ impl PendingCredential {
         );
         // Verify before claiming the nonce so a forged request cannot burn a
         // nonce belonging to an in-flight legitimate request.
-        key.verify(&payload, &signature)
+        // Strict verification also refuses small-order keys and
+        // non-canonical signature encodings.
+        key.verify_strict(&payload, &signature)
             .map_err(|_| AppError::Unauthenticated)?;
         auth.claim_nonce(&credential.device_id, timestamp, &credential.nonce)?;
         auth.registry.touch(&credential.device_id);
@@ -673,5 +722,162 @@ mod tests {
         assert!(auth
             .claim_nonce("dev_a", unix_secs() - MAX_CLOCK_SKEW_SECS, "n2")
             .is_ok());
+    }
+
+    #[test]
+    fn future_timestamps_never_block_eviction_of_expired_claims() {
+        let mut cache = NonceCache::default();
+        // Claimed first, but far ahead in time.
+        cache.claim("dev_a", 10_000, "future").unwrap();
+        for index in 0..100 {
+            cache.claim("dev_a", 100, &format!("old-{index}")).unwrap();
+        }
+        cache.claim("dev_b", 150, "other").unwrap();
+        cache.evict_before(200);
+        assert_eq!(cache.by_time.len(), 1);
+        assert_eq!(
+            cache.by_device["dev_a"].iter().collect::<Vec<_>>(),
+            ["future"]
+        );
+        assert!(!cache.by_device.contains_key("dev_b"));
+        // The surviving claim still blocks its replay.
+        assert!(matches!(
+            cache.claim("dev_a", 10_000, "future"),
+            Err(AppError::Unauthenticated)
+        ));
+    }
+
+    #[test]
+    fn the_per_device_nonce_cap_only_limits_that_device() {
+        let mut cache = NonceCache::default();
+        for index in 0..NONCE_DEVICE_LIMIT {
+            cache.claim("dev_a", 1_000, &index.to_string()).unwrap();
+        }
+        let error = cache.claim("dev_a", 1_000, "one-more").unwrap_err();
+        assert_eq!(error.code(), "RATE_LIMITED");
+        cache.claim("dev_b", 1_000, "fine").unwrap();
+        // The cap is per window: once the old claims expire there is room.
+        cache.evict_before(1_001);
+        cache.claim("dev_a", 2_000, "one-more").unwrap();
+    }
+
+    fn enrolled(
+        seed: u8,
+    ) -> (
+        DeviceAuthenticator,
+        test_support::TestDevice,
+        std::path::PathBuf,
+    ) {
+        let root = std::env::temp_dir().join(format!("todex-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let device = test_support::TestDevice::new(seed);
+        device.enroll(&root);
+        let auth = DeviceAuthenticator::new(DeviceRegistry::load(&root).unwrap());
+        (auth, device, root)
+    }
+
+    fn signed_headers(device: &test_support::TestDevice, timestamp: u64) -> HeaderMap {
+        let nonce = "bm9uY2U";
+        let signature = ed25519_dalek::Signer::sign(
+            &device.key,
+            &signed_payload(
+                &device.device_id,
+                "GET",
+                "/v2/workspaces",
+                "",
+                &timestamp.to_string(),
+                nonce,
+                &[],
+            ),
+        );
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            (HEADER_DEVICE_ID, device.device_id.clone()),
+            (HEADER_TIMESTAMP, timestamp.to_string()),
+            (HEADER_NONCE, nonce.to_owned()),
+            (
+                HEADER_SIGNATURE,
+                URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            ),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn stale_future_and_pre_boot_timestamps_report_the_server_time() {
+        let (mut auth, device, root) = enrolled(51);
+        let now = unix_secs();
+        let check = |auth: &DeviceAuthenticator, timestamp: u64| {
+            auth.authenticate(
+                &Method::GET,
+                "/v2/workspaces",
+                None,
+                &signed_headers(&device, timestamp),
+                &[],
+            )
+        };
+        for timestamp in [now - MAX_CLOCK_SKEW_SECS - 5, now + MAX_CLOCK_SKEW_SECS + 5] {
+            match check(&auth, timestamp) {
+                Err(AppError::AuthTimestampRejected { server_time }) => {
+                    assert!(server_time.abs_diff(now) <= 2)
+                }
+                other => panic!("expected a timestamp rejection, got {other:?}"),
+            }
+        }
+        // Inside the window but before this daemon started: the nonce cache
+        // of the previous run is gone, so such credentials could replay.
+        auth.boot_secs = now + 1;
+        assert!(matches!(
+            check(&auth, now),
+            Err(AppError::AuthTimestampRejected { .. })
+        ));
+        auth.boot_secs = now;
+        assert!(check(&auth, now).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn small_order_device_keys_are_refused_by_strict_verification() {
+        // The identity point is a weak (small-order) key: with it, `R = [s]B`
+        // makes a signature that plain verification accepts for any message.
+        let identity = {
+            let mut key = [0_u8; 32];
+            key[0] = 1;
+            key
+        };
+        let weak = VerifyingKey::from_bytes(&identity).unwrap();
+        assert!(weak.is_weak());
+        let helper = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let mut forged = [0_u8; 64];
+        forged[..32].copy_from_slice(&helper.verifying_key().to_bytes());
+        forged[32..].copy_from_slice(&helper.to_scalar().to_bytes());
+        let forged = Signature::from_bytes(&forged);
+        assert!(
+            ed25519_dalek::Verifier::verify(&weak, b"any message", &forged).is_ok(),
+            "the forgery works against non-strict verification"
+        );
+
+        let root = std::env::temp_dir().join(format!("todex-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = DeviceRegistry::load(&root).unwrap();
+        let record = registry.register("weak", &identity).unwrap();
+        let auth = DeviceAuthenticator::new(registry);
+        let timestamp = unix_secs().to_string();
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            (HEADER_DEVICE_ID, record.device_id.clone()),
+            (HEADER_TIMESTAMP, timestamp),
+            (HEADER_NONCE, "bm9uY2U".to_owned()),
+            (HEADER_SIGNATURE, URL_SAFE_NO_PAD.encode(forged.to_bytes())),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        assert!(matches!(
+            auth.authenticate(&Method::GET, "/v2/workspaces", None, &headers, &[]),
+            Err(AppError::Unauthenticated)
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
