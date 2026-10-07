@@ -2638,7 +2638,12 @@ struct RequestFileFingerprint {
 async fn fingerprint_file(path: &Path) -> Result<String, AppError> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    // On the heap: a buffer held across `.await` is stored inline in this
+    // future and from there in every caller's (`prompt_inner` and the
+    // WebSocket, REST and follow-up queue paths above it). The inline 64 KiB
+    // array made each of those futures 64 KiB larger, and unoptimized builds
+    // keep several stack copies per frame, overflowing the 2 MiB worker stack.
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let length = file.read(&mut buffer).await?;
         if length == 0 {

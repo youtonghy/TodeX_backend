@@ -810,3 +810,48 @@ for raw in sys.stdin:
     emit({"type": "assistant", "error": "rate_limit", "is_api_error_message": True, "message": {"role": "assistant", "content": [{"type": "text", "text": notice}]}})
     emit({"type": "result", "subtype": "success", "is_error": True, "session_id": "claude-native", "result": notice})
 "#;
+
+/// Regression: a 64 KiB read buffer held inline across `.await` in
+/// `fingerprint_file` grew `prompt_inner` and every future above it (queue
+/// resume/drain, the WebSocket dispatcher) to ~68 KiB. Unoptimized builds keep
+/// several stack copies of such futures per poll frame, and
+/// `conversation.queue.resume` overflowed the 2 MiB tokio worker stack. The
+/// futures are created but never polled; only their sizes are checked.
+#[tokio::test]
+async fn prompt_path_futures_stay_small() {
+    const LIMIT: usize = 16 * 1024;
+    let (root, _store, supervisor, workspace) = control_fixture("todex-future-sizes").await;
+    let file = workspace.join("fingerprint.txt");
+    let fingerprint = fingerprint_file(&file);
+    assert!(
+        std::mem::size_of_val(&fingerprint) < 1024,
+        "fingerprint_file future is {} bytes",
+        std::mem::size_of_val(&fingerprint)
+    );
+    drop(fingerprint);
+    let sizes = [
+        (
+            "prompt_inner",
+            std::mem::size_of_val(&supervisor.prompt_inner("local", "c", queued_prompt("x"))),
+        ),
+        (
+            "prompt_owned",
+            std::mem::size_of_val(&supervisor.prompt_owned("local", "c", queued_prompt("x"))),
+        ),
+        (
+            "drain_follow_ups",
+            std::mem::size_of_val(&supervisor.drain_follow_ups("c")),
+        ),
+        (
+            "queue_resume_owned",
+            std::mem::size_of_val(&supervisor.queue_resume_owned("local", "c")),
+        ),
+    ];
+    for (name, size) in sizes {
+        assert!(
+            size < LIMIT,
+            "{name} future is {size} bytes (limit {LIMIT})"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
