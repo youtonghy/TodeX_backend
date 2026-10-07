@@ -213,26 +213,41 @@ pub(crate) fn validate_inner_path(path: &str) -> Result<(), TransportCryptoError
     Ok(())
 }
 
+/// Parses the request head at the start of `u32_be(len(head)) || head ||
+/// body` once enough plaintext has arrived. Returns the head and the offset
+/// where the body starts, or `None` while the head is still incomplete.
+pub(crate) fn parse_inner_head(
+    plaintext: &[u8],
+) -> Result<Option<(InnerRequestHead, usize)>, TransportCryptoError> {
+    let Some(prefix) = plaintext.get(..4) else {
+        return Ok(None);
+    };
+    let length = u32::from_be_bytes(prefix.try_into().expect("four-byte head length")) as usize;
+    if length > MAX_HEAD_BYTES {
+        return Err(TransportCryptoError::new("inner head too large"));
+    }
+    let Some(json) = plaintext.get(4..4 + length) else {
+        return Ok(None);
+    };
+    let head: InnerRequestHead = serde_json::from_slice(json)
+        .map_err(|_| TransportCryptoError::new("malformed inner request head"))?;
+    validate_inner_path(&head.path)?;
+    Ok(Some((head, 4 + length)))
+}
+
 /// Splits `u32_be(len(head)) || head || body` and parses the request head.
+#[cfg(test)]
 pub(crate) fn split_inner_request(
     mut plaintext: Vec<u8>,
 ) -> Result<(InnerRequestHead, Vec<u8>), TransportCryptoError> {
     if plaintext.len() < 4 {
         return Err(TransportCryptoError::new("inner message too short"));
     }
-    let length =
-        u32::from_be_bytes(plaintext[..4].try_into().expect("four-byte head length")) as usize;
-    if length > MAX_HEAD_BYTES {
-        return Err(TransportCryptoError::new("inner head too large"));
-    }
-    if plaintext.len() < 4 + length {
+    let Some((head, body_start)) = parse_inner_head(&plaintext)? else {
         return Err(TransportCryptoError::new("inner head truncated"));
-    }
-    let head: InnerRequestHead = serde_json::from_slice(&plaintext[4..4 + length])
-        .map_err(|_| TransportCryptoError::new("malformed inner request head"))?;
-    validate_inner_path(&head.path)?;
+    };
     // Reuse the allocation for the body.
-    plaintext.drain(..4 + length);
+    plaintext.drain(..body_start);
     Ok((head, plaintext))
 }
 

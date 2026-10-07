@@ -14,8 +14,10 @@ encryption for REST.
 ## Goals
 
 - REST and WebSocket share one key schedule and one AEAD construction.
-- Every session key mixes in fresh server randomness, so replaying a
-  handshake never reproduces a key or a nonce, even across daemon restarts.
+- Every WebSocket session key mixes in fresh server randomness, so replaying
+  a WebSocket handshake never reproduces a key or a nonce, even across daemon
+  restarts. REST has no round trip for a server nonce: see "Key schedule" for
+  where its freshness comes from.
 - Non-loopback peers can only talk to the API through v2. Loopback peers may
   still use plaintext.
 - Encryption is invisible to business code: handlers and UI see plain
@@ -59,7 +61,13 @@ k_down = HKDF-Expand(prk, label || "/down", 32)   // server -> client
 - REST: `label = "todex.transport.v2/rest"`, `device_id` = empty string (the
   inner request carries its own signature), `client_nonce` = 32 random bytes
   per request, `server_nonce` = empty (zero-length). Freshness comes from the
-  per-request client material and the inner signature's single-use nonce.
+  per-request client material and the inner signature's single-use nonce:
+  a captured tunnel request replays to the same keys, but its signed inner
+  request is refused (`401`) because the device-auth nonce was already
+  claimed. Inner requests to unsigned public routes (`/health`,
+  `/v2/version`, `/v2/transport-policy`, `/v2/device-pairing/*`) can be
+  replayed through the tunnel; they are just as reachable directly, so this
+  gives an attacker nothing new.
 
 ## Sealed records
 
@@ -256,6 +264,18 @@ derived keys).
     record). Outer failures, including an oversized body or a protocol other
     than the server's `pairing_encryption`, answer `400` with the usual error
     envelope `{"code":"TRANSPORT_CRYPTO_FAILED","message":"transport crypto failure"}`.
+  - The inner head is checked as soon as it is decrypted, before the rest of
+    the outer body is read. Public routes (`/health`, `/v2/version`,
+    `/v2/transport-policy`, `/v2/device-pairing/*`) need no credential but
+    their inner body is capped at 64 KiB (more is an outer `400`). Every
+    other inner path, unknown ones included, needs the device-auth headers
+    of a registered device with a fresh timestamp (anonymous deployments:
+    the loopback `Host`/`Origin` check); otherwise the tunnel stops reading
+    and answers a sealed inner `401` (`403` for the anonymous check). The
+    full signature over the body is still verified by the router's device
+    auth. Requests that pass this check share 32 permits for buffering and
+    handling the inner request; extra ones wait. A permit is released once
+    the inner handler has produced its response head.
   - Inner headers kept: `content-type`, `accept`, `x-todex-device-id`,
     `x-todex-auth-ts`, `x-todex-auth-nonce`, `x-todex-auth-sig` (names are
     matched case-insensitively). `Host` and `Origin` are taken from the outer
@@ -270,7 +290,10 @@ derived keys).
   - Inner response headers are copied except hop-by-hop headers; repeated
     headers are joined with `, `. Records follow the inner body's chunks (the
     latest chunk is held back until the next one or the end, so exactly the
-    last record is final). If the inner body fails mid-stream the outer body
+    last record is final). A streaming inner body therefore reaches the
+    client one chunk late: each chunk is sent when the next one is produced
+    (or the body ends). Long-lived streams that need every chunk at once
+    should use the WebSocket instead. If the inner body fails mid-stream the outer body
     ends with an error and no final record, which clients report as
     truncation. The tunnel response is never gzip-compressed.
 - Device pairing v3 is implemented in `src/device_pairing.rs`; the

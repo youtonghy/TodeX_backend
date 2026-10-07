@@ -612,6 +612,17 @@ async fn sealed_tunnel_filters_headers_marks_requests_and_streams_bodies() {
         .route("/download", get(|| chunks(false)))
         .route("/broken", get(|| chunks(true)));
     let app = super::sealed::routes(api, server.state.clone());
+    // The probe routes have no device auth, but the tunnel still wants a
+    // credential from a registered device before it reads an inner body.
+    let device = TestDevice::new(35);
+    device.enroll(&server.root.join("data"));
+    let credential = |method: &str, uri: &str| -> serde_json::Map<String, Value> {
+        device
+            .sign(method, uri, &[])
+            .into_iter()
+            .map(|(name, value)| (name.as_str().to_owned(), json!(value)))
+            .collect()
+    };
     let peer: SocketAddr = "192.0.2.7:4242".parse().unwrap();
     let call = |sealed: SealedRequest| {
         let mut request = Request::builder()
@@ -628,17 +639,21 @@ async fn sealed_tunnel_filters_headers_marks_requests_and_streams_bodies() {
         async move { (app.oneshot(request).await.unwrap(), sealed.down) }
     };
 
+    let mut probe_headers = credential("POST", "/probe?a=1&b=2");
+    for (name, value) in [
+        ("content-type", "text/plain"),
+        ("Accept", "application/json"),
+        ("x-todex-transport", "2"),
+        ("x-todex-verified-device", "dev_forged"),
+        ("cookie", "secret=1"),
+        ("connection", "close"),
+        ("host", "inner.test"),
+    ] {
+        probe_headers.insert(name.to_owned(), json!(value));
+    }
     let inner = encode_inner(
-        &json!({"method": "POST", "path": "/probe", "query": "a=1&b=2", "headers": {
-            "content-type": "text/plain",
-            "Accept": "application/json",
-            "x-todex-device-id": "dev_probe",
-            "x-todex-transport": "2",
-            "x-todex-verified-device": "dev_forged",
-            "cookie": "secret=1",
-            "connection": "close",
-            "host": "inner.test",
-        }}),
+        &json!({"method": "POST", "path": "/probe", "query": "a=1&b=2",
+                "headers": probe_headers}),
         b"hello",
     );
     let (response, down) = call(seal_request(&keys, EncryptionProtocol::X25519, &inner)).await;
@@ -661,7 +676,15 @@ async fn sealed_tunnel_filters_headers_marks_requests_and_streams_bodies() {
     names.sort_unstable();
     assert_eq!(
         names,
-        ["accept", "content-type", "host", "x-todex-device-id"]
+        [
+            "accept",
+            "content-type",
+            "host",
+            "x-todex-auth-nonce",
+            "x-todex-auth-sig",
+            "x-todex-auth-ts",
+            "x-todex-device-id"
+        ]
     );
     assert_eq!(
         seen["headers"]["host"], "example.test:7345",
@@ -670,7 +693,8 @@ async fn sealed_tunnel_filters_headers_marks_requests_and_streams_bodies() {
 
     // Streaming download: several records, the inner content length kept.
     let inner = encode_inner(
-        &json!({"method": "GET", "path": "/download", "headers": {}}),
+        &json!({"method": "GET", "path": "/download",
+                "headers": credential("GET", "/download")}),
         &[],
     );
     let (response, down) = call(seal_request(&keys, EncryptionProtocol::X25519, &inner)).await;
@@ -685,7 +709,8 @@ async fn sealed_tunnel_filters_headers_marks_requests_and_streams_bodies() {
 
     // A failing inner body never gets a final record.
     let inner = encode_inner(
-        &json!({"method": "GET", "path": "/broken", "headers": {}}),
+        &json!({"method": "GET", "path": "/broken",
+                "headers": credential("GET", "/broken")}),
         &[],
     );
     let (response, down) = call(seal_request(&keys, EncryptionProtocol::X25519, &inner)).await;
@@ -708,7 +733,8 @@ async fn sealed_tunnel_filters_headers_marks_requests_and_streams_bodies() {
 
     // Outer requests for an unrouted inner path answer the inner 404.
     let inner = encode_inner(
-        &json!({"method": "GET", "path": "/missing", "headers": {}}),
+        &json!({"method": "GET", "path": "/missing",
+                "headers": credential("GET", "/missing")}),
         &[],
     );
     let (response, down) = call(seal_request(&keys, EncryptionProtocol::X25519, &inner)).await;
@@ -879,4 +905,89 @@ async fn websocket_without_tv_is_plaintext_only_and_transport_v1_is_retired() {
     })
     .await
     .unwrap();
+}
+
+/// The tunnel checks the inner credential as soon as the inner head is
+/// decrypted, so an unsigned peer cannot make it buffer a large inner body.
+#[tokio::test]
+async fn sealed_tunnel_checks_the_credential_before_reading_the_inner_body() {
+    let server = TestServer::start(PairingEncryption::X25519).await;
+    let keys = server.state.pairing_keys.clone();
+    let device = TestDevice::new(36);
+    device.enroll(&server.root.join("data"));
+    let app = super::router(server.state.clone());
+    let peer: SocketAddr = "192.0.2.10:6000".parse().unwrap();
+    // Only the first record (the inner head plus the start of the body)
+    // arrives; reading any further fails, which the tunnel reports as an
+    // outer 400. A sealed inner answer proves the rest was never polled.
+    let first_record_then_failure = |sealed: &SealedRequest| {
+        let length = u32::from_be_bytes(sealed.body[..4].try_into().unwrap()) as usize;
+        assert!(4 + length < sealed.body.len(), "needs more than one record");
+        let first = Bytes::copy_from_slice(&sealed.body[..4 + length]);
+        Body::from_stream(futures_util::stream::iter([
+            Ok(first),
+            Err(std::io::Error::other(
+                "inner body must not be read before the credential check",
+            )),
+        ]))
+    };
+    let send = |sealed: &SealedRequest, body: Body| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v2/sealed")
+            .extension(ConnectInfo(peer));
+        for (name, value) in &sealed.headers {
+            request = request.header(*name, value);
+        }
+        app.clone().oneshot(request.body(body).unwrap())
+    };
+    let large = vec![b'x'; 200_000];
+
+    // Unsigned, and signed by an unknown device: inner 401, body unread.
+    let stranger = TestDevice::new(37);
+    let mut stranger_headers = serde_json::Map::new();
+    for (name, value) in stranger.sign("PUT", "/v2/workspaces", &large) {
+        stranger_headers.insert(name.as_str().to_owned(), json!(value));
+    }
+    for headers in [json!({}), Value::Object(stranger_headers)] {
+        let inner = encode_inner(
+            &json!({"method": "PUT", "path": "/v2/workspaces", "headers": headers}),
+            &large,
+        );
+        let sealed = seal_request(&keys, EncryptionProtocol::X25519, &inner);
+        let body = first_record_then_failure(&sealed);
+        let response = send(&sealed, body).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let opened = open_response(sealed.down, &bytes);
+        assert_eq!(opened.status, 401);
+        let error: Value = serde_json::from_slice(&opened.body).unwrap();
+        assert_eq!(error["code"], "UNAUTHENTICATED");
+    }
+
+    // A registered device passes the head check, so the body is read (and
+    // here fails to read).
+    let inner = signed_inner(&device, "PUT", "/v2/workspaces", &large);
+    let sealed = seal_request(&keys, EncryptionProtocol::X25519, &inner);
+    let body = first_record_then_failure(&sealed);
+    let response = send(&sealed, body).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Public routes need no credential but take at most 64 KiB of body.
+    let inner = encode_inner(
+        &json!({"method": "POST", "path": "/v2/device-pairing/create", "headers": {}}),
+        &large,
+    );
+    let sealed = seal_request(&keys, EncryptionProtocol::X25519, &inner);
+    let response = send(&sealed, Body::from(sealed.body.clone())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let inner = encode_inner(
+        &json!({"method": "GET", "path": "/v2/version", "headers": {}}),
+        &[],
+    );
+    let sealed = seal_request(&keys, EncryptionProtocol::X25519, &inner);
+    let response = send(&sealed, Body::from(sealed.body.clone())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(open_response(sealed.down, &bytes).status, 200);
 }

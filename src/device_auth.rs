@@ -134,6 +134,17 @@ impl DeviceAuthenticator {
         })
     }
 
+    /// [`Self::check_credential`] for callers that see the headers before
+    /// the body (the transport v2 tunnel checks the inner head this way).
+    /// The device auth middleware still verifies the signature later.
+    pub(crate) fn check_credential_headers(
+        &self,
+        headers: &HeaderMap,
+        query: Option<&str>,
+    ) -> Result<(), AppError> {
+        self.check_credential(headers, query).map(drop)
+    }
+
     /// Single-use nonces scoped per device within the accepted timestamp
     /// window. Replays are rejected even when the signature itself is valid.
     fn claim_nonce(&self, device_id: &str, timestamp: u64, nonce: &str) -> Result<(), AppError> {

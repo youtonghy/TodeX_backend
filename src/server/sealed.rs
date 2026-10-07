@@ -16,6 +16,7 @@ use axum::routing::post;
 use axum::Router;
 use futures_util::StreamExt;
 use tower::ServiceExt;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::debug;
 
 use crate::app_state::AppState;
@@ -24,7 +25,7 @@ use crate::device_auth;
 use crate::error::AppError;
 use crate::transport_crypto::channel::{RecordCipher, DIRECTION_DOWN, DIRECTION_UP};
 use crate::transport_crypto::envelope::{
-    encode_response_head, sealed_stream_length, split_inner_request, InnerRequestHead,
+    encode_response_head, parse_inner_head, sealed_stream_length, InnerRequestHead,
     InnerResponseHead, RecordStreamDecoder, RecordStreamSealer, MAX_HEAD_BYTES,
     SEALED_CONTENT_TYPE, SEALED_PATH,
 };
@@ -42,6 +43,17 @@ const HEADER_REQUEST_NONCE: &str = "x-todex-request-nonce";
 const MAX_INNER_PLAINTEXT: usize = 4 + MAX_HEAD_BYTES + device_auth::MAX_AUTH_BODY;
 /// The outer body limit: that plaintext plus the record overhead.
 const MAX_OUTER_BODY: usize = sealed_stream_length(MAX_INNER_PLAINTEXT);
+
+/// Inner body limit for routes that answer without a device credential
+/// (see [`is_public_route`]). Their real bodies are small JSON documents.
+const PUBLIC_INNER_BODY_MAX: usize = 64 * 1024;
+
+/// Tunnel requests that may buffer an inner body at the same time. Only
+/// requests whose inner head passed [`admit`] wait for a permit, so peers
+/// without a credential cannot occupy one; a request holds it until the
+/// inner handler has produced its response head.
+const MAX_CONCURRENT_SEALED: usize = 32;
+static SEALED_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_SEALED);
 
 /// Inner request headers the tunnel forwards; everything else (hop-by-hop
 /// headers, `x-todex-transport*`, cookies, ...) is dropped.
@@ -88,16 +100,26 @@ pub(super) fn routes(api: Router, state: AppState) -> Router {
 }
 
 async fn sealed(State(sealed): State<SealedState>, request: Request) -> Response {
-    let (inner, down) = match open_request(&sealed.state, request).await {
+    let (opened, down) = match open_request(&sealed.state, request).await {
         Ok(opened) => opened,
         Err(error) => {
             debug!(reason = error.reason(), "sealed request rejected");
             return AppError::TransportCryptoFailed.into_response();
         }
     };
-    let response = match sealed.api.oneshot(inner).await {
-        Ok(response) => response,
-        Err(infallible) => match infallible {},
+    let response = match opened {
+        Opened::Forward(inner, permit) => {
+            let response = match sealed.api.oneshot(inner).await {
+                Ok(response) => response,
+                Err(infallible) => match infallible {},
+            };
+            // The inner body was consumed; streaming the response needs no
+            // permit.
+            drop(permit);
+            response
+        }
+        // Answered from the inner head alone, before the inner body was read.
+        Opened::Rejected(error) => error.into_response(),
     };
     match seal_response(response, down) {
         Ok(response) => response,
@@ -106,6 +128,43 @@ async fn sealed(State(sealed): State<SealedState>, request: Request) -> Response
             AppError::TransportCryptoFailed.into_response()
         }
     }
+}
+
+/// What an opened tunnel request turns into.
+enum Opened {
+    /// The complete inner request, holding a [`SEALED_PERMITS`] permit.
+    Forward(Request, SemaphorePermit<'static>),
+    /// The inner head alone was enough to refuse the request; the error is
+    /// sealed like any inner response.
+    Rejected(AppError),
+}
+
+/// Routes that answer without a device credential (compare
+/// `enforcement::is_direct_route`). Every other inner path, including
+/// unknown ones, needs a credential before its body is read.
+fn is_public_route(path: &str) -> bool {
+    matches!(path, "/health" | "/v2/transport-policy" | "/v2/version")
+        || path.starts_with("/v2/device-pairing/")
+}
+
+/// Body-independent checks on the inner head, run as soon as the head is
+/// decrypted: the device credential is present and names a registered
+/// device (anonymous deployments: the request is local), so an unsigned
+/// peer cannot make the daemon buffer a large inner body. Returns the inner
+/// body limit. The full signature check over the body still runs in the
+/// router's device auth middleware.
+fn admit(state: &AppState, parts: &InnerParts) -> Result<usize, AppError> {
+    if is_public_route(parts.uri.path()) {
+        return Ok(PUBLIC_INNER_BODY_MAX);
+    }
+    if state.config.security.enable_auth {
+        state
+            .device_auth
+            .check_credential_headers(&parts.headers, parts.uri.query())?;
+    } else {
+        device_auth::ensure_local_request(&parts.headers, &parts.uri)?;
+    }
+    Ok(device_auth::MAX_AUTH_BODY)
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, TransportCryptoError> {
@@ -129,7 +188,7 @@ fn is_sealed_content_type(headers: &HeaderMap) -> bool {
 async fn open_request(
     state: &AppState,
     request: Request,
-) -> Result<(Request, RecordCipher), TransportCryptoError> {
+) -> Result<(Opened, RecordCipher), TransportCryptoError> {
     let (parts, body) = request.into_parts();
     let headers = &parts.headers;
     if !is_sealed_content_type(headers) || header(headers, HEADER_TRANSPORT)? != "2" {
@@ -166,8 +225,33 @@ async fn open_request(
 
     let mut received = 0_usize;
     let mut plaintext = Vec::new();
+    // Set once the inner head is decrypted and admitted.
+    let mut admitted: Option<(InnerParts, usize, usize, SemaphorePermit<'static>)> = None;
     let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        if admitted.is_none() {
+            if let Some((head, head_end)) = parse_inner_head(&plaintext)? {
+                let inner = inner_parts(head, &parts.headers)?;
+                let body_limit = match admit(state, &inner) {
+                    Ok(limit) => limit,
+                    // Stop reading: the rest of the outer body is dropped.
+                    Err(error) => return Ok((Opened::Rejected(error), down)),
+                };
+                let permit = SEALED_PERMITS
+                    .acquire()
+                    .await
+                    .map_err(|_| TransportCryptoError::new("tunnel closed"))?;
+                admitted = Some((inner, head_end, body_limit, permit));
+            }
+        }
+        if let Some((_, head_end, body_limit, _)) = &admitted {
+            if plaintext.len() - head_end > *body_limit {
+                return Err(TransportCryptoError::new("inner body too large"));
+            }
+        }
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
         let chunk = chunk.map_err(|_| TransportCryptoError::new("outer body read"))?;
         received = received.saturating_add(chunk.len());
         if received > MAX_OUTER_BODY {
@@ -176,17 +260,26 @@ async fn open_request(
         decoder.push(&chunk, &mut plaintext)?;
     }
     decoder.finish()?;
-    let (head, body) = split_inner_request(plaintext)?;
-    let inner = inner_request(head, body, &parts.headers, &parts.extensions)?;
-    Ok((inner, down))
+    let Some((inner, head_end, _, permit)) = admitted else {
+        return Err(TransportCryptoError::new("inner head truncated"));
+    };
+    // Reuse the allocation for the body.
+    plaintext.drain(..head_end);
+    let request = inner_request(inner, plaintext, &parts.extensions);
+    Ok((Opened::Forward(request, permit), down))
 }
 
-fn inner_request(
+/// Method, target and forwarded headers of the inner request.
+struct InnerParts {
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+}
+
+fn inner_parts(
     head: InnerRequestHead,
-    body: Vec<u8>,
     outer_headers: &HeaderMap,
-    outer_extensions: &axum::http::Extensions,
-) -> Result<Request, TransportCryptoError> {
+) -> Result<InnerParts, TransportCryptoError> {
     fn invalid<E>(_: E) -> TransportCryptoError {
         TransportCryptoError::new("invalid inner request")
     }
@@ -200,10 +293,7 @@ fn inner_request(
     if uri.scheme().is_some() || uri.authority().is_some() {
         return Err(TransportCryptoError::new("inner request target"));
     }
-    let mut request = Request::new(Body::from(body));
-    *request.method_mut() = method;
-    *request.uri_mut() = uri;
-    let headers = request.headers_mut();
+    let mut headers = HeaderMap::new();
     for (name, value) in &head.headers {
         let name = name.to_ascii_lowercase();
         if !FORWARDED_INNER_HEADERS.contains(&name.as_str()) {
@@ -221,13 +311,29 @@ fn inner_request(
             headers.append(name.clone(), value.clone());
         }
     }
+    Ok(InnerParts {
+        method,
+        uri,
+        headers,
+    })
+}
+
+fn inner_request(
+    parts: InnerParts,
+    body: Vec<u8>,
+    outer_extensions: &axum::http::Extensions,
+) -> Request {
+    let mut request = Request::new(Body::from(body));
+    *request.method_mut() = parts.method;
+    *request.uri_mut() = parts.uri;
+    *request.headers_mut() = parts.headers;
     // Only the peer address carries over: the inner request gets no other
     // outer extension (body limits, matched route, ...).
     if let Some(peer) = peer_address(outer_extensions) {
         request.extensions_mut().insert(ConnectInfo(peer));
     }
     request.extensions_mut().insert(ArrivedViaTransportV2);
-    Ok(request)
+    request
 }
 
 /// The peer address the way the `ConnectInfo` extractor resolves it: the
@@ -253,6 +359,8 @@ fn seal_response(response: Response, down: RecordCipher) -> Result<Response, Tra
             continue;
         }
         let Ok(value) = value.to_str() else {
+            // The inner head is JSON text; a non-UTF-8 value cannot travel.
+            debug!(header = name.as_str(), "sealed response dropped a non-text header value");
             continue;
         };
         headers
