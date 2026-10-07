@@ -1580,9 +1580,10 @@ fn envelope_event(line: &[u8], conversation_id: &str) -> Result<ConversationEven
 }
 
 /// Atomically publish a prepared segment (§4.1): `.idx` then `.seg` are
-/// renamed into place, then the plaintext sources are deleted and the
-/// directory synced. `step` lets crash tests stop after any step. Blocking;
-/// callers hold the conversation lock.
+/// renamed into place and the directory synced, so the renames are durable
+/// before the plaintext sources are deleted; the directory is synced again
+/// after the deletions. `step` lets crash tests stop after any step.
+/// Blocking; callers hold the conversation lock.
 pub(super) fn commit_prepared(
     directory: &Path,
     prepared: &PreparedSegment,
@@ -1606,6 +1607,9 @@ pub(super) fn commit_prepared(
     if stop(CommitStep::SegmentRenamed) {
         return Ok(());
     }
+    // Without this a crash could persist a source's deletion but not the
+    // renames, losing the records both held.
+    sync_directory_blocking(directory)?;
     for (index, source) in prepared.body.sources.iter().enumerate() {
         match std::fs::remove_file(directory.join(source)) {
             Ok(()) => {}
