@@ -1,0 +1,1132 @@
+{
+  "acp": {
+    "mode=- work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=- work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=- work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=- work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=- work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=ask work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=ask work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=ask work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=ask work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=auto work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support permission mode auto"
+    },
+    "mode=auto work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support permission mode auto"
+    },
+    "mode=auto work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not support permission mode auto"
+    },
+    "mode=auto work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not support permission mode auto"
+    },
+    "mode=auto work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=auto work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=auto work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=auto work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=full-access work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support permission mode full-access"
+    },
+    "mode=full-access work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support permission mode full-access"
+    },
+    "mode=full-access work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not support permission mode full-access"
+    },
+    "mode=full-access work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not support permission mode full-access"
+    },
+    "mode=full-access work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=bogus work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: acp does not support Plan mode"
+    }
+  },
+  "codex": {
+    "mode=- work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": "user",
+      "sandboxMode": "workspace-write",
+      "approvalPolicy": "on-request",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=- work=- profile=read-only sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": "read-only",
+      "approvalPolicy": "on-request",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=- work=- profile=- sandbox=workspace-write approval=never": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": "workspace-write",
+      "approvalPolicy": "never",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=- work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": "danger-full-access",
+      "approvalPolicy": "on-request",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=- work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": "user",
+      "sandboxMode": "workspace-write",
+      "approvalPolicy": "on-request",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=- work=plan profile=read-only sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": "read-only",
+      "approvalPolicy": "on-request",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=- work=plan profile=- sandbox=workspace-write approval=never": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": "workspace-write",
+      "approvalPolicy": "never",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=- work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": "danger-full-access",
+      "approvalPolicy": "on-request",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=ask work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": "user",
+      "sandboxMode": "workspace-write",
+      "approvalPolicy": "on-request",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=ask work=- profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=ask work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=ask work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=ask work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": "user",
+      "sandboxMode": "workspace-write",
+      "approvalPolicy": "on-request",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=ask work=plan profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=ask work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=auto work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "auto",
+      "workMode": "implement",
+      "approvalsReviewer": "auto_review",
+      "sandboxMode": "workspace-write",
+      "approvalPolicy": "on-request",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=auto work=- profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=auto work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=auto work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=auto work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "auto",
+      "workMode": "plan",
+      "approvalsReviewer": "auto_review",
+      "sandboxMode": "workspace-write",
+      "approvalPolicy": "on-request",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=auto work=plan profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=auto work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=auto work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=full-access work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "implement",
+      "approvalsReviewer": "user",
+      "sandboxMode": "danger-full-access",
+      "approvalPolicy": "never",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=full-access work=- profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=full-access work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=full-access work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=full-access work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "plan",
+      "approvalsReviewer": "user",
+      "sandboxMode": "danger-full-access",
+      "approvalPolicy": "never",
+      "providerMode": null,
+      "source": "validated-provider-controls"
+    },
+    "mode=full-access work=plan profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=full-access work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=full-access work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=bogus work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: codex does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: codex does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: codex does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: codex does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: codex does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: codex does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: codex does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: codex does not support permission mode bogus"
+    }
+  },
+  "pi": {
+    "mode=- work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=- work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=- work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=- work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=- work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=ask work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support permission mode ask"
+    },
+    "mode=ask work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support permission mode ask"
+    },
+    "mode=ask work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not support permission mode ask"
+    },
+    "mode=ask work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not support permission mode ask"
+    },
+    "mode=ask work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=ask work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=ask work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=auto work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support permission mode auto"
+    },
+    "mode=auto work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support permission mode auto"
+    },
+    "mode=auto work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not support permission mode auto"
+    },
+    "mode=auto work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not support permission mode auto"
+    },
+    "mode=auto work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=auto work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=auto work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=auto work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=full-access work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=full-access work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=bogus work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: pi does not support Plan mode"
+    }
+  },
+  "claude-code": {
+    "mode=- work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": "default",
+      "source": "validated-provider-controls"
+    },
+    "mode=- work=- profile=read-only sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": "read-only",
+      "approvalPolicy": "on-request",
+      "providerMode": "plan",
+      "source": "validated-provider-controls"
+    },
+    "mode=- work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=- work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=- work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": "plan",
+      "source": "validated-provider-controls"
+    },
+    "mode=- work=plan profile=read-only sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": "read-only",
+      "approvalPolicy": "on-request",
+      "providerMode": "plan",
+      "source": "validated-provider-controls"
+    },
+    "mode=- work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=- work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=ask work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": "default",
+      "source": "validated-provider-controls"
+    },
+    "mode=ask work=- profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=ask work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=ask work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=ask work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": "plan",
+      "source": "validated-provider-controls"
+    },
+    "mode=ask work=plan profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=ask work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=auto work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "auto",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": "auto",
+      "source": "validated-provider-controls"
+    },
+    "mode=auto work=- profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=auto work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=auto work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=auto work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "auto",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": "plan",
+      "source": "validated-provider-controls"
+    },
+    "mode=auto work=plan profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=auto work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=auto work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=full-access work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": "bypassPermissions",
+      "source": "validated-provider-controls"
+    },
+    "mode=full-access work=- profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=full-access work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=full-access work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=full-access work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": "plan",
+      "source": "validated-provider-controls"
+    },
+    "mode=full-access work=plan profile=read-only sandbox=- approval=-": {
+      "error": "invalid request: permissionMode conflicts with legacy permission controls; send one configuration format"
+    },
+    "mode=full-access work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=full-access work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: Claude stream-json does not support this permission combination"
+    },
+    "mode=bogus work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: claude-code does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: claude-code does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: claude-code does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: claude-code does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: claude-code does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: claude-code does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: claude-code does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: claude-code does not support permission mode bogus"
+    }
+  },
+  "grok-build": {
+    "mode=- work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=- work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=- work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=- work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=- work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=ask work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=ask work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=ask work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=ask work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=auto work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support permission mode auto"
+    },
+    "mode=auto work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support permission mode auto"
+    },
+    "mode=auto work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not support permission mode auto"
+    },
+    "mode=auto work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not support permission mode auto"
+    },
+    "mode=auto work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=auto work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=auto work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=auto work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=full-access work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support permission mode full-access"
+    },
+    "mode=full-access work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support permission mode full-access"
+    },
+    "mode=full-access work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not support permission mode full-access"
+    },
+    "mode=full-access work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not support permission mode full-access"
+    },
+    "mode=full-access work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=bogus work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: grok-build does not support Plan mode"
+    }
+  },
+  "devin": {
+    "mode=- work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=- work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=- work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=ask work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=ask work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=auto work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=auto work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=full-access work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=full-access work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not expose sandbox or approval overrides"
+    },
+    "mode=bogus work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: devin does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: devin does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: devin does not support permission mode bogus"
+    }
+  },
+  "opencode": {
+    "mode=- work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=- work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=- work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=ask work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=ask work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "auto",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=auto work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "auto",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=auto work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=full-access work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=full-access work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
+    },
+    "mode=bogus work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: opencode does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: opencode does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: opencode does not support permission mode bogus"
+    }
+  }
+}

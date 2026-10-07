@@ -1,0 +1,408 @@
+{
+  "acp": {
+    "skillRoots": [
+      {
+        "path": "<workspace>/.agents/skills",
+        "scope": "project",
+        "source": "provider-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.agents/skills",
+        "scope": "user",
+        "source": "provider-user",
+        "priority": 20
+      }
+    ],
+    "mcpSources": [],
+    "skills": 0,
+    "mcp": [],
+    "mcpTarget": {
+      "error": "resource not found: mcp resource missing"
+    }
+  },
+  "codex": {
+    "skillRoots": [
+      {
+        "path": "<workspace>/.agents/skills",
+        "scope": "project",
+        "source": "shared-project",
+        "priority": 30
+      },
+      {
+        "path": "<workspace>/.codex/skills",
+        "scope": "project",
+        "source": "provider-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.agents/skills",
+        "scope": "user",
+        "source": "shared-user",
+        "priority": 10
+      },
+      {
+        "path": "~/.codex/skills",
+        "scope": "user",
+        "source": "provider-user",
+        "priority": 20
+      }
+    ],
+    "mcpSources": [
+      {
+        "path": "<workspace>/.codex/config.toml",
+        "scope": "project",
+        "source": "codex-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.codex/config.toml",
+        "scope": "user",
+        "source": "codex-user",
+        "priority": 20
+      }
+    ],
+    "skills": 0,
+    "mcp": [
+      {
+        "name": "project:codex",
+        "source": "codex-project",
+        "scope": "project",
+        "active": true
+      },
+      {
+        "name": "user:codex",
+        "source": "codex-user",
+        "scope": "user",
+        "active": true
+      }
+    ],
+    "mcpTarget": {
+      "error": "resource not found: mcp resource missing"
+    }
+  },
+  "pi": {
+    "skillRoots": [
+      {
+        "path": "<workspace>/.agents/skills",
+        "scope": "project",
+        "source": "shared-project",
+        "priority": 30
+      },
+      {
+        "path": "<workspace>/.pi/skills",
+        "scope": "project",
+        "source": "provider-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.agents/skills",
+        "scope": "user",
+        "source": "shared-user",
+        "priority": 10
+      },
+      {
+        "path": "~/.pi/agent/skills",
+        "scope": "user",
+        "source": "provider-user",
+        "priority": 20
+      }
+    ],
+    "mcpSources": [
+      {
+        "path": "<workspace>/.mcp.json",
+        "scope": "project",
+        "source": "pi-project",
+        "priority": 40
+      },
+      {
+        "path": "<workspace>/.pi/mcp.json",
+        "scope": "project",
+        "source": "pi-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.pi/agent/mcp.json",
+        "scope": "user",
+        "source": "pi-user",
+        "priority": 20
+      },
+      {
+        "path": "~/.pi/agent/settings.json",
+        "scope": "user",
+        "source": "pi-user",
+        "priority": 20
+      }
+    ],
+    "skills": 0,
+    "mcp": [
+      {
+        "name": "project:.mcp.json",
+        "source": "pi-project",
+        "scope": "project",
+        "active": true
+      },
+      {
+        "name": "project:.pi/mcp.json",
+        "source": "pi-project",
+        "scope": "project",
+        "active": true
+      },
+      {
+        "name": "user:.pi/agent/mcp.json",
+        "source": "pi-user",
+        "scope": "user",
+        "active": true
+      },
+      {
+        "name": "user:.pi/agent/settings.json",
+        "source": "pi-user",
+        "scope": "user",
+        "active": true
+      }
+    ],
+    "mcpTarget": {
+      "error": "resource not found: mcp resource missing"
+    }
+  },
+  "claude-code": {
+    "skillRoots": [
+      {
+        "path": "<workspace>/.agents/skills",
+        "scope": "project",
+        "source": "shared-project",
+        "priority": 30
+      },
+      {
+        "path": "<workspace>/.claude/skills",
+        "scope": "project",
+        "source": "provider-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.agents/skills",
+        "scope": "user",
+        "source": "shared-user",
+        "priority": 10
+      },
+      {
+        "path": "~/.claude/skills",
+        "scope": "user",
+        "source": "provider-user",
+        "priority": 20
+      }
+    ],
+    "mcpSources": [
+      {
+        "path": "<workspace>/.claude/settings.json",
+        "scope": "project",
+        "source": "claude-project",
+        "priority": 40
+      },
+      {
+        "path": "<workspace>/.mcp.json",
+        "scope": "project",
+        "source": "claude-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.claude.json",
+        "scope": "user",
+        "source": "claude-user",
+        "priority": 20
+      },
+      {
+        "path": "~/.claude/settings.json",
+        "scope": "user",
+        "source": "claude-user",
+        "priority": 20
+      }
+    ],
+    "skills": 0,
+    "mcp": [
+      {
+        "name": "project:.claude/settings.json",
+        "source": "claude-project",
+        "scope": "project",
+        "active": true
+      },
+      {
+        "name": "project:.mcp.json",
+        "source": "claude-project",
+        "scope": "project",
+        "active": true
+      },
+      {
+        "name": "user:.claude.json",
+        "source": "claude-user",
+        "scope": "user",
+        "active": true
+      },
+      {
+        "name": "user:.claude/settings.json",
+        "source": "claude-user",
+        "scope": "user",
+        "active": true
+      }
+    ],
+    "mcpTarget": {
+      "error": "resource not found: mcp resource missing"
+    }
+  },
+  "grok-build": {
+    "skillRoots": [
+      {
+        "path": "<workspace>/.agents/skills",
+        "scope": "project",
+        "source": "shared-project",
+        "priority": 30
+      },
+      {
+        "path": "<workspace>/.grok/skills",
+        "scope": "project",
+        "source": "provider-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.agents/skills",
+        "scope": "user",
+        "source": "shared-user",
+        "priority": 10
+      },
+      {
+        "path": "~/.grok/skills",
+        "scope": "user",
+        "source": "provider-user",
+        "priority": 20
+      }
+    ],
+    "mcpSources": [],
+    "skills": {
+      "error": "provider unavailable: provider executable '/nonexistent/todex-golden/grok' was not found"
+    },
+    "mcp": {
+      "error": "provider unavailable: provider executable '/nonexistent/todex-golden/grok' was not found"
+    },
+    "mcpTarget": {
+      "error": "unsupported capability: Grok Build MCP servers are invoked natively during provider sessions"
+    }
+  },
+  "devin": {
+    "skillRoots": [
+      {
+        "path": "<workspace>/.agents/skills",
+        "scope": "project",
+        "source": "shared-project",
+        "priority": 30
+      },
+      {
+        "path": "<workspace>/.devin/skills",
+        "scope": "project",
+        "source": "provider-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.agents/skills",
+        "scope": "user",
+        "source": "shared-user",
+        "priority": 10
+      },
+      {
+        "path": "~/.config/devin/skills",
+        "scope": "user",
+        "source": "provider-user",
+        "priority": 20
+      }
+    ],
+    "mcpSources": [
+      {
+        "path": "<workspace>/.devin/mcp_config.json",
+        "scope": "project",
+        "source": "devin-project",
+        "priority": 40
+      },
+      {
+        "path": "<workspace>/.devin/mcp_config.local.json",
+        "scope": "project",
+        "source": "devin-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.config/devin/mcp_config.json",
+        "scope": "user",
+        "source": "devin-user",
+        "priority": 20
+      },
+      {
+        "path": "~/.config/devin/mcp_config.local.json",
+        "scope": "user",
+        "source": "devin-user",
+        "priority": 20
+      }
+    ],
+    "skills": 0,
+    "mcp": [
+      {
+        "name": "project:.devin/mcp_config.json",
+        "source": "devin-project",
+        "scope": "project",
+        "active": true
+      },
+      {
+        "name": "project:.devin/mcp_config.local.json",
+        "source": "devin-project",
+        "scope": "project",
+        "active": true
+      },
+      {
+        "name": "user:.config/devin/mcp_config.json",
+        "source": "devin-user",
+        "scope": "user",
+        "active": true
+      },
+      {
+        "name": "user:.config/devin/mcp_config.local.json",
+        "source": "devin-user",
+        "scope": "user",
+        "active": true
+      }
+    ],
+    "mcpTarget": {
+      "error": "resource not found: mcp resource missing"
+    }
+  },
+  "opencode": {
+    "skillRoots": [
+      {
+        "path": "<workspace>/.agents/skills",
+        "scope": "project",
+        "source": "shared-project",
+        "priority": 30
+      },
+      {
+        "path": "<workspace>/.opencode/skills",
+        "scope": "project",
+        "source": "provider-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.agents/skills",
+        "scope": "user",
+        "source": "shared-user",
+        "priority": 10
+      },
+      {
+        "path": "~/.config/opencode/skills",
+        "scope": "user",
+        "source": "provider-user",
+        "priority": 20
+      }
+    ],
+    "mcpSources": [],
+    "skills": 0,
+    "mcp": [],
+    "mcpTarget": {
+      "error": "resource not found: mcp resource missing"
+    }
+  }
+}

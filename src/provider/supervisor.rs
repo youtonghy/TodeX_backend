@@ -783,6 +783,98 @@ impl ConversationSupervisor {
         self.registry.descriptors()
     }
 
+    /// The `/v2/providers` list: each descriptor plus the live control
+    /// capabilities clients gate their actions on.
+    pub async fn providers_snapshot(&self) -> Result<Value, AppError> {
+        let mut providers = serde_json::to_value(self.providers())?;
+        if let Some(items) = providers.as_array_mut() {
+            for provider in items {
+                let provider_id = provider
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                self.refresh_control_capabilities(&provider_id).await;
+                let control_probe = self.control_probe(&provider_id);
+                let live_controls = self.supports_live_controls(&provider_id);
+                let native_queue = self.supports_native_queue(&provider_id);
+                let runtime_stop = self.supports_runtime_stop(&provider_id);
+                let capabilities = provider
+                    .get("capabilities")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let mut actions = Vec::new();
+                if live_controls {
+                    actions.push("steer");
+                }
+                if native_queue {
+                    actions.push("queue");
+                }
+                if capabilities
+                    .get("cancel")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    actions.push("cancel");
+                    actions.push("interrupt");
+                    actions.push("followUp");
+                    actions.push("retry");
+                    // Resume requires native continuation semantics, not prompt replay.
+                    if provider
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| self.supports_native_fork(id))
+                    {
+                        actions.push("fork");
+                    }
+                    if provider
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| self.supports_native_compact(id))
+                    {
+                        actions.push("compact");
+                    }
+                }
+                if let Some(object) = provider.as_object_mut() {
+                    if let Some(capabilities) = object
+                        .get_mut("capabilities")
+                        .and_then(Value::as_object_mut)
+                    {
+                        capabilities.insert("controlActions".to_owned(), json!(actions));
+                        if let Some(probe) = control_probe {
+                            capabilities.insert("controlProbe".to_owned(), probe);
+                        }
+                        capabilities.insert("steering".to_owned(), json!(live_controls));
+                        capabilities.insert("liveConfiguration".to_owned(), json!(live_controls));
+                        capabilities.insert("followUpQueue".to_owned(), json!(native_queue));
+                        // Every provider can hold follow-ups in the daemon's queue.
+                        capabilities.insert("backendQueue".to_owned(), json!(true));
+                        if runtime_stop {
+                            capabilities.insert("runtimeStop".to_owned(), json!(true));
+                            capabilities.insert("sessionCommands".to_owned(), json!(true));
+                            capabilities.insert("extensionMessages".to_owned(), json!(true));
+                            capabilities.insert(
+                                "extensionUi".to_owned(),
+                                json!([
+                                    "select",
+                                    "confirm",
+                                    "input",
+                                    "editor",
+                                    "notify",
+                                    "setStatus",
+                                    "setWidget",
+                                    "setTitle",
+                                    "set_editor_text"
+                                ]),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(providers)
+    }
+
     pub fn has_active_turns(&self) -> bool {
         !self.active.is_empty()
     }
@@ -792,16 +884,13 @@ impl ConversationSupervisor {
         let binary = cli.binary(&self.config);
         self.active.iter().any(|entry| {
             let turn = entry.value();
-            if turn.provider == provider {
-                return true;
-            }
-            if turn.provider != ProviderKind::Acp {
-                return false;
-            }
-            turn.provider_profile
-                .as_deref()
-                .and_then(|name| self.config.agent.acp_profiles.get(name))
-                .is_some_and(|profile| same_executable(&profile.command, binary))
+            turn_runs_cli(
+                &self.config.agent,
+                turn.provider,
+                turn.provider_profile.as_deref(),
+                provider,
+                binary,
+            )
         })
     }
 
@@ -1846,11 +1935,7 @@ impl ConversationSupervisor {
             .iter()
             .map(|skill| (skill.name.clone(), skill.content.clone()))
             .collect::<Vec<_>>();
-        let provider_text = if manifest.provider == ProviderKind::Codex {
-            user_text.clone()
-        } else {
-            compose_prompt_with_skills(&user_text, &injected)
-        };
+        let provider_text = provider_prompt_text(manifest.provider, &user_text, &injected);
         if provider_text.len() > MAX_PROMPT_BYTES {
             return Err(AppError::InvalidRequest(format!(
                 "prompt exceeds {MAX_PROMPT_BYTES} bytes after skill injection"
@@ -2854,6 +2939,40 @@ fn image_mime_type(path: &Path) -> Result<&'static str, AppError> {
     }
 }
 
+/// Whether a running turn executes `binary`, the CLI of `cli_provider`: its
+/// own provider's CLI, or an ACP profile launching the same executable.
+fn turn_runs_cli(
+    agent: &crate::config::AgentConfig,
+    turn_provider: ProviderKind,
+    turn_profile: Option<&str>,
+    cli_provider: ProviderKind,
+    binary: &str,
+) -> bool {
+    if turn_provider == cli_provider {
+        return true;
+    }
+    if turn_provider != ProviderKind::Acp {
+        return false;
+    }
+    turn_profile
+        .and_then(|name| agent.acp_profiles.get(name))
+        .is_some_and(|profile| same_executable(&profile.command, binary))
+}
+
+/// The prompt text a provider receives. Codex loads selected skills natively,
+/// so only the other providers get their instructions inlined.
+fn provider_prompt_text(
+    provider: ProviderKind,
+    user_text: &str,
+    injected: &[(String, String)],
+) -> String {
+    if provider == ProviderKind::Codex {
+        user_text.to_owned()
+    } else {
+        compose_prompt_with_skills(user_text, injected)
+    }
+}
+
 pub(crate) fn compose_prompt_with_skills(user_text: &str, skills: &[(String, String)]) -> String {
     if skills.is_empty() {
         return user_text.to_owned();
@@ -2971,6 +3090,7 @@ fn normalize_profile(
 #[cfg(all(test, unix))]
 mod tests {
     mod follow_up_queue;
+    mod profile_golden;
 
     use std::collections::BTreeMap;
     use std::fs;

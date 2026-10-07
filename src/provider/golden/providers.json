@@ -1,0 +1,740 @@
+[
+  {
+    "id": "acp",
+    "displayName": "ACP",
+    "available": false,
+    "unavailableReason": "no configured ACP profile executable was found",
+    "profiles": [
+      "golden"
+    ],
+    "capabilities": {
+      "permissionConfig": {
+        "modes": [
+          "ask"
+        ],
+        "defaultMode": "ask",
+        "supportsPlan": false,
+        "sandboxModes": [],
+        "approvalPolicies": [],
+        "permissionProfiles": [],
+        "enforcement": "unsupported",
+        "description": "This provider does not expose sandbox or approval overrides through its active protocol."
+      },
+      "nativeFork": false,
+      "nativeCompact": false,
+      "nativeResume": true,
+      "cancel": true,
+      "permissions": true,
+      "toolEvents": true,
+      "nativeSkills": true,
+      "nativeMcp": true,
+      "managedMcp": false,
+      "modelSelection": false,
+      "imageInput": false,
+      "imageInputMode": "profile",
+      "controlActions": [
+        "cancel",
+        "interrupt",
+        "followUp",
+        "retry"
+      ],
+      "steering": false,
+      "liveConfiguration": false,
+      "followUpQueue": false,
+      "backendQueue": true
+    },
+    "models": []
+  },
+  {
+    "id": "codex",
+    "displayName": "Codex CLI",
+    "available": false,
+    "unavailableReason": "executable '/nonexistent/todex-golden/codex' was not found",
+    "profiles": [],
+    "capabilities": {
+      "permissionConfig": {
+        "modes": [
+          "ask",
+          "auto",
+          "full-access"
+        ],
+        "defaultMode": "ask",
+        "supportsPlan": true,
+        "sandboxModes": [
+          "read-only",
+          "workspace-write",
+          "danger-full-access"
+        ],
+        "approvalPolicies": [
+          "untrusted",
+          "on-request",
+          "never"
+        ],
+        "permissionProfiles": [
+          "read-only",
+          "workspace-write",
+          "danger-full-access"
+        ],
+        "enforcement": "sandbox",
+        "description": "Codex native sandbox and approval controls"
+      },
+      "nativeFork": true,
+      "nativeCompact": true,
+      "nativeResume": true,
+      "cancel": true,
+      "permissions": true,
+      "toolEvents": true,
+      "nativeSkills": true,
+      "nativeMcp": true,
+      "managedMcp": true,
+      "modelSelection": true,
+      "imageInput": true,
+      "imageInputMode": "model",
+      "controlActions": [
+        "cancel",
+        "interrupt",
+        "followUp",
+        "retry",
+        "fork",
+        "compact"
+      ],
+      "controlProbe": {
+        "status": "unavailable",
+        "source": "installed-schema",
+        "reason": "The installed CLI schema could not be verified; experimental controls are disabled. Restart the backend after updating the CLI to probe again."
+      },
+      "steering": false,
+      "liveConfiguration": false,
+      "followUpQueue": false,
+      "backendQueue": true
+    },
+    "models": []
+  },
+  {
+    "id": "pi",
+    "displayName": "Pi",
+    "available": false,
+    "unavailableReason": "executable '/nonexistent/todex-golden/pi' was not found",
+    "profiles": [],
+    "capabilities": {
+      "permissionConfig": {
+        "modes": [
+          "full-access"
+        ],
+        "defaultMode": "full-access",
+        "supportsPlan": false,
+        "sandboxModes": [],
+        "approvalPolicies": [],
+        "permissionProfiles": [],
+        "enforcement": "unsupported",
+        "description": "This provider does not expose sandbox or approval overrides through its active protocol."
+      },
+      "nativeFork": true,
+      "nativeCompact": true,
+      "nativeResume": true,
+      "cancel": true,
+      "permissions": false,
+      "toolEvents": true,
+      "nativeSkills": true,
+      "nativeMcp": false,
+      "managedMcp": true,
+      "modelSelection": true,
+      "imageInput": true,
+      "imageInputMode": "model",
+      "controlActions": [
+        "steer",
+        "queue",
+        "cancel",
+        "interrupt",
+        "followUp",
+        "retry",
+        "fork",
+        "compact"
+      ],
+      "steering": true,
+      "liveConfiguration": true,
+      "followUpQueue": true,
+      "backendQueue": true,
+      "runtimeStop": true,
+      "sessionCommands": true,
+      "extensionMessages": true,
+      "extensionUi": [
+        "select",
+        "confirm",
+        "input",
+        "editor",
+        "notify",
+        "setStatus",
+        "setWidget",
+        "setTitle",
+        "set_editor_text"
+      ]
+    },
+    "models": []
+  },
+  {
+    "id": "claude-code",
+    "displayName": "Claude Code",
+    "available": false,
+    "unavailableReason": "executable '/nonexistent/todex-golden/claude' was not found",
+    "profiles": [],
+    "capabilities": {
+      "permissionConfig": {
+        "modes": [
+          "ask",
+          "auto",
+          "full-access"
+        ],
+        "defaultMode": "ask",
+        "supportsPlan": true,
+        "sandboxModes": [
+          "read-only",
+          "workspace-write",
+          "danger-full-access"
+        ],
+        "approvalPolicies": [
+          "on-request",
+          "never"
+        ],
+        "permissionProfiles": [
+          "read-only",
+          "workspace-write",
+          "danger-full-access"
+        ],
+        "enforcement": "agent-policy",
+        "description": "Claude default / auto / bypassPermissions and independent plan mode; not an operating-system sandbox. Legacy combinations remain validated."
+      },
+      "nativeFork": true,
+      "nativeCompact": false,
+      "nativeResume": true,
+      "cancel": true,
+      "permissions": true,
+      "toolEvents": true,
+      "nativeSkills": true,
+      "nativeMcp": true,
+      "managedMcp": true,
+      "modelSelection": true,
+      "imageInput": true,
+      "imageInputMode": "always",
+      "controlActions": [
+        "cancel",
+        "interrupt",
+        "followUp",
+        "retry",
+        "fork"
+      ],
+      "steering": false,
+      "liveConfiguration": false,
+      "followUpQueue": false,
+      "backendQueue": true
+    },
+    "models": [
+      {
+        "id": "default",
+        "displayName": "default",
+        "description": "Opus 5",
+        "isDefault": true,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "imageInput": true
+      },
+      {
+        "id": "opus",
+        "displayName": "opus",
+        "description": "Opus 5.5",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "imageInput": true,
+        "family": "opus"
+      },
+      {
+        "id": "claude-opus-5-5",
+        "displayName": "Opus 5.5",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "defaultReasoningEffort": "medium",
+        "contextWindow": 1000000,
+        "imageInput": true,
+        "family": "opus"
+      },
+      {
+        "id": "claude-opus-5",
+        "displayName": "Opus 5",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "defaultReasoningEffort": "high",
+        "contextWindow": 1000000,
+        "imageInput": true,
+        "family": "opus"
+      },
+      {
+        "id": "claude-opus-4-8",
+        "displayName": "Opus 4.8",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "defaultReasoningEffort": "high",
+        "contextWindow": 1000000,
+        "imageInput": true,
+        "family": "opus"
+      },
+      {
+        "id": "claude-opus-4-7",
+        "displayName": "Opus 4.7",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "defaultReasoningEffort": "xhigh",
+        "contextWindow": 1000000,
+        "imageInput": true,
+        "family": "opus"
+      },
+      {
+        "id": "claude-opus-4-6",
+        "displayName": "Opus 4.6",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "contextWindow": 200000,
+        "imageInput": true,
+        "family": "opus"
+      },
+      {
+        "id": "claude-opus-4-5-20251101",
+        "displayName": "Opus 4.5",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [],
+        "contextWindow": 200000,
+        "imageInput": true,
+        "family": "opus"
+      },
+      {
+        "id": "claude-opus-4-1-20250805",
+        "displayName": "Opus 4.1",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [],
+        "contextWindow": 200000,
+        "imageInput": true,
+        "family": "opus"
+      },
+      {
+        "id": "claude-opus-4-20250514",
+        "displayName": "Opus 4",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [],
+        "contextWindow": 200000,
+        "imageInput": true,
+        "family": "opus"
+      },
+      {
+        "id": "sonnet",
+        "displayName": "sonnet",
+        "description": "Sonnet 5.5",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "imageInput": true,
+        "family": "sonnet"
+      },
+      {
+        "id": "claude-sonnet-5-5",
+        "displayName": "Sonnet 5.5",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "defaultReasoningEffort": "medium",
+        "contextWindow": 1000000,
+        "imageInput": true,
+        "family": "sonnet"
+      },
+      {
+        "id": "claude-sonnet-5",
+        "displayName": "Sonnet 5",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "defaultReasoningEffort": "high",
+        "contextWindow": 1000000,
+        "imageInput": true,
+        "family": "sonnet"
+      },
+      {
+        "id": "claude-sonnet-4-6",
+        "displayName": "Sonnet 4.6",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "contextWindow": 200000,
+        "imageInput": true,
+        "family": "sonnet"
+      },
+      {
+        "id": "claude-sonnet-4-5-20250929",
+        "displayName": "Sonnet 4.5",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [],
+        "contextWindow": 200000,
+        "imageInput": true,
+        "family": "sonnet"
+      },
+      {
+        "id": "claude-sonnet-4-20250514",
+        "displayName": "Sonnet 4",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [],
+        "contextWindow": 200000,
+        "imageInput": true,
+        "family": "sonnet"
+      },
+      {
+        "id": "claude-3-7-sonnet-20250219",
+        "displayName": "Sonnet 3.7",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [],
+        "imageInput": true,
+        "family": "sonnet"
+      },
+      {
+        "id": "claude-3-5-sonnet-20241022",
+        "displayName": "Sonnet 3.5",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [],
+        "imageInput": true,
+        "family": "sonnet"
+      },
+      {
+        "id": "fable",
+        "displayName": "fable",
+        "description": "Fable 5.1",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "imageInput": true,
+        "family": "fable"
+      },
+      {
+        "id": "claude-fable-5-1",
+        "displayName": "Fable 5.1",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "defaultReasoningEffort": "high",
+        "contextWindow": 1000000,
+        "imageInput": true,
+        "family": "fable"
+      },
+      {
+        "id": "claude-fable-5",
+        "displayName": "Fable 5",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ],
+        "defaultReasoningEffort": "high",
+        "contextWindow": 1000000,
+        "imageInput": true,
+        "family": "fable"
+      },
+      {
+        "id": "haiku",
+        "displayName": "haiku",
+        "description": "Haiku 4.5",
+        "isDefault": false,
+        "supportedReasoningEfforts": [
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "imageInput": true,
+        "family": "haiku"
+      },
+      {
+        "id": "claude-haiku-4-5-20251001",
+        "displayName": "Haiku 4.5",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [],
+        "contextWindow": 200000,
+        "imageInput": true,
+        "family": "haiku"
+      },
+      {
+        "id": "claude-3-5-haiku-20241022",
+        "displayName": "Haiku 3.5",
+        "description": "",
+        "isDefault": false,
+        "supportedReasoningEfforts": [],
+        "imageInput": true,
+        "family": "haiku"
+      }
+    ]
+  },
+  {
+    "id": "grok-build",
+    "displayName": "Grok Build",
+    "available": false,
+    "unavailableReason": "executable '/nonexistent/todex-golden/grok' was not found; install Grok Build from https://x.ai/cli",
+    "profiles": [],
+    "capabilities": {
+      "permissionConfig": {
+        "modes": [
+          "ask"
+        ],
+        "defaultMode": "ask",
+        "supportsPlan": false,
+        "sandboxModes": [],
+        "approvalPolicies": [],
+        "permissionProfiles": [],
+        "enforcement": "unsupported",
+        "description": "This provider does not expose sandbox or approval overrides through its active protocol."
+      },
+      "nativeFork": true,
+      "nativeCompact": false,
+      "nativeResume": true,
+      "cancel": true,
+      "permissions": true,
+      "toolEvents": true,
+      "nativeSkills": true,
+      "nativeMcp": true,
+      "managedMcp": false,
+      "modelSelection": true,
+      "imageInput": true,
+      "imageInputMode": "always",
+      "controlActions": [
+        "steer",
+        "cancel",
+        "interrupt",
+        "followUp",
+        "retry",
+        "fork"
+      ],
+      "steering": true,
+      "liveConfiguration": true,
+      "followUpQueue": false,
+      "backendQueue": true
+    },
+    "models": []
+  },
+  {
+    "id": "devin",
+    "displayName": "Devin",
+    "available": false,
+    "unavailableReason": "executable '/nonexistent/todex-golden/devin' was not found; install Devin CLI from https://devin.ai",
+    "profiles": [],
+    "capabilities": {
+      "permissionConfig": {
+        "modes": [
+          "ask",
+          "full-access"
+        ],
+        "defaultMode": "ask",
+        "supportsPlan": true,
+        "sandboxModes": [],
+        "approvalPolicies": [],
+        "permissionProfiles": [],
+        "enforcement": "agent-policy",
+        "description": "Devin session modes over ACP: manual approval (accept-edits) / bypass, plus plan work mode; enforced by the agent, not an operating-system sandbox"
+      },
+      "nativeFork": false,
+      "nativeCompact": false,
+      "nativeResume": true,
+      "cancel": true,
+      "permissions": true,
+      "toolEvents": true,
+      "nativeSkills": true,
+      "nativeMcp": true,
+      "managedMcp": false,
+      "modelSelection": true,
+      "imageInput": true,
+      "imageInputMode": "always",
+      "controlActions": [
+        "steer",
+        "cancel",
+        "interrupt",
+        "followUp",
+        "retry"
+      ],
+      "steering": true,
+      "liveConfiguration": true,
+      "followUpQueue": false,
+      "backendQueue": true,
+      "runtimeStop": true,
+      "sessionCommands": true,
+      "extensionMessages": true,
+      "extensionUi": [
+        "select",
+        "confirm",
+        "input",
+        "editor",
+        "notify",
+        "setStatus",
+        "setWidget",
+        "setTitle",
+        "set_editor_text"
+      ]
+    },
+    "models": []
+  },
+  {
+    "id": "opencode",
+    "displayName": "OpenCode",
+    "available": false,
+    "unavailableReason": "executable '/nonexistent/todex-golden/opencode' was not found; install OpenCode from https://opencode.ai",
+    "profiles": [],
+    "capabilities": {
+      "permissionConfig": {
+        "modes": [
+          "ask",
+          "auto",
+          "full-access"
+        ],
+        "defaultMode": "ask",
+        "supportsPlan": true,
+        "sandboxModes": [],
+        "approvalPolicies": [],
+        "permissionProfiles": [],
+        "enforcement": "agent-policy",
+        "description": "OpenCode build/plan session modes over ACP; ask mediates each tool approval, auto/full-access approve client-side"
+      },
+      "nativeFork": true,
+      "nativeCompact": false,
+      "nativeResume": true,
+      "cancel": true,
+      "permissions": true,
+      "toolEvents": true,
+      "nativeSkills": true,
+      "nativeMcp": true,
+      "managedMcp": false,
+      "modelSelection": true,
+      "imageInput": true,
+      "imageInputMode": "always",
+      "controlActions": [
+        "steer",
+        "cancel",
+        "interrupt",
+        "followUp",
+        "retry",
+        "fork"
+      ],
+      "steering": true,
+      "liveConfiguration": true,
+      "followUpQueue": false,
+      "backendQueue": true,
+      "runtimeStop": true,
+      "sessionCommands": true,
+      "extensionMessages": true,
+      "extensionUi": [
+        "select",
+        "confirm",
+        "input",
+        "editor",
+        "notify",
+        "setStatus",
+        "setWidget",
+        "setTitle",
+        "set_editor_text"
+      ]
+    },
+    "models": []
+  }
+]

@@ -29,3 +29,5 @@ pub(crate) use types::PermissionOutcome;
 
 #[cfg(test)]
 mod control_tests;
+#[cfg(test)]
+pub(crate) mod golden_support;

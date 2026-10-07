@@ -1,0 +1,237 @@
+{
+  "acp": {
+    "managed": false,
+    "additive": false,
+    "readLive": {
+      "error": "unsupported capability: acp is not an exclusive-mode agent"
+    },
+    "additiveNodes": {
+      "error": "unsupported capability: acp is not an additive-mode agent"
+    },
+    "additiveSelection": {
+      "error": "unsupported capability: acp is not an additive-mode agent"
+    },
+    "firstModel": null,
+    "liveMatchesItself": false,
+    "masked": {
+      "auth": {
+        "OPENAI_API_KEY": "__TODEX_MASKED__"
+      },
+      "config": "model = \"gpt\"\n[model_providers.x.http_headers]\nAuthorization = \"Bearer t\"\n",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "__TODEX_MASKED__",
+        "ANTHROPIC_MODEL": "m"
+      },
+      "options": {
+        "apiKey": "__TODEX_MASKED__",
+        "baseURL": "https://example.test"
+      },
+      "models": {
+        "model-a": {
+          "name": "A"
+        }
+      }
+    },
+    "tomlHeaderTables": null
+  },
+  "codex": {
+    "managed": true,
+    "additive": false,
+    "readLive": null,
+    "additiveNodes": {
+      "error": "unsupported capability: codex is not an additive-mode agent"
+    },
+    "additiveSelection": {
+      "error": "unsupported capability: codex is not an additive-mode agent"
+    },
+    "firstModel": null,
+    "liveMatchesItself": true,
+    "masked": {
+      "auth": {
+        "OPENAI_API_KEY": "__TODEX_MASKED__"
+      },
+      "config": "model = \"gpt\"\n[model_providers.x.http_headers]\nAuthorization = \"__TODEX_MASKED__\"\n",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "__TODEX_MASKED__",
+        "ANTHROPIC_MODEL": "m"
+      },
+      "options": {
+        "apiKey": "__TODEX_MASKED__",
+        "baseURL": "https://example.test"
+      },
+      "models": {
+        "model-a": {
+          "name": "A"
+        }
+      }
+    },
+    "tomlHeaderTables": [
+      "http_headers"
+    ]
+  },
+  "pi": {
+    "managed": true,
+    "additive": true,
+    "readLive": {
+      "error": "unsupported capability: pi is not an exclusive-mode agent"
+    },
+    "additiveNodes": {},
+    "additiveSelection": null,
+    "firstModel": null,
+    "liveMatchesItself": false,
+    "masked": {
+      "auth": {
+        "OPENAI_API_KEY": "__TODEX_MASKED__"
+      },
+      "config": "model = \"gpt\"\n[model_providers.x.http_headers]\nAuthorization = \"Bearer t\"\n",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "__TODEX_MASKED__",
+        "ANTHROPIC_MODEL": "m"
+      },
+      "options": {
+        "apiKey": "__TODEX_MASKED__",
+        "baseURL": "https://example.test"
+      },
+      "models": {
+        "model-a": {
+          "name": "A"
+        }
+      }
+    },
+    "tomlHeaderTables": null
+  },
+  "claude-code": {
+    "managed": true,
+    "additive": false,
+    "readLive": null,
+    "additiveNodes": {
+      "error": "unsupported capability: claude-code is not an additive-mode agent"
+    },
+    "additiveSelection": {
+      "error": "unsupported capability: claude-code is not an additive-mode agent"
+    },
+    "firstModel": null,
+    "liveMatchesItself": true,
+    "masked": {
+      "auth": {
+        "OPENAI_API_KEY": "__TODEX_MASKED__"
+      },
+      "config": "model = \"gpt\"\n[model_providers.x.http_headers]\nAuthorization = \"Bearer t\"\n",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "__TODEX_MASKED__",
+        "ANTHROPIC_MODEL": "m"
+      },
+      "options": {
+        "apiKey": "__TODEX_MASKED__",
+        "baseURL": "https://example.test"
+      },
+      "models": {
+        "model-a": {
+          "name": "A"
+        }
+      }
+    },
+    "tomlHeaderTables": null
+  },
+  "grok-build": {
+    "managed": true,
+    "additive": false,
+    "readLive": null,
+    "additiveNodes": {
+      "error": "unsupported capability: grok-build is not an additive-mode agent"
+    },
+    "additiveSelection": {
+      "error": "unsupported capability: grok-build is not an additive-mode agent"
+    },
+    "firstModel": null,
+    "liveMatchesItself": true,
+    "masked": {
+      "auth": {
+        "OPENAI_API_KEY": "__TODEX_MASKED__"
+      },
+      "config": "model = \"gpt\"\n[model_providers.x.http_headers]\nAuthorization = \"__TODEX_MASKED__\"\n",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "__TODEX_MASKED__",
+        "ANTHROPIC_MODEL": "m"
+      },
+      "options": {
+        "apiKey": "__TODEX_MASKED__",
+        "baseURL": "https://example.test"
+      },
+      "models": {
+        "model-a": {
+          "name": "A"
+        }
+      }
+    },
+    "tomlHeaderTables": [
+      "extra_headers"
+    ]
+  },
+  "devin": {
+    "managed": false,
+    "additive": false,
+    "readLive": {
+      "error": "unsupported capability: devin is not an exclusive-mode agent"
+    },
+    "additiveNodes": {
+      "error": "unsupported capability: devin is not an additive-mode agent"
+    },
+    "additiveSelection": {
+      "error": "unsupported capability: devin is not an additive-mode agent"
+    },
+    "firstModel": null,
+    "liveMatchesItself": false,
+    "masked": {
+      "auth": {
+        "OPENAI_API_KEY": "__TODEX_MASKED__"
+      },
+      "config": "model = \"gpt\"\n[model_providers.x.http_headers]\nAuthorization = \"Bearer t\"\n",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "__TODEX_MASKED__",
+        "ANTHROPIC_MODEL": "m"
+      },
+      "options": {
+        "apiKey": "__TODEX_MASKED__",
+        "baseURL": "https://example.test"
+      },
+      "models": {
+        "model-a": {
+          "name": "A"
+        }
+      }
+    },
+    "tomlHeaderTables": null
+  },
+  "opencode": {
+    "managed": true,
+    "additive": true,
+    "readLive": {
+      "error": "unsupported capability: opencode is not an exclusive-mode agent"
+    },
+    "additiveNodes": {},
+    "additiveSelection": null,
+    "firstModel": "model-a",
+    "liveMatchesItself": false,
+    "masked": {
+      "auth": {
+        "OPENAI_API_KEY": "__TODEX_MASKED__"
+      },
+      "config": "model = \"gpt\"\n[model_providers.x.http_headers]\nAuthorization = \"Bearer t\"\n",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "__TODEX_MASKED__",
+        "ANTHROPIC_MODEL": "m"
+      },
+      "options": {
+        "apiKey": "__TODEX_MASKED__",
+        "baseURL": "https://example.test"
+      },
+      "models": {
+        "model-a": {
+          "name": "A"
+        }
+      }
+    },
+    "tomlHeaderTables": null
+  }
+}

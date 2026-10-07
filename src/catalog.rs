@@ -1131,6 +1131,8 @@ fn read_limited_text(path: &Path, max_bytes: u64) -> Result<String, AppError> {
 mod tests {
     use std::fs;
 
+    use serde_json::json;
+
     use super::*;
     use crate::config::{AgentConfig, PairingEncryption, SecurityConfig};
 
@@ -1232,6 +1234,145 @@ mod tests {
 
         assert_eq!(fs::read(user_skill).unwrap(), before_user);
         assert_eq!(fs::read(project_skill).unwrap(), before_project);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Where each provider's skills and MCP servers are read from, frozen
+    /// across the move to `ProviderProfile`.
+    #[tokio::test]
+    async fn provider_catalog_sources_match_golden() {
+        let root = temp_dir("todex-catalog-golden");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        // One distinct server in every MCP config file any provider reads.
+        let json_files = [
+            ".claude.json",
+            ".claude/settings.json",
+            ".pi/agent/mcp.json",
+            ".pi/agent/settings.json",
+            ".config/devin/mcp_config.json",
+            ".config/devin/mcp_config.local.json",
+        ];
+        let project_json = [
+            ".mcp.json",
+            ".claude/settings.json",
+            ".pi/mcp.json",
+            ".devin/mcp_config.json",
+            ".devin/mcp_config.local.json",
+        ];
+        let write_json = |path: PathBuf, name: &str| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                format!(r#"{{"mcpServers":{{"{name}":{{"command":"tool"}}}}}}"#),
+            )
+            .unwrap();
+        };
+        for file in json_files {
+            write_json(home.join(file), &format!("user:{file}"));
+        }
+        for file in project_json {
+            write_json(workspace.join(file), &format!("project:{file}"));
+        }
+        let write_toml = |path: PathBuf, name: &str| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                format!("[mcp_servers.\"{name}\"]\ncommand = \"tool\"\n"),
+            )
+            .unwrap();
+        };
+        write_toml(home.join(".codex/config.toml"), "user:codex");
+        write_toml(workspace.join(".codex/config.toml"), "project:codex");
+
+        // Provider homes may be redirected by the environment; record the
+        // default spelling either way so the snapshot is host independent.
+        let redirects: Vec<(PathBuf, &str)> = [
+            ("CODEX_HOME", "~/.codex"),
+            ("PI_CODING_AGENT_DIR", "~/.pi/agent"),
+            ("GROK_HOME", "~/.grok"),
+        ]
+        .into_iter()
+        .filter_map(|(name, default)| {
+            std::env::var_os(name).map(|value| (PathBuf::from(value), default))
+        })
+        .collect();
+        let normalize = |path: &Path| -> String {
+            for (redirect, default) in &redirects {
+                if let Ok(rest) = path.strip_prefix(redirect) {
+                    return Path::new(default).join(rest).display().to_string();
+                }
+            }
+            if let Ok(rest) = path.strip_prefix(&workspace) {
+                return Path::new("<workspace>").join(rest).display().to_string();
+            }
+            if let Ok(rest) = path.strip_prefix(&home) {
+                return Path::new("~").join(rest).display().to_string();
+            }
+            path.display().to_string()
+        };
+        let roots = |roots: Vec<SourceRoot>| -> Value {
+            let mut roots = roots
+                .into_iter()
+                .map(|root| {
+                    json!({
+                        "path": normalize(&root.path),
+                        "scope": root.scope,
+                        "source": root.source,
+                        "priority": root.priority,
+                    })
+                })
+                .collect::<Vec<_>>();
+            roots.sort_by_key(|root| root.to_string());
+            Value::Array(roots)
+        };
+
+        let mut config = test_config(root.join("data"), workspace_root);
+        config.agent.grok_bin = "/nonexistent/todex-golden/grok".to_owned();
+        let service = CatalogService::with_home(Arc::new(config), Some(home.clone()));
+        let outcome = |result: Result<Value, AppError>| {
+            result.unwrap_or_else(|error| json!({ "error": error.to_string() }))
+        };
+        let mut snapshot = serde_json::Map::new();
+        for provider in ProviderKind::ALL {
+            let mcp = service
+                .mcp(provider, workspace.clone())
+                .await
+                .map(|catalog| {
+                    json!(catalog
+                        .servers
+                        .iter()
+                        .map(|server| json!({
+                            "name": server.name,
+                            "source": server.source,
+                            "scope": server.scope,
+                            "active": server.active,
+                        }))
+                        .collect::<Vec<_>>())
+                });
+            let skills = service
+                .skills(provider, workspace.clone())
+                .await
+                .map(|catalog| json!(catalog.skills.len()));
+            let target = service
+                .mcp_target(provider, workspace.clone(), "missing")
+                .await
+                .map(|_| json!("found"));
+            snapshot.insert(
+                provider.as_str().to_owned(),
+                json!({
+                    "skillRoots": roots(skill_roots(Some(&home), &workspace, provider)),
+                    "mcpSources": roots(mcp_sources(Some(&home), &workspace, provider)),
+                    "skills": outcome(skills),
+                    "mcp": outcome(mcp),
+                    "mcpTarget": outcome(target),
+                }),
+            );
+        }
+        crate::provider::golden_support::assert_golden("catalog_sources", &Value::Object(snapshot));
         let _ = fs::remove_dir_all(root);
     }
 

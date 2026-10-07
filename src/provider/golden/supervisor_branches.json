@@ -1,0 +1,98 @@
+{
+  "acp": {
+    "recoveryIsSettled": true,
+    "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
+    "attachedFileText": "Attached file: @notes.txt",
+    "attachedFileItems": 1,
+    "typedImages": true,
+    "profileExplicit": "golden",
+    "profileOmitted": "golden",
+    "runsAcpProfileCli": true,
+    "runsOwnCli": true,
+    "runsOtherCli": false
+  },
+  "codex": {
+    "recoveryIsSettled": true,
+    "promptWithSkills": "do it",
+    "attachedFileText": "",
+    "attachedFileItems": 1,
+    "typedImages": true,
+    "profileExplicit": {
+      "error": "invalid request: providerProfile is only valid for ACP conversations"
+    },
+    "profileOmitted": null,
+    "runsAcpProfileCli": true,
+    "runsOwnCli": true,
+    "runsOtherCli": false
+  },
+  "pi": {
+    "recoveryIsSettled": false,
+    "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
+    "attachedFileText": "Attached file: @notes.txt",
+    "attachedFileItems": 1,
+    "typedImages": true,
+    "profileExplicit": {
+      "error": "invalid request: providerProfile is only valid for ACP conversations"
+    },
+    "profileOmitted": null,
+    "runsAcpProfileCli": false,
+    "runsOwnCli": true,
+    "runsOtherCli": false
+  },
+  "claude-code": {
+    "recoveryIsSettled": true,
+    "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
+    "attachedFileText": "Attached file: @notes.txt",
+    "attachedFileItems": 1,
+    "typedImages": true,
+    "profileExplicit": {
+      "error": "invalid request: providerProfile is only valid for ACP conversations"
+    },
+    "profileOmitted": null,
+    "runsAcpProfileCli": false,
+    "runsOwnCli": true,
+    "runsOtherCli": false
+  },
+  "grok-build": {
+    "recoveryIsSettled": true,
+    "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
+    "attachedFileText": "Attached file: @notes.txt",
+    "attachedFileItems": 1,
+    "typedImages": true,
+    "profileExplicit": {
+      "error": "invalid request: providerProfile is only valid for ACP conversations"
+    },
+    "profileOmitted": null,
+    "runsAcpProfileCli": false,
+    "runsOwnCli": true,
+    "runsOtherCli": false
+  },
+  "devin": {
+    "recoveryIsSettled": true,
+    "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
+    "attachedFileText": "Attached file: @notes.txt",
+    "attachedFileItems": 1,
+    "typedImages": true,
+    "profileExplicit": {
+      "error": "invalid request: providerProfile is only valid for ACP conversations"
+    },
+    "profileOmitted": null,
+    "runsAcpProfileCli": false,
+    "runsOwnCli": true,
+    "runsOtherCli": false
+  },
+  "opencode": {
+    "recoveryIsSettled": true,
+    "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
+    "attachedFileText": "Attached file: @notes.txt",
+    "attachedFileItems": 1,
+    "typedImages": true,
+    "profileExplicit": {
+      "error": "invalid request: providerProfile is only valid for ACP conversations"
+    },
+    "profileOmitted": null,
+    "runsAcpProfileCli": false,
+    "runsOwnCli": true,
+    "runsOtherCli": false
+  }
+}

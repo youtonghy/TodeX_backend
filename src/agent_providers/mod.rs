@@ -1129,6 +1129,47 @@ mod tests {
             .expect("service")
     }
 
+    /// How each agent's native config is projected (exclusive vs additive),
+    /// frozen across the move to a projection table.
+    #[test]
+    fn config_projection_dispatch_matches_golden() {
+        let root = TestRoot::new();
+        let dirs = dirs_in(root.path());
+        let root_text = root.path().display().to_string();
+        let outcome = |result: Result<Value, AppError>| {
+            let value = result.unwrap_or_else(|error| json!({ "error": error.to_string() }));
+            serde_json::from_str::<Value>(&value.to_string().replace(&root_text, "<root>")).unwrap()
+        };
+        let sample = json!({
+            "auth": {"OPENAI_API_KEY": "sk-sample"},
+            "config": "model = \"gpt\"\n[model_providers.x.http_headers]\nAuthorization = \"Bearer t\"\n",
+            "env": {"ANTHROPIC_AUTH_TOKEN": "token", "ANTHROPIC_MODEL": "m"},
+            "options": {"apiKey": "key", "baseURL": "https://example.test"},
+            "models": {"model-a": {"name": "A"}},
+        });
+        let mut snapshot = Map::new();
+        for agent in ProviderKind::ALL {
+            snapshot.insert(
+                agent.as_str().to_owned(),
+                json!({
+                    "managed": supported_agent(agent.as_str()).is_ok(),
+                    "additive": is_additive(agent),
+                    "readLive": outcome(read_live(&dirs, agent).map(|live| json!(live))),
+                    "additiveNodes": outcome(additive_nodes(&dirs, agent).map(Value::Object)),
+                    "additiveSelection": outcome(additive_selection(&dirs, agent)),
+                    "firstModel": additive_first_model(agent, &sample),
+                    "liveMatchesItself": live_matches(agent, &sample, &sample),
+                    "masked": mask_agent_settings(agent, &sample),
+                    "tomlHeaderTables": toml_header_tables(agent),
+                }),
+            );
+        }
+        crate::provider::golden_support::assert_golden(
+            "agent_config_projection",
+            &Value::Object(snapshot),
+        );
+    }
+
     fn input(name: &str, settings_config: Value) -> AgentProviderInput {
         AgentProviderInput {
             name: name.to_owned(),
