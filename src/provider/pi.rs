@@ -163,8 +163,7 @@ enum PiTurnReply {
     /// The worker stopped before starting this turn. `retry` is false when
     /// the stop was requested, so the turn must not reopen the runtime.
     NotStarted {
-        context: DriverContext,
-        prompt: DriverPrompt,
+        turn: Box<(DriverContext, DriverPrompt)>,
         retry: bool,
     },
 }
@@ -714,19 +713,14 @@ impl ProviderDriver for PiDriver {
                 })?;
             match response.await {
                 Ok(PiTurnReply::Finished(result)) => return result,
-                Ok(PiTurnReply::NotStarted {
-                    context: returned_context,
-                    prompt: returned_prompt,
-                    retry,
-                }) => {
+                Ok(PiTurnReply::NotStarted { turn, retry }) => {
                     // The turn raced the worker's own stop and never reached
                     // Pi, so reopening the session once cannot repeat it.
                     if !retry || retried {
                         return Err(pi_closing_error());
                     }
                     retried = true;
-                    context = returned_context;
-                    prompt = returned_prompt;
+                    (context, prompt) = *turn;
                 }
                 Err(_) => {
                     return Err(AppError::ProviderUnavailable(
@@ -881,6 +875,7 @@ async fn pi_package_declares_resource(package: &Value, package_root: &Path, sour
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pi_session_worker(
     mut process: JsonLineProcess,
     session_sink: DriverEventSink,
@@ -1087,8 +1082,7 @@ async fn pi_session_worker(
     let retry = shutdown.borrow().is_none();
     while let Ok(turn) = turns.try_recv() {
         let _ = turn.result.send(PiTurnReply::NotStarted {
-            context: turn.context,
-            prompt: turn.prompt,
+            turn: Box::new((turn.context, turn.prompt)),
             retry,
         });
     }
@@ -4422,9 +4416,9 @@ mod tests {
             .unwrap()
             .unwrap()
         {
-            PiTurnReply::NotStarted { prompt, retry, .. } => {
+            PiTurnReply::NotStarted { turn, retry } => {
                 assert!(retry);
-                assert_eq!(prompt.turn_id, "queued");
+                assert_eq!(turn.1.turn_id, "queued");
             }
             PiTurnReply::Finished(result) => panic!("queued turn ran: {result:?}"),
         }
