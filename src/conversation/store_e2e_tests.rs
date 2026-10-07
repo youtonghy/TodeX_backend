@@ -716,3 +716,39 @@ async fn a_provider_payload_cannot_pose_as_ciphertext() {
     assert_eq!(replayed.payload["_$enc"], forged["$enc"]);
     e2e.cleanup();
 }
+
+#[tokio::test]
+async fn large_payloads_sealed_on_the_blocking_pool_keep_journal_order() {
+    let e2e = E2e::new("todex-e2e-large", true).await;
+    let id = e2e.create(None).await.id;
+    let hub = ConversationEventHub::default();
+    let mut live = hub.subscribe(&id);
+    // Small and large payloads interleave: both encode paths share one
+    // order, and every record decrypts to what was appended.
+    let payloads: Vec<Value> = (0..6)
+        .map(|index| {
+            let size = if index % 2 == 0 { 16 } else { 200 * 1024 };
+            json!({"turnId": "t1", "index": index, "output": "x".repeat(size)})
+        })
+        .collect();
+    for payload in &payloads {
+        e2e.store
+            .append_and_publish(&id, "tool.updated", payload.clone(), &hub)
+            .await
+            .unwrap();
+    }
+    let keys = e2e.client_keys(&id).await;
+    let (events, frames) = history(&e2e.store, &id, ReplayDetail::Full).await;
+    assert_eq!(events.len(), payloads.len());
+    for (index, (event, payload)) in events.iter().zip(&payloads).enumerate() {
+        assert_eq!(event.sequence, index as u64 + 1);
+        let plain = crate::conversation::e2e_support::decrypt(&keys, event, &frames)
+            .expect("record is sealed");
+        assert_eq!(plain["index"], payload["index"]);
+        assert_eq!(plain["output"], payload["output"]);
+        let published = live.try_recv().unwrap();
+        assert_eq!(published.sequence, event.sequence);
+        assert_eq!(published.payload, event.payload);
+    }
+    e2e.cleanup();
+}

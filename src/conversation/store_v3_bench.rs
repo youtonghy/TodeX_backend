@@ -346,3 +346,106 @@ async fn measure_v3_real_journal_copies() {
         );
     }
 }
+
+fn percentiles(mut samples: Vec<f64>) -> (f64, f64, f64) {
+    samples.sort_by(f64::total_cmp);
+    let at = |fraction: f64| samples[((samples.len() - 1) as f64 * fraction) as usize];
+    (at(0.5), at(0.95), at(1.0))
+}
+
+/// Append and replay hot paths of an encrypted store, run on the
+/// single-threaded test runtime so CPU work left on the async thread shows
+/// up as latency of the other conversation:
+///
+/// - `append`: per-append latency of a mixed history with ~2-11 KiB tool
+///   output (seal, encode, write, fsync, rotations every 128 KiB);
+/// - `replay`: full-history paging of a second conversation (1000-record,
+///   8 MiB pages over sealed plaintext files awaiting conversion);
+/// - `cross`: append latency of the first conversation while the second
+///   is replayed in a loop.
+///
+/// ```text
+/// cargo test --release --locked -- --ignored measure_store_hot_paths --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "opt-in append/replay hot path measurement"]
+async fn measure_store_hot_paths() {
+    let e2e = super::e2e_tests::E2e::new("todex-hot-paths", true).await;
+    let writer = e2e.create(None).await.id;
+    let reader = e2e.create(None).await.id;
+    let mut text = TextGenerator(7);
+    let mut append_ms = Vec::with_capacity(2_000);
+    let start = Instant::now();
+    for index in 0..2_000 {
+        let event = synthetic_event(&writer, index, &mut text);
+        let begin = Instant::now();
+        e2e.store
+            .append(&writer, event.event_type, event.payload)
+            .await
+            .unwrap();
+        append_ms.push(begin.elapsed().as_secs_f64() * 1000.);
+    }
+    let append_total = start.elapsed();
+    let (p50, p95, max) = percentiles(append_ms);
+    eprintln!(
+        "append samples=2000 total_ms={:.1} p50_ms={p50:.3} p95_ms={p95:.3} max_ms={max:.3}",
+        append_total.as_secs_f64() * 1000.
+    );
+    for index in 0..4_000 {
+        let event = synthetic_event(&reader, index, &mut text);
+        e2e.store
+            .append(&reader, event.event_type, event.payload)
+            .await
+            .unwrap();
+    }
+    let replay_all = |store: ConversationStore, id: String| async move {
+        let mut after = 0;
+        let mut pages = 0;
+        loop {
+            let page = store.replay(&id, after, 1_000).await.unwrap();
+            after = page.next_sequence;
+            pages += 1;
+            if !page.has_more {
+                return pages;
+            }
+        }
+    };
+    // Warm the index first; the cold build is measured elsewhere.
+    replay_all(e2e.store.clone(), reader.clone()).await;
+    let start = Instant::now();
+    let mut pages = 0;
+    for _ in 0..5 {
+        pages += replay_all(e2e.store.clone(), reader.clone()).await;
+    }
+    eprintln!(
+        "replay events=4000 rounds=5 pages={pages} total_ms={:.1}",
+        start.elapsed().as_secs_f64() * 1000.
+    );
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let replayer = {
+        let done = done.clone();
+        let store = e2e.store.clone();
+        let reader = reader.clone();
+        tokio::spawn(async move {
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                replay_all(store.clone(), reader.clone()).await;
+            }
+        })
+    };
+    let mut cross_ms = Vec::with_capacity(200);
+    for index in 2_000..2_200 {
+        let event = synthetic_event(&writer, index, &mut text);
+        let begin = Instant::now();
+        e2e.store
+            .append(&writer, event.event_type, event.payload)
+            .await
+            .unwrap();
+        cross_ms.push(begin.elapsed().as_secs_f64() * 1000.);
+        tokio::task::yield_now().await;
+    }
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    replayer.await.unwrap();
+    let (p50, p95, max) = percentiles(cross_ms);
+    eprintln!("cross samples=200 p50_ms={p50:.3} p95_ms={p95:.3} max_ms={max:.3}");
+    e2e.cleanup();
+}

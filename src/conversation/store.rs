@@ -119,6 +119,51 @@ const FRAME_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// Replay indexes kept in memory; the least recently used is rebuilt from
 /// the segment `.idx` files and the active file when needed again.
 const INDEX_CACHE_ENTRIES: usize = 64;
+/// Newest-record caches kept (see [`JournalTail`]); a miss re-reads one
+/// record from the end of the journal.
+const TAIL_CACHE_ENTRIES: usize = 256;
+/// Whole-journal digests kept; a miss rebuilds from the segment `.idx`
+/// files and the plaintext files.
+const DIGEST_CACHE_ENTRIES: usize = 256;
+/// Payloads at least this large are sealed and encoded on the blocking
+/// pool (still under the conversation lock) instead of an async worker.
+const BLOCKING_ENCODE_BYTES: usize = 64 * 1024;
+
+/// A string-keyed LRU. Like the index cache it is only touched under the
+/// conversation lock and the mutex is never held across an await.
+pub(super) struct LruMap<V>(std::sync::Mutex<LruCache<String, V>>);
+
+impl<V> LruMap<V> {
+    fn new(entries: usize) -> Self {
+        Self(std::sync::Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(entries).expect("cache is not empty"),
+        )))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LruCache<String, V>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Runs `access` on the entry (marking it recently used).
+    pub(super) fn with<R>(&self, key: &str, access: impl FnOnce(&mut V) -> R) -> Option<R> {
+        self.lock().get_mut(key).map(access)
+    }
+
+    fn insert(&self, key: &str, value: V) {
+        self.lock().put(key.to_owned(), value);
+    }
+
+    fn remove(&self, key: &str) {
+        self.lock().pop(key);
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.lock().len()
+    }
+}
 
 #[derive(Clone)]
 pub struct ConversationStore {
@@ -127,7 +172,7 @@ pub struct ConversationStore {
     /// Replay indexes, LRU-bounded. Only touched under the conversation
     /// lock and never held across an await.
     indexes: Arc<std::sync::Mutex<LruCache<String, JournalIndex>>>,
-    tails: Arc<DashMap<String, JournalTail>>,
+    tails: Arc<LruMap<JournalTail>>,
     /// Open streaming-text merge window per conversation. Only touched while
     /// the conversation lock is held, so any other write flushes it first and
     /// journal order matches emission order.
@@ -142,7 +187,7 @@ pub struct ConversationStore {
     /// through, then folded forward by every append under the conversation
     /// lock. Like the replay index it is a rebuildable cache keyed by the
     /// journal file fingerprint.
-    digests: Arc<DashMap<String, CachedDigest>>,
+    digests: Arc<LruMap<CachedDigest>>,
     /// Decompressed sealed frames shared by every conversation.
     frames: Arc<FrameCache>,
     /// Conversations whose directory went through crash reconciliation
@@ -447,11 +492,11 @@ impl ConversationStore {
             indexes: Arc::new(std::sync::Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(INDEX_CACHE_ENTRIES).expect("index cache is not empty"),
             ))),
-            tails: Arc::new(DashMap::new()),
+            tails: Arc::new(LruMap::new(TAIL_CACHE_ENTRIES)),
             pending_deltas: Arc::new(DashMap::new()),
             delta_generation: Arc::new(AtomicU64::new(0)),
             manifests: Arc::new(DashMap::new()),
-            digests: Arc::new(DashMap::new()),
+            digests: Arc::new(LruMap::new(DIGEST_CACHE_ENTRIES)),
             frames: Arc::new(FrameCache::new(FRAME_CACHE_BYTES)),
             reconciled: Arc::new(DashMap::new()),
             sealing: Arc::new(DashMap::new()),
@@ -1166,7 +1211,12 @@ impl ConversationStore {
         let directory = self.directory(conversation_id)?;
         let mut manifest = self.get_unlocked(conversation_id).await?;
         let persisted_status = manifest.status;
-        let (last_event, mut terminated) = self.read_last_event(conversation_id).await?;
+        // One directory listing serves the tail check and the write below;
+        // nothing else changes the journal while the lock is held.
+        let mut files = self.files_locked(conversation_id, &directory).await?;
+        let (last_event, mut terminated) = self
+            .read_last_event_in(conversation_id, &directory, &files)
+            .await?;
         let journal_sequence = last_event.as_ref().map_or(0, |event| event.sequence);
         if manifest.last_sequence != journal_sequence {
             // The journal is the commit point, so it wins in both directions.
@@ -1203,7 +1253,6 @@ impl ConversationStore {
         // later replay decodes.
         event.time = truncate_to_micros(event.time);
         let event_path = directory.join(EVENTS_FILE);
-        let mut files = self.files_locked(conversation_id, &directory).await?;
         // A torn final record (a write interrupted before its newline) must
         // be closed before anything else is appended. When it is the active
         // file's tail the separator is prepended to the new line below; when
@@ -1241,11 +1290,11 @@ impl ConversationStore {
                     index.files = files.clone();
                 }
             });
-            if let Some(mut cached) = self.digests.get_mut(conversation_id) {
+            self.digests.with(conversation_id, |cached| {
                 if cached.files == previous {
                     cached.files = files.clone();
                 }
-            }
+            });
             terminated = true;
             self.maintenance.request(conversation_id);
             // Each DEK's records stay inside one sealed file, which is what
@@ -1258,19 +1307,21 @@ impl ConversationStore {
         // rotation, so it uses the new file's key — and the stored form
         // (envelope plus `$enc`) is what is journalled, published and
         // folded into the digest.
-        let event = match self.record_key(conversation_id).await? {
-            Some((kid, key, fingerprint)) => {
-                add_history_macs(&event.event_type, &mut event.payload, &fingerprint);
-                seal_event(&event, &kid, &key)?
-            }
-            None => {
-                // Plaintext from here on: the conversation is no longer
-                // entirely encrypted.
-                manifest.history_encrypted_at = None;
-                event
-            }
+        let key = self.record_key(conversation_id).await?;
+        if key.is_none() {
+            // Plaintext from here on: the conversation is no longer
+            // entirely encrypted.
+            manifest.history_encrypted_at = None;
+        }
+        // Large payloads are sealed and encoded on the blocking pool; the
+        // conversation lock is still held, so journal order is unchanged.
+        let (event, record) = if bounded.bytes >= BLOCKING_ENCODE_BYTES {
+            tokio::task::spawn_blocking(move || stored_record(event, key))
+                .await
+                .map_err(blocking_error)??
+        } else {
+            stored_record(event, key)?
         };
-        let record = encode_record(&event)?;
         // `create` normally made the journal and rotation always creates the
         // fresh active file; only here does a missing one get created, and
         // only then do its permissions and directory entry need work.
@@ -1294,19 +1345,13 @@ impl ConversationStore {
         line.extend_from_slice(&record);
         line.push(b'\n');
         let pre_write_files = files.clone();
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&event_path)
-            .await?;
-        if created {
-            set_owner_only(&event_path, false).await?;
-            sync_directory(&directory).await?;
-        }
-        file.write_all(&line).await?;
-        file.flush().await?;
-        file.sync_data().await?;
-        let metadata = file.metadata().await?;
+        let write_directory = directory.clone();
+        let (line, metadata) = tokio::task::spawn_blocking(move || {
+            append_journal_line(&write_directory, &event_path, created, &line)
+                .map(|metadata| (line, metadata))
+        })
+        .await
+        .map_err(blocking_error)??;
         let last = files.last_mut().expect("active segment is present");
         last.bytes = metadata.len();
         last.modified = metadata.modified().ok();
@@ -1324,20 +1369,22 @@ impl ConversationStore {
         // A digest that described the journal up to this record stays exact
         // by folding the record in; any other is stale and dropped, so the
         // next query rebuilds it.
-        let digest_current = match self.digests.get_mut(conversation_id) {
-            Some(mut cached) if cached.files == pre_write_files => {
+        let digest_current = self
+            .digests
+            .with(conversation_id, |cached| {
+                if cached.files != pre_write_files {
+                    return false;
+                }
                 cached.digest.apply(&event);
                 cached.files = files;
                 true
-            }
-            Some(_) => false,
-            None => true,
-        };
+            })
+            .unwrap_or(true);
         if !digest_current {
             self.digests.remove(conversation_id);
         }
         self.tails.insert(
-            conversation_id.to_owned(),
+            conversation_id,
             JournalTail {
                 name: EVENTS_FILE.to_owned(),
                 bytes: metadata.len(),
@@ -1510,11 +1557,7 @@ impl ConversationStore {
     ) -> Result<R, AppError> {
         let _guard = self.lock(conversation_id).await;
         self.flush_pending_delta_logged(conversation_id).await;
-        self.ensure_digest_locked(conversation_id).await?;
-        Ok(match self.digests.get(conversation_id) {
-            Some(cached) => read(&cached.digest),
-            None => read(&JournalDigest::default()),
-        })
+        self.ensure_digest_locked(conversation_id, read).await
     }
 
     /// Point read of the event with `sequence` through the replay index;
@@ -1544,20 +1587,31 @@ impl ConversationStore {
     /// replay, bounded by one page of events in memory — and restarts when
     /// a repair changed the journal mid-build. An absent journal has the
     /// empty digest and caches nothing. Callers hold the conversation lock.
-    async fn ensure_digest_locked(&self, conversation_id: &str) -> Result<(), AppError> {
+    async fn ensure_digest_locked<R>(
+        &self,
+        conversation_id: &str,
+        read: impl FnOnce(&JournalDigest) -> R,
+    ) -> Result<R, AppError> {
         let directory = self.directory(conversation_id)?;
         let files = self.files_locked(conversation_id, &directory).await?;
         if files.is_empty() {
             self.digests.remove(conversation_id);
-            return Ok(());
+            return Ok(read(&JournalDigest::default()));
         }
-        if self
+        // `read` runs on the entry it found or built: the bounded cache may
+        // evict it again before a later lookup.
+        let mut read = Some(read);
+        if let Some(result) = self
             .digests
-            .get(conversation_id)
-            .is_some_and(|cached| cached.files == files)
+            .with(conversation_id, |cached| {
+                (cached.files == files)
+                    .then(|| read.take().expect("read runs once")(&cached.digest))
+            })
+            .flatten()
         {
-            return Ok(());
+            return Ok(result);
         }
+        let read = read.expect("read has not run");
         self.digests.remove(conversation_id);
         let index_files =
             |store: &Self| store.index_get(conversation_id, |index| index.files.clone());
@@ -1633,14 +1687,15 @@ impl ConversationStore {
                 }
             }
             if complete && index_files(self).as_ref() == Some(&start_files) {
+                let result = read(&digest);
                 self.digests.insert(
-                    conversation_id.to_owned(),
+                    conversation_id,
                     CachedDigest {
                         files: start_files,
                         digest,
                     },
                 );
-                return Ok(());
+                return Ok(result);
             }
         }
         Err(AppError::Conflict(format!(
@@ -1850,7 +1905,7 @@ impl ConversationStore {
         };
         if let Some((file, event)) = last {
             self.tails.insert(
-                conversation_id.to_owned(),
+                conversation_id,
                 JournalTail {
                     name: files[file].name.clone(),
                     bytes: files[file].bytes,
@@ -2094,20 +2149,16 @@ impl ConversationStore {
         if lo == hi {
             return Ok((Vec::new(), complete));
         }
-        let start = offsets[lo].0;
-        let end = offsets[hi - 1].1;
-        let mut file = tokio::fs::File::open(directory.join(name)).await?;
-        file.seek(std::io::SeekFrom::Start(start)).await?;
-        let mut page = vec![0u8; (end - start) as usize];
-        file.read_exact(&mut page).await?;
-        let mut events = Vec::with_capacity(hi - lo);
-        for (index, (start_offset, end_offset)) in offsets[lo..hi].iter().enumerate() {
-            let line =
-                trim_ascii(&page[(start_offset - start) as usize..(end_offset - start) as usize]);
-            let event = decode_journal_record(line, conversation_id)?;
-            validate_event(&event, conversation_id, first + (lo + index) as u64)?;
-            events.push(event);
-        }
+        // Reading and decoding a page (up to the page budget) is blocking
+        // work; the caller still holds the conversation lock.
+        let path = directory.join(name);
+        let offsets = offsets[lo..hi].to_vec();
+        let id = conversation_id.to_owned();
+        let events = tokio::task::spawn_blocking(move || {
+            read_plain_records(&path, &offsets, &id, first + lo as u64)
+        })
+        .await
+        .map_err(blocking_error)??;
         Ok((events, complete))
     }
 
@@ -2323,15 +2374,15 @@ impl ConversationStore {
         let _guard = self.lock(conversation_id).await;
         self.flush_pending_delta_logged(conversation_id).await;
         let mut manifest = self.get_unlocked(conversation_id).await?;
-        self.ensure_digest_locked(conversation_id).await?;
-        let (last_sequence, last_time, mut status) = match self.digests.get(conversation_id) {
-            Some(cached) => (
-                cached.digest.last_sequence(),
-                cached.digest.last_time(),
-                cached.digest.status_from(super::ConversationStatus::Idle),
-            ),
-            None => (0, None, super::ConversationStatus::Idle),
-        };
+        let (last_sequence, last_time, mut status) = self
+            .ensure_digest_locked(conversation_id, |digest| {
+                (
+                    digest.last_sequence(),
+                    digest.last_time(),
+                    digest.status_from(super::ConversationStatus::Idle),
+                )
+            })
+            .await?;
         if status == super::ConversationStatus::Running
             || status == super::ConversationStatus::WaitingPermission
         {
@@ -2603,7 +2654,7 @@ impl ConversationStore {
             match tail {
                 Some((file, event)) => {
                     self.tails.insert(
-                        conversation_id.to_owned(),
+                        conversation_id,
                         JournalTail {
                             name: files[file].name.clone(),
                             bytes: files[file].bytes,
@@ -2809,20 +2860,33 @@ impl ConversationStore {
     ) -> Result<(Option<ConversationEvent>, bool), AppError> {
         let directory = self.directory(conversation_id)?;
         let files = self.files_locked(conversation_id, &directory).await?;
+        self.read_last_event_in(conversation_id, &directory, &files)
+            .await
+    }
+
+    /// [`Self::read_last_event`] for a file listing the caller just took
+    /// under the conversation lock.
+    async fn read_last_event_in(
+        &self,
+        conversation_id: &str,
+        directory: &Path,
+        files: &[JournalFile],
+    ) -> Result<(Option<ConversationEvent>, bool), AppError> {
         let Some(last) = files.iter().rev().find(|file| file.bytes > 0) else {
             return Ok((None, true));
         };
         // Every writer that fills the tail cache leaves its file
         // newline-terminated (appends, recovery, the cold scan).
-        if let Some(tail) = self.tails.get(conversation_id) {
-            if tail.name == last.name && tail.bytes == last.bytes && tail.modified == last.modified
-            {
-                return Ok((Some(tail.event.clone()), true));
-            }
+        let cached = self.tails.with(conversation_id, |tail| {
+            (tail.name == last.name && tail.bytes == last.bytes && tail.modified == last.modified)
+                .then(|| tail.event.clone())
+        });
+        if let Some(event) = cached.flatten() {
+            return Ok((Some(event), true));
         }
         if last.is_sealed_segment() {
             let number = last.number().unwrap_or_default();
-            let path = directory.clone();
+            let path = directory.to_owned();
             let cache = self.frames.clone();
             let id = conversation_id.to_owned();
             let event = tokio::task::spawn_blocking(move || {
@@ -2834,7 +2898,7 @@ impl ConversationStore {
             .map_err(blocking_error)?
             .map_err(|error| segment_error(conversation_id, number, error))?;
             self.tails.insert(
-                conversation_id.to_owned(),
+                conversation_id,
                 JournalTail {
                     name: last.name.clone(),
                     bytes: last.bytes,
@@ -3129,13 +3193,13 @@ impl ConversationStore {
         if updated != Some(true) {
             self.index_remove(conversation_id);
         }
-        if let Some(mut cached) = self.digests.get_mut(conversation_id) {
+        self.digests.with(conversation_id, |cached| {
             // Slimming keeps every sequence and the digest is computed from
             // the original records, so it still describes the journal.
             if cached.files == files {
                 cached.files = new_files.clone();
             }
-        }
+        });
         tracing::info!(
             conversation_id,
             segment = number,
@@ -3255,11 +3319,11 @@ impl ConversationStore {
                 index.files = files.clone();
             }
         });
-        if let Some(mut cached) = self.digests.get_mut(conversation_id) {
+        self.digests.with(conversation_id, |cached| {
             if cached.files == previous {
                 cached.files = files.clone();
             }
-        }
+        });
         self.tails.remove(conversation_id);
         if let Some(keys) = &self.history {
             keys.deks().rotate(conversation_id).await;
@@ -4336,6 +4400,78 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
     value
 }
 
+/// Reads the contiguous plaintext records at `offsets` (the first holding
+/// sequence `first`) with one read and decodes and validates them.
+fn read_plain_records(
+    path: &Path,
+    offsets: &[(u64, u64)],
+    conversation_id: &str,
+    first: u64,
+) -> Result<Vec<ConversationEvent>, AppError> {
+    use std::io::{Read as _, Seek as _};
+    let (Some(&(start, _)), Some(&(_, end))) = (offsets.first(), offsets.last()) else {
+        return Ok(Vec::new());
+    };
+    let mut file = std::fs::File::open(path)?;
+    file.seek(std::io::SeekFrom::Start(start))?;
+    let mut page = vec![0u8; (end - start) as usize];
+    file.read_exact(&mut page)?;
+    let mut events = Vec::with_capacity(offsets.len());
+    for (index, (start_offset, end_offset)) in offsets.iter().enumerate() {
+        let line =
+            trim_ascii(&page[(start_offset - start) as usize..(end_offset - start) as usize]);
+        let event = decode_journal_record(line, conversation_id)?;
+        validate_event(&event, conversation_id, first + index as u64)?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// The stored form of a new record and its journal line: with a record key
+/// the payload gets its MACs and is sealed. CPU only; large payloads run it
+/// on the blocking pool.
+fn stored_record(
+    mut event: ConversationEvent,
+    key: Option<(String, Arc<SegmentKey>, Arc<FingerprintKey>)>,
+) -> Result<(ConversationEvent, Vec<u8>), AppError> {
+    let event = match key {
+        Some((kid, key, fingerprint)) => {
+            add_history_macs(&event.event_type, &mut event.payload, &fingerprint);
+            seal_event(&event, &kid, &key)?
+        }
+        None => event,
+    };
+    let record = encode_record(&event)?;
+    Ok((event, record))
+}
+
+/// Appends `line` to the active journal file and syncs it, in one blocking
+/// call. A file this append creates is made owner-only and its directory
+/// entry synced before the record is written. Returns the file's metadata
+/// after the write.
+fn append_journal_line(
+    directory: &Path,
+    path: &Path,
+    created: bool,
+    line: &[u8],
+) -> std::io::Result<std::fs::Metadata> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if created {
+        crate::secure_fs::set_owner_only(path, false)?;
+        #[cfg(unix)]
+        std::fs::File::open(directory)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    file.write_all(line)?;
+    file.sync_data()?;
+    file.metadata()
+}
+
 async fn sync_directory(path: &Path) -> Result<(), AppError> {
     #[cfg(unix)]
     {
@@ -5075,7 +5211,7 @@ mod tests {
             );
             assert_eq!(index.total(), 120);
         }
-        assert_eq!(store.tails.get(&id).unwrap().event.sequence, 120);
+        assert_eq!(store.tails.with(&id, |tail| tail.event.sequence), Some(120));
 
         let before = store.replay_before(&id, 50, 20).await.unwrap();
         assert_eq!(sequences(&before), (31..=50).collect::<Vec<_>>());
@@ -6089,7 +6225,7 @@ mod tests {
         let directory = root.join("conversations").join(&id);
         assert!(journal_files(&directory).await.unwrap().len() > 2);
         // Appends (rotation included) kept the cached digest current.
-        assert!(store.digests.contains_key(&id));
+        assert!(store.digests.with(&id, |_| ()).is_some());
         let live = store.digest(&id, Clone::clone).await.unwrap();
         let history = store.complete_history(&id).await.unwrap();
         assert_matches_reference(&live, &history);

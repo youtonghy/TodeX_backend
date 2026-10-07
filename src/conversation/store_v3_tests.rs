@@ -671,6 +671,51 @@ async fn forks_stream_sealed_history_into_new_segments() {
 }
 
 #[tokio::test]
+async fn tail_and_digest_caches_are_bounded_and_rebuild_on_demand() {
+    let root = temp_dir("todex-v3-tail-lru");
+    let store = ConversationStore::new(root.clone()).await.unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..TAIL_CACHE_ENTRIES.max(DIGEST_CACHE_ENTRIES) + 3 {
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(&manifest.id, "turn.started", json!({"turnId": "t"}))
+            .await
+            .unwrap();
+        store
+            .digest(&manifest.id, |digest| digest.last_sequence())
+            .await
+            .unwrap();
+        ids.push(manifest.id);
+    }
+    assert_eq!(store.tails.len(), TAIL_CACHE_ENTRIES);
+    assert_eq!(store.digests.len(), DIGEST_CACHE_ENTRIES);
+    assert!(store.tails.with(&ids[0], |_| ()).is_none());
+    assert!(store.digests.with(&ids[0], |_| ()).is_none());
+    // An evicted conversation re-reads its tail and rebuilds its digest.
+    let appended = store
+        .append(&ids[0], "turn.completed", json!({"turnId": "t"}))
+        .await
+        .unwrap();
+    assert_eq!(appended.sequence, 2);
+    assert_eq!(
+        store
+            .digest(&ids[0], |digest| digest.last_sequence())
+            .await
+            .unwrap(),
+        2
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn evicted_indexes_rebuild_on_demand() {
     let root = temp_dir("todex-v3-lru");
     let store = ConversationStore::new(root.clone()).await.unwrap();
