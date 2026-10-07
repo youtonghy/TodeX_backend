@@ -2521,6 +2521,15 @@ impl WsSubscriptions {
         }
     }
 
+    /// A client that declared `historyEncryption=1`, as every current
+    /// client does.
+    #[cfg(test)]
+    fn declared() -> Self {
+        let mut subscriptions = Self::new();
+        subscriptions.history_encryption = true;
+        subscriptions
+    }
+
     fn abort_all(self) {
         for task in self.tasks.into_values() {
             task.handle.abort();
@@ -3914,7 +3923,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             host: "127.0.0.1".into(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -4169,7 +4178,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -4388,7 +4397,10 @@ mod tests {
             .oneshot(signed_request(
                 &device,
                 "GET",
-                &format!("/v2/conversations/{}/events", created.id),
+                &format!(
+                    "/v2/conversations/{}/events?historyEncryption=1",
+                    created.id
+                ),
                 "",
             ))
             .await
@@ -4408,7 +4420,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -4469,7 +4481,7 @@ mod tests {
                 &device,
                 "GET",
                 &format!(
-                    "/v2/conversations/{}/events?beforeSequence=8&limit=3",
+                    "/v2/conversations/{}/events?historyEncryption=1&beforeSequence=8&limit=3",
                     manifest.id
                 ),
                 "",
@@ -4491,7 +4503,7 @@ mod tests {
                 &device,
                 "GET",
                 &format!(
-                    "/v2/conversations/{}/events?beforeSequence=5&limit=10",
+                    "/v2/conversations/{}/events?historyEncryption=1&beforeSequence=5&limit=10",
                     manifest.id
                 ),
                 "",
@@ -4517,7 +4529,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let mut state = AppState::new(Config {
+        let mut state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -4579,7 +4591,7 @@ mod tests {
         }
 
         let (outgoing, mut events) = mpsc::channel(16);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         let (replayed, ack) = subscribe_and_collect(
             &state,
             &outgoing,
@@ -4606,7 +4618,7 @@ mod tests {
         subscriptions.abort_all();
 
         let (future_outgoing, mut future_events) = mpsc::channel(16);
-        let mut future_subscriptions = WsSubscriptions::new();
+        let mut future_subscriptions = WsSubscriptions::declared();
         let (replayed, ack) = subscribe_and_collect(
             &state,
             &future_outgoing,
@@ -4675,7 +4687,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let mut state = AppState::new(Config {
+        let mut state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -4744,7 +4756,7 @@ mod tests {
                 .unwrap();
         }
         let (outgoing, mut events) = mpsc::channel(16);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
 
         let (_, invalid) = subscribe_and_collect(
             &state,
@@ -4806,7 +4818,7 @@ mod tests {
 
         // A cap covering the backlog behaves like an uncapped subscription.
         let (outgoing, mut events) = mpsc::channel(16);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         let (replayed, ack) = subscribe_and_collect(
             &state,
             &outgoing,
@@ -4839,7 +4851,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -4898,7 +4910,7 @@ mod tests {
                 .unwrap();
         }
         let uri = format!(
-            "/v2/conversations/{}/events?afterSequence=0&limit=200",
+            "/v2/conversations/{}/events?historyEncryption=1&afterSequence=0&limit=200",
             manifest.id
         );
         let mut request = signed_request(&device, "GET", &uri, "");
@@ -4974,7 +4986,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let mut state = AppState::new(Config {
+        let mut state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -5030,7 +5042,7 @@ mod tests {
             .unwrap();
 
         let (outgoing, mut events) = mpsc::channel(16);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         let event_scope = Arc::new(tokio::sync::RwLock::new(
             websocket::LegacyEventScope::default(),
         ));
@@ -5112,7 +5124,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -5150,7 +5162,7 @@ mod tests {
             .await
             .unwrap();
         let (outgoing, _events) = mpsc::channel(16);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         let event_scope = Arc::new(tokio::sync::RwLock::new(
             websocket::LegacyEventScope::default(),
         ));
@@ -5216,7 +5228,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let mut state = AppState::new(Config {
+        let mut state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -5272,7 +5284,7 @@ mod tests {
             .unwrap();
 
         let (outgoing, _events) = mpsc::channel(16);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         subscriptions
             .active
             .lock()
@@ -5354,7 +5366,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -5574,7 +5586,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -6263,7 +6275,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -6476,7 +6488,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -6807,7 +6819,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -6886,7 +6898,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -7061,7 +7073,7 @@ mod tests {
 
         // Token-less deployments keep the historical local trust model: the
         // handshake succeeds under the synthetic `local` principal.
-        let state = AppState::new(base.clone()).await.unwrap();
+        let state = AppState::new_for_tests(base.clone()).await.unwrap();
         let app = crate::server::loopback_test_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -7090,7 +7102,7 @@ mod tests {
         let mut secured = base;
         secured.security.enable_auth = true;
         let secured_data_dir = secured.data_dir.clone();
-        let state = AppState::new(secured).await.unwrap();
+        let state = AppState::new_for_tests(secured).await.unwrap();
         let device = enroll(&secured_data_dir);
         let other = TestDevice::new(23);
         let app = crate::server::loopback_test_router(state);
@@ -7199,7 +7211,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let mut state = AppState::new(Config {
+        let mut state = AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -7268,7 +7280,7 @@ mod tests {
         // A one-slot queue nobody drains yet: the backfill stalls on its
         // second frame, like a slow peer behind a large journal.
         let (outgoing, mut events) = mpsc::channel(1);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         let event_scope = Arc::new(tokio::sync::RwLock::new(
             websocket::LegacyEventScope::default(),
         ));
@@ -7394,7 +7406,7 @@ mod tests {
     async fn v2_unsubscribe_during_backfill_answers_the_pending_subscribe() {
         let (root, state, _store, hub, manifest) = subscription_fixture("unsub-bg").await;
         let (outgoing, mut events) = mpsc::channel(16);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         let event_scope = Arc::new(tokio::sync::RwLock::new(
             websocket::LegacyEventScope::default(),
         ));
@@ -7460,7 +7472,7 @@ mod tests {
         // A one-slot queue parks the task on its first live frame while the
         // hub overruns the subscription's broadcast ring.
         let (outgoing, mut events) = mpsc::channel(1);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         let (_, ack) = subscribe_and_collect(
             &state,
             &outgoing,
@@ -7513,7 +7525,7 @@ mod tests {
         let (root, state, store, hub, manifest) = subscription_fixture("backfill-fail").await;
         // A full one-slot queue holds the failure frame back until drained.
         let (outgoing, mut events) = mpsc::channel(1);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         let event_scope = Arc::new(tokio::sync::RwLock::new(
             websocket::LegacyEventScope::default(),
         ));
@@ -7582,6 +7594,39 @@ mod tests {
 
     /// An authenticated state with no real providers, for socket tests.
     async fn auth_test_state(root: &Path) -> AppState {
+        AppState::new_for_tests(auth_test_config(root))
+            .await
+            .unwrap()
+    }
+
+    /// [`auth_test_state`] without any history recipient, for the key
+    /// scenarios that register their own and count epochs. The daemon
+    /// cannot create a conversation without a recipient, so `count`
+    /// (empty) conversations are written beforehand by a keyless store.
+    async fn keyless_auth_test_state(root: &Path, count: usize) -> (AppState, Vec<String>) {
+        let config = auth_test_config(root);
+        let store = ConversationStore::new(config.data_dir.clone())
+            .await
+            .unwrap();
+        let workspace = fs::canonicalize(root.join("workspaces").join("project")).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..count {
+            let manifest = store
+                .create(ConversationManifest::new(
+                    ProviderKind::ClaudeCode,
+                    workspace.clone(),
+                    None,
+                    None,
+                ))
+                .await
+                .unwrap();
+            ids.push(manifest.id);
+        }
+        drop(store);
+        (AppState::new(config).await.unwrap(), ids)
+    }
+
+    fn auth_test_config(root: &Path) -> Config {
         let workspace_root = root.join("workspaces");
         fs::create_dir_all(workspace_root.join("project")).unwrap();
         // Conversations are created with Claude Code, which must resolve to
@@ -7590,7 +7635,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        AppState::new(Config {
+        Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: PairingEncryption::None,
@@ -7619,9 +7664,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
-        })
-        .await
-        .unwrap()
+        }
     }
 
     async fn anonymous_test_state(root: &Path) -> AppState {
@@ -8124,7 +8167,7 @@ mod tests {
         use crate::history_keys::{decode_id, encode_id};
 
         let root = make_temp_workspace("v2-history-keys");
-        let state = Box::pin(auth_test_state(&root)).await;
+        let (state, conversations) = Box::pin(keyless_auth_test_state(&root, 1)).await;
         let data_dir = root.join("data");
         let devices = crate::devices::DeviceRegistry::load(&data_dir).unwrap();
         let pair = |byte: u8| {
@@ -8135,20 +8178,9 @@ mod tests {
                 .device_id
         };
         let (a, b) = (pair(1), pair(2));
-        let manifest = state
-            .conversations
-            .create_owned(
-                "local",
-                ProviderKind::ClaudeCode,
-                root.join("workspaces").join("project"),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let conversation = manifest.id.clone();
+        let conversation = conversations[0].clone();
         let (outgoing, _events) = mpsc::channel(16);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         let event_scope = Arc::new(tokio::sync::RwLock::new(
             websocket::LegacyEventScope::default(),
         ));
@@ -8170,17 +8202,34 @@ mod tests {
         let code = |result: Result<Value, AppError>| result.unwrap_err().code();
 
         let initial = run!(&a, "history.encryption.get", Value::Null).unwrap();
-        assert_eq!(initial["mode"], "off");
+        assert_eq!(initial["mode"], "e2e");
         assert_eq!(initial["epoch"], 0);
         assert!(initial.get("myRid").is_none());
         assert_eq!(
             code(run!("dev_ghost", "history.encryption.get", json!({}))),
             "UNAUTHENTICATED"
         );
-        assert_eq!(
-            code(run!(&a, "history.encryption.enable", json!({}))),
-            "INVALID_REQUEST"
-        );
+        // The retired switches are unknown commands now.
+        for retired in ["history.encryption.enable", "history.encryption.disable"] {
+            assert!(!is_v2_native_command(retired));
+            assert!(!super::history_keys::is_history_command(retired));
+            let answer = dispatch_command(
+                &state,
+                &outgoing,
+                &mut subscriptions,
+                &event_scope,
+                "local",
+                &a,
+                V2Command {
+                    id: "retired".to_owned(),
+                    command_type: retired.to_owned(),
+                    payload: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(answer["type"], "server.error", "{answer}");
+        }
         assert_eq!(
             code(run!(&a, "history.encryption.get", json!({ "extra": 1 }))),
             "INVALID_REQUEST"
@@ -8212,7 +8261,7 @@ mod tests {
             .unwrap()["rid"],
             rid_a
         );
-        let enabled = run!(&a, "history.encryption.enable", json!({})).unwrap();
+        let enabled = run!(&a, "history.encryption.get", json!({})).unwrap();
         assert_eq!(enabled["mode"], "e2e");
         assert_eq!(enabled["myRid"], rid_a);
         let rid_recovery = run!(
@@ -8436,7 +8485,7 @@ mod tests {
         use crate::history_keys::test_support::{public_key_text, recipient, seed};
 
         let root = make_temp_workspace("v2-history-updates");
-        let state = Box::pin(auth_test_state(&root)).await;
+        let (state, conversations) = Box::pin(keyless_auth_test_state(&root, 3)).await;
         let data_dir = root.join("data");
         let devices = crate::devices::DeviceRegistry::load(&data_dir).unwrap();
         let pair = |byte: u8| {
@@ -8447,23 +8496,8 @@ mod tests {
                 .device_id
         };
         let (a, b, c) = (pair(1), pair(2), pair(3));
-        let mut conversations = Vec::new();
-        for _ in 0..3 {
-            let manifest = state
-                .conversations
-                .create_owned(
-                    "local",
-                    ProviderKind::ClaudeCode,
-                    root.join("workspaces").join("project"),
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-            conversations.push(manifest.id);
-        }
         let (outgoing, _outgoing_rx) = mpsc::channel(16);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         let event_scope = Arc::new(tokio::sync::RwLock::new(
             websocket::LegacyEventScope::default(),
         ));
@@ -8494,18 +8528,13 @@ mod tests {
         assert_eq!(
             history_updates(&mut events),
             vec![json!({
-                "epoch": 1, "mode": "off", "reason": "recipient.registered",
+                "epoch": 1, "mode": "e2e", "reason": "recipient.registered",
                 "rid": rid_a, "deviceId": a,
             })]
         );
         // Idempotent re-registration writes nothing and publishes nothing.
         run!(&a, "history.recipient.register", register(1)).unwrap();
         assert!(history_updates(&mut events).is_empty());
-        run!(&a, "history.encryption.enable", json!({})).unwrap();
-        assert_eq!(
-            history_updates(&mut events),
-            vec![json!({ "epoch": 1, "mode": "e2e", "reason": "mode" })]
-        );
         let rid_recovery = run!(&a, "history.recovery.set", register(9)).unwrap()["rid"].clone();
         assert_eq!(
             history_updates(&mut events),
@@ -8680,8 +8709,6 @@ mod tests {
                 json!({ "conversationId": conversation, "kids": [kid], "rid": rid_a }),
             ),
             ("history.recovery.set", register(4)),
-            ("history.encryption.enable", json!({})),
-            ("history.encryption.disable", json!({})),
             ("history.recipient.revoke", json!({ "rid": rid_a })),
             ("history.device.restore", json!({ "deviceId": b })),
         ];
@@ -8777,10 +8804,6 @@ mod tests {
         );
         let view = run!(&c, "history.encryption.get", json!({})).unwrap();
         assert_eq!(view["myAccess"], "revoked");
-        run!(&a, "history.encryption.disable", json!({})).unwrap();
-        let updates = history_updates(&mut events);
-        assert_eq!(updates.last().unwrap()["reason"], "mode");
-        assert_eq!(updates.last().unwrap()["mode"], "off");
 
         // Blocked devices may still subscribe and replay ciphertext.
         subscriptions.history_encryption = true;
@@ -8806,8 +8829,6 @@ mod tests {
 
     #[tokio::test]
     async fn v2_e2e_history_requires_declared_clients() {
-        use crate::history_keys::test_support::recipient;
-
         let root = make_temp_workspace("v2-history-gate");
         let state = Box::pin(auth_test_state(&root)).await;
         let manifest = state
@@ -8831,15 +8852,7 @@ mod tests {
             command_type: "conversation.subscribe".to_owned(),
             payload: json!({ "conversationId": manifest.id }),
         };
-        let signing = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
-        let device = crate::devices::DeviceRegistry::load(&root.join("data"))
-            .unwrap()
-            .register("Phone", &signing.verifying_key().to_bytes())
-            .unwrap();
-        let registry = state.history_keys.recipients();
-        registry
-            .register_device(&device.device_id, &recipient(1))
-            .unwrap();
+        // Every client must declare it, whatever the conversation holds.
         let refused = dispatch_command(
             &state,
             &outgoing,
@@ -8867,6 +8880,83 @@ mod tests {
         .await;
         assert!(accepted.is_none(), "the subscription task answers");
         subscriptions.abort_all();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn v2_history_writes_need_a_key_and_legacy_history_is_read_only() {
+        let root = make_temp_workspace("v2-history-write-gates");
+        // One legacy conversation, plaintext from an older version.
+        let (state, ids) = Box::pin(keyless_auth_test_state(&root, 0)).await;
+        drop(state);
+        let workspace = fs::canonicalize(root.join("workspaces").join("project")).unwrap();
+        let legacy_writer = ConversationStore::new(root.join("data")).await.unwrap();
+        let legacy = legacy_writer
+            .create(ConversationManifest::new(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                Some("old".to_owned()),
+                None,
+            ))
+            .await
+            .unwrap();
+        drop(legacy_writer);
+        assert!(ids.is_empty());
+        let state = AppState::new(auth_test_config(&root)).await.unwrap();
+        let (outgoing, _events) = mpsc::channel(16);
+        let mut subscriptions = WsSubscriptions::declared();
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        macro_rules! send {
+            ($type:expr, $payload:expr) => {
+                Box::pin(dispatch_command(
+                    &state,
+                    &outgoing,
+                    &mut subscriptions,
+                    &event_scope,
+                    "local",
+                    "local",
+                    V2Command {
+                        id: $type.to_owned(),
+                        command_type: $type.to_owned(),
+                        payload: $payload,
+                    },
+                ))
+                .await
+                .unwrap()
+            };
+        }
+        // No recipient: nothing new can be created.
+        let refused = send!(
+            "conversation.create",
+            json!({ "provider": "claude-code", "workspace": workspace })
+        );
+        assert_eq!(
+            refused["payload"]["code"], "HISTORY_KEY_REQUIRED",
+            "{refused}"
+        );
+        // Legacy history refuses prompts even once a key exists.
+        state
+            .history_keys
+            .recipients()
+            .set_recovery(&crate::history_keys::test_support::recipient(1))
+            .unwrap();
+        let refused = send!(
+            "conversation.prompt",
+            json!({ "conversationId": legacy.id, "text": "hi" })
+        );
+        assert_eq!(refused["payload"]["code"], "HISTORY_READ_ONLY", "{refused}");
+        let listed = state.conversations.list_owned("local").await.unwrap();
+        let wire = serde_json::to_value(&listed).unwrap();
+        assert_eq!(wire[0]["legacyPlaintext"], true);
+        let created = send!(
+            "conversation.create",
+            json!({ "provider": "claude-code", "workspace": workspace })
+        );
+        assert_eq!(created["type"], "server.result", "{created}");
+        assert!(created["payload"].get("legacyPlaintext").is_none());
+        assert!(created["payload"]["historyEncryptedAt"].is_string());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9043,7 +9133,7 @@ mod tests {
 
         // Socket backfill: every message carries the frames it refers to.
         let (outgoing, mut received) = mpsc::channel(256);
-        let mut subscriptions = WsSubscriptions::new();
+        let mut subscriptions = WsSubscriptions::declared();
         subscriptions.history_encryption = true;
         let event_scope = Arc::new(tokio::sync::RwLock::new(
             websocket::LegacyEventScope::default(),

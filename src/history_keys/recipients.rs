@@ -127,7 +127,10 @@ pub(crate) struct RevokedDevice {
 struct RetiredMode;
 
 impl Serialize for RetiredMode {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         serializer.serialize_str(HISTORY_MODE)
     }
 }
@@ -306,7 +309,8 @@ impl RecipientRegistry {
     pub(crate) fn device_owns(&self, device_id: &str, rid: &str) -> Result<bool> {
         self.update(|file, _| {
             Ok(file.active(rid).is_some_and(|record| {
-                record.kind == RecipientKind::Device && record.device_id.as_deref() == Some(device_id)
+                record.kind == RecipientKind::Device
+                    && record.device_id.as_deref() == Some(device_id)
             }))
         })
     }
@@ -977,8 +981,14 @@ mod tests {
         let root = temp_dir("anonymous");
         let registry = registry(&root);
         // Two clients of the same `local` device each register a key.
-        let first = registry.register_device("local", &recipient(1)).unwrap().value;
-        let second = registry.register_device("local", &recipient(2)).unwrap().value;
+        let first = registry
+            .register_device("local", &recipient(1))
+            .unwrap()
+            .value;
+        let second = registry
+            .register_device("local", &recipient(2))
+            .unwrap()
+            .value;
         assert!(registry.is_active(&first).unwrap());
         assert!(registry.is_active(&second).unwrap());
         assert_eq!(registry.snapshot().unwrap().epoch, 2);
@@ -1009,7 +1019,9 @@ mod tests {
         let registry = registry(&root);
         registry.register_device("local", &recipient(1)).unwrap();
         let path = root.join(HISTORY_DIR).join(FILE_NAME);
-        let raw = std::fs::read_to_string(&path).unwrap().replace("\"e2e\"", "\"off\"");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"e2e\"", "\"off\"");
         write_private_file(&path, raw.as_bytes()).unwrap();
         let reloaded = self::registry(&root);
         assert_eq!(reloaded.active_recipients().unwrap().keys.len(), 1);
@@ -1084,8 +1096,8 @@ mod tests {
         assert_ne!(second, grant);
         registry.complete_grant(&second).unwrap();
         let third = registry.request_grant("dev_b").unwrap().value.grant_id;
-        // Replacing the device key settles its pending grant.
-        registry.register_device("dev_b", &recipient(3)).unwrap();
+        // Revoking the requesting key settles its pending grant.
+        registry.revoke(&rid_b, "local").unwrap();
         let grants = registry.snapshot().unwrap().grants;
         let status = |id: &str| grants.iter().find(|g| g.grant_id == id).unwrap().status;
         assert_eq!(status(&grant), GrantStatus::Dismissed);
@@ -1143,10 +1155,8 @@ mod tests {
         let device = devices
             .register("Phone", &signing.verifying_key().to_bytes())
             .unwrap();
-        let registry = RecipientRegistry::load(&root, Some(devices.clone()),
-            system_clock(),
-        )
-        .unwrap();
+        let registry =
+            RecipientRegistry::load(&root, Some(devices.clone()), system_clock()).unwrap();
         registry.ensure_device(&device.device_id).unwrap();
         let rid = registry
             .register_device(&device.device_id, &recipient(1))
@@ -1180,9 +1190,7 @@ mod tests {
         let root = temp_dir("block");
         let (devices, a) = paired(&root, 1);
         let (_, b) = paired(&root, 2);
-        let registry =
-            RecipientRegistry::load(&root, Some(devices), system_clock())
-                .unwrap();
+        let registry = RecipientRegistry::load(&root, Some(devices), system_clock()).unwrap();
         let rid_a = registry.register_device(&a, &recipient(1)).unwrap().value;
         let rid_b = registry.register_device(&b, &recipient(2)).unwrap().value;
         let recovery = registry.set_recovery(&recipient(9)).unwrap().value;
@@ -1265,10 +1273,8 @@ mod tests {
         let root = temp_dir("external");
         let (devices, a) = paired(&root, 1);
         let (_, b) = paired(&root, 2);
-        let registry = RecipientRegistry::load(&root, Some(devices.clone()),
-            system_clock(),
-        )
-        .unwrap();
+        let registry =
+            RecipientRegistry::load(&root, Some(devices.clone()), system_clock()).unwrap();
         registry.register_device(&a, &recipient(1)).unwrap();
         registry.register_device(&b, &recipient(2)).unwrap();
         assert!(registry.take_external_changes().unwrap().is_empty());
@@ -1371,7 +1377,7 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["version"], 1);
-        assert_eq!(value["mode"], "off");
+        assert_eq!(value["mode"], "e2e");
         assert_eq!(value["recipients"][0]["revokedAt"], serde_json::Value::Null);
 
         // A record whose rid does not match its key is rejected.

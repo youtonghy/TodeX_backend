@@ -156,7 +156,7 @@ mod tests {
             workspace_roots: vec![root.join("workspaces")],
             ..crate::config::Config::default()
         };
-        let state = AppState::new(config.clone()).await.unwrap();
+        let state = AppState::new_for_tests(config.clone()).await.unwrap();
         let app = super::super::loopback_test_router(state);
         let client = StaticSecret::from([7; 32]);
         let client_public = PublicKey::from(&client);

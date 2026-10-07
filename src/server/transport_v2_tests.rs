@@ -51,7 +51,7 @@ impl TestServer {
             pairing_encryption,
             ..Config::default()
         };
-        let state = AppState::new(config).await.unwrap();
+        let state = AppState::new_for_tests(config).await.unwrap();
         let app = super::router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

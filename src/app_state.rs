@@ -275,6 +275,83 @@ mod tests {
     use crate::workspace_store::WorkspaceRecord;
     use uuid::Uuid;
 
+    /// Opt-in: the legacy plaintext scan over a COPY of a real data
+    /// directory (`TODEX_REAL_DATA`, e.g. an APFS clone of
+    /// `~/.todex-agent/conversations` in a scratch directory). Prints the
+    /// scan's duration and counts, then checks that a legacy conversation
+    /// refuses a prompt with `HISTORY_READ_ONLY` and still reads.
+    #[tokio::test]
+    #[ignore = "opt-in: scans a COPY of a real data directory (TODEX_REAL_DATA)"]
+    async fn measure_legacy_scan_on_a_real_data_copy() {
+        let data_dir =
+            PathBuf::from(std::env::var("TODEX_REAL_DATA").expect("set TODEX_REAL_DATA"));
+        let workspace_root = data_dir.join("scan-workspaces");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let state = AppState::new(Config {
+            data_dir: data_dir.clone(),
+            workspace_roots: vec![workspace_root],
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let store = state.conversation_store();
+        let started = std::time::Instant::now();
+        let scan = store.scan_legacy(&data_dir).await.unwrap();
+        let first_ms = started.elapsed().as_millis();
+        let manifests = store.list().await.unwrap();
+        let legacy = manifests
+            .iter()
+            .filter(|manifest| manifest.legacy_plaintext)
+            .collect::<Vec<_>>();
+        let encrypted = manifests
+            .iter()
+            .filter(|manifest| manifest.history_encrypted_at.is_some())
+            .count();
+        let started = std::time::Instant::now();
+        let again = store.scan_legacy(&data_dir).await.unwrap();
+        let second_ms = started.elapsed().as_millis();
+        eprintln!(
+            "legacy scan: {scan:?} in {first_ms} ms; conversations={} legacy={} encrypted={} undecided={}; second pass {again:?} in {second_ms} ms",
+            manifests.len(),
+            legacy.len(),
+            encrypted,
+            manifests.len() - legacy.len() - encrypted,
+        );
+        assert!(again.skipped);
+        let sample = legacy.first().expect("the copy holds legacy history");
+        let refused = state
+            .conversations
+            .prompt_owned(
+                &sample.owner_id,
+                &sample.id,
+                crate::provider::ConversationPrompt {
+                    client_request_id: Some("legacy-check".to_owned()),
+                    text: "hello".to_owned(),
+                    model: None,
+                    reasoning_effort: None,
+                    skills: Vec::new(),
+                    content: Vec::new(),
+                    permission_mode: None,
+                    work_mode: None,
+                    permission_profile: None,
+                    sandbox_mode: None,
+                    approval_policy: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "HISTORY_READ_ONLY");
+        let page = store.replay(&sample.id, 0, 50).await.unwrap();
+        eprintln!(
+            "prompt on legacy {} -> {}; replay read {} events (last {})",
+            sample.id,
+            refused.code(),
+            page.events.len(),
+            sample.last_sequence
+        );
+        assert!(!page.events.is_empty());
+    }
+
     #[tokio::test]
     async fn startup_trusts_registered_workspaces_without_overriding_revocation() {
         let root = std::env::temp_dir().join(format!(

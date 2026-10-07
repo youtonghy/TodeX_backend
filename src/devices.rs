@@ -370,8 +370,7 @@ mod tests {
         let (root, registry) = fixture();
         let first = registry.register("Phone", &key(7)).unwrap();
         let second = registry.register("Laptop", &key(8)).unwrap();
-        let recipients =
-            RecipientRegistry::load(&root, None, system_clock()).unwrap();
+        let recipients = RecipientRegistry::load(&root, None, system_clock()).unwrap();
         // Paired but never registered for history: still blocked by revoke-all.
         let third = registry.register("Tablet", &key(9)).unwrap();
         let first_rid = recipients

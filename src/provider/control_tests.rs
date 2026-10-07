@@ -83,8 +83,7 @@ impl Harness {
             .await
             .unwrap();
         if encrypted {
-            let keys = crate::history_keys::HistoryKeys::load(&config.data_dir, None)
-            .unwrap();
+            let keys = crate::history_keys::HistoryKeys::load(&config.data_dir, None).unwrap();
             keys.recipients()
                 .register_device("dev_a", &crate::history_keys::test_support::recipient(1))
                 .unwrap();

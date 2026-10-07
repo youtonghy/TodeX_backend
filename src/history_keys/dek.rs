@@ -397,7 +397,8 @@ mod tests {
             .draft_key(&fixture.conversation, &draft)
             .await
             .unwrap();
-        let written = std::fs::read_to_string(draft.join(super::super::keyring::FILE_NAME)).unwrap();
+        let written =
+            std::fs::read_to_string(draft.join(super::super::keyring::FILE_NAME)).unwrap();
         assert!(written.contains(&kid));
         // Nothing went to the conversation's own keyring or into memory.
         assert!(fixture
@@ -573,11 +574,7 @@ mod tests {
             .unwrap()
             .value;
         // A fresh key is recorded but never becomes the active one.
-        let (fresh, _) = fixture
-            .deks
-            .fresh_key(&fixture.conversation)
-            .await
-            .unwrap();
+        let (fresh, _) = fixture.deks.fresh_key(&fixture.conversation).await.unwrap();
         assert!(fixture
             .deks
             .keys_snapshot(&fixture.conversation)

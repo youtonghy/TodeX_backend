@@ -518,7 +518,11 @@ async fn legacy_plaintext_history_is_marked_once_and_left_untouched() {
     let mixed = legacy_writer.create(None).await.id;
     legacy_writer
         .store
-        .append(&mixed, "message.created", json!({"role": "user", "content": SECRETS[1]}))
+        .append(
+            &mixed,
+            "message.created",
+            json!({"role": "user", "content": SECRETS[1]}),
+        )
         .await
         .unwrap();
     let directory = legacy_writer.store.directory(&legacy).unwrap();
@@ -528,14 +532,22 @@ async fn legacy_plaintext_history_is_marked_once_and_left_untouched() {
     let daemon = legacy_writer.restart().await;
     daemon
         .store
-        .append(&mixed, "message.completed", json!({"role": "assistant", "content": "x"}))
+        .append(
+            &mixed,
+            "message.completed",
+            json!({"role": "assistant", "content": "x"}),
+        )
         .await
         .unwrap();
     // Created encrypted: decided from the start.
     let encrypted = daemon.create(Some("secret title")).await.id;
     daemon
         .store
-        .append(&encrypted, "message.created", json!({"role": "user", "content": "hi"}))
+        .append(
+            &encrypted,
+            "message.created",
+            json!({"role": "user", "content": "hi"}),
+        )
         .await
         .unwrap();
     assert!(daemon
@@ -547,7 +559,12 @@ async fn legacy_plaintext_history_is_marked_once_and_left_untouched() {
         .is_some());
     // An interrupted earlier pass already decided one conversation.
     assert_eq!(
-        daemon.store.ensure_not_legacy(&titled).await.unwrap_err().code(),
+        daemon
+            .store
+            .ensure_not_legacy(&titled)
+            .await
+            .unwrap_err()
+            .code(),
         "HISTORY_READ_ONLY"
     );
 
@@ -586,9 +603,19 @@ async fn legacy_plaintext_history_is_marked_once_and_left_untouched() {
         assert_eq!(after.payload, before.payload);
     }
     // The marker makes later passes skip; a restart keeps the flags.
-    assert!(daemon.root.join(crate::conversation::legacy::LEGACY_SCAN_MARKER).exists());
+    assert!(daemon
+        .root
+        .join(crate::conversation::legacy::LEGACY_SCAN_MARKER)
+        .exists());
     let restarted = daemon.restart().await;
-    assert!(restarted.store.scan_legacy(&restarted.root).await.unwrap().skipped);
+    assert!(
+        restarted
+            .store
+            .scan_legacy(&restarted.root)
+            .await
+            .unwrap()
+            .skipped
+    );
     assert!(restarted.store.get(&legacy).await.unwrap().legacy_plaintext);
     restarted.cleanup();
 }
@@ -610,7 +637,12 @@ async fn legacy_conversations_are_read_only() {
             .save_request(&id, &json!({"request": {"text": "new"}}))
             .await,
     );
-    read_only(store.append(&id, "turn.started", json!({"turnId": "t"})).await.map(|_| ()));
+    read_only(
+        store
+            .append(&id, "turn.started", json!({"turnId": "t"}))
+            .await
+            .map(|_| ()),
+    );
     read_only(
         store
             .update_metadata(&id, Some(Some("renamed".to_owned())), None)
@@ -711,7 +743,10 @@ async fn imports_and_fork_trailers_are_encrypted() {
         .iter()
         .all(|event| encrypted_content(&event.payload).is_some()));
     let view = client_view(&fork_keys, &forked, &frames, false);
-    assert_eq!(view.last().unwrap().payload["sourceConversationId"], SECRETS[2]);
+    assert_eq!(
+        view.last().unwrap().payload["sourceConversationId"],
+        SECRETS[2]
+    );
     assert_eq!(view[0].payload["content"], events[0].payload["content"]);
     // The startup scan agrees: nothing here is legacy.
     let scan = e2e.store.scan_legacy(&e2e.root).await.unwrap();

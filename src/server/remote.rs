@@ -555,7 +555,7 @@ mod tests {
     async fn signed_raw_upload_bodies_pass_device_auth() {
         let root =
             std::env::temp_dir().join(format!("todex-remote-routes-{}", uuid::Uuid::new_v4()));
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             data_dir: root.join("data"),
             workspace_roots: vec![root.join("workspaces")],
             ..Config::default()

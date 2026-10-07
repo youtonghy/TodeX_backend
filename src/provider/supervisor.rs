@@ -645,7 +645,7 @@ impl ConversationSupervisor {
         &self,
         conversation_id: &str,
     ) -> Vec<crate::conversation::ConversationEvent> {
-        self.store.complete_history(conversation_id).await.unwrap()
+        self.store.plain_history_for_tests(conversation_id).await
     }
 
     pub async fn recover_all(&self) -> Result<(), AppError> {
@@ -1904,8 +1904,8 @@ impl ConversationSupervisor {
         let sealed_key = fingerprint_key
             .as_deref()
             .filter(|_| self.store.history_encrypted());
-        let saved_request = saved_request(&request_snapshot, sealed_key)
-            .map(|saved| (saved, sealed_key.is_some()));
+        let saved_request =
+            saved_request(&request_snapshot, sealed_key).map(|saved| (saved, sealed_key.is_some()));
         let (saved_request, request_sealed) = match saved_request {
             Ok(saved) => saved,
             Err(error) => {
@@ -3038,8 +3038,7 @@ mod tests {
     ) {
         let root = temp_dir(label);
         let data_dir = root.join("data");
-        let keys = crate::history_keys::HistoryKeys::load(&data_dir, None)
-        .unwrap();
+        let keys = crate::history_keys::HistoryKeys::load(&data_dir, None).unwrap();
         keys.recipients()
             .register_device("dev_a", &crate::history_keys::test_support::recipient(1))
             .unwrap();
@@ -3130,6 +3129,154 @@ mod tests {
             trust,
         );
         (root, store, supervisor, workspace)
+    }
+
+    #[tokio::test]
+    async fn legacy_conversations_refuse_every_write_entry_point() {
+        let (root, store, supervisor, workspace, _keys) =
+            encrypted_control_fixture("todex-legacy-read-only").await;
+        // Written in plaintext, as versions before mandatory encryption did.
+        let legacy_writer = ConversationStore::new(root.join("data")).await.unwrap();
+        let legacy = legacy_writer
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                workspace.clone(),
+                Some("old title".to_owned()),
+                None,
+            ))
+            .await
+            .unwrap();
+        legacy_writer
+            .append(
+                &legacy.id,
+                "message.created",
+                json!({"role": "user", "content": "old prompt", "turnId": "old"}),
+            )
+            .await
+            .unwrap();
+        drop(legacy_writer);
+        let id = legacy.id.clone();
+        let prompt = || ConversationPrompt {
+            client_request_id: Some("new".to_owned()),
+            text: "new prompt".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            skills: Vec::new(),
+            content: Vec::new(),
+            permission_mode: None,
+            work_mode: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
+        };
+        let read_only = |label: &str, error: AppError| {
+            assert_eq!(error.code(), "HISTORY_READ_ONLY", "{label}: {error}");
+        };
+        read_only(
+            "prompt",
+            supervisor
+                .prompt_owned("local", &id, prompt())
+                .await
+                .unwrap_err(),
+        );
+        read_only(
+            "retry",
+            supervisor
+                .retry_owned("local", &id, None, Some("old prompt".to_owned()), None)
+                .await
+                .unwrap_err(),
+        );
+        read_only(
+            "queue.add",
+            supervisor
+                .queue_add_owned("local", &id, "queued-1", prompt(), false)
+                .await
+                .err()
+                .unwrap(),
+        );
+        assert!(store.follow_up_queue(&id).await.unwrap().is_none());
+        assert!(!root
+            .join("data")
+            .join("conversations")
+            .join(&id)
+            .join("queue.json")
+            .exists());
+        read_only(
+            "queue.resume",
+            supervisor
+                .queue_resume_owned("local", &id)
+                .await
+                .unwrap_err(),
+        );
+        read_only(
+            "compact",
+            supervisor
+                .compact_owned("local", &id, "compact-1")
+                .await
+                .unwrap_err(),
+        );
+        read_only(
+            "fork",
+            supervisor.fork_owned("local", &id, None).await.unwrap_err(),
+        );
+        read_only(
+            "rename",
+            supervisor
+                .update_metadata_owned("local", &id, Some(Some("new".to_owned())), None)
+                .await
+                .unwrap_err(),
+        );
+        read_only(
+            "permission",
+            supervisor
+                .resolve_permission_owned(
+                    "local",
+                    "local",
+                    &id,
+                    "perm_1",
+                    PermissionDecision {
+                        outcome: PermissionOutcome::AllowOnce,
+                        option_id: Some("allow_once".to_owned()),
+                        data: None,
+                    },
+                )
+                .await
+                .unwrap_err(),
+        );
+        read_only(
+            "control",
+            supervisor
+                .control_owned(
+                    "local",
+                    &id,
+                    "old",
+                    "control-1",
+                    ProviderControl::Steer {
+                        text: "steer".to_owned(),
+                    },
+                )
+                .await
+                .unwrap_err(),
+        );
+        let manifest = store.get(&id).await.unwrap();
+        assert!(manifest.legacy_plaintext);
+        assert_eq!(manifest.title.as_deref(), Some("old title"));
+        // Nothing was written; reading, archiving and deleting stay allowed.
+        let history = supervisor.history_for_tests(&id).await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].payload["content"], "old prompt");
+        let archived = supervisor
+            .update_metadata_owned("local", &id, None, Some(true))
+            .await
+            .unwrap();
+        assert!(archived.archived_at.is_some());
+        supervisor
+            .update_metadata_owned("local", &id, None, Some(false))
+            .await
+            .unwrap();
+        supervisor.delete_owned("local", &id).await.unwrap();
+        supervisor.shutdown_all().await;
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -3303,10 +3450,12 @@ mod tests {
         for (copy, original) in forked.iter().zip(&source) {
             assert_eq!(copy.payload["$enc"], original.payload["$enc"]);
         }
+        // Plus the fork's own key, which encrypted its `conversation.forked`.
         assert_eq!(
             keys.keyrings().keys(&fork.id).await.unwrap().len(),
-            keys.keyrings().keys(&manifest.id).await.unwrap().len()
+            keys.keyrings().keys(&manifest.id).await.unwrap().len() + 1
         );
+        assert!(encrypted_content(&forked.last().unwrap().payload).is_some());
         supervisor.delete_owned("local", &fork.id).await.unwrap();
         fs::remove_dir_all(root).unwrap();
     }

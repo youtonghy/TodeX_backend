@@ -854,7 +854,7 @@ exit 3
             workspace_roots: vec![std::fs::canonicalize(root.join("workspaces")).unwrap()],
             ..Config::default()
         };
-        let mut state = AppState::new(config).await.unwrap();
+        let mut state = AppState::new_for_tests(config).await.unwrap();
         state.ssh = crate::ssh::SshService::with_home(
             &root.join("data"),
             fake.display().to_string(),

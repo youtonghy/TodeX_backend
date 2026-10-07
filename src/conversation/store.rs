@@ -23,8 +23,8 @@ use super::record::{
     ENCRYPTED_FIELD, JOURNAL_COMPACTED_EVENT,
 };
 use super::segment::{
-    self, CommitStep, FrameCache, FrameRef, PreparedSegment, SealPolicy,
-    SealedSegment, SegmentError, SegmentReader, JOURNAL_RECORD_LOST_EVENT,
+    self, CommitStep, FrameCache, FrameRef, PreparedSegment, SealPolicy, SealedSegment,
+    SegmentError, SegmentReader, JOURNAL_RECORD_LOST_EVENT,
 };
 use super::{
     redact_secrets, status_after_conversation_event, ConversationEvent, ConversationEventHub,
@@ -809,7 +809,11 @@ impl ConversationStore {
         if copied && encrypted_content(&event.payload).is_some() {
             return Ok(event);
         }
-        rename_reserved_encrypted_field(&event.conversation_id, &event.event_type, &mut event.payload);
+        rename_reserved_encrypted_field(
+            &event.conversation_id,
+            &event.event_type,
+            &mut event.payload,
+        );
         if draft.seal.is_none() {
             let (kid, key) = keys
                 .deks()
@@ -1375,6 +1379,9 @@ impl ConversationStore {
                 terminated = true;
             }
         }
+        // Nothing may change on disk for a record that cannot be encrypted
+        // (no recipient and no key left in memory): check before rotating.
+        let mut key = self.record_key(conversation_id).await?;
         // Seal the active file once it passed its target size and start a
         // fresh `events.jsonl`. Sealing only renames the active file, so a
         // matching cached index survives by retagging its file list: the
@@ -1405,13 +1412,13 @@ impl ConversationStore {
             // lets the seal converter repack them and then drop the key.
             if let Some(keys) = &self.history {
                 keys.deks().rotate(conversation_id).await;
+                key = self.record_key(conversation_id).await?;
             }
         }
         // With history encryption on, the record is sealed now — after any
         // rotation, so it uses the new file's key — and the stored form
         // (envelope plus `$enc`) is what is journalled, published and
         // folded into the digest.
-        let key = self.record_key(conversation_id).await?;
         // Large payloads are sealed and encoded on the blocking pool; the
         // conversation lock is still held, so journal order is unchanged.
         let (event, record) = if bounded.bytes >= BLOCKING_ENCODE_BYTES {
@@ -3310,6 +3317,42 @@ impl ConversationStore {
         self.index_remove(conversation_id);
         self.digests.remove(conversation_id);
         self.tails.remove(conversation_id);
+    }
+
+    /// The whole history as a client sees it: encrypted records opened
+    /// with the test recipients' keys (`AppState::new_for_tests`'s recovery
+    /// seed and device seed 1). Plaintext records stay as they are.
+    #[cfg(test)]
+    pub async fn plain_history_for_tests(&self, conversation_id: &str) -> Vec<ConversationEvent> {
+        use super::e2e_support::{client_keys, client_view};
+        let mut events = Vec::new();
+        let mut frames = serde_json::Map::new();
+        let mut after = 0;
+        loop {
+            let page = self
+                .replay(conversation_id, after, MAX_REPLAY_LIMIT)
+                .await
+                .unwrap();
+            after = page.next_sequence;
+            frames.extend(page.frames);
+            events.extend(page.events);
+            if !page.has_more {
+                break;
+            }
+        }
+        let Some(keys) = &self.history else {
+            return events;
+        };
+        let mut opened = client_keys(keys, conversation_id, 1).await;
+        opened.extend(
+            client_keys(
+                keys,
+                conversation_id,
+                crate::app_state::TEST_HISTORY_RECIPIENT,
+            )
+            .await,
+        );
+        client_view(&opened, &events, &frames, false)
     }
 
     /// Seal the active file now, as a rotation would.

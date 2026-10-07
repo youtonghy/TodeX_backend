@@ -3876,7 +3876,7 @@ mod tests {
     }
 
     async fn test_state() -> AppState {
-        AppState::new(Config {
+        AppState::new_for_tests(Config {
             host: "127.0.0.1".to_owned(),
             port: 0,
             pairing_encryption: crate::config::PairingEncryption::default(),

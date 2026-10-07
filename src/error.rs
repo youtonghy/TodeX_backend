@@ -213,3 +213,19 @@ impl IntoResponse for AppError {
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_write_refusals_are_conflicts() {
+        for (error, code) in [
+            (AppError::HistoryKeyRequired, "HISTORY_KEY_REQUIRED"),
+            (AppError::HistoryReadOnly, "HISTORY_READ_ONLY"),
+        ] {
+            assert_eq!(error.code(), code);
+            assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+        }
+    }
+}

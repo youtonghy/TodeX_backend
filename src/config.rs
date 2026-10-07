@@ -626,7 +626,9 @@ pub fn warn_retired_history_encryption(data_dir: &Path) {
             }
         }
         // `Config::load` already read (and reported) this file.
-        Err(error) => tracing::debug!(error = %error, "config file unreadable while checking retired settings"),
+        Err(error) => {
+            tracing::debug!(error = %error, "config file unreadable while checking retired settings")
+        }
     }
 }
 

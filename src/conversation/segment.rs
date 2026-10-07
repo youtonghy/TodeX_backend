@@ -58,8 +58,8 @@ use sha2::{Digest as _, Sha256};
 
 use super::digest::JournalDigest;
 use super::record::{
-    compacted_marker, decode_journal_record, encode_envelope, encrypted_content,
-    open_event, parse_record, record_bytes, ENCRYPTED_FIELD, JOURNAL_COMPACTED_EVENT,
+    compacted_marker, decode_journal_record, encode_envelope, encrypted_content, open_event,
+    parse_record, record_bytes, ENCRYPTED_FIELD, JOURNAL_COMPACTED_EVENT,
 };
 use super::{summarize_event, ConversationEvent, ProviderKind};
 use crate::history_crypto::{self, ContentStream, SegmentKey};

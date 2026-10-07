@@ -839,7 +839,7 @@ mod tests {
     async fn harness() -> (std::path::PathBuf, AppState, String, Client) {
         let root = std::env::temp_dir().join(format!("todex-desktop-mcp-{}", Uuid::new_v4()));
         std::fs::create_dir_all(root.join("workspaces/project")).unwrap();
-        let state = AppState::new(Config {
+        let state = AppState::new_for_tests(Config {
             data_dir: root.join("data"),
             workspace_roots: vec![std::fs::canonicalize(root.join("workspaces")).unwrap()],
             ..Config::default()
