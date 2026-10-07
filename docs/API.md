@@ -55,7 +55,7 @@ cargo run -- serve --host 127.0.0.1 --port 7345
 | 是否开启认证 | 无 | `TODEX_AGENTD_ENABLE_AUTH` | `true` |
 | 历史保留天数 | `--history-retention-days` | `TODEX_AGENTD_HISTORY_RETENTION_DAYS` | 关闭 |
 
-当前 HTTP 层没有实现 TLS 终止，配置 `enable_tls = true` 时服务会拒绝启动，避免产生“已经启用 TLS”的错误安全假设。生产环境应在可信反向代理终止 TLS，且不应直接暴露明文端口。v2 HTTP 和 WebSocket 都使用设备签名认证：每个请求携带 `x-todex-device-id`、`x-todex-auth-ts`、`x-todex-auth-nonce`、`x-todex-auth-sig` 四个 header（无法设置 header 的客户端使用等价 query 参数 `device_id`、`auth_ts`、`auth_nonce`、`auth_sig`），签名覆盖方法、路径、canonical query、时间戳、nonce 与 body 哈希，见 [设备验证](device-verification.md)。conversation 持久化 owner tenant，所有读取、订阅与变更入口都会校验 tenant。
+当前 HTTP 层没有实现 TLS 终止，配置 `enable_tls = true` 时服务会拒绝启动，避免产生“已经启用 TLS”的错误安全假设。生产环境应在可信反向代理终止 TLS，且不应直接暴露明文端口。v2 HTTP 和 WebSocket 都使用设备签名认证：每个请求携带 `x-todex-device-id`、`x-todex-auth-ts`、`x-todex-auth-nonce`、`x-todex-auth-sig` 四个 header（无法设置 header 的客户端使用等价 query 参数 `device_id`、`auth_ts`、`auth_nonce`、`auth_sig`），签名覆盖方法、路径、canonical query、时间戳、nonce 与 body 哈希，见 [设备验证](device-verification.md)。签名用 Ed25519 严格校验（`verify_strict`）。时间戳与服务端时钟相差超过 300 秒，或早于 daemon 本次启动时刻（重启会清空 nonce 缓存，启动栅栏阻止旧凭证重放），返回 401 `{"code":"AUTH_TIMESTAMP_REJECTED","message":"...","serverTime":<unix 秒>}`（`serverTime` 与 `code`/`message` 并列在顶层，仅此错误带该字段）；REST 客户端据此按后端记录 `offset = serverTime − 本地时间`，用新 nonce 重签并重试一次，WebSocket 只靠退避重连。其他认证失败仍是 `UNAUTHENTICATED`。nonce 在窗口内一次性有效，每台设备窗口内最多 8192 个，超出只对该设备返回 429 `RATE_LIMITED`（`Retry-After: 1`）；全局 65536 条作为最后防线（429 `RESOURCE_EXHAUSTED`）。WebSocket 升级使用同样的检查。conversation 持久化 owner tenant，所有读取、订阅与变更入口都会校验 tenant。
 
 认证策略是 fail-closed 的：`enable_auth = true` 时匿名 `/v2/ws` 握手直接被拒绝（401），不存在“先连上再限制命令”的匿名模式；`enable_auth = false` 的本地部署才会以本地信任模式接受匿名连接。关闭认证时监听地址必须是回环地址（`127.0.0.1`、`::1`），否则 daemon 拒绝启动（TUI 也拒绝保存这种监听地址）；匿名请求（HTTP 与 `/v2/ws` 升级）的 `Host` 必须是 `localhost` 或回环 IP（可带端口），`Origin` 若存在须为回环主机的 `http(s)` 源或桌面端固定的 `todex-desktop://app`（桌面端把自身 `loadFile` 页面的 `null` / `file://` Origin 改写为它），否则返回 403 `UNAUTHORIZED`；`Origin: null` 与 `file://` 一律拒绝，因为任意网页都能用 sandbox iframe 产生 `null` Origin，用于防御 DNS rebinding 与跨站 WebSocket 劫持。开启认证时不做此检查。认证中间件先校验凭证（header 或 query 齐全、时间戳在窗口内、设备已登记）再读取请求体，缺少或无效凭证的请求在读取请求体前即返回 401。没有可配置的共享凭据：设备只能通过配对流程登记（见 `POST /v2/device-pairing/*`）。
 
@@ -305,17 +305,19 @@ Codex 的原生 `thread/tokenUsage/updated` 通知会在 Provider 边界规范�
 
 ### 传输策略与 REST 隧道
 
-`GET /v2/transport-policy`（无需签名，`Cache-Control: no-store`）返回 `{"requiredProtocol": "none" | "x25519" | "ml-kem-768", "transportVersion": 2}`。客户端只用它检查与已固定协议是否冲突，不会因此降级为明文；协议与公钥本身只来自设备配对（见下）。
+`GET /v2/transport-policy`（无需签名，`Cache-Control: no-store`）返回 `{"requiredProtocol": "none" | "x25519" | "ml-kem-768", "transportVersion": 2, "sealedRevision": 2}`。客户端只用它检查与已固定协议是否冲突、后端是否支持 sealed revision 2（不满足即拒绝连接，不回落），不会因此降级为明文；协议与公钥本身只来自设备配对（见下）。
 
-`POST /v2/sealed` 是 transport v2 的 REST 隧道（无需外层签名）：外层 header 为 `Content-Type: application/vnd.todex.sealed`、`X-Todex-Transport: 2`、`X-Todex-Encryption`、`X-Todex-Client-Key`（x25519）或 `X-Todex-Kem-Ciphertext`（ml-kem-768）、`X-Todex-Request-Nonce`；外层 body 是用 `k_up` 封装的记录流，明文为一个完整的内层请求（JSON head + body）。内层请求经同一个 router 执行，照常做设备签名校验（签名覆盖内层方法、路径、query 与 body）和各路由的 body 上限；内层 head 一解出就先做与 body 无关的检查：公开路由（`/health`、`/v2/version`、`/v2/transport-policy`、`/v2/device-pairing/*`）无需凭证但内层 body 上限 64 KiB，其余路径须带已登记设备的有效签名 header（匿名部署则做回环 `Host`/`Origin` 检查），否则不再读取外层 body，直接返回加密的内层 `401`（匿名检查为 `403`）；通过检查的隧道请求全局最多 32 个同时缓冲与处理，其余排队；内层只保留 `content-type`、`accept` 与四个设备签名 header，`Host`/`Origin` 与对端地址取自外层请求。成功时外层固定 `200`、`Content-Type: application/vnd.todex.sealed`，body 是用 `k_down` 流式封装的内层响应（状态码、header 与 body，下载等流式响应逐记录转发；为保证只有最后一条记录带 final 标记，封装器总是扣住最新一块，直到下一块到达或 body 结束才发出，因此流式响应在客户端会晚一块到达）。外层无法打开（header、密钥材料、认证失败、截断、超过 32 MiB 加记录开销、嵌套 `/v2/sealed`）时返回 `400 TRANSPORT_CRYPTO_FAILED`，不含细节。格式与限制见 [transport-v2.md](transport-v2.md)。
+`POST /v2/sealed` 是 transport v2 的 REST 隧道（无需外层签名）：外层 header 为 `Content-Type: application/vnd.todex.sealed`、`X-Todex-Transport: 2`、`X-Todex-Encryption`、`X-Todex-Client-Key`（x25519）或 `X-Todex-Kem-Ciphertext`（ml-kem-768）、`X-Todex-Request-Nonce`、`X-Todex-Sealed-Revision: 2`（缺失或不是 `2` 时，读取 body 前即返回明文 426 `PROTOCOL_UPGRADE_REQUIRED`）；外层 body 是用 `k_up` 封装的记录流，明文为一个完整的内层请求（JSON head + body）。内层请求经同一个 router 执行，照常做设备签名校验（签名覆盖内层方法、路径、query 与 body）和各路由的 body 上限；内层 head 一解出就先做与 body 无关的检查：公开路由（`/health`、`/v2/version`、`/v2/transport-policy`、`/v2/device-pairing/*`）无需凭证但内层 body 上限 64 KiB，其余路径须带已登记设备的有效签名 header（匿名部署则做回环 `Host`/`Origin` 检查），否则不再读取外层 body，直接返回加密的内层 `401`（匿名检查为 `403`）；通过检查的隧道请求最多 32 个同时缓冲与处理，公开路由另有独立的 4 个名额，其余排队，排队超过 10 秒返回加密的内层 `503 TRANSPORT_BUSY`（内层 `retry-after: 1`；保证未执行、签名 nonce 未被占用，客户端无论 method 都可用新签名重试一次）；请求开始 30 秒内必须解出内层 head，否则返回明文 `400 TRANSPORT_CRYPTO_FAILED`；外层 body 两块之间最多间隔 30 秒，内层 head 解出前超时为明文 400，解出后为加密的内层 `408 REQUEST_TIMEOUT`；内层只保留 `content-type`、`accept` 与四个设备签名 header，`Host`/`Origin` 与对端地址取自外层请求。成功时外层固定 `200`、`Content-Type: application/vnd.todex.sealed; r=2`，body 先是 32 字节原始 `response_nonce`（每个响应新生成，加密的内层错误同样如此），随后是用 `k_down = HKDF-Expand(prk, "todex.transport.v2/rest/down" || response_nonce, 32)` 流式封装的内层响应（状态码、header 与 body，下载等流式响应逐记录转发；为保证只有最后一条记录带 final 标记，封装器总是扣住最新一块，直到下一块到达或 body 结束才发出，因此流式响应在客户端会晚一块到达）。外层无法打开（header、密钥材料、认证失败、截断、超过 32 MiB 加记录开销、嵌套 `/v2/sealed`、内层 head 超时）时返回 `400 TRANSPORT_CRYPTO_FAILED`，不含细节。客户端只对 `200` 且 content type 带 `r=2` 的响应解密；不足 32 字节即结束视为截断；其他响应一律按未认证的普通 API 错误处理；不带 `r=2` 的 sealed 响应说明后端版本过旧，提示更新后端。格式与限制见 [transport-v2.md](transport-v2.md)。
 
 ### 设备配对（v3：先承诺后揭示）
 
 配对路由无需签名，始终可直接访问（不经隧道），body 上限 2 KiB，响应 `Cache-Control: no-store`：
 
-1. `POST /v2/device-pairing/create` `{clientCommitment, transportBinding: 1, deviceName, devicePublicKey}` → `{requestId, serverPublicKey, expiresAt, pollIntervalMs, transportProtocol, transportPublicKey}`。`clientCommitment = base64url(SHA256(LP("todex.device-pairing.v3/commit") || client_public || client_nonce))`，`client_public` 为临时 X25519 公钥、`client_nonce` 为 32 字节随机数。`transportProtocol` 是服务端配置的 `pairing_encryption`（`none` / `x25519` / `ml-kem-768`），`transportPublicKey` 是 v2 握手此刻使用的静态公钥（base64url 无填充；`none` 时为空串），二者写入 transcript、由验证码认证。仍提交 `clientPublicKey` 的配对 v2 客户端，或缺少 `transportBinding`（必须是 JSON 整数 `1`）的客户端，得到 426 `PROTOCOL_UPGRADE_REQUIRED`。
-2. `POST /v2/device-pairing/reveal` `{requestId, clientPublicKey, clientNonce}` → `{"status":"pending"}`。服务端常量时间比较承诺，派生 v3 材料后才把验证码交给 TUI；承诺不符返回 401 并作废该申请，重复 reveal 返回 409 `CONFLICT`。
+1. `POST /v2/device-pairing/create` `{clientCommitment, transportBinding: 1, deviceNameBinding: 1, deviceName, devicePublicKey}` → `{requestId, serverPublicKey, expiresAt, pollIntervalMs, transportProtocol, transportPublicKey}`。`clientCommitment = base64url(SHA256(LP("todex.device-pairing.v3/commit") || client_public || client_nonce))`，`client_public` 为临时 X25519 公钥、`client_nonce` 为 32 字节随机数。`transportProtocol` 是服务端配置的 `pairing_encryption`（`none` / `x25519` / `ml-kem-768`），`transportPublicKey` 是 v2 握手此刻使用的静态公钥（base64url 无填充；`none` 时为空串），二者写入 transcript、由验证码认证。仍提交 `clientPublicKey` 的配对 v2 客户端，或缺少 `transportBinding` / `deviceNameBinding`（都必须是 JSON 整数 `1`）的客户端，得到 426 `PROTOCOL_UPGRADE_REQUIRED`。`deviceName` 按 UTF-8 原样写入 transcript（`LP(utf8(device_name))` 接在传输字段之后），由验证码认证。客户端先去掉首尾空白、为空时填默认名；服务端不再 trim、不再替换为 "Unknown device"，名称须为 1–80 个 Unicode 标量、不含 Cc 控制字符与 bidi 控制字符（U+200E/F、U+202A–202E、U+2066–2069）、首尾不是空白（Unicode `White_Space`），否则返回 400 `INVALID_REQUEST`；通过校验后原样保存。小阶（weak）Ed25519 设备公钥同样返回 400。
+2. `POST /v2/device-pairing/reveal` `{requestId, clientPublicKey, clientNonce}` → `{"status":"pending"}`。服务端常量时间比较承诺，派生 v3 材料后才把验证码交给 TUI；承诺不符返回 401 但保留该申请，重复 reveal 返回 409 `CONFLICT`。
 3. `POST /v2/device-pairing/poll` / `cancel` `{requestId, proof}` 与之前相同，proof 改用 v3 材料；reveal 之前没有可用 proof（401）。批准后 `poll` 返回用 wrap key、以完整 v3 transcript 为 AAD 加密的 `{deviceId, transportProtocol, transportPublicKey}`；客户端确认两个传输字段与 `create` 响应完全一致后才保存公钥。若 `create` 之后加密密钥被重置，已批准的申请返回 `expired` 且不登记设备。
+
+准入限制（均无需认证）：按来源计数，IPv4 按地址、IPv6 按 /64（IPv4-mapped 视为 IPv4）。`create` 每来源每分钟 4 次、全局每分钟 24 次；`create` 后 30 秒内必须 `reveal`，否则丢弃；每来源未完成（未 reveal 或待审批）的申请最多 2 个，超出返回 429 `PAIRING_BUSY`；全局活动申请达到 16 个时先淘汰最早一个未 reveal 的申请，全部已 reveal 才返回 429 `PAIRING_BUSY`；每个申请每分钟最多 8 次 `reveal`；`poll` / `cancel` 每个申请每秒最多 4 次，且 `reveal` / `poll` / `cancel` 全局每秒 1024 次作为最后防线；频率超限返回 429 `RATE_LIMITED` 并带 `Retry-After`。客户端在 `expiresAt` 之前 `poll` 遇到 429、5xx 或网络错误时退避（翻倍，最多 5 秒）继续，只在 404、`expired`、`rejected`、401 或用户取消时结束。
 
 transcript、HKDF 标签与验证码格式见 [transport-v2.md](transport-v2.md#device-pairing-v3-commit-then-reveal) 与 [设备验证](device-verification.md)。
 
@@ -1079,7 +1081,12 @@ TUI 配对二维码只携带后端地址（`{"kind":"todex-pairing-link","versio
 | code | 说明 |
 | --- | --- |
 | `INVALID_REQUEST` | JSON 格式、字段或消息类型不符合当前协议。 |
-| `UNAUTHENTICATED` | `enable_auth` 开启时未提供有效设备签名（header 或 query 参数），或设备未注册/已吊销、时间戳超窗、nonce 重放。 |
+| `UNAUTHENTICATED` | `enable_auth` 开启时未提供有效设备签名（header 或 query 参数），或设备未注册/已吊销、nonce 重放；配对 `reveal` 承诺不符、`poll`/`cancel` proof 无效。 |
+| `AUTH_TIMESTAMP_REJECTED` | 设备签名时间戳与服务端相差超过 300 秒或早于 daemon 启动（HTTP 401）；顶层附带 `serverTime`（Unix 秒），REST 客户端据此校正时钟偏移、重签重试一次。 |
+| `RATE_LIMITED` | 请求频率超限（HTTP 429，带 `Retry-After`）：单设备签名 nonce 超过 8192 个/窗口，或配对 `create` / `reveal` / `poll` / `cancel` 频率超限。 |
+| `PAIRING_BUSY` | 配对申请已满（HTTP 429）：同一来源已有 2 个未完成申请，或 16 个活动申请都已 reveal。 |
+| `TRANSPORT_BUSY` | `/v2/sealed` 隧道 10 秒内没有空闲名额（加密的内层 HTTP 503，`retry-after: 1`）；请求未执行、nonce 未占用，可用新签名重试一次。 |
+| `REQUEST_TIMEOUT` | `/v2/sealed` 外层 body 在内层 head 解出后停顿超过 30 秒（加密的内层 HTTP 408）。 |
 | `UNAUTHORIZED` | tenant 与认证上下文不匹配；或 `enable_auth = false` 时请求的 `Host`/`Origin` 不是本地来源。 |
 | `UNSUPPORTED` | 请求能力不在当前后端支持范围。 |
 | `REMOTE_AUTH_FAILED` | SFTP/FTP 登录失败（HTTP 403）：提供密码，或先在终端登录以复用共享连接。 |
@@ -1087,7 +1094,7 @@ TUI 配对二维码只携带后端地址（`{"kind":"todex-pairing-link","versio
 | `REMOTE_UNREACHABLE` | 远程主机不可达或连接中断（HTTP 502），会话随之关闭。 |
 | `REMOTE_PERMISSION_DENIED` | 远程服务器拒绝该文件操作（HTTP 403）；与 TodeX 设备认证无关。 |
 | `REMOTE_OPERATION_FAILED` | 其他远程文件操作失败（HTTP 422）。 |
-| `PROTOCOL_UPGRADE_REQUIRED` | 请求使用了已停用的协议（HTTP 426）：非回环对端绕过 transport v2 直接访问、`/v2/ws` 的 `tv` 不是 `2` 或仍用 v1 `enc=`，或配对 `create` 仍提交 `clientPublicKey`（配对 v2）；需升级客户端。 |
+| `PROTOCOL_UPGRADE_REQUIRED` | 请求使用了已停用的协议（HTTP 426）：非回环对端绕过 transport v2 直接访问、`/v2/ws` 的 `tv` 不是 `2` 或仍用 v1 `enc=`，配对 `create` 仍提交 `clientPublicKey`（配对 v2）或缺少 `transportBinding: 1` / `deviceNameBinding: 1`，或 `/v2/sealed` 缺少 `X-Todex-Sealed-Revision: 2`；需升级客户端。 |
 | `TRANSPORT_CRYPTO_FAILED` | `POST /v2/sealed` 的外层无法打开（HTTP 400），不含细节；WebSocket 上对应 close code `4400`。 |
 | `CLIENT_UPGRADE_REQUIRED` | 历史已端到端加密，而客户端未声明 `historyEncryption=1`（HTTP 426）；需升级客户端。 |
 | `HISTORY_KEY_REQUIRED` | 没有可读取新历史的接收方（HTTP 409）：新建会话、prompt、追加与重试等写入被拒绝，不写任何内容；在客户端登记设备密钥（`history.recipient.register`）后重试。 |

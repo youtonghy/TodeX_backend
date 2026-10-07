@@ -14,10 +14,11 @@ encryption for REST.
 ## Goals
 
 - REST and WebSocket share one key schedule and one AEAD construction.
-- Every WebSocket session key mixes in fresh server randomness, so replaying
-  a WebSocket handshake never reproduces a key or a nonce, even across daemon
-  restarts. REST has no round trip for a server nonce: see "Key schedule" for
-  where its freshness comes from.
+- Every session key in the server-to-client direction mixes in fresh server
+  randomness, so replaying a WebSocket handshake or a tunnel request never
+  reproduces a response key or nonce, even across daemon restarts. REST has
+  no round trip for a server nonce, so the server sends its randomness in
+  front of the response instead (sealed revision 2, see "Key schedule").
 - Non-loopback peers can only talk to the API through v2. Loopback peers may
   still use plaintext.
 - Encryption is invisible to business code: handlers and UI see plain
@@ -50,7 +51,9 @@ th   = SHA256(LP(label) || LP(protocol) || LP(device_id) ||
               LP(client_nonce) || LP(server_nonce))
 prk  = HKDF-Extract(salt = th, ikm = shared)
 k_up   = HKDF-Expand(prk, label || "/up",   32)   // client -> server
-k_down = HKDF-Expand(prk, label || "/down", 32)   // server -> client
+k_down = HKDF-Expand(prk, label || "/down", 32)   // server -> client (WebSocket)
+k_down = HKDF-Expand(prk, "todex.transport.v2/rest/down" || response_nonce, 32)
+                                                  // server -> client (REST, sealed revision 2)
 ```
 
 - `protocol` is the ASCII protocol id (`x25519` | `ml-kem-768`).
@@ -60,14 +63,18 @@ k_down = HKDF-Expand(prk, label || "/down", 32)   // server -> client
   bytes from the server.
 - REST: `label = "todex.transport.v2/rest"`, `device_id` = empty string (the
   inner request carries its own signature), `client_nonce` = 32 random bytes
-  per request, `server_nonce` = empty (zero-length). Freshness comes from the
-  per-request client material and the inner signature's single-use nonce:
-  a captured tunnel request replays to the same keys, but its signed inner
-  request is refused (`401`) because the device-auth nonce was already
-  claimed. Inner requests to unsigned public routes (`/health`,
-  `/v2/version`, `/v2/transport-policy`, `/v2/device-pairing/*`) can be
-  replayed through the tunnel; they are just as reachable directly, so this
-  gives an attacker nothing new.
+  per request, `server_nonce` = empty (zero-length). `response_nonce` is 32
+  bytes from the server's CSPRNG, generated for every tunnel response
+  (sealed inner errors included) and sent in front of the response records.
+  The upstream direction can be replayed: a captured tunnel request opens to
+  the same `k_up`. But every response is sealed under a `k_down` that only
+  that response's fresh nonce selects, so a replay never reproduces a
+  response key or record nonce. The replayed inner request itself is
+  refused by the device-auth signature's single-use nonce (and its
+  timestamp window); requests to unsigned public routes (`/health`,
+  `/v2/version`, `/v2/transport-policy`, `/v2/device-pairing/*`) may run
+  again, exactly as if sent directly. A client keeps `prk` only until it has
+  read the first 32 response bytes, derives `k_down` and wipes `prk`.
 
 ## Sealed records
 
@@ -115,6 +122,11 @@ Outer request headers:
 - `X-Todex-Encryption: <protocol>`
 - `X-Todex-Client-Key` (x25519) or `X-Todex-Kem-Ciphertext` (ml-kem-768)
 - `X-Todex-Request-Nonce: <b64url 32B>`
+- `X-Todex-Sealed-Revision: 2`
+
+An outer request without `X-Todex-Sealed-Revision: 2` (missing or another
+value) is answered with a plain `426 PROTOCOL_UPGRADE_REQUIRED` before its
+body is read.
 
 Outer body: a record stream sealed with `k_up`. On the wire each record is
 `u32_be(len(ciphertext)) || ciphertext`. Each record's plaintext is at most
@@ -137,8 +149,9 @@ head = UTF-8 JSON {"method": "GET", "path": "/v2/...", "query": "a=b" (optional,
   including device auth (which signs the inner method, path, query and body)
   and per-route body limits.
 
-Outer response: status `200`, `Content-Type: application/vnd.todex.sealed`,
-body is a record stream sealed with `k_down` whose plaintext is:
+Outer response: status `200`, `Content-Type: application/vnd.todex.sealed; r=2`,
+body is `response_nonce` (32 raw bytes) followed by a record stream sealed
+with that response's `k_down`, whose plaintext is:
 
 ```
 u32_be(len(head)) || head || body
@@ -147,13 +160,37 @@ head = UTF-8 JSON {"status": 200, "headers": {"content-type": "...", ...}}
 
 The server streams records as the inner body is produced. When the outer
 request itself cannot be opened (bad header, bad material, AEAD failure,
-truncation), the server answers a plain `400` with
-`{"error":{"code":"TRANSPORT_CRYPTO_FAILED","message":"transport crypto failure"}}`
+truncation, an inner head that does not arrive in time), the server answers
+a plain `400` with
+`{"code":"TRANSPORT_CRYPTO_FAILED","message":"transport crypto failure"}`
 and no further detail.
+
+Clients decrypt only a `200` whose content type is the sealed type with
+`r=2`. The nonce may span several body chunks; a body that ends before 32
+bytes is truncation (a crypto failure). Any other status or content type is
+an unauthenticated plain API error. A sealed content type without `r=2`
+comes from an older backend and is reported as "the backend needs an
+update".
+
+Admission (sealed inner answers carry the error envelope as the inner
+response):
+
+- The inner head must be decrypted within 30 s of the request start; else a
+  plain `400 TRANSPORT_CRYPTO_FAILED`.
+- The outer body may pause at most 30 s between chunks. Before the inner
+  head: plain `400`; after it: sealed inner `408 REQUEST_TIMEOUT`.
+- Admitted requests wait at most 10 s for a permit (32 for routes that need
+  a device credential, a separate 4 for the public routes). Past that:
+  sealed inner `503` `{"code":"TRANSPORT_BUSY",...}` with inner header
+  `retry-after: 1`. The request was not run and its signature nonce was not
+  claimed; a client may retry it once with a fresh signature, whatever the
+  method.
 
 ## Enforcement
 
-- `/v2/transport-policy` adds `"transportVersion": 2`.
+- `/v2/transport-policy` adds `"transportVersion": 2` and
+  `"sealedRevision": 2`. Clients check the revision while connecting and
+  refuse (no fallback) when it is missing or different.
 - A non-loopback listener with `pairing_encryption = "none"` is a startup
   error. Loopback listeners may keep `none`.
 - For a non-loopback peer, only these routes are reachable directly:
@@ -195,18 +232,28 @@ transcript so the verification code authenticates it.
 commit     = SHA256(LP("todex.device-pairing.v3/commit") || client_public || client_nonce)
 transcript = "todex.device-pairing.v3/transcript\0" || request_id || 0x00 ||
              client_public || server_public || 0x00 || device_public || client_nonce ||
-             LP(transport_protocol_ascii) || LP(transport_public_key_raw)
+             LP(transport_protocol_ascii) || LP(transport_public_key_raw) ||
+             LP(utf8(device_name))
 LP(x)      = u32_be(len(x)) || x        (for none: LP("none") || 00 00 00 00)
 ```
 
 1. `POST /v2/device-pairing/create`
-   `{clientCommitment, transportBinding: 1, deviceName, devicePublicKey}` →
+   `{clientCommitment, transportBinding: 1, deviceNameBinding: 1, deviceName,
+   devicePublicKey}` →
    `{requestId, serverPublicKey, expiresAt, pollIntervalMs, transportProtocol,
    transportPublicKey}`. `transportProtocol` is `none`, `x25519` or
    `ml-kem-768`; `transportPublicKey` is base64url without padding (32 bytes
    for x25519, 1184 for ml-kem-768, the empty string for `none`). A body with
-   `clientPublicKey` (v2), or without `transportBinding` equal to the JSON
-   integer `1`, answers `426 PROTOCOL_UPGRADE_REQUIRED`. Before deriving
+   `clientPublicKey` (v2), or without `transportBinding` and
+   `deviceNameBinding` both equal to the JSON integer `1`, answers
+   `426 PROTOCOL_UPGRADE_REQUIRED`. `deviceName` is bound into the transcript
+   byte for byte. Clients trim surrounding whitespace and fill in a default
+   name when it is empty; the server never trims or substitutes and answers
+   `400 INVALID_REQUEST` unless the name has 1–80 Unicode scalars, no Cc
+   control characters, no bidirectional formatting characters (U+200E,
+   U+200F, U+202A–U+202E, U+2066–U+2069) and no leading or trailing
+   whitespace (Unicode `White_Space`). A small-order (weak) Ed25519
+   `devicePublicKey` is a `400` too. Before deriving
    anything the client validates the protocol and key (length, canonical
    base64url, a throwaway handshake; `none` only for a loopback server).
 2. `POST /v2/device-pairing/reveal` `{requestId, clientPublicKey, clientNonce}`.
@@ -214,13 +261,28 @@ LP(x)      = u32_be(len(x)) || x        (for none: LP("none") || 00 00 00 00)
    material from the v3 transcript (same HKDF salt/info pattern as v2 with v3
    labels: `todex.device-pairing.v3/wrap-key`, `/poll-proof`, `/cancel-proof`),
    and only then shows the verification code. Answers `{"status":"pending"}`.
-   A second reveal for the same request fails.
+   A second reveal for the same request fails. A reveal that does not open
+   the commitment answers `401` and leaves the request in place.
 3. `poll` and `cancel` are unchanged apart from using v3 material. The
    approval credential (XChaCha20-Poly1305 under the wrap key, AAD = the full
    transcript) is the JSON
    `{"deviceId", "transportProtocol", "transportPublicKey"}`. The client
    checks that `deviceId` matches its device key and that both transport
    fields equal the create response exactly; otherwise it pins nothing.
+
+Admission (all of it unauthenticated): limits count per source, an IPv4
+address or an IPv6 /64 (IPv4-mapped addresses count as IPv4). `create`
+allows 4 per source and 24 overall per minute; a request must be revealed
+within 30 s or it is dropped; a source may have at most 2 unfinished
+(unrevealed or undecided) requests, else `429 PAIRING_BUSY`; when 16 requests
+are active, the oldest unrevealed one is dropped to make room, and only when
+every one is revealed does `create` answer `429 PAIRING_BUSY`. Each request
+takes 8 reveals per minute and 4 poll/cancel calls per second, with a
+global backstop of 1024 reveal/poll/cancel calls per second; over a limit
+the answer is `429 RATE_LIMITED` with `Retry-After`. Until `expiresAt`,
+clients keep polling through `429`, `5xx` and network errors with a backoff
+that doubles up to 5 s, and stop only on `404`, `expired`, `rejected`,
+`401` or a user cancel.
 
 The verification code is still the first 5 bytes of `SHA256(transcript)`,
 formatted `XXXXX-XXXXX`. The key fingerprint shown next to it (backend TUI)
@@ -243,10 +305,16 @@ ml-kem-768, the ciphertext with its expected shared secret, because not every
 library supports deterministic encapsulation), nonces, `th`, `k_up`, `k_down`,
 WebSocket frames for a few messages in both directions, a REST request and
 response stream including a multi-record case, and failure cases (wrong
-counter, flipped tag bit, truncated stream, extra trailing bytes). It also
-contains a pairing v3 vector (commitment, transport binding, transcript hash,
-code, the three derived keys, the credential plaintext and ciphertext for a
-fixed nonce, the fingerprint, a tampered-key case and the `none` case).
+counter, flipped tag bit, truncated stream, extra trailing bytes). REST adds
+`prk`, a fixed `responseNonce` with its `kDown`, `kDownWithoutNonce` (the
+pre-revision key, which must not open anything), a second response to the
+same request under another nonce, the nonce-prefixed response streams, and
+prefix failures (short prefix, prefix only, missing prefix, records under
+the nonce-less key, swapped nonces). It also contains a pairing v3 vector
+(commitment, transport binding, device name, transcript hash, code, the
+three derived keys, the credential plaintext and ciphertext for a fixed
+nonce, the fingerprint, a tampered-key case, the `none` case, a non-ASCII
+name, a tampered name, and valid and invalid device names).
 
 ## Clarifications (normative)
 
@@ -270,9 +338,9 @@ fixed nonce, the fingerprint, a tampered-key case and the `none` case).
    frame limit minus 24 bytes (8-byte counter + 16-byte tag).
 9. The `device_id` in the key schedule is the one in the signed upgrade
    credential; a client whose signer has a different id refuses to connect.
-10. A tunnel response that is not `200` with the sealed content type is not
-    authenticated and is reported as a plain API error (for example `400
-    TRANSPORT_CRYPTO_FAILED` or `426 PROTOCOL_UPGRADE_REQUIRED`).
+10. A tunnel response that is not `200` with the sealed content type and
+    `r=2` is not authenticated and is reported as a plain API error (for
+    example `400 TRANSPORT_CRYPTO_FAILED` or `426 PROTOCOL_UPGRADE_REQUIRED`).
 
 ## Backend implementation notes
 
@@ -282,8 +350,11 @@ fixed nonce, the fingerprint, a tampered-key case and the `none` case).
   `server::ws` (handshake negotiation, the plaintext / v1 / v2 frame codecs
   and the socket loops) and `server::sealed` (the tunnel). Business handlers
   only see JSON text and plain HTTP requests.
-- Keys live inside the AEAD (wiped on drop); transcripts, shared secrets and
-  derived keys are `Zeroizing`. pqcrypto-mlkem's `SharedSecret` is a plain
+- Keys live inside the AEAD (wiped on drop); transcripts, shared secrets,
+  `prk` and derived keys are `Zeroizing`. The tunnel derives `k_down` as soon
+  as it has drawn the response nonce, at the start of the request, and wipes
+  `prk` right away (hkdf 0.12 keeps an HMAC state for the expansion that it
+  does not zeroize; it lives only for that call). pqcrypto-mlkem's `SharedSecret` is a plain
   `Copy` array without zeroize support, so the backend overwrites its own
   copy with a volatile write after copying it out; the temporary that
   `decapsulate` fills inside the crate cannot be reached.
@@ -311,8 +382,11 @@ fixed nonce, the fingerprint, a tampered-key case and the `none` case).
     and answers a sealed inner `401` (`403` for the anonymous check). The
     full signature over the body is still verified by the router's device
     auth. Requests that pass this check share 32 permits for buffering and
-    handling the inner request; extra ones wait. A permit is released once
-    the inner handler has produced its response head.
+    handling the inner request, public routes a separate 4; extra ones wait
+    up to 10 s (then `503 TRANSPORT_BUSY`). A permit is released once the
+    inner handler has produced its response head. The 30 s head deadline
+    and the 30 s gap limit between outer body chunks bound how long a slow
+    peer holds a connection or a permit.
   - Inner headers kept: `content-type`, `accept`, `x-todex-device-id`,
     `x-todex-auth-ts`, `x-todex-auth-nonce`, `x-todex-auth-sig` (names are
     matched case-insensitively). `Host` and `Origin` are taken from the outer
@@ -344,8 +418,10 @@ fixed nonce, the fingerprint, a tampered-key case and the `none` case).
   request whose bound key no longer matches (reset after `create`) is
   answered `expired` without registering the device. The verification code reaches the
   local approver (TUI) only after `reveal`. A reveal that does not open the
-  commitment discards the request; a second reveal answers `409 CONFLICT`.
-  `poll` and `cancel` before `reveal` answer `401`.
+  commitment answers `401` and keeps the request; a second reveal answers
+  `409 CONFLICT`. `poll` and `cancel` before `reveal` answer `401`. The
+  approval summary file carries the `deviceId` the request would enroll and
+  the canonical peer address for the TUI.
 
 ## Enforcement in the backend
 
