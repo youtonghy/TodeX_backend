@@ -91,22 +91,48 @@ impl Sessions {
     }
 
     pub async fn stop(&self, id: &str) {
-        if let Some(sender) = self.workers.lock().await.remove(id) {
-            let (tx, rx) = oneshot::channel();
-            if sender.send(Command::Shutdown(tx)).await.is_ok() {
-                let _ = rx.await;
-            }
+        // Its own statement: in edition 2021 the guard of a lock taken in an
+        // `if let` scrutinee lives through the whole block, which would hold
+        // every other session's run/control/stop behind this shutdown.
+        let sender = self.workers.lock().await.remove(id);
+        if let Some(sender) = sender {
+            shutdown_worker(id, sender).await;
         }
     }
 
     pub async fn stop_all(&self) {
         let workers = std::mem::take(&mut *self.workers.lock().await);
-        for (_, sender) in workers {
-            let (tx, rx) = oneshot::channel();
-            if sender.send(Command::Shutdown(tx)).await.is_ok() {
-                let _ = rx.await;
-            }
+        futures_util::future::join_all(
+            workers
+                .into_iter()
+                .map(|(id, sender)| async move { shutdown_worker(&id, sender).await }),
+        )
+        .await;
+    }
+}
+
+/// How long a worker may take to acknowledge a shutdown: a busy worker reads
+/// it between protocol frames, then gives its process the graceful-stop
+/// window before killing it.
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Asks the worker to stop its process and waits, bounded, for it. A worker
+/// that does not answer in time still exits once its command channel closes,
+/// which dropping `sender` (already out of the map) does.
+async fn shutdown_worker(id: &str, sender: mpsc::Sender<Command>) {
+    let (tx, rx) = oneshot::channel();
+    let stopped = tokio::time::timeout(WORKER_STOP_TIMEOUT, async {
+        if sender.send(Command::Shutdown(tx)).await.is_ok() {
+            let _ = rx.await;
         }
+    })
+    .await;
+    if stopped.is_err() {
+        tracing::warn!(
+            conversation_id = id,
+            timeout_secs = WORKER_STOP_TIMEOUT.as_secs(),
+            "Codex session worker did not acknowledge shutdown in time; closing its command channel"
+        );
     }
 }
 
@@ -661,6 +687,30 @@ mod tests {
     use crate::workspace_trust::WorkspaceTrustStore;
     #[cfg(unix)]
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn stopping_a_session_does_not_hold_the_worker_map() {
+        let sessions = std::sync::Arc::new(Sessions::new());
+        let (tx, mut commands) = mpsc::channel(1);
+        sessions.workers.lock().await.insert("slow".to_owned(), tx);
+        let stopping = tokio::spawn({
+            let sessions = sessions.clone();
+            async move { sessions.stop("slow").await }
+        });
+        let Some(Command::Shutdown(done)) = commands.recv().await else {
+            panic!("the worker should be asked to shut down");
+        };
+        // While that worker is still stopping its process, other sessions
+        // can run, control and stop.
+        let workers = tokio::time::timeout(Duration::from_secs(1), sessions.workers.lock())
+            .await
+            .expect("the worker map is free while a worker stops");
+        drop(workers);
+        assert!(!stopping.is_finished());
+        done.send(()).unwrap();
+        stopping.await.unwrap();
+        assert!(sessions.workers.lock().await.is_empty());
+    }
 
     #[test]
     fn controls_use_exact_upstream_preconditions_and_queue_identity() {
