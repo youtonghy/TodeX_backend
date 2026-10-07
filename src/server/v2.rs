@@ -2441,6 +2441,9 @@ async fn handle_agent_desktop_frame(
                     ));
                 }
                 let browser = state.agent_desktop.browser().clone();
+                // `unwatch` unregisters the key, so a put the aborted task
+                // was finishing cannot queue a frame after it.
+                frames.register(&conversation_id);
                 let frames = frames.clone();
                 let watched = conversation_id.clone();
                 let task = tokio::spawn(async move {

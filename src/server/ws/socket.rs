@@ -1,5 +1,5 @@
 //! Socket read/write loops for `/v2/ws`, shared by every transport.
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,7 +57,10 @@ impl Outbound {
 /// drained by the send task beside the shared queue. A newer frame replaces
 /// an unsent one instead of queueing behind it, and nothing put here is
 /// dropped for lack of room, so the final state (e.g. `closed`) always
-/// arrives while the connection lives.
+/// arrives while the connection lives. Only registered keys take frames:
+/// a view registers when it starts watching and [`FrameSlots::remove`]
+/// unregisters it under the same mutex, so a producer that is still
+/// finishing a `put` after the view closed cannot queue a stray frame.
 #[derive(Clone, Default)]
 pub(crate) struct FrameSlots {
     inner: Arc<FrameSlotsInner>,
@@ -65,45 +68,64 @@ pub(crate) struct FrameSlots {
 
 #[derive(Default)]
 struct FrameSlotsInner {
-    /// Pending frames in first-put order; at most one per key.
-    pending: Mutex<VecDeque<(String, Outbound)>>,
+    state: Mutex<SlotState>,
     ready: Notify,
 }
 
+#[derive(Default)]
+struct SlotState {
+    /// Keys whose view is open.
+    registered: HashSet<String>,
+    /// Pending frames in first-put order; at most one per key.
+    pending: VecDeque<(String, Outbound)>,
+}
+
 impl FrameSlots {
-    /// Replaces `key`'s unsent frame, or queues it.
+    /// Opens `key`'s view: from now on `put` accepts its frames.
+    pub(crate) fn register(&self, key: &str) {
+        self.lock().registered.insert(key.to_owned());
+    }
+
+    /// Replaces `key`'s unsent frame, or queues it. A frame for a key that
+    /// is not registered (never watched, or already removed) is dropped.
     pub(crate) fn put(&self, key: &str, frame: Outbound) {
         {
-            let mut pending = self.lock();
-            match pending
+            let mut state = self.lock();
+            if !state.registered.contains(key) {
+                return;
+            }
+            match state
+                .pending
                 .iter_mut()
                 .find(|(pending_key, _)| pending_key == key)
             {
                 Some(slot) => slot.1 = frame,
-                None => pending.push_back((key.to_owned(), frame)),
+                None => state.pending.push_back((key.to_owned(), frame)),
             }
         }
         self.inner.ready.notify_one();
     }
 
-    /// Drops `key`'s unsent frame (the view was closed).
+    /// Closes `key`'s view: unregisters it and drops its unsent frame.
     pub(crate) fn remove(&self, key: &str) {
-        self.lock().retain(|(pending_key, _)| pending_key != key);
+        let mut state = self.lock();
+        state.registered.remove(key);
+        state.pending.retain(|(pending_key, _)| pending_key != key);
     }
 
     fn take(&self) -> Option<Outbound> {
-        let mut pending = self.lock();
-        let frame = pending.pop_front().map(|(_, frame)| frame);
-        if !pending.is_empty() {
+        let mut state = self.lock();
+        let frame = state.pending.pop_front().map(|(_, frame)| frame);
+        if !state.pending.is_empty() {
             // Keep the send task coming back for the rest.
             self.inner.ready.notify_one();
         }
         frame
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<(String, Outbound)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SlotState> {
         self.inner
-            .pending
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -347,6 +369,9 @@ mod tests {
     #[test]
     fn frame_slots_keep_the_latest_frame_per_key() {
         let slots = FrameSlots::default();
+        for key in ["a", "b", "c"] {
+            slots.register(key);
+        }
         slots.put("a", text(json!({ "seq": 1 })));
         slots.put("b", text(json!({ "seq": 10 })));
         slots.put("a", text(json!({ "seq": 2 })));
@@ -355,6 +380,23 @@ mod tests {
         assert_eq!(slots.take().unwrap().into_value(), json!({ "seq": 2 }));
         assert_eq!(slots.take().unwrap().into_value(), json!({ "seq": 10 }));
         assert!(slots.take().is_none());
+    }
+
+    #[test]
+    fn frame_slots_drop_frames_of_views_that_are_not_open() {
+        let slots = FrameSlots::default();
+        slots.put("never", text(json!({ "seq": 1 })));
+        assert!(slots.take().is_none(), "never watched");
+        slots.register("view");
+        slots.put("view", text(json!({ "seq": 2 })));
+        slots.remove("view");
+        assert!(slots.take().is_none(), "removed with its view");
+        // A producer that finishes a put after the view closed.
+        slots.put("view", text(json!({ "seq": 3 })));
+        assert!(slots.take().is_none(), "late frame after unwatch");
+        slots.register("view");
+        slots.put("view", text(json!({ "seq": 4 })));
+        assert_eq!(slots.take().unwrap().into_value(), json!({ "seq": 4 }));
     }
 
     #[tokio::test]
@@ -368,6 +410,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        frames.register("view");
         frames.put("view", text(json!({ "seq": 1 })));
         frames.put("view", text(json!({ "seq": 2 })));
         frames.put("view", text(json!({ "closed": true })));
@@ -395,6 +438,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        frames.register("view");
         frames.put("view", text(json!({ "frame": true })));
         let mut order = Vec::new();
         for _ in 0..41 {
