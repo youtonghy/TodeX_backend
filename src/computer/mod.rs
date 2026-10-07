@@ -17,7 +17,10 @@ pub(crate) mod tree;
 
 use std::{
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -135,17 +138,35 @@ struct NativeComputer {
     engine: Arc<Mutex<Engine>>,
 }
 
+/// Marks the work of a call abandoned when its future is dropped (the
+/// caller timed out or was cancelled), so the blocking thread, which
+/// cannot be stopped, sends no input it has not sent yet.
+struct AbandonOnDrop(Arc<AtomicBool>);
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 impl NativeComputer {
     async fn with_engine<T: Send + 'static>(
         &self,
-        work: impl FnOnce(&mut Engine) -> Result<T, ComputerError> + Send + 'static,
+        work: impl FnOnce(&mut Engine, &AtomicBool) -> Result<T, ComputerError> + Send + 'static,
     ) -> Result<T, ComputerError> {
         let engine = self.engine.clone();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let _abandon = AbandonOnDrop(abandoned.clone());
         tokio::task::spawn_blocking(move || {
             let mut engine = engine
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            work(&mut engine)
+            // An earlier call may have held the engine past this one's
+            // deadline.
+            if abandoned.load(Ordering::SeqCst) {
+                return Err(ComputerError::new("CANCELLED", "the call was abandoned"));
+            }
+            work(&mut engine, &abandoned)
         })
         .await
         .map_err(ComputerError::platform)?
@@ -195,7 +216,8 @@ impl ComputerHost for NativeComputer {
     }
 
     async fn observe(&self, args: Value) -> Result<Value, ComputerError> {
-        self.with_engine(move |engine| engine.observe(&args)).await
+        self.with_engine(move |engine, _| engine.observe(&args, std::process::id()))
+            .await
     }
 
     async fn act(
@@ -204,12 +226,13 @@ impl ComputerHost for NativeComputer {
         allowed_apps: Vec<String>,
         confirmed: bool,
     ) -> Result<Value, ComputerError> {
-        self.with_engine(move |engine| {
+        self.with_engine(move |engine, cancelled| {
             engine.act(
                 &args,
                 Grants {
                     allowed_apps: &allowed_apps,
                     confirmed,
+                    cancelled,
                 },
                 std::process::id(),
             )
@@ -218,7 +241,7 @@ impl ComputerHost for NativeComputer {
     }
 
     async fn frame(&self, max_width: u32, quality: u8) -> Result<Vec<u8>, ComputerError> {
-        self.with_engine(move |engine| engine.frame(max_width, quality))
+        self.with_engine(move |engine, _| engine.frame(max_width, quality))
             .await
     }
 

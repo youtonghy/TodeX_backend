@@ -62,6 +62,8 @@ struct Pill {
 }
 
 static MARKER_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// `windowNumber` of the marker panel; 0 before it exists.
+static MARKER_WINDOW: AtomicU64 = AtomicU64::new(0);
 /// One confirmation dialog at a time.
 static CONFIRMING: Mutex<()> = Mutex::new(());
 /// Where the on-screen confirmation sends its answer.
@@ -313,6 +315,10 @@ pub(super) fn mark_point(x: f64, y: f64) {
         });
         marker.setFrame_display(frame, true);
         marker.orderFrontRegardless();
+        // Known once on screen (a window gets its number when ordered in).
+        if let Ok(number) = u64::try_from(marker.windowNumber()) {
+            MARKER_WINDOW.store(number, Ordering::SeqCst);
+        }
     });
     std::thread::spawn(move || {
         std::thread::sleep(MARKER_VISIBLE);
@@ -324,6 +330,12 @@ pub(super) fn mark_point(x: f64, y: f64) {
             });
         }
     });
+}
+
+pub(super) fn marker_window() -> Option<u32> {
+    u32::try_from(MARKER_WINDOW.load(Ordering::SeqCst))
+        .ok()
+        .filter(|number| *number != 0)
 }
 
 pub(super) fn confirm(strings: &Strings, title: &str, message: &str, timeout: Duration) -> bool {

@@ -3,13 +3,20 @@
 //! [`policy`], and performs it. Runs on blocking threads behind a mutex;
 //! refs and the screenshot mapping belong to the latest observation.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
 use xa11y::{
     input::{InputSim, MouseButton, ScrollDelta},
-    ElementData, Point, Provider, Rect, ScreenshotProvider,
+    ElementData, Point, Provider, Rect, Screenshot, ScreenshotProvider,
 };
 
 use super::{
@@ -25,6 +32,8 @@ const MAX_WINDOWS: usize = 40;
 const MAX_NODES: usize = 4000;
 const MAX_DEPTH: usize = 60;
 const MAX_WAIT_MS: u64 = 10_000;
+/// How long an app just brought forward may take to own the keyboard.
+const FRONT_SETTLE: Duration = Duration::from_millis(500);
 
 /// A window listed by the latest observation; agents refer to it by `id`.
 struct WindowEntry {
@@ -53,6 +62,9 @@ pub(super) struct Engine {
 pub(super) struct Grants<'a> {
     pub allowed_apps: &'a [String],
     pub confirmed: bool,
+    /// Set when the caller stopped waiting (timeout, cancellation): input
+    /// not sent yet is dropped.
+    pub cancelled: &'a AtomicBool,
 }
 
 impl Engine {
@@ -98,7 +110,10 @@ impl Engine {
 
     // ---- Observe --------------------------------------------------------
 
-    pub(super) fn observe(&mut self, args: &Value) -> Result<Value, ComputerError> {
+    /// Protected apps (TodeX itself, [`policy::is_blocked`]) stay unseen:
+    /// naming one is refused, its tree is never read, its window titles
+    /// are withheld and its windows are painted over in screenshots.
+    pub(super) fn observe(&mut self, args: &Value, own_pid: u32) -> Result<Value, ComputerError> {
         let provider = self.provider()?;
         self.reset();
         self.list_windows(&provider);
@@ -122,22 +137,38 @@ impl Engine {
             })?,
             (None, None) => frontmost(&provider)?,
         };
+        let protected = policy::is_protected(&app, own_pid);
+        if protected && (target_window.is_some() || args["app"].is_string()) {
+            return Err(ComputerError::from(policy::blocked(label(&app))));
+        }
+        // The front app is protected: show the display without its tree.
         let window_index = target_window.or_else(|| {
             self.windows
                 .iter()
-                .position(|window| window.app.pid == app.pid)
+                .position(|window| !protected && window.app.pid == app.pid)
         });
-        let root = match window_index {
-            Some(index) => self.windows[index].element.clone(),
-            None => provider
-                .app_by_pid(app.pid)
-                .map_err(ComputerError::platform)?,
+        let (tree_text, truncated) = if protected {
+            (
+                format!(
+                    "({} is protected: its contents are hidden. Name another app or window to observe it.)",
+                    label(&app)
+                ),
+                false,
+            )
+        } else {
+            let root = match window_index {
+                Some(index) => self.windows[index].element.clone(),
+                None => provider
+                    .app_by_pid(app.pid)
+                    .map_err(ComputerError::platform)?,
+            };
+            let offset = window_index.map_or((0, 0), |index| self.windows[index].offset);
+            let mut budget = MAX_NODES;
+            let node = self.read_tree(&provider, root, 0, offset, &mut budget);
+            let formatted = tree::format(&node);
+            self.refs = formatted.refs;
+            (formatted.text, formatted.truncated || budget == 0)
         };
-        let offset = window_index.map_or((0, 0), |index| self.windows[index].offset);
-        let mut budget = MAX_NODES;
-        let node = self.read_tree(&provider, root.clone(), 0, offset, &mut budget);
-        let formatted = tree::format(&node);
-        self.refs = formatted.refs;
 
         let displays = platform::displays();
         let mut result = json!({
@@ -146,11 +177,11 @@ impl Engine {
                 "id": window.id,
                 "app": window.app.name,
                 "bundleId": window.app.id,
-                "title": window.title,
+                "title": if policy::is_protected(&window.app, own_pid) { "" } else { &window.title },
             })).collect::<Vec<_>>(),
             "displays": displays,
-            "tree": formatted.text,
-            "truncated": formatted.truncated || budget == 0,
+            "tree": tree_text,
+            "truncated": truncated,
         });
         if let Some(index) = window_index {
             let window = &self.windows[index];
@@ -180,7 +211,7 @@ impl Engine {
                     .or_else(|| displays.first().map(display_rect))
                     .ok_or_else(|| ComputerError::platform("no display to capture"))?,
             };
-            let (screenshot, mapping) = self.capture(rect)?;
+            let (screenshot, mapping) = self.capture(rect, own_pid)?;
             self.shot = Some(mapping);
             result["screenshot"] = screenshot;
         }
@@ -268,11 +299,12 @@ impl Engine {
         node
     }
 
-    fn capture(&mut self, rect: Rect) -> Result<(Value, ShotMapping), ComputerError> {
+    fn capture(&mut self, rect: Rect, own_pid: u32) -> Result<(Value, ShotMapping), ComputerError> {
         let screenshots = self.screenshots()?;
-        let shot = screenshots
+        let mut shot = screenshots
             .capture_region(rect)
             .map_err(ComputerError::platform)?;
+        self.hide_protected(&mut shot, rect, own_pid)?;
         let shot = if shot.width > SCREENSHOT_MAX_WIDTH {
             let height = (u64::from(shot.height) * u64::from(SCREENSHOT_MAX_WIDTH)
                 / u64::from(shot.width))
@@ -302,6 +334,59 @@ impl Engine {
             }),
             mapping,
         ))
+    }
+
+    /// Paints over protected apps' visible windows. Where the platform
+    /// cannot list windows, a capture that may show one is refused.
+    fn hide_protected(
+        &self,
+        shot: &mut Screenshot,
+        rect: Rect,
+        own_pid: u32,
+    ) -> Result<(), ComputerError> {
+        let mut known: HashMap<u32, bool> = HashMap::new();
+        let mut protected = |pid: u32| {
+            *known.entry(pid).or_insert_with(|| {
+                pid != 0 && policy::is_protected(&platform::app_identity(pid), own_pid)
+            })
+        };
+        let capture = (
+            f64::from(rect.x),
+            f64::from(rect.y),
+            f64::from(rect.width),
+            f64::from(rect.height),
+        );
+        let Some(stack) = platform::window_stack() else {
+            let shown = self.windows.iter().find(|window| {
+                protected(window.app.pid)
+                    && window.element.bounds.is_some_and(|bounds| {
+                        overlaps(
+                            capture,
+                            (
+                                f64::from(bounds.x),
+                                f64::from(bounds.y),
+                                f64::from(bounds.width),
+                                f64::from(bounds.height),
+                            ),
+                        )
+                    })
+            });
+            return match shown {
+                Some(window) => Err(ComputerError::new(
+                    "TARGET_BLOCKED",
+                    format!(
+                        "{} is on screen and this computer cannot hide it from a screenshot; \
+                         observe with screenshot: false or ask the user to move it away.",
+                        label(&window.app)
+                    ),
+                )),
+                None => Ok(()),
+            };
+        };
+        let areas = policy::protected_areas(&stack, &mut protected);
+        let (width, height) = (shot.width, shot.height);
+        policy::paint_areas(&mut shot.pixels, width, height, capture, &areas);
+        Ok(())
     }
 
     /// A JPEG of the display a session works on, for live viewers.
@@ -340,6 +425,29 @@ impl Engine {
         own_pid: u32,
     ) -> Result<Value, ComputerError> {
         let action = args["action"].as_str().unwrap_or_default().to_owned();
+        let cancelled = grants.cancelled;
+        if action != "wait" && super::host_ui::confirming() {
+            return Err(ComputerError::new(
+                "TARGET_BLOCKED",
+                "a TodeX confirmation is open on this computer; only the person there may answer it. Retry after it closes.",
+            ));
+        }
+        let chord = if action == "key" {
+            let chord = keys::parse(args["keys"].as_str().unwrap_or_default())
+                .map_err(ComputerError::invalid)?;
+            if let Some(what) = keys::system_shortcut(&chord) {
+                return Err(ComputerError::new(
+                    "TARGET_BLOCKED",
+                    format!(
+                        "{} is a system shortcut ({what}) that agents may not send.",
+                        args["keys"].as_str().unwrap_or_default()
+                    ),
+                ));
+            }
+            Some(chord)
+        } else {
+            None
+        };
         let provider = if action == "wait" || action == "open_app" {
             None
         } else {
@@ -365,12 +473,21 @@ impl Engine {
         let point = self.map_point(args["x"].as_f64(), args["y"].as_f64())?;
         let to = self.map_point(args["toX"].as_f64(), args["toY"].as_f64())?;
 
-        if action != "wait" {
+        let target = if action == "wait" {
+            Target::default()
+        } else {
             let target = self.target(&action, args, element.as_ref(), point, provider.as_ref())?;
             if let Some(failure) = policy::check_target(&target, grants.allowed_apps, own_pid) {
                 return Err(ComputerError::from(failure));
             }
-        }
+            target
+        };
+        // Pointer input lands wherever the pointer is: right before it is
+        // sent, nothing protected may be there, and a point the policy
+        // checked must still show the same app.
+        let landing = |at: (f64, f64), same_app: bool| {
+            check_landing(at, &target, same_app && point.is_some(), own_pid, cancelled)
+        };
         if policy::uses_pointer(&action, point.is_some()) {
             if let Some(failure) =
                 policy::check_user_active(&action, point.is_some(), platform::idle_seconds())
@@ -401,6 +518,7 @@ impl Engine {
                             "show_menu"
                         };
                         element.actions.iter().any(|a| a == verb)
+                            && !cancelled.load(Ordering::SeqCst)
                             && provider.as_ref().is_some_and(|provider| {
                                 provider.perform_action(element, verb).is_ok()
                             })
@@ -409,6 +527,7 @@ impl Engine {
                     "background"
                 } else {
                     let at = require_point(pointer_at)?;
+                    landing(at, true)?;
                     super::host_ui::mark_point(at.0, at.1);
                     let button = if action == "click" {
                         MouseButton::Left
@@ -424,6 +543,7 @@ impl Engine {
             }
             "double_click" => {
                 let at = require_point(pointer_at)?;
+                landing(at, true)?;
                 super::host_ui::mark_point(at.0, at.1);
                 self.input()?
                     .backend()
@@ -433,6 +553,7 @@ impl Engine {
             }
             "hover" => {
                 let at = require_point(pointer_at)?;
+                landing(at, true)?;
                 self.input()?
                     .mouse()
                     .move_to(to_point(at))
@@ -442,6 +563,8 @@ impl Engine {
             "drag" => {
                 let from = require_point(pointer_at)?;
                 let to = to.ok_or_else(|| ComputerError::invalid("drag needs toX and toY"))?;
+                landing(from, true)?;
+                landing(to, false)?;
                 super::host_ui::mark_point(from.0, from.1);
                 self.input()?
                     .mouse()
@@ -458,48 +581,38 @@ impl Engine {
                     Some(at) => at,
                     None => self.default_point()?,
                 };
+                landing(at, true)?;
                 self.input()?
                     .mouse()
                     .scroll(to_point(at), delta)
                     .map_err(ComputerError::platform)?;
                 "pointer"
             }
-            "type" => {
-                self.type_text(args, element.as_ref(), provider.as_ref(), grants.confirmed)?
-            }
+            "type" => self.type_text(
+                args,
+                element.as_ref(),
+                provider.as_ref(),
+                grants.confirmed,
+                own_pid,
+                cancelled,
+            )?,
             "key" => {
-                let chord = keys::parse(args["keys"].as_str().unwrap_or_default())
-                    .map_err(ComputerError::invalid)?;
-                let pid = match args["app"].as_str() {
-                    Some(identifier) => Some(
-                        platform::running_app(identifier)
-                            .ok_or_else(|| {
-                                ComputerError::invalid(format!("{identifier} is not running"))
-                            })?
-                            .pid,
-                    ),
-                    None => provider
-                        .as_ref()
-                        .and_then(|provider| provider.focused_app().ok())
-                        .and_then(|app| app.pid),
-                };
-                match pid {
-                    Some(pid)
-                        if platform::post_chord(pid, &chord)
-                            .map_err(ComputerError::platform)? =>
-                    {
-                        "background"
-                    }
-                    _ => {
-                        if let Some(pid) = pid {
-                            platform::activate(pid, None).map_err(ComputerError::platform)?;
-                        }
-                        self.input()?
-                            .keyboard()
-                            .chord(chord.key.clone(), &chord.held)
-                            .map_err(ComputerError::platform)?;
-                        "keyboard"
-                    }
+                let chord = chord.ok_or_else(|| ComputerError::invalid("key needs keys"))?;
+                // The app the policy checked, not whatever is in front now.
+                let pid = Some(target.pid).filter(|pid| *pid != 0).ok_or_else(|| {
+                    ComputerError::new("TARGET_CHANGED", "no app to send the keys to")
+                })?;
+                live(cancelled)?;
+                if platform::post_chord(pid, &chord).map_err(ComputerError::platform)? {
+                    "background"
+                } else {
+                    platform::activate(pid, None).map_err(ComputerError::platform)?;
+                    check_front(provider.as_ref(), pid, own_pid, cancelled)?;
+                    self.input()?
+                        .keyboard()
+                        .chord(chord.key.clone(), &chord.held)
+                        .map_err(ComputerError::platform)?;
+                    "keyboard"
                 }
             }
             "wait" => {
@@ -508,11 +621,13 @@ impl Engine {
                 "none"
             }
             "open_app" => {
+                live(cancelled)?;
                 platform::open_app(args["app"].as_str().unwrap_or_default())
                     .map_err(ComputerError::invalid)?;
                 "background"
             }
             "focus_window" => {
+                live(cancelled)?;
                 if let Some(id) = args["window"].as_u64() {
                     let window = self
                         .windows
@@ -646,8 +761,11 @@ impl Engine {
         element: Option<&ElementData>,
         provider: Option<&Arc<dyn Provider>>,
         confirmed: bool,
+        own_pid: u32,
+        cancelled: &AtomicBool,
     ) -> Result<&'static str, ComputerError> {
         let text = args["text"].as_str().unwrap_or_default();
+        live(cancelled)?;
         let provider =
             provider.ok_or_else(|| ComputerError::platform("no accessibility provider"))?;
         if let Some(element) = element {
@@ -662,6 +780,7 @@ impl Engine {
             // platform may paste text its keystrokes cannot type.
             let secure = platform::is_secure(element) || is_secure_role(element);
             if let (true, false, Some(pid)) = (focused, secure, element.pid) {
+                live(cancelled)?;
                 if platform::paste_text(pid, text).map_err(ComputerError::platform)? {
                     return Ok("keyboard");
                 }
@@ -675,21 +794,106 @@ impl Engine {
             (None, Some(identifier)) => platform::running_app(identifier).map(|app| app.pid),
             (None, None) => provider.focused_app().ok().and_then(|app| app.pid),
         };
-        if let Some(pid) = pid {
-            match platform::type_into_focused(pid, text, confirmed) {
-                Typed::Inserted => return Ok("background"),
-                Typed::Secure => return Err(sensitive()),
-                Typed::Unsupported => {
-                    platform::activate(pid, None).map_err(ComputerError::platform)?
-                }
-            }
+        // Never typed blind: keystrokes go to whatever has the keyboard.
+        let pid = pid.ok_or_else(|| {
+            ComputerError::new(
+                "TARGET_CHANGED",
+                "cannot tell which app would receive the text; observe again",
+            )
+        })?;
+        match platform::type_into_focused(pid, text, confirmed) {
+            Typed::Inserted => return Ok("background"),
+            Typed::Secure => return Err(sensitive()),
+            Typed::Unsupported => platform::activate(pid, None).map_err(ComputerError::platform)?,
         }
+        check_front(Some(provider), pid, own_pid, cancelled)?;
         self.input()?
             .keyboard()
             .type_text(text)
             .map_err(ComputerError::platform)?;
         Ok("keyboard")
     }
+}
+
+fn live(cancelled: &AtomicBool) -> Result<(), ComputerError> {
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(ComputerError::new(
+            "CANCELLED",
+            "the call timed out or was cancelled before its input was sent",
+        ));
+    }
+    Ok(())
+}
+
+fn changed() -> ComputerError {
+    ComputerError::new(
+        "TARGET_CHANGED",
+        "a different app came to the front before the input was sent; observe again",
+    )
+}
+
+/// See `landing` in [`Engine::act`].
+fn check_landing(
+    at: (f64, f64),
+    target: &Target,
+    same_app: bool,
+    own_pid: u32,
+    cancelled: &AtomicBool,
+) -> Result<(), ComputerError> {
+    live(cancelled)?;
+    let Some(pid) = platform::app_at(at.0, at.1) else {
+        return Ok(());
+    };
+    let app = platform::app_identity(pid);
+    if policy::is_protected(&app, own_pid) {
+        return Err(ComputerError::from(policy::blocked(label(&app))));
+    }
+    if same_app && target.pid != 0 && pid != target.pid {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+/// Waits briefly for `expected` to own the keyboard after activation;
+/// refuses if a protected app has it, aborts if another app does.
+fn check_front(
+    provider: Option<&Arc<dyn Provider>>,
+    expected: u32,
+    own_pid: u32,
+    cancelled: &AtomicBool,
+) -> Result<(), ComputerError> {
+    let deadline = Instant::now() + FRONT_SETTLE;
+    loop {
+        live(cancelled)?;
+        let front = provider
+            .and_then(|provider| provider.focused_app().ok())
+            .and_then(|app| app.pid);
+        if let Some(pid) = front {
+            let app = platform::app_identity(pid);
+            if policy::is_protected(&app, own_pid) {
+                return Err(ComputerError::from(policy::blocked(label(&app))));
+            }
+            if pid == expected {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(changed());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn label(app: &Target) -> &str {
+    match (app.name.is_empty(), app.id.is_empty()) {
+        (false, _) => &app.name,
+        (true, false) => &app.id,
+        (true, true) => "This app",
+    }
+}
+
+fn overlaps(a: policy::Area, b: policy::Area) -> bool {
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
 }
 
 fn sensitive() -> ComputerError {

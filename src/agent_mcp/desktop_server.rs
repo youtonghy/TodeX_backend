@@ -1091,6 +1091,14 @@ mod tests {
             allowed_apps: Vec<String>,
             confirmed: bool,
         ) -> Result<Value, crate::computer::ComputerError> {
+            // e9 is somewhere the host cannot identify: asked every time.
+            if args["ref"] == "e9" && !allowed_apps.iter().any(String::is_empty) {
+                return Err(crate::computer::ComputerError {
+                    code: "APP_CONFIRM".into(),
+                    message: "the target of this action cannot be identified".into(),
+                    detail: Some(json!({ "bundleId": "", "name": "", "unidentified": true })),
+                });
+            }
             if !allowed_apps.iter().any(|app| app == "com.apple.TextEdit") {
                 return Err(crate::computer::ComputerError {
                     code: "APP_CONFIRM".into(),
@@ -1220,37 +1228,27 @@ mod tests {
         let busy = call(&other_client, "computer_observe", json!({})).await;
         assert!(text(&busy).contains("SCREEN_BUSY"), "{}", text(&busy));
 
-        // The first action in an app asks once (any device), then not again.
-        let click = {
-            let client = client.clone();
-            tokio::spawn(async move {
-                call(
-                    &client,
-                    "computer_act",
-                    json!({ "action": "click", "ref": "e1" }),
-                )
-                .await
-            })
-        };
-        let app = pending_permission(&state, &conversation_id, "desktop_computer_app").await;
-        assert_eq!(app["details"]["bundleId"], "com.apple.TextEdit");
-        state
-            .conversations
-            .resolve_permission_owned(
-                "local",
-                "dev_phone",
-                &conversation_id,
-                app["permissionId"].as_str().unwrap(),
-                allow("allow", PermissionOutcome::AllowAlways),
-            )
-            .await
-            .unwrap();
-        let clicked = click.await.unwrap();
+        // The first action in an app asks the person at the host once,
+        // then not again; paired devices are never asked.
+        fake.answers.lock().unwrap().push_back(Some(true));
+        let clicked = call(
+            &client,
+            "computer_act",
+            json!({ "action": "click", "ref": "e1" }),
+        )
+        .await;
         assert_ne!(clicked.is_error, Some(true), "{}", text(&clicked));
+        assert!(fake
+            .confirmations
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|title| title.contains("TextEdit")));
         assert_eq!(
             state.agent_desktop.approved_apps(&conversation_id),
             vec!["com.apple.TextEdit".to_owned()]
         );
+        let asked = fake.confirmations.lock().unwrap().len();
         let again = call(
             &client,
             "computer_act",
@@ -1258,33 +1256,49 @@ mod tests {
         )
         .await;
         assert_ne!(again.is_error, Some(true), "{}", text(&again));
+        assert_eq!(fake.confirmations.lock().unwrap().len(), asked);
 
-        // A password field asks every time, then retries confirmed.
-        let typed = {
-            let client = client.clone();
-            tokio::spawn(async move {
-                call(
-                    &client,
-                    "computer_act",
-                    json!({ "action": "type", "ref": "e2", "text": "hunter2" }),
-                )
-                .await
-            })
-        };
-        let sensitive =
-            pending_permission(&state, &conversation_id, "desktop_computer_action").await;
-        state
+        // A target the host cannot identify asks every time and is never
+        // remembered; a declined one fails.
+        fake.answers.lock().unwrap().push_back(Some(true));
+        let unknown = call(
+            &client,
+            "computer_act",
+            json!({ "action": "click", "ref": "e9" }),
+        )
+        .await;
+        assert_ne!(unknown.is_error, Some(true), "{}", text(&unknown));
+        fake.answers.lock().unwrap().push_back(Some(false));
+        let refused = call(
+            &client,
+            "computer_act",
+            json!({ "action": "click", "ref": "e9" }),
+        )
+        .await;
+        assert!(text(&refused).contains("DECLINED"), "{}", text(&refused));
+        assert_eq!(fake.confirmations.lock().unwrap().len(), asked + 2);
+        assert_eq!(
+            state.agent_desktop.approved_apps(&conversation_id),
+            vec!["com.apple.TextEdit".to_owned()]
+        );
+
+        // A password field asks the host every time, then retries
+        // confirmed.
+        fake.answers.lock().unwrap().push_back(Some(true));
+        let typed = call(
+            &client,
+            "computer_act",
+            json!({ "action": "type", "ref": "e2", "text": "hunter2" }),
+        )
+        .await;
+        assert_ne!(typed.is_error, Some(true), "{}", text(&typed));
+        assert_eq!(fake.confirmations.lock().unwrap().len(), asked + 3);
+        assert!(!state
             .conversations
-            .resolve_permission_owned(
-                "local",
-                "dev_phone",
-                &conversation_id,
-                sensitive["permissionId"].as_str().unwrap(),
-                allow("allow", PermissionOutcome::AllowOnce),
-            )
+            .history_for_tests(&conversation_id)
             .await
-            .unwrap();
-        assert_ne!(typed.await.unwrap().is_error, Some(true));
+            .iter()
+            .any(|event| event.event_type == "permission.requested"));
 
         // Done releases the screen (the host hides its pill); the other
         // conversation may now take it.
@@ -1316,7 +1330,7 @@ mod tests {
             .filter(|event| event.event_type == "desktop.computer.action")
             .map(|event| &event.payload)
             .collect();
-        assert_eq!(actions.len(), 4);
+        assert_eq!(actions.len(), 6);
         assert!(actions[0]["shotId"].is_string());
         assert_eq!(actions[0]["deviceName"], "test-host");
         assert_eq!(actions[1]["path"], "background");

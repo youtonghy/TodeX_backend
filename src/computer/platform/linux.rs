@@ -53,7 +53,10 @@ use super::{
     },
     Display, Permissions, Typed,
 };
-use crate::computer::{keys::Chord, policy::Target};
+use crate::computer::{
+    keys::Chord,
+    policy::{StackWindow, Target},
+};
 
 type XResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -379,6 +382,48 @@ pub(crate) fn app_at(x: f64, y: f64) -> Option<u32> {
         }
     }
     None
+}
+
+/// Windows front to back in global coordinates, for hiding protected
+/// apps in screenshots; `None` when the window manager cannot be asked.
+pub(crate) fn window_stack() -> Option<Vec<StackWindow>> {
+    if kde_wayland_session() {
+        let snapshot = kde_wayland::snapshot()
+            .map_err(|error| eprintln!("todex-agentd: cannot list KWin windows: {error}"))
+            .ok()?;
+        return Some(
+            snapshot
+                .windows
+                .iter()
+                .rev()
+                .filter(|window| window.visible && !window.minimized)
+                .map(|window| StackWindow {
+                    pid: window.pid,
+                    x: window.frame_geometry.x,
+                    y: window.frame_geometry.y,
+                    width: window.frame_geometry.width,
+                    height: window.frame_geometry.height,
+                    covers: true,
+                })
+                .collect(),
+        );
+    }
+    let scale = coordinate_scale();
+    let mut stack = Vec::new();
+    for window in client_windows_top_down().ok()? {
+        let Ok(Some((x, y, width, height))) = window_frame(window) else {
+            continue;
+        };
+        stack.push(StackWindow {
+            pid: window_pid(window).unwrap_or(0),
+            x: f64::from(x) / scale,
+            y: f64::from(y) / scale,
+            width: f64::from(width) / scale,
+            height: f64::from(height) / scale,
+            covers: true,
+        });
+    }
+    Some(stack)
 }
 
 /// RandR monitors (else the whole root window), the primary first; KWin's

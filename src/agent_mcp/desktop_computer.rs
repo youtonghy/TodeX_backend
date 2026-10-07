@@ -5,9 +5,10 @@
 //! only the person at the host can give (a dialog on that screen). The
 //! screen is leased to one conversation at a time. The host refuses
 //! blocked apps itself and reports `APP_CONFIRM` for the first action in
-//! an app and `SENSITIVE_ACTION` for password fields; this module asks the
-//! user (any paired device) and retries with approved apps / a
-//! confirmation, which agents cannot set.
+//! an app (or every action whose target it cannot identify) and
+//! `SENSITIVE_ACTION` for password fields; this module asks the person at
+//! the host, like the grant (paired devices cannot answer), and retries
+//! with approved apps / a confirmation, which agents cannot set.
 
 use std::time::Duration;
 
@@ -26,12 +27,10 @@ use super::{
 };
 use crate::{
     agent_desktop::{Grant, ScreenClaim, HOST_DEVICE_ID},
-    computer::{host_ui, ComputerError},
-    provider::{ConversationSupervisor, PermissionOutcome},
+    computer::{host_ui, keys, ComputerError},
+    provider::ConversationSupervisor,
 };
 
-const APP_KIND: &str = "desktop_computer_app";
-const ACTION_KIND: &str = "desktop_computer_action";
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
 const ACT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TEXT_CHARS: usize = 4096;
@@ -154,6 +153,15 @@ pub(super) fn validate(name: &str, arguments: Value) -> Result<ComputerCall, Str
                 "key" if args.keys.as_deref().is_none_or(str::is_empty) => {
                     return Err("key needs keys, e.g. cmd+c or enter".to_owned())
                 }
+                "key" => {
+                    let raw = args.keys.as_deref().unwrap_or_default();
+                    let chord = keys::parse(raw)?;
+                    if let Some(what) = keys::system_shortcut(&chord) {
+                        return Err(format!(
+                            "TARGET_BLOCKED: {raw} is a system shortcut ({what}) that agents may not send."
+                        ));
+                    }
+                }
                 "open_app" if args.app.as_deref().is_none_or(str::is_empty) => {
                     return Err("open_app needs app (bundle id or name)".to_owned())
                 }
@@ -164,7 +172,7 @@ pub(super) fn validate(name: &str, arguments: Value) -> Result<ComputerCall, Str
                     return Err(format!("wait is limited to {MAX_WAIT_MS} ms"))
                 }
                 "click" | "double_click" | "right_click" | "hover" | "drag" | "scroll" | "type"
-                | "key" | "wait" | "open_app" | "focus_window" => {}
+                | "wait" | "open_app" | "focus_window" => {}
                 other => {
                     return Err(format!(
                     "unknown action {other}; use click, double_click, right_click, hover, drag, \
@@ -440,19 +448,19 @@ impl DesktopTools {
         }
         computer.host().session(Some(&call.summary));
         let mut confirmed = false;
+        // Approvals for this call only: an unidentified target ("").
+        let mut once: Vec<String> = Vec::new();
         let mut outcome = Err(ComputerError::new("CANCELLED", "cancelled"));
         for _ in 0..MAX_ATTEMPTS {
             let work = async {
                 if call.tool == "computer_observe" {
                     computer.host().observe(call.args.clone()).await
                 } else {
+                    let mut allowed = desktop.approved_apps(conversation_id);
+                    allowed.extend(once.iter().cloned());
                     computer
                         .host()
-                        .act(
-                            call.args.clone(),
-                            desktop.approved_apps(conversation_id),
-                            confirmed,
-                        )
+                        .act(call.args.clone(), allowed, confirmed)
                         .await
                 }
             };
@@ -470,13 +478,12 @@ impl DesktopTools {
                     let detail = error.detail.clone().unwrap_or_default();
                     let app_id = detail["bundleId"].as_str().unwrap_or_default().to_owned();
                     let name = detail["name"].as_str().unwrap_or(&app_id).to_owned();
-                    if app_id.is_empty() {
+                    let unidentified = app_id.is_empty();
+                    if unidentified && once.contains(&app_id) {
                         break;
                     }
-                    match self
-                        .confirm_app(conversation_id, &app_id, &name, &call.summary, context)
-                        .await
-                    {
+                    match self.confirm_app(&app_id, &name, &call.summary).await {
+                        Ok(()) if unidentified => once.push(app_id),
                         Ok(()) => desktop.approve_app(conversation_id, &app_id),
                         Err(message) => {
                             outcome = Err(ComputerError::new("DECLINED", message));
@@ -486,10 +493,7 @@ impl DesktopTools {
                 }
                 "SENSITIVE_ACTION" if !confirmed => {
                     let reason = error.message.clone();
-                    match self
-                        .confirm_action(conversation_id, &call.summary, &reason, context)
-                        .await
-                    {
+                    match self.confirm_action(&call.summary, &reason).await {
                         Ok(()) => confirmed = true,
                         Err(message) => {
                             outcome = Err(ComputerError::new("DECLINED", message));
@@ -606,70 +610,101 @@ impl DesktopTools {
         }
     }
 
-    async fn confirm_app(
-        &self,
-        conversation_id: &str,
-        bundle_id: &str,
-        name: &str,
-        summary: &str,
-        context: &RequestContext<RoleServer>,
-    ) -> Result<(), String> {
-        let (decision, _) = self
-            .ask(
-                conversation_id,
-                APP_KIND,
-                format!("Allow the agent to control {name}?"),
-                json!({ "bundleId": bundle_id, "app": name, "action": summary }),
-                json!([
-                    { "id": "allow", "kind": "allow_always", "name": "Allow for this conversation" },
-                    { "id": "reject", "kind": "reject_once", "name": "Deny" }
-                ]),
-                None,
-                context,
-            )
-            .await?;
-        if matches!(
-            decision.outcome,
-            PermissionOutcome::AllowAlways | PermissionOutcome::AllowOnce
-        ) {
-            Ok(())
-        } else {
-            Err(format!("The user declined control of {name}."))
-        }
+    /// Lets the agent control an app for the rest of the conversation, or
+    /// (`bundle_id` empty) act once on a target that cannot be
+    /// identified. Only the person at this computer may answer.
+    async fn confirm_app(&self, bundle_id: &str, name: &str, summary: &str) -> Result<(), String> {
+        let (title, message) = app_prompt(bundle_id, name, summary);
+        self.confirm_on_host(title, message)
+            .await
+            .map_err(|declined| {
+                declined.unwrap_or_else(|| {
+                    format!(
+                        "The user declined control of {}.",
+                        app_label(bundle_id, name)
+                    )
+                })
+            })
     }
 
-    async fn confirm_action(
-        &self,
-        conversation_id: &str,
-        summary: &str,
-        reason: &str,
-        context: &RequestContext<RoleServer>,
-    ) -> Result<(), String> {
-        let (decision, _) = self
-            .ask(
-                conversation_id,
-                ACTION_KIND,
-                format!(
-                    "Allow the agent to {summary} on {}?",
-                    status_host(&self.mcp.desktop().computer())
-                ),
-                json!({ "action": summary, "reason": reason }),
-                json!([
-                    { "id": "allow", "kind": "allow_once", "name": "Allow once" },
-                    { "id": "reject", "kind": "reject_once", "name": "Deny" }
-                ]),
-                None,
-                context,
-            )
-            .await?;
-        if matches!(
-            decision.outcome,
-            PermissionOutcome::AllowOnce | PermissionOutcome::AllowAlways
-        ) {
-            Ok(())
-        } else {
-            Err(format!("The user declined: {summary}."))
+    /// One action the host flagged as sensitive (typing into a password
+    /// field). Only the person at this computer may answer.
+    async fn confirm_action(&self, summary: &str, reason: &str) -> Result<(), String> {
+        let (title, message) = action_prompt(summary, reason);
+        self.confirm_on_host(title, message)
+            .await
+            .map_err(|declined| {
+                declined.unwrap_or_else(|| format!("The user declined: {summary}."))
+            })
+    }
+
+    /// `Err(None)` when declined (or unanswered in time), `Err(Some(_))`
+    /// when nobody can be asked.
+    async fn confirm_on_host(&self, title: String, message: String) -> Result<(), Option<String>> {
+        match self
+            .mcp
+            .desktop()
+            .computer()
+            .host()
+            .confirm(title, message, CONFIRM_TIMEOUT)
+            .await
+        {
+            Some(true) => Ok(()),
+            Some(false) => Err(None),
+            None => Err(Some(
+                "nobody can confirm on this computer; the TodeX backend must run in its desktop session."
+                    .to_owned(),
+            )),
         }
+    }
+}
+
+fn app_label<'a>(bundle_id: &str, name: &'a str) -> &'a str {
+    if bundle_id.is_empty() && name.is_empty() {
+        "an unidentified app"
+    } else {
+        name
+    }
+}
+
+/// The host dialog for the first action in an app, or for an action whose
+/// target cannot be identified.
+fn app_prompt(bundle_id: &str, name: &str, summary: &str) -> (String, String) {
+    let summary: String = summary.chars().take(120).collect();
+    let name: String = name.chars().take(80).collect();
+    match (host_ui::chinese(), bundle_id.is_empty()) {
+        (true, false) => (
+            format!("允许 Agent 控制「{name}」？"),
+            format!("Agent 想在「{name}」中执行：{summary}。允许后本对话可继续操作该应用。"),
+        ),
+        (true, true) => (
+            "允许 Agent 执行这一步操作？".to_owned(),
+            format!("TodeX 无法识别这一步会作用到哪个应用（{summary}）。只允许这一次。"),
+        ),
+        (false, false) => (
+            format!("Allow the agent to control {name}?"),
+            format!("The agent wants to {summary} in {name}. If you allow it, this conversation may keep using {name}."),
+        ),
+        (false, true) => (
+            "Allow this agent action?".to_owned(),
+            format!("TodeX cannot tell which app this action would reach ({summary}). Allow it this once?"),
+        ),
+    }
+}
+
+/// The host dialog for a sensitive action.
+fn action_prompt(summary: &str, reason: &str) -> (String, String) {
+    let summary: String = summary.chars().take(120).collect();
+    if host_ui::chinese() {
+        (
+            "允许 Agent 执行敏感操作？".to_owned(),
+            format!("Agent 想执行：{summary}（{reason}）。只允许这一次。"),
+        )
+    } else {
+        (
+            "Allow a sensitive agent action?".to_owned(),
+            format!("The agent wants to {summary} ({reason}). Allow it this once?"),
+        )
     }
 }
 
@@ -769,12 +804,39 @@ mod tests {
             "open_app TextEdit"
         );
         assert!(validate("computer_done", json!({ "now": true })).is_err());
+        // System shortcuts never reach the host.
+        let lock = if cfg!(target_os = "macos") {
+            "ctrl+cmd+q"
+        } else {
+            "super+l"
+        };
+        assert!(
+            validate("computer_act", json!({ "action": "key", "keys": lock }))
+                .err()
+                .is_some_and(|error| error.starts_with("TARGET_BLOCKED")),
+            "{lock}"
+        );
+        assert!(validate(
+            "computer_act",
+            json!({ "action": "key", "keys": "cmd+bogus" })
+        )
+        .is_err());
         for tool in tools() {
             assert!(tool
                 .name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_'));
         }
+    }
+
+    #[test]
+    fn host_prompts_name_the_app_or_say_it_is_unknown() {
+        let (title, message) = app_prompt("com.apple.TextEdit", "TextEdit", "click e1");
+        assert!(title.contains("TextEdit") && message.contains("click e1"));
+        let (_, message) = app_prompt("", "", "click (10, 20)");
+        assert!(message.contains("click (10, 20)"));
+        assert_ne!(app_prompt("", "", "x").0, app_prompt("a.b", "B", "x").0);
+        assert_eq!(app_label("", ""), "an unidentified app");
     }
 
     #[test]

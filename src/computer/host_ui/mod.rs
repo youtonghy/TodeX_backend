@@ -27,7 +27,7 @@ use other as native;
 
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         OnceLock,
     },
     time::Duration,
@@ -117,7 +117,38 @@ pub(crate) fn mark_point(x: f64, y: f64) {
 /// Asks the person at this computer; blocks until they answer or
 /// `timeout` passes (`Some(false)`). `None` when there is no host UI.
 pub(crate) fn confirm(title: &str, message: &str, timeout: Duration) -> Option<bool> {
-    available().then(|| native::confirm(&strings(), title, message, timeout))
+    if !available() {
+        return None;
+    }
+    CONFIRMING.fetch_add(1, Ordering::SeqCst);
+    let _open = Confirming;
+    Some(native::confirm(&strings(), title, message, timeout))
+}
+
+/// Confirmations on screen. While one is, agents may not act at all: on
+/// Linux it is another process (a notification or `kdialog`), so the
+/// hit test cannot tell it is ours, and nobody but the person at the host
+/// may answer it.
+static CONFIRMING: AtomicUsize = AtomicUsize::new(0);
+
+struct Confirming;
+
+impl Drop for Confirming {
+    fn drop(&mut self) {
+        CONFIRMING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A host confirmation is on screen.
+pub(crate) fn confirming() -> bool {
+    CONFIRMING.load(Ordering::SeqCst) > 0
+}
+
+/// The window number of the pointer marker, which lets clicks through;
+/// hit tests skip it.
+#[cfg(target_os = "macos")]
+pub(crate) fn marker_window() -> Option<u32> {
+    native::marker_window()
 }
 
 /// Host UI strings in the system language.

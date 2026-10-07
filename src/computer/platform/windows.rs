@@ -61,10 +61,10 @@ use ::windows::{
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
                 EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
-                GetWindow, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-                IsWindowVisible, PeekMessageW, SetForegroundWindow, ShowWindow, WindowFromPoint,
-                GA_ROOT, GWL_EXSTYLE, GW_OWNER, MONITORINFOF_PRIMARY, MSG, PM_NOREMOVE, SW_RESTORE,
-                SW_SHOWNORMAL, WS_EX_TOOLWINDOW,
+                GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+                IsIconic, IsWindowVisible, PeekMessageW, SetForegroundWindow, ShowWindow,
+                WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GW_OWNER, MONITORINFOF_PRIMARY, MSG,
+                PM_NOREMOVE, SW_RESTORE, SW_SHOWNORMAL, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
             },
         },
     },
@@ -78,7 +78,10 @@ use super::{
     },
     Display, Permissions, Typed,
 };
-use crate::computer::{keys::Chord, policy::Target};
+use crate::computer::{
+    keys::Chord,
+    policy::{StackWindow, Target},
+};
 
 /// Hosts the windows of UWP apps; the app itself is another process.
 const FRAME_HOST_CLASS: &str = "ApplicationFrameWindow";
@@ -314,6 +317,49 @@ pub(crate) fn app_at(x: f64, y: f64) -> Option<u32> {
         return None;
     }
     Some(window_pid(root)).filter(|pid| *pid != 0)
+}
+
+/// Visible windows front to back in physical desktop pixels, for hiding
+/// protected apps in screenshots. Click-through windows (the pointer
+/// marker) are left out; only app windows count as covering.
+pub(crate) fn window_stack() -> Option<Vec<StackWindow>> {
+    ensure_dpi_aware();
+    let mut handles: Vec<HWND> = Vec::new();
+    // SAFETY: the callback gets our Vec back through lparam while
+    // EnumWindows runs.
+    unsafe {
+        EnumWindows(
+            Some(collect_window),
+            LPARAM(&mut handles as *mut Vec<HWND> as isize),
+        )
+        .ok()?;
+    }
+    Some(
+        handles
+            .into_iter()
+            .filter_map(|hwnd| {
+                // SAFETY: plain window queries; `rect` is a RECT out value.
+                unsafe {
+                    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+                        return None;
+                    }
+                    if (GetWindowLongW(hwnd, GWL_EXSTYLE) as u32) & WS_EX_TRANSPARENT.0 != 0 {
+                        return None;
+                    }
+                    let mut rect = RECT::default();
+                    GetWindowRect(hwnd, &mut rect).ok()?;
+                    Some(StackWindow {
+                        pid: window_pid(hwnd),
+                        x: f64::from(rect.left),
+                        y: f64::from(rect.top),
+                        width: f64::from(rect.right - rect.left),
+                        height: f64::from(rect.bottom - rect.top),
+                        covers: is_app_window(hwnd),
+                    })
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Monitors in physical desktop pixels, the primary first.

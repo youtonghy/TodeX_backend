@@ -3,7 +3,10 @@
 use xa11y::ElementData;
 
 use super::{Display, Permissions, Typed};
-use crate::computer::{keys::Chord, policy::Target};
+use crate::computer::{
+    keys::Chord,
+    policy::{StackWindow, Target},
+};
 
 pub(crate) fn adopt_own_permission_identity() {}
 
@@ -50,6 +53,10 @@ pub(crate) fn activate(pid: u32, _title: Option<&str>) -> Result<(), String> {
 }
 
 pub(crate) fn app_at(_x: f64, _y: f64) -> Option<u32> {
+    None
+}
+
+pub(crate) fn window_stack() -> Option<Vec<StackWindow>> {
     None
 }
 

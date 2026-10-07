@@ -19,7 +19,10 @@ use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWork
 use xa11y::{input::Key, ElementData};
 
 use super::{Display, Permissions, Typed};
-use crate::computer::{keys::Chord, policy::Target};
+use crate::computer::{
+    keys::Chord,
+    policy::{StackWindow, Target},
+};
 
 type AXUIElementRef = *const c_void;
 type CGEventRef = *mut c_void;
@@ -315,8 +318,27 @@ pub(crate) fn activate(pid: u32, _title: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// The process owning the front-most normal window at a global point.
-pub(crate) fn app_at(x: f64, y: f64) -> Option<u32> {
+/// An on-screen window from the window server, front to back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CgWindow {
+    layer: i64,
+    pid: u32,
+    alpha: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl CgWindow {
+    fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x && y >= self.y && x < self.x + self.width && y < self.y + self.height
+    }
+}
+
+/// On-screen windows, front to back, without the desktop and the pointer
+/// marker; `None` when the window server does not answer.
+fn on_screen_windows() -> Option<Vec<CgWindow>> {
     // SAFETY: the returned array follows the create rule.
     let windows: CFArray<CFDictionary<CFString, CFType>> = unsafe {
         let array = CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0);
@@ -330,10 +352,9 @@ pub(crate) fn app_at(x: f64, y: f64) -> Option<u32> {
             .and_then(|value| value.downcast::<CFNumber>())
             .and_then(|number| number.to_f64())
     };
+    let marker = crate::computer::host_ui::marker_window();
+    let mut found = Vec::new();
     for window in windows.iter() {
-        if number(&window, "kCGWindowLayer") != Some(0.0) {
-            continue;
-        }
         let Some(bounds) = window
             .find(CFString::from_static_string("kCGWindowBounds"))
             .and_then(|value| value.downcast::<CFDictionary>())
@@ -343,7 +364,7 @@ pub(crate) fn app_at(x: f64, y: f64) -> Option<u32> {
         // SAFETY: kCGWindowBounds is a dictionary of CFString → CFNumber.
         let bounds: CFDictionary<CFString, CFType> =
             unsafe { CFDictionary::wrap_under_get_rule(bounds.as_concrete_TypeRef()) };
-        let (Some(left), Some(top), Some(width), Some(height)) = (
+        let (Some(x), Some(y), Some(width), Some(height)) = (
             number(&bounds, "X"),
             number(&bounds, "Y"),
             number(&bounds, "Width"),
@@ -351,11 +372,63 @@ pub(crate) fn app_at(x: f64, y: f64) -> Option<u32> {
         ) else {
             continue;
         };
-        if x >= left && y >= top && x < left + width && y < top + height {
-            return number(&window, "kCGWindowOwnerPID").map(|pid| pid as u32);
+        let window_number = number(&window, "kCGWindowNumber").map_or(0, |n| n as u32);
+        if marker.is_some_and(|marker| marker == window_number) {
+            continue;
         }
+        found.push(CgWindow {
+            layer: number(&window, "kCGWindowLayer").map_or(0, |layer| layer as i64),
+            pid: number(&window, "kCGWindowOwnerPID").map_or(0, |pid| pid as u32),
+            alpha: number(&window, "kCGWindowAlpha").unwrap_or(1.0),
+            x,
+            y,
+            width,
+            height,
+        });
     }
-    None
+    Some(found)
+}
+
+/// The process that receives a click at a global point: the front-most
+/// normal-layer window, unless a window of a protected process (TodeX's
+/// own panels and dialogs sit at the status level, the system's
+/// authentication dialogs higher still) lies above it there. Other
+/// windows above the normal layer (the menu bar, the Dock, overlays) are
+/// skipped as before.
+fn hit(windows: &[CgWindow], x: f64, y: f64, protected: impl Fn(u32) -> bool) -> Option<u32> {
+    windows
+        .iter()
+        .filter(|window| window.contains(x, y))
+        .find(|window| window.layer == 0 || protected(window.pid))
+        .map(|window| window.pid)
+}
+
+fn is_protected_pid(pid: u32) -> bool {
+    pid != 0
+        && (pid == std::process::id() || crate::computer::policy::is_blocked(&app_identity(pid).id))
+}
+
+/// The process owning the window an input at a global point lands in.
+pub(crate) fn app_at(x: f64, y: f64) -> Option<u32> {
+    hit(&on_screen_windows()?, x, y, is_protected_pid).filter(|pid| *pid != 0)
+}
+
+/// On-screen windows front to back, for hiding protected apps in
+/// screenshots. Only opaque normal-layer windows count as covering.
+pub(crate) fn window_stack() -> Option<Vec<StackWindow>> {
+    Some(
+        on_screen_windows()?
+            .into_iter()
+            .map(|window| StackWindow {
+                pid: window.pid,
+                x: window.x,
+                y: window.y,
+                width: window.width,
+                height: window.height,
+                covers: window.layer == 0 && window.alpha >= 1.0,
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn displays() -> Vec<Display> {
@@ -559,4 +632,36 @@ fn key_code(key: &Key) -> Option<u16> {
         },
         Key::Shift | Key::Ctrl | Key::Alt | Key::Meta => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(layer: i64, pid: u32) -> CgWindow {
+        CgWindow {
+            layer,
+            pid,
+            alpha: 1.0,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        }
+    }
+
+    #[test]
+    fn protected_windows_above_the_normal_layer_take_the_hit() {
+        let own = 7;
+        let protected = |pid| pid == own;
+        // A TodeX dialog at the status level over an editor.
+        let stack = [window(25, own), window(0, 50)];
+        assert_eq!(hit(&stack, 10.0, 10.0, protected), Some(own));
+        // The menu bar or another overlay is skipped as before.
+        let stack = [window(24, 3), window(0, 50)];
+        assert_eq!(hit(&stack, 10.0, 10.0, protected), Some(50));
+        // Nothing normal there.
+        assert_eq!(hit(&[window(24, 3)], 10.0, 10.0, protected), None);
+        assert_eq!(hit(&stack, 500.0, 10.0, protected), None);
+    }
 }
