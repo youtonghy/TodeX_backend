@@ -5278,6 +5278,8 @@ mod tests {
     /// A caller that gives up on an append while its journal write runs
     /// must not let the next append reuse the sequence.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // The held guard is the point: it parks the journal write.
+    #[allow(clippy::await_holding_lock)]
     async fn a_dropped_append_still_finishes_before_the_next_one() {
         let (root, id, _) = seed_journal("todex-dropped-append", 3).await;
         let store = ConversationStore::new(root.clone()).await.unwrap();
