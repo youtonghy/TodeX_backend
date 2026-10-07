@@ -925,6 +925,46 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn wire_turn_queued_behind_a_discarded_session_runs_on_a_new_one() {
+        let fixture = Fixture::new().await;
+        let (cancel, first) = fixture.start("turn-cancel", "cancel").await;
+        fixture.wait_for_method("session/prompt").await;
+        let (_cancel, queued) = fixture.start("turn-queued", "normal").await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !fixture
+                .driver
+                .sessions
+                .has_queued_turn(&fixture.manifest.id)
+                .await
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("second turn was never queued");
+        // A cancelled turn discards the process; the queued turn must not be
+        // dropped with it.
+        cancel.send(true).unwrap();
+        assert!(first.await.unwrap().unwrap().cancelled);
+        let queued = tokio::time::timeout(Duration::from_secs(15), queued)
+            .await
+            .expect("queued turn hung")
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.stop_reason, "end_turn");
+        assert_eq!(
+            fixture
+                .requests()
+                .iter()
+                .filter(|request| request["method"] == "initialize")
+                .count(),
+            2
+        );
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn wire_discovers_project_commands_and_forks_native_history() {
         let fixture = Fixture::new().await;
         let commands = fixture

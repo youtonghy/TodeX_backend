@@ -52,7 +52,17 @@ struct ResidentTurn {
     sink: DriverEventSink,
     cancel: watch::Receiver<bool>,
     launch_permit: WorkspaceTrustPermit,
-    respond_to: oneshot::Sender<Result<DriverTurnResult, AppError>>,
+    respond_to: oneshot::Sender<ResidentReply>,
+}
+
+enum ResidentReply {
+    Finished(Result<DriverTurnResult, AppError>),
+    /// The actor stopped before starting this turn; `retry` is false when the
+    /// stop was requested, so the turn must not reopen the session.
+    NotStarted {
+        turn: Box<ResidentTurn>,
+        retry: bool,
+    },
 }
 
 /// The resident sessions of one provider.
@@ -84,7 +94,9 @@ impl ResidentSessions {
     }
 
     /// Runs a turn on the conversation's session, starting it with `launch`
-    /// when none is running.
+    /// when none is running. A turn that raced the session's own stop (idle
+    /// timeout, discarded process) never reached the agent and is retried
+    /// once on a new session.
     pub(super) async fn run_turn(
         &self,
         context: DriverContext,
@@ -92,71 +104,132 @@ impl ResidentSessions {
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
-        launch: impl FnOnce(&DriverContext, &DriverPrompt) -> Result<ResidentLaunch, AppError>,
+        launch: impl Fn(&DriverContext, &DriverPrompt) -> Result<ResidentLaunch, AppError>,
     ) -> Result<DriverTurnResult, AppError> {
         let label = self.label;
         let conversation_id = context.manifest.id.clone();
-        let handle = {
-            let mut sessions = self.sessions.lock().await;
-            sessions.retain(|_, handle| !handle.turns.is_closed());
-            if let Some(handle) = sessions.get(&conversation_id) {
-                if handle.workspace != context.manifest.workspace {
-                    return Err(AppError::InvalidRequest(format!(
-                        "{label} resident session workspace changed"
-                    )));
-                }
-                handle.clone()
-            } else {
-                if sessions.len() >= self.max_sessions {
-                    return Err(AppError::ProviderUnavailable(format!(
-                        "{label} resident session limit reached ({}); close an idle session",
-                        self.max_sessions
-                    )));
-                }
-                let ResidentLaunch { spec, runtime } = launch(&context, &prompt)?;
-                let (turns, turn_rx) = mpsc::channel(1);
-                let (controls, control_rx) = mpsc::channel(16);
-                let (shutdown, shutdown_rx) = watch::channel(false);
-                let (stopped_tx, stopped) = watch::channel(false);
-                let handle = SessionHandle {
-                    workspace: context.manifest.workspace.clone(),
-                    turns,
-                    controls,
-                    shutdown,
-                    stopped,
-                };
-                tokio::spawn(
-                    SessionActor {
-                        provider: self.provider,
-                        label,
-                        idle_timeout: self.idle_timeout,
-                        spec,
-                        runtime,
-                    }
-                    .run(turn_rx, control_rx, shutdown_rx, stopped_tx),
-                );
-                sessions.insert(conversation_id, handle.clone());
-                handle
-            }
+        let mut turn = ResidentTurn {
+            context,
+            prompt,
+            sink,
+            cancel,
+            launch_permit,
+            respond_to: oneshot::channel().0,
         };
-        let (respond_to, response) = oneshot::channel();
-        handle
-            .turns
-            .send(ResidentTurn {
-                context,
-                prompt,
-                sink,
-                cancel,
-                launch_permit,
-                respond_to,
-            })
+        let mut retried = false;
+        loop {
+            let handle = self.session(&conversation_id, &turn, &launch).await?;
+            let (respond_to, response) = oneshot::channel();
+            turn.respond_to = respond_to;
+            let (returned, retry) = match handle.turns.send(turn).await {
+                Ok(()) => match response.await {
+                    Ok(ResidentReply::Finished(result)) => return result,
+                    Ok(ResidentReply::NotStarted { turn, retry }) => (*turn, retry),
+                    Err(_) => {
+                        return Err(AppError::ProviderUnavailable(format!(
+                            "{label} session stopped before turn completed"
+                        )))
+                    }
+                },
+                // Closed between lookup and send: the actor is stopping.
+                Err(mpsc::error::SendError(turn)) => (turn, !*handle.shutdown.borrow()),
+            };
+            if !retry || retried {
+                return Err(AppError::Conflict(format!(
+                    "{label} session closed before the turn started; retry"
+                )));
+            }
+            retried = true;
+            turn = returned;
+            wait_stopped(handle).await;
+        }
+    }
+
+    /// The conversation's live session, waiting out one that is stopping and
+    /// starting a new one when none remains.
+    async fn session(
+        &self,
+        conversation_id: &str,
+        turn: &ResidentTurn,
+        launch: &impl Fn(&DriverContext, &DriverPrompt) -> Result<ResidentLaunch, AppError>,
+    ) -> Result<SessionHandle, AppError> {
+        let label = self.label;
+        loop {
+            let stopping = {
+                let mut sessions = self.sessions.lock().await;
+                sessions.retain(|_, handle| !*handle.stopped.borrow());
+                match sessions.get(conversation_id) {
+                    Some(handle) if handle.turns.is_closed() => handle.clone(),
+                    Some(handle) => {
+                        if handle.workspace != turn.context.manifest.workspace {
+                            return Err(AppError::InvalidRequest(format!(
+                                "{label} resident session workspace changed"
+                            )));
+                        }
+                        return Ok(handle.clone());
+                    }
+                    None => {
+                        if sessions.len() >= self.max_sessions {
+                            return Err(AppError::ProviderUnavailable(format!(
+                                "{label} resident session limit reached ({}); close an idle session",
+                                self.max_sessions
+                            )));
+                        }
+                        let handle = self.spawn_session(turn, launch)?;
+                        sessions.insert(conversation_id.to_owned(), handle.clone());
+                        return Ok(handle);
+                    }
+                }
+            };
+            // Its process is still exiting; never run two on one session.
+            wait_stopped(stopping.clone()).await;
+            let mut sessions = self.sessions.lock().await;
+            if sessions
+                .get(conversation_id)
+                .is_some_and(|current| current.stopped.same_channel(&stopping.stopped))
+            {
+                sessions.remove(conversation_id);
+            }
+        }
+    }
+
+    fn spawn_session(
+        &self,
+        turn: &ResidentTurn,
+        launch: &impl Fn(&DriverContext, &DriverPrompt) -> Result<ResidentLaunch, AppError>,
+    ) -> Result<SessionHandle, AppError> {
+        let ResidentLaunch { spec, runtime } = launch(&turn.context, &turn.prompt)?;
+        let (turns, turn_rx) = mpsc::channel(1);
+        let (controls, control_rx) = mpsc::channel(16);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (stopped_tx, stopped) = watch::channel(false);
+        tokio::spawn(
+            SessionActor {
+                provider: self.provider,
+                label: self.label,
+                idle_timeout: self.idle_timeout,
+                spec,
+                runtime,
+            }
+            .run(turn_rx, control_rx, shutdown_rx, stopped_tx),
+        );
+        Ok(SessionHandle {
+            workspace: turn.context.manifest.workspace.clone(),
+            turns,
+            controls,
+            shutdown,
+            stopped,
+        })
+    }
+
+    /// Whether a turn is queued behind the running one.
+    #[cfg(test)]
+    pub(super) async fn has_queued_turn(&self, conversation_id: &str) -> bool {
+        self.sessions
+            .lock()
             .await
-            .map_err(|_| {
-                AppError::ProviderUnavailable(format!("{label} session closed before turn started"))
-            })?;
-        response.await.map_err(|_| {
-            AppError::ProviderUnavailable(format!("{label} session stopped before turn completed"))
-        })?
+            .get(conversation_id)
+            .is_some_and(|handle| handle.turns.capacity() == 0)
     }
 
     /// Forwards a live control into the conversation's running turn.
@@ -227,11 +300,14 @@ impl ResidentSessions {
     }
 }
 
-async fn stop_session(mut handle: SessionHandle) {
+async fn stop_session(handle: SessionHandle) {
     let _ = handle.shutdown.send(true);
-    if !*handle.stopped.borrow() {
-        let _ = tokio::time::timeout(STOP_TIMEOUT, handle.stopped.changed()).await;
-    }
+    wait_stopped(handle).await;
+}
+
+/// Waits, bounded by [`STOP_TIMEOUT`], for the session's actor to finish.
+async fn wait_stopped(mut handle: SessionHandle) {
+    let _ = tokio::time::timeout(STOP_TIMEOUT, handle.stopped.wait_for(|stopped| *stopped)).await;
 }
 
 struct SessionActor {
@@ -256,10 +332,12 @@ impl SessionActor {
         let mut last_sink: Option<DriverEventSink> = None;
         let mut idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
         loop {
+            // Biased: a requested stop wins, then a waiting turn; the idle
+            // deadline only fires when nothing else is ready.
             let request = tokio::select! {
-                request = turns.recv() => match request { Some(request) => request, None => break },
+                biased;
                 _ = shutdown.changed() => break,
-                _ = tokio::time::sleep_until(idle_deadline) => break,
+                request = turns.recv() => match request { Some(request) => request, None => break },
                 control = controls.recv() => {
                     if let Some(control) = control {
                         let _ = control.respond_to.send(Err(AppError::InvalidRequest(format!("{label} has no active turn"))));
@@ -278,6 +356,7 @@ impl SessionActor {
                     }
                     continue;
                 }
+                _ = tokio::time::sleep_until(idle_deadline) => break,
             };
             let ResidentTurn {
                 context,
@@ -291,7 +370,7 @@ impl SessionActor {
                 match JsonLineProcess::spawn_trusted(&self.spec, launch_permit).await {
                     Ok(spawned) => process = Some(spawned),
                     Err(error) => {
-                        let _ = respond_to.send(Err(error));
+                        let _ = respond_to.send(ResidentReply::Finished(Err(error)));
                         break;
                     }
                 }
@@ -309,7 +388,7 @@ impl SessionActor {
             };
             let result = tokio::select! {
                 result = run_acp_turn_controlled(running, context, prompt, &sink, &mut cancel, options, &mut connection, Some(&mut controls)) => result,
-                _ = shutdown.changed() => { let _ = respond_to.send(Err(AppError::TurnCancelled)); break; }
+                _ = shutdown.changed() => { let _ = respond_to.send(ResidentReply::Finished(Err(AppError::TurnCancelled))); break; }
             };
             let reusable = result.as_ref().is_ok_and(|result| !result.cancelled);
             last_sink = Some(sink);
@@ -324,7 +403,7 @@ impl SessionActor {
                 turns.close();
                 controls.close();
             }
-            let _ = respond_to.send(result);
+            let _ = respond_to.send(ResidentReply::Finished(result));
             if !reusable {
                 break;
             }
@@ -334,6 +413,16 @@ impl SessionActor {
         controls.close();
         if let Some(process) = process.as_mut() {
             process.terminate().await;
+        }
+        // A turn queued before the close never reached the agent: hand it
+        // back, after the process is gone, so the caller can reopen.
+        let retry = !*shutdown.borrow();
+        while let Ok(mut turn) = turns.try_recv() {
+            let respond_to = std::mem::replace(&mut turn.respond_to, oneshot::channel().0);
+            let _ = respond_to.send(ResidentReply::NotStarted {
+                turn: Box::new(turn),
+                retry,
+            });
         }
         let _ = stopped.send(true);
     }
