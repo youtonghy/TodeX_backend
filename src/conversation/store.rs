@@ -176,6 +176,12 @@ pub struct ConversationStore {
     /// lock and never held across an await.
     indexes: Arc<std::sync::Mutex<LruCache<String, JournalIndex>>>,
     tails: Arc<LruMap<JournalTail>>,
+    /// Test hook: journal writes wait on this lock (see
+    /// [`Self::hold_journal_writes`]).
+    #[cfg(test)]
+    journal_write_hold: Arc<std::sync::Mutex<()>>,
+    #[cfg(test)]
+    journal_writes_started: Arc<std::sync::atomic::AtomicUsize>,
     /// Open streaming-text merge window per conversation. Only touched while
     /// the conversation lock is held, so any other write flushes it first and
     /// journal order matches emission order.
@@ -512,6 +518,10 @@ impl ConversationStore {
             free_space_override: Arc::new(AtomicU64::new(u64::MAX)),
             #[cfg(test)]
             commit_stop: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            journal_write_hold: Arc::default(),
+            #[cfg(test)]
+            journal_writes_started: Arc::default(),
         })
     }
 
@@ -1077,6 +1087,26 @@ impl ConversationStore {
         validate_event_type(&event_type)?;
         // Reject an unknown conversation now instead of from the flush timer.
         self.directory(conversation_id)?;
+        let store = self.clone();
+        let conversation_id = conversation_id.to_owned();
+        let hub = hub.clone();
+        // Detached like `append_inner`: the merge may flush a journal write.
+        Self::detached(async move {
+            store
+                .buffer_delta(&conversation_id, event_type, payload, fragment, hub)
+                .await
+        })
+        .await
+    }
+
+    async fn buffer_delta(
+        &self,
+        conversation_id: &str,
+        event_type: String,
+        payload: Value,
+        fragment: DeltaFragment,
+        hub: ConversationEventHub,
+    ) -> Result<(), AppError> {
         let _guard = self.lock(conversation_id).await;
         let payload = match self.pending_deltas.get_mut(conversation_id) {
             Some(mut pending) => match pending.delta.try_append(&event_type, &fragment, payload) {
@@ -1087,7 +1117,7 @@ impl ConversationStore {
         };
         self.flush_pending_delta_locked(conversation_id).await?;
         let generation = self.delta_generation.fetch_add(1, Ordering::Relaxed);
-        let delta = PendingDelta::new(Some(hub.clone()), event_type, fragment, payload);
+        let delta = PendingDelta::new(Some(hub), event_type, fragment, payload);
         let deadline = delta.deadline();
         self.pending_deltas
             .insert(conversation_id.to_owned(), StoreDelta { generation, delta });
@@ -1170,11 +1200,29 @@ impl ConversationStore {
         hub: Option<&ConversationEventHub>,
     ) -> Result<ConversationEvent, AppError> {
         validate_event_type(&event_type)?;
-        let _guard = self.lock(conversation_id).await;
-        // Buffered stream text precedes this event in emission order.
-        self.flush_pending_delta_locked(conversation_id).await?;
-        self.append_locked(conversation_id, event_type, payload, hub)
-            .await
+        let store = self.clone();
+        let conversation_id = conversation_id.to_owned();
+        let hub = hub.cloned();
+        Self::detached(async move {
+            let _guard = store.lock(&conversation_id).await;
+            // Buffered stream text precedes this event in emission order.
+            store.flush_pending_delta_locked(&conversation_id).await?;
+            store
+                .append_locked(&conversation_id, event_type, payload, hub.as_ref())
+                .await
+        })
+        .await
+    }
+
+    /// Runs a write that takes the conversation lock on its own task and
+    /// waits for it. Dropping the caller then cannot release the lock while
+    /// a blocking journal write it started is still running (the next
+    /// writer would read the old tail and reuse its sequence); the write
+    /// always finishes, and only its result is lost.
+    async fn detached<T: Send + 'static>(
+        work: impl std::future::Future<Output = Result<T, AppError>> + Send + 'static,
+    ) -> Result<T, AppError> {
+        tokio::spawn(work).await.map_err(blocking_error)?
     }
 
     /// Callers hold the conversation lock.
@@ -1353,7 +1401,17 @@ impl ConversationStore {
         line.push(b'\n');
         let pre_write_files = files.clone();
         let write_directory = directory.clone();
+        #[cfg(test)]
+        let hold = (
+            self.journal_write_hold.clone(),
+            self.journal_writes_started.clone(),
+        );
         let (line, metadata) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            {
+                hold.1.fetch_add(1, Ordering::SeqCst);
+                drop(hold.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+            }
             append_journal_line(&write_directory, &event_path, created, &line)
                 .map(|metadata| (line, metadata))
         })
@@ -3292,6 +3350,21 @@ impl ConversationStore {
         Ok(sealed)
     }
 
+    /// Holds every journal write (on the blocking pool, after it started)
+    /// until the guard drops; [`Self::journal_writes_started`] counts the
+    /// writes that reached the hold.
+    #[cfg(test)]
+    pub(super) fn hold_journal_writes(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.journal_write_hold
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(test)]
+    pub(super) fn journal_writes_started(&self) -> usize {
+        self.journal_writes_started.load(Ordering::SeqCst)
+    }
+
     /// Stop segment commits after `step`, simulating a crash.
     #[cfg(test)]
     pub(super) fn set_commit_stop(&self, step: Option<CommitStep>) {
@@ -5196,6 +5269,46 @@ mod tests {
 
     fn sequences(replay: &ConversationReplay) -> Vec<u64> {
         replay.events.iter().map(|event| event.sequence).collect()
+    }
+
+    /// A caller that gives up on an append while its journal write runs
+    /// must not let the next append reuse the sequence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_append_still_finishes_before_the_next_one() {
+        let (root, id, _) = seed_journal("todex-dropped-append", 3).await;
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let hold = store.hold_journal_writes();
+        let started = store.journal_writes_started();
+        let mut first = Box::pin(store.append(&id, "turn.completed", json!({"n": 1})));
+        // Drive the append until its journal write is under way, then drop
+        // the caller.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store.journal_writes_started() == started {
+                tokio::select! {
+                    biased;
+                    _ = &mut first => panic!("the write is held"),
+                    () = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+            }
+        })
+        .await
+        .expect("the journal write started");
+        drop(first);
+        let second = tokio::spawn({
+            let store = store.clone();
+            let id = id.clone();
+            async move { store.append(&id, "turn.completed", json!({"n": 2})).await }
+        });
+        // Give the second append time to reach the lock (or, if the lock
+        // were already free, to read the tail).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(hold);
+        let second = second.await.unwrap().unwrap();
+        assert_eq!(second.sequence, 5);
+        let replay = store.replay(&id, 0, 100).await.unwrap();
+        assert_eq!(sequences(&replay), vec![1, 2, 3, 4, 5]);
+        assert_eq!(replay.events[3].payload["n"], 1);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
