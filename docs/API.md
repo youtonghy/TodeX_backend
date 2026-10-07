@@ -8,7 +8,7 @@
 - 默认监听地址：`127.0.0.1:7345`
 - 默认 HTTP Base URL：`http://127.0.0.1:7345`
 - 默认 WebSocket URL：`ws://127.0.0.1:7345/v2/ws`
-- 传输加密：transport v2（[transport-v2.md](transport-v2.md)），`x25519` 或 `ml-kem-768`，由 TUI 配对二维码携带的服务端公钥协商；WebSocket 用 `tv=2` 握手，REST 走 `POST /v2/sealed` 隧道
+- 传输加密：transport v2（[transport-v2.md](transport-v2.md)），`x25519` 或 `ml-kem-768`，服务端公钥由设备配对交付（验证码认证）；WebSocket 用 `tv=2` 握手，REST 走 `POST /v2/sealed` 隧道
 - 数据格式：JSON
 - 字符编码：UTF-8
 
@@ -298,7 +298,7 @@ Codex 的原生 `thread/tokenUsage/updated` 通知会在 Provider 边界规范�
 
 ### 传输策略与 REST 隧道
 
-`GET /v2/transport-policy`（无需签名，`Cache-Control: no-store`）返回 `{"requiredProtocol": "none" | "x25519" | "ml-kem-768", "transportVersion": 2}`。客户端只用它检查与已固定协议是否冲突，不会因此降级为明文。
+`GET /v2/transport-policy`（无需签名，`Cache-Control: no-store`）返回 `{"requiredProtocol": "none" | "x25519" | "ml-kem-768", "transportVersion": 2}`。客户端只用它检查与已固定协议是否冲突，不会因此降级为明文；协议与公钥本身只来自设备配对（见下）。
 
 `POST /v2/sealed` 是 transport v2 的 REST 隧道（无需外层签名）：外层 header 为 `Content-Type: application/vnd.todex.sealed`、`X-Todex-Transport: 2`、`X-Todex-Encryption`、`X-Todex-Client-Key`（x25519）或 `X-Todex-Kem-Ciphertext`（ml-kem-768）、`X-Todex-Request-Nonce`；外层 body 是用 `k_up` 封装的记录流，明文为一个完整的内层请求（JSON head + body）。内层请求经同一个 router 执行，照常做设备签名校验（签名覆盖内层方法、路径、query 与 body）和各路由的 body 上限；内层 head 一解出就先做与 body 无关的检查：公开路由（`/health`、`/v2/version`、`/v2/transport-policy`、`/v2/device-pairing/*`）无需凭证但内层 body 上限 64 KiB，其余路径须带已登记设备的有效签名 header（匿名部署则做回环 `Host`/`Origin` 检查），否则不再读取外层 body，直接返回加密的内层 `401`（匿名检查为 `403`）；通过检查的隧道请求全局最多 32 个同时缓冲与处理，其余排队；内层只保留 `content-type`、`accept` 与四个设备签名 header，`Host`/`Origin` 与对端地址取自外层请求。成功时外层固定 `200`、`Content-Type: application/vnd.todex.sealed`，body 是用 `k_down` 流式封装的内层响应（状态码、header 与 body，下载等流式响应逐记录转发；为保证只有最后一条记录带 final 标记，封装器总是扣住最新一块，直到下一块到达或 body 结束才发出，因此流式响应在客户端会晚一块到达）。外层无法打开（header、密钥材料、认证失败、截断、超过 32 MiB 加记录开销、嵌套 `/v2/sealed`）时返回 `400 TRANSPORT_CRYPTO_FAILED`，不含细节。格式与限制见 [transport-v2.md](transport-v2.md)。
 
@@ -306,9 +306,9 @@ Codex 的原生 `thread/tokenUsage/updated` 通知会在 Provider 边界规范�
 
 配对路由无需签名，始终可直接访问（不经隧道），body 上限 2 KiB，响应 `Cache-Control: no-store`：
 
-1. `POST /v2/device-pairing/create` `{clientCommitment, deviceName, devicePublicKey}` → `{requestId, serverPublicKey, expiresAt, pollIntervalMs}`。`clientCommitment = base64url(SHA256(LP("todex.device-pairing.v3/commit") || client_public || client_nonce))`，`client_public` 为临时 X25519 公钥、`client_nonce` 为 32 字节随机数。仍提交 `clientPublicKey` 的配对 v2 客户端得到 426 `PROTOCOL_UPGRADE_REQUIRED`。
+1. `POST /v2/device-pairing/create` `{clientCommitment, transportBinding: 1, deviceName, devicePublicKey}` → `{requestId, serverPublicKey, expiresAt, pollIntervalMs, transportProtocol, transportPublicKey}`。`clientCommitment = base64url(SHA256(LP("todex.device-pairing.v3/commit") || client_public || client_nonce))`，`client_public` 为临时 X25519 公钥、`client_nonce` 为 32 字节随机数。`transportProtocol` 是服务端配置的 `pairing_encryption`（`none` / `x25519` / `ml-kem-768`），`transportPublicKey` 是 v2 握手此刻使用的静态公钥（base64url 无填充；`none` 时为空串），二者写入 transcript、由验证码认证。仍提交 `clientPublicKey` 的配对 v2 客户端，或缺少 `transportBinding`（必须是 JSON 整数 `1`）的客户端，得到 426 `PROTOCOL_UPGRADE_REQUIRED`。
 2. `POST /v2/device-pairing/reveal` `{requestId, clientPublicKey, clientNonce}` → `{"status":"pending"}`。服务端常量时间比较承诺，派生 v3 材料后才把验证码交给 TUI；承诺不符返回 401 并作废该申请，重复 reveal 返回 409 `CONFLICT`。
-3. `POST /v2/device-pairing/poll` / `cancel` `{requestId, proof}` 与之前相同，proof 改用 v3 材料；reveal 之前没有可用 proof（401）。批准后 `poll` 返回用 wrap key、以完整 v3 transcript 为 AAD 加密的 `{deviceId}`。
+3. `POST /v2/device-pairing/poll` / `cancel` `{requestId, proof}` 与之前相同，proof 改用 v3 材料；reveal 之前没有可用 proof（401）。批准后 `poll` 返回用 wrap key、以完整 v3 transcript 为 AAD 加密的 `{deviceId, transportProtocol, transportPublicKey}`；客户端确认两个传输字段与 `create` 响应完全一致后才保存公钥。若 `create` 之后加密密钥被重置，已批准的申请返回 `expired` 且不登记设备。
 
 transcript、HKDF 标签与验证码格式见 [transport-v2.md](transport-v2.md#device-pairing-v3-commit-then-reveal) 与 [设备验证](device-verification.md)。
 
@@ -719,7 +719,7 @@ Computer Use 由 daemon 在**自己所在的主机**上执行（`src/computer`�
 
 握手认证与 HTTP 一致：四个 `x-todex-*` header，或等价 query 参数（Electron 原生 WebSocket、浏览器等无法设置 header 的客户端）：`ws://127.0.0.1:7345/v2/ws?device_id=<id>&auth_ts=<unix>&auth_nonce=<b64url>&auth_sig=<b64url>`。签名按 `GET /v2/ws`、完整 canonical query 与空 body 计算；query 中的传输加密参数同样被签名覆盖，因此握手材料无法被中间人替换。注意 query 凭据可能进入反向代理日志，生产环境优先使用 header。
 
-TUI 配对二维码只携带后端地址、当前首选加密方式和服务端公钥，不携带任何访问凭据——设备身份一律走 `/v2/device-pairing` 配对流程登记。
+TUI 配对二维码只携带后端地址（`{"kind":"todex-pairing-link","version":2,"serverUrl":"http://host:port"}`，不分片），不携带公钥或任何访问凭据——设备身份与传输公钥一律走 `/v2/device-pairing` 配对流程获取。
 
 - transport v2：`ws://.../v2/ws?tv=2&enc=<x25519|ml-kem-768>&client_nonce=<b64url 32B>&client_key=<b64url>`（ML-KEM-768 用 `ciphertext=<b64url>` 代替 `client_key`），再加设备签名参数。会话密钥由 HKDF-SHA256 从共享秘密与 transcript（含签名凭证里的 `device_id`，关闭认证时为空串、双方 nonce）派生，每个方向独立密钥与严格递增计数器，服务端 nonce 每次连接新鲜生成，重放握手不会得到相同密钥。`tv` 不是 `2` 时升级前返回 426 `PROTOCOL_UPGRADE_REQUIRED`；协议与服务端 `pairing_encryption` 不符返回 403；握手材料畸形、帧解密失败、计数器不连续或 hello 之后收到文本帧时以 close code `4400`、reason `transport crypto failure` 关闭，不带细节。
 - transport v1（`todex.crypto.v1`，`enc=` 而无 `tv`）已停用：升级前返回 426 `PROTOCOL_UPGRADE_REQUIRED`。不带 `enc` 的明文握手只接受回环对端，且服务端 `pairing_encryption` 必须为 `none`（否则 403）。

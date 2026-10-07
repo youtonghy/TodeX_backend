@@ -166,8 +166,14 @@ and no further detail.
 
 ## Client rules
 
+- The protocol and key come only from device pairing v3 (below); no manual,
+  QR or pairing-link path can set them. A profile pins them together with
+  `transportVerified = true` in one write.
 - If the profile pins an encryption protocol and key, the client always uses
   v2 for the WebSocket and the tunnel for every REST call, including loopback.
+- A pinned key without `transportVerified` (profiles from before transport
+  binding) is refused on every host, loopback included, with a re-pair error;
+  it never falls back to plaintext.
 - If the profile has no pinned key and the host is not loopback, the client
   refuses to connect and asks the user to pair with encryption. It never
   falls back to plaintext because of a policy answer.
@@ -181,26 +187,53 @@ and no further detail.
 v2 let a man in the middle grind its own public key against a 40-bit code.
 v3 makes the client commit first.
 
+Pairing also delivers the transport key: the static public key the v2
+handshake uses for the server's `pairing_encryption`, bound into the
+transcript so the verification code authenticates it.
+
 ```
 commit     = SHA256(LP("todex.device-pairing.v3/commit") || client_public || client_nonce)
 transcript = "todex.device-pairing.v3/transcript\0" || request_id || 0x00 ||
-             client_public || server_public || 0x00 || device_public || client_nonce
+             client_public || server_public || 0x00 || device_public || client_nonce ||
+             LP(transport_protocol_ascii) || LP(transport_public_key_raw)
+LP(x)      = u32_be(len(x)) || x        (for none: LP("none") || 00 00 00 00)
 ```
 
 1. `POST /v2/device-pairing/create`
-   `{clientCommitment, deviceName, devicePublicKey}` →
-   `{requestId, serverPublicKey, expiresAt, pollIntervalMs}`.
-   A body with `clientPublicKey` (v2) answers `426 PROTOCOL_UPGRADE_REQUIRED`.
+   `{clientCommitment, transportBinding: 1, deviceName, devicePublicKey}` →
+   `{requestId, serverPublicKey, expiresAt, pollIntervalMs, transportProtocol,
+   transportPublicKey}`. `transportProtocol` is `none`, `x25519` or
+   `ml-kem-768`; `transportPublicKey` is base64url without padding (32 bytes
+   for x25519, 1184 for ml-kem-768, the empty string for `none`). A body with
+   `clientPublicKey` (v2), or without `transportBinding` equal to the JSON
+   integer `1`, answers `426 PROTOCOL_UPGRADE_REQUIRED`. Before deriving
+   anything the client validates the protocol and key (length, canonical
+   base64url, a throwaway handshake; `none` only for a loopback server).
 2. `POST /v2/device-pairing/reveal` `{requestId, clientPublicKey, clientNonce}`.
    The server checks the commitment in constant time, derives the pairing
    material from the v3 transcript (same HKDF salt/info pattern as v2 with v3
    labels: `todex.device-pairing.v3/wrap-key`, `/poll-proof`, `/cancel-proof`),
    and only then shows the verification code. Answers `{"status":"pending"}`.
    A second reveal for the same request fails.
-3. `poll` and `cancel` are unchanged apart from using v3 material.
+3. `poll` and `cancel` are unchanged apart from using v3 material. The
+   approval credential (XChaCha20-Poly1305 under the wrap key, AAD = the full
+   transcript) is the JSON
+   `{"deviceId", "transportProtocol", "transportPublicKey"}`. The client
+   checks that `deviceId` matches its device key and that both transport
+   fields equal the create response exactly; otherwise it pins nothing.
 
 The verification code is still the first 5 bytes of `SHA256(transcript)`,
-formatted `XXXXX-XXXXX`.
+formatted `XXXXX-XXXXX`. The key fingerprint shown next to it (backend TUI)
+and in client settings is `upper-hex(SHA256(transport_public_key_raw))[0..16]`,
+grouped `XXXX-XXXX-XXXX-XXXX` (`none` for plaintext).
+
+## Pairing link
+
+The backend's pairing QR/link is address only:
+`{"kind":"todex-pairing-link","version":2,"serverUrl":"http://host:port"}`.
+There are no chunks. Clients that parse links accept version 1 or 2, use only
+`serverUrl` and ignore every other field; importing a link fills the address
+and starts device verification.
 
 ## Test vectors
 
@@ -211,8 +244,9 @@ library supports deterministic encapsulation), nonces, `th`, `k_up`, `k_down`,
 WebSocket frames for a few messages in both directions, a REST request and
 response stream including a multi-record case, and failure cases (wrong
 counter, flipped tag bit, truncated stream, extra trailing bytes). It also
-contains a pairing v3 vector (commitment, transcript hash, code and the three
-derived keys).
+contains a pairing v3 vector (commitment, transport binding, transcript hash,
+code, the three derived keys, the credential plaintext and ciphertext for a
+fixed nonce, the fingerprint, a tampered-key case and the `none` case).
 
 ## Clarifications (normative)
 
@@ -301,7 +335,14 @@ derived keys).
     truncation. The tunnel response is never gzip-compressed.
 - Device pairing v3 is implemented in `src/device_pairing.rs`; the
   approval credential wrap is unchanged from v2 (XChaCha20-Poly1305 under the
-  wrap key, AAD = the full v3 transcript). The verification code reaches the
+  wrap key, AAD = the full v3 transcript). The transport binding is captured
+  at `create` from `PairingKeyStore`, the same in-memory keys the WS and REST
+  handshakes read, and the daemon's configured `pairing_encryption`. The
+  store stats `pairing_keys.json` on every access and reloads it when its
+  mtime, size or (Unix) inode changes, so a TUI reset switches pairing and
+  the handshake together; a missing or invalid file fails closed. An approved
+  request whose bound key no longer matches (reset after `create`) is
+  answered `expired` without registering the device. The verification code reaches the
   local approver (TUI) only after `reveal`. A reveal that does not open the
   commitment discards the request; a second reveal answers `409 CONFLICT`.
   `poll` and `cancel` before `reveal` answer `401`.

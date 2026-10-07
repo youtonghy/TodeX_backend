@@ -45,7 +45,7 @@
     - **明文** (`none`)
     - **X25519-ChaCha20Poly1305** (`x25519`)
     - **ML-KEM-768** (`ml-kem-768`，NIST 后量子密码学标准)
-  - 密钥交换参数通过 TUI 配对二维码无缝传输。
+  - 传输公钥由[设备验证](docs/device-verification.md)交付并由验证码认证；TUI 配对二维码只包含服务器地址。
 - **安全与沙箱边界**：
   - Fail-Closed 设备签名认证：每个请求携带已注册设备的 Ed25519 签名，未授权请求直接返回 `401 Unauthorized`；设备经[设备验证](docs/device-verification.md)登记，可在 TUI 单独吊销。
   - 租户隔离（`tenant_id`），严格校验所有会话读取、订阅与变更入口。
@@ -61,7 +61,7 @@
   - Agent 观察并操作 daemon 所在的电脑（`todex_desktop` 的 `computer_*` 工具），在进程内通过 [xa11y](https://github.com/xa11y/xa11y)（macOS AX、Windows UI Automation、Linux AT-SPI）完成；客户端只负责预览（实时画面、截图）和审批。
   - 每个会话首次使用需由主机前的人确认；浮条“停止”和全局快捷键可随时结束；TodeX、凭据存储和系统设置永远不会被操作。macOS 上需为 `todex-agentd` 授予屏幕录制和辅助功能权限，详见 `docs/API.md`。
 - **交互式 TUI 与守护进程管理**：
-  - 基于 Ratatui 构建的交互式 TUI（`cargo run -- tui`）：查看运行状态、实时日志、启停守护进程，并自动探测局域网 IP 生成移动端配对二维码。
+  - 基于 Ratatui 构建的交互式 TUI（`cargo run -- tui`）：查看运行状态、实时日志、启停守护进程，并自动探测局域网 IP 生成只含服务器地址的配对二维码。
   - 基于 PID 文件管理的后台守护进程模式（`start`、`stop`、`restart`、`status`）。
 
 ---
@@ -147,7 +147,7 @@ cargo build --release
 cargo run -- tui
 ```
 
-在 TUI 控制台中可以直观启动/停止后台守护进程、查看实时日志，并显示移动端配对二维码。退出 TUI 不会终止后台守护进程。
+在 TUI 控制台中可以直观启动/停止后台守护进程、查看实时日志，并显示移动端配对二维码（只含服务器地址）。按 `d` 打开设备验证面板，核对完整验证码后按 `a` 批准；验证码旁显示后端传输公钥指纹，客户端只从配对中获取并保存公钥。退出 TUI 不会终止后台守护进程。
 
 #### 方式 B：前台运行服务
 
@@ -197,7 +197,7 @@ cargo run -- daemon autostart enable   # status / disable 查询或取消
 | **Claude 可执行文件**| — | `TODEX_AGENTD_CLAUDE_BIN` | `claude` | Claude Code CLI 路径或命令名称。 |
 | **Pi 可执行文件**    | — | `TODEX_AGENTD_PI_BIN` | `pi` | Pi CLI 路径或命令名称。 |
 | **启用认证** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | 是否启用 Fail-closed 设备签名认证。 |
-| **配对加密方式** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | 配对加密算法（`none`、`x25519`、`ml-kem-768`）。监听非回环地址时不能为 `none`。 |
+| **配对加密方式** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | 配对加密算法（`none`、`x25519`、`ml-kem-768`）。监听非回环地址时不能为 `none`。客户端在设备验证时获取对应公钥。 |
 | **历史加密** | — | `TODEX_AGENTD_HISTORY_ENCRYPTION` | 始终 `e2e` | 已作废：会话历史始终端到端加密（见 [docs/history-encryption.md](docs/history-encryption.md)）。该变量或 `config.toml` 中 `history_encryption` 的任何值都只记一条警告后忽略。写入需要至少一台客户端登记设备密钥；旧版本写下的明文会话仍可读取，但只读。 |
 
 ### `config.toml` 配置示例

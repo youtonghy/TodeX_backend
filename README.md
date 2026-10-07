@@ -50,7 +50,7 @@ In TodeX 2.0, all interactions are consolidated under the `/v2` surface (REST en
     - **Plaintext** (`none`)
     - **X25519-ChaCha20Poly1305** (`x25519`)
     - **ML-KEM-768** (`ml-kem-768`, NIST Post-Quantum standard)
-  - Key exchange parameters are seamlessly exchanged via TUI pairing QR codes.
+  - The transport public key is delivered by [device verification](docs/device-verification.md) and authenticated by its verification code; the TUI pairing QR carries only the server address.
 - **Security & Sandboxing**:
   - Fail-closed device authentication: every request carries an Ed25519 signature from a registered device (unauthorized requests are rejected with `401 Unauthorized`). Devices are enrolled via [device verification](docs/device-verification.md) and can be revoked individually in the TUI.
   - Tenant isolation (`tenant_id`) enforced across all conversation queries, event journals, and subscriptions.
@@ -152,9 +152,9 @@ cargo build --release
 cargo run -- tui
 ```
 
-The TUI allows starting and stopping the background daemon, viewing live server logs, and displaying QR codes for mobile client pairing. [Device verification](docs/device-verification.md) is the only way clients gain access: press `d` in the TUI, compare the full code, then use `a` to approve or `r` to reject; the same panel lists registered devices (`x` revokes the selected one). Encryption public keys still require QR or manual import. Quitting the TUI keeps the daemon running in the background.
+The TUI allows starting and stopping the background daemon, viewing live server logs, and displaying QR codes for mobile client pairing. [Device verification](docs/device-verification.md) is the only way clients gain access: press `d` in the TUI, compare the full code, then use `a` to approve or `r` to reject; the same panel lists registered devices (`x` revokes the selected one). The verification code also authenticates the backend's transport key, whose fingerprint is shown next to it; clients pin the key only from pairing, never by manual import. Quitting the TUI keeps the daemon running in the background.
 
-Pairing QR codes use solid terminal cell backgrounds to avoid gaps caused by terminal fonts. If the code does not fit, press `b` in the QR popup to view it in your default browser. The browser page renders a square SVG code and supports Left/Right keys or buttons to switch ML-KEM segments. It loads no external resources; its private temporary file is removed when the TUI exits.
+Pairing QR codes use solid terminal cell backgrounds to avoid gaps caused by terminal fonts. If the code does not fit, press `b` in the QR popup to view it in your default browser. The QR holds only the server address, so it is a single code for every encryption mode. The browser page renders it as a square SVG and loads no external resources; its private temporary file is removed when the TUI exits.
 
 #### Option B: Foreground Server
 
@@ -204,7 +204,7 @@ Configuration values are resolved using the following precedence:
 | **Claude Binary** | — | `TODEX_AGENTD_CLAUDE_BIN` | `claude` | Path or executable name for Claude Code CLI. |
 | **Pi Binary** | — | `TODEX_AGENTD_PI_BIN` | `pi` | Path or executable name for Pi CLI. |
 | **Enable Auth** | — | `TODEX_AGENTD_ENABLE_AUTH` | `true` | Enables fail-closed device-signature authentication. |
-| **Pairing Encryption** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | Required WebSocket encryption (`x25519` or `ml-kem-768`); `none` permits plaintext from loopback clients and is refused on a non-loopback listener (remote clients must use encrypted transport v2). Clients must import the matching public key separately from device approval. |
+| **Pairing Encryption** | — | `TODEX_AGENTD_PAIRING_ENCRYPTION` | `ml-kem-768` | Required WebSocket encryption (`x25519` or `ml-kem-768`); `none` permits plaintext from loopback clients and is refused on a non-loopback listener (remote clients must use encrypted transport v2). Clients receive the matching public key during device verification. |
 | **History Encryption** | — | `TODEX_AGENTD_HISTORY_ENCRYPTION` | always `e2e` | Retired: conversation history is always end-to-end encrypted (see [docs/history-encryption.md](docs/history-encryption.md)). Any value of this variable or of `history_encryption` in `config.toml` is ignored with a warning. Writes need at least one client device key; conversations written in plaintext by older versions stay readable but are read-only. |
 
 ### Example `config.toml`
