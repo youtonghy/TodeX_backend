@@ -259,9 +259,12 @@ returned. Replay pages
 `limit` events or about 8 MiB of journal, whichever comes first, but always
 hold at least one event; clients keep paging while `hasMore`.
 
-On unix every spawned provider is recorded in
-`<data_dir>/provider_processes.json` (0600, atomic rewrite) with pid, pgid and
-start time, next to the owning server's pid and start time. At startup the
+On unix every spawned provider, including the `codex.local` app-server, is
+recorded in `<data_dir>/provider_processes.json` (0600, atomic rewrite from the
+blocking pool, newest snapshot wins) with pid, pgid and start time, next to the
+owning server's pid and start time. Start times come from the kernel
+(`proc_pidinfo` on macOS, `/proc/<pid>/stat` plus the boot id on Linux) and
+from `ps` elsewhere or for records an older daemon wrote. At startup the
 server kills each recorded process group whose leader still has the recorded
 start time, unless the owning server is still alive: then the new server
 neither reaps nor tracks. Linux also sets `PR_SET_PDEATHSIG` (SIGKILL). Both
