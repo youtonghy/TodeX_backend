@@ -5,6 +5,8 @@ use std::sync::Mutex as StdMutex;
 
 use tokio::sync::Semaphore;
 
+use super::super::follow_ups::rate_limit_resume_at;
+
 use super::*;
 
 /// Each turn records its prompt text, then waits for a permit (or its
@@ -130,6 +132,9 @@ async fn gated_fixture(
             limit_next,
         })
     });
+    // The fixture's resets are a second away; the production minute floor
+    // would only slow the tests down.
+    supervisor.rate_limit_retry_floor = Duration::from_millis(50);
     (root, store, supervisor, workspace, gate)
 }
 
@@ -678,6 +683,203 @@ async fn daemon_restart_keeps_a_rate_limit_wait() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn continuations_wait_at_least_the_floor_and_back_off() {
+    let now = chrono::Utc::now();
+    let floor = Duration::from_secs(60);
+    let minutes = |n: i64| chrono::Duration::minutes(n);
+    // A reset already in the past still waits a minute.
+    assert_eq!(
+        rate_limit_resume_at(now - minutes(5), now, 0, floor),
+        now + minutes(1)
+    );
+    // A later reset wins over the floor.
+    assert_eq!(
+        rate_limit_resume_at(now + minutes(90), now, 2, floor),
+        now + minutes(90)
+    );
+    // The nth consecutive failed continuation waits 60 s × 2^(n−1).
+    for (failures, wait) in [(1, 1), (2, 2), (3, 4)] {
+        assert_eq!(
+            rate_limit_resume_at(now, now, failures, floor),
+            now + minutes(wait),
+            "{failures}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn continuations_stop_after_three_consecutive_limits() {
+    let (root, store, supervisor, workspace, gate) =
+        gated_fixture("todex-queue-rate-limit-cap").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    supervisor
+        .prompt(&manifest.id, "first".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    // The original turn, then three continuations, all hit the limit.
+    for started in 2..=4 {
+        gate.limit_next(chrono::Duration::zero());
+        gate.release();
+        gate.wait_for_prompts(started).await;
+        assert_eq!(gate.prompts()[started - 1], CONTINUE_TEXT);
+    }
+    gate.limit_next(chrono::Duration::zero());
+    gate.release();
+    let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| {
+        q["pauseReason"] == "turn_failed"
+    })
+    .await;
+    assert_eq!(snapshot["paused"], true);
+    assert_eq!(snapshot["items"], json!([]), "no fourth continuation");
+    assert!(snapshot["resumeAt"].is_null());
+    assert!(
+        snapshot["pauseMessage"]
+            .as_str()
+            .unwrap()
+            .contains("3 automatic continuations"),
+        "{snapshot}"
+    );
+    wait_until_idle(&supervisor).await;
+    // The count survives a restart, since it lives in queue.json.
+    let saved = store.follow_up_queue(&manifest.id).await.unwrap().unwrap();
+    assert_eq!(saved["rateLimitFailures"], 3);
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(gate.prompts().len(), 4);
+
+    // A completed turn starts the count over and lifts the stale pause.
+    supervisor
+        .prompt(&manifest.id, "manual".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(5).await;
+    gate.release();
+    wait_until_idle(&supervisor).await;
+    let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| q["paused"] == false).await;
+    assert!(snapshot["pauseReason"].is_null());
+    let saved = store.follow_up_queue(&manifest.id).await.unwrap().unwrap();
+    assert!(saved.get("rateLimitFailures").is_none(), "{saved}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_rate_limit_keeps_a_pause_the_user_holds() {
+    let (root, _store, supervisor, workspace, gate) =
+        gated_fixture("todex-queue-rate-limit-held").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    supervisor
+        .prompt(&manifest.id, "first".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    add(&supervisor, &manifest.id, "item-2", queued_prompt("second")).await;
+    supervisor.cancel(&manifest.id).await.unwrap();
+    wait_for_queue(&supervisor, &manifest.id, |q| {
+        q["pauseReason"] == "turn_cancelled"
+    })
+    .await;
+    wait_until_idle(&supervisor).await;
+
+    // A manual prompt under the pause hits the limit.
+    let failed_turn = supervisor
+        .prompt(&manifest.id, "manual".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(2).await;
+    gate.limit_next(chrono::Duration::zero());
+    gate.release();
+    let continue_id = format!("rate-limit-continue-{failed_turn}");
+    let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| {
+        q["items"][0]["id"] == continue_id.as_str()
+    })
+    .await;
+    assert_eq!(snapshot["pauseReason"], "turn_cancelled");
+    assert!(snapshot["resumeAt"].is_string(), "{snapshot}");
+    assert_eq!(snapshot["items"][1]["id"], "item-2");
+    wait_until_idle(&supervisor).await;
+
+    // No timer: the reset passes and nothing starts until the user resumes.
+    let resume_at =
+        chrono::DateTime::parse_from_rfc3339(snapshot["resumeAt"].as_str().unwrap()).unwrap();
+    let remaining = resume_at.signed_duration_since(chrono::Utc::now());
+    sleep(remaining.to_std().unwrap_or_default() + Duration::from_millis(300)).await;
+    assert_eq!(gate.prompts().len(), 2);
+    assert_eq!(
+        queue_ids(&supervisor, &manifest.id).await.1["pauseReason"],
+        "turn_cancelled"
+    );
+
+    supervisor
+        .queue_resume_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(3).await;
+    assert_eq!(gate.prompts()[2], CONTINUE_TEXT);
+    gate.release();
+    gate.wait_for_prompts(4).await;
+    assert_eq!(gate.prompts()[3], "second");
+    gate.release();
+    wait_until_idle(&supervisor).await;
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn nothing_starts_from_the_queue_once_shutdown_begins() {
+    let (root, store, supervisor, workspace, gate) = gated_fixture("todex-queue-shutdown").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    supervisor
+        .prompt(&manifest.id, "first".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    assert!(!supervisor.has_pending_follow_ups());
+    add(&supervisor, &manifest.id, "item-2", queued_prompt("second")).await;
+    // The updater must not count this conversation as idle.
+    assert!(supervisor.has_pending_follow_ups());
+
+    // Shutdown has begun when the running turn completes.
+    supervisor
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    gate.release();
+    wait_until_idle(&supervisor).await;
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(gate.prompts().len(), 1, "the queued item did not start");
+    assert_eq!(queue_ids(&supervisor, &manifest.id).await.0, ["item-2"]);
+    supervisor
+        .queue_resume_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(gate.prompts().len(), 1, "resume does not start it either");
+
+    // The next daemon finds it waiting and holds it for the user.
+    let restarted = ConversationSupervisor::new(
+        supervisor.config.clone(),
+        store.clone(),
+        ConversationEventHub::default(),
+        supervisor.workspace_trust.clone(),
+    );
+    restarted.recover_all().await.unwrap();
+    let snapshot = restarted
+        .queue_list_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    assert_eq!(snapshot["pauseReason"], "daemon_restarted");
+    assert!(!restarted.has_pending_follow_ups());
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Real Claude driver, scripted CLI. The fixture speaks stream-json the way
 /// Claude Code 2.1.288 does on a usage limit: an assistant `rate_limit` frame
 /// with no `quotaLimits`, then `result.is_error` whose text is
@@ -686,7 +888,8 @@ async fn daemon_restart_keeps_a_rate_limit_wait() {
 /// must run by itself.
 #[tokio::test]
 async fn claude_session_limit_retries_after_the_reset() {
-    let (root, store, supervisor, workspace) = control_fixture("todex-claude-limit-e2e").await;
+    let (root, store, mut supervisor, workspace) = control_fixture("todex-claude-limit-e2e").await;
+    supervisor.rate_limit_retry_floor = Duration::from_millis(50);
     fs::write(root.join("provider-fixture.sh"), CLAUDE_LIMIT_FIXTURE).unwrap();
     let manifest = supervisor
         .create(ProviderKind::ClaudeCode, workspace, None, None)

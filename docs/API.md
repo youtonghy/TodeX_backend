@@ -212,9 +212,14 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 
 快照为 `{ "items": [{ "id", "text", "status": "queued", "queuedAt", "contentCount", "skills" }], "paused", "pauseReason", "pauseMessage", "resumeAt" }`，不含内联图片数据。每次变化都会追加 `followups.updated` 事件（payload 即快照）；懒加载窗口可能不含最近一次该事件，客户端打开会话或重连后应调用 `conversation.queue.list` 取当前快照。
 
-派发规则：turn 以 `turn.completed` 结束（或原生压缩结束）后，daemon 以队列项的 `itemId` 作为 `clientRequestId` 开始队首，成功后移出队列。`turn.failed` / `turn.cancelled` / `turn.interrupted` 使队列暂停（`pauseReason` 为 `turn_failed` / `turn_cancelled` / `turn_interrupted`）；队首无法开始时保留在队首并暂停（`start_failed`，`pauseMessage` 为原因）；daemon 重启后有待发项的队列暂停（`daemon_restarted`）。暂停期间空闲会话仍可直接 `conversation.prompt`，该 turn 完成后队列保持暂停。
+派发规则：turn 以 `turn.completed` 结束（或原生压缩结束）后，daemon 以队列项的 `itemId` 作为 `clientRequestId` 开始队首，成功后移出队列。`turn.failed` / `turn.cancelled` / `turn.interrupted` 使队列暂停（`pauseReason` 为 `turn_failed` / `turn_cancelled` / `turn_interrupted`）；队首无法开始时保留在队首并暂停（`start_failed`，`pauseMessage` 为原因）；daemon 重启后有待发项的队列暂停（`daemon_restarted`）。daemon 开始关停后不再从队列取下一项（关停期间完成的 turn 也不会带起队首），这些队列在下次启动时按 `daemon_restarted` 暂停；自动更新判定"空闲"时除没有运行中的 turn 外，还要求没有"未暂停且非空"的队列。暂停期间空闲会话仍可直接 `conversation.prompt`，该 turn 完成后队列保持暂停（队列已空时除外，见下文）。
 
-额度续写：turn 失败且该 turn 最近一次 `quota.updated` 显示套餐窗口已用尽时——快照带 `status` 时只有 `status: "rejected"` 算用尽（`allowed` / `allowed_warning` 即使某窗口达到 100 % 也不算）；不带 `status` 时需某窗口 `usedPercent` ≥ 100 且 `isUsingOverage` 不为 `true`——daemon 不按普通失败处理，而是在队首插入一条续写项（`id` 为 `rate-limit-continue-<turnId>`，沿用失败请求的模型、思考强度与权限设置，正文为固定英文续写指令，不重复附件与 skills）——队列为空时也插入，已有续写项时不重复插入——并以 `rate_limited` 暂停，`resumeAt` 为窗口重置时间（ISO 8601）。到点后 daemon 自行解除暂停并开始队首（按墙钟时间每 30 秒复核，机器休眠后也会补上），daemon 重启后继续等待。等待期间客户端可移除续写项或 `resume` 提前开始；若期间有 turn 以 `turn.completed` 结束（用户已手动继续），续写项被移除、暂停解除。
+额度续写：turn 失败且该 turn 最近一次 `quota.updated` 显示套餐窗口已用尽时，daemon 不按普通失败处理，而是在队首插入一条续写项（`id` 为 `rate-limit-continue-<turnId>`，沿用失败请求的模型、思考强度与权限设置，正文为固定英文续写指令，不重复附件与 skills）——队列为空时也插入，已有续写项时不重复插入——并以 `rate_limited` 暂停，`resumeAt`（ISO 8601）为续写项可开始的时间。到点后 daemon 自行解除暂停并开始队首（按墙钟时间每 30 秒复核，机器休眠后也会补上），daemon 重启后继续等待。等待期间客户端可移除续写项或 `resume` 提前开始；若期间有 turn 以 `turn.completed` 结束（用户已手动继续），续写项被移除、暂停解除。具体规则：
+
+- 用尽判定：快照带 `status` 时只有 `status: "rejected"` 算用尽（`allowed` / `allowed_warning` 即使某窗口达到 100 % 也不算）；不带 `status` 时需某窗口 `usedPercent` ≥ 100 且 `isUsingOverage` 不为 `true`。
+- 等待下限：`resumeAt` = max(窗口重置时间, 现在 + 60 秒)，重置时间已过去时也至少等 60 秒。Claude 只在错误文本中给出重置时刻（如 "resets 5:30pm (UTC)"）时，解析出的时刻早于现在但不超过 10 分钟按"现在"处理（再套 60 秒下限），不再顺延到次日或下周。
+- 退避与上限：续写项本身再次因用尽失败时，第 n 次（n 从 1 起）等待 max(重置时间, 现在 + 60 秒 × 2^(n−1))。连续 3 个续写项都因用尽失败后不再插入续写项，队列以 `turn_failed` 暂停（队列为空时也暂停），`pauseMessage` 说明已停止自动续写；计数随 `queue.json` 持久化，重启不清零，任一 turn 以 `turn.completed` 结束时清零，此时只剩这一暂停的空队列也一并解除暂停。
+- 用户持有的暂停：队列已因 `turn_cancelled` / `start_failed` / `daemon_restarted` 暂停时（例如暂停期间手动发送的 prompt 遇到额度用尽），续写项照常插到队首，但 `pauseReason` 不变、不设定时器，`resumeAt` 照常下发仅供显示；用户 `resume` 后从续写项开始。
 
 ### 历史加密密钥（`history.*`）
 

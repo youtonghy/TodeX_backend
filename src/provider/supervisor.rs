@@ -375,6 +375,15 @@ pub struct ConversationSupervisor {
     /// encrypted and the journal only holds it as ciphertext. In memory
     /// only: control results may carry prompt text.
     control_results: Arc<std::sync::Mutex<lru::LruCache<(String, String), Value>>>,
+    /// Set once [`Self::shutdown_all`] starts: the follow-up queue no longer
+    /// starts items, so nothing new runs while turns are being stopped.
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Conversations whose follow-up queue is unpaused and holds items, so
+    /// the next item is about to start; the updater waits for them.
+    pending_follow_ups: Arc<dashmap::DashSet<String>>,
+    /// Shortest wait before a rate-limit continuation runs (doubled per
+    /// consecutive failed continuation). Tests shorten it.
+    rate_limit_retry_floor: Duration,
 }
 
 /// Completed control results kept for retried requests.
@@ -481,6 +490,9 @@ impl ConversationSupervisor {
                 std::num::NonZeroUsize::new(CONTROL_RESULT_CACHE)
                     .expect("the control result cache is not empty"),
             ))),
+            shutting_down: Arc::default(),
+            pending_follow_ups: Arc::default(),
+            rate_limit_retry_floor: follow_ups::RATE_LIMIT_RETRY_FLOOR,
         }
     }
 
@@ -817,6 +829,12 @@ impl ConversationSupervisor {
         !self.active.is_empty()
     }
 
+    /// Whether some follow-up queue is unpaused with items waiting, so a
+    /// turn is about to start even if none runs right now.
+    pub fn has_pending_follow_ups(&self) -> bool {
+        !self.pending_follow_ups.is_empty()
+    }
+
     pub fn has_active_turns_for_cli(&self, cli: ManagedCli) -> bool {
         let provider = cli.provider_kind();
         let binary = cli.binary(&self.config);
@@ -1139,6 +1157,7 @@ impl ConversationSupervisor {
             .shutdown_session_with_reason(&manifest.id, "conversation_deleted")
             .await;
         self.store.delete(&manifest.id).await?;
+        self.pending_follow_ups.remove(&manifest.id);
         self.revoke_agent_mcp(&manifest.id).await;
         // Close the broadcast channel so live websocket subscriptions exit
         // instead of holding their per-connection slot forever.
@@ -1163,6 +1182,7 @@ impl ConversationSupervisor {
                 .driver(manifest.provider)?
                 .shutdown_session_with_reason(&manifest.id, "conversation_expired")
                 .await;
+            self.pending_follow_ups.remove(&manifest.id);
             self.revoke_agent_mcp(&manifest.id).await;
             self.hub.remove(&manifest.id);
         }
@@ -2636,6 +2656,11 @@ impl ConversationSupervisor {
     }
 
     pub async fn shutdown_all(&self) {
+        // Before any turn is cancelled: a turn that completes during shutdown
+        // must not start the next queued item. Recovery pauses those queues
+        // with `daemon_restarted` on the next start.
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         for entry in self.active.iter() {
             let _ = entry.cancel.send(true);
         }

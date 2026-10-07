@@ -155,11 +155,13 @@ impl ManagedServer {
         self.handle.is_finished()
     }
 
-    /// No Agent turn or local Codex adapter is running, and nothing holds the
-    /// CLI execution gate (an Agent start in progress or a CLI install/upgrade).
+    /// No Agent turn or local Codex adapter is running, no follow-up queue is
+    /// about to start its next item, and nothing holds the CLI execution gate
+    /// (an Agent start in progress or a CLI install/upgrade).
     pub fn is_agent_idle(&self) -> bool {
         self.state.cli_execution_gate.try_write().is_ok()
             && !self.state.conversations.has_active_turns()
+            && !self.state.conversations.has_pending_follow_ups()
             && !self.state.codex_local_adapters.has_active_adapters()
     }
 

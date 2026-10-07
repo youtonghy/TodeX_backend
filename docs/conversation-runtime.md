@@ -315,7 +315,15 @@ queue with waiting items is paused with `daemon_restarted` at startup. A
 turn in the quota store, since concurrent conversations overwrite the
 provider snapshot) instead inserts one continuation item at the head and
 pauses with `rate_limited` until `resumeAt`; a wall-clock timer, re-armed on
-recovery, lifts that pause and drains the queue.
+recovery, lifts that pause and drains the queue. `resumeAt` is never less
+than a minute away, doubles for each consecutive continuation that hits the
+limit again (the count lives in `queue.json` and resets when a turn
+completes), and after three such continuations the queue pauses with
+`turn_failed` instead. A pause the user holds (`turn_cancelled`,
+`start_failed`, `daemon_restarted`) is kept: the continuation joins the head
+without a timer. Once `shutdown_all` starts, neither a completed turn nor a
+timer starts a queued item, and the updater treats an unpaused, non-empty
+queue as work in progress.
 
 Regression coverage includes malformed approvals, provider wire parameters,
 quiet processes and blocked writes, replay/live races, late acknowledgements,
