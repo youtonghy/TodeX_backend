@@ -11,6 +11,7 @@
 //! a time; the lease ends with `computer_done`, a stop, a revoke, or
 //! [`SCREEN_IDLE`].
 
+mod keyed;
 mod shots;
 
 use std::{
@@ -30,6 +31,7 @@ use crate::{
     secure_fs,
 };
 
+pub(crate) use keyed::KeyedLocks;
 pub(crate) use shots::ShotStore;
 
 const SETTINGS_FILE: &str = "agent-desktop.json";

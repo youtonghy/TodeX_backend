@@ -25,8 +25,13 @@ pub(crate) struct Process {
 }
 
 pub(crate) async fn launch(executable: &Path, profile_dir: &Path) -> Result<Process, BrowserError> {
-    tokio::fs::create_dir_all(profile_dir)
+    // Cookies and storage of the agent's sessions: owner-only (0700).
+    let dir = profile_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::secure_fs::ensure_owner_only_dir(&dir))
         .await
+        .map_err(|error| {
+            BrowserError::failed(format!("cannot create the browser profile: {error}"))
+        })?
         .map_err(|error| {
             BrowserError::failed(format!("cannot create the browser profile: {error}"))
         })?;
@@ -104,15 +109,42 @@ async fn wait_ready(cdp: &Cdp) -> Result<(), BrowserError> {
 fn spawn_with_pipe(mut command: Command) -> Result<(Transport, Child), BrowserError> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+    /// A close-on-exec pipe, so no other child the daemon starts inherits
+    /// the browser's DevTools channel.
     fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
         let mut fds = [0; 2];
-        // SAFETY: fds has room for the two descriptors pipe() writes.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
+        // Linux creates the pipe close-on-exec atomically.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // SAFETY: fds has room for the two descriptors pipe2() writes.
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
-        for fd in fds {
-            // SAFETY: fd was just returned by pipe().
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        // macOS has no pipe2: between pipe() and fcntl() a fork+exec on
+        // another thread (any provider or tool the daemon spawns) can
+        // inherit both ends. That child would hold the DevTools channel
+        // open (Chromium sees no EOF when we close ours) but cannot use it
+        // unless it already speaks CDP on that fd. The daemon has no global
+        // spawn lock to close the window; it is a few instructions wide.
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            // SAFETY: fds has room for the two descriptors pipe() writes.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for fd in fds {
+                // SAFETY: fd was just returned by pipe().
+                if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    // SAFETY: both were returned by pipe() and are unused.
+                    unsafe {
+                        libc::close(fds[0]);
+                        libc::close(fds[1]);
+                    }
+                    return Err(error);
+                }
+            }
         }
         // SAFETY: both descriptors are open and owned by nobody else.
         Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })

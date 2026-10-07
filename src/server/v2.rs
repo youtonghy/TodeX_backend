@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::FileType;
-use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -1115,34 +1114,11 @@ pub(super) async fn browser_fetch(
 /// Loopback http(s) without credentials: the only pages the browser
 /// preview and agent desktop browsers may load at the top level.
 pub(crate) fn is_allowed_browser_target(url: &reqwest::Url) -> bool {
-    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
-    let is_loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .map(|address| address.is_loopback())
-            .unwrap_or(false);
-    is_loopback && url.username().is_empty() && url.password().is_none()
+    crate::agent_browser::policy::is_allowed_target(url)
 }
 
 pub(crate) fn validate_browser_url(raw: &str) -> Result<String, AppError> {
-    let value = raw.trim();
-    let Ok(mut parsed) = reqwest::Url::parse(value) else {
-        return Err(AppError::InvalidRequest(
-            "only valid http and https URLs are allowed".to_owned(),
-        ));
-    };
-    if value.len() > 2048
-        || !matches!(parsed.scheme(), "http" | "https")
-        || parsed.host_str().is_none()
-    {
-        return Err(AppError::InvalidRequest(
-            "only valid http and https URLs are allowed".to_owned(),
-        ));
-    }
-    if parsed.path().is_empty() {
-        parsed.set_path("/");
-    }
-    Ok(parsed.to_string())
+    crate::agent_browser::policy::validate_url(raw).map_err(AppError::InvalidRequest)
 }
 
 pub(super) fn mime_for_name(name: &str) -> String {

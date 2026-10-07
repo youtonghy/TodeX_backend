@@ -10,7 +10,13 @@ use std::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
 
-use super::{ax, cdp::Cdp, launch::Process, BrowserError, Frames};
+use super::{
+    ax,
+    cdp::Cdp,
+    launch::Process,
+    policy::{self, allowed_top_level, Navigation, Popup},
+    BrowserError, Frames,
+};
 
 const VIEWPORT_WIDTH: u32 = 1280;
 const VIEWPORT_HEIGHT: u32 = 800;
@@ -18,7 +24,9 @@ const SCREENSHOT_MAX_WIDTH: f64 = 1280.0;
 const SCREENSHOT_QUALITY: u8 = 70;
 const SETTLE_LIMIT: Duration = Duration::from_secs(10);
 const MAX_WAIT_MS: u64 = 10_000;
-/// Live frames published at most this often.
+/// Live frames arrive at most this often: each frame is acked only once
+/// this long has passed since the previous one, and Chromium encodes the
+/// next frame only after the ack.
 const FRAME_INTERVAL: Duration = Duration::from_millis(66);
 const SCREENCAST_QUALITY: u8 = 60;
 
@@ -45,6 +53,10 @@ pub(crate) struct Tab {
     pub target_id: String,
     pub session_id: String,
     pub refs: HashMap<String, i64>,
+    /// The last agent tool call on this tab.
+    pub last_used: Instant,
+    /// `Page.startScreencast` is in effect.
+    screencasting: bool,
 }
 
 /// What the event loop needs to know about a tab without awaiting.
@@ -62,18 +74,6 @@ pub(crate) struct Running {
     sessions: Mutex<HashMap<String, SessionInfo>>,
     pub last_used: Mutex<Instant>,
     frames: Weak<Frames>,
-}
-
-pub(crate) fn allowed_top_level(url: &str) -> bool {
-    if url == "about:blank" {
-        return true;
-    }
-    reqwest::Url::parse(url).is_ok_and(|parsed| {
-        matches!(parsed.scheme(), "http" | "https")
-            && crate::server::is_allowed_browser_target(&parsed)
-            && (parsed.port_or_known_default() != super::daemon_port()
-                || super::daemon_port().is_none())
-    })
 }
 
 impl Running {
@@ -113,6 +113,7 @@ impl Running {
         )
         .await?;
         Self::spawn_events(&running);
+        Self::spawn_frames(&running);
         Ok(running)
     }
 
@@ -150,145 +151,65 @@ impl Running {
             .cloned()
     }
 
-    /// Navigation guard, dialogs, popups, frames and closed windows.
+    /// Navigation guard, dialogs, popups and closed windows. These events
+    /// arrive on a lossless queue: a dropped `Fetch.requestPaused` would
+    /// leave that navigation hanging.
     fn spawn_events(running: &Arc<Self>) {
         let weak = Arc::downgrade(running);
-        let mut events = running.cdp.events();
+        let Some(mut events) = running.cdp.take_events() else {
+            return;
+        };
         tokio::spawn(async move {
-            let mut last_frame: HashMap<String, Instant> = HashMap::new();
-            loop {
-                let event = match events.recv().await {
-                    Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "agent browser dropped CDP events");
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                };
+            while let Some(event) = events.recv().await {
                 let Some(running) = weak.upgrade() else { break };
                 let session = event
                     .session_id
                     .as_deref()
                     .and_then(|session| running.session_info(session));
                 match (event.method.as_str(), session) {
-                    ("Fetch.requestPaused", Some(info)) => {
+                    ("Fetch.requestPaused", info) => {
                         let params = &event.params;
                         let request_id =
                             params["requestId"].as_str().unwrap_or_default().to_owned();
                         let url = params["request"]["url"].as_str().unwrap_or_default();
-                        let top_level = params["resourceType"] == "Document"
-                            && params["frameId"].as_str() == Some(info.main_frame_id.as_str());
+                        // A tab not (or no longer) registered is guarded as
+                        // if every Document were top-level.
+                        let main_frame = info.as_ref().is_none_or(|info| {
+                            params["frameId"].as_str() == Some(info.main_frame_id.as_str())
+                        });
+                        let resource_type = params["resourceType"].as_str().unwrap_or_default();
                         // `Aborted` cancels the navigation and keeps the current page
                         // (other reasons commit an error page).
-                        let (method, body) = if top_level && !allowed_top_level(url) {
-                            tracing::info!(url, "agent browser blocked a top-level navigation");
-                            (
-                                "Fetch.failRequest",
-                                json!({ "requestId": request_id, "errorReason": "Aborted" }),
-                            )
-                        } else {
-                            ("Fetch.continueRequest", json!({ "requestId": request_id }))
+                        let (method, body) = match policy::guard_request(
+                            url,
+                            resource_type,
+                            main_frame,
+                        ) {
+                            Navigation::Block => {
+                                tracing::info!(url, "agent browser blocked a top-level navigation");
+                                (
+                                    "Fetch.failRequest",
+                                    json!({ "requestId": request_id, "errorReason": "Aborted" }),
+                                )
+                            }
+                            Navigation::Continue => {
+                                ("Fetch.continueRequest", json!({ "requestId": request_id }))
+                            }
                         };
-                        let cdp = running.cdp.clone();
-                        let session_id = event.session_id.clone();
-                        tokio::spawn(async move {
-                            let _ = cdp.call(method, body, session_id.as_deref()).await;
-                        });
+                        running
+                            .cdp
+                            .notify(method, body, event.session_id.as_deref());
                     }
                     ("Page.javascriptDialogOpening", Some(_)) => {
                         // Nobody is there to answer; a pending dialog would
                         // freeze the page for every later action.
-                        let cdp = running.cdp.clone();
-                        let session_id = event.session_id.clone();
-                        tokio::spawn(async move {
-                            let _ = cdp
-                                .call(
-                                    "Page.handleJavaScriptDialog",
-                                    json!({ "accept": false }),
-                                    session_id.as_deref(),
-                                )
-                                .await;
-                        });
+                        running.cdp.notify(
+                            "Page.handleJavaScriptDialog",
+                            json!({ "accept": false }),
+                            event.session_id.as_deref(),
+                        );
                     }
-                    ("Page.screencastFrame", Some(info)) => {
-                        let cdp = running.cdp.clone();
-                        let session_id = event.session_id.clone();
-                        let ack = event.params["sessionId"].clone();
-                        tokio::spawn(async move {
-                            let _ = cdp
-                                .call(
-                                    "Page.screencastFrameAck",
-                                    json!({ "sessionId": ack }),
-                                    session_id.as_deref(),
-                                )
-                                .await;
-                        });
-                        let due = last_frame
-                            .get(&info.conversation_id)
-                            .is_none_or(|last| last.elapsed() >= FRAME_INTERVAL);
-                        if due {
-                            last_frame.insert(info.conversation_id.clone(), Instant::now());
-                            if let (Some(frames), Some(data)) =
-                                (running.frames.upgrade(), event.params["data"].as_str())
-                            {
-                                frames.publish(
-                                    &info.conversation_id,
-                                    data,
-                                    &event.params["metadata"],
-                                );
-                            }
-                        }
-                    }
-                    ("Target.targetCreated", _) => {
-                        let info = &event.params["targetInfo"];
-                        let opener = info["openerId"].as_str().unwrap_or_default();
-                        let opened_by_tab = if opener.is_empty() {
-                            None
-                        } else {
-                            running
-                                .sessions
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .values()
-                                .find(|session| session.target_id == opener)
-                                .cloned()
-                        };
-                        if let Some(opener_session) =
-                            opened_by_tab.filter(|_| info["type"] == "page")
-                        {
-                            // Popups stay in the agent's tab: local ones load
-                            // there, the rest are refused.
-                            let target_id =
-                                info["targetId"].as_str().unwrap_or_default().to_owned();
-                            let url = info["url"].as_str().unwrap_or_default().to_owned();
-                            let cdp = running.cdp.clone();
-                            let session_id = running
-                                .sessions
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .iter()
-                                .find(|(_, session)| session.target_id == opener_session.target_id)
-                                .map(|(id, _)| id.clone());
-                            tokio::spawn(async move {
-                                let _ = cdp
-                                    .call(
-                                        "Target.closeTarget",
-                                        json!({ "targetId": target_id }),
-                                        None,
-                                    )
-                                    .await;
-                                if url != "about:blank" && allowed_top_level(&url) {
-                                    let _ = cdp
-                                        .call(
-                                            "Page.navigate",
-                                            json!({ "url": url }),
-                                            session_id.as_deref(),
-                                        )
-                                        .await;
-                                }
-                            });
-                        }
-                    }
+                    ("Target.targetCreated", _) => running.fold_popup(&event.params),
                     ("Target.detachedFromTarget", _) => {
                         // The window was closed (by the person at the host,
                         // or a crash): the conversation has no tab now.
@@ -308,6 +229,84 @@ impl Running {
                     }
                     _ => {}
                 }
+            }
+        });
+    }
+
+    /// Popups stay in the agent's tab: local ones load there, the rest
+    /// are refused.
+    fn fold_popup(&self, params: &Value) {
+        let info = &params["targetInfo"];
+        let opener = info["openerId"].as_str().unwrap_or_default();
+        if opener.is_empty() || info["type"] != "page" {
+            return;
+        }
+        let Some(opener_session) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|(_, session)| session.target_id == opener)
+            .map(|(id, _)| id.clone())
+        else {
+            return;
+        };
+        let target_id = info["targetId"].as_str().unwrap_or_default();
+        let url = info["url"].as_str().unwrap_or_default();
+        self.cdp
+            .notify("Target.closeTarget", json!({ "targetId": target_id }), None);
+        if policy::popup(url) == Popup::LoadInTab {
+            self.cdp.notify(
+                "Page.navigate",
+                json!({ "url": url }),
+                Some(&opener_session),
+            );
+        }
+    }
+
+    /// Publishes live frames and paces Chromium: each frame is acked
+    /// [`FRAME_INTERVAL`] after the previous one, so the browser encodes no
+    /// more frames than viewers get.
+    fn spawn_frames(running: &Arc<Self>) {
+        let weak = Arc::downgrade(running);
+        let cdp = running.cdp.clone();
+        tokio::spawn(async move {
+            // Session → when its previous frame was acked.
+            let mut last_ack: HashMap<String, Instant> = HashMap::new();
+            loop {
+                cdp.frame_ready().await;
+                if cdp.is_closed() {
+                    break;
+                }
+                let Some(running) = weak.upgrade() else { break };
+                for (session_id, mut params) in cdp.take_frames() {
+                    let Some(info) = running.session_info(&session_id) else {
+                        // The tab is gone; its screencast went with it.
+                        continue;
+                    };
+                    if let (Some(frames), Value::String(data)) =
+                        (running.frames.upgrade(), params["data"].take())
+                    {
+                        frames.publish(&info.conversation_id, data, &params["metadata"]);
+                    }
+                    let now = Instant::now();
+                    let due = last_ack
+                        .get(&session_id)
+                        .map_or(now, |last| (*last + FRAME_INTERVAL).max(now));
+                    last_ack.insert(session_id.clone(), due);
+                    let ack = json!({ "sessionId": params["sessionId"].take() });
+                    let cdp = cdp.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep_until(due.into()).await;
+                        cdp.notify("Page.screencastFrameAck", ack, Some(&session_id));
+                    });
+                }
+                // Forget sessions whose tab closed.
+                let sessions = running
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                last_ack.retain(|session_id, _| sessions.contains_key(session_id));
             }
         });
     }
@@ -374,6 +373,8 @@ impl Running {
                 target_id,
                 session_id,
                 refs: HashMap::new(),
+                last_used: Instant::now(),
+                screencasting: false,
             },
         );
         Ok(())
@@ -474,26 +475,61 @@ impl Running {
             })
     }
 
+    /// Starts or stops the tab's screencast; a no-op when it already is
+    /// in that state. Callers serialize per conversation.
     pub(crate) async fn set_screencast(&self, conversation_id: &str, on: bool) {
-        let Ok((target_id, session_id)) = self.tab(conversation_id).await else {
-            return;
+        let session_id = {
+            let tabs = self.tabs.lock().await;
+            match tabs.get(conversation_id) {
+                Some(tab) if tab.screencasting != on => tab.session_id.clone(),
+                _ => return,
+            }
         };
-        if on {
-            self.unminimize(&target_id).await;
-            let _ = self
-                .cdp
+        let result = if on {
+            if let Ok((target_id, _)) = self.tab(conversation_id).await {
+                self.unminimize(&target_id).await;
+            }
+            self.cdp
                 .call(
                     "Page.startScreencast",
                     json!({ "format": "jpeg", "quality": SCREENCAST_QUALITY, "maxWidth": 1280, "maxHeight": 1280, "everyNthFrame": 1 }),
                     Some(&session_id),
                 )
-                .await;
+                .await
         } else {
-            let _ = self
-                .cdp
+            self.cdp
                 .call("Page.stopScreencast", json!({}), Some(&session_id))
-                .await;
+                .await
+        };
+        match result {
+            Ok(_) => {
+                if let Some(tab) = self.tabs.lock().await.get_mut(conversation_id) {
+                    if tab.session_id == session_id {
+                        tab.screencasting = on;
+                    }
+                }
+            }
+            Err(error) => tracing::debug!(%error, on, "agent browser screencast toggle failed"),
         }
+    }
+
+    /// Records an agent tool call on the conversation's tab.
+    pub(crate) async fn touch_tab(&self, conversation_id: &str) {
+        self.touch();
+        if let Some(tab) = self.tabs.lock().await.get_mut(conversation_id) {
+            tab.last_used = Instant::now();
+        }
+    }
+
+    /// Conversations whose tab saw no tool call for `idle`.
+    pub(crate) async fn idle_tabs(&self, idle: Duration) -> Vec<String> {
+        self.tabs
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, tab)| tab.last_used.elapsed() >= idle)
+            .map(|(conversation_id, _)| conversation_id.clone())
+            .collect()
     }
 
     // ---- Tools ----------------------------------------------------------
@@ -952,24 +988,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_local_pages_load_at_the_top_level() {
-        for allowed in [
-            "http://localhost:5173/",
-            "https://127.0.0.1/x",
-            "http://[::1]:8080",
-            "about:blank",
-        ] {
-            assert!(allowed_top_level(allowed), "{allowed}");
-        }
-        for blocked in [
-            "https://example.com",
-            "file:///etc/passwd",
-            "http://user:pw@localhost/",
-            "javascript:alert(1)",
-            "http://192.168.1.2/",
-        ] {
-            assert!(!allowed_top_level(blocked), "{blocked}");
-        }
+    fn named_keys_map_to_cdp_key_data() {
         assert!(named_key("Enter").is_some());
         assert!(named_key("F13").is_none());
     }

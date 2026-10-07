@@ -1,7 +1,13 @@
 //! A small Chrome DevTools Protocol client: requests with ids and timeouts,
-//! and a broadcast of events (flat sessions). Unix talks to Chromium over
+//! and events of flat sessions. Unix talks to Chromium over
 //! `--remote-debugging-pipe` (NUL-terminated JSON on fds 3/4), so no other
 //! local process can reach the browser; Windows uses a loopback WebSocket.
+//!
+//! Events take two paths so live video can never crowd out the navigation
+//! guard: the few events the browser session acts on ([`HANDLED_EVENTS`])
+//! go through an unbounded single-consumer queue and are never dropped (a
+//! lost `Fetch.requestPaused` would hang that navigation forever), while
+//! `Page.screencastFrame` lands in a latest-frame slot per session.
 
 use std::{
     collections::HashMap,
@@ -13,12 +19,20 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::BrowserError;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
-const EVENT_BUFFER: usize = 1024;
+const SCREENCAST_FRAME: &str = "Page.screencastFrame";
+/// Events the browser session handles; everything else is dropped on
+/// arrival.
+const HANDLED_EVENTS: &[&str] = &[
+    "Fetch.requestPaused",
+    "Page.javascriptDialogOpening",
+    "Target.targetCreated",
+    "Target.detachedFromTarget",
+];
 
 /// One CDP event; `session_id` is the flat session it belongs to.
 #[derive(Debug)]
@@ -30,11 +44,23 @@ pub(crate) struct Event {
 
 type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<Value, BrowserError>>>>;
 
+/// The newest unconsumed screencast frame of each session.
+#[derive(Default)]
+struct FrameSlot {
+    /// Session id → `Page.screencastFrame` params.
+    latest: Mutex<HashMap<String, Value>>,
+    ready: Notify,
+}
+
 struct Inner {
     next_id: AtomicU64,
     pending: Pending,
     outgoing: mpsc::UnboundedSender<String>,
-    events: broadcast::Sender<Arc<Event>>,
+    /// Dropped when the browser goes away, which ends the event loop.
+    events: Mutex<Option<mpsc::UnboundedSender<Event>>>,
+    /// Taken once by the browser session's event loop.
+    event_receiver: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
+    frames: FrameSlot,
     closed: AtomicBool,
 }
 
@@ -57,13 +83,15 @@ pub(crate) enum Transport {
 impl Cdp {
     pub(crate) async fn connect(transport: Transport) -> Result<Self, BrowserError> {
         let (outgoing, outgoing_rx) = mpsc::unbounded_channel::<String>();
-        let (events, _) = broadcast::channel(EVENT_BUFFER);
+        let (events, event_receiver) = mpsc::unbounded_channel();
         let cdp = Self {
             inner: Arc::new(Inner {
                 next_id: AtomicU64::new(1),
                 pending: Mutex::new(HashMap::new()),
                 outgoing,
-                events,
+                events: Mutex::new(Some(events)),
+                event_receiver: Mutex::new(Some(event_receiver)),
+                frames: FrameSlot::default(),
                 closed: AtomicBool::new(false),
             }),
         };
@@ -150,8 +178,35 @@ impl Cdp {
         self.inner.closed.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn events(&self) -> broadcast::Receiver<Arc<Event>> {
-        self.inner.events.subscribe()
+    /// The handled events, in order; `None` after the first call.
+    pub(crate) fn take_events(&self) -> Option<mpsc::UnboundedReceiver<Event>> {
+        self.inner
+            .event_receiver
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    /// Waits until a screencast frame may be available.
+    pub(crate) async fn frame_ready(&self) {
+        self.inner.frames.ready.notified().await;
+    }
+
+    /// The newest frame of each session since the last call, as
+    /// (session id, `Page.screencastFrame` params).
+    pub(crate) fn take_frames(&self) -> Vec<(String, Value)> {
+        self.inner
+            .frames
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .collect()
+    }
+
+    /// Sends a command without waiting for (or keeping) its response.
+    pub(crate) fn notify(&self, method: &str, params: Value, session_id: Option<&str>) {
+        send_unanswered(&self.inner, method, params, session_id);
     }
 
     pub(crate) async fn call(
@@ -197,8 +252,18 @@ impl Cdp {
     }
 }
 
+fn send_unanswered(inner: &Inner, method: &str, params: Value, session_id: Option<&str>) {
+    // Its response finds no waiter and is dropped by `dispatch`.
+    let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+    let mut message = json!({ "id": id, "method": method, "params": params });
+    if let Some(session_id) = session_id {
+        message["sessionId"] = Value::from(session_id);
+    }
+    let _ = inner.outgoing.send(message.to_string());
+}
+
 fn dispatch(inner: &Inner, bytes: &[u8]) {
-    let Ok(message) = serde_json::from_slice::<Value>(bytes) else {
+    let Ok(mut message) = serde_json::from_slice::<Value>(bytes) else {
         tracing::debug!("unparseable CDP message");
         return;
     };
@@ -219,21 +284,67 @@ fn dispatch(inner: &Inner, bytes: &[u8]) {
         }
         return;
     }
-    if let Some(method) = message.get("method").and_then(Value::as_str) {
-        let _ = inner.events.send(Arc::new(Event {
-            session_id: message
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            method: method.to_owned(),
-            params: message.get("params").cloned().unwrap_or(Value::Null),
-        }));
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    let frame = method == SCREENCAST_FRAME;
+    if !frame && !HANDLED_EVENTS.contains(&method) {
+        return;
+    }
+    let method = method.to_owned();
+    let session_id = match message.get_mut("sessionId").map(Value::take) {
+        Some(Value::String(session_id)) => Some(session_id),
+        _ => None,
+    };
+    let params = message
+        .get_mut("params")
+        .map(Value::take)
+        .unwrap_or(Value::Null);
+    if frame {
+        let Some(session_id) = session_id else { return };
+        let replaced = inner
+            .frames
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id.clone(), params);
+        // Chromium sends the next frame only once this one is acked; a frame
+        // replaced before anyone saw it is skipped, but still acked.
+        if let Some(skipped) = replaced {
+            send_unanswered(
+                inner,
+                "Page.screencastFrameAck",
+                json!({ "sessionId": skipped["sessionId"] }),
+                Some(&session_id),
+            );
+        }
+        inner.frames.ready.notify_one();
+        return;
+    }
+    if let Some(events) = inner
+        .events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        let _ = events.send(Event {
+            session_id,
+            method,
+            params,
+        });
     }
 }
 
 /// Fails every waiting call once the browser is gone.
 fn close(inner: &Inner) {
     inner.closed.store(true, Ordering::SeqCst);
+    inner
+        .events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    // Wakes the frame loop so it sees the browser is gone.
+    inner.frames.ready.notify_one();
     let pending: Vec<_> = inner
         .pending
         .lock()
@@ -242,5 +353,88 @@ fn close(inner: &Inner) {
         .collect();
     for (_, waiter) in pending {
         let _ = waiter.send(Err(BrowserError::failed("the browser exited")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inner() -> (Inner, mpsc::UnboundedReceiver<String>) {
+        let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
+        let (events, event_receiver) = mpsc::unbounded_channel();
+        (
+            Inner {
+                next_id: AtomicU64::new(1),
+                pending: Mutex::new(HashMap::new()),
+                outgoing,
+                events: Mutex::new(Some(events)),
+                event_receiver: Mutex::new(Some(event_receiver)),
+                frames: FrameSlot::default(),
+                closed: AtomicBool::new(false),
+            },
+            outgoing_rx,
+        )
+    }
+
+    fn frame(session: &str, ack: u64) -> Vec<u8> {
+        json!({ "method": SCREENCAST_FRAME, "sessionId": session, "params": { "sessionId": ack, "data": "AAAA" } })
+            .to_string()
+            .into_bytes()
+    }
+
+    #[test]
+    fn guard_events_are_never_dropped_behind_video() {
+        let (inner, _outgoing) = inner();
+        let mut events = inner.event_receiver.lock().unwrap().take().unwrap();
+        // Far more than the old 1024-event broadcast buffer, interleaved
+        // with frames and noise nobody handles.
+        for index in 0..5000 {
+            dispatch(&inner, &frame("s1", index));
+            dispatch(
+                &inner,
+                json!({ "method": "Runtime.consoleAPICalled", "sessionId": "s1", "params": {} })
+                    .to_string()
+                    .as_bytes(),
+            );
+            dispatch(
+                &inner,
+                json!({ "method": "Fetch.requestPaused", "sessionId": "s1", "params": { "requestId": index.to_string() } })
+                    .to_string()
+                    .as_bytes(),
+            );
+        }
+        for index in 0..5000 {
+            let event = events.try_recv().unwrap();
+            assert_eq!(event.method, "Fetch.requestPaused");
+            assert_eq!(event.session_id.as_deref(), Some("s1"));
+            assert_eq!(event.params["requestId"], index.to_string());
+        }
+        assert!(events.try_recv().is_err(), "unhandled events are dropped");
+        close(&inner);
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn frames_keep_the_newest_per_session_and_ack_skipped_ones() {
+        let (inner, mut outgoing) = inner();
+        dispatch(&inner, &frame("s1", 1));
+        dispatch(&inner, &frame("s2", 7));
+        dispatch(&inner, &frame("s1", 2));
+        let mut latest: Vec<(String, Value)> =
+            inner.frames.latest.lock().unwrap().drain().collect();
+        latest.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(latest.len(), 2);
+        assert_eq!(latest[0].1["sessionId"], 2);
+        assert_eq!(latest[1].1["sessionId"], 7);
+        // Frame 1 was replaced unseen: acked so Chromium keeps sending.
+        let ack: Value = serde_json::from_str(&outgoing.try_recv().unwrap()).unwrap();
+        assert_eq!(ack["method"], "Page.screencastFrameAck");
+        assert_eq!(ack["params"]["sessionId"], 1);
+        assert_eq!(ack["sessionId"], "s1");
+        assert!(outgoing.try_recv().is_err());
     }
 }

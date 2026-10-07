@@ -12,6 +12,7 @@ pub(crate) mod ax;
 mod cdp;
 pub(crate) mod install;
 mod launch;
+pub(crate) mod policy;
 pub(crate) mod profiles;
 mod session;
 
@@ -90,8 +91,11 @@ pub(crate) fn daemon_port() -> Option<u16> {
 const MAX_TABS: usize = 4;
 /// Browser profiles running at once.
 const MAX_RUNNING: usize = 2;
-/// A profile without tabs this long has its Chromium closed.
-const IDLE_SHUTDOWN: Duration = Duration::from_secs(600);
+/// A tab nobody watches and no tool used for this long is closed; the next
+/// tool call reopens it at the same URL.
+const TAB_IDLE: Duration = Duration::from_secs(600);
+/// A profile without tabs and tool calls this long has its Chromium closed.
+const IDLE_SHUTDOWN: Duration = TAB_IDLE;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A refused or failed browser call, reported as `CODE: message`.
@@ -164,7 +168,7 @@ impl Frames {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn publish(&self, conversation_id: &str, data: &str, metadata: &Value) {
+    fn publish(&self, conversation_id: &str, data: String, metadata: &Value) {
         let mut channels = self.lock();
         let Some(channel) = channels.get_mut(conversation_id) else {
             return;
@@ -172,7 +176,7 @@ impl Frames {
         channel.seq += 1;
         let frame = Frame {
             seq: channel.seq,
-            data: data.to_owned(),
+            data,
             width: metadata["deviceWidth"].as_f64().unwrap_or(0.0) as u32,
             height: metadata["deviceHeight"].as_f64().unwrap_or(0.0) as u32,
         };
@@ -238,6 +242,11 @@ struct Inner {
     running: tokio::sync::Mutex<HashMap<String, Arc<Running>>>,
     /// Conversation → the profile its tab is in.
     tabs: Mutex<HashMap<String, String>>,
+    /// Conversation → the URL of its tab, closed for being idle; the next
+    /// tool call reopens it there.
+    parked: Mutex<HashMap<String, String>>,
+    /// Conversation → lock serializing screencast start/stop.
+    screencast_locks: crate::agent_desktop::KeyedLocks,
     frames: Arc<Frames>,
 }
 
@@ -260,11 +269,7 @@ impl Drop for BrowserWatch {
             let browser = self.browser.clone();
             let conversation_id = self.conversation_id.clone();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    if let Some(running) = browser.running_for(&conversation_id).await {
-                        running.set_screencast(&conversation_id, false).await;
-                    }
-                });
+                runtime.spawn(async move { browser.sync_screencast(&conversation_id).await });
             }
         }
     }
@@ -282,6 +287,8 @@ impl AgentBrowser {
                 profiles,
                 running: tokio::sync::Mutex::new(HashMap::new()),
                 tabs: Mutex::new(HashMap::new()),
+                parked: Mutex::new(HashMap::new()),
+                screencast_locks: crate::agent_desktop::KeyedLocks::default(),
                 frames: Arc::new(Frames::default()),
             }),
         };
@@ -289,8 +296,9 @@ impl AgentBrowser {
         Ok(browser)
     }
 
-    /// Closes the Chromium of profiles without tabs for a while; stops once
-    /// the browser service is gone.
+    /// Parks tabs nobody watches or uses, then closes the Chromium of
+    /// profiles without tabs for a while; stops once the browser service is
+    /// gone.
     fn spawn_sweeper(&self) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
@@ -301,7 +309,9 @@ impl AgentBrowser {
             loop {
                 interval.tick().await;
                 let Some(inner) = weak.upgrade() else { break };
-                let mut running = inner.running.lock().await;
+                let browser = AgentBrowser { inner };
+                browser.park_idle_tabs().await;
+                let mut running = browser.inner.running.lock().await;
                 let mut idle = Vec::new();
                 for (id, profile) in running.iter() {
                     if !profile.alive()
@@ -318,6 +328,49 @@ impl AgentBrowser {
                 }
             }
         });
+    }
+
+    /// Closes tabs without viewers and without a tool call for
+    /// [`TAB_IDLE`], remembering their URL.
+    async fn park_idle_tabs(&self) {
+        let profiles: Vec<Arc<Running>> =
+            self.inner.running.lock().await.values().cloned().collect();
+        for running in profiles {
+            for conversation_id in running.idle_tabs(TAB_IDLE).await {
+                // Serialized with watch start/stop: a viewer arriving now
+                // keeps the tab.
+                let lock = self.inner.screencast_locks.get(&conversation_id);
+                let _serial = lock.lock().await;
+                if self.inner.frames.watched(&conversation_id) {
+                    continue;
+                }
+                let Ok((target_id, _)) = running.tab(&conversation_id).await else {
+                    continue;
+                };
+                let url = running
+                    .page(&target_id)
+                    .await
+                    .ok()
+                    .and_then(|page| page["url"].as_str().map(str::to_owned))
+                    .filter(|url| policy::allowed_top_level(url) && url != "about:blank");
+                if !running.close_tab(&conversation_id).await {
+                    continue;
+                }
+                self.inner
+                    .tabs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&conversation_id);
+                if let Some(url) = url {
+                    self.inner
+                        .parked
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(conversation_id.clone(), url);
+                }
+                tracing::debug!(conversation_id, "agent browser closed an idle tab");
+            }
+        }
     }
 
     pub(crate) fn status(&self) -> BrowserStatus {
@@ -446,13 +499,39 @@ impl AgentBrowser {
                 )
                 .await;
         }
-        let running = self.running_for(conversation_id).await.ok_or_else(|| {
+        let parked = self
+            .inner
+            .parked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(conversation_id);
+        if tool == "browser_close" && parked.is_some() {
+            return Ok(json!({ "closed": true }));
+        }
+        let mut running = self.running_for(conversation_id).await;
+        if running.is_none() {
+            if let Some(url) = parked {
+                // Closed for being idle: reopen where it was (and keep the
+                // URL for the next try if that fails).
+                if let Err(error) = self.open(conversation_id, workspace, &url).await {
+                    self.inner
+                        .parked
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .entry(conversation_id.to_owned())
+                        .or_insert(url);
+                    return Err(error);
+                }
+                running = self.running_for(conversation_id).await;
+            }
+        }
+        let running = running.ok_or_else(|| {
             BrowserError::new(
                 "NO_TAB",
                 "This conversation has no browser tab; call browser_open first.",
             )
         })?;
-        running.touch();
+        running.touch_tab(conversation_id).await;
         match tool {
             "browser_navigate" => running.navigate(conversation_id, args).await,
             "browser_snapshot" => {
@@ -501,8 +580,13 @@ impl AgentBrowser {
         if current.as_deref().is_some_and(|current| current != profile) {
             self.close_conversation(conversation_id).await;
         }
+        self.inner
+            .parked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(conversation_id);
         let running = self.ensure_running(&profile).await?;
-        running.touch();
+        running.touch_tab(conversation_id).await;
         if running.tab(conversation_id).await.is_err() {
             let open = self
                 .inner
@@ -522,15 +606,18 @@ impl AgentBrowser {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(conversation_id.to_owned(), profile);
-            if self.inner.frames.watched(conversation_id) {
-                running.set_screencast(conversation_id, true).await;
-            }
+            self.sync_screencast(conversation_id).await;
         }
         running.load(conversation_id, url).await
     }
 
     /// The conversation's tab goes away (close, revoke, deletion).
     pub(crate) async fn close_conversation(&self, conversation_id: &str) {
+        self.inner
+            .parked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(conversation_id);
         let running = self.running_for(conversation_id).await;
         self.inner
             .tabs
@@ -543,18 +630,32 @@ impl AgentBrowser {
         self.inner.frames.tab_closed(conversation_id);
     }
 
-    /// Live frames of the conversation's tab, from now on.
+    /// Live frames of the conversation's tab, from now on. The
+    /// subscription is registered before anything is awaited, so a caller
+    /// aborted mid-way still releases it.
     pub(crate) async fn watch(&self, conversation_id: &str) -> BrowserWatch {
         let (frames, first) = self.inner.frames.subscribe(conversation_id);
-        if first {
-            if let Some(running) = self.running_for(conversation_id).await {
-                running.set_screencast(conversation_id, true).await;
-            }
-        }
-        BrowserWatch {
+        let watch = BrowserWatch {
             frames,
             browser: self.clone(),
             conversation_id: conversation_id.to_owned(),
+        };
+        if first {
+            self.sync_screencast(conversation_id).await;
+        }
+        watch
+    }
+
+    /// Makes the tab's screencast match whether anyone watches. Start and
+    /// stop for one conversation run one at a time and each re-reads the
+    /// watcher count, so a stop racing a new viewer cannot win.
+    async fn sync_screencast(&self, conversation_id: &str) {
+        let lock = self.inner.screencast_locks.get(conversation_id);
+        let _serial = lock.lock().await;
+        if let Some(running) = self.running_for(conversation_id).await {
+            running
+                .set_screencast(conversation_id, self.inner.frames.watched(conversation_id))
+                .await;
         }
     }
 
@@ -691,7 +792,7 @@ mod tests {
         // Nobody watching: frames are not kept.
         frames.publish(
             "c",
-            "AAAA",
+            "AAAA".into(),
             &json!({ "deviceWidth": 10, "deviceHeight": 5 }),
         );
         assert!(frames.latest("c").is_none());
@@ -701,12 +802,12 @@ mod tests {
         assert!(!not_first);
         frames.publish(
             "c",
-            "AAAA",
+            "AAAA".into(),
             &json!({ "deviceWidth": 10, "deviceHeight": 5 }),
         );
         frames.publish(
             "c",
-            "BBBB",
+            "BBBB".into(),
             &json!({ "deviceWidth": 10, "deviceHeight": 5 }),
         );
         let latest = receiver.borrow().clone().unwrap();
