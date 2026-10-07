@@ -958,3 +958,75 @@ async fn large_payloads_sealed_on_the_blocking_pool_keep_journal_order() {
     }
     e2e.cleanup();
 }
+
+/// The journal lines of `path`; every one must be a whole record.
+fn journal_records(path: &Path) -> Vec<Value> {
+    let bytes = fs::read(path).unwrap();
+    let Some(lines) = bytes.strip_suffix(b"\n") else {
+        assert!(bytes.is_empty(), "torn journal tail");
+        return Vec::new();
+    };
+    lines
+        .split(|byte| *byte == b'\n')
+        .map(|line| serde_json::from_slice(line).expect("whole journal record"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_failed_seal_keeps_appending_to_the_active_file() {
+    let e2e = E2e::new("todex-e2e-failed-seal", true).await;
+    let id = e2e.create(None).await.id;
+    let directory = e2e.store.directory(&id).unwrap();
+    let journal = directory.join(EVENTS_FILE);
+    let pad = "x".repeat(8 * 1024);
+    let mut appended = 0;
+    let mut kid = Value::Null;
+    while fs::metadata(&journal).unwrap().len() < journal_segment_bytes() {
+        let event = e2e
+            .store
+            .append(&id, "tool.updated", json!({"turnId": "t", "pad": pad}))
+            .await
+            .unwrap();
+        kid = event.payload["$enc"]["kid"].clone();
+        appended += 1;
+    }
+    // The last record lost its newline, and something holds the sealed
+    // file's name, so the rename fails after the record was terminated.
+    let mut bytes = fs::read(&journal).unwrap();
+    assert_eq!(bytes.pop(), Some(b'\n'));
+    fs::write(&journal, &bytes).unwrap();
+    let blocker = directory.join("events.000001.jsonl");
+    fs::create_dir_all(blocker.join("held")).unwrap();
+    for _ in 0..2 {
+        let event = e2e
+            .store
+            .append(&id, "tool.updated", json!({"turnId": "t"}))
+            .await
+            .unwrap();
+        appended += 1;
+        assert_eq!(event.sequence, appended);
+        // No rotation, so no new key either.
+        assert_eq!(event.payload["$enc"]["kid"], kid);
+    }
+    assert_eq!(journal_records(&journal).len() as u64, appended);
+    // Once the name is free the next append seals the file and rotates.
+    fs::remove_dir_all(&blocker).unwrap();
+    let event = e2e
+        .store
+        .append(&id, "tool.updated", json!({"turnId": "t"}))
+        .await
+        .unwrap();
+    appended += 1;
+    assert_ne!(event.payload["$enc"]["kid"], kid);
+    assert_eq!(journal_records(&blocker).len() as u64, appended - 1);
+    assert_eq!(journal_records(&journal).len(), 1);
+    let (events, _) = history(&e2e.store, &id, ReplayDetail::Summary).await;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        (1..=appended).collect::<Vec<_>>()
+    );
+    e2e.cleanup();
+}

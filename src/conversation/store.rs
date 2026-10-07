@@ -1393,26 +1393,51 @@ impl ConversationStore {
             .is_some_and(|file| file.name == EVENTS_FILE && file.bytes >= journal_segment_bytes())
         {
             let previous = files.clone();
-            let (sealed, fresh) = rotate_journal(&directory, &files, terminated).await?;
-            *files.last_mut().expect("active segment is present") = sealed;
-            files.push(fresh);
-            self.index_update(conversation_id, |index| {
-                if index.files == previous {
-                    index.files = files.clone();
+            match rotate_journal(&directory, &files, terminated).await {
+                Ok((sealed, fresh)) => {
+                    *files.last_mut().expect("active segment is present") = sealed;
+                    // Without the fresh file the append below creates it.
+                    files.extend(fresh);
+                    self.index_update(conversation_id, |index| {
+                        if index.files == previous {
+                            index.files = files.clone();
+                        }
+                    });
+                    self.digests.with(conversation_id, |cached| {
+                        if cached.files == previous {
+                            cached.files = files.clone();
+                        }
+                    });
+                    terminated = true;
+                    self.maintenance.request(conversation_id);
+                    // Each DEK's records stay inside one sealed file, which
+                    // is what lets the seal converter repack them and then
+                    // drop the key.
+                    if let Some(keys) = &self.history {
+                        keys.deks().rotate(conversation_id).await;
+                        key = self.record_key(conversation_id).await?;
+                    }
                 }
-            });
-            self.digests.with(conversation_id, |cached| {
-                if cached.files == previous {
-                    cached.files = files.clone();
+                Err(error) => {
+                    // The active file has no size limit, so a failed seal
+                    // (the file locked by a scanner, say) must not cost a
+                    // running turn its event: keep appending to it, under
+                    // its key, and try again on the next append.
+                    tracing::warn!(
+                        conversation_id,
+                        error = %error,
+                        "could not seal the active conversation journal; appending to it"
+                    );
+                    if !terminated {
+                        // The attempt may have closed the torn record
+                        // already; the separator below must match the file.
+                        files = self.files_locked(conversation_id, &directory).await?;
+                        terminated = self
+                            .read_last_event_in(conversation_id, &directory, &files)
+                            .await?
+                            .1;
+                    }
                 }
-            });
-            terminated = true;
-            self.maintenance.request(conversation_id);
-            // Each DEK's records stay inside one sealed file, which is what
-            // lets the seal converter repack them and then drop the key.
-            if let Some(keys) = &self.history {
-                keys.deks().rotate(conversation_id).await;
-                key = self.record_key(conversation_id).await?;
             }
         }
         // With history encryption on, the record is sealed now — after any
@@ -3414,7 +3439,7 @@ impl ConversationStore {
         let mut files = files;
         let (sealed, fresh) = rotate_journal(&directory, &files, terminated).await?;
         *files.last_mut().expect("active segment is present") = sealed;
-        files.push(fresh);
+        files.extend(fresh);
         self.index_update(conversation_id, |index| {
             if index.files == previous {
                 index.files = files.clone();
@@ -3558,13 +3583,16 @@ pub(super) async fn journal_files(directory: &Path) -> Result<Vec<JournalFile>, 
 /// Seal the active `events.jsonl` under the next segment number and create
 /// a fresh empty active file. `terminated` reports whether the active file
 /// ends with a newline; a torn final record is terminated before sealing so
-/// no record ever straddles a file boundary. Returns the sealed and fresh
-/// active file metadata. Callers hold the conversation lock.
+/// no record ever straddles a file boundary. Returns the sealed file and,
+/// when it could be fully set up, the fresh active one; without it the next
+/// append creates `events.jsonl` (permissions and directory sync included).
+/// An error means the active file was not renamed, though it may have been
+/// terminated. Callers hold the conversation lock.
 async fn rotate_journal(
     directory: &Path,
     files: &[JournalFile],
     terminated: bool,
-) -> Result<(JournalFile, JournalFile), AppError> {
+) -> Result<(JournalFile, Option<JournalFile>), AppError> {
     let active_path = directory.join(EVENTS_FILE);
     if !terminated {
         terminate_journal(&active_path).await?;
@@ -3577,32 +3605,48 @@ async fn rotate_journal(
         + 1;
     let sealed_name = format!("events.{next:06}.jsonl");
     let sealed_path = directory.join(&sealed_name);
+    // Taken before the rename, which keeps size and mtime, so nothing after
+    // it can fail the rotation.
+    let sealed_metadata = tokio::fs::metadata(&active_path).await?;
     tokio::fs::rename(&active_path, &sealed_path).await?;
-    // A crash between the rename and this create leaves the journal ending
-    // in a sealed file; the next append recreates `events.jsonl`.
-    let fresh = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&active_path)
-        .await?;
-    fresh.sync_all().await?;
-    drop(fresh);
-    set_owner_only(&active_path, false).await?;
-    sync_directory(directory).await?;
-    let sealed_metadata = tokio::fs::metadata(&sealed_path).await?;
-    let fresh_metadata = tokio::fs::metadata(&active_path).await?;
-    Ok((
-        JournalFile {
-            name: sealed_name,
-            bytes: sealed_metadata.len(),
-            modified: sealed_metadata.modified().ok(),
-        },
-        JournalFile {
+    let sealed = JournalFile {
+        name: sealed_name,
+        bytes: sealed_metadata.len(),
+        modified: sealed_metadata.modified().ok(),
+    };
+    // A crash (or an error) between the rename and the end of this setup
+    // leaves the journal ending in a sealed file or an unsynced fresh one;
+    // the next append (re)creates `events.jsonl` and syncs the directory.
+    let fresh = async {
+        let fresh = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&active_path)
+            .await?;
+        fresh.sync_all().await?;
+        drop(fresh);
+        set_owner_only(&active_path, false).await?;
+        sync_directory(directory).await?;
+        let metadata = tokio::fs::metadata(&active_path).await?;
+        Ok::<_, AppError>(JournalFile {
             name: EVENTS_FILE.to_owned(),
-            bytes: fresh_metadata.len(),
-            modified: fresh_metadata.modified().ok(),
-        },
-    ))
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+    .await;
+    let fresh = match fresh {
+        Ok(fresh) => Some(fresh),
+        Err(error) => {
+            tracing::warn!(
+                directory = %directory.display(),
+                error = %error,
+                "sealed the active conversation journal but could not set up its successor; the next append creates it"
+            );
+            None
+        }
+    };
+    Ok((sealed, fresh))
 }
 
 /// A conversation directory being written before it is published.
