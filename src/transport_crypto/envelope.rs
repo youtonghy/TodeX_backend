@@ -20,6 +20,8 @@ pub(crate) const SEALED_CONTENT_TYPE: &str = "application/vnd.todex.sealed";
 /// The sealed revision this server speaks: responses start with a 32-byte
 /// response nonce that the response key mixes in (`docs/transport-v2.md`).
 pub(crate) const SEALED_REVISION: u8 = 2;
+/// Outer request header that names the sealed revision the client speaks.
+pub(crate) const SEALED_REVISION_HEADER: &str = "x-todex-sealed-revision";
 /// `Content-Type` of a sealed response. Clients decrypt only a `200` with
 /// exactly this revision.
 pub(crate) const SEALED_RESPONSE_CONTENT_TYPE: &str = "application/vnd.todex.sealed; r=2";

@@ -125,6 +125,9 @@ pub(crate) fn derive_keys(
     })
 }
 
+/// `(th, k_down)` of one REST response.
+pub(crate) type ResponseKey = (Zeroizing<[u8; 32]>, Zeroizing<[u8; KEY_LENGTH]>);
+
 /// REST key schedule before the response nonce is known: `th`, `k_up`, and
 /// `prk` for [`RestKeys::k_down`]. Everything is wiped on drop.
 pub(crate) struct RestKeys {
@@ -134,12 +137,18 @@ pub(crate) struct RestKeys {
 }
 
 impl RestKeys {
+    /// The pseudorandom key, for the shared vectors.
+    #[cfg(test)]
+    pub(crate) fn prk(&self) -> &[u8; 32] {
+        &self.prk
+    }
+
     /// `k_down = HKDF-Expand(prk, label || "/down" || response_nonce, 32)`.
     /// Consumes the keys, so `prk` is wiped once the response key exists.
     pub(crate) fn into_k_down(
         self,
         response_nonce: &[u8; RESPONSE_NONCE_LENGTH],
-    ) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; KEY_LENGTH]>), TransportCryptoError> {
+    ) -> Result<ResponseKey, TransportCryptoError> {
         let k_down = expand(
             &self.prk,
             &[REST_LABEL.as_bytes(), b"/down", response_nonce],

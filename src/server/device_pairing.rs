@@ -68,7 +68,6 @@ async fn create(
 }
 async fn reveal(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     ApiJson(request): ApiJson<RevealDevicePairingRequest>,
 ) -> Result<
     (
@@ -79,12 +78,11 @@ async fn reveal(
 > {
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(state.device_pairing.reveal(peer.ip(), request)?),
+        Json(state.device_pairing.reveal(request)?),
     ))
 }
 async fn poll(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     ApiJson(request): ApiJson<DevicePairingProofRequest>,
 ) -> Result<
     (
@@ -95,15 +93,14 @@ async fn poll(
 > {
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(state.device_pairing.poll(peer.ip(), request)?),
+        Json(state.device_pairing.poll(request)?),
     ))
 }
 async fn cancel(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     ApiJson(request): ApiJson<DevicePairingProofRequest>,
 ) -> Result<([(header::HeaderName, &'static str); 1], Json<Value>), AppError> {
-    state.device_pairing.cancel(peer.ip(), request)?;
+    state.device_pairing.cancel(request)?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({"status":"cancelled"})),
@@ -201,6 +198,17 @@ mod tests {
         assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
         assert_eq!(unbound["code"], "PROTOCOL_UPGRADE_REQUIRED");
         create["transportBinding"] = json!(1);
+        // Clients that do not bind the device name.
+        let (status, unbound) = post(&app, "/v2/device-pairing/create", create.clone()).await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(unbound["code"], "PROTOCOL_UPGRADE_REQUIRED");
+        create["deviceNameBinding"] = json!(1);
+        // Names are validated, never trimmed or replaced.
+        create["deviceName"] = json!(" HTTP test");
+        let (status, invalid) = post(&app, "/v2/device-pairing/create", create.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid["code"], "INVALID_REQUEST");
+        create["deviceName"] = json!("HTTP test");
         let (status, created) = post(&app, "/v2/device-pairing/create", create).await;
         assert_eq!(status, StatusCode::OK);
         assert!(created.get("authToken").is_none());
@@ -253,6 +261,8 @@ mod tests {
             b"ml-kem-768",
             &(transport_public.len() as u32).to_be_bytes(),
             &transport_public,
+            &9_u32.to_be_bytes(),
+            b"HTTP test",
         ]
         .concat();
         let listed = crate::device_pairing::list_device_pairing_requests(&config.data_dir).unwrap();

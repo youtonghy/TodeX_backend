@@ -34,6 +34,7 @@ use crate::transport_crypto::envelope::{
     encode_response_head, parse_inner_head, sealed_stream_length, InnerRequestHead,
     InnerResponseHead, RecordStreamDecoder, RecordStreamSealer, MAX_HEAD_BYTES,
     SEALED_CONTENT_TYPE, SEALED_PATH, SEALED_RESPONSE_CONTENT_TYPE, SEALED_REVISION,
+    SEALED_REVISION_HEADER,
 };
 use crate::transport_crypto::handshake::{decode_b64url, RESPONSE_NONCE_LENGTH};
 use crate::transport_crypto::{EncryptionProtocol, TransportCryptoError};
@@ -43,7 +44,6 @@ const HEADER_ENCRYPTION: &str = "x-todex-encryption";
 const HEADER_CLIENT_KEY: &str = "x-todex-client-key";
 const HEADER_KEM_CIPHERTEXT: &str = "x-todex-kem-ciphertext";
 const HEADER_REQUEST_NONCE: &str = "x-todex-request-nonce";
-const HEADER_SEALED_REVISION: &str = "x-todex-sealed-revision";
 
 /// Largest inner plaintext: the head plus the largest body device auth
 /// buffers (every route-level limit is below it).
@@ -155,7 +155,7 @@ async fn sealed(State(sealed): State<SealedState>, request: Request) -> Response
     // update instead of failing to decrypt the response.
     let revision = request
         .headers()
-        .get(HEADER_SEALED_REVISION)
+        .get(SEALED_REVISION_HEADER)
         .and_then(|value| value.to_str().ok());
     if revision != Some(SEALED_REVISION.to_string().as_str()) {
         return AppError::ProtocolUpgradeRequired(format!(

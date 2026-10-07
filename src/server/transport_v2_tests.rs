@@ -847,6 +847,7 @@ async fn non_loopback_peers_only_reach_bootstrap_routes_and_transport_v2() {
             json!({
                 "clientCommitment": encode_b64(&[1; 32]),
                 "transportBinding": 1,
+                "deviceNameBinding": 1,
                 "deviceName": "remote",
                 "devicePublicKey": device.public_key_b64(),
             })
@@ -1046,6 +1047,7 @@ async fn key_reset_switches_pairing_and_handshake_together() {
                 .json(&json!({
                     "clientCommitment": encode_b64(&[peer; 32]),
                     "transportBinding": 1,
+                "deviceNameBinding": 1,
                     "deviceName": "reset test",
                     "devicePublicKey": device_public_key,
                 }))

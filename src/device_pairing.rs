@@ -14,7 +14,14 @@
 //! Pairing also delivers the daemon's transport public key (the static key
 //! of the v2 handshake). It is bound into the transcript, so the verification
 //! code authenticates it, and it is repeated inside the encrypted credential;
-//! clients pin it only when both agree.
+//! clients pin it only when both agree. The device name the approver sees is
+//! bound too (`deviceNameBinding: 1`), validated strictly and stored as sent.
+//!
+//! Admission (all unauthenticated): requests are counted per source (an IPv4
+//! address or an IPv6 /64); a request must be revealed within 30 s; a source
+//! may have two unfinished requests; a full table evicts the oldest
+//! unrevealed request; reveal, poll and cancel are rate limited per request
+//! with a global backstop.
 use crate::config::PairingEncryption;
 use crate::devices::DeviceRegistry;
 use crate::error::AppError;
@@ -44,7 +51,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 type Result<T> = std::result::Result<T, AppError>;
 const TTL: Duration = Duration::from_secs(300);
+/// A created request that is not revealed within this time is dropped.
+const REVEAL_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_ACTIVE: usize = 16;
+/// Unfinished (unrevealed or awaiting approval) requests per source.
+const MAX_UNFINISHED_PER_SOURCE: usize = 2;
+const MAX_DEVICE_NAME_CHARS: usize = 80;
 const MAX_RECORDS: usize = 64;
 const MAX_LOCAL_FILE: u64 = 4096;
 const DIRECTORY: &str = "device-pairing";
@@ -71,6 +83,12 @@ pub(crate) struct CreateDevicePairingRequest {
     /// `426 PROTOCOL_UPGRADE_REQUIRED`.
     #[serde(default)]
     pub transport_binding: Option<serde_json::Value>,
+    /// Must be the JSON integer `1`: the transcript binds `deviceName`, so
+    /// the verification code covers the name the approver sees. Anything
+    /// else gets `426 PROTOCOL_UPGRADE_REQUIRED`.
+    #[serde(default)]
+    pub device_name_binding: Option<serde_json::Value>,
+    /// Shown to the approver exactly as sent; see [`validate_device_name`].
     pub device_name: String,
     /// Long-term Ed25519 device identity key registered on approval.
     pub device_public_key: String,
@@ -130,6 +148,10 @@ pub(crate) struct DevicePairingRequestSummary {
     pub request_id: String,
     pub verification_code: String,
     pub device_name: String,
+    /// The id the device gets on approval (derived from its key), so the
+    /// approver can spot a re-pair or a revoked device.
+    #[serde(default)]
+    pub device_id: Option<String>,
     pub expires_at: u64,
     pub peer_address: String,
     /// Fingerprint of the transport key bound into this request's code
@@ -186,7 +208,35 @@ fn commitment(client_public: &[u8; 32], client_nonce: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// `deviceName` rules shared with every client: 1–80 Unicode scalars, no
+/// control characters (Cc), no bidirectional formatting characters (U+200E,
+/// U+200F, U+202A–U+202E, U+2066–U+2069) and no leading or trailing
+/// whitespace. Clients trim and fill in a default name before sending; the
+/// server never rewrites the name, because the transcript binds its bytes.
+pub(crate) fn validate_device_name(name: &str) -> Result<()> {
+    let count = name.chars().count();
+    let starts_or_ends_with_space = name.chars().next().is_some_and(char::is_whitespace)
+        || name.chars().next_back().is_some_and(char::is_whitespace);
+    if count == 0
+        || count > MAX_DEVICE_NAME_CHARS
+        || starts_or_ends_with_space
+        || name.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                )
+        })
+    {
+        return Err(invalid(
+            "deviceName must be 1-80 characters without control or bidirectional formatting characters and without leading or trailing whitespace",
+        ));
+    }
+    Ok(())
+}
+
 impl PairingMaterial {
+    #[allow(clippy::too_many_arguments)]
     fn derive(
         request_id: &str,
         client_public: &[u8; 32],
@@ -194,14 +244,16 @@ impl PairingMaterial {
         device_public: &[u8; 32],
         client_nonce: &[u8; 32],
         transport: &TransportBinding,
+        device_name: &str,
         shared: &[u8; 32],
     ) -> Result<Self> {
         if bool::from(shared.ct_eq(&[0; 32])) {
             return Err(invalid("invalid client public key"));
         }
-        // The enrolled device key and the delivered transport key are part
-        // of the transcript, so the short verification code also binds the
-        // identity being approved and the key the client will pin.
+        // The enrolled device key, the delivered transport key and the
+        // device name are part of the transcript, so the short verification
+        // code also binds the identity being approved, the key the client
+        // will pin and the name the approver reads.
         let transcript = [
             TRANSCRIPT_DOMAIN,
             request_id.as_bytes(),
@@ -213,6 +265,7 @@ impl PairingMaterial {
             client_nonce,
             &length_prefixed(transport.protocol.as_str().as_bytes()),
             &length_prefixed(&transport.public_key),
+            &length_prefixed(device_name.as_bytes()),
         ]
         .concat();
         let salt = Sha256::digest(&transcript);
@@ -280,6 +333,8 @@ enum Stage {
     Committed {
         server_secret: StaticSecret,
         commitment: [u8; 32],
+        /// Dropped unless revealed by then.
+        reveal_by: Instant,
     },
     Revealed(PairingMaterial),
 }
@@ -289,17 +344,27 @@ struct PendingRequest {
     server_public: [u8; 32],
     transport: TransportBinding,
     peer: IpAddr,
+    /// [`source_key`] of `peer`.
+    source: IpAddr,
     device_name: String,
     device_public_key: [u8; 32],
+    created: Instant,
     expires: Instant,
     expires_at: u64,
     status: RequestStatus,
+    /// Reveal attempts (8 per minute).
+    reveals: RateWindow<()>,
+    /// Poll and cancel calls (4 per second).
+    proofs: RateWindow<()>,
 }
 struct RegistryState {
     directory: PathBuf,
     requests: HashMap<String, PendingRequest>,
-    creates: VecDeque<(Instant, IpAddr)>,
-    lookups: VecDeque<(Instant, IpAddr)>,
+    /// `create` calls per source key (4 per minute) and overall (24).
+    creates: RateWindow<IpAddr>,
+    /// Every reveal, poll and cancel (1024 per second): the backstop for
+    /// unknown request ids.
+    lookups: RateWindow<()>,
 }
 impl Drop for RegistryState {
     fn drop(&mut self) {
@@ -357,8 +422,8 @@ impl DevicePairingRegistry {
             inner: Arc::new(Mutex::new(RegistryState {
                 directory,
                 requests: HashMap::new(),
-                creates: VecDeque::new(),
-                lookups: VecDeque::new(),
+                creates: RateWindow::new(Duration::from_secs(60)),
+                lookups: RateWindow::new(Duration::from_secs(1)),
             })),
         })
     }
@@ -385,13 +450,13 @@ impl DevicePairingRegistry {
                     .to_owned(),
             ));
         }
-        if request.device_name.chars().count() > 80
-            || request.device_name.chars().any(char::is_control)
-        {
-            return Err(invalid(
-                "deviceName must contain at most 80 printable characters",
+        if request.device_name_binding != Some(serde_json::Value::from(1)) {
+            return Err(AppError::ProtocolUpgradeRequired(
+                "this client does not bind the device name into pairing; update it (deviceNameBinding: 1)"
+                    .to_owned(),
             ));
         }
+        validate_device_name(&request.device_name)?;
         let commitment = decode_32(
             request
                 .client_commitment
@@ -399,13 +464,33 @@ impl DevicePairingRegistry {
                 .ok_or_else(|| invalid("missing clientCommitment"))?,
         )?;
         let device_public = crate::devices::parse_public_key(&request.device_public_key)?;
+        // A small-order key would accept forged signatures under plain
+        // verification; auth verifies strictly, but never enroll one.
+        if ed25519_dalek::VerifyingKey::from_bytes(&device_public).map_or(true, |key| key.is_weak())
+        {
+            return Err(invalid("device public key is a weak Ed25519 key"));
+        }
         let transport = self.transport_binding()?;
+        let source = source_key(peer);
         let mut state = self
             .inner
             .lock()
             .map_err(|_| invalid("pairing registry is unavailable"))?;
         state.prune()?;
-        rate_limit(&mut state.creates, peer, Duration::from_secs(60), 24, 4)?;
+        let now = Instant::now();
+        state.creates.admit(now, source, 24, 4)?;
+        if state
+            .requests
+            .values()
+            .filter(|request| request.source == source && request.status == RequestStatus::Pending)
+            .count()
+            >= MAX_UNFINISHED_PER_SOURCE
+        {
+            return Err(AppError::PairingBusy(
+                "this address already has unfinished pairing requests; finish or cancel them first"
+                    .to_owned(),
+            ));
+        }
         if state.requests.len() >= MAX_RECORDS
             || state
                 .requests
@@ -414,34 +499,46 @@ impl DevicePairingRegistry {
                 .count()
                 >= MAX_ACTIVE
         {
-            return Err(AppError::ResourceExhausted(
-                "Too many pending device pairing requests".to_owned(),
-            ));
+            // Make room by dropping the oldest request that was never
+            // revealed (it has no code on screen yet); when every request is
+            // revealed, refuse.
+            let oldest_unrevealed = state
+                .requests
+                .iter()
+                .filter(|(_, request)| matches!(request.stage, Stage::Committed { .. }))
+                .min_by_key(|(_, request)| request.created)
+                .map(|(id, _)| id.clone());
+            let Some(id) = oldest_unrevealed else {
+                return Err(AppError::PairingBusy(
+                    "too many pending device pairing requests".to_owned(),
+                ));
+            };
+            state.requests.remove(&id);
         }
         let server_secret = StaticSecret::random_from_rng(OsRng);
         let server_public = PublicKey::from(&server_secret).to_bytes();
         let request_id = Uuid::new_v4().to_string();
         let expires_at = unix_ms().saturating_add(TTL.as_millis() as u64);
-        let device_name = if request.device_name.trim().is_empty() {
-            "Unknown device".to_owned()
-        } else {
-            request.device_name.trim().to_owned()
-        };
         state.requests.insert(
             request_id.clone(),
             PendingRequest {
                 stage: Stage::Committed {
                     server_secret,
                     commitment,
+                    reveal_by: now + REVEAL_DEADLINE,
                 },
                 server_public,
                 transport: transport.clone(),
                 peer,
-                device_name,
+                source,
+                device_name: request.device_name,
                 device_public_key: device_public,
-                expires: Instant::now() + TTL,
+                created: now,
+                expires: now + TTL,
                 expires_at,
                 status: RequestStatus::Pending,
+                reveals: RateWindow::new(Duration::from_secs(60)),
+                proofs: RateWindow::new(Duration::from_secs(1)),
             },
         );
         Ok(CreateDevicePairingResponse {
@@ -464,12 +561,12 @@ impl DevicePairingRegistry {
     }
 
     /// Opens the commitment, fixes the transcript and only then publishes the
-    /// verification code to the local approver. Single use: a second reveal,
-    /// or one that does not match the commitment, fails (the latter also
-    /// discards the request).
+    /// verification code to the local approver. Single use: a second reveal
+    /// fails. One that does not match the commitment answers `401` and keeps
+    /// the request (the commitment cannot be opened by anyone else); each
+    /// request takes at most 8 reveal attempts per minute.
     pub(crate) fn reveal(
         &self,
-        peer: IpAddr,
         request: RevealDevicePairingRequest,
     ) -> Result<RevealDevicePairingResponse> {
         validate_id(&request.request_id)?;
@@ -479,7 +576,8 @@ impl DevicePairingRegistry {
             .inner
             .lock()
             .map_err(|_| invalid("pairing registry is unavailable"))?;
-        rate_limit(&mut state.lookups, peer, Duration::from_secs(1), 128, 32)?;
+        let now = Instant::now();
+        state.lookups.admit(now, (), 1024, 1024)?;
         state.prune()?;
         let directory = state.directory.clone();
         let Some(pending) = state.requests.get_mut(&request.request_id) else {
@@ -487,9 +585,11 @@ impl DevicePairingRegistry {
                 "pairing request no longer exists".to_owned(),
             ));
         };
+        pending.reveals.admit(now, (), 8, 8)?;
         let Stage::Committed {
             server_secret,
             commitment: expected,
+            ..
         } = &pending.stage
         else {
             return Err(AppError::Conflict(
@@ -497,7 +597,6 @@ impl DevicePairingRegistry {
             ));
         };
         if !bool::from(commitment(&client_public, &client_nonce).ct_eq(expected)) {
-            state.requests.remove(&request.request_id);
             return Err(AppError::Unauthenticated);
         }
         let shared = Zeroizing::new(
@@ -512,6 +611,7 @@ impl DevicePairingRegistry {
             &pending.device_public_key,
             &client_nonce,
             &pending.transport,
+            &pending.device_name,
             &shared,
         ) {
             Ok(material) => material,
@@ -524,8 +624,9 @@ impl DevicePairingRegistry {
             request_id: request.request_id.clone(),
             verification_code: material.verification_code.clone(),
             device_name: pending.device_name.clone(),
+            device_id: Some(crate::devices::device_id_for(&pending.device_public_key)),
             expires_at: pending.expires_at,
-            peer_address: pending.peer.to_string(),
+            peer_address: pending.peer.to_canonical().to_string(),
             transport_fingerprint: crate::transport_crypto::transport_fingerprint(
                 &pending.transport.public_key,
             ),
@@ -546,7 +647,6 @@ impl DevicePairingRegistry {
 
     pub(crate) fn poll(
         &self,
-        peer: IpAddr,
         request: DevicePairingProofRequest,
     ) -> Result<DevicePairingPollResponse> {
         validate_id(&request.request_id)?;
@@ -555,11 +655,13 @@ impl DevicePairingRegistry {
             .inner
             .lock()
             .map_err(|_| invalid("pairing registry is unavailable"))?;
-        rate_limit(&mut state.lookups, peer, Duration::from_secs(1), 128, 32)?;
+        let now = Instant::now();
+        state.lookups.admit(now, (), 1024, 1024)?;
         state.prune()?;
-        let Some(pending) = state.requests.get(&request.request_id) else {
+        let Some(pending) = state.requests.get_mut(&request.request_id) else {
             return Ok(poll_state("expired", unix_ms()));
         };
+        pending.proofs.admit(now, (), 4, 4)?;
         if !pending
             .material()
             .is_some_and(|material| bool::from(material.poll_proof.ct_eq(&proof)))
@@ -606,18 +708,20 @@ impl DevicePairingRegistry {
         })
     }
 
-    pub(crate) fn cancel(&self, peer: IpAddr, request: DevicePairingProofRequest) -> Result<()> {
+    pub(crate) fn cancel(&self, request: DevicePairingProofRequest) -> Result<()> {
         validate_id(&request.request_id)?;
         let proof = decode_32(&request.proof)?;
         let mut state = self
             .inner
             .lock()
             .map_err(|_| invalid("pairing registry is unavailable"))?;
-        rate_limit(&mut state.lookups, peer, Duration::from_secs(1), 128, 32)?;
+        let now = Instant::now();
+        state.lookups.admit(now, (), 1024, 1024)?;
         state.prune()?;
-        let Some(pending) = state.requests.get(&request.request_id) else {
+        let Some(pending) = state.requests.get_mut(&request.request_id) else {
             return Ok(());
         };
+        pending.proofs.admit(now, (), 4, 4)?;
         if !pending
             .material()
             .is_some_and(|material| bool::from(material.cancel_proof.ct_eq(&proof)))
@@ -645,7 +749,10 @@ impl RegistryState {
         let expired = self
             .requests
             .iter()
-            .filter(|(_, request)| request.expires <= now)
+            .filter(|(_, request)| {
+                request.expires <= now
+                    || matches!(request.stage, Stage::Committed { reveal_by, .. } if reveal_by <= now)
+            })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in expired {
@@ -682,27 +789,62 @@ fn poll_state(status: &'static str, expires_at: u64) -> DevicePairingPollRespons
         ciphertext: None,
     }
 }
-fn rate_limit(
-    events: &mut VecDeque<(Instant, IpAddr)>,
-    peer: IpAddr,
+/// The counting key for unauthenticated pairing limits: an IPv4 address
+/// (IPv4-mapped IPv6 included) or the /64 prefix of an IPv6 address, which
+/// one host can usually pick freely within.
+fn source_key(peer: IpAddr) -> IpAddr {
+    match peer.to_canonical() {
+        IpAddr::V4(address) => IpAddr::V4(address),
+        IpAddr::V6(address) => IpAddr::V6((u128::from(address) & !u128::from(u64::MAX)).into()),
+    }
+}
+
+/// Events within a sliding window, optionally counted per key.
+struct RateWindow<K> {
     window: Duration,
-    global: usize,
-    per_peer: usize,
-) -> Result<()> {
-    let now = Instant::now();
-    while events
-        .front()
-        .is_some_and(|(instant, _)| now.duration_since(*instant) >= window)
-    {
-        events.pop_front();
+    events: VecDeque<(Instant, K)>,
+}
+
+impl<K: Copy + PartialEq> RateWindow<K> {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            events: VecDeque::new(),
+        }
     }
-    if events.len() >= global || events.iter().filter(|(_, ip)| *ip == peer).count() >= per_peer {
-        return Err(AppError::ResourceExhausted(
-            "Device pairing rate limit reached; retry later".to_owned(),
-        ));
+
+    /// Records an event for `key` when fewer than `global` events (and
+    /// fewer than `per_key` for `key`) are in the window; otherwise answers
+    /// `429 RATE_LIMITED` with the seconds until a slot frees up.
+    fn admit(&mut self, now: Instant, key: K, global: usize, per_key: usize) -> Result<()> {
+        while self
+            .events
+            .front()
+            .is_some_and(|(instant, _)| now.duration_since(*instant) >= self.window)
+        {
+            self.events.pop_front();
+        }
+        let oldest_blocking = if self.events.len() >= global {
+            self.events.front().map(|(instant, _)| *instant)
+        } else {
+            let mut same = self
+                .events
+                .iter()
+                .filter(|(_, other)| *other == key)
+                .map(|(instant, _)| *instant);
+            let first = same.next();
+            first.filter(|_| 1 + same.count() >= per_key)
+        };
+        if let Some(oldest) = oldest_blocking {
+            let wait = self.window.saturating_sub(now.duration_since(oldest));
+            return Err(AppError::RateLimited {
+                message: "device pairing rate limit reached; retry later".to_owned(),
+                retry_after_secs: wait.as_secs() + u64::from(wait.subsec_nanos() > 0),
+            });
+        }
+        self.events.push_back((now, key));
+        Ok(())
     }
-    events.push_back((now, peer));
-    Ok(())
 }
 fn decode_32(value: &str) -> Result<[u8; 32]> {
     if value.len() != 43 {
@@ -984,6 +1126,7 @@ mod tests {
             .to_bytes()
     }
     const CLIENT_NONCE: [u8; 32] = [5; 32];
+    const DEVICE_NAME: &str = "Synthetic device";
     fn client_public() -> [u8; 32] {
         PublicKey::from(&StaticSecret::from([7; 32])).to_bytes()
     }
@@ -992,7 +1135,8 @@ mod tests {
             client_commitment: commitment.map(|value| URL_SAFE_NO_PAD.encode(value)),
             client_public_key: None,
             transport_binding: Some(json!(1)),
-            device_name: "Synthetic device".to_owned(),
+            device_name_binding: Some(json!(1)),
+            device_name: DEVICE_NAME.to_owned(),
             device_public_key: URL_SAFE_NO_PAD.encode(device_key()),
         }
     }
@@ -1009,22 +1153,32 @@ mod tests {
     }
     /// Commit only; the request is invisible to the local approver.
     fn commit(registry: &DevicePairingRegistry) -> CreateDevicePairingResponse {
+        commit_from(registry, peer())
+    }
+    fn commit_from(registry: &DevicePairingRegistry, from: IpAddr) -> CreateDevicePairingResponse {
         registry
             .create(
-                peer(),
+                from,
                 create_request(Some(commitment(&client_public(), &CLIENT_NONCE))),
             )
             .unwrap()
     }
     fn begin(registry: &DevicePairingRegistry) -> (CreateDevicePairingResponse, PairingMaterial) {
+        begin_from(registry, peer())
+    }
+    fn begin_from(
+        registry: &DevicePairingRegistry,
+        from: IpAddr,
+    ) -> (CreateDevicePairingResponse, PairingMaterial) {
         let client_secret = StaticSecret::from([7; 32]);
-        let response = commit(registry);
+        let response = commit_from(registry, from);
         assert_eq!(
             registry
-                .reveal(
-                    peer(),
-                    reveal_request(&response.request_id, client_public(), CLIENT_NONCE),
-                )
+                .reveal(reveal_request(
+                    &response.request_id,
+                    client_public(),
+                    CLIENT_NONCE
+                ))
                 .unwrap()
                 .status,
             "pending"
@@ -1040,6 +1194,7 @@ mod tests {
             &device_key(),
             &CLIENT_NONCE,
             &response_binding(&response),
+            DEVICE_NAME,
             &shared,
         )
         .unwrap();
@@ -1127,6 +1282,24 @@ mod tests {
                 .decode(case["transportPublicKey"].as_str().unwrap())
                 .unwrap(),
         };
+        let device_name = vector["deviceName"].as_str().unwrap();
+        assert_eq!(
+            device_name.as_bytes(),
+            fixture_bytes(&vector["deviceNameUtf8"])
+        );
+        let derive_named = |transport: &TransportBinding, device_name: &str| {
+            PairingMaterial::derive(
+                request_id,
+                &client_public,
+                &server_public,
+                &device_public,
+                &client_nonce,
+                transport,
+                device_name,
+                &shared,
+            )
+            .unwrap()
+        };
         let derive = |transport: &TransportBinding| {
             PairingMaterial::derive(
                 request_id,
@@ -1135,6 +1308,7 @@ mod tests {
                 &device_public,
                 &client_nonce,
                 transport,
+                device_name,
                 &shared,
             )
             .unwrap()
@@ -1203,6 +1377,45 @@ mod tests {
             assert_eq!(other.verification_code, case["verificationCode"]);
             assert_ne!(other.verification_code, material.verification_code);
         }
+        // The device name is bound: another name, another code.
+        for case in [&vector["nonAsciiName"], &vector["tamperedName"]] {
+            let name = case["deviceName"].as_str().unwrap();
+            assert_eq!(name.as_bytes(), fixture_bytes(&case["deviceNameUtf8"]));
+            assert_eq!(
+                name.chars().count() as u64,
+                case["scalarCount"].as_u64().unwrap()
+            );
+            assert!(validate_device_name(name).is_ok(), "{name:?}");
+            let other = derive_named(&transport, name);
+            assert!(other
+                .transcript
+                .ends_with(&length_prefixed(name.as_bytes())));
+            assert_eq!(
+                Sha256::digest(&other.transcript).as_slice(),
+                fixture_bytes(&case["transcriptHash"])
+            );
+            assert_eq!(other.verification_code, case["verificationCode"]);
+            assert_ne!(other.verification_code, material.verification_code);
+        }
+        let rules = &vector["deviceNameRules"];
+        assert_eq!(rules["maxScalars"], MAX_DEVICE_NAME_CHARS);
+        for case in vector["validDeviceNames"].as_array().unwrap() {
+            let name = case["deviceName"].as_str().unwrap();
+            assert_eq!(name.as_bytes(), fixture_bytes(&case["deviceNameUtf8"]));
+            assert!(validate_device_name(name).is_ok(), "{}", case["name"]);
+        }
+        let invalid_names = vector["invalidDeviceNames"].as_array().unwrap();
+        assert!(!invalid_names.is_empty());
+        for case in invalid_names {
+            let name = case["deviceName"].as_str().unwrap();
+            assert_eq!(name.as_bytes(), fixture_bytes(&case["deviceNameUtf8"]));
+            assert!(
+                matches!(validate_device_name(name), Err(AppError::InvalidRequest(_))),
+                "{}",
+                case["name"]
+            );
+        }
+
         let none = binding(&vector["noneCase"]);
         assert_eq!(none.protocol, PairingEncryption::None);
         assert!(none.public_key.is_empty());
@@ -1233,7 +1446,14 @@ mod tests {
             Some(json!(1.0)),
         ] {
             let mut request = create_request(Some([1; 32]));
-            request.transport_binding = binding;
+            request.transport_binding = binding.clone();
+            assert!(matches!(
+                registry.create(peer(), request),
+                Err(AppError::ProtocolUpgradeRequired(_))
+            ));
+            // Clients that do not bind the device name.
+            let mut request = create_request(Some([1; 32]));
+            request.device_name_binding = binding;
             assert!(matches!(
                 registry.create(peer(), request),
                 Err(AppError::ProtocolUpgradeRequired(_))
@@ -1251,41 +1471,42 @@ mod tests {
             .is_empty());
         assert!(decide_device_pairing(&fixture.root, &created.request_id, true).is_err());
         assert!(matches!(
-            registry.poll(peer(), proof(&created.request_id, &[0; 32])),
+            registry.poll(proof(&created.request_id, &[0; 32])),
             Err(AppError::Unauthenticated)
         ));
         registry
-            .reveal(
-                peer(),
-                reveal_request(&created.request_id, client_public(), CLIENT_NONCE),
-            )
+            .reveal(reveal_request(
+                &created.request_id,
+                client_public(),
+                CLIENT_NONCE,
+            ))
             .unwrap();
         let listed = list_device_pairing_requests(&fixture.root).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].request_id, created.request_id);
         assert!(matches!(
-            registry.reveal(
-                peer(),
-                reveal_request(&created.request_id, client_public(), CLIENT_NONCE),
-            ),
+            registry.reveal(reveal_request(
+                &created.request_id,
+                client_public(),
+                CLIENT_NONCE
+            )),
             Err(AppError::Conflict(_))
         ));
 
-        // A reveal that does not open the commitment discards the request.
-        let other = commit(&registry);
+        // A reveal that does not open the commitment is refused, but the
+        // request stays for the real client.
+        let other = commit_from(&registry, "192.0.2.77".parse().unwrap());
         assert!(matches!(
-            registry.reveal(
-                peer(),
-                reveal_request(&other.request_id, client_public(), [6; 32])
-            ),
+            registry.reveal(reveal_request(&other.request_id, client_public(), [6; 32])),
             Err(AppError::Unauthenticated)
         ));
         assert!(matches!(
-            registry.reveal(
-                peer(),
-                reveal_request(&other.request_id, client_public(), CLIENT_NONCE),
-            ),
-            Err(AppError::NotFound(_))
+            registry.reveal(reveal_request(
+                &other.request_id,
+                client_public(),
+                CLIENT_NONCE
+            )),
+            Ok(RevealDevicePairingResponse { status: "pending" })
         ));
     }
 
@@ -1322,7 +1543,7 @@ mod tests {
         }
         assert_eq!(
             registry
-                .poll(peer(), proof(&created.request_id, &material.poll_proof))
+                .poll(proof(&created.request_id, &material.poll_proof))
                 .unwrap()
                 .status,
             "pending"
@@ -1333,7 +1554,7 @@ mod tests {
             .is_empty());
         assert!(decide_device_pairing(&fixture.root, &created.request_id, false).is_err());
         let response = registry
-            .poll(peer(), proof(&created.request_id, &material.poll_proof))
+            .poll(proof(&created.request_id, &material.poll_proof))
             .unwrap();
         assert_eq!(response.status, "approved");
         assert!(!serde_json::to_string(&response)
@@ -1367,7 +1588,7 @@ mod tests {
         assert_eq!(record.name, "Synthetic device");
         assert_eq!(
             registry
-                .poll(peer(), proof(&created.request_id, &material.poll_proof))
+                .poll(proof(&created.request_id, &material.poll_proof))
                 .unwrap()
                 .status,
             "expired"
@@ -1380,35 +1601,32 @@ mod tests {
         let registry = fixture.registry();
         let (created, material) = begin(&registry);
         assert!(matches!(
-            registry.poll(peer(), proof(&created.request_id, &material.cancel_proof)),
+            registry.poll(proof(&created.request_id, &material.cancel_proof)),
             Err(AppError::Unauthenticated)
         ));
         assert!(matches!(
-            registry.cancel(peer(), proof(&created.request_id, &material.poll_proof)),
+            registry.cancel(proof(&created.request_id, &material.poll_proof)),
             Err(AppError::Unauthenticated)
         ));
         let (other, other_material) = begin(&registry);
         assert!(matches!(
-            registry.poll(peer(), proof(&other.request_id, &material.poll_proof)),
+            registry.poll(proof(&other.request_id, &material.poll_proof)),
             Err(AppError::Unauthenticated)
         ));
         decide_device_pairing(&fixture.root, &created.request_id, false).unwrap();
         assert_eq!(
             registry
-                .poll(peer(), proof(&created.request_id, &material.poll_proof))
+                .poll(proof(&created.request_id, &material.poll_proof))
                 .unwrap()
                 .status,
             "rejected"
         );
         registry
-            .cancel(
-                peer(),
-                proof(&other.request_id, &other_material.cancel_proof),
-            )
+            .cancel(proof(&other.request_id, &other_material.cancel_proof))
             .unwrap();
         assert_eq!(
             registry
-                .poll(peer(), proof(&other.request_id, &other_material.poll_proof))
+                .poll(proof(&other.request_id, &other_material.poll_proof))
                 .unwrap()
                 .status,
             "expired"
@@ -1425,7 +1643,7 @@ mod tests {
             .expires = Instant::now() - Duration::from_secs(1);
         assert_eq!(
             registry
-                .poll(peer(), proof(&expired.request_id, &material.poll_proof))
+                .poll(proof(&expired.request_id, &material.poll_proof))
                 .unwrap()
                 .status,
             "expired"
@@ -1451,7 +1669,13 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    registry.poll(peer(), proof(&id, &value)).unwrap().status
+                    // Four polls per second per request: the rest are
+                    // refused before they look at the request.
+                    match registry.poll(proof(&id, &value)) {
+                        Ok(response) => response.status,
+                        Err(AppError::RateLimited { .. }) => "rate-limited",
+                        Err(error) => panic!("{error}"),
+                    }
                 })
             })
             .collect::<Vec<_>>();
@@ -1469,17 +1693,17 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .filter(|status| **status == "expired")
+                .filter(|status| **status == "expired" || **status == "rate-limited")
                 .count(),
             7
         );
     }
 
     #[test]
-    fn unauthenticated_creation_has_rate_capacity_and_key_validation_limits() {
+    fn unauthenticated_creation_validates_keys_and_limits_unfinished_requests_per_source() {
         let fixture = Fixture::new();
         let registry = fixture.registry();
-        // A low-order key commits fine but fails at reveal.
+        // A low-order client key commits fine but fails at reveal.
         let created = registry
             .create(
                 peer(),
@@ -1487,35 +1711,305 @@ mod tests {
             )
             .unwrap();
         assert!(registry
-            .reveal(
-                peer(),
-                reveal_request(&created.request_id, [0; 32], CLIENT_NONCE)
-            )
+            .reveal(reveal_request(&created.request_id, [0; 32], CLIENT_NONCE))
             .is_err());
-        // An invalid Ed25519 key is rejected before rate limits are consumed.
+        // An invalid Ed25519 key is rejected before rate limits are consumed,
+        // and so is a small-order (weak) one.
         let mut bad_device = create_request(Some([1; 32]));
         bad_device.device_public_key = "not-a-key".into();
         assert!(registry.create(peer(), bad_device).is_err());
-        for _ in 0..3 {
-            begin(&registry);
-        }
+        let mut identity = [0_u8; 32];
+        identity[0] = 1;
+        let mut weak_device = create_request(Some([1; 32]));
+        weak_device.device_public_key = URL_SAFE_NO_PAD.encode(identity);
+        assert!(matches!(
+            registry.create(peer(), weak_device),
+            Err(AppError::InvalidRequest(_))
+        ));
+
+        // Two unfinished requests per source: unrevealed or awaiting a
+        // decision.
+        begin(&registry);
+        begin(&registry);
         assert!(matches!(
             registry.create(peer(), create_request(Some([1; 32]))),
-            Err(AppError::ResourceExhausted(_))
+            Err(AppError::PairingBusy(_))
         ));
-        for index in 1..14 {
-            registry
-                .create(
-                    format!("192.0.2.{index}").parse().unwrap(),
-                    create_request(Some([1; 32])),
-                )
-                .unwrap();
+        // IPv6 peers count per /64; IPv4-mapped addresses count as IPv4.
+        for address in ["2001:db8::1", "2001:db8::ffff:2"] {
+            commit_from(&registry, address.parse().unwrap());
         }
-        assert_eq!(registry.inner.lock().unwrap().requests.len(), MAX_ACTIVE);
         assert!(matches!(
-            registry.create("192.0.2.99".parse().unwrap(), create_request(Some([1; 32]))),
-            Err(AppError::ResourceExhausted(_))
+            registry.create(
+                "2001:db8::abcd:1:2:3".parse().unwrap(),
+                create_request(Some([1; 32]))
+            ),
+            Err(AppError::PairingBusy(_))
         ));
+        commit_from(&registry, "2001:db8:0:1::1".parse().unwrap());
+        commit_from(&registry, "192.0.2.50".parse().unwrap());
+        commit_from(&registry, "::ffff:192.0.2.50".parse().unwrap());
+        assert!(matches!(
+            registry.create("192.0.2.50".parse().unwrap(), create_request(Some([1; 32]))),
+            Err(AppError::PairingBusy(_))
+        ));
+        assert_eq!(
+            source_key("::ffff:192.0.2.50".parse().unwrap()),
+            "192.0.2.50".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            source_key("2001:db8::abcd:1:2:3".parse().unwrap()),
+            "2001:db8::".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn create_rate_is_limited_per_source_with_a_retry_hint() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        // Finished (rejected) requests no longer count as unfinished, so
+        // only the rate limit applies: four per source per minute.
+        for _ in 0..4 {
+            let created = commit(&registry);
+            registry
+                .inner
+                .lock()
+                .unwrap()
+                .requests
+                .get_mut(&created.request_id)
+                .unwrap()
+                .status = RequestStatus::Rejected;
+        }
+        match registry.create(peer(), create_request(Some([1; 32]))) {
+            Err(AppError::RateLimited {
+                retry_after_secs, ..
+            }) => assert!((1..=60).contains(&retry_after_secs)),
+            other => panic!("expected a rate limit, got {:?}", other.err()),
+        }
+        commit_from(&registry, "192.0.2.60".parse().unwrap());
+    }
+
+    #[test]
+    fn a_full_table_evicts_the_oldest_unrevealed_request_first() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let address = |index: u8| -> IpAddr { format!("198.51.100.{index}").parse().unwrap() };
+        for index in 0..15 {
+            begin_from(&registry, address(index));
+        }
+        let unrevealed = commit_from(&registry, address(100));
+        assert_eq!(registry.inner.lock().unwrap().requests.len(), MAX_ACTIVE);
+        // Room is made by dropping the unrevealed request.
+        let newest = commit_from(&registry, address(101));
+        assert!(matches!(
+            registry.reveal(reveal_request(
+                &unrevealed.request_id,
+                client_public(),
+                CLIENT_NONCE
+            )),
+            Err(AppError::NotFound(_))
+        ));
+        registry
+            .reveal(reveal_request(
+                &newest.request_id,
+                client_public(),
+                CLIENT_NONCE,
+            ))
+            .unwrap();
+        // Every request is revealed now: nothing can be evicted.
+        assert!(matches!(
+            registry.create(address(102), create_request(Some([1; 32]))),
+            Err(AppError::PairingBusy(_))
+        ));
+        assert_eq!(registry.inner.lock().unwrap().requests.len(), MAX_ACTIVE);
+    }
+
+    #[test]
+    fn reveal_has_a_deadline_and_attempts_and_proofs_are_rate_limited_per_request() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        // Not revealed within the deadline: gone.
+        let late = commit(&registry);
+        if let Stage::Committed { reveal_by, .. } = &mut registry
+            .inner
+            .lock()
+            .unwrap()
+            .requests
+            .get_mut(&late.request_id)
+            .unwrap()
+            .stage
+        {
+            *reveal_by = Instant::now() - Duration::from_secs(1);
+        }
+        assert!(matches!(
+            registry.reveal(reveal_request(
+                &late.request_id,
+                client_public(),
+                CLIENT_NONCE
+            )),
+            Err(AppError::NotFound(_))
+        ));
+
+        // Eight reveal attempts per request per minute.
+        let created = commit(&registry);
+        for _ in 0..8 {
+            assert!(matches!(
+                registry.reveal(reveal_request(
+                    &created.request_id,
+                    client_public(),
+                    [6; 32]
+                )),
+                Err(AppError::Unauthenticated)
+            ));
+        }
+        assert!(matches!(
+            registry.reveal(reveal_request(
+                &created.request_id,
+                client_public(),
+                CLIENT_NONCE
+            )),
+            Err(AppError::RateLimited { .. })
+        ));
+
+        // Four poll/cancel calls per request per second.
+        let (pending, material) = begin_from(&registry, "192.0.2.61".parse().unwrap());
+        for _ in 0..4 {
+            assert_eq!(
+                registry
+                    .poll(proof(&pending.request_id, &material.poll_proof))
+                    .unwrap()
+                    .status,
+                "pending"
+            );
+        }
+        match registry.cancel(proof(&pending.request_id, &material.cancel_proof)) {
+            Err(AppError::RateLimited {
+                retry_after_secs, ..
+            }) => assert_eq!(retry_after_secs, 1),
+            other => panic!("expected a rate limit, got {other:?}"),
+        }
+        // Other requests are unaffected.
+        let (other, other_material) = begin_from(&registry, "192.0.2.62".parse().unwrap());
+        registry
+            .poll(proof(&other.request_id, &other_material.poll_proof))
+            .unwrap();
+    }
+
+    #[test]
+    fn rate_windows_count_globally_and_per_key() {
+        let mut window = RateWindow::new(Duration::from_secs(1));
+        let now = Instant::now();
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        window.admit(now, a, 3, 2).unwrap();
+        window.admit(now, a, 3, 2).unwrap();
+        assert!(window.admit(now, a, 3, 2).is_err());
+        window.admit(now, b, 3, 2).unwrap();
+        assert!(window.admit(now, b, 3, 2).is_err(), "global limit");
+        // The window slides.
+        window.admit(now + Duration::from_secs(1), a, 3, 2).unwrap();
+    }
+
+    #[test]
+    fn device_names_are_validated_strictly_and_stored_exactly() {
+        for valid in [
+            "a",
+            "Yoh 的 iPhone 📱",
+            "Mid  dle",
+            &"📱".repeat(80),
+            &"a".repeat(80),
+        ] {
+            assert!(validate_device_name(valid).is_ok(), "{valid:?}");
+        }
+        for invalid in [
+            "",
+            " leading",
+            "trailing ",
+            "\u{3000}ideographic space",
+            "tab\tinside",
+            "new\nline",
+            "esc\u{1b}[31m",
+            "bidi\u{202e}override",
+            "isolate\u{2066}x",
+            "mark\u{200e}",
+            "\u{200f}rtl",
+            &"a".repeat(81),
+            &"📱".repeat(81),
+        ] {
+            assert!(
+                matches!(
+                    validate_device_name(invalid),
+                    Err(AppError::InvalidRequest(_))
+                ),
+                "{invalid:?}"
+            );
+        }
+
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let mut request = create_request(Some([1; 32]));
+        request.device_name = " padded ".to_owned();
+        assert!(matches!(
+            registry.create(peer(), request),
+            Err(AppError::InvalidRequest(_))
+        ));
+
+        // The exact name reaches the transcript, the approver and the
+        // registry.
+        let name = "Yoh 的 iPhone 📱";
+        let mut request = create_request(Some(commitment(&client_public(), &CLIENT_NONCE)));
+        request.device_name = name.to_owned();
+        let created = registry.create(peer(), request).unwrap();
+        registry
+            .reveal(reveal_request(
+                &created.request_id,
+                client_public(),
+                CLIENT_NONCE,
+            ))
+            .unwrap();
+        let listed = list_device_pairing_requests(&fixture.root).unwrap();
+        assert_eq!(listed[0].device_name, name);
+        assert_eq!(
+            listed[0].device_id.as_deref(),
+            Some(crate::devices::device_id_for(&device_key()).as_str())
+        );
+        assert_eq!(listed[0].peer_address, "127.0.0.1");
+        let server_public = decode_32(&created.server_public_key).unwrap();
+        let shared = StaticSecret::from([7; 32])
+            .diffie_hellman(&PublicKey::from(server_public))
+            .to_bytes();
+        let derive = |name: &str| {
+            PairingMaterial::derive(
+                &created.request_id,
+                &client_public(),
+                &server_public,
+                &device_key(),
+                &CLIENT_NONCE,
+                &response_binding(&created),
+                name,
+                &shared,
+            )
+            .unwrap()
+        };
+        let material = derive(name);
+        assert!(material
+            .transcript
+            .ends_with(&length_prefixed(name.as_bytes())));
+        assert_eq!(listed[0].verification_code, material.verification_code);
+        assert_ne!(
+            derive("Yoh 的 iPhone").verification_code,
+            material.verification_code
+        );
+        decide_device_pairing(&fixture.root, &created.request_id, true).unwrap();
+        assert_eq!(
+            registry
+                .poll(proof(&created.request_id, &material.poll_proof))
+                .unwrap()
+                .status,
+            "approved"
+        );
+        let record = crate::devices::list_devices(&fixture.root).unwrap();
+        assert_eq!(record[0].name, name);
     }
 
     #[test]
@@ -1535,7 +2029,7 @@ mod tests {
         drop(third);
         assert_eq!(
             first
-                .poll(peer(), proof(&created.request_id, &material.poll_proof))
+                .poll(proof(&created.request_id, &material.poll_proof))
                 .unwrap()
                 .status,
             "approved"
@@ -1549,12 +2043,12 @@ mod tests {
         let (created, material) = begin(&registry);
         assert_eq!(created.transport_protocol, PairingEncryption::None);
         assert_eq!(created.transport_public_key, "");
-        assert!(material
-            .transcript
-            .ends_with(&[0, 0, 0, 4, b'n', b'o', b'n', b'e', 0, 0, 0, 0]));
+        let mut tail = vec![0, 0, 0, 4, b'n', b'o', b'n', b'e', 0, 0, 0, 0];
+        tail.extend(length_prefixed(DEVICE_NAME.as_bytes()));
+        assert!(material.transcript.ends_with(&tail));
         decide_device_pairing(&fixture.root, &created.request_id, true).unwrap();
         let response = registry
-            .poll(peer(), proof(&created.request_id, &material.poll_proof))
+            .poll(proof(&created.request_id, &material.poll_proof))
             .unwrap();
         assert_eq!(
             decrypt(&material, &response)["transportProtocol"],
@@ -1584,7 +2078,7 @@ mod tests {
         // key: it is dropped without registering the device.
         assert_eq!(
             registry
-                .poll(peer(), proof(&before.request_id, &material.poll_proof))
+                .poll(proof(&before.request_id, &material.poll_proof))
                 .unwrap()
                 .status,
             "expired"
@@ -1607,6 +2101,7 @@ mod tests {
                     client_commitment: None,
                     client_public_key: None,
                     transport_binding: None,
+                    device_name_binding: None,
                     device_name: String::new(),
                     device_public_key: String::new(),
                 }

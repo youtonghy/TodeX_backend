@@ -14,7 +14,10 @@ use super::channel::{RecordCipher, SecureChannel, DIRECTION_DOWN, DIRECTION_UP};
 use super::envelope::{
     seal_record_stream, split_inner_request, RecordStreamDecoder, RecordStreamSealer,
 };
-use super::handshake::{derive_keys, KeyScheduleInput, TransportKeys, REST_LABEL, WS_LABEL};
+use super::handshake::{
+    derive_keys, derive_rest_keys, KeyScheduleInput, RestKeys, TransportKeys,
+    RESPONSE_NONCE_LENGTH, REST_LABEL, WS_LABEL,
+};
 use super::{encode_b64, EncryptionProtocol, PairingKeys};
 
 pub(crate) fn fixture() -> Value {
@@ -60,23 +63,89 @@ fn assert_keys(keys: &TransportKeys, vector: &Value) {
     assert_eq!(to_hex(keys.k_down.as_slice()), vector["kDown"]);
 }
 
+fn schedule_input<'a>(
+    protocol: EncryptionProtocol,
+    server: &'a PairingKeys,
+    vector: &'a Value,
+    material: &'a [u8],
+    client_nonce: &'a [u8],
+    server_nonce: &'a [u8],
+    shared: &'a [u8],
+) -> KeyScheduleInput<'a> {
+    KeyScheduleInput {
+        label: vector["label"].as_str().unwrap(),
+        protocol,
+        device_id: vector["deviceId"].as_str().unwrap(),
+        server_static_public: server.static_public(protocol),
+        client_material: material,
+        client_nonce,
+        server_nonce,
+        shared,
+    }
+}
+
+/// The client's WebSocket keys (or, for `rest`, the pre-revision-2 keys
+/// whose `k_down` had no response nonce).
 fn client_keys(
     protocol: EncryptionProtocol,
     server: &PairingKeys,
     vector: &Value,
 ) -> TransportKeys {
-    let shared = hex(&vector["shared"]);
-    derive_keys(&KeyScheduleInput {
-        label: vector["label"].as_str().unwrap(),
+    let (material, client_nonce, server_nonce, shared) = (
+        hex(&vector["clientMaterial"]),
+        hex(&vector["clientNonce"]),
+        hex(&vector["serverNonce"]),
+        hex(&vector["shared"]),
+    );
+    derive_keys(&schedule_input(
         protocol,
-        device_id: vector["deviceId"].as_str().unwrap(),
-        server_static_public: server.static_public(protocol),
-        client_material: &hex(&vector["clientMaterial"]),
-        client_nonce: &hex(&vector["clientNonce"]),
-        server_nonce: &hex(&vector["serverNonce"]),
-        shared: &shared,
-    })
+        server,
+        vector,
+        &material,
+        &client_nonce,
+        &server_nonce,
+        &shared,
+    ))
     .unwrap()
+}
+
+/// The client's REST keys for the vector request.
+fn client_rest_keys(protocol: EncryptionProtocol, server: &PairingKeys, rest: &Value) -> RestKeys {
+    let (material, client_nonce, shared) = (
+        hex(&rest["clientMaterial"]),
+        hex(&rest["clientNonce"]),
+        hex(&rest["shared"]),
+    );
+    derive_rest_keys(&schedule_input(
+        protocol,
+        server,
+        rest,
+        &material,
+        &client_nonce,
+        &[],
+        &shared,
+    ))
+    .unwrap()
+}
+
+/// `k_down` for a response nonce, and the record cipher it keys.
+fn rest_down(keys: RestKeys, nonce: &[u8]) -> (Vec<u8>, RecordCipher) {
+    let nonce: [u8; RESPONSE_NONCE_LENGTH] = nonce.try_into().unwrap();
+    let (th, k_down) = keys.into_k_down(&nonce).unwrap();
+    (
+        k_down.to_vec(),
+        RecordCipher::new(&k_down, &th, DIRECTION_DOWN),
+    )
+}
+
+/// A client reading a sealed revision 2 response body: the 32-byte response
+/// nonce, then records under the `k_down` it selects.
+fn open_rest_response(keys: RestKeys, body: &[u8]) -> Result<Vec<u8>, super::TransportCryptoError> {
+    if body.len() < RESPONSE_NONCE_LENGTH {
+        return Err(super::TransportCryptoError::new("truncated response nonce"));
+    }
+    let (nonce, records) = body.split_at(RESPONSE_NONCE_LENGTH);
+    open_stream(rest_down(keys, nonce).1, records)
 }
 
 fn open_stream(
@@ -112,6 +181,26 @@ fn transport_v2_vectors_match() {
     assert_eq!(
         fixture["constants"]["failureCode"],
         crate::error::AppError::TransportCryptoFailed.code()
+    );
+    assert_eq!(
+        fixture["constants"]["sealedRevision"],
+        super::envelope::SEALED_REVISION
+    );
+    assert_eq!(
+        fixture["constants"]["sealedRevisionHeader"],
+        super::envelope::SEALED_REVISION_HEADER
+    );
+    assert_eq!(
+        fixture["constants"]["sealedResponseContentType"],
+        super::envelope::SEALED_RESPONSE_CONTENT_TYPE
+    );
+    assert_eq!(
+        fixture["constants"]["responseNonceLength"],
+        RESPONSE_NONCE_LENGTH
+    );
+    assert_eq!(
+        fixture["constants"]["restDownInfo"],
+        format!("{REST_LABEL}/down")
     );
     let protocols = fixture["protocols"].as_array().unwrap();
     assert_eq!(protocols.len(), 2);
@@ -175,6 +264,14 @@ fn check_rest(protocol: EncryptionProtocol, server: &PairingKeys, rest: &Value) 
         super::envelope::SEALED_CONTENT_TYPE
     );
     assert_eq!(headers["x-todex-transport"], "2");
+    assert_eq!(
+        headers[super::envelope::SEALED_REVISION_HEADER],
+        super::envelope::SEALED_REVISION.to_string()
+    );
+    assert_eq!(
+        rest["responseHeaders"]["content-type"],
+        super::envelope::SEALED_RESPONSE_CONTENT_TYPE
+    );
     assert_eq!(headers["x-todex-encryption"], protocol.as_str());
     let material_header = match protocol {
         EncryptionProtocol::X25519 => "x-todex-client-key",
@@ -187,19 +284,32 @@ fn check_rest(protocol: EncryptionProtocol, server: &PairingKeys, rest: &Value) 
     );
     assert_eq!(rest["deviceId"], "");
     assert_eq!(rest["serverNonce"], "");
-    let keys = server
-        .server_session_keys(
-            REST_LABEL,
-            protocol,
-            "",
-            &material,
-            &hex(&rest["clientNonce"]),
-            &[],
-        )
-        .unwrap();
-    assert_keys(&keys, rest);
-    let up = || RecordCipher::new(&keys.k_up, &keys.th, DIRECTION_UP);
-    let down = || RecordCipher::new(&keys.k_down, &keys.th, DIRECTION_DOWN);
+    assert_eq!(rest["label"], REST_LABEL);
+    // The server side of the key schedule, as the tunnel runs it.
+    let server_keys = || {
+        server
+            .server_rest_keys(protocol, &material, &hex(&rest["clientNonce"]))
+            .unwrap()
+    };
+    let keys = server_keys();
+    assert_eq!(to_hex(keys.th.as_slice()), rest["th"]);
+    assert_eq!(to_hex(keys.prk()), rest["prk"]);
+    assert_eq!(to_hex(keys.k_up.as_slice()), rest["kUp"]);
+    let k_up = keys.k_up.clone();
+    let th = keys.th.clone();
+    let up = || RecordCipher::new(&k_up, &th, DIRECTION_UP);
+    let response_nonce = hex(&rest["responseNonce"]);
+    let (k_down, _) = rest_down(keys, &response_nonce);
+    assert_eq!(to_hex(&k_down), rest["kDown"]);
+    let down = || rest_down(server_keys(), &response_nonce).1;
+    // Before revision 2, k_down had no nonce: it must differ.
+    let legacy = client_keys(protocol, server, rest);
+    assert_eq!(to_hex(legacy.k_down.as_slice()), rest["kDownWithoutNonce"]);
+    assert_ne!(rest["kDownWithoutNonce"], rest["kDown"]);
+    // The client derives the same keys.
+    let client = client_rest_keys(protocol, server, rest);
+    assert_eq!(to_hex(client.k_up.as_slice()), rest["kUp"]);
+    assert_eq!(to_hex(client.prk()), rest["prk"]);
 
     // Request: open the sealed stream and parse the inner request.
     let request = &rest["request"];
@@ -210,16 +320,48 @@ fn check_rest(protocol: EncryptionProtocol, server: &PairingKeys, rest: &Value) 
     assert_eq!(serde_json::to_value(&head).unwrap(), expected_head);
     assert_eq!(to_hex(&body), request["body"]);
 
-    // Response: seal the given plaintext, one-shot and streamed.
+    // Response: seal the given plaintext, one-shot and streamed; the body
+    // is the response nonce followed by the records.
     let response = &rest["response"];
     let plaintext = hex(&response["plaintext"]);
+    let records = hex(&response["recordStream"]);
     let stream = hex(&response["stream"]);
-    assert_eq!(seal_record_stream(&mut down(), &plaintext).unwrap(), stream);
+    assert_eq!(stream[..RESPONSE_NONCE_LENGTH], response_nonce[..]);
+    assert_eq!(stream[RESPONSE_NONCE_LENGTH..], records[..]);
+    assert_eq!(
+        seal_record_stream(&mut down(), &plaintext).unwrap(),
+        records
+    );
     let head_len = u32::from_be_bytes(plaintext[..4].try_into().unwrap()) as usize;
     let mut sealer = RecordStreamSealer::new(down(), plaintext[..4 + head_len].to_vec());
     let mut streamed = sealer.push(&plaintext[4 + head_len..]).unwrap();
     streamed.extend(sealer.finish().unwrap());
-    assert_eq!(streamed, stream);
+    assert_eq!(streamed, records);
+    assert_eq!(
+        open_rest_response(client_rest_keys(protocol, server, rest), &stream).unwrap(),
+        plaintext
+    );
+    assert_eq!(
+        to_hex(&plaintext[4..4 + head_len]),
+        to_hex(response["headJson"].as_str().unwrap().as_bytes())
+    );
+    assert_eq!(to_hex(&plaintext[4 + head_len..]), response["body"]);
+
+    // A second response to the same request: another nonce, another key.
+    let second = &rest["secondResponse"];
+    let second_nonce = hex(&second["responseNonce"]);
+    assert_ne!(second_nonce, response_nonce);
+    let (second_k_down, mut second_down) = rest_down(server_keys(), &second_nonce);
+    assert_eq!(to_hex(&second_k_down), second["kDown"]);
+    assert_ne!(second["kDown"], rest["kDown"]);
+    let second_stream = hex(&second["stream"]);
+    let mut expected = second_nonce.clone();
+    expected.extend(seal_record_stream(&mut second_down, &plaintext).unwrap());
+    assert_eq!(second_stream, expected);
+    assert_eq!(
+        open_rest_response(client_rest_keys(protocol, server, rest), &second_stream).unwrap(),
+        plaintext
+    );
     let head: Value = serde_json::from_slice(&plaintext[4..4 + head_len]).unwrap();
     assert_eq!(head["status"], response["status"]);
 
@@ -239,8 +381,18 @@ fn check_rest(protocol: EncryptionProtocol, server: &PairingKeys, rest: &Value) 
         multi["plaintextSha256"]
     );
     let stream = seal_record_stream(&mut down(), &plaintext).unwrap();
-    assert_eq!(stream.len() as u64, multi["streamLength"].as_u64().unwrap());
-    assert_eq!(to_hex(&Sha256::digest(&stream)), multi["streamSha256"]);
+    assert_eq!(
+        stream.len() as u64,
+        multi["recordStreamLength"].as_u64().unwrap()
+    );
+    assert_eq!(
+        to_hex(&Sha256::digest(&stream)),
+        multi["recordStreamSha256"]
+    );
+    let mut body = response_nonce.clone();
+    body.extend_from_slice(&stream);
+    assert_eq!(body.len() as u64, multi["streamLength"].as_u64().unwrap());
+    assert_eq!(to_hex(&Sha256::digest(&body)), multi["streamSha256"]);
     let mut offset = 0;
     for record in multi["records"].as_array().unwrap() {
         let length = u32::from_be_bytes(stream[offset..offset + 4].try_into().unwrap()) as usize;
@@ -271,9 +423,8 @@ fn check_failures(protocol: EncryptionProtocol, server: &PairingKeys, vector: &V
                 assert!(channel.opener.open_frame(&input).is_err(), "{name}");
             }
             "rest" => {
-                let keys = client_keys(protocol, server, &vector["rest"]);
-                let down = RecordCipher::new(&keys.k_down, &keys.th, DIRECTION_DOWN);
-                assert!(open_stream(down, &input).is_err(), "{name}");
+                let keys = client_rest_keys(protocol, server, &vector["rest"]);
+                assert!(open_rest_response(keys, &input).is_err(), "{name}");
             }
             other => panic!("unknown failure kind {other}"),
         }
