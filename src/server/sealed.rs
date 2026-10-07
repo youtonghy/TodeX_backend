@@ -210,7 +210,11 @@ async fn open_request(
         },
     )?)?;
     let client_nonce = decode_b64url(header(headers, HEADER_REQUEST_NONCE)?)?;
-    let keys = state.pairing_keys.server_session_keys(
+    let pairing_keys = state.pairing_keys.current().map_err(|error| {
+        tracing::warn!(%error, "pairing keys unavailable; refusing sealed request");
+        TransportCryptoError::new("pairing keys unavailable")
+    })?;
+    let keys = pairing_keys.server_session_keys(
         REST_LABEL,
         protocol,
         "",

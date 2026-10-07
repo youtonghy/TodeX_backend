@@ -1,7 +1,9 @@
 //! Pairing keys and transport encryption.
 //!
 //! - [`PairingKeys`]: the daemon's static X25519 / ML-KEM-768 keys that
-//!   clients pin at pairing, plus the pairing QR payloads.
+//!   clients pin at pairing; [`PairingKeyStore`] is the shared, reloading
+//!   handle the handshake and device pairing both read.
+//! - The address-only pairing link and its QR renderings.
 //! - Transport v2 (`docs/transport-v2.md`): [`handshake`] (key agreement and
 //!   key schedule), [`channel`] (sealed records and WebSocket frames) and
 //!   [`envelope`] (REST record streams and the inner request/response).
@@ -15,8 +17,9 @@ mod vector_tests;
 pub(crate) use channel::TransportCryptoError;
 
 use std::net::IpAddr;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -32,7 +35,9 @@ use crate::config::{Config, PairingEncryption};
 use crate::error::AppError;
 
 const PAIRING_VERSION: u8 = 1;
-const PAIRING_QR_SEGMENT_DATA_LENGTH: usize = 160;
+/// Version 2 links carry only the server address; the transport key is
+/// delivered (and authenticated) by device pairing v3.
+const PAIRING_LINK_VERSION: u8 = 2;
 const PAIRING_KEYS_FILE: &str = "pairing_keys.json";
 
 #[derive(Clone)]
@@ -78,11 +83,13 @@ impl PairingKeys {
         Ok(keys)
     }
 
-    pub(crate) fn pairing_public_key(&self, encryption: PairingEncryption) -> Option<String> {
+    /// Raw static public key for the configured protocol: what the v2
+    /// handshake uses and device pairing v3 delivers; empty for `none`.
+    pub(crate) fn transport_public_key(&self, encryption: PairingEncryption) -> &[u8] {
         match encryption {
-            PairingEncryption::None => None,
-            PairingEncryption::X25519 => Some(encode_b64(&self.x25519_public)),
-            PairingEncryption::MlKem768 => Some(encode_b64(&self.ml_kem_public)),
+            PairingEncryption::None => &[],
+            PairingEncryption::X25519 => self.static_public(EncryptionProtocol::X25519),
+            PairingEncryption::MlKem768 => self.static_public(EncryptionProtocol::MlKem768),
         }
     }
 
@@ -137,99 +144,114 @@ impl PairingKeys {
             ml_kem_public,
         })
     }
+}
 
-    #[cfg(test)]
-    fn pairing_qr_text(
-        &self,
-        config: &Config,
-        port: u16,
-        preferred_encryption: PairingEncryption,
-    ) -> Result<String, AppError> {
-        render_qr_text(&self.pairing_qr_payload(config, port, preferred_encryption)?)
+/// Version of `pairing_keys.json` the in-memory keys were read from. `reset`
+/// publishes by rename, so on Unix the inode changes even when a coarse mtime
+/// does not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn file_stamp(path: &Path) -> std::io::Result<FileStamp> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(FileStamp {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+        #[cfg(unix)]
+        inode: std::os::unix::fs::MetadataExt::ino(&metadata),
+    })
+}
+
+struct KeyStoreState {
+    path: PathBuf,
+    keys: Arc<PairingKeys>,
+    stamp: FileStamp,
+}
+
+/// The daemon's single source of pairing keys: the v2 handshake (WebSocket
+/// and REST) and device pairing v3 both read [`PairingKeyStore::current`], so
+/// a TUI reset of `pairing_keys.json` switches them together without a
+/// restart (same mtime-reload model as `devices.json`).
+#[derive(Clone)]
+pub(crate) struct PairingKeyStore {
+    inner: Arc<Mutex<KeyStoreState>>,
+}
+
+impl PairingKeyStore {
+    pub(crate) async fn load(data_dir: &Path) -> Result<Self, AppError> {
+        let keys = PairingKeys::load_or_generate(data_dir).await?;
+        let path = data_dir.join(PAIRING_KEYS_FILE);
+        let stamp = file_stamp(&path)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(KeyStoreState {
+                path,
+                keys: Arc::new(keys),
+                stamp,
+            })),
+        })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn pairing_qr_payload(
-        &self,
-        config: &Config,
-        port: u16,
-        preferred_encryption: PairingEncryption,
-    ) -> Result<String, AppError> {
-        self.pairing_link_json(config, port, preferred_encryption)
-    }
-
-    pub(crate) fn pairing_qr_payloads(
-        &self,
-        config: &Config,
-        port: u16,
-        preferred_encryption: PairingEncryption,
-    ) -> Result<Vec<String>, AppError> {
-        let payload = self.pairing_link_json(config, port, preferred_encryption)?;
-        if preferred_encryption != PairingEncryption::MlKem768 {
-            return Ok(vec![payload]);
+    /// Keys for the next handshake or pairing request. Every call stats the
+    /// file (one syscall, far cheaper than the key agreement it precedes, and
+    /// what `devices.json` already does per authenticated request), so there
+    /// is no window in which a stale key is served after a reset. The file is
+    /// re-read only when it changed. A missing or invalid file fails closed:
+    /// no handshake or pairing succeeds until it is valid again (a daemon
+    /// restart regenerates a missing file).
+    pub(crate) fn current(&self) -> Result<Arc<PairingKeys>, AppError> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| AppError::InvalidRequest("pairing keys are unavailable".to_owned()))?;
+        let stamp = file_stamp(&state.path)?;
+        if stamp != state.stamp {
+            // A replacement between the stat and the read only causes one
+            // more (identical) reload on the next call.
+            let raw = std::fs::read_to_string(&state.path)?;
+            state.keys = Arc::new(PairingKeys::from_persisted_json(&raw, "pairing keys file")?);
+            state.stamp = stamp;
+            tracing::info!("pairing keys file changed; reloaded transport keys");
         }
-
-        self.segment_pairing_qr_payload(&payload)
+        Ok(state.keys.clone())
     }
+}
 
-    fn pairing_link_json(
-        &self,
-        config: &Config,
-        port: u16,
-        preferred_encryption: PairingEncryption,
-    ) -> Result<String, AppError> {
-        let advertise_host = pairing_advertise_host(&config.host);
-        Ok(serde_json::to_string(&PairingLinkPayload {
-            kind: "todex-pairing-link".to_owned(),
-            version: PAIRING_VERSION,
-            server_url: format!("http://{advertise_host}:{port}"),
-            // Pairing links never carry credentials: devices authenticate by
-            // signature after the device-verification ceremony registers them.
-            preferred_encryption: Some(preferred_encryption),
-            protocol: self.pairing_protocol_for(preferred_encryption),
-        })?)
+/// Short, human-comparable identity of a transport public key:
+/// `upper-hex(SHA256(key))[0..16]` grouped `XXXX-XXXX-XXXX-XXXX`. `None` for
+/// the empty key of `pairing_encryption = "none"`.
+pub(crate) fn transport_fingerprint(public_key: &[u8]) -> Option<String> {
+    if public_key.is_empty() {
+        return None;
     }
+    let hex = Sha256::digest(public_key)[..8]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+    Some(format!(
+        "{}-{}-{}-{}",
+        &hex[..4],
+        &hex[4..8],
+        &hex[8..12],
+        &hex[12..]
+    ))
+}
 
-    fn pairing_protocol_for(&self, encryption: PairingEncryption) -> Option<PairingProtocol> {
-        match encryption {
-            PairingEncryption::None => None,
-            PairingEncryption::X25519 => Some(PairingProtocol {
-                id: EncryptionProtocol::X25519.as_str().to_owned(),
-                public_key: encode_b64(&self.x25519_public),
-            }),
-            PairingEncryption::MlKem768 => Some(PairingProtocol {
-                id: EncryptionProtocol::MlKem768.as_str().to_owned(),
-                public_key: encode_b64(&self.ml_kem_public),
-            }),
-        }
-    }
-
-    fn segment_pairing_qr_payload(&self, payload: &str) -> Result<Vec<String>, AppError> {
-        let encoded = encode_b64(payload.as_bytes());
-        let checksum = encode_b64(&Sha256::digest(payload.as_bytes()));
-        let chunks: Vec<&[u8]> = encoded
-            .as_bytes()
-            .chunks(PAIRING_QR_SEGMENT_DATA_LENGTH)
-            .collect();
-        let total = chunks.len() as u16;
-
-        chunks
-            .into_iter()
-            .enumerate()
-            .map(|(index, chunk)| {
-                serde_json::to_string(&PairingQrChunkPayload {
-                    kind: "todex-pairing-chunk".to_owned(),
-                    version: PAIRING_VERSION,
-                    checksum: checksum.clone(),
-                    index: (index + 1) as u16,
-                    total,
-                    data: String::from_utf8(chunk.to_vec())
-                        .expect("base64url chunk should always be valid UTF-8"),
-                })
-                .map_err(Into::into)
-            })
-            .collect()
-    }
+/// The address-only pairing link (version 2). It carries no key and no
+/// credential: importing it fills the server address and starts device
+/// verification, which delivers the transport key authenticated by the
+/// verification code.
+pub(crate) fn pairing_link_json(config: &Config, port: u16) -> Result<String, AppError> {
+    let advertise_host = pairing_advertise_host(&config.host);
+    Ok(serde_json::to_string(&PairingLinkPayload {
+        kind: "todex-pairing-link",
+        version: PAIRING_LINK_VERSION,
+        server_url: format!("http://{advertise_host}:{port}"),
+    })?)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -276,33 +298,12 @@ impl EncryptionProtocol {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PairingProtocol {
-    id: String,
-    public_key: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PairingQrChunkPayload {
-    kind: String,
-    version: u8,
-    checksum: String,
-    index: u16,
-    total: u16,
-    data: String,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PairingLinkPayload {
-    kind: String,
+    kind: &'static str,
     version: u8,
     server_url: String,
-    preferred_encryption: Option<PairingEncryption>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    protocol: Option<PairingProtocol>,
 }
 
 pub(crate) fn query_value(query: Option<&str>, key: &str) -> Option<String> {
@@ -390,42 +391,25 @@ async fn set_owner_only_permissions(_path: &Path) -> Result<(), AppError> {
 
 /// Render locally generated QR geometry only. Payload text never becomes HTML,
 /// a script literal, a URL, or an attribute value.
-pub(crate) fn render_pairing_qr_browser_html(payloads: &[String]) -> Result<String, AppError> {
-    if payloads.is_empty() || payloads.len() > 128 {
-        return Err(AppError::InvalidRequest(
-            "invalid pairing QR frame count".to_owned(),
-        ));
-    }
-    let mut frames = String::new();
-    for (index, payload) in payloads.iter().enumerate() {
-        let qr = QrCode::encode_text(payload, QrCodeEcc::Low).map_err(|_| {
-            AppError::InvalidRequest("pairing payload is too large for QR".to_owned())
-        })?;
-        let modules = qr.size() + 8;
-        let pixels = modules * 8;
-        let mut path = String::new();
-        for y in 0..qr.size() {
-            for x in 0..qr.size() {
-                if qr.get_module(x, y) {
-                    use std::fmt::Write;
-                    write!(&mut path, "M{} {}h1v1h-1z", x + 4, y + 4).expect("writing to String");
-                }
+pub(crate) fn render_pairing_qr_browser_html(payload: &str) -> Result<String, AppError> {
+    use std::fmt::Write;
+    let qr = QrCode::encode_text(payload, QrCodeEcc::Low)
+        .map_err(|_| AppError::InvalidRequest("pairing payload is too large for QR".to_owned()))?;
+    let modules = qr.size() + 8;
+    let pixels = modules * 8;
+    let mut path = String::new();
+    for y in 0..qr.size() {
+        for x in 0..qr.size() {
+            if qr.get_module(x, y) {
+                write!(&mut path, "M{} {}h1v1h-1z", x + 4, y + 4).expect("writing to String");
             }
         }
-        use std::fmt::Write;
-        write!(&mut frames,
-            r##"<div class="qr-frame"{}><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="配对二维码 {} / {}" width="{}" height="{}" viewBox="0 0 {} {}" shape-rendering="crispEdges"><rect width="{}" height="{}" fill="#ffffff"/><path fill="#000000" d="{}"/></svg></div>"##,
-            if index == 0 { "" } else { " hidden" }, index + 1, payloads.len(), pixels, pixels,
-            modules, modules, modules, modules, path,
-        ).expect("writing to String");
     }
     let script_hash = base64::engine::general_purpose::STANDARD
         .encode(Sha256::digest(PAIRING_BROWSER_SCRIPT.as_bytes()));
-    let controls_disabled = if payloads.len() == 1 { " disabled" } else { "" };
     Ok(format!(
-        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{script_hash}'; base-uri 'none'; form-action 'none'; object-src 'none'; connect-src 'none'"><title>TodeX 配对</title><style>{style}</style></head><body><main><h1>TodeX 配对</h1><p>在客户端导入同一组的全部二维码。</p><div class="qr-window">{frames}</div><nav aria-label="二维码分片"><button id="previous" type="button"{controls_disabled}>← 上一张</button><output id="counter" aria-live="polite">1 / {total}</output><button id="next" type="button"{controls_disabled}>下一张 →</button></nav><p class="hint">也可使用方向键切换；二维码已完整保留白色边缘。</p></main><script>{script}</script></body></html>"#,
+        r##"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{script_hash}'; base-uri 'none'; form-action 'none'; object-src 'none'; connect-src 'none'"><title>TodeX 配对</title><style>{style}</style></head><body><main><h1>TodeX 配对</h1><p>在客户端扫描此二维码填入服务器地址，然后在 TUI 中核对验证码。</p><div class="qr-window"><div class="qr-frame"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="配对二维码" width="{pixels}" height="{pixels}" viewBox="0 0 {modules} {modules}" shape-rendering="crispEdges"><rect width="{modules}" height="{modules}" fill="#ffffff"/><path fill="#000000" d="{path}"/></svg></div></div><p class="hint">二维码只包含服务器地址；已完整保留白色边缘。</p></main><script>{script}</script></body></html>"##,
         style = PAIRING_BROWSER_STYLE,
-        total = payloads.len(),
         script = PAIRING_BROWSER_SCRIPT,
     ))
 }
@@ -439,43 +423,21 @@ h1 { margin: 0 0 8px; font-size: 24px; }
 p { margin: 8px 0 18px; }
 .qr-window { max-width: 100%; overflow: auto; }
 .qr-frame { width: fit-content; margin: auto; background: #fff; }
-.qr-frame[hidden] { display: none; }
 svg { display: block; }
-nav { display: flex; align-items: center; justify-content: center; gap: 20px; margin-top: 20px; }
-button { border: 1px solid #bac5ce; border-radius: 8px; background: #fff; color: #172129; padding: 10px 16px; font: inherit; cursor: pointer; }
-button:focus-visible { outline: 3px solid #168a70; outline-offset: 3px; }
-button:disabled { opacity: .45; cursor: default; }
-output { min-width: 64px; font-variant-numeric: tabular-nums; }
 .hint { font-size: 13px; color: #52606b; margin-bottom: 0; }
 "#;
 
 const PAIRING_BROWSER_SCRIPT: &str = r#"
 'use strict';
-const frames = Array.from(document.querySelectorAll('.qr-frame'));
-const counter = document.getElementById('counter');
-let active = 0;
+const svg = document.querySelector('.qr-frame svg');
 function fit() {
-  const svg = frames[active].querySelector('svg');
   const modules = svg.viewBox.baseVal.width;
   const availableWidth = Math.max(1, document.documentElement.clientWidth - 48);
-  const availableHeight = Math.max(1, window.innerHeight - 210);
+  const availableHeight = Math.max(1, window.innerHeight - 180);
   const scale = Math.max(1, Math.min(8, Math.floor(availableWidth / modules), Math.floor(availableHeight / modules)));
   svg.setAttribute('width', String(modules * scale));
   svg.setAttribute('height', String(modules * scale));
 }
-function show(index) {
-  frames[active].hidden = true;
-  active = (index + frames.length) % frames.length;
-  frames[active].hidden = false;
-  counter.textContent = (active + 1) + ' / ' + frames.length;
-  fit();
-}
-document.getElementById('previous').addEventListener('click', () => show(active - 1));
-document.getElementById('next').addEventListener('click', () => show(active + 1));
-document.addEventListener('keydown', event => {
-  if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') { event.preventDefault(); show(active - 1); }
-  if (event.key === 'ArrowRight' || event.key === 'ArrowDown') { event.preventDefault(); show(active + 1); }
-});
 window.addEventListener('resize', fit);
 fit();
 "#;
@@ -579,7 +541,7 @@ mod tests {
     #[test]
     fn browser_pairing_page_is_self_contained_and_escapes_payload_by_geometry() {
         let payload = "synthetic-</script><img src=malicious onerror=alert(1)>".to_owned();
-        let html = render_pairing_qr_browser_html(&[payload.clone()]).unwrap();
+        let html = render_pairing_qr_browser_html(&payload).unwrap();
         let size = QrCode::encode_text(&payload, QrCodeEcc::Low)
             .unwrap()
             .size()
@@ -591,137 +553,75 @@ mod tests {
         assert!(html.contains("shape-rendering=\"crispEdges\""));
         assert!(html.contains("connect-src 'none'"));
         assert!(html.contains("default-src 'none'"));
-        assert!(html.contains("type=\"button\" disabled"));
+        assert_eq!(html.matches("<svg ").count(), 1);
+        assert!(!html.contains("<button"));
         let hash = base64::engine::general_purpose::STANDARD
             .encode(Sha256::digest(PAIRING_BROWSER_SCRIPT.as_bytes()));
         assert!(html.contains(&format!("script-src 'sha256-{hash}'")));
-        assert!(html.contains("ArrowLeft") && html.contains("ArrowRight"));
-        assert!(html.contains("ArrowUp") && html.contains("ArrowDown"));
     }
 
     #[test]
-    fn browser_pairing_page_keeps_all_segments_with_one_visible_frame() {
-        let keys = PairingKeys::generate();
+    fn pairing_link_carries_only_the_server_address() {
         let config = test_config();
-        let payloads = keys
-            .pairing_qr_payloads(&config, 7345, PairingEncryption::MlKem768)
-            .unwrap();
-        let html = render_pairing_qr_browser_html(&payloads).unwrap();
-        assert!(payloads.len() > 1);
-        assert_eq!(html.matches("<svg ").count(), payloads.len());
-        assert_eq!(
-            html.matches("class=\"qr-frame\" hidden").count(),
-            payloads.len() - 1
-        );
-        assert!(!html.contains("todex-pairing-chunk"));
-        assert!(!html.contains("publicKey"));
-        assert!(render_pairing_qr_browser_html(&[]).is_err());
-        assert!(render_pairing_qr_browser_html(&vec!["synthetic".to_owned(); 129]).is_err());
-    }
-
-    #[test]
-    fn pairing_qr_embeds_selected_public_key() {
-        let keys = PairingKeys::generate();
-        let config = test_config();
-        let link = keys
-            .pairing_link_json(&config, 7345, PairingEncryption::X25519)
-            .unwrap();
+        let link = pairing_link_json(&config, 7345).unwrap();
         let value: serde_json::Value = serde_json::from_str(&link).unwrap();
-
-        assert_eq!(value["kind"], "todex-pairing-link");
-        // Pairing links carry no credentials; devices prove identity by
-        // signature after the verification ceremony registers their key.
-        assert!(value.get("authToken").is_none());
-        assert_eq!(value["preferredEncryption"], "x25519");
-        assert_eq!(value["protocol"]["id"], "x25519");
-        assert!(value["protocol"]["publicKey"].as_str().unwrap().len() > 40);
-        assert!(value.get("protocols").is_none());
-        assert!(value.get("pairingUrl").is_none());
-
-        let qr = keys
-            .pairing_qr_text(&config, 7345, PairingEncryption::X25519)
-            .unwrap();
+        // No key, protocol or credential: device pairing v3 delivers the
+        // transport key authenticated by the verification code.
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "todex-pairing-link",
+                "version": 2,
+                "serverUrl": "http://127.0.0.1:7345",
+            })
+        );
+        let qr = render_qr_text(&link).unwrap();
         let max_width = qr.lines().map(|line| line.chars().count()).max().unwrap();
         assert!(
             max_width <= 80,
-            "x25519 pairing QR should fit common terminal widths, got {max_width}"
+            "pairing QR should fit common terminal widths, got {max_width}"
         );
     }
 
     #[test]
-    fn pairing_public_key_returns_only_the_selected_public_material() {
+    fn transport_public_key_returns_only_the_selected_public_material() {
         let keys = PairingKeys::generate();
 
-        assert_eq!(keys.pairing_public_key(PairingEncryption::None), None);
+        assert!(keys
+            .transport_public_key(PairingEncryption::None)
+            .is_empty());
         assert_eq!(
-            keys.pairing_public_key(PairingEncryption::X25519),
-            Some(encode_b64(&keys.x25519_public))
+            keys.transport_public_key(PairingEncryption::X25519),
+            keys.x25519_public.as_slice()
         );
         assert_eq!(
-            keys.pairing_public_key(PairingEncryption::MlKem768),
-            Some(encode_b64(&keys.ml_kem_public))
+            keys.transport_public_key(PairingEncryption::MlKem768),
+            keys.ml_kem_public.as_slice()
+        );
+        assert_eq!(
+            keys.transport_public_key(PairingEncryption::MlKem768).len(),
+            1184
         );
         assert_ne!(
-            keys.pairing_public_key(PairingEncryption::X25519),
-            Some(encode_b64(&keys.x25519_secret.to_bytes()))
+            keys.transport_public_key(PairingEncryption::X25519),
+            keys.x25519_secret.to_bytes().as_slice()
         );
     }
 
     #[test]
-    fn ml_kem_pairing_qr_is_split_into_segments() {
-        let keys = PairingKeys::generate();
-        let config = test_config();
-        let frames = keys
-            .pairing_qr_payloads(&config, 7345, PairingEncryption::MlKem768)
-            .unwrap();
-
-        assert!(frames.len() > 1, "ml-kem pairing QR should be segmented");
-
-        let mut encoded = String::new();
-        let mut checksum = String::new();
-
-        for (index, frame) in frames.iter().enumerate() {
-            let value: serde_json::Value = serde_json::from_str(frame).unwrap();
-            assert_eq!(value["kind"], "todex-pairing-chunk");
-            assert_eq!(value["version"], PAIRING_VERSION);
-            assert_eq!(value["index"], (index + 1) as u64);
-            assert_eq!(value["total"], frames.len() as u64);
-            if checksum.is_empty() {
-                checksum = value["checksum"].as_str().unwrap().to_owned();
-            } else {
-                assert_eq!(value["checksum"], checksum);
-            }
-            encoded.push_str(value["data"].as_str().unwrap());
-        }
-
-        let decoded = decode_b64(&encoded, "pairing qr chunk payload").unwrap();
-        assert_eq!(encode_b64(&Sha256::digest(&decoded)), checksum);
-        let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(value["kind"], "todex-pairing-link");
-        assert_eq!(value["preferredEncryption"], "ml-kem-768");
-    }
-
-    #[test]
-    fn plaintext_pairing_qr_does_not_embed_a_public_key() {
-        let keys = PairingKeys::generate();
-        let config = test_config();
-        let link = keys
-            .pairing_link_json(&config, 7345, PairingEncryption::None)
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&link).unwrap();
-
-        assert_eq!(value["preferredEncryption"], "none");
-        assert!(value.get("protocol").is_none());
+    fn transport_fingerprint_is_grouped_upper_hex_of_the_key_hash() {
+        assert_eq!(transport_fingerprint(&[]), None);
+        // SHA256("abc") = ba7816bf8f01cfea...
+        assert_eq!(
+            transport_fingerprint(b"abc").as_deref(),
+            Some("BA78-16BF-8F01-CFEA")
+        );
     }
 
     #[test]
     fn pairing_qr_renderer_uses_block_cells_instead_of_braille_dots() {
-        let keys = PairingKeys::generate();
-        let config = test_config();
-        let payload = keys
-            .pairing_qr_payload(&config, 7345, PairingEncryption::X25519)
-            .unwrap();
-        let rendered = render_qr_text_for_bounds(&payload, 76, 20).unwrap();
+        let payload = pairing_link_json(&test_config(), 7345).unwrap();
+        let rendered = render_qr_text_for_bounds(&payload, 76, 10).unwrap();
 
         assert!(
             rendered.width <= 76,
@@ -729,7 +629,7 @@ mod tests {
             rendered.width
         );
         assert!(
-            rendered.height > 20,
+            rendered.height > 10,
             "block-cell pairing QR should report that this terminal height is too short"
         );
         assert!(
@@ -743,12 +643,9 @@ mod tests {
 
     #[test]
     fn pairing_link_replaces_unspecified_bind_host_with_reachable_advertise_host() {
-        let keys = PairingKeys::generate();
         let mut config = test_config();
         config.host = "0.0.0.0".to_owned();
-        let link = keys
-            .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
-            .unwrap();
+        let link = pairing_link_json(&config, 7345).unwrap();
         let value: serde_json::Value = serde_json::from_str(&link).unwrap();
 
         assert_ne!(value["serverUrl"], "http://0.0.0.0:7345");
@@ -760,36 +657,20 @@ mod tests {
     async fn pairing_keys_persist_across_restarts() {
         let data_dir = unique_tmp_dir("todex-pairing-keys-persist");
         tokio::fs::create_dir_all(&data_dir).await.unwrap();
-        let config = test_config();
         let first = PairingKeys::load_or_generate(&data_dir).await.unwrap();
-        let first_x25519 = first
-            .pairing_link_json(&config, 7345, PairingEncryption::X25519)
-            .unwrap();
-        let first_ml_kem = first
-            .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
-            .unwrap();
-
         let second = PairingKeys::load_or_generate(&data_dir).await.unwrap();
-        assert_eq!(
-            second
-                .pairing_link_json(&config, 7345, PairingEncryption::X25519)
-                .unwrap(),
-            first_x25519
-        );
-        assert_eq!(
-            second
-                .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
-                .unwrap(),
-            first_ml_kem
-        );
+        for encryption in [PairingEncryption::X25519, PairingEncryption::MlKem768] {
+            assert_eq!(
+                second.transport_public_key(encryption),
+                first.transport_public_key(encryption)
+            );
+        }
 
         // The reloaded secret agrees with the public key a client pinned.
-        let first_value: serde_json::Value = serde_json::from_str(&first_x25519).unwrap();
-        let server_public = decode_fixed_32(
-            first_value["protocol"]["publicKey"].as_str().unwrap(),
-            "persisted x25519 public key",
-        )
-        .unwrap();
+        let server_public: [u8; 32] = first
+            .transport_public_key(PairingEncryption::X25519)
+            .try_into()
+            .unwrap();
         let client = X25519Secret::random_from_rng(OsRng);
         let client_public = X25519PublicKey::from(&client).to_bytes();
         let server_shared = second
@@ -804,39 +685,52 @@ mod tests {
     #[tokio::test]
     async fn pairing_keys_reset_replaces_persisted_public_keys() {
         let data_dir = unique_tmp_dir("todex-pairing-keys-reset");
-        let config = test_config();
-
         let first = PairingKeys::reset(&data_dir).await.unwrap();
-        let first_x25519 = first
-            .pairing_link_json(&config, 7345, PairingEncryption::X25519)
-            .unwrap();
-        let first_ml_kem = first
-            .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
-            .unwrap();
-
         let second = PairingKeys::reset(&data_dir).await.unwrap();
-        assert_ne!(
-            second
-                .pairing_link_json(&config, 7345, PairingEncryption::X25519)
-                .unwrap(),
-            first_x25519
-        );
-        assert_ne!(
-            second
-                .pairing_link_json(&config, 7345, PairingEncryption::MlKem768)
-                .unwrap(),
-            first_ml_kem
-        );
-
+        for encryption in [PairingEncryption::X25519, PairingEncryption::MlKem768] {
+            assert_ne!(
+                second.transport_public_key(encryption),
+                first.transport_public_key(encryption)
+            );
+        }
         let reloaded = PairingKeys::load_or_generate(&data_dir).await.unwrap();
         assert_eq!(
-            reloaded
-                .pairing_link_json(&config, 7345, PairingEncryption::X25519)
-                .unwrap(),
-            second
-                .pairing_link_json(&config, 7345, PairingEncryption::X25519)
-                .unwrap()
+            reloaded.transport_public_key(PairingEncryption::MlKem768),
+            second.transport_public_key(PairingEncryption::MlKem768)
         );
+
+        tokio::fs::remove_dir_all(&data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn key_store_follows_a_reset_and_fails_closed_on_a_broken_file() {
+        let data_dir = unique_tmp_dir("todex-pairing-key-store");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let store = PairingKeyStore::load(&data_dir).await.unwrap();
+        let first = store.current().unwrap();
+        // Unchanged file: the same in-memory keys, no re-read.
+        assert!(Arc::ptr_eq(&first, &store.current().unwrap()));
+
+        let reset = PairingKeys::reset(&data_dir).await.unwrap();
+        let current = store.current().unwrap();
+        assert_eq!(
+            current.transport_public_key(PairingEncryption::MlKem768),
+            reset.transport_public_key(PairingEncryption::MlKem768)
+        );
+        assert_ne!(
+            current.transport_public_key(PairingEncryption::X25519),
+            first.transport_public_key(PairingEncryption::X25519)
+        );
+
+        // Never fall back to the previous keys.
+        tokio::fs::write(data_dir.join(PAIRING_KEYS_FILE), "{}")
+            .await
+            .unwrap();
+        assert!(store.current().is_err());
+        tokio::fs::remove_file(data_dir.join(PAIRING_KEYS_FILE))
+            .await
+            .unwrap();
+        assert!(store.current().is_err());
 
         tokio::fs::remove_dir_all(&data_dir).await.unwrap();
     }

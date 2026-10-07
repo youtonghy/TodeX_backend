@@ -70,9 +70,9 @@ impl PairingQrBrowserPage {
 }
 
 pub(crate) async fn open_pairing_qr_browser(
-    payloads: &[String],
+    payload: &str,
 ) -> Result<PairingQrBrowserPage, AppError> {
-    let html = super::render_pairing_qr_browser_html(payloads)?;
+    let html = super::render_pairing_qr_browser_html(payload)?;
     let page = tokio::task::spawn_blocking(move || PairingQrBrowserPage::create(&html))
         .await
         .map_err(|_| {

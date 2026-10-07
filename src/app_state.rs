@@ -28,7 +28,7 @@ use crate::{
     quota_store::QuotaStore,
     remote_fs::RemoteSessions,
     ssh::SshService,
-    transport_crypto::PairingKeys,
+    transport_crypto::PairingKeyStore,
     workspace_store::WorkspaceStore,
     workspace_trust::WorkspaceTrustStore,
 };
@@ -48,7 +48,7 @@ pub struct AppState {
     pub(crate) cli_execution_gate: Arc<tokio::sync::RwLock<()>>,
     conversation_store: ConversationStore,
     pub local_terminals: LocalTerminalManager,
-    pub pairing_keys: PairingKeys,
+    pub pairing_keys: PairingKeyStore,
     pub(crate) device_auth: DeviceAuthenticator,
     pub(crate) device_pairing: DevicePairingRegistry,
     /// History encryption recipients, keyrings and DEKs; see
@@ -150,10 +150,17 @@ impl AppState {
         conversations.recover_all().await?;
         let local_terminals = LocalTerminalManager::new(events.clone());
         let cli_manager = CliManager::default();
-        let pairing_keys = PairingKeys::load_or_generate(&config.data_dir).await?;
+        let pairing_keys = PairingKeyStore::load(&config.data_dir).await?;
         let device_auth = DeviceAuthenticator::new(devices.clone());
-        let device_pairing =
-            DevicePairingRegistry::new(&config.data_dir, config.security.enable_auth, devices)?;
+        // Pairing reads the same key store and configured protocol as the
+        // handshake, so the key it delivers is the one the transport uses.
+        let device_pairing = DevicePairingRegistry::new(
+            &config.data_dir,
+            config.security.enable_auth,
+            devices,
+            pairing_keys.clone(),
+            config.pairing_encryption,
+        )?;
         let websocket_connections = Arc::new(AtomicUsize::new(0));
         let audit_log = crate::event::AuditLog::default();
 

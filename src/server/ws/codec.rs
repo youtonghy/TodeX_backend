@@ -198,9 +198,17 @@ impl WsTransport {
         };
         let mut server_nonce = [0_u8; NONCE_LENGTH];
         OsRng.fill_bytes(&mut server_nonce);
+        let pairing_keys = match state.pairing_keys.current() {
+            Ok(keys) => keys,
+            Err(error) => {
+                warn!(%error, "pairing keys unavailable; refusing v2 websocket handshake");
+                super::socket::close_for_crypto_failure(socket).await;
+                return None;
+            }
+        };
         let keys = decode_b64url(&offer.client_material).and_then(|material| {
             let client_nonce = decode_b64url(&offer.client_nonce)?;
-            state.pairing_keys.server_session_keys(
+            pairing_keys.server_session_keys(
                 WS_LABEL,
                 offer.protocol,
                 device_id,

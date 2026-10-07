@@ -144,9 +144,9 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// The address-only pairing link (`docs/transport-v2.md`).
 struct PairingQr {
-    payloads: Vec<String>,
-    active_index: usize,
+    payload: String,
 }
 
 struct PairingQrPopup {
@@ -156,7 +156,8 @@ struct PairingQrPopup {
 }
 
 struct CredentialsPopup {
-    public_key: Option<String>,
+    /// Fingerprint of the transport key; `None` when encryption is off.
+    fingerprint: Option<String>,
     scroll: u16,
 }
 
@@ -195,6 +196,7 @@ fn daemon_op_retry_delay(failures: u32) -> Duration {
 struct DevicePairingRequest {
     request_id: String,
     verification_code: String,
+    transport_fingerprint: Option<String>,
     device_name: String,
     expires_at: i64,
 }
@@ -511,20 +513,15 @@ impl TuiApp {
         let mut config = self.config.clone();
         config.host = process.host.clone();
         config.port = process.port;
-        let qr = daemon::pairing_qr_payloads(&config, process.port).await;
-        match qr {
-            Ok(payloads) => {
-                let total = payloads.len();
-                self.pairing_qr = Some(PairingQr {
-                    payloads,
-                    active_index: 0,
-                });
-                self.notice = match (self.language, total > 1) {
-                    (TuiLanguage::English, true) => format!("Pairing QR is open in the center window. Use Left/Right to switch {total} segments; b opens a browser."),
-                    (TuiLanguage::Chinese, true) => format!("配对二维码已打开。使用左右方向键切换 {total} 个分段，按 b 在浏览器查看。"),
-                    (TuiLanguage::English, false) => "Pairing QR is open in the center window; b opens a browser.".to_owned(),
-                    (TuiLanguage::Chinese, false) => "配对二维码已在中央窗口打开，按 b 在浏览器查看。".to_owned(),
-                };
+        match daemon::pairing_qr_payload(&config, process.port) {
+            Ok(payload) => {
+                self.pairing_qr = Some(PairingQr { payload });
+                self.notice = self
+                    .text(
+                        "Pairing QR is open in the center window; b opens a browser.",
+                        "配对二维码已在中央窗口打开，按 b 在浏览器查看。",
+                    )
+                    .to_owned();
             }
             Err(error) => {
                 self.notice = self
@@ -540,13 +537,15 @@ impl TuiApp {
         match PairingKeys::load_or_generate(&self.config.data_dir).await {
             Ok(keys) => {
                 self.credentials = Some(CredentialsPopup {
-                    public_key: keys.pairing_public_key(self.config.pairing_encryption),
+                    fingerprint: crate::transport_crypto::transport_fingerprint(
+                        keys.transport_public_key(self.config.pairing_encryption),
+                    ),
                     scroll: 0,
                 });
                 self.notice = self
                     .text(
-                        "Encryption key window is open. Press Enter or c to copy the public key.",
-                        "加密密钥窗口已打开。按 Enter 或 c 复制公钥。",
+                        "Encryption key window is open. Press Enter or c to copy the fingerprint.",
+                        "加密密钥窗口已打开。按 Enter 或 c 复制指纹。",
                     )
                     .to_owned();
             }
@@ -570,8 +569,8 @@ impl TuiApp {
         let Some(credentials) = self.credentials.as_ref() else {
             return;
         };
-        let label = self.text("Encryption public key", "加密公钥").to_owned();
-        let value = credentials.public_key.clone();
+        let label = self.text("Key fingerprint", "密钥指纹").to_owned();
+        let value = credentials.fingerprint.clone();
         let Some(value) = value.filter(|value| !value.is_empty()) else {
             self.notice = self
                 .text(
@@ -671,8 +670,7 @@ impl TuiApp {
         let Some(qr) = self.pairing_qr.as_ref() else {
             return;
         };
-        match crate::transport_crypto::pairing_browser::open_pairing_qr_browser(&qr.payloads).await
-        {
+        match crate::transport_crypto::pairing_browser::open_pairing_qr_browser(&qr.payload).await {
             Ok(page) => {
                 self.pairing_browser_pages.push(page);
                 self.notice = self
@@ -704,26 +702,6 @@ impl TuiApp {
         }
     }
 
-    fn next_pairing_qr(&mut self) {
-        if let Some(qr) = &mut self.pairing_qr {
-            if !qr.payloads.is_empty() {
-                qr.active_index = (qr.active_index + 1) % qr.payloads.len();
-            }
-        }
-    }
-
-    fn previous_pairing_qr(&mut self) {
-        if let Some(qr) = &mut self.pairing_qr {
-            if !qr.payloads.is_empty() {
-                qr.active_index = if qr.active_index == 0 {
-                    qr.payloads.len() - 1
-                } else {
-                    qr.active_index - 1
-                };
-            }
-        }
-    }
-
     fn refresh_device_pairing(&mut self, force: bool) {
         if !force
             && self
@@ -747,6 +725,7 @@ impl TuiApp {
                         .map(|request| DevicePairingRequest {
                             request_id: request.request_id,
                             verification_code: request.verification_code,
+                            transport_fingerprint: request.transport_fingerprint,
                             device_name: request.device_name,
                             expires_at: i64::try_from(request.expires_at).unwrap_or(i64::MAX),
                         })
@@ -1130,6 +1109,15 @@ impl TuiApp {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
+                // The code also authenticates this transport key; clients show
+                // the same fingerprint after pairing.
+                Line::from(format!(
+                    "{}{}",
+                    self.text("Key fingerprint: ", "密钥指纹："),
+                    request.transport_fingerprint.as_deref().unwrap_or(
+                        self.text("none (plaintext, loopback only)", "none（明文，仅回环）")
+                    )
+                )),
                 Line::from(format!(
                     "{}{}",
                     self.text("Device (self-reported): ", "设备（自报）："),
@@ -1212,8 +1200,6 @@ impl TuiApp {
         if self.pairing_qr.is_some() {
             match key.code {
                 KeyCode::Char('b') => self.open_pairing_qr_browser().await,
-                KeyCode::Left | KeyCode::PageUp => self.previous_pairing_qr(),
-                KeyCode::Right | KeyCode::PageDown => self.next_pairing_qr(),
                 KeyCode::Esc | KeyCode::Char('q') => self.close_pairing_qr(),
                 _ => self.close_pairing_qr(),
             }
@@ -2782,24 +2768,23 @@ impl TuiApp {
 
     fn credentials_widget(&self, credentials: &CredentialsPopup) -> Paragraph<'static> {
         let encryption = pairing_encryption_label(self.config.pairing_encryption);
-        let public_key = credentials.public_key.clone();
-        let key_lines = match public_key {
-            Some(public_key) => vec![
+        let key_lines = match credentials.fingerprint.clone() {
+            Some(fingerprint) => vec![
                 Line::from(Span::styled(
                     match self.language {
                         TuiLanguage::English => {
-                            format!("Encryption public key ({encryption})")
+                            format!("Transport key fingerprint ({encryption})")
                         }
-                        TuiLanguage::Chinese => format!("加密公钥（{encryption}）"),
+                        TuiLanguage::Chinese => format!("传输密钥指纹（{encryption}）"),
                     },
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
-                Line::from(public_key),
+                Line::from(fingerprint),
             ],
             None => vec![Line::from(
                 self.text(
-                    "Transport encryption is disabled; there is no key to copy.",
-                    "传输加密未启用，没有可复制的密钥。",
+                    "Transport encryption is disabled (none); only loopback clients can connect.",
+                    "传输加密未启用（none），只有回环客户端可以连接。",
                 )
                 .to_owned(),
             )],
@@ -2807,12 +2792,12 @@ impl TuiApp {
         let mut lines = key_lines;
         lines.push(Line::from(""));
         lines.push(Line::from(self.text(
-            "Enter or c copies. PageUp/PageDown scrolls. Esc closes.",
-            "Enter 或 c 复制，PageUp/PageDown 滚动，Esc 关闭。",
+            "Clients receive the key during device verification and show the same fingerprint.",
+            "客户端在设备验证时获取密钥，并显示相同的指纹。",
         )));
         lines.push(Line::from(self.text(
-            "Only the public encryption key is shown; private keys never appear here.",
-            "这里只显示加密公钥，私钥绝不会在此展示。",
+            "Enter or c copies the fingerprint. PageUp/PageDown scrolls. Esc closes.",
+            "Enter 或 c 复制指纹，PageUp/PageDown 滚动，Esc 关闭。",
         )));
 
         Paragraph::new(lines)
@@ -2820,7 +2805,7 @@ impl TuiApp {
             .wrap(Wrap { trim: false })
             .block(
                 panel_block()
-                    .title(self.text("Encryption Public Key", "加密公钥"))
+                    .title(self.text("Transport Key", "传输密钥"))
                     .borders(Borders::ALL),
             )
     }
@@ -3137,26 +3122,12 @@ impl TuiApp {
     }
 
     fn pairing_qr_popup(&self, area: Rect) -> PairingQrPopup {
-        let title = match self.pairing_qr.as_ref() {
-            Some(qr) if qr.payloads.len() > 1 => match self.language {
-                TuiLanguage::English => format!(
-                    "Pairing QR {}/{} - Left/Right switch, b browser, Esc closes",
-                    qr.active_index + 1,
-                    qr.payloads.len()
-                ),
-                TuiLanguage::Chinese => format!(
-                    "配对二维码 {}/{} - 左右切换，b 浏览器，Esc 关闭",
-                    qr.active_index + 1,
-                    qr.payloads.len()
-                ),
-            },
-            Some(_) | None => self
-                .text(
-                    "Pairing QR - b browser, Esc closes",
-                    "配对二维码 - b 浏览器，Esc 关闭",
-                )
-                .to_owned(),
-        };
+        let title = self
+            .text(
+                "Pairing QR - b browser, Esc closes",
+                "配对二维码 - b 浏览器，Esc 关闭",
+            )
+            .to_owned();
         let max_popup_width = area
             .width
             .saturating_sub(QR_POPUP_MARGIN.saturating_mul(2))
@@ -3181,11 +3152,7 @@ impl TuiApp {
                 self.text("Failed to render pairing QR.", "无法生成配对二维码。"),
             )];
         };
-        let Some(payload) = qr.payloads.get(qr.active_index) else {
-            return vec![Line::from(
-                self.text("Failed to render pairing QR.", "无法生成配对二维码。"),
-            )];
-        };
+        let payload = &qr.payload;
         match render_qr_text_for_bounds(payload, max_width / 2, max_height / 2) {
             Ok(rendered)
                 if rendered.width.saturating_mul(2) <= max_width
@@ -4506,7 +4473,7 @@ mod tests {
                     }
                     "Credentials" => {
                         app.credentials = Some(super::CredentialsPopup {
-                            public_key: Some("preview-public-key".into()),
+                            fingerprint: Some("0000-0000-0000-0000".into()),
                             scroll: 0,
                         })
                     }
@@ -4578,6 +4545,7 @@ mod tests {
         super::DevicePairingRequest {
             request_id: id.to_owned(),
             verification_code: "ABCDE-FGHJK".to_owned(),
+            transport_fingerprint: Some("0123-4567-89AB-CDEF".to_owned()),
             device_name: "My laptop".to_owned(),
             expires_at: chrono::Utc::now().timestamp_millis() + 60_000,
         }
@@ -4791,6 +4759,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(contents.contains("ABCDE-FGHJK"));
+        assert!(contents.contains("Key fingerprint: 0123-4567-89AB-CDEF"));
         assert!(contents.contains("My laptop"));
         assert!(contents.contains("Expires in"));
         assert!(contents.contains("a approve"));
@@ -4812,8 +4781,7 @@ mod tests {
             std::env::temp_dir().join(format!("todex-qr-test-{}", uuid::Uuid::new_v4()));
         let mut app = super::TuiApp::new(config);
         app.pairing_qr = Some(super::PairingQr {
-            payloads: vec![payload.to_owned()],
-            active_index: 0,
+            payload: payload.to_owned(),
         });
         let mut terminal = Terminal::new(TestBackend::new(100, 60)).unwrap();
         let popup = app.pairing_qr_popup(ratatui::layout::Rect::new(0, 0, 100, 60));
@@ -4881,8 +4849,7 @@ mod tests {
         let mut app = super::TuiApp::new(config);
         app.language = super::TuiLanguage::English;
         app.pairing_qr = Some(super::PairingQr {
-            payloads: vec![payload.to_owned()],
-            active_index: 0,
+            payload: payload.to_owned(),
         });
         let fits = app.pairing_qr_lines(full.width * 2, full.height * 2);
         assert_eq!(fits.len(), usize::from(full.height * 2));

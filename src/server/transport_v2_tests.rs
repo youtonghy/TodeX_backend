@@ -254,7 +254,7 @@ async fn ping(socket: &mut ClientSocket, channel: &mut SecureChannel, id: &str) 
 async fn ws_v2_round_trips_over_a_real_socket_and_closes_4400_on_tampering() {
     for required in [PairingEncryption::X25519, PairingEncryption::MlKem768] {
         let server = TestServer::start(required).await;
-        let keys = server.state.pairing_keys.clone();
+        let keys = server.state.pairing_keys.current().unwrap();
         let protocol = EncryptionProtocol::parse(required.as_str()).unwrap();
         let device = TestDevice::new(31);
         device.enroll(&server.root.join("data"));
@@ -457,7 +457,7 @@ async fn expect_outer_failure(response: reqwest::Response) {
 async fn sealed_tunnel_runs_signed_inner_requests_through_the_router() {
     for required in [PairingEncryption::X25519, PairingEncryption::MlKem768] {
         let server = TestServer::start(required).await;
-        let keys = server.state.pairing_keys.clone();
+        let keys = server.state.pairing_keys.current().unwrap();
         let protocol = EncryptionProtocol::parse(required.as_str()).unwrap();
         let device = TestDevice::new(32);
         device.enroll(&server.root.join("data"));
@@ -606,7 +606,7 @@ async fn chunks(fail: bool) -> Response {
 #[tokio::test]
 async fn sealed_tunnel_filters_headers_marks_requests_and_streams_bodies() {
     let server = TestServer::start(PairingEncryption::X25519).await;
-    let keys = server.state.pairing_keys.clone();
+    let keys = server.state.pairing_keys.current().unwrap();
     let api = Router::new()
         .route("/probe", any(probe))
         .route("/download", get(|| chunks(false)))
@@ -754,7 +754,7 @@ async fn oneshot_status(app: &Router, request: Request) -> (StatusCode, Bytes) {
 #[tokio::test]
 async fn non_loopback_peers_only_reach_bootstrap_routes_and_transport_v2() {
     let server = TestServer::start(PairingEncryption::X25519).await;
-    let keys = server.state.pairing_keys.clone();
+    let keys = server.state.pairing_keys.current().unwrap();
     let device = TestDevice::new(33);
     device.enroll(&server.root.join("data"));
     let app = super::router(server.state.clone());
@@ -816,6 +816,7 @@ async fn non_loopback_peers_only_reach_bootstrap_routes_and_transport_v2() {
         .body(Body::from(
             json!({
                 "clientCommitment": encode_b64(&[1; 32]),
+                "transportBinding": 1,
                 "deviceName": "remote",
                 "devicePublicKey": device.public_key_b64(),
             })
@@ -857,7 +858,7 @@ async fn websocket_without_tv_is_plaintext_only_and_transport_v1_is_retired() {
     let server = TestServer::start(PairingEncryption::X25519).await;
     let device = TestDevice::new(34);
     device.enroll(&server.root.join("data"));
-    let keys = server.state.pairing_keys.clone();
+    let keys = server.state.pairing_keys.current().unwrap();
     let offer = ws_offer(&keys, EncryptionProtocol::X25519);
     let v1 = offer.query.replace("tv=2&", "");
     let status = |result: Result<_, tokio_tungstenite::tungstenite::Error>| match result {
@@ -912,7 +913,7 @@ async fn websocket_without_tv_is_plaintext_only_and_transport_v1_is_retired() {
 #[tokio::test]
 async fn sealed_tunnel_checks_the_credential_before_reading_the_inner_body() {
     let server = TestServer::start(PairingEncryption::X25519).await;
-    let keys = server.state.pairing_keys.clone();
+    let keys = server.state.pairing_keys.current().unwrap();
     let device = TestDevice::new(36);
     device.enroll(&server.root.join("data"));
     let app = super::router(server.state.clone());
@@ -994,4 +995,86 @@ async fn sealed_tunnel_checks_the_credential_before_reading_the_inner_body() {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
     assert_eq!(open_response(sealed.down, &bytes).status, 200);
+}
+
+/// A TUI reset rewrites `pairing_keys.json` while the daemon runs: the next
+/// pairing delivers the new key and the handshake (WS and REST) switches to it
+/// in the same step, without a restart.
+#[tokio::test]
+async fn key_reset_switches_pairing_and_handshake_together() {
+    let server = TestServer::start(PairingEncryption::X25519).await;
+    let data_dir = server.root.join("data");
+    let device = TestDevice::new(36);
+    device.enroll(&data_dir);
+    let protocol = EncryptionProtocol::X25519;
+    let created_key = |peer: u8| {
+        let address = server.address;
+        let device_public_key = TestDevice::new(peer).public_key_b64();
+        async move {
+            let response: Value = reqwest::Client::new()
+                .post(format!("http://{address}/v2/device-pairing/create"))
+                .json(&json!({
+                    "clientCommitment": encode_b64(&[peer; 32]),
+                    "transportBinding": 1,
+                    "deviceName": "reset test",
+                    "devicePublicKey": device_public_key,
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(response["transportProtocol"], "x25519");
+            response["transportPublicKey"].as_str().unwrap().to_owned()
+        }
+    };
+
+    let old = server.state.pairing_keys.current().unwrap();
+    assert_eq!(
+        created_key(41).await,
+        encode_b64(old.static_public(protocol))
+    );
+
+    let reset = PairingKeys::reset(&data_dir).await.unwrap();
+    assert_ne!(reset.static_public(protocol), old.static_public(protocol));
+    assert_eq!(
+        created_key(42).await,
+        encode_b64(reset.static_public(protocol))
+    );
+
+    // The handshake now answers only for the new key.
+    let offer = ws_offer(&reset, protocol);
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(signed_ws_url(server.address, &device, &offer.query))
+            .await
+            .unwrap();
+    let mut channel = offer
+        .accept_hello(&reset, &device.device_id, &mut socket)
+        .await;
+    ping(&mut socket, &mut channel, "after-reset").await;
+
+    let offer = ws_offer(&old, protocol);
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(signed_ws_url(server.address, &device, &offer.query))
+            .await
+            .unwrap();
+    let mut stale = offer
+        .accept_hello(&old, &device.device_id, &mut socket)
+        .await;
+    let frame = stale
+        .sealer
+        .seal_text(r#"{"id":"stale","type":"server.ping"}"#)
+        .unwrap();
+    socket.send(Message::Binary(frame.into())).await.unwrap();
+    expect_crypto_close(&mut socket).await;
+
+    let inner = signed_inner(&device, "GET", "/v2/workspaces", &[]);
+    assert_eq!(
+        seal_request(&reset, protocol, &inner)
+            .send_and_open(server.address)
+            .await
+            .status,
+        200
+    );
 }

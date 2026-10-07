@@ -10,8 +10,15 @@
 //! the transcript fixed and the verification code shown. A man in the middle
 //! can no longer grind its own key against the 40-bit code, because its key
 //! is committed before it sees the server key.
+//!
+//! Pairing also delivers the daemon's transport public key (the static key
+//! of the v2 handshake). It is bound into the transcript, so the verification
+//! code authenticates it, and it is repeated inside the encrypted credential;
+//! clients pin it only when both agree.
+use crate::config::PairingEncryption;
 use crate::devices::DeviceRegistry;
 use crate::error::AppError;
+use crate::transport_crypto::PairingKeyStore;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -58,6 +65,12 @@ pub(crate) struct CreateDevicePairingRequest {
     /// `426 PROTOCOL_UPGRADE_REQUIRED`.
     #[serde(default)]
     pub client_public_key: Option<String>,
+    /// Must be the JSON integer `1`: the client validates and pins the
+    /// transport key this response delivers. Anything else (including a
+    /// missing field from a client that still pins keys manually) gets
+    /// `426 PROTOCOL_UPGRADE_REQUIRED`.
+    #[serde(default)]
+    pub transport_binding: Option<serde_json::Value>,
     pub device_name: String,
     /// Long-term Ed25519 device identity key registered on approval.
     pub device_public_key: String,
@@ -86,6 +99,11 @@ pub(crate) struct CreateDevicePairingResponse {
     pub server_public_key: String,
     pub expires_at: u64,
     pub poll_interval_ms: u64,
+    /// The server's configured `pairing_encryption`.
+    pub transport_protocol: PairingEncryption,
+    /// Static public key the v2 handshake uses right now for that protocol,
+    /// base64url without padding; empty for `none`.
+    pub transport_public_key: String,
 }
 
 #[derive(Deserialize)]
@@ -114,6 +132,10 @@ pub(crate) struct DevicePairingRequestSummary {
     pub device_name: String,
     pub expires_at: u64,
     pub peer_address: String,
+    /// Fingerprint of the transport key bound into this request's code
+    /// (`None` for `pairing_encryption = "none"`), shown next to the code.
+    #[serde(default)]
+    pub transport_fingerprint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,6 +143,22 @@ pub(crate) struct DevicePairingRequestSummary {
 struct LocalDecision {
     request_id: String,
     approved: bool,
+}
+
+/// The transport key a request delivers. Captured at `create`, bound into
+/// the transcript at `reveal` and repeated in the credential.
+#[derive(Clone, PartialEq, Eq)]
+struct TransportBinding {
+    protocol: PairingEncryption,
+    public_key: Vec<u8>,
+}
+
+/// `u32_be(len(x)) || x`.
+fn length_prefixed(value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + value.len());
+    out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    out.extend_from_slice(value);
+    out
 }
 
 struct PairingMaterial {
@@ -155,13 +193,15 @@ impl PairingMaterial {
         server_public: &[u8; 32],
         device_public: &[u8; 32],
         client_nonce: &[u8; 32],
+        transport: &TransportBinding,
         shared: &[u8; 32],
     ) -> Result<Self> {
         if bool::from(shared.ct_eq(&[0; 32])) {
             return Err(invalid("invalid client public key"));
         }
-        // The enrolled device key is part of the transcript, so the short
-        // verification code also binds the identity being approved.
+        // The enrolled device key and the delivered transport key are part
+        // of the transcript, so the short verification code also binds the
+        // identity being approved and the key the client will pin.
         let transcript = [
             TRANSCRIPT_DOMAIN,
             request_id.as_bytes(),
@@ -171,6 +211,8 @@ impl PairingMaterial {
             &[0],
             device_public,
             client_nonce,
+            &length_prefixed(transport.protocol.as_str().as_bytes()),
+            &length_prefixed(&transport.public_key),
         ]
         .concat();
         let salt = Sha256::digest(&transcript);
@@ -194,13 +236,24 @@ impl PairingMaterial {
         })
     }
 
-    fn wrap(&self, device_id: &str, nonce: &[u8; 24]) -> Result<String> {
+    fn wrap(
+        &self,
+        device_id: &str,
+        transport: &TransportBinding,
+        nonce: &[u8; 24],
+    ) -> Result<String> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Credential<'a> {
             device_id: &'a str,
+            transport_protocol: PairingEncryption,
+            transport_public_key: String,
         }
-        let plaintext = serde_json::to_vec(&Credential { device_id })?;
+        let plaintext = serde_json::to_vec(&Credential {
+            device_id,
+            transport_protocol: transport.protocol,
+            transport_public_key: URL_SAFE_NO_PAD.encode(&transport.public_key),
+        })?;
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.wrap_key));
         let encrypted = cipher
             .encrypt(
@@ -234,6 +287,7 @@ enum Stage {
 struct PendingRequest {
     stage: Stage,
     server_public: [u8; 32],
+    transport: TransportBinding,
     peer: IpAddr,
     device_name: String,
     device_public_key: [u8; 32],
@@ -260,9 +314,19 @@ pub(crate) struct DevicePairingRegistry {
     inner: Arc<Mutex<RegistryState>>,
     enabled: bool,
     devices: DeviceRegistry,
+    /// The handshake's key store and configured protocol: pairing delivers
+    /// exactly the key the transport uses.
+    transport_keys: PairingKeyStore,
+    transport_protocol: PairingEncryption,
 }
 impl DevicePairingRegistry {
-    pub(crate) fn new(data_dir: &Path, enabled: bool, devices: DeviceRegistry) -> Result<Self> {
+    pub(crate) fn new(
+        data_dir: &Path,
+        enabled: bool,
+        devices: DeviceRegistry,
+        transport_keys: PairingKeyStore,
+        transport_protocol: PairingEncryption,
+    ) -> Result<Self> {
         let directory = prepare_directory(data_dir)?;
         // Another daemon can share this data directory, or a second start can
         // fail after constructing AppState. Never delete its live requests.
@@ -288,6 +352,8 @@ impl DevicePairingRegistry {
         Ok(Self {
             enabled,
             devices,
+            transport_keys,
+            transport_protocol,
             inner: Arc::new(Mutex::new(RegistryState {
                 directory,
                 requests: HashMap::new(),
@@ -307,17 +373,23 @@ impl DevicePairingRegistry {
                 "Authentication is disabled; connect without device pairing".to_owned(),
             ));
         }
+        if request.client_public_key.is_some() {
+            return Err(AppError::ProtocolUpgradeRequired(
+                "device pairing v2 is retired; update this client to pairing v3 (clientCommitment)"
+                    .to_owned(),
+            ));
+        }
+        if request.transport_binding != Some(serde_json::Value::from(1)) {
+            return Err(AppError::ProtocolUpgradeRequired(
+                "this client does not take the transport key from device pairing; update it (transportBinding: 1)"
+                    .to_owned(),
+            ));
+        }
         if request.device_name.chars().count() > 80
             || request.device_name.chars().any(char::is_control)
         {
             return Err(invalid(
                 "deviceName must contain at most 80 printable characters",
-            ));
-        }
-        if request.client_public_key.is_some() {
-            return Err(AppError::ProtocolUpgradeRequired(
-                "device pairing v2 is retired; update this client to pairing v3 (clientCommitment)"
-                    .to_owned(),
             ));
         }
         let commitment = decode_32(
@@ -327,6 +399,7 @@ impl DevicePairingRegistry {
                 .ok_or_else(|| invalid("missing clientCommitment"))?,
         )?;
         let device_public = crate::devices::parse_public_key(&request.device_public_key)?;
+        let transport = self.transport_binding()?;
         let mut state = self
             .inner
             .lock()
@@ -362,6 +435,7 @@ impl DevicePairingRegistry {
                     commitment,
                 },
                 server_public,
+                transport: transport.clone(),
                 peer,
                 device_name,
                 device_public_key: device_public,
@@ -375,6 +449,17 @@ impl DevicePairingRegistry {
             server_public_key: URL_SAFE_NO_PAD.encode(server_public),
             expires_at,
             poll_interval_ms: 1000,
+            transport_protocol: transport.protocol,
+            transport_public_key: URL_SAFE_NO_PAD.encode(&transport.public_key),
+        })
+    }
+
+    /// The protocol and key the handshake would use right now.
+    fn transport_binding(&self) -> Result<TransportBinding> {
+        let keys = self.transport_keys.current()?;
+        Ok(TransportBinding {
+            protocol: self.transport_protocol,
+            public_key: keys.transport_public_key(self.transport_protocol).to_vec(),
         })
     }
 
@@ -426,6 +511,7 @@ impl DevicePairingRegistry {
             &pending.server_public,
             &pending.device_public_key,
             &client_nonce,
+            &pending.transport,
             &shared,
         ) {
             Ok(material) => material,
@@ -440,6 +526,9 @@ impl DevicePairingRegistry {
             device_name: pending.device_name.clone(),
             expires_at: pending.expires_at,
             peer_address: pending.peer.to_string(),
+            transport_fingerprint: crate::transport_crypto::transport_fingerprint(
+                &pending.transport.public_key,
+            ),
         };
         // The summary file is what the local approver (TUI) lists, so the
         // code becomes visible only now.
@@ -491,6 +580,12 @@ impl DevicePairingRegistry {
         if pending.status == RequestStatus::Rejected {
             return Ok(poll_state("rejected", pending.expires_at));
         }
+        // The keys were reset after this request was created: its credential
+        // would pin a key the handshake no longer accepts. Nothing is
+        // registered; the client starts a fresh pairing.
+        if self.transport_binding()? != pending.transport {
+            return Ok(poll_state("expired", pending.expires_at));
+        }
         // Approval commits the long-term device key to the registry before the
         // id is delivered; a registration failure must not leak a device id
         // that cannot authenticate.
@@ -502,7 +597,7 @@ impl DevicePairingRegistry {
         let Some(material) = pending.material() else {
             return Err(AppError::Unauthenticated);
         };
-        let ciphertext = material.wrap(&record.device_id, &nonce)?;
+        let ciphertext = material.wrap(&record.device_id, &pending.transport, &nonce)?;
         Ok(DevicePairingPollResponse {
             status: "approved",
             expires_at: pending.expires_at,
@@ -843,17 +938,36 @@ mod tests {
 
     struct Fixture {
         root: PathBuf,
+        keys: PairingKeyStore,
     }
     impl Fixture {
         fn new() -> Self {
             let root =
                 std::env::temp_dir().join(format!("todex-device-pairing-test-{}", Uuid::new_v4()));
             fs::create_dir_all(&root).unwrap();
-            Self { root }
+            let keys = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(PairingKeyStore::load(&root))
+                .unwrap();
+            Self { root, keys }
         }
         fn registry(&self) -> DevicePairingRegistry {
-            DevicePairingRegistry::new(&self.root, true, DeviceRegistry::load(&self.root).unwrap())
-                .unwrap()
+            self.registry_with(true, PairingEncryption::MlKem768)
+        }
+        fn registry_with(
+            &self,
+            enabled: bool,
+            protocol: PairingEncryption,
+        ) -> DevicePairingRegistry {
+            DevicePairingRegistry::new(
+                &self.root,
+                enabled,
+                DeviceRegistry::load(&self.root).unwrap(),
+                self.keys.clone(),
+                protocol,
+            )
+            .unwrap()
         }
     }
     impl Drop for Fixture {
@@ -877,6 +991,7 @@ mod tests {
         CreateDevicePairingRequest {
             client_commitment: commitment.map(|value| URL_SAFE_NO_PAD.encode(value)),
             client_public_key: None,
+            transport_binding: Some(json!(1)),
             device_name: "Synthetic device".to_owned(),
             device_public_key: URL_SAFE_NO_PAD.encode(device_key()),
         }
@@ -924,10 +1039,20 @@ mod tests {
             &server_public,
             &device_key(),
             &CLIENT_NONCE,
+            &response_binding(&response),
             &shared,
         )
         .unwrap();
         (response, material)
+    }
+    /// The binding a client takes from the create response.
+    fn response_binding(response: &CreateDevicePairingResponse) -> TransportBinding {
+        TransportBinding {
+            protocol: response.transport_protocol,
+            public_key: URL_SAFE_NO_PAD
+                .decode(&response.transport_public_key)
+                .unwrap(),
+        }
     }
     fn proof(id: &str, value: &[u8; 32]) -> DevicePairingProofRequest {
         DevicePairingProofRequest {
@@ -994,15 +1119,41 @@ mod tests {
             .diffie_hellman(&PublicKey::from(client_public))
             .to_bytes();
         assert_eq!(shared, fixture_32(&vector["shared"]));
-        let material = PairingMaterial::derive(
-            request_id,
-            &client_public,
-            &server_public,
-            &device_public,
-            &client_nonce,
-            &shared,
-        )
-        .unwrap();
+        let binding = |case: &Value| TransportBinding {
+            protocol: PairingEncryption::parse(case["transportProtocol"].as_str().unwrap())
+                .filter(|protocol| protocol.as_str() == case["transportProtocol"])
+                .unwrap(),
+            public_key: URL_SAFE_NO_PAD
+                .decode(case["transportPublicKey"].as_str().unwrap())
+                .unwrap(),
+        };
+        let derive = |transport: &TransportBinding| {
+            PairingMaterial::derive(
+                request_id,
+                &client_public,
+                &server_public,
+                &device_public,
+                &client_nonce,
+                transport,
+                &shared,
+            )
+            .unwrap()
+        };
+        let transport = binding(vector);
+        // The bound key is the ML-KEM server static key of the protocol
+        // vectors, i.e. what the handshake would use.
+        assert_eq!(transport.protocol, PairingEncryption::MlKem768);
+        let ml_kem_static = fixture["protocols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["protocol"] == "ml-kem-768")
+            .unwrap();
+        assert_eq!(
+            transport.public_key,
+            fixture_bytes(&ml_kem_static["server"]["publicKey"])
+        );
+        let material = derive(&transport);
         assert_eq!(material.transcript, fixture_bytes(&vector["transcript"]));
         assert_eq!(
             Sha256::digest(&material.transcript).as_slice(),
@@ -1012,26 +1163,54 @@ mod tests {
         assert_eq!(material.wrap_key, fixture_32(&vector["wrapKey"]));
         assert_eq!(material.poll_proof, fixture_32(&vector["pollProof"]));
         assert_eq!(material.cancel_proof, fixture_32(&vector["cancelProof"]));
+        assert_eq!(
+            crate::transport_crypto::transport_fingerprint(&transport.public_key).unwrap(),
+            vector["fingerprint"]
+        );
 
-        // The credential wrap keeps v2's construction: XChaCha20-Poly1305
-        // under the wrap key with the full v3 transcript as AAD.
-        let nonce = [11; 24];
-        let wrapped = URL_SAFE_NO_PAD
-            .decode(material.wrap("dev_vector", &nonce).unwrap())
-            .unwrap();
+        // The credential: XChaCha20-Poly1305 under the wrap key with the full
+        // transcript as AAD; the plaintext repeats the transport key.
+        let credential = &vector["credential"];
+        let nonce: [u8; 24] = fixture_bytes(&credential["nonce"]).try_into().unwrap();
+        assert_eq!(URL_SAFE_NO_PAD.encode(nonce), credential["nonceBase64Url"]);
+        let wrapped = material.wrap("dev_vector", &transport, &nonce).unwrap();
+        assert_eq!(wrapped, credential["ciphertextBase64Url"]);
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(&wrapped).unwrap(),
+            fixture_bytes(&credential["ciphertext"])
+        );
         let opened = XChaCha20Poly1305::new(Key::from_slice(&fixture_32(&vector["wrapKey"])))
             .decrypt(
                 XNonce::from_slice(&nonce),
                 Payload {
-                    msg: &wrapped,
+                    msg: &fixture_bytes(&credential["ciphertext"]),
                     aad: &fixture_bytes(&vector["transcript"]),
                 },
             )
             .unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&opened).unwrap(),
-            json!({"deviceId": "dev_vector"})
+            std::str::from_utf8(&opened).unwrap(),
+            credential["plaintext"]
         );
+
+        // A substituted transport key changes the code the user compares.
+        for case in [&vector["tampered"], &vector["noneCase"]] {
+            let other = derive(&binding(case));
+            assert_eq!(
+                Sha256::digest(&other.transcript).as_slice(),
+                fixture_bytes(&case["transcriptHash"])
+            );
+            assert_eq!(other.verification_code, case["verificationCode"]);
+            assert_ne!(other.verification_code, material.verification_code);
+        }
+        let none = binding(&vector["noneCase"]);
+        assert_eq!(none.protocol, PairingEncryption::None);
+        assert!(none.public_key.is_empty());
+        assert_eq!(
+            crate::transport_crypto::transport_fingerprint(&none.public_key),
+            None
+        );
+        assert_eq!(vector["noneCase"]["fingerprint"], "none");
     }
 
     #[test]
@@ -1045,6 +1224,21 @@ mod tests {
             registry.create(peer(), legacy),
             Err(AppError::ProtocolUpgradeRequired(_))
         ));
+        // Clients that do not take the transport key from pairing.
+        for binding in [
+            None,
+            Some(json!(0)),
+            Some(json!(2)),
+            Some(json!("1")),
+            Some(json!(1.0)),
+        ] {
+            let mut request = create_request(Some([1; 32]));
+            request.transport_binding = binding;
+            assert!(matches!(
+                registry.create(peer(), request),
+                Err(AppError::ProtocolUpgradeRequired(_))
+            ));
+        }
         assert!(matches!(
             registry.create(peer(), create_request(None)),
             Err(AppError::InvalidRequest(_))
@@ -1103,6 +1297,14 @@ mod tests {
         let summaries = list_device_pairing_requests(&fixture.root).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].verification_code, material.verification_code);
+        assert_eq!(
+            summaries[0].transport_fingerprint,
+            crate::transport_crypto::transport_fingerprint(
+                &URL_SAFE_NO_PAD
+                    .decode(&created.transport_public_key)
+                    .unwrap()
+            )
+        );
         let file = fs::read_to_string(summary_path(
             &fixture.root.join(DIRECTORY),
             &created.request_id,
@@ -1138,7 +1340,24 @@ mod tests {
             .unwrap()
             .contains("authToken"));
         let expected_id = crate::devices::device_id_for(&device_key());
-        assert_eq!(decrypt(&material, &response)["deviceId"], expected_id);
+        // The credential repeats the delivered transport key, which is the
+        // handshake's current ML-KEM static key.
+        let handshake_key = fixture.keys.current().unwrap();
+        assert_eq!(created.transport_protocol, PairingEncryption::MlKem768);
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(&created.transport_public_key)
+                .unwrap(),
+            handshake_key.static_public(crate::transport_crypto::EncryptionProtocol::MlKem768)
+        );
+        assert_eq!(
+            decrypt(&material, &response),
+            json!({
+                "deviceId": expected_id,
+                "transportProtocol": "ml-kem-768",
+                "transportPublicKey": created.transport_public_key,
+            })
+        );
         // Approval committed the device to the shared registry.
         let record = crate::devices::list_devices(&fixture.root)
             .unwrap()
@@ -1324,20 +1543,70 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_server_delivers_an_empty_key_bound_as_a_zero_length_field() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry_with(true, PairingEncryption::None);
+        let (created, material) = begin(&registry);
+        assert_eq!(created.transport_protocol, PairingEncryption::None);
+        assert_eq!(created.transport_public_key, "");
+        assert!(material
+            .transcript
+            .ends_with(&[0, 0, 0, 4, b'n', b'o', b'n', b'e', 0, 0, 0, 0]));
+        decide_device_pairing(&fixture.root, &created.request_id, true).unwrap();
+        let response = registry
+            .poll(peer(), proof(&created.request_id, &material.poll_proof))
+            .unwrap();
+        assert_eq!(
+            decrypt(&material, &response)["transportProtocol"],
+            json!("none")
+        );
+        assert_eq!(
+            decrypt(&material, &response)["transportPublicKey"],
+            json!("")
+        );
+    }
+
+    #[test]
+    fn a_key_reset_switches_new_pairings_and_voids_pending_credentials() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry_with(true, PairingEncryption::X25519);
+        let (before, material) = begin(&registry);
+        decide_device_pairing(&fixture.root, &before.request_id, true).unwrap();
+        let reset = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(crate::transport_crypto::PairingKeys::reset(&fixture.root))
+            .unwrap();
+        let reset_key =
+            URL_SAFE_NO_PAD.encode(reset.transport_public_key(PairingEncryption::X25519));
+        assert_ne!(before.transport_public_key, reset_key);
+        // An approved request created before the reset would pin the old
+        // key: it is dropped without registering the device.
+        assert_eq!(
+            registry
+                .poll(peer(), proof(&before.request_id, &material.poll_proof))
+                .unwrap()
+                .status,
+            "expired"
+        );
+        assert!(crate::devices::list_devices(&fixture.root)
+            .unwrap()
+            .is_empty());
+        let (after, _) = begin(&registry);
+        assert_eq!(after.transport_public_key, reset_key);
+    }
+
+    #[test]
     fn auth_disabled_server_does_not_offer_pairing() {
         let fixture = Fixture::new();
-        let registry = DevicePairingRegistry::new(
-            &fixture.root,
-            false,
-            DeviceRegistry::load(&fixture.root).unwrap(),
-        )
-        .unwrap();
+        let registry = fixture.registry_with(false, PairingEncryption::MlKem768);
         assert!(matches!(
             registry.create(
                 peer(),
                 CreateDevicePairingRequest {
                     client_commitment: None,
                     client_public_key: None,
+                    transport_binding: None,
                     device_name: String::new(),
                     device_public_key: String::new(),
                 }

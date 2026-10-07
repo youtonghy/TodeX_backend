@@ -13,7 +13,6 @@ use tokio::time::{sleep, MissedTickBehavior};
 
 use crate::config::Config;
 use crate::server_runner::{ManagedServer, ProviderProcessTracking};
-use crate::transport_crypto::PairingKeys;
 use crate::update;
 
 const PID_FILE_NAME: &str = "daemon.json";
@@ -345,9 +344,9 @@ impl IdleTimer {
     }
 }
 
-pub async fn pairing_qr_payloads(config: &Config, port: u16) -> Result<Vec<String>> {
-    let keys = PairingKeys::load_or_generate(&config.data_dir).await?;
-    Ok(keys.pairing_qr_payloads(config, port, config.pairing_encryption)?)
+/// The address-only pairing link shown as a QR code.
+pub fn pairing_qr_payload(config: &Config, port: u16) -> Result<String> {
+    Ok(crate::transport_crypto::pairing_link_json(config, port)?)
 }
 
 pub fn pid_file_path(data_dir: &Path) -> PathBuf {
