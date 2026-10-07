@@ -41,6 +41,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 toml = "0.8"
 toml_edit = "0.22"
+# Runs inner `/v2/sealed` requests through the router.
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -93,7 +95,6 @@ png = "0.18"
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"
-tower = { version = "0.5", features = ["util"] }
 tungstenite = "0.29"
 
 # RSA key generation (`POST /v2/ssh/keys/generate`) takes minutes with

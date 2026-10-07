@@ -58,6 +58,15 @@ pub enum AppError {
     /// The client cannot read end-to-end encrypted history.
     #[error("client upgrade required: {0}")]
     ClientUpgradeRequired(String),
+    /// The request used a retired protocol (transport v1, plaintext from a
+    /// non-loopback peer, device pairing v2); the client must move to
+    /// transport v2 / pairing v3 (docs/transport-v2.md).
+    #[error("protocol upgrade required: {0}")]
+    ProtocolUpgradeRequired(String),
+    /// A transport v2 envelope could not be opened. Deliberately carries no
+    /// detail.
+    #[error("transport crypto failure")]
+    TransportCryptoFailed,
     /// The calling device is on the history revocation list
     /// (docs/history-encryption.md §3.4); only `history.encryption.get` is
     /// still allowed until another device restores it.
@@ -119,6 +128,8 @@ impl AppError {
             Self::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
             Self::JournalFull(_) => "JOURNAL_FULL",
             Self::ClientUpgradeRequired(_) => "CLIENT_UPGRADE_REQUIRED",
+            Self::ProtocolUpgradeRequired(_) => "PROTOCOL_UPGRADE_REQUIRED",
+            Self::TransportCryptoFailed => "TRANSPORT_CRYPTO_FAILED",
             Self::HistoryAccessRevoked => "HISTORY_ACCESS_REVOKED",
             Self::StorageLow(_) => "STORAGE_LOW",
             Self::ProviderUnavailable(_) => "PROVIDER_UNAVAILABLE",
@@ -160,7 +171,10 @@ impl IntoResponse for AppError {
             Self::TurnCancelled => StatusCode::CONFLICT,
             Self::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::JournalFull(_) | Self::StorageLow(_) => StatusCode::INSUFFICIENT_STORAGE,
-            Self::ClientUpgradeRequired(_) => StatusCode::UPGRADE_REQUIRED,
+            Self::ClientUpgradeRequired(_) | Self::ProtocolUpgradeRequired(_) => {
+                StatusCode::UPGRADE_REQUIRED
+            }
+            Self::TransportCryptoFailed => StatusCode::BAD_REQUEST,
             Self::HistoryAccessRevoked => StatusCode::FORBIDDEN,
             Self::ProviderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             // Not 401: clients treat that as a failed device signature.

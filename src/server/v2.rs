@@ -6,14 +6,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::WebSocket;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, Method, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -31,7 +31,6 @@ use crate::provider::{
     CliVersionsResponse, ConversationPrompt, ConversationSupervisor, FollowUpAddOutcome,
     ManagedCli, PermissionDecision, PromptContentRef, PromptSkillRef,
 };
-use crate::transport_crypto::TransportCryptoSession;
 use crate::workspace_paths::{
     canonical_workspace_roots, containing_workspace_root, validate_workspace_directory_text,
 };
@@ -41,6 +40,8 @@ use super::agent_providers;
 use super::git;
 use super::history_keys;
 use super::websocket::{self, AuthContext};
+use super::ws::codec::{self as ws_socket_codec, WsTransport};
+use super::ws::socket::{self as ws_socket, send_with_deadline, SendFailure};
 
 /// Maximum WebSocket message size for the unified `/v2/ws` socket (8MB).
 /// Matches MAX_LEGACY_WS_MESSAGE_BYTES: chat attachments travel as base64
@@ -58,14 +59,6 @@ const MAX_WS_CONCURRENT_BACKFILLS: usize = 4;
 /// messages before it stops early with `hasMore` (history encryption).
 const MAX_WS_BACKFILL_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WS_IN_FLIGHT_OPERATIONS: usize = 16;
-/// Keep idle connections alive; mirrors the legacy `/v1/ws` socket so clients
-/// without an application-level heartbeat are not reaped. A Ping draws an
-/// automatic Pong, which counts as receive activity below.
-const WS_PING_INTERVAL_SECS: u64 = 30;
-const WS_CLIENT_TIMEOUT_SECS: u64 = 90;
-/// A peer whose socket accepts no frame for this long is treated as gone, so a
-/// stalled client cannot hold the send task (and its queue) forever.
-const WS_SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Commands and subscription backfill wait at most this long for room in the
 /// outgoing queue; a queue that stays full means the send side is stuck.
 const WS_QUEUE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2071,15 +2064,27 @@ async fn ws(
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
     // Device signature auth already ran in `device_auth_middleware`, covering
-    // the full request query (including the transport-crypto handshake
-    // parameters) so the encrypted channel is bound to the device identity.
+    // the full request query (including the transport handshake parameters)
+    // so the encrypted channel is bound to the device identity.
     let auth = require_auth(&state, &headers)?;
-    let crypto = websocket::transport_crypto_from_handshake(&state, &headers, uri.query())?;
+    let transport = WsTransport::negotiate(&state, &headers, uri.query())?;
+    // Transport v2 binds the device id from the signed credential into the
+    // key schedule; anonymous (auth disabled) sessions use the empty string.
+    let device_id = if state.config.security.enable_auth {
+        auth.principal_id.clone()
+    } else {
+        String::new()
+    };
     let history_encryption = declares_history_encryption(uri.query());
     Ok(ws
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_socket(state, socket, crypto, auth, history_encryption)))
+        .on_upgrade(move |mut socket| async move {
+            let Some(codec) = transport.establish(&state, &mut socket, &device_id).await else {
+                return;
+            };
+            handle_socket(state, socket, codec, auth, history_encryption).await
+        }))
 }
 
 /// History crypto version the client can decrypt (spec §5.4).
@@ -2112,27 +2117,6 @@ fn ensure_history_client(state: &AppState, declared: bool) -> Result<(), AppErro
     ))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum SendFailure {
-    /// The receiving side is gone.
-    Closed,
-    /// The receiving side did not accept the item before the deadline.
-    Stalled,
-}
-
-/// Bounds one send on the websocket or its outgoing queue. Either failure
-/// means the connection can no longer deliver and must be torn down.
-async fn send_with_deadline<E>(
-    deadline: Duration,
-    send: impl std::future::Future<Output = Result<(), E>>,
-) -> Result<(), SendFailure> {
-    match tokio::time::timeout(deadline, send).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(SendFailure::Closed),
-        Err(_) => Err(SendFailure::Stalled),
-    }
-}
-
 /// Queues a frame for the send task. The read loop tears the connection down
 /// on failure instead of blocking behind a peer that stopped reading.
 async fn queue_frame(outgoing: &mpsc::Sender<Value>, value: Value) -> Result<(), SendFailure> {
@@ -2146,24 +2130,21 @@ async fn queue_frame(outgoing: &mpsc::Sender<Value>, value: Value) -> Result<(),
     result
 }
 
-fn log_socket_send_failure(failure: SendFailure) {
-    match failure {
-        SendFailure::Closed => {}
-        SendFailure::Stalled => warn!(
-            timeout_secs = WS_SOCKET_SEND_TIMEOUT.as_secs(),
-            "v2 websocket peer stopped accepting frames, closing connection"
-        ),
-    }
-}
-
 async fn handle_socket(
     state: AppState,
     socket: WebSocket,
-    crypto: Option<TransportCryptoSession>,
+    codec: ws_socket_codec::WsCodec,
     auth: AuthContext,
     history_encryption: bool,
 ) {
     let authenticated = state.config.security.enable_auth;
+    let ws_socket_codec::WsCodec {
+        sealer,
+        mut opener,
+        protocol,
+        transport_version,
+    } = codec;
+    let encryption_protocol = protocol.map(|protocol| protocol.as_str());
     let active_connections = state.increment_websocket_connections();
     state
         .events
@@ -2176,8 +2157,9 @@ async fn handle_socket(
                 "active_connections": active_connections,
                 "authenticated": authenticated,
                 "principal_id": auth.principal_id,
-                "encrypted": crypto.is_some(),
-                "encryption_protocol": crypto.as_ref().map(|crypto| crypto.protocol().as_str()),
+                "encrypted": encryption_protocol.is_some(),
+                "encryption_protocol": encryption_protocol,
+                "transport_version": transport_version,
                 "plane": "v2",
             }),
         ))
@@ -2188,49 +2170,10 @@ async fn handle_socket(
     // of the synthetic local principal the v2 layer always produces.
     let legacy_auth = authenticated.then(|| auth.clone());
 
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
     let mut event_rx = state.events.subscribe();
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Value>(256);
-    let sender_crypto = crypto.clone();
-    let send_task = tokio::spawn(async move {
-        let mut ping_interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(WS_PING_INTERVAL_SECS));
-        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                value = outgoing_rx.recv() => {
-                    let Some(value) = value else { break };
-                    let text = match serde_json::to_string(&value) {
-                        Ok(text) => text,
-                        Err(error) => {
-                            warn!(error = %error, "failed to serialize v2 websocket event");
-                            continue;
-                        }
-                    };
-                    let text = match &sender_crypto {
-                        Some(crypto) => match crypto.encrypt_server_text(&text) {
-                            Ok(text) => text,
-                            Err(error) => {
-                                warn!(error = %error, "failed to encrypt v2 websocket event");
-                                break;
-                            }
-                        },
-                        None => text,
-                    };
-                    if let Err(failure) = send_with_deadline(WS_SOCKET_SEND_TIMEOUT, sender.send(Message::Text(text.into()))).await {
-                        log_socket_send_failure(failure);
-                        break;
-                    }
-                }
-                _ = ping_interval.tick() => {
-                    if let Err(failure) = send_with_deadline(WS_SOCKET_SEND_TIMEOUT, sender.send(Message::Ping(Default::default()))).await {
-                        log_socket_send_failure(failure);
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Value>(256);
+    let (send_task, close_handle) = ws_socket::spawn_sender(sender, sealer, outgoing_rx);
 
     let event_scope = Arc::new(tokio::sync::RwLock::new(
         websocket::LegacyEventScope::default(),
@@ -2291,56 +2234,30 @@ async fn handle_socket(
     let mut browser_watches: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let operation_limit = Arc::new(Semaphore::new(MAX_WS_IN_FLIGHT_OPERATIONS));
     let mut operation_tasks = Vec::new();
-    let client_timeout = tokio::time::Duration::from_secs(WS_CLIENT_TIMEOUT_SECS);
     loop {
-        let frame = tokio::select! {
-            frame = tokio::time::timeout(client_timeout, receiver.next()) => frame,
+        let text = tokio::select! {
+            text = ws_socket::next_text(&mut receiver, opener.as_mut(), &close_handle) => text,
             // The send task stopped (socket error or send deadline): nothing
             // queued from here on can reach the client.
             _ = outgoing_tx.closed() => break,
         };
-        let frame = match frame {
-            Ok(Some(frame)) => frame,
-            Ok(None) => break,
-            Err(_) => {
-                warn!(
-                    timeout_secs = WS_CLIENT_TIMEOUT_SECS,
-                    "v2 websocket client inactive, closing connection"
-                );
-                break;
-            }
-        };
-        let frame = match frame {
+        let Some(text) = text else { break };
+        // Parse once; every dispatcher below takes the parsed value.
+        let frame: Value = match serde_json::from_str(&text) {
             Ok(frame) => frame,
             Err(error) => {
-                warn!(error = %error, "v2 websocket receive failed");
-                break;
-            }
-        };
-        let Message::Text(text) = frame else {
-            if matches!(frame, Message::Close(_)) {
-                break;
-            }
-            continue;
-        };
-        let text = match &crypto {
-            Some(crypto) => match crypto.decrypt_client_text(&text) {
-                Ok(text) => text,
-                Err(error) => {
-                    if queue_frame(&outgoing_tx, error_response(None, error))
-                        .await
-                        .is_err()
-                    {
+                let error =
+                    AppError::InvalidRequest(format!("failed to parse client message: {error}"));
+                if let Ok(value) = serde_json::to_value(websocket::direct_error_event(error)) {
+                    if queue_frame(&outgoing_tx, value).await.is_err() {
                         break;
                     }
-                    continue;
                 }
-            },
-            None => text.to_string(),
+                continue;
+            }
         };
-        let command_type = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned));
+        drop(text);
+        let command_type = frame.get("type").and_then(Value::as_str).map(str::to_owned);
         match command_type.as_deref() {
             Some(command_type) if is_agent_desktop_frame(command_type) => {
                 let response = handle_agent_desktop_frame(
@@ -2348,7 +2265,7 @@ async fn handle_socket(
                     &auth,
                     &outgoing_tx,
                     &mut browser_watches,
-                    &text,
+                    &frame,
                 )
                 .await;
                 if let Some(response) = response {
@@ -2358,7 +2275,7 @@ async fn handle_socket(
                 }
             }
             Some(command_type) if is_v2_native_command(command_type) => {
-                let command: V2Command = match serde_json::from_str(&text) {
+                let command = match V2Command::deserialize(frame) {
                     Ok(command) => command,
                     Err(error) => {
                         let response = error_response(
@@ -2424,8 +2341,8 @@ async fn handle_socket(
             _ => {
                 // Legacy command plane: same scoped dispatch, error events and
                 // scope semantics as the previous `/v1/ws` socket.
-                if let Err(error) = websocket::dispatch_scoped_client_text(
-                    &text,
+                if let Err(error) = websocket::dispatch_scoped_client_message(
+                    frame,
                     &state,
                     legacy_auth.as_ref(),
                     &event_scope,
@@ -2477,8 +2394,9 @@ async fn handle_socket(
             json!({
                 "active_connections": active_connections,
                 "authenticated": authenticated,
-                "encrypted": crypto.is_some(),
-                "encryption_protocol": crypto.as_ref().map(|crypto| crypto.protocol().as_str()),
+                "encrypted": encryption_protocol.is_some(),
+                "encryption_protocol": encryption_protocol,
+                "transport_version": transport_version,
                 "plane": "v2",
             }),
         ))
@@ -2495,17 +2413,8 @@ async fn handle_agent_desktop_frame(
     auth: &AuthContext,
     outgoing: &mpsc::Sender<Value>,
     watches: &mut HashMap<String, tokio::task::JoinHandle<()>>,
-    text: &str,
+    frame: &Value,
 ) -> Option<Value> {
-    let frame: Value = match serde_json::from_str(text) {
-        Ok(frame) => frame,
-        Err(error) => {
-            return Some(error_response(
-                None,
-                AppError::InvalidRequest(format!("invalid frame: {error}")),
-            ))
-        }
-    };
     let id = frame["id"].as_str().map(str::to_owned);
     let payload = &frame["payload"];
     match frame["type"].as_str().unwrap_or_default() {
@@ -2986,7 +2895,7 @@ async fn start_subscription(
     owner_id: &str,
     command: &V2Command,
 ) -> Result<Option<Value>, AppError> {
-    let request: SubscribeRequest = serde_json::from_value(command.payload.clone())?;
+    let request: SubscribeRequest = Deserialize::deserialize(&command.payload)?;
     let summary = summary_detail(request.detail.as_deref())?;
     ensure_history_client(state, subscriptions.history_encryption)?;
     state
@@ -3052,7 +2961,7 @@ async fn dispatch_command_inner(
 ) -> Result<Value, AppError> {
     match command.command_type.as_str() {
         "conversation.unsubscribe" => {
-            let request: UnsubscribeRequest = serde_json::from_value(command.payload.clone())?;
+            let request: UnsubscribeRequest = Deserialize::deserialize(&command.payload)?;
             let was_subscribed = subscriptions
                 .active
                 .lock()
@@ -3093,8 +3002,7 @@ async fn dispatch_command_inner(
             }))
         }
         "conversation.create" => {
-            let request: CreateConversationRequest =
-                serde_json::from_value(command.payload.clone())?;
+            let request: CreateConversationRequest = Deserialize::deserialize(&command.payload)?;
             let provider = match request.provider {
                 Some(provider) => provider,
                 None => state
@@ -3118,7 +3026,7 @@ async fn dispatch_command_inner(
             )?)
         }
         "conversation.prompt" | "conversation.followUp" => {
-            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             let text = request.text.unwrap_or_default();
             if text.trim().is_empty() && request.skills.is_empty() && request.content.is_empty() {
                 return Err(AppError::InvalidRequest(
@@ -3148,7 +3056,7 @@ async fn dispatch_command_inner(
             Ok(json!({ "conversationId": request.conversation_id, "turnId": turn_id }))
         }
         "conversation.queue.add" => {
-            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             let item_id = request
                 .item_id
                 .clone()
@@ -3188,7 +3096,7 @@ async fn dispatch_command_inner(
         | "conversation.queue.clear"
         | "conversation.queue.resume"
         | "conversation.queue.list" => {
-            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             let conversations = &state.conversations;
             let conversation_id = request.conversation_id.as_str();
             let snapshot = match command.command_type.as_str() {
@@ -3221,7 +3129,7 @@ async fn dispatch_command_inner(
             Ok(json!({ "conversationId": request.conversation_id, "queue": snapshot }))
         }
         "conversation.retry" => {
-            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             let turn_id = state
                 .conversations
                 .retry_owned(
@@ -3239,7 +3147,7 @@ async fn dispatch_command_inner(
             )
         }
         "conversation.resume" => {
-            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             state
                 .conversations
                 .get_owned(owner_id, &request.conversation_id)
@@ -3247,7 +3155,7 @@ async fn dispatch_command_inner(
             Err(AppError::Unsupported("Native resume is not implemented; submit an explicit follow-up to continue this conversation.".to_owned()))
         }
         "conversation.compact" => {
-            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             let operation_id = state
                 .conversations
                 .compact_owned(owner_id, &request.conversation_id, &command.id)
@@ -3257,7 +3165,7 @@ async fn dispatch_command_inner(
             )
         }
         "conversation.fork" => {
-            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             let fork = state
                 .conversations
                 .fork_owned(owner_id, &request.conversation_id, request.title)
@@ -3265,7 +3173,7 @@ async fn dispatch_command_inner(
             Ok(json!({ "conversationId": fork.id, "forkedFrom": request.conversation_id }))
         }
         "conversation.cancel" | "conversation.interrupt" | "conversation.stop" => {
-            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             state
                 .conversations
                 .cancel_owned(owner_id, &request.conversation_id)
@@ -3273,14 +3181,14 @@ async fn dispatch_command_inner(
             Ok(json!({ "conversationId": request.conversation_id, "accepted": true }))
         }
         "conversation.runtime.stop" => {
-            let request: WsConversationRequest = serde_json::from_value(command.payload.clone())?;
+            let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             state
                 .conversations
                 .stop_runtime_owned(owner_id, &request.conversation_id)
                 .await
         }
         "conversation.permission.respond" => {
-            let request: WsPermissionRequest = serde_json::from_value(command.payload.clone())?;
+            let request: WsPermissionRequest = Deserialize::deserialize(&command.payload)?;
             state
                 .conversations
                 .resolve_permission_owned(
@@ -3310,7 +3218,7 @@ async fn dispatch_command_inner(
             // connection visibility for still-existing Codex sessions and
             // replay gateway events after each cursor directly to this connection,
             // serialized with its live forwarding (never republished globally).
-            let request: SessionResumeRequest = serde_json::from_value(command.payload.clone())?;
+            let request: SessionResumeRequest = Deserialize::deserialize(&command.payload)?;
             let resumed = websocket::resume_session_cursors(
                 state,
                 event_scope,
@@ -3358,7 +3266,7 @@ async fn dispatch_provider_control(
         expected_turn_id: String,
         control: crate::provider::types::ProviderControl,
     }
-    let request: Request = serde_json::from_value(command.payload.clone())?;
+    let request: Request = Deserialize::deserialize(&command.payload)?;
     state
         .conversations
         .control_owned(
@@ -3376,7 +3284,7 @@ async fn dispatch_mcp_command(
     owner_id: &str,
     command: &V2Command,
 ) -> Result<Value, AppError> {
-    let request: WsMcpRequest = serde_json::from_value(command.payload.clone())?;
+    let request: WsMcpRequest = Deserialize::deserialize(&command.payload)?;
     match command.command_type.as_str() {
         "mcp.list" => Ok(serde_json::to_value(
             state
@@ -3851,6 +3759,7 @@ struct WsPermissionRequest {
 
 #[cfg(test)]
 mod tests {
+    use axum::extract::ws::Message;
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]

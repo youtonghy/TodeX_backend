@@ -4,7 +4,7 @@ TodeX 的唯一授权方式是设备验证：每台客户端设备持有一对�
 
 ## 配对流程
 
-1. 客户端生成（或复用本 profile 的）设备密钥对，发起配对申请并提交设备公钥。
+1. 客户端生成（或复用本 profile 的）设备密钥对，发起配对申请（`create`）并提交设备公钥与对临时公钥、随机数的承诺，再用 `reveal` 公开二者（配对 v3，见 [transport-v2.md](transport-v2.md#device-pairing-v3-commit-then-reveal)）。验证码只在 reveal 之后出现在 TUI。
 2. 在后端 TUI 按 `d` 打开设备面板，选择待验证申请，核对双方完整的 `XXXXX-XXXXX` 验证码。
 3. 按 `a` 批准，或按 `r` 拒绝。设备名称由客户端自报，核对时以验证码为准。
 4. 批准后设备公钥写入注册表并返回 `deviceId`，客户端立即可用签名认证连接。
@@ -23,7 +23,7 @@ TUI `d` 面板分两段：上半是待验证申请（`a`/`r`），下半是已�
 todex.device-auth.v1 \0 deviceId \0 method \0 path \0 canonicalQuery \0 timestamp \0 nonce \0 base64url(sha256(body))
 ```
 
-服务端按序校验：设备已注册 → 时间戳偏差不超过 300 秒 → nonce 未在窗口内出现过 → 签名有效。签名覆盖完整 query，因此 WebSocket 握手中的传输加密参数（`enc`、`client_key`、`ciphertext`）也被绑定到设备身份，中间人无法替换。
+服务端按序校验：设备已注册 → 时间戳偏差不超过 300 秒 → nonce 未在窗口内出现过 → 签名有效。签名覆盖完整 query，因此 WebSocket 握手中的传输加密参数（`tv`、`enc`、`client_nonce`、`client_key`、`ciphertext`）也被绑定到设备身份，中间人无法替换；transport v2 还把签名凭证中的 `deviceId` 写入会话密钥的 transcript。经 `POST /v2/sealed` 隧道的 REST 请求由内层请求自带签名，签名覆盖内层方法、路径、query 与 body。
 
 设备时钟偏差超过 300 秒时握手被拒绝；请同步设备时间。签名在发出请求时生成，客户端在系统休眠前签好、唤醒后才送达的请求同样会因时间戳过期返回 401，重新签名重试即可。自定义 header 使跨源请求需要 CORS 预检，服务端以 `Access-Control-Max-Age: 7200` 允许浏览器缓存预检结果（Chromium 上限两小时），避免每个签名请求都额外占用一次连接。nonce 缓存是进程内的，daemon 重启后旧签名时间戳通常已出窗口，不构成重放风险。
 
@@ -35,6 +35,6 @@ todex.device-auth.v1 \0 deviceId \0 method \0 path \0 canonicalQuery \0 timestam
 
 批准入口只读写后端本机的私有控制目录，没有公网批准 API。配对申请、查询和取消请求有大小、数量与频率限制。
 
-配对握手沿用双向临时 X25519 DH：双方各出临时公钥，验证码由共同 transcript（含设备公钥）导出，可检测中间人；批准后设备身份经 HKDF-SHA256 + XChaCha20-Poly1305 加密投递，只有发起方能够解密。临时密钥不替代、不导入后端长期传输加密公钥。
+配对握手沿用双向临时 X25519 DH：双方各出临时公钥，验证码由共同 transcript（含设备公钥与客户端随机数）导出，可检测中间人。v3 要求客户端先提交承诺、看到服务端公钥后才揭示自己的临时公钥，中间人无法再针对 40 位验证码反复挑选自己的公钥；批准后设备身份经 HKDF-SHA256 + XChaCha20-Poly1305 加密投递，只有发起方能够解密。临时密钥不替代、不导入后端长期传输加密公钥。
 
 设备私钥只保存在客户端各自的安全存储（iOS Keychain、WebCrypto 不可导出密钥、桌面端 safeStorage），不进入注册表、不出现在任何响应或 TUI 界面。

@@ -25,7 +25,8 @@ async fn transport_policy(
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         axum::Json(serde_json::json!({
-            "requiredProtocol": state.config.pairing_encryption.as_str()
+            "requiredProtocol": state.config.pairing_encryption.as_str(),
+            "transportVersion": 2,
         })),
     )
 }

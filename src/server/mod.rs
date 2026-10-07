@@ -7,9 +7,13 @@ pub mod protocol;
 mod quota;
 mod remote;
 mod routes;
+mod sealed;
 mod ssh;
+#[cfg(test)]
+mod transport_v2_tests;
 mod v2;
 pub(crate) mod websocket;
+mod ws;
 
 pub(crate) use history_keys::spawn_history_watch;
 
@@ -25,15 +29,19 @@ use crate::app_state::AppState;
 use crate::listen_addrs::is_loopback_host;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api: Router = Router::new()
         .merge(routes::routes(&state))
         .merge(device_pairing::routes())
         // Loopback + per-conversation token; deliberately outside device auth.
         .merge(crate::agent_mcp::routes(&state))
+        .with_state(state.clone());
+    // `/v2/sealed` runs inner requests through `api`, which does not contain
+    // the tunnel itself, so nesting is impossible.
+    api.clone()
+        .merge(sealed::routes(api, state.clone()))
         .layer(compression_layer())
         .layer(cors_layer(&state.config.host))
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
 }
 
 /// Responses below this size are sent as-is; gzip framing would not pay off.
@@ -51,7 +59,12 @@ fn compression_layer() -> CompressionLayer<impl Predicate> {
             .and(NotForContentType::IMAGES)
             .and(NotForContentType::SSE)
             // Remote file downloads: arbitrary bytes with an exact length.
-            .and(NotForContentType::const_new("application/octet-stream")),
+            .and(NotForContentType::const_new("application/octet-stream"))
+            // Transport v2 tunnel: ciphertext does not compress, and the
+            // records must stream as they are sealed.
+            .and(NotForContentType::const_new(
+                crate::transport_crypto::envelope::SEALED_CONTENT_TYPE,
+            )),
     )
 }
 

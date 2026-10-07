@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use axum::http::HeaderMap;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
@@ -23,7 +22,6 @@ use crate::{
         CodexGatewayAction, CodexLifecycleRequest, CodexLocalErrorCode, CodexLocalErrorPayload,
         ServerEvent,
     },
-    transport_crypto::TransportCryptoSession,
     workspace_paths::validate_workspace_directory_text,
 };
 
@@ -55,19 +53,6 @@ pub(super) struct LegacyEventScope {
     delivered_cursors: std::collections::BTreeMap<String, u64>,
 }
 
-pub fn transport_crypto_from_handshake(
-    state: &AppState,
-    headers: &HeaderMap,
-    query: Option<&str>,
-) -> Result<Option<TransportCryptoSession>, AppError> {
-    TransportCryptoSession::from_headers_and_query(
-        &state.pairing_keys,
-        state.config.pairing_encryption,
-        headers,
-        query,
-    )
-}
-
 #[derive(Default)]
 struct LegacyScopeCandidate {
     tenant_id: String,
@@ -81,13 +66,13 @@ struct LegacyScopeRegistration {
     terminals: Vec<String>,
 }
 
-pub(super) async fn dispatch_scoped_client_text(
-    text: &str,
+pub(super) async fn dispatch_scoped_client_message(
+    frame: serde_json::Value,
     state: &AppState,
     auth: Option<&AuthContext>,
     event_scope: &tokio::sync::RwLock<LegacyEventScope>,
 ) -> Result<(), AppError> {
-    let mut message = serde_json::from_str::<ClientMessage>(text).map_err(|err| {
+    let mut message = serde_json::from_value::<ClientMessage>(frame).map_err(|err| {
         AppError::InvalidRequest(format!("failed to parse client message: {err}"))
     })?;
     ensure_terminal_start_id(&mut message);

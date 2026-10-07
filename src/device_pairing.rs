@@ -3,6 +3,13 @@
 //! code authenticates the ephemeral transcript; on approval the client's
 //! long-term Ed25519 device key is registered and the assigned device id is
 //! returned once, encrypted for the initiating client's ephemeral private key.
+//!
+//! Pairing v3 (commit, then reveal): `create` carries only a commitment to the
+//! client's ephemeral key and nonce, and the server answers with its own
+//! per-request key. The client then reveals the key and nonce; only then is
+//! the transcript fixed and the verification code shown. A man in the middle
+//! can no longer grind its own key against the 40-bit code, because its key
+//! is committed before it sees the server key.
 use crate::devices::DeviceRegistry;
 use crate::error::AppError;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -26,6 +33,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::{Zeroize, Zeroizing};
 
 type Result<T> = std::result::Result<T, AppError>;
 const TTL: Duration = Duration::from_secs(300);
@@ -33,19 +41,42 @@ const MAX_ACTIVE: usize = 16;
 const MAX_RECORDS: usize = 64;
 const MAX_LOCAL_FILE: u64 = 4096;
 const DIRECTORY: &str = "device-pairing";
-const TRANSCRIPT_DOMAIN: &[u8] = b"todex.device-pairing.v2/transcript\0";
-const WRAP_INFO: &[u8] = b"todex.device-pairing.v2/wrap-key";
-const POLL_INFO: &[u8] = b"todex.device-pairing.v2/poll-proof";
-const CANCEL_INFO: &[u8] = b"todex.device-pairing.v2/cancel-proof";
+const COMMIT_LABEL: &[u8] = b"todex.device-pairing.v3/commit";
+const TRANSCRIPT_DOMAIN: &[u8] = b"todex.device-pairing.v3/transcript\0";
+const WRAP_INFO: &[u8] = b"todex.device-pairing.v3/wrap-key";
+const POLL_INFO: &[u8] = b"todex.device-pairing.v3/poll-proof";
+const CANCEL_INFO: &[u8] = b"todex.device-pairing.v3/cancel-proof";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CreateDevicePairingRequest {
-    /// Ephemeral X25519 key that encrypts the approval payload.
-    pub client_public_key: String,
+    /// `SHA256(LP("todex.device-pairing.v3/commit") || client_public ||
+    /// client_nonce)`; the key and nonce follow in `reveal`.
+    #[serde(default)]
+    pub client_commitment: Option<String>,
+    /// Pairing v2 sent the ephemeral key here directly; such clients get
+    /// `426 PROTOCOL_UPGRADE_REQUIRED`.
+    #[serde(default)]
+    pub client_public_key: Option<String>,
     pub device_name: String,
     /// Long-term Ed25519 device identity key registered on approval.
     pub device_public_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RevealDevicePairingRequest {
+    pub request_id: String,
+    /// Ephemeral X25519 key that encrypts the approval payload.
+    pub client_public_key: String,
+    /// 32 random bytes committed together with the key.
+    pub client_nonce: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RevealDevicePairingResponse {
+    pub status: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,12 +131,30 @@ struct PairingMaterial {
     verification_code: String,
 }
 
+impl Drop for PairingMaterial {
+    fn drop(&mut self) {
+        self.wrap_key.zeroize();
+        self.poll_proof.zeroize();
+        self.cancel_proof.zeroize();
+    }
+}
+
+fn commitment(client_public: &[u8; 32], client_nonce: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update((COMMIT_LABEL.len() as u32).to_be_bytes());
+    hasher.update(COMMIT_LABEL);
+    hasher.update(client_public);
+    hasher.update(client_nonce);
+    hasher.finalize().into()
+}
+
 impl PairingMaterial {
     fn derive(
         request_id: &str,
         client_public: &[u8; 32],
         server_public: &[u8; 32],
         device_public: &[u8; 32],
+        client_nonce: &[u8; 32],
         shared: &[u8; 32],
     ) -> Result<Self> {
         if bool::from(shared.ct_eq(&[0; 32])) {
@@ -121,6 +170,7 @@ impl PairingMaterial {
             server_public,
             &[0],
             device_public,
+            client_nonce,
         ]
         .concat();
         let salt = Sha256::digest(&transcript);
@@ -171,8 +221,20 @@ enum RequestStatus {
     Approved,
     Rejected,
 }
+/// Before `reveal` only the commitment and the server's per-request secret
+/// exist; the proofs and the verification code need the revealed key.
+enum Stage {
+    Committed {
+        server_secret: StaticSecret,
+        commitment: [u8; 32],
+    },
+    Revealed(PairingMaterial),
+}
+
 struct PendingRequest {
-    material: PairingMaterial,
+    stage: Stage,
+    server_public: [u8; 32],
+    peer: IpAddr,
     device_name: String,
     device_public_key: [u8; 32],
     expires: Instant,
@@ -252,7 +314,18 @@ impl DevicePairingRegistry {
                 "deviceName must contain at most 80 printable characters",
             ));
         }
-        let client_public = decode_32(&request.client_public_key)?;
+        if request.client_public_key.is_some() {
+            return Err(AppError::ProtocolUpgradeRequired(
+                "device pairing v2 is retired; update this client to pairing v3 (clientCommitment)"
+                    .to_owned(),
+            ));
+        }
+        let commitment = decode_32(
+            request
+                .client_commitment
+                .as_deref()
+                .ok_or_else(|| invalid("missing clientCommitment"))?,
+        )?;
         let device_public = crate::devices::parse_public_key(&request.device_public_key)?;
         let mut state = self
             .inner
@@ -274,39 +347,22 @@ impl DevicePairingRegistry {
         }
         let server_secret = StaticSecret::random_from_rng(OsRng);
         let server_public = PublicKey::from(&server_secret).to_bytes();
-        let shared = server_secret
-            .diffie_hellman(&PublicKey::from(client_public))
-            .to_bytes();
         let request_id = Uuid::new_v4().to_string();
-        let material = PairingMaterial::derive(
-            &request_id,
-            &client_public,
-            &server_public,
-            &device_public,
-            &shared,
-        )?;
         let expires_at = unix_ms().saturating_add(TTL.as_millis() as u64);
         let device_name = if request.device_name.trim().is_empty() {
             "Unknown device".to_owned()
         } else {
             request.device_name.trim().to_owned()
         };
-        let summary = DevicePairingRequestSummary {
-            request_id: request_id.clone(),
-            verification_code: material.verification_code.clone(),
-            device_name: device_name.clone(),
-            expires_at,
-            peer_address: peer.to_string(),
-        };
-        write_new_json(
-            &state.directory,
-            &summary_path(&state.directory, &request_id),
-            &summary,
-        )?;
         state.requests.insert(
             request_id.clone(),
             PendingRequest {
-                material,
+                stage: Stage::Committed {
+                    server_secret,
+                    commitment,
+                },
+                server_public,
+                peer,
                 device_name,
                 device_public_key: device_public,
                 expires: Instant::now() + TTL,
@@ -320,6 +376,83 @@ impl DevicePairingRegistry {
             expires_at,
             poll_interval_ms: 1000,
         })
+    }
+
+    /// Opens the commitment, fixes the transcript and only then publishes the
+    /// verification code to the local approver. Single use: a second reveal,
+    /// or one that does not match the commitment, fails (the latter also
+    /// discards the request).
+    pub(crate) fn reveal(
+        &self,
+        peer: IpAddr,
+        request: RevealDevicePairingRequest,
+    ) -> Result<RevealDevicePairingResponse> {
+        validate_id(&request.request_id)?;
+        let client_public = decode_32(&request.client_public_key)?;
+        let client_nonce = decode_32(&request.client_nonce)?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid("pairing registry is unavailable"))?;
+        rate_limit(&mut state.lookups, peer, Duration::from_secs(1), 128, 32)?;
+        state.prune()?;
+        let directory = state.directory.clone();
+        let Some(pending) = state.requests.get_mut(&request.request_id) else {
+            return Err(AppError::NotFound(
+                "pairing request no longer exists".to_owned(),
+            ));
+        };
+        let Stage::Committed {
+            server_secret,
+            commitment: expected,
+        } = &pending.stage
+        else {
+            return Err(AppError::Conflict(
+                "pairing request was already revealed".to_owned(),
+            ));
+        };
+        if !bool::from(commitment(&client_public, &client_nonce).ct_eq(expected)) {
+            state.requests.remove(&request.request_id);
+            return Err(AppError::Unauthenticated);
+        }
+        let shared = Zeroizing::new(
+            server_secret
+                .diffie_hellman(&PublicKey::from(client_public))
+                .to_bytes(),
+        );
+        let material = match PairingMaterial::derive(
+            &request.request_id,
+            &client_public,
+            &pending.server_public,
+            &pending.device_public_key,
+            &client_nonce,
+            &shared,
+        ) {
+            Ok(material) => material,
+            Err(error) => {
+                state.requests.remove(&request.request_id);
+                return Err(error);
+            }
+        };
+        let summary = DevicePairingRequestSummary {
+            request_id: request.request_id.clone(),
+            verification_code: material.verification_code.clone(),
+            device_name: pending.device_name.clone(),
+            expires_at: pending.expires_at,
+            peer_address: pending.peer.to_string(),
+        };
+        // The summary file is what the local approver (TUI) lists, so the
+        // code becomes visible only now.
+        if let Err(error) = write_new_json(
+            &directory,
+            &summary_path(&directory, &request.request_id),
+            &summary,
+        ) {
+            state.requests.remove(&request.request_id);
+            return Err(error);
+        }
+        pending.stage = Stage::Revealed(material);
+        Ok(RevealDevicePairingResponse { status: "pending" })
     }
 
     pub(crate) fn poll(
@@ -338,7 +471,10 @@ impl DevicePairingRegistry {
         let Some(pending) = state.requests.get(&request.request_id) else {
             return Ok(poll_state("expired", unix_ms()));
         };
-        if !bool::from(pending.material.poll_proof.ct_eq(&proof)) {
+        if !pending
+            .material()
+            .is_some_and(|material| bool::from(material.poll_proof.ct_eq(&proof)))
+        {
             return Err(AppError::Unauthenticated);
         }
         if pending.status == RequestStatus::Pending {
@@ -363,7 +499,10 @@ impl DevicePairingRegistry {
             .register(&pending.device_name, &pending.device_public_key)?;
         let mut nonce = [0; 24];
         OsRng.fill_bytes(&mut nonce);
-        let ciphertext = pending.material.wrap(&record.device_id, &nonce)?;
+        let Some(material) = pending.material() else {
+            return Err(AppError::Unauthenticated);
+        };
+        let ciphertext = material.wrap(&record.device_id, &nonce)?;
         Ok(DevicePairingPollResponse {
             status: "approved",
             expires_at: pending.expires_at,
@@ -384,12 +523,24 @@ impl DevicePairingRegistry {
         let Some(pending) = state.requests.get(&request.request_id) else {
             return Ok(());
         };
-        if !bool::from(pending.material.cancel_proof.ct_eq(&proof)) {
+        if !pending
+            .material()
+            .is_some_and(|material| bool::from(material.cancel_proof.ct_eq(&proof)))
+        {
             return Err(AppError::Unauthenticated);
         }
         state.requests.remove(&request.request_id);
         remove_local_files(&state.directory, &request.request_id);
         Ok(())
+    }
+}
+
+impl PendingRequest {
+    fn material(&self) -> Option<&PairingMaterial> {
+        match &self.stage {
+            Stage::Revealed(material) => Some(material),
+            Stage::Committed { .. } => None,
+        }
     }
 }
 
@@ -718,28 +869,61 @@ mod tests {
             .verifying_key()
             .to_bytes()
     }
-    fn begin(registry: &DevicePairingRegistry) -> (CreateDevicePairingResponse, PairingMaterial) {
-        let client_secret = StaticSecret::from([7; 32]);
-        let client_public = PublicKey::from(&client_secret).to_bytes();
-        let response = registry
+    const CLIENT_NONCE: [u8; 32] = [5; 32];
+    fn client_public() -> [u8; 32] {
+        PublicKey::from(&StaticSecret::from([7; 32])).to_bytes()
+    }
+    fn create_request(commitment: Option<[u8; 32]>) -> CreateDevicePairingRequest {
+        CreateDevicePairingRequest {
+            client_commitment: commitment.map(|value| URL_SAFE_NO_PAD.encode(value)),
+            client_public_key: None,
+            device_name: "Synthetic device".to_owned(),
+            device_public_key: URL_SAFE_NO_PAD.encode(device_key()),
+        }
+    }
+    fn reveal_request(
+        id: &str,
+        client_public: [u8; 32],
+        nonce: [u8; 32],
+    ) -> RevealDevicePairingRequest {
+        RevealDevicePairingRequest {
+            request_id: id.to_owned(),
+            client_public_key: URL_SAFE_NO_PAD.encode(client_public),
+            client_nonce: URL_SAFE_NO_PAD.encode(nonce),
+        }
+    }
+    /// Commit only; the request is invisible to the local approver.
+    fn commit(registry: &DevicePairingRegistry) -> CreateDevicePairingResponse {
+        registry
             .create(
                 peer(),
-                CreateDevicePairingRequest {
-                    client_public_key: URL_SAFE_NO_PAD.encode(client_public),
-                    device_name: "Synthetic device".to_owned(),
-                    device_public_key: URL_SAFE_NO_PAD.encode(device_key()),
-                },
+                create_request(Some(commitment(&client_public(), &CLIENT_NONCE))),
             )
-            .unwrap();
+            .unwrap()
+    }
+    fn begin(registry: &DevicePairingRegistry) -> (CreateDevicePairingResponse, PairingMaterial) {
+        let client_secret = StaticSecret::from([7; 32]);
+        let response = commit(registry);
+        assert_eq!(
+            registry
+                .reveal(
+                    peer(),
+                    reveal_request(&response.request_id, client_public(), CLIENT_NONCE),
+                )
+                .unwrap()
+                .status,
+            "pending"
+        );
         let server_public = decode_32(&response.server_public_key).unwrap();
         let shared = client_secret
             .diffie_hellman(&PublicKey::from(server_public))
             .to_bytes();
         let material = PairingMaterial::derive(
             &response.request_id,
-            &client_public,
+            &client_public(),
             &server_public,
             &device_key(),
+            &CLIENT_NONCE,
             &shared,
         )
         .unwrap();
@@ -769,43 +953,146 @@ mod tests {
             .unwrap();
         serde_json::from_slice(&plaintext).unwrap()
     }
-    fn vector() -> Value {
-        let id = "11111111-2222-4333-8444-555555555555";
-        let client_secret = StaticSecret::from([7; 32]);
-        let server_secret = StaticSecret::from([9; 32]);
+    fn fixture_bytes(value: &Value) -> Vec<u8> {
+        let text = value.as_str().unwrap();
+        (0..text.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
+            .collect()
+    }
+    fn fixture_32(value: &Value) -> [u8; 32] {
+        fixture_bytes(value).try_into().unwrap()
+    }
+
+    /// `pairingV3` in the shared transport v2 vectors
+    /// (tests/fixtures/transport-v2.json, generated by TodeX_protocol).
+    #[test]
+    fn device_pairing_v3_cross_language_vector_matches() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/transport-v2.json")).unwrap();
+        let vector = &fixture["pairingV3"];
+        let request_id = vector["requestId"].as_str().unwrap();
+        let client_secret = StaticSecret::from(fixture_32(&vector["clientSecretKey"]));
+        let server_secret = StaticSecret::from(fixture_32(&vector["serverSecretKey"]));
         let client_public = PublicKey::from(&client_secret).to_bytes();
         let server_public = PublicKey::from(&server_secret).to_bytes();
+        assert_eq!(client_public, fixture_32(&vector["clientPublicKey"]));
+        assert_eq!(server_public, fixture_32(&vector["serverPublicKey"]));
+        let device_public =
+            ed25519_dalek::SigningKey::from_bytes(&fixture_32(&vector["deviceSeed"]))
+                .verifying_key()
+                .to_bytes();
+        assert_eq!(device_public, fixture_32(&vector["devicePublicKey"]));
+        let client_nonce = fixture_32(&vector["clientNonce"]);
+        let expected_commitment = commitment(&client_public, &client_nonce);
+        assert_eq!(expected_commitment, fixture_32(&vector["commitment"]));
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(expected_commitment),
+            vector["commitmentBase64Url"]
+        );
         let shared = server_secret
             .diffie_hellman(&PublicKey::from(client_public))
             .to_bytes();
-        let device_public = device_key();
-        let device_id = crate::devices::device_id_for(&device_public);
-        let material =
-            PairingMaterial::derive(id, &client_public, &server_public, &device_public, &shared)
-                .unwrap();
-        json!({
-            "requestId": id, "expiresAt": 2000000300000_u64,
-            "clientSecret": URL_SAFE_NO_PAD.encode([7; 32]), "serverSecret": URL_SAFE_NO_PAD.encode([9; 32]),
-            "deviceSecret": URL_SAFE_NO_PAD.encode([21; 32]),
-            "clientPublicKey": URL_SAFE_NO_PAD.encode(client_public), "serverPublicKey": URL_SAFE_NO_PAD.encode(server_public),
-            "devicePublicKey": URL_SAFE_NO_PAD.encode(device_public), "deviceId": device_id,
-            "transcript": URL_SAFE_NO_PAD.encode(&material.transcript), "verificationCode": material.verification_code,
-            "wrapKey": URL_SAFE_NO_PAD.encode(material.wrap_key), "pollProof": URL_SAFE_NO_PAD.encode(material.poll_proof), "cancelProof": URL_SAFE_NO_PAD.encode(material.cancel_proof),
-            "nonce": URL_SAFE_NO_PAD.encode([11; 24]),
-            "ciphertext": material.wrap(&device_id, &[11; 24]).unwrap(),
-        })
+        assert_eq!(shared, fixture_32(&vector["shared"]));
+        let material = PairingMaterial::derive(
+            request_id,
+            &client_public,
+            &server_public,
+            &device_public,
+            &client_nonce,
+            &shared,
+        )
+        .unwrap();
+        assert_eq!(material.transcript, fixture_bytes(&vector["transcript"]));
+        assert_eq!(
+            Sha256::digest(&material.transcript).as_slice(),
+            fixture_bytes(&vector["transcriptHash"])
+        );
+        assert_eq!(material.verification_code, vector["verificationCode"]);
+        assert_eq!(material.wrap_key, fixture_32(&vector["wrapKey"]));
+        assert_eq!(material.poll_proof, fixture_32(&vector["pollProof"]));
+        assert_eq!(material.cancel_proof, fixture_32(&vector["cancelProof"]));
+
+        // The credential wrap keeps v2's construction: XChaCha20-Poly1305
+        // under the wrap key with the full v3 transcript as AAD.
+        let nonce = [11; 24];
+        let wrapped = URL_SAFE_NO_PAD
+            .decode(material.wrap("dev_vector", &nonce).unwrap())
+            .unwrap();
+        let opened = XChaCha20Poly1305::new(Key::from_slice(&fixture_32(&vector["wrapKey"])))
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &wrapped,
+                    aad: &fixture_bytes(&vector["transcript"]),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&opened).unwrap(),
+            json!({"deviceId": "dev_vector"})
+        );
     }
+
     #[test]
-    fn device_pairing_cross_language_vector_matches() {
-        let actual = vector();
-        if std::env::var_os("TODEX_WRITE_FIXTURES").is_some() {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/device-pairing-v2.json");
-            fs::write(&path, serde_json::to_string_pretty(&actual).unwrap()).unwrap();
-        }
-        let expected: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/device-pairing-v2.json")).unwrap();
-        assert_eq!(actual, expected);
+    fn reveal_is_single_use_bound_to_the_commitment_and_gates_the_code() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        // v2 clients send the key in `create`.
+        let mut legacy = create_request(None);
+        legacy.client_public_key = Some(URL_SAFE_NO_PAD.encode(client_public()));
+        assert!(matches!(
+            registry.create(peer(), legacy),
+            Err(AppError::ProtocolUpgradeRequired(_))
+        ));
+        assert!(matches!(
+            registry.create(peer(), create_request(None)),
+            Err(AppError::InvalidRequest(_))
+        ));
+
+        let created = commit(&registry);
+        // Nothing for the approver to see, and no proof works, before reveal.
+        assert!(list_device_pairing_requests(&fixture.root)
+            .unwrap()
+            .is_empty());
+        assert!(decide_device_pairing(&fixture.root, &created.request_id, true).is_err());
+        assert!(matches!(
+            registry.poll(peer(), proof(&created.request_id, &[0; 32])),
+            Err(AppError::Unauthenticated)
+        ));
+        registry
+            .reveal(
+                peer(),
+                reveal_request(&created.request_id, client_public(), CLIENT_NONCE),
+            )
+            .unwrap();
+        let listed = list_device_pairing_requests(&fixture.root).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].request_id, created.request_id);
+        assert!(matches!(
+            registry.reveal(
+                peer(),
+                reveal_request(&created.request_id, client_public(), CLIENT_NONCE),
+            ),
+            Err(AppError::Conflict(_))
+        ));
+
+        // A reveal that does not open the commitment discards the request.
+        let other = commit(&registry);
+        assert!(matches!(
+            registry.reveal(
+                peer(),
+                reveal_request(&other.request_id, client_public(), [6; 32])
+            ),
+            Err(AppError::Unauthenticated)
+        ));
+        assert!(matches!(
+            registry.reveal(
+                peer(),
+                reveal_request(&other.request_id, client_public(), CLIENT_NONCE),
+            ),
+            Err(AppError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -973,66 +1260,41 @@ mod tests {
     fn unauthenticated_creation_has_rate_capacity_and_key_validation_limits() {
         let fixture = Fixture::new();
         let registry = fixture.registry();
-        assert!(registry
+        // A low-order key commits fine but fails at reveal.
+        let created = registry
             .create(
                 peer(),
-                CreateDevicePairingRequest {
-                    client_public_key: URL_SAFE_NO_PAD.encode([0; 32]),
-                    device_name: "Device".into(),
-                    device_public_key: URL_SAFE_NO_PAD.encode(device_key()),
-                }
+                create_request(Some(commitment(&[0; 32], &CLIENT_NONCE))),
+            )
+            .unwrap();
+        assert!(registry
+            .reveal(
+                peer(),
+                reveal_request(&created.request_id, [0; 32], CLIENT_NONCE)
             )
             .is_err());
         // An invalid Ed25519 key is rejected before rate limits are consumed.
-        assert!(registry
-            .create(
-                peer(),
-                CreateDevicePairingRequest {
-                    client_public_key: URL_SAFE_NO_PAD
-                        .encode(PublicKey::from(&StaticSecret::from([7; 32])).to_bytes()),
-                    device_name: "Device".into(),
-                    device_public_key: "not-a-key".into(),
-                }
-            )
-            .is_err());
+        let mut bad_device = create_request(Some([1; 32]));
+        bad_device.device_public_key = "not-a-key".into();
+        assert!(registry.create(peer(), bad_device).is_err());
         for _ in 0..3 {
             begin(&registry);
         }
-        let key = URL_SAFE_NO_PAD.encode(PublicKey::from(&StaticSecret::from([7; 32])).to_bytes());
-        let device = URL_SAFE_NO_PAD.encode(device_key());
         assert!(matches!(
-            registry.create(
-                peer(),
-                CreateDevicePairingRequest {
-                    client_public_key: key.clone(),
-                    device_name: "Device".into(),
-                    device_public_key: device.clone(),
-                }
-            ),
+            registry.create(peer(), create_request(Some([1; 32]))),
             Err(AppError::ResourceExhausted(_))
         ));
         for index in 1..14 {
             registry
                 .create(
                     format!("192.0.2.{index}").parse().unwrap(),
-                    CreateDevicePairingRequest {
-                        client_public_key: key.clone(),
-                        device_name: "Device".into(),
-                        device_public_key: device.clone(),
-                    },
+                    create_request(Some([1; 32])),
                 )
                 .unwrap();
         }
         assert_eq!(registry.inner.lock().unwrap().requests.len(), MAX_ACTIVE);
         assert!(matches!(
-            registry.create(
-                "192.0.2.99".parse().unwrap(),
-                CreateDevicePairingRequest {
-                    client_public_key: key,
-                    device_name: "Device".into(),
-                    device_public_key: device,
-                }
-            ),
+            registry.create("192.0.2.99".parse().unwrap(), create_request(Some([1; 32]))),
             Err(AppError::ResourceExhausted(_))
         ));
     }
@@ -1074,7 +1336,8 @@ mod tests {
             registry.create(
                 peer(),
                 CreateDevicePairingRequest {
-                    client_public_key: String::new(),
+                    client_commitment: None,
+                    client_public_key: None,
                     device_name: String::new(),
                     device_public_key: String::new(),
                 }

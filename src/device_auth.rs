@@ -59,10 +59,10 @@ const AUTH_QUERY_KEYS: [&str; 4] = [
 ];
 
 const SIGN_DOMAIN: &[u8] = b"todex.device-auth.v1\0";
-const MAX_CLOCK_SKEW_SECS: u64 = 300;
+pub(crate) const MAX_CLOCK_SKEW_SECS: u64 = 300;
 /// Bodies are buffered once for hashing. Matches the largest route-level body
 /// limit in the v2 router (workspace file writes are ~12 MiB).
-const MAX_AUTH_BODY: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_AUTH_BODY: usize = 32 * 1024 * 1024;
 const NONCE_CACHE_LIMIT: usize = 65_536;
 
 /// `device_id` → `(timestamp, nonce)` claims within the acceptance window.

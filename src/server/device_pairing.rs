@@ -2,7 +2,7 @@ use crate::{
     app_state::AppState,
     device_pairing::{
         CreateDevicePairingRequest, CreateDevicePairingResponse, DevicePairingPollResponse,
-        DevicePairingProofRequest,
+        DevicePairingProofRequest, RevealDevicePairingRequest, RevealDevicePairingResponse,
     },
     error::AppError,
 };
@@ -44,6 +44,7 @@ where
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v2/device-pairing/create", post(create))
+        .route("/v2/device-pairing/reveal", post(reveal))
         .route("/v2/device-pairing/poll", post(poll))
         .route("/v2/device-pairing/cancel", post(cancel))
         .layer(DefaultBodyLimit::max(2048))
@@ -63,6 +64,22 @@ async fn create(
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(state.device_pairing.create(peer.ip(), request)?),
+    ))
+}
+async fn reveal(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ApiJson(request): ApiJson<RevealDevicePairingRequest>,
+) -> Result<
+    (
+        [(header::HeaderName, &'static str); 1],
+        Json<RevealDevicePairingResponse>,
+    ),
+    AppError,
+> {
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(state.device_pairing.reveal(peer.ip(), request)?),
     ))
 }
 async fn poll(
@@ -145,11 +162,35 @@ mod tests {
         let client_public = PublicKey::from(&client);
         let device = crate::device_auth::test_support::TestDevice::new(21);
         let device_public = device.key.verifying_key().to_bytes();
-        let (status, created) = post(
+        // Pairing v2 (key in `create`) is retired.
+        let (status, legacy) = post(
             &app,
             "/v2/device-pairing/create",
             json!({
                 "clientPublicKey": URL_SAFE_NO_PAD.encode(client_public.as_bytes()),
+                "deviceName": "HTTP test",
+                "devicePublicKey": URL_SAFE_NO_PAD.encode(device_public),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(legacy["code"], "PROTOCOL_UPGRADE_REQUIRED");
+        let client_nonce = [3_u8; 32];
+        let commit_label = b"todex.device-pairing.v3/commit";
+        let commitment = Sha256::digest(
+            [
+                (commit_label.len() as u32).to_be_bytes().as_slice(),
+                commit_label,
+                client_public.as_bytes(),
+                &client_nonce,
+            ]
+            .concat(),
+        );
+        let (status, created) = post(
+            &app,
+            "/v2/device-pairing/create",
+            json!({
+                "clientCommitment": URL_SAFE_NO_PAD.encode(commitment),
                 "deviceName": "HTTP test",
                 "devicePublicKey": URL_SAFE_NO_PAD.encode(device_public),
             }),
@@ -164,20 +205,48 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
+        assert!(
+            crate::device_pairing::list_device_pairing_requests(&config.data_dir)
+                .unwrap()
+                .is_empty()
+        );
+        let reveal = json!({
+            "requestId": id,
+            "clientPublicKey": URL_SAFE_NO_PAD.encode(client_public.as_bytes()),
+            "clientNonce": URL_SAFE_NO_PAD.encode(client_nonce),
+        });
+        let (status, revealed) = post(&app, "/v2/device-pairing/reveal", reveal.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(revealed, json!({"status": "pending"}));
+        assert_eq!(
+            post(&app, "/v2/device-pairing/reveal", reveal).await.0,
+            StatusCode::CONFLICT
+        );
         let transcript = [
-            b"todex.device-pairing.v2/transcript\0".as_slice(),
+            b"todex.device-pairing.v3/transcript\0".as_slice(),
             id.as_bytes(),
             &[0],
             client_public.as_bytes(),
             &server_public,
             &[0],
             &device_public,
+            &client_nonce,
         ]
         .concat();
+        let listed = crate::device_pairing::list_device_pairing_requests(&config.data_dir).unwrap();
+        let digest = Sha256::digest(&transcript);
+        let short: String = digest[..5]
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
+        assert_eq!(
+            listed[0].verification_code,
+            format!("{}-{}", &short[..5], &short[5..])
+        );
         let shared = client.diffie_hellman(&PublicKey::from(server_public));
         let hkdf = Hkdf::<Sha256>::new(Some(&Sha256::digest(&transcript)), shared.as_bytes());
         let mut proof = [0; 32];
-        hkdf.expand(b"todex.device-pairing.v2/poll-proof", &mut proof)
+        hkdf.expand(b"todex.device-pairing.v3/poll-proof", &mut proof)
             .unwrap();
         let request = json!({"requestId": id, "proof": URL_SAFE_NO_PAD.encode(proof)});
         assert_eq!(
