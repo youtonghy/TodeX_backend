@@ -23,6 +23,14 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const STDERR_LINE_BYTES: usize = 2048;
 /// Stderr lines logged per server process; the rest is drained unlogged.
 const STDERR_MAX_LINES: usize = 200;
+/// A tool result is journaled whole (`mcp.completed`); keep it well under
+/// the per-event limit so the event around it always fits.
+const MAX_RESULT_BYTES: usize = crate::conversation::MAX_EVENT_PAYLOAD_BYTES / 2;
+/// Room kept for the truncation note itself.
+const RESULT_NOTE_BYTES: usize = 1024;
+/// Tools and description length kept from one server's `tools/list`.
+const MAX_LISTED_TOOLS: usize = 512;
+const MAX_TOOL_DESCRIPTION_CHARS: usize = 4096;
 
 #[derive(Debug)]
 pub struct McpCallResult {
@@ -67,14 +75,7 @@ async fn stdio_tools(target: &McpRuntimeTarget) -> Result<Vec<McpToolDescriptor>
         .map_err(|_| mcp_timeout(target, "tools/list"))?
         .map_err(|error| mcp_error(target, "tools/list", error));
     close_client(&mut client).await;
-    Ok(result?
-        .tools
-        .into_iter()
-        .map(|tool| McpToolDescriptor {
-            name: tool.name.into_owned(),
-            description: tool.description.map(|value| value.into_owned()),
-        })
-        .collect())
+    Ok(tool_descriptors(target, result?.tools))
 }
 
 async fn stdio_call(
@@ -202,14 +203,7 @@ async fn http_tools(target: &McpRuntimeTarget) -> Result<Vec<McpToolDescriptor>,
         .map_err(|_| mcp_timeout(target, "tools/list"))?
         .map_err(|error| mcp_error(target, "tools/list", error));
     close_client(&mut client).await;
-    Ok(result?
-        .tools
-        .into_iter()
-        .map(|tool| McpToolDescriptor {
-            name: tool.name.into_owned(),
-            description: tool.description.map(|value| value.into_owned()),
-        })
-        .collect())
+    Ok(tool_descriptors(target, result?.tools))
 }
 
 async fn http_call(
@@ -271,12 +265,134 @@ fn call_arguments(arguments: Value) -> Result<serde_json::Map<String, Value>, Ap
     }
 }
 
+/// At most [`MAX_LISTED_TOOLS`] tools, descriptions cut at
+/// [`MAX_TOOL_DESCRIPTION_CHARS`] (marked with `…`).
+fn tool_descriptors(
+    target: &McpRuntimeTarget,
+    tools: Vec<rmcp::model::Tool>,
+) -> Vec<McpToolDescriptor> {
+    if tools.len() > MAX_LISTED_TOOLS {
+        tracing::warn!(
+            mcp_server = %target.descriptor.name,
+            tools = tools.len(),
+            "mcp server lists more tools than TodeX shows; the rest are omitted"
+        );
+    }
+    tools
+        .into_iter()
+        .take(MAX_LISTED_TOOLS)
+        .map(|tool| McpToolDescriptor {
+            name: tool.name.into_owned(),
+            description: tool.description.map(|value| {
+                if value.chars().count() > MAX_TOOL_DESCRIPTION_CHARS {
+                    let mut cut: String = value.chars().take(MAX_TOOL_DESCRIPTION_CHARS).collect();
+                    cut.push('…');
+                    cut
+                } else {
+                    value.into_owned()
+                }
+            }),
+        })
+        .collect()
+}
+
 fn convert_call_result(result: rmcp::model::CallToolResult) -> Result<McpCallResult, AppError> {
     let is_error = result.is_error.unwrap_or(false);
     Ok(McpCallResult {
-        content: serde_json::to_value(result)?,
+        content: bound_result(serde_json::to_value(result)?, MAX_RESULT_BYTES),
         is_error,
     })
+}
+
+/// Bytes `character` takes inside a serde_json string.
+fn escaped_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        character if (character as u32) < 0x20 => 6,
+        character => character.len_utf8(),
+    }
+}
+
+fn json_len(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// A serialized `CallToolResult` of at most `limit` bytes. Over the limit,
+/// content blocks are kept in order while they fit, the first text block
+/// that does not is cut, other blocks that do not are replaced by a note,
+/// `structuredContent` is dropped, and the result says so (`truncated` and
+/// a closing text block).
+fn bound_result(result: Value, limit: usize) -> Value {
+    let total = json_len(&result);
+    if total <= limit {
+        return result;
+    }
+    let Value::Object(mut object) = result else {
+        return serde_json::json!({ "content": [], "truncated": true });
+    };
+    let blocks = match object.remove("content") {
+        Some(Value::Array(blocks)) => blocks,
+        _ => Vec::new(),
+    };
+    object.remove("structuredContent");
+    let mut budget = limit
+        .saturating_sub(RESULT_NOTE_BYTES)
+        .saturating_sub(json_len(&Value::Object(object.clone())));
+    let mut kept = Vec::new();
+    for block in blocks {
+        let size = json_len(&block).saturating_add(1);
+        if size <= budget {
+            budget -= size;
+            kept.push(block);
+            continue;
+        }
+        // This block is the last one kept (cut or noted): no budget after.
+        let kind = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("content")
+            .to_owned();
+        if kind == "text" {
+            let text = block
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // JSON escaping can grow text up to 6x (`\u0000`); cut by the
+            // escaped size so the block is guaranteed to fit.
+            let mut cut = String::new();
+            let mut used = 32;
+            for character in text.chars() {
+                let escaped = escaped_len(character);
+                if used + escaped > budget {
+                    break;
+                }
+                used += escaped;
+                cut.push(character);
+            }
+            if !cut.is_empty() {
+                kept.push(serde_json::json!({ "type": "text", "text": cut }));
+            }
+        } else {
+            let note = serde_json::json!({
+                "type": "text",
+                "text": format!("[{kind} block of {size} bytes omitted]"),
+            });
+            let note_size = json_len(&note) + 1;
+            if note_size <= budget {
+                kept.push(note);
+            }
+        }
+        break;
+    }
+    kept.push(serde_json::json!({
+        "type": "text",
+        "text": format!(
+            "[TodeX truncated this MCP result: it was {total} bytes, the limit is {limit}]"
+        ),
+    }));
+    object.insert("content".to_owned(), Value::Array(kept));
+    object.insert("truncated".to_owned(), Value::Bool(true));
+    Value::Object(object)
 }
 
 async fn close_client<T>(client: &mut rmcp::service::RunningService<rmcp::RoleClient, T>)
@@ -309,6 +425,54 @@ fn mcp_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_results_are_cut_to_the_limit_and_say_so() {
+        let small =
+            serde_json::json!({ "content": [{ "type": "text", "text": "ok" }], "isError": false });
+        assert_eq!(bound_result(small.clone(), 4096), small);
+        for character in ['a', '"', '\\', '\n', '\u{1}', '\u{7f}', 'é', '你', '😀'] {
+            assert_eq!(
+                escaped_len(character),
+                json_len(&Value::String(character.to_string())) - 2,
+                "{character:?}"
+            );
+        }
+
+        let big = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "head" },
+                { "type": "text", "text": "\u{0}".repeat(10_000) },
+                { "type": "image", "data": "A".repeat(10_000), "mimeType": "image/png" }
+            ],
+            "structuredContent": { "rows": "x".repeat(10_000) },
+            "isError": true
+        });
+        let limit = 4096;
+        let bounded = bound_result(big, limit);
+        assert!(json_len(&bounded) <= limit, "{}", json_len(&bounded));
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(bounded["isError"], true);
+        assert!(bounded.get("structuredContent").is_none());
+        let content = bounded["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "head");
+        assert!(content[1]["text"].as_str().unwrap().starts_with('\u{0}'));
+        assert!(content.last().unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("TodeX truncated this MCP result"));
+
+        // A huge non-text block becomes a note.
+        let image = serde_json::json!({
+            "content": [{ "type": "image", "data": "A".repeat(10_000), "mimeType": "image/png" }]
+        });
+        let bounded = bound_result(image, limit);
+        assert!(bounded["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("image block"));
+        assert!(json_len(&bounded) <= limit);
+    }
     use std::fs;
     use std::path::PathBuf;
 
