@@ -466,6 +466,8 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             sort_order: None,
+            group_id: None,
+            group_name: None,
         }
     }
 }

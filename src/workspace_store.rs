@@ -59,6 +59,13 @@ pub struct WorkspaceRecord {
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<i64>,
+    /// Sidebar group id; workspaces sharing it form one group. Opaque to the
+    /// backend apart from trimming and length capping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// Sidebar group display name, copied onto every member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
 }
 
 /// A workspace record rejected during normalization (for example because its
@@ -289,6 +296,8 @@ fn normalize_workspaces(
         workspace.session_id = format!("cdxs_{}", workspace.id);
         workspace.thread_id.clear();
         workspace.local_adapter_state = None;
+        workspace.group_id = normalize_group_field(workspace.group_id.take());
+        workspace.group_name = normalize_group_field(workspace.group_name.take());
         let key = (workspace.tenant_id.clone(), workspace.id.clone());
         match normalized.get(&key) {
             Some(existing) if existing.updated_at > workspace.updated_at => {}
@@ -301,6 +310,18 @@ fn normalize_workspaces(
         workspaces: normalized.into_values().collect(),
         rejected,
     }
+}
+
+/// Max characters kept for `groupId` / `groupName`, matching the protocol.
+const WORKSPACE_GROUP_FIELD_MAX: usize = 64;
+
+fn normalize_group_field(value: Option<String>) -> Option<String> {
+    let trimmed = value?
+        .trim()
+        .chars()
+        .take(WORKSPACE_GROUP_FIELD_MAX)
+        .collect::<String>();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 fn validate_workspace_record(
@@ -371,6 +392,8 @@ mod tests {
                     created_at: 10,
                     updated_at: 20,
                     sort_order: Some(3),
+                    group_id: Some(" wsg_1 ".to_owned()),
+                    group_name: Some("x".repeat(80)),
                 }],
             )
             .await
@@ -396,6 +419,14 @@ mod tests {
                 .to_string()
         );
         assert_eq!(reloaded.workspaces[0].sort_order, Some(3));
+        assert_eq!(reloaded.workspaces[0].group_id.as_deref(), Some("wsg_1"));
+        assert_eq!(
+            reloaded.workspaces[0]
+                .group_name
+                .as_deref()
+                .map(|name| name.chars().count()),
+            Some(WORKSPACE_GROUP_FIELD_MAX)
+        );
         assert_eq!(reloaded.workspaces[0].icon.as_deref(), Some("rocket"));
         assert_eq!(
             reloaded.workspaces[0].icon_color.as_deref(),
@@ -437,6 +468,8 @@ mod tests {
             created_at: 10,
             updated_at: 20,
             sort_order: None,
+            group_id: None,
+            group_name: None,
         };
 
         let snapshot = store
@@ -584,6 +617,8 @@ mod tests {
             created_at: 10,
             updated_at: 20,
             sort_order: None,
+            group_id: None,
+            group_name: None,
         }
     }
 
