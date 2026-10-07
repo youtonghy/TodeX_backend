@@ -49,6 +49,9 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
     if let Some(process) = status(&config)? {
         return Ok(process);
     }
+    // The child would refuse the same configuration; fail here with the
+    // reason instead of a generic "exited during startup".
+    config.ensure_listener_matches_auth()?;
     remove_stale_pid_file(&config.data_dir)?;
     if port_is_listening(&config.host, config.port) {
         bail!(

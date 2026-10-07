@@ -14,7 +14,6 @@ pub(crate) mod websocket;
 pub(crate) use history_keys::spawn_history_watch;
 pub(crate) use v2::{is_allowed_browser_target, validate_browser_url};
 
-use std::net::IpAddr;
 use std::time::Duration;
 
 use axum::Router;
@@ -24,6 +23,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::app_state::AppState;
+use crate::listen_addrs::is_loopback_host;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -71,18 +71,9 @@ fn cors_layer(host: &str) -> CorsLayer {
     }
 }
 
-pub(crate) fn is_loopback_host(host: &str) -> bool {
-    let normalized = host.trim().trim_matches(['[', ']']);
-    normalized.eq_ignore_ascii_case("localhost")
-        || normalized
-            .parse::<IpAddr>()
-            .map(|address| address.is_loopback())
-            .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{cors_layer, is_loopback_host};
+    use super::cors_layer;
     use axum::{body::Body, http::Request, routing::get, Router};
     use tower::ServiceExt;
 
@@ -107,14 +98,5 @@ mod tests {
             "7200",
             "preflights must not be re-sent for every signed request"
         );
-    }
-
-    #[test]
-    fn recognizes_loopback_hosts_for_private_network_cors() {
-        assert!(is_loopback_host("127.0.0.1"));
-        assert!(is_loopback_host("[::1]"));
-        assert!(is_loopback_host("localhost"));
-        assert!(!is_loopback_host("0.0.0.0"));
-        assert!(!is_loopback_host("192.168.1.20"));
     }
 }

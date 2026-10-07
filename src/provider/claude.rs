@@ -331,7 +331,9 @@ fn claude_discovery_url(base: &str) -> Option<reqwest::Url> {
             return None;
         }
     };
-    let loopback = url.host_str().is_some_and(crate::server::is_loopback_host);
+    let loopback = url
+        .host_str()
+        .is_some_and(crate::listen_addrs::is_loopback_host);
     match url.scheme() {
         "https" => Some(url),
         "http" if loopback => Some(url),

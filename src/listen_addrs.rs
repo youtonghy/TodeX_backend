@@ -65,6 +65,17 @@ pub fn connect_addresses(bind_host: &str) -> io::Result<Vec<ConnectAddress>> {
     Ok(select_addresses(bind_ip, interfaces, default_route_ipv4()))
 }
 
+/// Whether `host` (a bind address or a URL host, IPv6 optionally bracketed)
+/// only reaches this machine: `localhost` or a loopback IP.
+pub fn is_loopback_host(host: &str) -> bool {
+    let normalized = host.trim().trim_matches(['[', ']']);
+    normalized.eq_ignore_ascii_case("localhost")
+        || normalized
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
+}
+
 /// Local IPv4 address the OS would use for outbound traffic, if any.
 ///
 /// Connecting a UDP socket only selects a route; no packet is sent.
@@ -144,6 +155,19 @@ mod tests {
             .iter()
             .map(|address| address.host.as_str())
             .collect()
+    }
+
+    #[test]
+    fn recognizes_loopback_hosts() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.0.0.2"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("LocalHost"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("::"));
+        assert!(!is_loopback_host("192.168.1.20"));
+        assert!(!is_loopback_host("localhost.attacker.example"));
     }
 
     #[test]

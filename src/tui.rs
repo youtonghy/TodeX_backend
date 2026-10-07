@@ -1908,7 +1908,12 @@ impl TuiApp {
             EditMode::Text {
                 field: EditField::Host,
                 value,
-            } => match validate_host(&value) {
+            } => match validate_host(&value).and_then(|host| {
+                // The daemon refuses to start on this combination; reject it
+                // here so the saved config never holds it.
+                crate::config::ensure_listener_matches_auth(&host, self.config.security.enable_auth)
+                    .map(|()| host)
+            }) {
                 Ok(host) => {
                     self.config.host = host;
                     let subject = self.text("Listen IP updated", "监听 IP 已更新").to_owned();

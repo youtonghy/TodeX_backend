@@ -43,6 +43,7 @@ impl ManagedServer {
                 "TLS is configured but this build has no certificate/key listener; terminate TLS at a trusted reverse proxy or disable enable_tls"
             );
         }
+        config.ensure_listener_matches_auth()?;
         let addr = bind_addr(&config)?;
         let listener = TcpListener::bind(addr)
             .await
@@ -329,6 +330,26 @@ mod tests {
         server.stop().await.expect("stop server");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn managed_server_refuses_anonymous_non_loopback_listener() {
+        let root = env::temp_dir().join(format!("todex-server-anon-test-{}", uuid::Uuid::new_v4()));
+        let mut config = Config {
+            host: "0.0.0.0".to_owned(),
+            port: 0,
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspace")],
+            ..Config::default()
+        };
+        config.security.enable_auth = false;
+        let error = ManagedServer::start(config, ProviderProcessTracking::Disabled)
+            .await
+            .err()
+            .expect("anonymous non-loopback listener must not start");
+        assert!(error.to_string().contains("enable_auth = false"), "{error}");
+        // Refused before anything touched the data directory.
+        assert!(!root.exists());
     }
 
     #[tokio::test]

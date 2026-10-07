@@ -370,6 +370,14 @@ impl Config {
         })
     }
 
+    /// Without device authentication only this machine may reach the daemon,
+    /// so a non-loopback listener is refused instead of serving every network
+    /// peer anonymously.
+    pub fn ensure_listener_matches_auth(&self) -> anyhow::Result<()> {
+        ensure_listener_matches_auth(&self.host, self.security.enable_auth)
+            .map_err(anyhow::Error::msg)
+    }
+
     /// The first configured root; `workspace_roots` is never empty after load.
     pub fn primary_workspace_root(&self) -> &Path {
         self.workspace_roots
@@ -420,6 +428,19 @@ impl Config {
         document["tui"]["language"] = value(language);
         write_config_document(&data_dir, &document)
     }
+}
+
+/// Shared by startup and the TUI host editor; see
+/// [`Config::ensure_listener_matches_auth`].
+pub fn ensure_listener_matches_auth(host: &str, enable_auth: bool) -> Result<(), String> {
+    if enable_auth || crate::listen_addrs::is_loopback_host(host) {
+        return Ok(());
+    }
+    Err(format!(
+        "device authentication is disabled (security.enable_auth = false) but the listener \
+         {host} is not a loopback address; bind to 127.0.0.1 or ::1, or enable device \
+         authentication"
+    ))
 }
 
 impl Default for Config {
@@ -823,6 +844,33 @@ mod tests {
         let config = Config::default();
 
         assert!(config.security.enable_auth);
+    }
+
+    #[test]
+    fn disabled_auth_requires_a_loopback_listener() {
+        for host in ["127.0.0.1", "::1", "[::1]"] {
+            assert!(
+                super::ensure_listener_matches_auth(host, false).is_ok(),
+                "{host}"
+            );
+        }
+        for host in ["0.0.0.0", "::", "192.168.1.20"] {
+            let error = super::ensure_listener_matches_auth(host, false).unwrap_err();
+            assert!(error.contains("enable_auth = false"), "{error}");
+            assert!(
+                super::ensure_listener_matches_auth(host, true).is_ok(),
+                "{host}"
+            );
+        }
+        let config = Config {
+            host: "0.0.0.0".to_owned(),
+            security: super::SecurityConfig {
+                enable_auth: false,
+                enable_tls: false,
+            },
+            ..Config::default()
+        };
+        assert!(config.ensure_listener_matches_auth().is_err());
     }
 
     #[test]
