@@ -1410,7 +1410,11 @@ impl ConversationStore {
             #[cfg(test)]
             {
                 hold.1.fetch_add(1, Ordering::SeqCst);
-                drop(hold.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+                drop(
+                    hold.0
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
             }
             append_journal_line(&write_directory, &event_path, created, &line)
                 .map(|metadata| (line, metadata))
