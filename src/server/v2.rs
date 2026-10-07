@@ -26,9 +26,9 @@ use crate::conversation::{
 use crate::device_auth;
 use crate::error::AppError;
 use crate::provider::{
-    read_current_version, run_install, run_upgrade, CliOperationAction, CliUpgradeOperation,
-    CliVersionsResponse, ConversationPrompt, ConversationSupervisor, FollowUpAddOutcome,
-    ManagedCli, PermissionDecision, PromptContentRef, PromptSkillRef,
+    read_current_version, run_install, run_upgrade, CancelOutcome, CliOperationAction,
+    CliUpgradeOperation, CliVersionsResponse, ConversationPrompt, ConversationSupervisor,
+    FollowUpAddOutcome, ManagedCli, PermissionDecision, PromptContentRef, PromptSkillRef,
 };
 use crate::workspace_paths::{
     canonical_workspace_roots, containing_workspace_root, validate_workspace_directory_text,
@@ -1995,19 +1995,64 @@ async fn prompt_conversation(
     ))
 }
 
+/// `POST /v2/conversations/{id}/cancel` (and `/interrupt`). The body is
+/// optional: empty, or `{"turnId": "..."}` to stop only that turn.
 async fn cancel_conversation(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(conversation_id): AxumPath<String>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
-    state
+    let request: CancelConversationRequest = if body.trim_ascii().is_empty() {
+        CancelConversationRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|error| {
+            AppError::InvalidRequest(format!("invalid cancel request body: {error}"))
+        })?
+    };
+    let outcome = state
         .conversations
-        .cancel_owned(&auth.tenant_id, &conversation_id)
+        .cancel_owned(
+            &auth.tenant_id,
+            &conversation_id,
+            request.turn_id.as_deref(),
+        )
         .await?;
-    Ok(Json(
-        json!({ "conversationId": conversation_id, "accepted": true }),
-    ))
+    Ok(Json(cancel_result(
+        &conversation_id,
+        request.turn_id.as_deref(),
+        outcome,
+    )))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelConversationRequest {
+    #[serde(default)]
+    turn_id: Option<String>,
+}
+
+/// Cancel result shared by REST and WebSocket. Without a turn id the reply is
+/// unchanged from before turn ids existed; with one it says whether that turn
+/// was stopped, and otherwise which turn is active (a no-op, not an error).
+fn cancel_result(conversation_id: &str, turn_id: Option<&str>, outcome: CancelOutcome) -> Value {
+    match (turn_id, outcome) {
+        (None, _) => json!({ "conversationId": conversation_id, "accepted": true }),
+        (Some(turn_id), CancelOutcome::Signalled) => json!({
+            "conversationId": conversation_id,
+            "accepted": true,
+            "turnId": turn_id,
+            "cancelled": true,
+        }),
+        (Some(turn_id), CancelOutcome::NotActive { active_turn_id }) => json!({
+            "conversationId": conversation_id,
+            "accepted": true,
+            "turnId": turn_id,
+            "cancelled": false,
+            "activeTurnId": active_turn_id,
+        }),
+    }
 }
 
 async fn resolve_permission(
@@ -3218,11 +3263,19 @@ async fn dispatch_command_inner(
         }
         "conversation.cancel" | "conversation.interrupt" | "conversation.stop" => {
             let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
-            state
+            let outcome = state
                 .conversations
-                .cancel_owned(owner_id, &request.conversation_id)
+                .cancel_owned(
+                    owner_id,
+                    &request.conversation_id,
+                    request.turn_id.as_deref(),
+                )
                 .await?;
-            Ok(json!({ "conversationId": request.conversation_id, "accepted": true }))
+            Ok(cancel_result(
+                &request.conversation_id,
+                request.turn_id.as_deref(),
+                outcome,
+            ))
         }
         "conversation.runtime.stop" => {
             let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
@@ -3778,6 +3831,9 @@ struct WsConversationRequest {
     /// the request being retried.
     #[serde(default)]
     prompt: Option<String>,
+    /// `conversation.cancel` / `interrupt` / `stop`: stop only this turn.
+    #[serde(default)]
+    turn_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7842,6 +7898,99 @@ mod tests {
         }
         let response = app.oneshot(registered).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancel_accepts_an_optional_turn_id_over_rest_and_websocket() {
+        let root = std::env::temp_dir().join(format!("todex-v2-cancel-turn-{}", Uuid::new_v4()));
+        let state = anonymous_test_state(&root).await;
+        let manifest = state
+            .conversations
+            .create_for_tests(
+                ProviderKind::Codex,
+                fs::canonicalize(root.join("workspaces/project")).unwrap(),
+            )
+            .await
+            .unwrap();
+        let app = crate::server::loopback_test_router(state.clone());
+        let cancel = |body: &'static str, content_type: Option<&'static str>| {
+            let app = app.clone();
+            let uri = format!("/v2/conversations/{}/cancel", manifest.id);
+            async move {
+                let mut request = Request::post(uri).header("host", "127.0.0.1:7345");
+                if let Some(content_type) = content_type {
+                    request = request.header("content-type", content_type);
+                }
+                let response = app
+                    .oneshot(request.body(Body::from(body)).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+
+        // No body, JSON content type or not: the reply predates turn ids.
+        for content_type in [None, Some("application/json")] {
+            let (status, body) = cancel("", content_type).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body,
+                json!({ "conversationId": manifest.id, "accepted": true })
+            );
+        }
+        let (status, body) = cancel("{}", Some("application/json")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("cancelled").is_none());
+        // A named turn that is not running is a no-op, not an error.
+        let (status, body) = cancel(r#"{"turnId":"turn_gone"}"#, Some("application/json")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["cancelled"], false);
+        assert_eq!(body["turnId"], "turn_gone");
+        assert!(body["activeTurnId"].is_null());
+        let (status, _) = cancel("not json", Some("application/json")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (outgoing, _events) = mpsc::channel(16);
+        let mut subscriptions = WsSubscriptions::declared();
+        let event_scope = Arc::new(tokio::sync::RwLock::new(
+            websocket::LegacyEventScope::default(),
+        ));
+        for (command_type, payload, cancelled) in [
+            (
+                "conversation.stop",
+                json!({ "conversationId": manifest.id, "turnId": "turn_gone" }),
+                Some(false),
+            ),
+            (
+                "conversation.interrupt",
+                json!({ "conversationId": manifest.id }),
+                None,
+            ),
+        ] {
+            let result = dispatch_command_inner(
+                &state,
+                &outgoing,
+                &mut subscriptions,
+                &event_scope,
+                "local",
+                "local",
+                &V2Command {
+                    id: command_type.to_owned(),
+                    command_type: command_type.to_owned(),
+                    payload,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["accepted"], true);
+            assert_eq!(result.get("cancelled").and_then(Value::as_bool), cancelled);
+            if cancelled.is_some() {
+                assert!(result["activeTurnId"].is_null());
+            }
+        }
         let _ = fs::remove_dir_all(root);
     }
 

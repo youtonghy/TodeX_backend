@@ -380,6 +380,17 @@ pub struct ConversationSupervisor {
 /// Completed control results kept for retried requests.
 const CONTROL_RESULT_CACHE: usize = 256;
 
+/// Result of [`ConversationSupervisor::cancel_owned`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The active turn was told to stop, or nothing was running and the
+    /// request named no turn.
+    Signalled,
+    /// The request named a turn that is not the active one; nothing was
+    /// signalled. Carries the turn that is running, if any.
+    NotActive { active_turn_id: Option<String> },
+}
+
 struct ActiveTurn {
     turn_id: String,
     cancel: watch::Sender<bool>,
@@ -2324,22 +2335,43 @@ impl ConversationSupervisor {
 
     #[allow(dead_code)]
     pub async fn cancel(&self, conversation_id: &str) -> Result<(), AppError> {
-        self.cancel_owned("local", conversation_id).await
+        self.cancel_owned("local", conversation_id, None)
+            .await
+            .map(drop)
     }
 
+    /// Signals the conversation's active turn to stop. With
+    /// `expected_turn_id`, only that turn is stopped: a request that names a
+    /// turn which already ended (or another one) must not cancel whatever
+    /// runs now, so it reports the active turn instead. Without it, whatever
+    /// is active stops, and an idle conversation is a no-op.
     pub async fn cancel_owned(
         &self,
         owner_id: &str,
         conversation_id: &str,
-    ) -> Result<(), AppError> {
+        expected_turn_id: Option<&str>,
+    ) -> Result<CancelOutcome, AppError> {
         ensure_owner(&self.store.get(conversation_id).await?, owner_id)?;
+        // The map guard is held from the comparison through the send, so the
+        // named turn cannot end and be replaced in between.
         let Some(active) = self.active.get(conversation_id) else {
-            return Ok(());
+            return Ok(match expected_turn_id {
+                Some(_) => CancelOutcome::NotActive {
+                    active_turn_id: None,
+                },
+                None => CancelOutcome::Signalled,
+            });
         };
+        if expected_turn_id.is_some_and(|expected| expected != active.turn_id) {
+            return Ok(CancelOutcome::NotActive {
+                active_turn_id: Some(active.turn_id.clone()),
+            });
+        }
         active
             .cancel
             .send(true)
-            .map_err(|_| AppError::Conflict("turn has already stopped".to_owned()))
+            .map_err(|_| AppError::Conflict("turn has already stopped".to_owned()))?;
+        Ok(CancelOutcome::Signalled)
     }
 
     pub async fn cancel_workspace_owned(
@@ -3795,6 +3827,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_naming_a_turn_only_stops_that_turn() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-cancel-turn-id").await;
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                workspace,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        // Idle: a named turn is reported as not active, an unnamed cancel is
+        // the old no-op.
+        assert_eq!(
+            supervisor
+                .cancel_owned("local", &manifest.id, Some("turn_old"))
+                .await
+                .unwrap(),
+            CancelOutcome::NotActive {
+                active_turn_id: None
+            }
+        );
+        assert_eq!(
+            supervisor
+                .cancel_owned("local", &manifest.id, None)
+                .await
+                .unwrap(),
+            CancelOutcome::Signalled
+        );
+
+        let (cancel, cancelled) = watch::channel(false);
+        supervisor.active.insert(
+            manifest.id.clone(),
+            ActiveTurn {
+                turn_id: "turn_new".to_owned(),
+                cancel,
+                provider: ProviderKind::Codex,
+                provider_profile: None,
+            },
+        );
+        // A late cancel for the previous turn leaves the new one running.
+        assert_eq!(
+            supervisor
+                .cancel_owned("local", &manifest.id, Some("turn_old"))
+                .await
+                .unwrap(),
+            CancelOutcome::NotActive {
+                active_turn_id: Some("turn_new".to_owned())
+            }
+        );
+        assert!(!*cancelled.borrow());
+        assert!(matches!(
+            supervisor
+                .cancel_owned("other", &manifest.id, Some("turn_new"))
+                .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(!*cancelled.borrow());
+        assert_eq!(
+            supervisor
+                .cancel_owned("local", &manifest.id, Some("turn_new"))
+                .await
+                .unwrap(),
+            CancelOutcome::Signalled
+        );
+        assert!(*cancelled.borrow());
+        supervisor.active.remove(&manifest.id);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn cli_upgrade_blocking_scopes_to_the_running_agent() {
         let root = temp_dir("todex-cli-upgrade-scope");
         let workspace_root = root.join("workspaces");
@@ -5202,7 +5305,7 @@ mod tests {
             Err(AppError::NotFound(_))
         ));
         supervisor
-            .cancel_owned("local", &manifest.id)
+            .cancel_owned("local", &manifest.id, None)
             .await
             .unwrap();
         assert_eq!(
