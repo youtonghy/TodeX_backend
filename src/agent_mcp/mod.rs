@@ -166,8 +166,9 @@ impl AgentMcp {
     }
 
     /// The effective permission mode of the conversation's turn that just
-    /// started. Tools with side effects follow it: refused while planning,
-    /// approved per call in `ask`, free in `auto` / `full-access`.
+    /// started. Tools with side effects follow it until the turn ends:
+    /// refused while planning, approved per call in `ask`, free in `auto` /
+    /// `full-access`.
     pub(crate) fn record_turn_mode(
         &self,
         conversation_id: &str,
@@ -178,6 +179,12 @@ impl AgentMcp {
             conversation_id,
             ToolMode::from_turn(permission_mode, work_mode),
         );
+    }
+
+    /// The conversation's turn ended (completed, failed or cancelled): its
+    /// side-effect tools ask again until the next turn records its mode.
+    pub(crate) fn end_turn_mode(&self, conversation_id: &str) {
+        self.inner.authorizer.clear_mode(conversation_id);
     }
 
     #[cfg(test)]

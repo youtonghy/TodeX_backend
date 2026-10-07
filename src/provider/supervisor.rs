@@ -390,10 +390,17 @@ struct ActiveTurn {
 struct ActiveTurnCleanup {
     active: Arc<DashMap<String, ActiveTurn>>,
     conversation_id: String,
+    /// Set for prompt turns: their tool mode ends with them.
+    agent_mcp: Option<AgentMcp>,
 }
 
 impl Drop for ActiveTurnCleanup {
     fn drop(&mut self) {
+        // Before the turn stops being active, so the next turn's mode is
+        // never cleared by this one.
+        if let Some(agent_mcp) = &self.agent_mcp {
+            agent_mcp.end_turn_mode(&self.conversation_id);
+        }
         self.active.remove(&self.conversation_id);
     }
 }
@@ -1291,6 +1298,7 @@ impl ConversationSupervisor {
         let _cleanup = ActiveTurnCleanup {
             active: self.active.clone(),
             conversation_id: conversation_id.to_owned(),
+            agent_mcp: None,
         };
         let launch_permit = self
             .workspace_trust
@@ -1387,6 +1395,7 @@ impl ConversationSupervisor {
         let cleanup = ActiveTurnCleanup {
             active: self.active.clone(),
             conversation_id: conversation_id.to_owned(),
+            agent_mcp: None,
         };
         let launch_permit = self
             .workspace_trust
@@ -1862,14 +1871,6 @@ impl ConversationSupervisor {
             }
         }
         drop(cli_start_permit);
-        // TodeX's own MCP tools follow this turn's permission mode.
-        if let Some(agent_mcp) = &self.agent_mcp {
-            agent_mcp.record_turn_mode(
-                conversation_id,
-                &effective_permissions.permission_mode,
-                &effective_permissions.work_mode,
-            );
-        }
 
         let launch_permit = match self
             .workspace_trust
@@ -1959,12 +1960,22 @@ impl ConversationSupervisor {
             "provider prompt includes injected skill context"
         );
 
+        // The turn has started: TodeX's own MCP tools follow its permission
+        // mode until it ends (then they fall back to asking).
+        if let Some(agent_mcp) = &self.agent_mcp {
+            agent_mcp.record_turn_mode(
+                conversation_id,
+                &effective_permissions.permission_mode,
+                &effective_permissions.work_mode,
+            );
+        }
         let supervisor = self.clone();
         let conversation_id = conversation_id.to_owned();
         let spawned_turn_id = turn_id.clone();
         let cleanup = ActiveTurnCleanup {
             active: self.active.clone(),
             conversation_id: conversation_id.clone(),
+            agent_mcp: self.agent_mcp.clone(),
         };
         tokio::spawn(async move {
             let cleanup = cleanup;
@@ -4259,6 +4270,56 @@ mod tests {
         assert!(history
             .iter()
             .any(|event| event.event_type == "turn.cancelled"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_tool_mode_lasts_only_while_a_turn_runs() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-agent-tool-mode").await;
+        let ssh = crate::ssh::tests::fixture("Host web\n").await;
+        let agent_mcp = crate::agent_mcp::tests::registry(ssh.service.clone(), &root).await;
+        let supervisor = supervisor.with_agent_mcp(agent_mcp.clone());
+        let mode = |id: &str| agent_mcp.authorizer_state().mode(id);
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace.clone(), None, None)
+            .await
+            .unwrap();
+
+        // A turn that cannot start records nothing.
+        supervisor
+            .workspace_trust
+            .set_owned("local", &workspace, false)
+            .await
+            .unwrap();
+        assert!(supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .is_err());
+        assert_eq!(mode(&manifest.id), None);
+        supervisor
+            .workspace_trust
+            .set_owned("local", &workspace, true)
+            .await
+            .unwrap();
+
+        // Recorded while the turn runs (it waits on a permission here),
+        // gone once it ends.
+        fs::write(root.join("permission-drain"), "").unwrap();
+        supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+        wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "permission.requested"
+        })
+        .await;
+        assert!(mode(&manifest.id).is_some());
+        supervisor.cancel(&manifest.id).await.unwrap();
+        wait_until_idle(&supervisor).await;
+        // No mode: side-effect tools ask (see `AuthorizerState::tool_mode`).
+        assert_eq!(mode(&manifest.id), None);
         fs::remove_dir_all(root).unwrap();
     }
 

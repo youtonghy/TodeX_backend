@@ -193,7 +193,7 @@ type HostAnswer = Option<bool>;
 /// Daemon-wide prompt state, shared by every TodeX MCP server.
 #[derive(Default)]
 pub(crate) struct AuthorizerState {
-    /// Conversation → the permission mode of its latest turn.
+    /// Conversation → the permission mode of its running turn.
     modes: Mutex<HashMap<String, ToolMode>>,
     /// Conversation → `server.tool` allowed for the rest of it (ask mode).
     always: Mutex<HashMap<String, HashSet<String>>>,
@@ -224,15 +224,18 @@ impl AuthorizerState {
         locked(&self.modes).insert(conversation_id.to_owned(), mode);
     }
 
+    pub(crate) fn clear_mode(&self, conversation_id: &str) {
+        locked(&self.modes).remove(conversation_id);
+    }
+
     /// `None` before the conversation's first turn in this daemon (only
     /// tests call tools then: providers are started by turns).
     pub(crate) fn mode(&self, conversation_id: &str) -> Option<ToolMode> {
         locked(&self.modes).get(conversation_id).copied()
     }
 
-    /// The mode side-effect tools follow. No recorded turn (none started in
-    /// this daemon run) asks, like an unknown mode: unknown state never
-    /// skips approval.
+    /// The mode side-effect tools follow. No running turn asks, like an
+    /// unknown mode: unknown state never skips approval.
     pub(crate) fn tool_mode(&self, conversation_id: &str) -> ToolMode {
         self.mode(conversation_id).unwrap_or(ToolMode::Ask)
     }
