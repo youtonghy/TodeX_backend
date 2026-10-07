@@ -7615,9 +7615,8 @@ mod tests {
             (Some("localhost:7345"), Some("http://localhost:5173")),
             (Some("[::1]:7345"), Some("http://[::1]:5173")),
             (Some("127.0.0.1"), Some("https://127.0.0.1")),
-            // Electron `loadFile`: fetch sends `null`, WebSockets `file://`.
-            (Some("127.0.0.1:7345"), Some("null")),
-            (Some("127.0.0.1:7345"), Some("file://")),
+            // The desktop app rewrites its `null` / `file://` origins to this.
+            (Some("127.0.0.1:7345"), Some("todex-desktop://app")),
         ] {
             assert_eq!(
                 status(host, origin).await,
@@ -7638,6 +7637,13 @@ mod tests {
             ),
             (Some("127.0.0.1:7345"), Some("chrome-extension://abcdef")),
             (Some("127.0.0.1:7345"), Some("not an origin")),
+            // Any page can produce `null` from a sandboxed iframe; `file://`
+            // pages are not trusted either.
+            (Some("127.0.0.1:7345"), Some("null")),
+            (Some("127.0.0.1:7345"), Some("file://")),
+            (Some("127.0.0.1:7345"), Some("file:///Users/me/evil.html")),
+            (Some("127.0.0.1:7345"), Some("todex-desktop://app.attacker")),
+            (Some("127.0.0.1:7345"), Some("todex-desktop://evil")),
         ] {
             assert_eq!(
                 status(host, origin).await,
@@ -7691,7 +7697,9 @@ mod tests {
             tokio_tungstenite::connect_async(request).await
         };
         assert!(connect("https://attacker.example").await.is_err());
-        let (mut ws, _) = connect("null").await.unwrap();
+        assert!(connect("null").await.is_err());
+        assert!(connect("file://").await.is_err());
+        let (mut ws, _) = connect("todex-desktop://app").await.unwrap();
         let _ = ws.close(None).await;
         let (mut ws, _) = connect("http://localhost:5173").await.unwrap();
         let _ = ws.close(None).await;

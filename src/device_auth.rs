@@ -257,10 +257,12 @@ pub(crate) async fn device_auth_middleware(
 /// `Config::ensure_listener_matches_auth`), but any web page the user opens
 /// can still aim a request or WebSocket at loopback. Require a loopback `Host`
 /// (defeats DNS rebinding, where an attacker's name resolves to 127.0.0.1)
-/// and, when the browser sends one, a loopback, `null` (Electron `loadFile`
-/// fetches) or `file://` (Electron `loadFile` WebSockets) `Origin`
-/// (defeats cross-site requests and WebSocket hijacking). Native clients send
-/// no `Origin`.
+/// and, when the browser sends one, a loopback `http(s)` `Origin` or the
+/// desktop app's fixed [`DESKTOP_APP_ORIGIN`] (defeats cross-site requests and
+/// WebSocket hijacking). `Origin: null` and `file://` are rejected: any web
+/// page can produce a `null` origin from a sandboxed iframe. The desktop app
+/// rewrites its own `null`/`file://` origins to [`DESKTOP_APP_ORIGIN`] before
+/// they leave the process. Native clients send no `Origin`.
 pub(crate) fn ensure_local_request(headers: &HeaderMap, uri: &Uri) -> Result<(), AppError> {
     if !has_loopback_host(headers, uri) {
         return Err(AppError::Unauthorized(
@@ -293,8 +295,13 @@ fn has_loopback_host(headers: &HeaderMap, uri: &Uri) -> bool {
     })
 }
 
+/// Origin the desktop app stamps on its own requests (it rewrites the `null`
+/// and `file://` origins of its packaged pages to this value). Web pages
+/// cannot send it: browsers only emit serialized web origins.
+pub(crate) const DESKTOP_APP_ORIGIN: &str = "todex-desktop://app";
+
 fn is_local_origin(origin: &str) -> bool {
-    if origin == "null" || origin.starts_with("file://") {
+    if origin == DESKTOP_APP_ORIGIN {
         return true;
     }
     origin.parse::<Uri>().is_ok_and(|uri| {
