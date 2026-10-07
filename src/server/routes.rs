@@ -27,6 +27,7 @@ async fn transport_policy(
         axum::Json(serde_json::json!({
             "requiredProtocol": state.config.pairing_encryption.as_str(),
             "transportVersion": 2,
+            "sealedRevision": crate::transport_crypto::envelope::SEALED_REVISION,
         })),
     )
 }

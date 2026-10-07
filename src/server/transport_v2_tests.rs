@@ -27,10 +27,11 @@ use crate::transport_crypto::channel::{
     RecordCipher, SecureChannel, DIRECTION_DOWN, DIRECTION_UP, WS_CLOSE_CODE, WS_CLOSE_REASON,
 };
 use crate::transport_crypto::envelope::{
-    seal_record_stream, RecordStreamDecoder, SEALED_CONTENT_TYPE,
+    seal_record_stream, RecordStreamDecoder, SEALED_CONTENT_TYPE, SEALED_RESPONSE_CONTENT_TYPE,
 };
 use crate::transport_crypto::handshake::{
-    derive_keys, KeyScheduleInput, TransportKeys, REST_LABEL, WS_LABEL,
+    derive_keys, derive_rest_keys, KeyScheduleInput, RestKeys, TransportKeys,
+    RESPONSE_NONCE_LENGTH, REST_LABEL, WS_LABEL,
 };
 use crate::transport_crypto::{encode_b64, EncryptionProtocol, PairingKeys};
 
@@ -343,7 +344,7 @@ async fn ws_v2_round_trips_over_a_real_socket_and_closes_4400_on_tampering() {
 pub(crate) struct SealedRequest {
     pub headers: Vec<(&'static str, String)>,
     pub body: Vec<u8>,
-    down: RecordCipher,
+    down: RestKeys,
 }
 
 pub(crate) fn encode_inner(head: &Value, body: &[u8]) -> Vec<u8> {
@@ -354,6 +355,27 @@ pub(crate) fn encode_inner(head: &Value, body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The client's REST keys for one request.
+fn client_rest_keys(
+    keys: &PairingKeys,
+    protocol: EncryptionProtocol,
+    material: &[u8],
+    shared: &[u8],
+    client_nonce: &[u8],
+) -> RestKeys {
+    derive_rest_keys(&KeyScheduleInput {
+        label: REST_LABEL,
+        protocol,
+        device_id: "",
+        server_static_public: keys.static_public(protocol),
+        client_material: material,
+        client_nonce,
+        server_nonce: &[],
+        shared,
+    })
+    .unwrap()
+}
+
 pub(crate) fn seal_request(
     keys: &PairingKeys,
     protocol: EncryptionProtocol,
@@ -361,16 +383,7 @@ pub(crate) fn seal_request(
 ) -> SealedRequest {
     let (material, shared) = client_handshake(keys, protocol);
     let nonce = random_nonce();
-    let session = client_keys(
-        keys,
-        protocol,
-        REST_LABEL,
-        "",
-        &material,
-        &shared,
-        &nonce,
-        &[],
-    );
+    let session = client_rest_keys(keys, protocol, &material, &shared, &nonce);
     let mut up = RecordCipher::new(&session.k_up, &session.th, DIRECTION_UP);
     let material_header = match protocol {
         EncryptionProtocol::X25519 => "x-todex-client-key",
@@ -383,9 +396,10 @@ pub(crate) fn seal_request(
             ("x-todex-encryption", protocol.as_str().to_owned()),
             (material_header, encode_b64(&material)),
             ("x-todex-request-nonce", encode_b64(&nonce)),
+            ("x-todex-sealed-revision", "2".to_owned()),
         ],
         body: seal_record_stream(&mut up, plaintext).unwrap(),
-        down: RecordCipher::new(&session.k_down, &session.th, DIRECTION_DOWN),
+        down: session,
     }
 }
 
@@ -409,12 +423,22 @@ pub(crate) struct OpenedResponse {
     pub status: u16,
     pub headers: Value,
     pub body: Vec<u8>,
+    pub response_nonce: Vec<u8>,
 }
 
-pub(crate) fn open_response(down: RecordCipher, stream: &[u8]) -> OpenedResponse {
-    let mut decoder = RecordStreamDecoder::new(down);
+/// The response cipher once the response nonce in front of the records is
+/// known; `prk` is gone afterwards.
+fn response_cipher(keys: RestKeys, nonce: &[u8]) -> RecordCipher {
+    let nonce: [u8; RESPONSE_NONCE_LENGTH] = nonce.try_into().unwrap();
+    let (th, k_down) = keys.into_k_down(&nonce).unwrap();
+    RecordCipher::new(&k_down, &th, DIRECTION_DOWN)
+}
+
+pub(crate) fn open_response(down: RestKeys, stream: &[u8]) -> OpenedResponse {
+    let (nonce, records) = stream.split_at(RESPONSE_NONCE_LENGTH);
+    let mut decoder = RecordStreamDecoder::new(response_cipher(down, nonce));
     let mut plaintext = Vec::new();
-    decoder.push(stream, &mut plaintext).unwrap();
+    decoder.push(records, &mut plaintext).unwrap();
     decoder.finish().unwrap();
     let length = u32::from_be_bytes(plaintext[..4].try_into().unwrap()) as usize;
     let head: Value = serde_json::from_slice(&plaintext[4..4 + length]).unwrap();
@@ -422,11 +446,12 @@ pub(crate) fn open_response(down: RecordCipher, stream: &[u8]) -> OpenedResponse
         status: head["status"].as_u64().unwrap() as u16,
         headers: head["headers"].clone(),
         body: plaintext[4 + length..].to_vec(),
+        response_nonce: nonce.to_vec(),
     }
 }
 
 impl SealedRequest {
-    pub(crate) async fn send(self, address: SocketAddr) -> (reqwest::Response, RecordCipher) {
+    pub(crate) async fn send(self, address: SocketAddr) -> (reqwest::Response, RestKeys) {
         let mut request = reqwest::Client::new()
             .post(format!("http://{address}/v2/sealed"))
             .body(self.body);
@@ -439,7 +464,10 @@ impl SealedRequest {
     pub(crate) async fn send_and_open(self, address: SocketAddr) -> OpenedResponse {
         let (response, down) = self.send(address).await;
         assert_eq!(response.status(), 200);
-        assert_eq!(response.headers()["content-type"], SEALED_CONTENT_TYPE);
+        assert_eq!(
+            response.headers()["content-type"],
+            SEALED_RESPONSE_CONTENT_TYPE
+        );
         assert_eq!(response.headers()["cache-control"], "no-store");
         open_response(down, &response.bytes().await.unwrap())
     }
@@ -705,7 +733,7 @@ async fn sealed_tunnel_filters_headers_marks_requests_and_streams_bodies() {
     assert!(opened.body[..50_000].iter().all(|byte| *byte == 0));
     assert!(opened.body[100_000..].iter().all(|byte| *byte == 2));
     // Records follow the producer's chunks: more than one record.
-    assert!(bytes.len() > 150_000 + 2 * 20);
+    assert!(bytes.len() > RESPONSE_NONCE_LENGTH + 150_000 + 2 * 20);
 
     // A failing inner body never gets a final record.
     let inner = encode_inner(
@@ -716,7 +744,9 @@ async fn sealed_tunnel_filters_headers_marks_requests_and_streams_bodies() {
     let (response, down) = call(seal_request(&keys, EncryptionProtocol::X25519, &inner)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
-    let mut decoder = RecordStreamDecoder::new(down);
+    // The response nonce arrives first, on its own.
+    let nonce = body.next().await.unwrap().unwrap();
+    let mut decoder = RecordStreamDecoder::new(response_cipher(down, &nonce));
     let mut plaintext = Vec::new();
     let mut failed = false;
     while let Some(chunk) = body.next().await {
@@ -1076,5 +1106,298 @@ async fn key_reset_switches_pairing_and_handshake_together() {
             .await
             .status,
         200
+    );
+}
+
+/// Sealed revision 2: the outer request must say so, every response starts
+/// with a fresh response nonce, and a replayed request gets a new key.
+#[tokio::test]
+async fn sealed_revision_2_requires_the_header_and_freshens_every_response_key() {
+    let server = TestServer::start(PairingEncryption::X25519).await;
+    let keys = server.state.pairing_keys.current().unwrap();
+    let protocol = EncryptionProtocol::X25519;
+    let app = super::router(server.state.clone());
+    let peer: SocketAddr = "192.0.2.20:7000".parse().unwrap();
+    let build = |headers: &[(&'static str, String)], body: Body| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v2/sealed")
+            .extension(ConnectInfo(peer));
+        for (name, value) in headers {
+            request = request.header(*name, value);
+        }
+        request.body(body).unwrap()
+    };
+    // Without the revision header (or with another revision) the server
+    // answers a plain 426 before it reads the body: this body would fail.
+    let version = encode_inner(
+        &json!({"method": "GET", "path": "/v2/version", "headers": {}}),
+        &[],
+    );
+    for revision in [None, Some("1"), Some("3")] {
+        let sealed = seal_request(&keys, protocol, &version);
+        let mut headers = sealed.headers.clone();
+        headers.retain(|(name, _)| *name != "x-todex-sealed-revision");
+        if let Some(revision) = revision {
+            headers.push(("x-todex-sealed-revision", revision.to_owned()));
+        }
+        let unread = Body::from_stream(futures_util::stream::iter([Err::<Bytes, _>(
+            std::io::Error::other("the body must not be read"),
+        )]));
+        let (status, body) = oneshot_status(&app, build(&headers, unread)).await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "{revision:?}");
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "PROTOCOL_UPGRADE_REQUIRED");
+    }
+
+    // The same captured request twice: both answer, under different nonces.
+    let sealed = seal_request(&keys, protocol, &version);
+    let replay_headers = sealed.headers.clone();
+    let replay_body = sealed.body.clone();
+    let mut nonces = Vec::new();
+    let mut down = Some(sealed.down);
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(build(&replay_headers, Body::from(replay_body.clone())))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            SEALED_RESPONSE_CONTENT_TYPE
+        );
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        nonces.push(bytes[..RESPONSE_NONCE_LENGTH].to_vec());
+        if let Some(keys) = down.take() {
+            let opened = open_response(keys, &bytes);
+            assert_eq!(opened.status, 200);
+            assert_eq!(opened.response_nonce, nonces[0]);
+        }
+    }
+    assert_ne!(nonces[0], nonces[1]);
+
+    // A response sealed under the old `k_down` (label || "/down", no nonce)
+    // does not open with the revision 2 key, and vice versa.
+    let (material, shared) = client_handshake(&keys, protocol);
+    let client_nonce = random_nonce();
+    let legacy = client_keys(
+        &keys,
+        protocol,
+        REST_LABEL,
+        "",
+        &material,
+        &shared,
+        &client_nonce,
+        &[],
+    );
+    let rest = client_rest_keys(&keys, protocol, &material, &shared, &client_nonce);
+    assert_eq!(legacy.k_up.as_slice(), rest.k_up.as_slice());
+    let mut legacy_down = RecordCipher::new(&legacy.k_down, &legacy.th, DIRECTION_DOWN);
+    let stream = seal_record_stream(&mut legacy_down, b"\0\0\0\x02{}").unwrap();
+    let nonce = [7_u8; RESPONSE_NONCE_LENGTH];
+    let mut decoder = RecordStreamDecoder::new(response_cipher(rest, &nonce));
+    assert!(decoder.push(&stream, &mut Vec::new()).is_err());
+
+    // The policy advertises the revision.
+    let request = Request::builder()
+        .uri("/v2/transport-policy")
+        .extension(ConnectInfo(peer))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = oneshot_status(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let policy: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(policy["sealedRevision"], 2);
+    assert_eq!(policy["transportVersion"], 2);
+}
+
+/// Body that delivers `first` and then never ends.
+fn stalled_body(first: &[u8]) -> Body {
+    Body::from_stream(
+        futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::copy_from_slice(first))])
+            .chain(futures_util::stream::pending()),
+    )
+}
+
+/// The first wire record of a sealed request (it carries the inner head).
+fn first_record(sealed: &SealedRequest) -> Vec<u8> {
+    let length = u32::from_be_bytes(sealed.body[..4].try_into().unwrap()) as usize;
+    assert!(4 + length < sealed.body.len(), "needs more than one record");
+    sealed.body[..4 + length].to_vec()
+}
+
+#[tokio::test]
+async fn tunnel_admission_bounds_time_and_keeps_public_and_signed_pools_apart() {
+    let server = TestServer::start(PairingEncryption::X25519).await;
+    let keys = server.state.pairing_keys.current().unwrap();
+    let protocol = EncryptionProtocol::X25519;
+    let device = TestDevice::new(38);
+    device.enroll(&server.root.join("data"));
+    let api = Router::new()
+        .route("/probe", any(probe))
+        .route("/v2/version", get(|| async { "version" }));
+    let limits = super::sealed::TunnelLimits {
+        head_deadline: Duration::from_millis(400),
+        // Longer than the permit wait, so a stalled holder keeps its slot
+        // until the waiter gives up.
+        idle_timeout: Duration::from_millis(800),
+        permit_wait: Duration::from_millis(200),
+    };
+    let app = super::sealed::routes_with_limits(api, server.state.clone(), limits, 1);
+    let peer: SocketAddr = "192.0.2.21:7001".parse().unwrap();
+    let send = |sealed: &SealedRequest, body: Body| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v2/sealed")
+            .extension(ConnectInfo(peer));
+        for (name, value) in &sealed.headers {
+            request = request.header(*name, value);
+        }
+        app.clone().oneshot(request.body(body).unwrap())
+    };
+    let open = |response: Response, down: RestKeys| async move {
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        open_response(down, &bytes)
+    };
+    let large = vec![b'x'; 100_000];
+
+    // Nothing arrives: the inner head is never decrypted, a plain 400.
+    let sealed = seal_request(
+        &keys,
+        protocol,
+        &signed_inner(&device, "PUT", "/probe", &large),
+    );
+    let started = std::time::Instant::now();
+    let response = send(&sealed, stalled_body(&[])).await.unwrap();
+    expect_outer_failure_response(response).await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // A slow drip that keeps the connection busy but never completes the
+    // head still hits the head deadline.
+    let sealed = seal_request(
+        &keys,
+        protocol,
+        &signed_inner(&device, "PUT", "/probe", &large),
+    );
+    let drip = futures_util::stream::iter(sealed.body.clone().into_iter().take(64)).then(
+        |byte| async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<_, std::io::Error>(Bytes::from(vec![byte]))
+        },
+    );
+    let response = send(&sealed, Body::from_stream(drip)).await.unwrap();
+    expect_outer_failure_response(response).await;
+
+    // The head arrives, then the body stalls: a sealed 408.
+    let sealed = seal_request(
+        &keys,
+        protocol,
+        &signed_inner(&device, "PUT", "/probe", &large),
+    );
+    let response = send(&sealed, stalled_body(&first_record(&sealed)))
+        .await
+        .unwrap();
+    let opened = open(response, sealed.down).await;
+    assert_eq!(opened.status, 408);
+    let error: Value = serde_json::from_slice(&opened.body).unwrap();
+    assert_eq!(error["code"], "REQUEST_TIMEOUT");
+
+    // One signed slot: while it is held, a second signed request waits and
+    // then gets a sealed 503 TRANSPORT_BUSY without running.
+    let holder = seal_request(
+        &keys,
+        protocol,
+        &signed_inner(&device, "PUT", "/probe", &large),
+    );
+    let held = tokio::spawn(send(&holder, stalled_body(&first_record(&holder))));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let inner = signed_inner(&device, "POST", "/probe", b"once");
+    let busy = seal_request(&keys, protocol, &inner);
+    let opened = open(
+        send(&busy, Body::from(busy.body.clone())).await.unwrap(),
+        busy.down,
+    )
+    .await;
+    assert_eq!(opened.status, 503);
+    assert_eq!(opened.headers["retry-after"], "1");
+    let error: Value = serde_json::from_slice(&opened.body).unwrap();
+    assert_eq!(error["code"], "TRANSPORT_BUSY");
+
+    // Public routes have their own pool: they still answer meanwhile.
+    let version = encode_inner(
+        &json!({"method": "GET", "path": "/v2/version", "headers": {}}),
+        &[],
+    );
+    let public = seal_request(&keys, protocol, &version);
+    let opened = open(
+        send(&public, Body::from(public.body.clone()))
+            .await
+            .unwrap(),
+        public.down,
+    )
+    .await;
+    assert_eq!(opened.status, 200);
+    assert_eq!(opened.body, b"version");
+
+    // The holder times out (408) and frees the slot; the refused request
+    // was never run, so the same signed inner request still works.
+    let opened = open(held.await.unwrap().unwrap(), holder.down).await;
+    assert_eq!(opened.status, 408);
+    let retry = seal_request(&keys, protocol, &inner);
+    let opened = open(
+        send(&retry, Body::from(retry.body.clone())).await.unwrap(),
+        retry.down,
+    )
+    .await;
+    assert_eq!(opened.status, 200);
+    let seen: Value = serde_json::from_slice(&opened.body).unwrap();
+    assert_eq!(seen["body"], "once");
+
+    // Four stalled public requests fill the public pool; a fifth is busy
+    // while a signed request is unaffected.
+    let public_large = encode_inner(
+        &json!({"method": "POST", "path": "/v2/version", "headers": {}}),
+        &vec![b'p'; 65_500],
+    );
+    let mut stalled = Vec::new();
+    for _ in 0..4 {
+        let sealed = seal_request(&keys, protocol, &public_large);
+        let body = stalled_body(&first_record(&sealed));
+        stalled.push(tokio::spawn(send(&sealed, body)));
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let fifth = seal_request(&keys, protocol, &version);
+    let opened = open(
+        send(&fifth, Body::from(fifth.body.clone())).await.unwrap(),
+        fifth.down,
+    )
+    .await;
+    assert_eq!(opened.status, 503);
+    let signed = seal_request(
+        &keys,
+        protocol,
+        &signed_inner(&device, "GET", "/probe", &[]),
+    );
+    let opened = open(
+        send(&signed, Body::from(signed.body.clone()))
+            .await
+            .unwrap(),
+        signed.down,
+    )
+    .await;
+    assert_eq!(opened.status, 200);
+    for task in stalled {
+        assert_eq!(task.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+}
+
+async fn expect_outer_failure_response(response: Response) {
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"code": "TRANSPORT_CRYPTO_FAILED", "message": "transport crypto failure"})
     );
 }

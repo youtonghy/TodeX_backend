@@ -4,9 +4,13 @@
 //! `k_up`. The inner request runs through the same router as a direct
 //! request (device auth, per-route body limits, handlers) and its response
 //! streams back sealed with `k_down`, record by record as the inner body is
-//! produced. Any problem with the outer request answers a plain
-//! `400 TRANSPORT_CRYPTO_FAILED` without detail.
+//! produced, behind a fresh 32-byte response nonce (sealed revision 2). Any
+//! problem with the outer request answers a plain
+//! `400 TRANSPORT_CRYPTO_FAILED` without detail; an outer request without
+//! `X-Todex-Sealed-Revision: 2` answers a plain `426` before its body is read.
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Request, State};
@@ -15,7 +19,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use futures_util::StreamExt;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use rand_core::{OsRng, RngCore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 use tower::ServiceExt;
 use tracing::debug;
 
@@ -27,9 +33,9 @@ use crate::transport_crypto::channel::{RecordCipher, DIRECTION_DOWN, DIRECTION_U
 use crate::transport_crypto::envelope::{
     encode_response_head, parse_inner_head, sealed_stream_length, InnerRequestHead,
     InnerResponseHead, RecordStreamDecoder, RecordStreamSealer, MAX_HEAD_BYTES,
-    SEALED_CONTENT_TYPE, SEALED_PATH,
+    SEALED_CONTENT_TYPE, SEALED_PATH, SEALED_RESPONSE_CONTENT_TYPE, SEALED_REVISION,
 };
-use crate::transport_crypto::handshake::{decode_b64url, REST_LABEL};
+use crate::transport_crypto::handshake::{decode_b64url, RESPONSE_NONCE_LENGTH};
 use crate::transport_crypto::{EncryptionProtocol, TransportCryptoError};
 
 const HEADER_TRANSPORT: &str = "x-todex-transport";
@@ -37,6 +43,7 @@ const HEADER_ENCRYPTION: &str = "x-todex-encryption";
 const HEADER_CLIENT_KEY: &str = "x-todex-client-key";
 const HEADER_KEM_CIPHERTEXT: &str = "x-todex-kem-ciphertext";
 const HEADER_REQUEST_NONCE: &str = "x-todex-request-nonce";
+const HEADER_SEALED_REVISION: &str = "x-todex-sealed-revision";
 
 /// Largest inner plaintext: the head plus the largest body device auth
 /// buffers (every route-level limit is below it).
@@ -48,12 +55,37 @@ const MAX_OUTER_BODY: usize = sealed_stream_length(MAX_INNER_PLAINTEXT);
 /// (see [`is_public_route`]). Their real bodies are small JSON documents.
 const PUBLIC_INNER_BODY_MAX: usize = 64 * 1024;
 
-/// Tunnel requests that may buffer an inner body at the same time. Only
-/// requests whose inner head passed [`admit`] wait for a permit, so peers
-/// without a credential cannot occupy one; a request holds it until the
-/// inner handler has produced its response head.
-const MAX_CONCURRENT_SEALED: usize = 32;
-static SEALED_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_SEALED);
+/// Tunnel requests with a device credential that may buffer an inner body
+/// at the same time. Only requests whose inner head passed [`admit`] wait
+/// for a permit, so peers without a credential cannot occupy one; a request
+/// holds it until the inner handler has produced its response head.
+const AUTHENTICATED_PERMITS: usize = 32;
+/// The same for public inner routes (no credential): a separate, small pool,
+/// so anonymous peers cannot take slots from paired devices.
+const PUBLIC_PERMITS: usize = 4;
+
+/// Time limits that keep a tunnel request from holding the daemon.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TunnelLimits {
+    /// From the start of the request until the inner head is decrypted;
+    /// past it the request fails as an outer `400`.
+    pub head_deadline: Duration,
+    /// Longest gap between two outer body chunks. Before the inner head:
+    /// outer `400`; after it: sealed inner `408 REQUEST_TIMEOUT`.
+    pub idle_timeout: Duration,
+    /// Longest wait for a permit; then sealed inner `503 TRANSPORT_BUSY`.
+    pub permit_wait: Duration,
+}
+
+impl Default for TunnelLimits {
+    fn default() -> Self {
+        Self {
+            head_deadline: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(30),
+            permit_wait: Duration::from_secs(10),
+        }
+    }
+}
 
 /// Inner request headers the tunnel forwards; everything else (hop-by-hop
 /// headers, `x-todex-transport*`, cookies, ...) is dropped.
@@ -91,16 +123,47 @@ struct SealedState {
     /// even be routed.
     api: Router,
     state: AppState,
+    limits: TunnelLimits,
+    authenticated_permits: Arc<Semaphore>,
+    public_permits: Arc<Semaphore>,
 }
 
 pub(super) fn routes(api: Router, state: AppState) -> Router {
+    routes_with_limits(api, state, TunnelLimits::default(), AUTHENTICATED_PERMITS)
+}
+
+/// [`routes`] with explicit limits and authenticated pool size (tests).
+pub(super) fn routes_with_limits(
+    api: Router,
+    state: AppState,
+    limits: TunnelLimits,
+    authenticated_permits: usize,
+) -> Router {
     Router::new()
         .route(SEALED_PATH, post(sealed))
-        .with_state(SealedState { api, state })
+        .with_state(SealedState {
+            api,
+            state,
+            limits,
+            authenticated_permits: Arc::new(Semaphore::new(authenticated_permits)),
+            public_permits: Arc::new(Semaphore::new(PUBLIC_PERMITS)),
+        })
 }
 
 async fn sealed(State(sealed): State<SealedState>, request: Request) -> Response {
-    let (opened, down) = match open_request(&sealed.state, request).await {
+    // Checked before anything else, so an older client learns that it must
+    // update instead of failing to decrypt the response.
+    let revision = request
+        .headers()
+        .get(HEADER_SEALED_REVISION)
+        .and_then(|value| value.to_str().ok());
+    if revision != Some(SEALED_REVISION.to_string().as_str()) {
+        return AppError::ProtocolUpgradeRequired(format!(
+            "this server speaks sealed revision {SEALED_REVISION}; update the client (X-Todex-Sealed-Revision: {SEALED_REVISION})"
+        ))
+        .into_response();
+    }
+    let (opened, down) = match open_request(&sealed, request).await {
         Ok(opened) => opened,
         Err(error) => {
             debug!(reason = error.reason(), "sealed request rejected");
@@ -132,11 +195,19 @@ async fn sealed(State(sealed): State<SealedState>, request: Request) -> Response
 
 /// What an opened tunnel request turns into.
 enum Opened {
-    /// The complete inner request, holding a [`SEALED_PERMITS`] permit.
-    Forward(Request, SemaphorePermit<'static>),
-    /// The inner head alone was enough to refuse the request; the error is
-    /// sealed like any inner response.
+    /// The complete inner request, holding a permit from its pool.
+    Forward(Request, OwnedSemaphorePermit),
+    /// The request was refused without running it (by the inner head
+    /// alone, no free permit, or a stalled body); the error is sealed like
+    /// any inner response.
     Rejected(AppError),
+}
+
+/// The response half of a tunnel request: a fresh response nonce and the
+/// `k_down` cipher derived from it.
+struct ResponseKeys {
+    nonce: [u8; RESPONSE_NONCE_LENGTH],
+    cipher: RecordCipher,
 }
 
 /// Routes that answer without a device credential (compare
@@ -153,9 +224,12 @@ fn is_public_route(path: &str) -> bool {
 /// peer cannot make the daemon buffer a large inner body. Returns the inner
 /// body limit. The full signature check over the body still runs in the
 /// router's device auth middleware.
-fn admit(state: &AppState, parts: &InnerParts) -> Result<usize, AppError> {
+fn admit(state: &AppState, parts: &InnerParts) -> Result<Admission, AppError> {
     if is_public_route(parts.uri.path()) {
-        return Ok(PUBLIC_INNER_BODY_MAX);
+        return Ok(Admission {
+            body_limit: PUBLIC_INNER_BODY_MAX,
+            public: true,
+        });
     }
     if state.config.security.enable_auth {
         state
@@ -164,7 +238,16 @@ fn admit(state: &AppState, parts: &InnerParts) -> Result<usize, AppError> {
     } else {
         device_auth::ensure_local_request(&parts.headers, &parts.uri)?;
     }
-    Ok(device_auth::MAX_AUTH_BODY)
+    Ok(Admission {
+        body_limit: device_auth::MAX_AUTH_BODY,
+        public: false,
+    })
+}
+
+/// The inner body limit and permit pool of an admitted inner head.
+struct Admission {
+    body_limit: usize,
+    public: bool,
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, TransportCryptoError> {
@@ -184,11 +267,14 @@ fn is_sealed_content_type(headers: &HeaderMap) -> bool {
 }
 
 /// Checks the outer headers, runs the key agreement, opens the record stream
-/// and builds the inner request. Returns the response cipher.
+/// and builds the inner request. Returns the response keys.
 async fn open_request(
-    state: &AppState,
+    sealed: &SealedState,
     request: Request,
-) -> Result<(Opened, RecordCipher), TransportCryptoError> {
+) -> Result<(Opened, ResponseKeys), TransportCryptoError> {
+    let started = Instant::now();
+    let state = &sealed.state;
+    let limits = sealed.limits;
     let (parts, body) = request.into_parts();
     let headers = &parts.headers;
     if !is_sealed_content_type(headers) || header(headers, HEADER_TRANSPORT)? != "2" {
@@ -214,38 +300,53 @@ async fn open_request(
         tracing::warn!(%error, "pairing keys unavailable; refusing sealed request");
         TransportCryptoError::new("pairing keys unavailable")
     })?;
-    let keys = pairing_keys.server_session_keys(
-        REST_LABEL,
-        protocol,
-        "",
-        &material,
-        &client_nonce,
-        &[],
-    )?;
+    let keys = pairing_keys.server_rest_keys(protocol, &material, &client_nonce)?;
     let mut decoder =
         RecordStreamDecoder::new(RecordCipher::new(&keys.k_up, &keys.th, DIRECTION_UP));
-    let down = RecordCipher::new(&keys.k_down, &keys.th, DIRECTION_DOWN);
-    drop(keys);
+    // Every response, sealed inner errors included, gets its own nonce and
+    // therefore its own key, even when the request is a replay. Deriving it
+    // now lets `prk` be wiped right away.
+    let mut nonce = [0_u8; RESPONSE_NONCE_LENGTH];
+    OsRng.fill_bytes(&mut nonce);
+    let (th, k_down) = keys.into_k_down(&nonce)?;
+    let down = ResponseKeys {
+        nonce,
+        cipher: RecordCipher::new(&k_down, &th, DIRECTION_DOWN),
+    };
+    drop((th, k_down));
 
+    let head_deadline = started + limits.head_deadline;
     let mut received = 0_usize;
     let mut plaintext = Vec::new();
     // Set once the inner head is decrypted and admitted.
-    let mut admitted: Option<(InnerParts, usize, usize, SemaphorePermit<'static>)> = None;
+    let mut admitted: Option<(InnerParts, usize, usize, OwnedSemaphorePermit)> = None;
     let mut stream = body.into_data_stream();
     loop {
         if admitted.is_none() {
             if let Some((head, head_end)) = parse_inner_head(&plaintext)? {
                 let inner = inner_parts(head, &parts.headers)?;
-                let body_limit = match admit(state, &inner) {
-                    Ok(limit) => limit,
+                let admission = match admit(state, &inner) {
+                    Ok(admission) => admission,
                     // Stop reading: the rest of the outer body is dropped.
                     Err(error) => return Ok((Opened::Rejected(error), down)),
                 };
-                let permit = SEALED_PERMITS
-                    .acquire()
-                    .await
-                    .map_err(|_| TransportCryptoError::new("tunnel closed"))?;
-                admitted = Some((inner, head_end, body_limit, permit));
+                let pool = if admission.public {
+                    &sealed.public_permits
+                } else {
+                    &sealed.authenticated_permits
+                };
+                let permit = match tokio::time::timeout(
+                    limits.permit_wait,
+                    Arc::clone(pool).acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => return Err(TransportCryptoError::new("tunnel closed")),
+                    // Nothing ran and no signature nonce was claimed.
+                    Err(_) => return Ok((Opened::Rejected(AppError::TransportBusy), down)),
+                };
+                admitted = Some((inner, head_end, admission.body_limit, permit));
             }
         }
         if let Some((_, head_end, body_limit, _)) = &admitted {
@@ -253,7 +354,20 @@ async fn open_request(
                 return Err(TransportCryptoError::new("inner body too large"));
             }
         }
-        let Some(chunk) = stream.next().await else {
+        let idle_deadline = Instant::now() + limits.idle_timeout;
+        let deadline = if admitted.is_some() {
+            idle_deadline
+        } else {
+            idle_deadline.min(head_deadline)
+        };
+        let next = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(next) => next,
+            Err(_) if admitted.is_some() => {
+                return Ok((Opened::Rejected(AppError::RequestTimeout), down))
+            }
+            Err(_) => return Err(TransportCryptoError::new("inner head not received in time")),
+        };
+        let Some(chunk) = next else {
             break;
         };
         let chunk = chunk.map_err(|_| TransportCryptoError::new("outer body read"))?;
@@ -353,9 +467,10 @@ pub(crate) fn peer_address(extensions: &axum::http::Extensions) -> Option<Socket
         })
 }
 
-/// `200 application/vnd.todex.sealed` whose body is the inner response
-/// sealed record by record as the inner body streams.
-fn seal_response(response: Response, down: RecordCipher) -> Result<Response, TransportCryptoError> {
+/// `200 application/vnd.todex.sealed; r=2` whose body is the response nonce
+/// followed by the inner response sealed record by record as the inner body
+/// streams.
+fn seal_response(response: Response, down: ResponseKeys) -> Result<Response, TransportCryptoError> {
     let (parts, body) = response.into_parts();
     let mut headers = std::collections::BTreeMap::<String, String>::new();
     for (name, value) in &parts.headers {
@@ -382,8 +497,9 @@ fn seal_response(response: Response, down: RecordCipher) -> Result<Response, Tra
         status: parts.status.as_u16(),
         headers,
     })?;
-    let sealer = RecordStreamSealer::new(down, head);
-    let stream = futures_util::stream::unfold(
+    let ResponseKeys { nonce, cipher } = down;
+    let sealer = RecordStreamSealer::new(cipher, head);
+    let records = futures_util::stream::unfold(
         Some((body.into_data_stream(), sealer)),
         |state| async move {
             let (mut inner, mut sealer) = state?;
@@ -410,9 +526,13 @@ fn seal_response(response: Response, down: RecordCipher) -> Result<Response, Tra
             }
         },
     );
+    let stream = futures_util::stream::once(async move {
+        Ok::<_, std::io::Error>(Bytes::copy_from_slice(&nonce))
+    })
+    .chain(records);
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, SEALED_CONTENT_TYPE)
+        .header(header::CONTENT_TYPE, SEALED_RESPONSE_CONTENT_TYPE)
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
         .map_err(|_| TransportCryptoError::new("outer response"))

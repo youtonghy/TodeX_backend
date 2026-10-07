@@ -1,4 +1,8 @@
-use axum::{http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    http::{header, HeaderValue, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use serde_json::json;
 
 #[derive(Debug, thiserror::Error)]
@@ -8,6 +12,12 @@ pub enum AppError {
     InvalidRequest(String),
     #[error("authentication required")]
     Unauthenticated,
+    /// The device credential's timestamp is outside the accepted window
+    /// (more than 300 s from the server clock, or older than the daemon's
+    /// start). The response carries `serverTime` (Unix seconds) so a client
+    /// can correct its clock offset and sign again.
+    #[error("the request timestamp is outside the accepted window; check the device clock")]
+    AuthTimestampRejected { server_time: u64 },
     #[error("access denied: {0}")]
     Unauthorized(String),
     #[error("workspace path does not exist")]
@@ -50,6 +60,24 @@ pub enum AppError {
     TurnCancelled,
     #[error("resource capacity exhausted: {0}")]
     ResourceExhausted(String),
+    /// Too many requests from one caller; `Retry-After` says when to retry.
+    #[error("rate limited: {message}")]
+    RateLimited {
+        message: String,
+        retry_after_secs: u64,
+    },
+    /// Device pairing has no room for another unfinished request from this
+    /// source (or at all).
+    #[error("device pairing is busy: {0}")]
+    PairingBusy(String),
+    /// The transport v2 tunnel had no free slot within its wait limit. The
+    /// inner request was not run and its signature nonce was not claimed,
+    /// so the client may retry it once with a fresh signature.
+    #[error("the server is busy; retry shortly")]
+    TransportBusy,
+    /// The request body stopped arriving before it was complete.
+    #[error("the request body was not received in time")]
+    RequestTimeout,
     /// Retired: history has no size limit since storage v3. Kept so the
     /// code stays reserved for clients that still map it.
     #[allow(dead_code)]
@@ -119,6 +147,7 @@ impl AppError {
         match self {
             Self::InvalidRequest(_) => "INVALID_REQUEST",
             Self::Unauthenticated => "UNAUTHENTICATED",
+            Self::AuthTimestampRejected { .. } => "AUTH_TIMESTAMP_REJECTED",
             Self::Unauthorized(_) => "UNAUTHORIZED",
             Self::WorkspacePathNotFound => "WORKSPACE_PATH_NOT_FOUND",
             Self::WorkspacePathOutsideRoot => "WORKSPACE_PATH_OUTSIDE_ROOT",
@@ -138,6 +167,10 @@ impl AppError {
             Self::Conflict(_) => "CONFLICT",
             Self::TurnCancelled => "TURN_CANCELLED",
             Self::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
+            Self::RateLimited { .. } => "RATE_LIMITED",
+            Self::PairingBusy(_) => "PAIRING_BUSY",
+            Self::TransportBusy => "TRANSPORT_BUSY",
+            Self::RequestTimeout => "REQUEST_TIMEOUT",
             Self::JournalFull(_) => "JOURNAL_FULL",
             Self::ClientUpgradeRequired(_) => "CLIENT_UPGRADE_REQUIRED",
             Self::ProtocolUpgradeRequired(_) => "PROTOCOL_UPGRADE_REQUIRED",
@@ -165,7 +198,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let status = match self {
             Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-            Self::Unauthenticated => StatusCode::UNAUTHORIZED,
+            Self::Unauthenticated | Self::AuthTimestampRejected { .. } => StatusCode::UNAUTHORIZED,
             Self::Unauthorized(_) => StatusCode::FORBIDDEN,
             Self::WorkspacePathNotFound => StatusCode::NOT_FOUND,
             Self::WorkspacePathOutsideRoot => StatusCode::FORBIDDEN,
@@ -183,7 +216,11 @@ impl IntoResponse for AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::TurnCancelled => StatusCode::CONFLICT,
-            Self::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::ResourceExhausted(_) | Self::RateLimited { .. } | Self::PairingBusy(_) => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
+            Self::TransportBusy => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::JournalFull(_) | Self::StorageLow(_) => StatusCode::INSUFFICIENT_STORAGE,
             Self::ClientUpgradeRequired(_) | Self::ProtocolUpgradeRequired(_) => {
                 StatusCode::UPGRADE_REQUIRED
@@ -201,14 +238,27 @@ impl IntoResponse for AppError {
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        (
-            status,
-            Json(json!({
-                "code": self.code(),
-                "message": self.to_string(),
-            })),
-        )
-            .into_response()
+        let mut body = json!({
+            "code": self.code(),
+            "message": self.to_string(),
+        });
+        if let Self::AuthTimestampRejected { server_time } = self {
+            body["serverTime"] = json!(server_time);
+        }
+        let retry_after = match &self {
+            Self::RateLimited {
+                retry_after_secs, ..
+            } => Some((*retry_after_secs).max(1)),
+            Self::TransportBusy => Some(1),
+            _ => None,
+        };
+        let mut response = (status, Json(body)).into_response();
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        response
     }
 }
 
@@ -226,6 +276,73 @@ mod tests {
         ] {
             assert_eq!(error.code(), code);
             assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+        }
+    }
+
+    async fn body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn timestamp_rejection_carries_the_server_time_at_the_top_level() {
+        let response = AppError::AuthTimestampRejected { server_time: 42 }.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let value = body(response).await;
+        assert_eq!(value["code"], "AUTH_TIMESTAMP_REJECTED");
+        assert_eq!(value["serverTime"], 42);
+        assert!(value["message"].is_string());
+        // No other error grows the field.
+        assert!(body(AppError::Unauthenticated.into_response())
+            .await
+            .get("serverTime")
+            .is_none());
+    }
+
+    #[test]
+    fn busy_and_rate_limited_answers_say_when_to_retry() {
+        for (error, status, code, retry) in [
+            (
+                AppError::TransportBusy,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "TRANSPORT_BUSY",
+                Some("1"),
+            ),
+            (
+                AppError::RateLimited {
+                    message: "x".to_owned(),
+                    retry_after_secs: 7,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                Some("7"),
+            ),
+            (
+                AppError::PairingBusy("x".to_owned()),
+                StatusCode::TOO_MANY_REQUESTS,
+                "PAIRING_BUSY",
+                None,
+            ),
+            (
+                AppError::RequestTimeout,
+                StatusCode::REQUEST_TIMEOUT,
+                "REQUEST_TIMEOUT",
+                None,
+            ),
+        ] {
+            assert_eq!(error.code(), code);
+            let response = error.into_response();
+            assert_eq!(response.status(), status, "{code}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .map(|value| value.to_str().unwrap()),
+                retry,
+                "{code}"
+            );
         }
     }
 }

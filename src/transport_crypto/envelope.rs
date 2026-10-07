@@ -15,7 +15,14 @@ const RECORD_CIPHERTEXT_MAX: usize = RECORD_PLAINTEXT_MAX + TAG_LENGTH;
 /// Wire overhead of one record: the length prefix plus the tag.
 pub(crate) const RECORD_OVERHEAD: usize = 4 + TAG_LENGTH;
 pub(crate) const MAX_HEAD_BYTES: usize = 65_536;
+/// Media type of a sealed request; sealed responses add the `r` parameter.
 pub(crate) const SEALED_CONTENT_TYPE: &str = "application/vnd.todex.sealed";
+/// The sealed revision this server speaks: responses start with a 32-byte
+/// response nonce that the response key mixes in (`docs/transport-v2.md`).
+pub(crate) const SEALED_REVISION: u8 = 2;
+/// `Content-Type` of a sealed response. Clients decrypt only a `200` with
+/// exactly this revision.
+pub(crate) const SEALED_RESPONSE_CONTENT_TYPE: &str = "application/vnd.todex.sealed; r=2";
 pub(crate) const SEALED_PATH: &str = "/v2/sealed";
 
 /// Wire size of a record stream carrying `plaintext` bytes.

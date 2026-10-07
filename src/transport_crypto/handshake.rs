@@ -6,8 +6,13 @@
 //!                 LP(client_nonce) || LP(server_nonce))
 //! prk    = HKDF-Extract(salt = th, ikm = shared)
 //! k_up   = HKDF-Expand(prk, label || "/up",   32)
-//! k_down = HKDF-Expand(prk, label || "/down", 32)
+//! k_down = HKDF-Expand(prk, label || "/down", 32)                    (WebSocket)
+//! k_down = HKDF-Expand(prk, label || "/down" || response_nonce, 32)  (REST, sealed revision 2)
 //! ```
+//!
+//! REST has no round trip for a server nonce, so the server mixes a fresh
+//! 32-byte `response_nonce` into every response key instead and sends it in
+//! front of the response records.
 use hkdf::Hkdf;
 use pqcrypto_mlkem::mlkem768;
 use pqcrypto_traits::kem::{Ciphertext as MlKemCiphertext, SharedSecret as MlKemSharedSecret};
@@ -23,6 +28,8 @@ pub(crate) const REST_LABEL: &str = "todex.transport.v2/rest";
 /// Client and server nonces are 32 random bytes (the REST server nonce is
 /// empty).
 pub(crate) const NONCE_LENGTH: usize = 32;
+/// REST response nonces (sealed revision 2) are 32 random bytes too.
+pub(crate) const RESPONSE_NONCE_LENGTH: usize = 32;
 const KEY_LENGTH: usize = 32;
 const ML_KEM_768_CIPHERTEXT_LENGTH: usize = 1088;
 
@@ -79,22 +86,80 @@ pub(crate) fn transcript_hash(input: &KeyScheduleInput<'_>) -> Zeroizing<[u8; 32
     Zeroizing::new(hasher.finalize().into())
 }
 
+/// `th` and `prk = HKDF-Extract(salt = th, ikm = shared)`.
+fn extract(input: &KeyScheduleInput<'_>) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+    let th = transcript_hash(input);
+    let (prk, _) = Hkdf::<Sha256>::extract(Some(th.as_slice()), input.shared);
+    let mut out = Zeroizing::new([0_u8; 32]);
+    out.copy_from_slice(prk.as_slice());
+    // `GenericArray` has no zeroize support; wipe the returned copy.
+    let mut prk = prk;
+    zeroize::Zeroize::zeroize(prk.as_mut_slice());
+    (th, out)
+}
+
+/// `HKDF-Expand(prk, concat(info), 32)`. hkdf 0.12 keeps the HMAC state of
+/// `prk` in a value it does not zeroize; it lives only for this call.
+fn expand(
+    prk: &[u8; 32],
+    info: &[&[u8]],
+) -> Result<Zeroizing<[u8; KEY_LENGTH]>, TransportCryptoError> {
+    let hkdf =
+        Hkdf::<Sha256>::from_prk(prk).map_err(|_| TransportCryptoError::new("key derivation"))?;
+    let mut key = Zeroizing::new([0_u8; KEY_LENGTH]);
+    hkdf.expand_multi_info(info, key.as_mut_slice())
+        .map_err(|_| TransportCryptoError::new("key derivation"))?;
+    Ok(key)
+}
+
+/// WebSocket key schedule: both directions from the handshake alone.
 pub(crate) fn derive_keys(
     input: &KeyScheduleInput<'_>,
 ) -> Result<TransportKeys, TransportCryptoError> {
-    let th = transcript_hash(input);
-    let hkdf = Hkdf::<Sha256>::new(Some(th.as_slice()), input.shared);
-    let expand = |suffix: &str| -> Result<Zeroizing<[u8; KEY_LENGTH]>, TransportCryptoError> {
-        let mut key = Zeroizing::new([0_u8; KEY_LENGTH]);
-        let info = [input.label.as_bytes(), suffix.as_bytes()].concat();
-        hkdf.expand(&info, key.as_mut_slice())
-            .map_err(|_| TransportCryptoError::new("key derivation"))?;
-        Ok(key)
-    };
+    let (th, prk) = extract(input);
+    let label = input.label.as_bytes();
     Ok(TransportKeys {
-        k_up: expand("/up")?,
-        k_down: expand("/down")?,
+        k_up: expand(&prk, &[label, b"/up"])?,
+        k_down: expand(&prk, &[label, b"/down"])?,
         th,
+    })
+}
+
+/// REST key schedule before the response nonce is known: `th`, `k_up`, and
+/// `prk` for [`RestKeys::k_down`]. Everything is wiped on drop.
+pub(crate) struct RestKeys {
+    pub th: Zeroizing<[u8; 32]>,
+    pub k_up: Zeroizing<[u8; KEY_LENGTH]>,
+    prk: Zeroizing<[u8; 32]>,
+}
+
+impl RestKeys {
+    /// `k_down = HKDF-Expand(prk, label || "/down" || response_nonce, 32)`.
+    /// Consumes the keys, so `prk` is wiped once the response key exists.
+    pub(crate) fn into_k_down(
+        self,
+        response_nonce: &[u8; RESPONSE_NONCE_LENGTH],
+    ) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; KEY_LENGTH]>), TransportCryptoError> {
+        let k_down = expand(
+            &self.prk,
+            &[REST_LABEL.as_bytes(), b"/down", response_nonce],
+        )?;
+        Ok((self.th, k_down))
+    }
+}
+
+/// REST key schedule (`label` is [`REST_LABEL`]).
+pub(crate) fn derive_rest_keys(
+    input: &KeyScheduleInput<'_>,
+) -> Result<RestKeys, TransportCryptoError> {
+    if input.label != REST_LABEL {
+        return Err(TransportCryptoError::new("rest key schedule label"));
+    }
+    let (th, prk) = extract(input);
+    Ok(RestKeys {
+        k_up: expand(&prk, &[REST_LABEL.as_bytes(), b"/up"])?,
+        th,
+        prk,
     })
 }
 
@@ -151,7 +216,8 @@ impl PairingKeys {
         }
     }
 
-    /// Agreement plus key schedule for one server-side session.
+    /// Agreement plus the WebSocket key schedule for one server-side
+    /// session.
     pub(crate) fn server_session_keys(
         &self,
         label: &str,
@@ -161,11 +227,52 @@ impl PairingKeys {
         client_nonce: &[u8],
         server_nonce: &[u8],
     ) -> Result<TransportKeys, TransportCryptoError> {
+        self.server_schedule(
+            label,
+            protocol,
+            device_id,
+            client_material,
+            client_nonce,
+            server_nonce,
+            derive_keys,
+        )
+    }
+
+    /// Agreement plus the REST key schedule for one tunnel request
+    /// (empty device id and server nonce).
+    pub(crate) fn server_rest_keys(
+        &self,
+        protocol: EncryptionProtocol,
+        client_material: &[u8],
+        client_nonce: &[u8],
+    ) -> Result<RestKeys, TransportCryptoError> {
+        self.server_schedule(
+            REST_LABEL,
+            protocol,
+            "",
+            client_material,
+            client_nonce,
+            &[],
+            derive_rest_keys,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn server_schedule<T>(
+        &self,
+        label: &str,
+        protocol: EncryptionProtocol,
+        device_id: &str,
+        client_material: &[u8],
+        client_nonce: &[u8],
+        server_nonce: &[u8],
+        schedule: fn(&KeyScheduleInput<'_>) -> Result<T, TransportCryptoError>,
+    ) -> Result<T, TransportCryptoError> {
         if client_nonce.len() != NONCE_LENGTH {
             return Err(TransportCryptoError::new("client nonce length"));
         }
         let shared = self.agree(protocol, client_material)?;
-        derive_keys(&KeyScheduleInput {
+        schedule(&KeyScheduleInput {
             label,
             protocol,
             device_id,
