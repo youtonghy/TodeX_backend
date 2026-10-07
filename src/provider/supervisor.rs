@@ -784,15 +784,15 @@ impl ConversationSupervisor {
         self.registry.descriptors()
     }
 
-    /// The `/v2/providers` list, in `ProviderKind` order. Capability probes
-    /// run first so each entry reflects them.
+    /// The `/v2/providers` list, in `ProviderKind` order. Each driver's
+    /// capability probes (cached, single-flight) run first, all drivers in
+    /// parallel, so each entry reflects them.
     pub async fn providers_snapshot(&self) -> Vec<ProviderSnapshot> {
-        let mut providers = Vec::new();
-        for driver in self.registry.drivers() {
+        futures_util::future::join_all(self.registry.drivers().map(|driver| async move {
             driver.refresh_control_capabilities().await;
-            providers.push(ProviderSnapshot::of(driver.as_ref()));
-        }
-        providers
+            ProviderSnapshot::of(driver.as_ref())
+        }))
+        .await
     }
 
     pub fn has_active_turns(&self) -> bool {

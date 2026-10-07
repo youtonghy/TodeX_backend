@@ -154,6 +154,57 @@ pub fn endpoint_credentials(settings: &Value) -> (Option<String>, Option<String>
     (base_url, api_key)
 }
 
+pub(super) struct Projection;
+
+impl super::ExclusiveProjection for Projection {
+    fn read_live(&self, dirs: &AgentDirs) -> Result<Option<Value>, AppError> {
+        read_live(dirs)
+    }
+
+    fn write_live(
+        &self,
+        dirs: &AgentDirs,
+        settings: &Value,
+        remove_auth: bool,
+    ) -> Result<(), AppError> {
+        write_live(dirs, settings, remove_auth)
+    }
+
+    fn live_matches(&self, live: &Value, settings: &Value) -> bool {
+        live_matches(live, settings)
+    }
+
+    fn has_auth_file(&self) -> bool {
+        true
+    }
+
+    /// Grok Build refreshes session tokens inside `auth.json` in the
+    /// background; rewriting the live files for an unchanged profile keeps
+    /// the live tokens of the same account instead of restoring the stored
+    /// (possibly rotated) ones.
+    fn carry_live_auth(
+        &self,
+        dirs: &AgentDirs,
+        settings: &mut Value,
+        stored: &Value,
+    ) -> Result<(), AppError> {
+        carry_live_auth(settings, stored, read_live(dirs)?.as_ref());
+        Ok(())
+    }
+
+    fn masked_settings(&self, settings: &Value) -> Value {
+        masked_settings(settings)
+    }
+
+    fn toml_header_tables(&self) -> Option<&'static [&'static str]> {
+        Some(HEADER_TABLES)
+    }
+
+    fn endpoint_credentials(&self, settings: &Value) -> (Option<String>, Option<String>) {
+        endpoint_credentials(settings)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,56 +306,5 @@ mod tests {
         // Session-only profiles expose no public-API credentials.
         let settings = json!({ "auth": session_auth("u1", "tok"), "config": "" });
         assert_eq!(endpoint_credentials(&settings), (None, None));
-    }
-}
-
-pub(super) struct Projection;
-
-impl super::ExclusiveProjection for Projection {
-    fn read_live(&self, dirs: &AgentDirs) -> Result<Option<Value>, AppError> {
-        read_live(dirs)
-    }
-
-    fn write_live(
-        &self,
-        dirs: &AgentDirs,
-        settings: &Value,
-        remove_auth: bool,
-    ) -> Result<(), AppError> {
-        write_live(dirs, settings, remove_auth)
-    }
-
-    fn live_matches(&self, live: &Value, settings: &Value) -> bool {
-        live_matches(live, settings)
-    }
-
-    fn has_auth_file(&self) -> bool {
-        true
-    }
-
-    /// Grok Build refreshes session tokens inside `auth.json` in the
-    /// background; rewriting the live files for an unchanged profile keeps
-    /// the live tokens of the same account instead of restoring the stored
-    /// (possibly rotated) ones.
-    fn carry_live_auth(
-        &self,
-        dirs: &AgentDirs,
-        settings: &mut Value,
-        stored: &Value,
-    ) -> Result<(), AppError> {
-        carry_live_auth(settings, stored, read_live(dirs)?.as_ref());
-        Ok(())
-    }
-
-    fn masked_settings(&self, settings: &Value) -> Value {
-        masked_settings(settings)
-    }
-
-    fn toml_header_tables(&self) -> Option<&'static [&'static str]> {
-        Some(HEADER_TABLES)
-    }
-
-    fn endpoint_credentials(&self, settings: &Value) -> (Option<String>, Option<String>) {
-        endpoint_credentials(settings)
     }
 }

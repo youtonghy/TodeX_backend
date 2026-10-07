@@ -12,6 +12,7 @@ use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{run_acp_turn_controlled, AcpConnectionState, AcpRuntimeOptions};
+use super::discovery::CatalogCache;
 use super::process::{
     executable_available, redact_sensitive_text, run_bounded_command, CommandSpec, JsonLineProcess,
 };
@@ -65,7 +66,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         idle: Some(Duration::from_secs(300)),
         max_sessions: 32,
     },
-    discovery_cache_ttl: None,
+    discovery_cache_ttl: Some(Duration::from_secs(60)),
     catalog: CatalogProfile {
         source: CatalogSource::NativeInspect,
         ..CatalogProfile::skills_only(
@@ -83,6 +84,8 @@ pub struct GrokBuildDriver {
     auth_method: Option<String>,
     env_allowlist: Vec<String>,
     sessions: Mutex<HashMap<String, GrokSessionHandle>>,
+    models: CatalogCache<Vec<ProviderModelDescriptor>>,
+    commands: CatalogCache<Vec<ProviderCommandDescriptor>>,
 }
 
 #[derive(Clone)]
@@ -110,6 +113,8 @@ impl GrokBuildDriver {
             auth_method: config.grok_auth_method.clone(),
             env_allowlist: config.grok_env_allowlist.clone(),
             sessions: Mutex::new(HashMap::new()),
+            models: CatalogCache::new(PROFILE.discovery_cache_ttl),
+            commands: CatalogCache::new(PROFILE.discovery_cache_ttl),
         }
     }
 
@@ -293,37 +298,41 @@ impl ProviderDriver for GrokBuildDriver {
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
-        Ok(parse_models(&self.initialize(workspace).await?))
+        let fetch = async { Ok(parse_models(&self.initialize(workspace).await?)) };
+        self.models.fetch(&self.binary, workspace, fetch).await
     }
 
     async fn discover_commands(
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
-        let mut process = JsonLineProcess::spawn(&self.command_spec(workspace, None)?).await?;
-        let result = async {
-            let initialize = initialize_process(&mut process).await?;
-            self.authenticate(&mut process, &initialize).await?;
-            let response = control_request(
-                &mut process,
-                "commands",
-                "_x.ai/commands/list",
-                json!({"cwd":workspace}),
-            )
-            .await?;
-            let commands = response
-                .get("commands")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    AppError::InvalidRequest("invalid Grok commands response".to_owned())
-                })?;
-            Ok(parse_commands(
-                &json!({"_meta":{"availableCommands":commands}}),
-            ))
-        }
-        .await;
-        process.terminate().await;
-        result
+        let fetch = async {
+            let mut process = JsonLineProcess::spawn(&self.command_spec(workspace, None)?).await?;
+            let result = async {
+                let initialize = initialize_process(&mut process).await?;
+                self.authenticate(&mut process, &initialize).await?;
+                let response = control_request(
+                    &mut process,
+                    "commands",
+                    "_x.ai/commands/list",
+                    json!({"cwd":workspace}),
+                )
+                .await?;
+                let commands = response
+                    .get("commands")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        AppError::InvalidRequest("invalid Grok commands response".to_owned())
+                    })?;
+                Ok(parse_commands(
+                    &json!({"_meta":{"availableCommands":commands}}),
+                ))
+            }
+            .await;
+            process.terminate().await;
+            result
+        };
+        self.commands.fetch(&self.binary, workspace, fetch).await
     }
 
     async fn run_turn(
@@ -532,10 +541,27 @@ async fn control_request(
         .await
 }
 
+/// `grok inspect` reports skills and MCP servers together and clients load
+/// both catalogs at once; one spawn serves them for a short while.
+const INSPECT_CACHE_TTL: Duration = Duration::from_secs(15);
+static INSPECT_CACHE: std::sync::LazyLock<CatalogCache<Value>> =
+    std::sync::LazyLock::new(|| CatalogCache::new(Some(INSPECT_CACHE_TTL)));
+
+/// `grok inspect --json` for `workspace`.
 pub(crate) async fn inspect_grok(
     config: &AgentConfig,
     workspace: &Path,
 ) -> Result<Value, AppError> {
+    INSPECT_CACHE
+        .fetch(
+            &config.grok_bin,
+            workspace,
+            inspect_grok_uncached(config, workspace),
+        )
+        .await
+}
+
+async fn inspect_grok_uncached(config: &AgentConfig, workspace: &Path) -> Result<Value, AppError> {
     let mut spec = CommandSpec::new(&config.grok_bin, workspace);
     spec.args = vec![
         "--no-auto-update".to_owned(),
@@ -831,6 +857,8 @@ mod tests {
                 auth_method: None,
                 env_allowlist: vec![],
                 sessions: Mutex::new(HashMap::new()),
+                models: CatalogCache::new(None),
+                commands: CatalogCache::new(None),
             });
             let store = crate::conversation::ConversationStore::new(root.join("data"))
                 .await

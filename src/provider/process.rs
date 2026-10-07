@@ -623,6 +623,27 @@ pub(crate) fn same_executable(a: &str, b: &str) -> bool {
     canonical(a) == canonical(b)
 }
 
+/// Identity of an installed executable: an upgrade replaces the file (or
+/// repoints the symlink), which changes the canonical path, size or mtime.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ExecutableStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// The [`ExecutableStamp`] of `program` as it would be launched now.
+pub(crate) fn executable_stamp(program: &str) -> Option<ExecutableStamp> {
+    let resolved = resolve_executable(program)?;
+    let path = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+    let metadata = std::fs::metadata(&path).ok()?;
+    Some(ExecutableStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        path,
+    })
+}
+
 fn resolve_executable(program: &str) -> Option<PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 {

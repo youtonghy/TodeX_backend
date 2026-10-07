@@ -12,6 +12,7 @@ use crate::conversation::{DeltaFragment, PendingDelta, ProviderKind};
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
+use super::discovery::CatalogCache;
 use super::process::{
     executable_available, provider_exit_error, CommandSpec, JsonLineProcess, ProviderRead,
 };
@@ -61,7 +62,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         idle: None,
         max_sessions: 32,
     },
-    discovery_cache_ttl: None,
+    discovery_cache_ttl: Some(Duration::from_secs(60)),
     catalog: CatalogProfile {
         source: CatalogSource::Filesystem,
         config_home: ConfigHome {
@@ -82,6 +83,8 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
 pub struct PiDriver {
     binary: String,
     sessions: Arc<Mutex<HashMap<String, PiSessionHandle>>>,
+    models: CatalogCache<Vec<super::types::ProviderModelDescriptor>>,
+    commands: CatalogCache<Vec<ProviderCommandDescriptor>>,
 }
 
 #[derive(Clone)]
@@ -110,6 +113,8 @@ impl PiDriver {
         Self {
             binary: config.pi_bin.clone(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            models: CatalogCache::new(PROFILE.discovery_cache_ttl),
+            commands: CatalogCache::new(PROFILE.discovery_cache_ttl),
         }
     }
 
@@ -357,73 +362,79 @@ impl ProviderDriver for PiDriver {
         &self,
         workspace: &Path,
     ) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
-        let mut spec = CommandSpec::new(&self.binary, workspace);
-        spec.args = vec![
-            "--mode".to_owned(),
-            "rpc".to_owned(),
-            "--no-session".to_owned(),
-            "--approve".to_owned(),
-        ];
-        let mut process = JsonLineProcess::spawn(&spec).await?;
-        process
-            .send(&json!({"id":"models","type":"get_available_models"}))
-            .await?;
-        let response = loop {
-            let Some(value) = process.read().await? else {
-                return Err(AppError::ProviderUnavailable(
-                    "Pi RPC process closed stdout".to_owned(),
-                ));
+        let fetch = async {
+            let mut spec = CommandSpec::new(&self.binary, workspace);
+            spec.args = vec![
+                "--mode".to_owned(),
+                "rpc".to_owned(),
+                "--no-session".to_owned(),
+                "--approve".to_owned(),
+            ];
+            let mut process = JsonLineProcess::spawn(&spec).await?;
+            process
+                .send(&json!({"id":"models","type":"get_available_models"}))
+                .await?;
+            let response = loop {
+                let Some(value) = process.read().await? else {
+                    return Err(AppError::ProviderUnavailable(
+                        "Pi RPC process closed stdout".to_owned(),
+                    ));
+                };
+                if value.get("id").and_then(Value::as_str) == Some("models") {
+                    break value;
+                }
             };
-            if value.get("id").and_then(Value::as_str) == Some("models") {
-                break value;
+            if response.get("success").and_then(Value::as_bool) != Some(true) {
+                process.terminate().await;
+                return Err(pi_response_error(&response, "get_available_models"));
             }
-        };
-        if response.get("success").and_then(Value::as_bool) != Some(true) {
+            process
+                .send(&json!({"id":"state","type":"get_state"}))
+                .await?;
+            let state = loop {
+                let Some(value) = process.read().await? else {
+                    return Err(AppError::ProviderUnavailable(
+                        "Pi RPC process closed stdout".to_owned(),
+                    ));
+                };
+                if value.get("id").and_then(Value::as_str) == Some("state") {
+                    break value;
+                }
+            };
             process.terminate().await;
-            return Err(pi_response_error(&response, "get_available_models"));
-        }
-        process
-            .send(&json!({"id":"state","type":"get_state"}))
-            .await?;
-        let state = loop {
-            let Some(value) = process.read().await? else {
-                return Err(AppError::ProviderUnavailable(
-                    "Pi RPC process closed stdout".to_owned(),
-                ));
-            };
-            if value.get("id").and_then(Value::as_str) == Some("state") {
-                break value;
+            if state.get("success").and_then(Value::as_bool) != Some(true) {
+                return Err(pi_response_error(&state, "get_state"));
             }
+            Ok(parse_pi_models(&response, &state))
         };
-        process.terminate().await;
-        if state.get("success").and_then(Value::as_bool) != Some(true) {
-            return Err(pi_response_error(&state, "get_state"));
-        }
-        Ok(parse_pi_models(&response, &state))
+        self.models.fetch(&self.binary, workspace, fetch).await
     }
 
     async fn discover_commands(
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
-        let mut spec = CommandSpec::new(&self.binary, workspace);
-        spec.args = vec![
-            "--mode".to_owned(),
-            "rpc".to_owned(),
-            "--no-session".to_owned(),
-            "--approve".to_owned(),
-        ];
-        let mut process = JsonLineProcess::spawn(&spec).await?;
-        let response = {
-            let (_cancel, receiver) = watch::channel(false);
-            let mut rpc = PiRpc::new(&mut process, None, receiver);
-            rpc.process
-                .send(&json!({"id":"commands","type":"get_commands"}))
-                .await?;
-            rpc.wait_response("commands").await?
+        let fetch = async {
+            let mut spec = CommandSpec::new(&self.binary, workspace);
+            spec.args = vec![
+                "--mode".to_owned(),
+                "rpc".to_owned(),
+                "--no-session".to_owned(),
+                "--approve".to_owned(),
+            ];
+            let mut process = JsonLineProcess::spawn(&spec).await?;
+            let response = {
+                let (_cancel, receiver) = watch::channel(false);
+                let mut rpc = PiRpc::new(&mut process, None, receiver);
+                rpc.process
+                    .send(&json!({"id":"commands","type":"get_commands"}))
+                    .await?;
+                rpc.wait_response("commands").await?
+            };
+            process.terminate().await;
+            pi_commands(&response).await
         };
-        process.terminate().await;
-        pi_commands(&response).await
+        self.commands.fetch(&self.binary, workspace, fetch).await
     }
 
     async fn run_turn(
@@ -2865,6 +2876,8 @@ mod tests {
                 driver: Arc::new(PiDriver {
                     binary: script.display().to_string(),
                     sessions: Arc::new(Mutex::new(HashMap::new())),
+                    models: CatalogCache::new(None),
+                    commands: CatalogCache::new(None),
                 }),
                 store,
                 manifest,

@@ -5,6 +5,7 @@ mod claude;
 mod cli_manager;
 pub(crate) mod codex;
 mod devin;
+mod discovery;
 mod doctor;
 mod grok;
 pub(crate) mod mcp_injection;

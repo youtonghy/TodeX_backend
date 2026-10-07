@@ -23,6 +23,7 @@ use store::{AgentProviderBucket, AgentProviderStore};
 
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,34 @@ pub const SUPPORTED_AGENTS: [ProviderKind; 5] = [
 /// Sentinel written into responses in place of secret values. A write that
 /// carries this value keeps the previously stored secret.
 pub const MASKED_SECRET: &str = "__TODEX_MASKED__";
+
+/// Bumped whenever TodeX rewrites an agent's native config, so cached
+/// provider discovery (model catalogs, CLI inspection) keyed on it refreshes
+/// after an account or endpoint switch.
+#[cfg(not(test))]
+static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
+// Per test thread, so tests writing provider configs in parallel do not
+// invalidate each other's discovery caches.
+#[cfg(test)]
+thread_local! {
+    static CONFIG_REVISION: AtomicU64 = const { AtomicU64::new(0) };
+}
+
+fn with_config_revision<R>(read: impl FnOnce(&AtomicU64) -> R) -> R {
+    #[cfg(not(test))]
+    return read(&CONFIG_REVISION);
+    #[cfg(test)]
+    return CONFIG_REVISION.with(read);
+}
+
+/// The current managed-config revision.
+pub(crate) fn config_revision() -> u64 {
+    with_config_revision(|revision| revision.load(Ordering::Acquire))
+}
+
+pub(crate) fn bump_config_revision() {
+    with_config_revision(|revision| revision.fetch_add(1, Ordering::AcqRel));
+}
 
 /// Read one env value from the live Claude `settings.json`, so model
 /// discovery follows the currently activated provider rather than only the
@@ -833,7 +862,9 @@ fn write_live(
     settings: &Value,
     remove_auth: bool,
 ) -> Result<(), AppError> {
-    exclusive(agent)?.write_live(dirs, settings, remove_auth)
+    exclusive(agent)?.write_live(dirs, settings, remove_auth)?;
+    bump_config_revision();
+    Ok(())
 }
 
 fn additive_nodes(dirs: &AgentDirs, agent: ProviderKind) -> Result<Map<String, Value>, AppError> {
@@ -846,11 +877,15 @@ fn additive_upsert(
     id: &str,
     node: &Value,
 ) -> Result<(), AppError> {
-    additive(agent)?.upsert_provider(dirs, id, node)
+    additive(agent)?.upsert_provider(dirs, id, node)?;
+    bump_config_revision();
+    Ok(())
 }
 
 fn additive_remove(dirs: &AgentDirs, agent: ProviderKind, id: &str) -> Result<(), AppError> {
-    additive(agent)?.remove_provider(dirs, id)
+    additive(agent)?.remove_provider(dirs, id)?;
+    bump_config_revision();
+    Ok(())
 }
 
 fn additive_set_default(
@@ -859,7 +894,9 @@ fn additive_set_default(
     id: &str,
     model_id: &str,
 ) -> Result<(), AppError> {
-    additive(agent)?.set_default(dirs, id, model_id)
+    additive(agent)?.set_default(dirs, id, model_id)?;
+    bump_config_revision();
+    Ok(())
 }
 
 /// `{providerId, modelId}` of the native default selection.

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -15,6 +15,7 @@ use super::acp::{
     declares_session_fork, run_acp_turn_controlled, select_auth_method, AcpConnectionState,
     AcpRuntimeOptions, FORK_PROBE_TTL, INTERACTIVE_AUTH_TIMEOUT,
 };
+use super::discovery::{DiscoveryCache, DiscoveryKey, DiscoverySnapshot};
 use super::process::{executable_available, CommandSpec, JsonLineProcess};
 use super::profile::{
     CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
@@ -46,10 +47,6 @@ const COMMAND_DRAIN: Duration = Duration::from_millis(1500);
 /// Model/command discovery spawns an authenticated probe process; cache it so
 /// routine client refreshes do not re-authenticate on every query.
 const DISCOVERY_TTL: Duration = PROFILE.discovery_cache_ttl.unwrap();
-/// A sweep cut short by its budget is still cached briefly: re-probing on every
-/// query made each request pay the full ~17s probe under load, while a short
-/// lifetime still lets a later query fill in the missing thinking levels.
-const PARTIAL_DISCOVERY_TTL: Duration = Duration::from_secs(60);
 /// Concurrent probe sessions for the per-model `thought_level` sweep. `devin
 /// acp` serves config requests on different sessions in parallel: a 95-model
 /// catalog takes ~18s one model at a time and ~4s across eight sessions.
@@ -59,28 +56,6 @@ const THOUGHT_LEVEL_PROBE_LANES: usize = 8;
 const THOUGHT_LEVEL_PROBE_BUDGET: Duration = Duration::from_secs(15);
 /// Probe sessions are deleted best-effort right before the process exits.
 const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// One ACP discovery probe yields both the model and the command catalog, so
-/// ACP drivers cache them together per workspace.
-#[derive(Clone)]
-pub(super) struct DiscoverySnapshot {
-    pub(super) fetched_at: Instant,
-    pub(super) models: Vec<ProviderModelDescriptor>,
-    pub(super) commands: Vec<ProviderCommandDescriptor>,
-    /// Whether every per-model option probe answered.
-    pub(super) complete: bool,
-}
-
-impl DiscoverySnapshot {
-    pub(super) fn is_fresh(&self) -> bool {
-        let ttl = if self.complete {
-            DISCOVERY_TTL
-        } else {
-            PARTIAL_DISCOVERY_TTL
-        };
-        self.fetched_at.elapsed() < ttl
-    }
-}
 
 /// What Devin supports and how TodeX adapts to it.
 pub(super) const PROFILE: ProviderProfile = ProviderProfile {
@@ -141,11 +116,11 @@ pub struct DevinDriver {
     cli_credentials: bool,
     env_allowlist: Vec<String>,
     sessions: Mutex<HashMap<String, DevinSessionHandle>>,
-    discovery: Mutex<HashMap<PathBuf, DiscoverySnapshot>>,
+    discovery: DiscoveryCache<DiscoveryKey, DiscoverySnapshot>,
     /// Cached `sessionCapabilities.fork` probe: Devin exposes session forking
     /// over ACP only once the installed CLI implements `session/fork`, so the
     /// advertised capability tracks the installed binary.
-    fork_probe: std::sync::Mutex<Option<(bool, Instant)>>,
+    fork_probe: DiscoveryCache<(), bool>,
 }
 
 #[derive(Clone)]
@@ -175,8 +150,8 @@ impl DevinDriver {
             cli_credentials: cli_credentials_enabled(),
             env_allowlist: config.devin_env_allowlist.clone(),
             sessions: Mutex::new(HashMap::new()),
-            discovery: Mutex::new(HashMap::new()),
-            fork_probe: std::sync::Mutex::new(None),
+            discovery: DiscoveryCache::new(),
+            fork_probe: DiscoveryCache::new(),
         }
     }
 
@@ -361,31 +336,31 @@ impl DevinDriver {
     /// catalog; reuse it briefly so independent client queries share a single
     /// spawn (and a single interactive authentication when no key is set).
     async fn discovery_snapshot(&self, workspace: &Path) -> Result<DiscoverySnapshot, AppError> {
-        let mut cache = self.discovery.lock().await;
-        if let Some(snapshot) = cache.get(workspace).filter(|snapshot| snapshot.is_fresh()) {
-            return Ok(snapshot.clone());
-        }
-        let (mut process, session, updates) = self.session_probe(workspace).await?;
-        let mut models = parse_devin_models(&session);
-        let mut probe = DevinProbe::new(&mut process, &session);
-        let complete = probe_thought_levels(
-            &mut probe,
-            workspace,
-            &session,
-            &mut models,
-            tokio::time::Instant::now() + THOUGHT_LEVEL_PROBE_BUDGET,
-        )
-        .await;
-        probe.delete_sessions().await;
-        process.terminate().await;
-        let snapshot = DiscoverySnapshot {
-            fetched_at: Instant::now(),
-            models,
-            commands: parse_devin_commands(&updates),
-            complete,
-        };
-        cache.insert(workspace.to_path_buf(), snapshot.clone());
-        Ok(snapshot)
+        let key = DiscoveryKey::new(&self.binary, workspace);
+        self.discovery
+            .get_or_fetch(&key, || async {
+                let (mut process, session, updates) = self.session_probe(workspace).await?;
+                let mut models = parse_devin_models(&session);
+                let mut probe = DevinProbe::new(&mut process, &session);
+                let complete = probe_thought_levels(
+                    &mut probe,
+                    workspace,
+                    &session,
+                    &mut models,
+                    tokio::time::Instant::now() + THOUGHT_LEVEL_PROBE_BUDGET,
+                )
+                .await;
+                probe.delete_sessions().await;
+                process.terminate().await;
+                let snapshot = DiscoverySnapshot {
+                    models,
+                    commands: parse_devin_commands(&updates),
+                    complete,
+                };
+                let ttl = snapshot.ttl(DISCOVERY_TTL);
+                Ok((snapshot, ttl))
+            })
+            .await
     }
 }
 
@@ -474,25 +449,19 @@ impl ProviderDriver for DevinDriver {
     }
 
     async fn refresh_control_capabilities(&self) {
-        let stale = self
-            .fork_probe
-            .lock()
-            .map(|entry| entry.is_none_or(|(_, at)| at.elapsed() >= FORK_PROBE_TTL))
-            .unwrap_or(true);
-        if !stale || !executable_available(&self.binary) {
+        if self.fork_probe.is_fresh(&()) || !executable_available(&self.binary) {
             return;
         }
-        let capable = self.probe_fork_capability().await;
-        if let Ok(mut entry) = self.fork_probe.lock() {
-            *entry = Some((capable, Instant::now()));
-        }
+        let _ = self
+            .fork_probe
+            .get_or_fetch(&(), || async {
+                Ok((self.probe_fork_capability().await, FORK_PROBE_TTL))
+            })
+            .await;
     }
 
     fn supports_native_fork(&self) -> bool {
-        self.fork_probe
-            .lock()
-            .map(|entry| entry.is_some_and(|(capable, _)| capable))
-            .unwrap_or(false)
+        self.fork_probe.peek(&()).unwrap_or(false)
     }
 
     async fn fork_session(
@@ -516,9 +485,7 @@ impl ProviderDriver for DevinDriver {
         let result = async {
             let initialize = initialize_process(&mut process).await?;
             let capable = declares_session_fork(&initialize);
-            if let Ok(mut entry) = self.fork_probe.lock() {
-                *entry = Some((capable, Instant::now()));
-            }
+            self.fork_probe.insert(&(), capable, FORK_PROBE_TTL).await;
             if !capable {
                 return Err(AppError::Unsupported(
                     "Devin does not declare sessionCapabilities.fork".to_owned(),
@@ -1294,8 +1261,8 @@ mod tests {
             cli_credentials: false,
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
-            discovery: Mutex::new(HashMap::new()),
-            fork_probe: std::sync::Mutex::new(None),
+            discovery: DiscoveryCache::new(),
+            fork_probe: DiscoveryCache::new(),
         };
         assert_eq!(driver.api_key().unwrap(), None);
 
@@ -1308,8 +1275,8 @@ mod tests {
                 cli_credentials: false,
                 env_allowlist: Vec::new(),
                 sessions: Mutex::new(HashMap::new()),
-                discovery: Mutex::new(HashMap::new()),
-                fork_probe: std::sync::Mutex::new(None),
+                discovery: DiscoveryCache::new(),
+                fork_probe: DiscoveryCache::new(),
             }
         };
         assert!(driver.api_key().is_err());
@@ -1331,8 +1298,8 @@ mod tests {
             cli_credentials: false,
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
-            discovery: Mutex::new(HashMap::new()),
-            fork_probe: std::sync::Mutex::new(None),
+            discovery: DiscoveryCache::new(),
+            fork_probe: DiscoveryCache::new(),
         };
         assert_eq!(
             driver.auth_timeout().unwrap(),
@@ -1365,12 +1332,11 @@ mod tests {
             cli_credentials: false,
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
-            discovery: Mutex::new(HashMap::new()),
-            fork_probe: std::sync::Mutex::new(None),
+            discovery: DiscoveryCache::new(),
+            fork_probe: DiscoveryCache::new(),
         };
         let workspace = PathBuf::from("/tmp/todex-devin-discovery-test");
         let snapshot = DiscoverySnapshot {
-            fetched_at: Instant::now(),
             models: vec![ProviderModelDescriptor {
                 id: "swe-2-high".to_owned(),
                 display_name: "SWE 2 High".to_owned(),
@@ -1387,9 +1353,12 @@ mod tests {
         };
         driver
             .discovery
-            .lock()
-            .await
-            .insert(workspace.clone(), snapshot);
+            .insert(
+                &DiscoveryKey::new(&driver.binary, &workspace),
+                snapshot,
+                DISCOVERY_TTL,
+            )
+            .await;
         let models = driver.discover_models(&workspace).await.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "swe-2-high");
@@ -1397,17 +1366,13 @@ mod tests {
 
     #[test]
     fn partial_discovery_expires_before_complete_discovery() {
-        let Some(fetched_at) = Instant::now().checked_sub(PARTIAL_DISCOVERY_TTL * 2) else {
-            return;
-        };
         let snapshot = |complete| DiscoverySnapshot {
-            fetched_at,
             models: Vec::new(),
             commands: Vec::new(),
             complete,
         };
-        assert!(!snapshot(false).is_fresh());
-        assert!(snapshot(true).is_fresh());
+        assert!(snapshot(false).ttl(DISCOVERY_TTL) < snapshot(true).ttl(DISCOVERY_TTL));
+        assert_eq!(snapshot(true).ttl(DISCOVERY_TTL), DISCOVERY_TTL);
     }
 
     #[test]
@@ -1462,8 +1427,8 @@ mod tests {
             cli_credentials: false,
             env_allowlist: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
-            discovery: Mutex::new(HashMap::new()),
-            fork_probe: std::sync::Mutex::new(None),
+            discovery: DiscoveryCache::new(),
+            fork_probe: DiscoveryCache::new(),
         };
         (driver, root)
     }
@@ -1498,7 +1463,9 @@ mod tests {
                 assert!(model.supported_reasoning_efforts.is_empty(), "{}", model.id);
             }
         }
-        assert!(driver.discovery.lock().await.contains_key(&root));
+        assert!(driver
+            .discovery
+            .is_fresh(&DiscoveryKey::new(&driver.binary, &root)));
 
         assert_eq!(
             fixture_calls(&root, "session/new").len(),

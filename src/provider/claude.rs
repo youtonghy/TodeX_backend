@@ -13,6 +13,7 @@ use crate::conversation::ProviderKind;
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
+use super::discovery::CatalogCache;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::profile::{
     CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
@@ -55,7 +56,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     profile_required: false,
     recovery_full_scan: false,
     process_model: ProcessModel::PerTurn,
-    discovery_cache_ttl: None,
+    discovery_cache_ttl: Some(Duration::from_secs(60)),
     catalog: CatalogProfile {
         source: CatalogSource::Filesystem,
         config_home: ConfigHome {
@@ -80,6 +81,7 @@ pub struct ClaudeDriver {
     /// runtime, so this is the only place the live catalog survives between
     /// the per-turn process exits.
     catalogs: Mutex<HashMap<String, ProviderSessionCommands>>,
+    models: CatalogCache<Vec<super::types::ProviderModelDescriptor>>,
 }
 
 /// Claude Code accepts both family aliases (`opus`) and concrete model ids
@@ -407,6 +409,7 @@ impl ClaudeDriver {
         Self {
             binary: config.claude_bin.clone(),
             catalogs: Mutex::new(HashMap::new()),
+            models: CatalogCache::new(PROFILE.discovery_cache_ttl),
         }
     }
 }
@@ -429,74 +432,77 @@ impl ProviderDriver for ClaudeDriver {
 
     async fn discover_models(
         &self,
-        _workspace: &Path,
+        workspace: &Path,
     ) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
-        let Some(base) = claude_discovery_env("ANTHROPIC_BASE_URL") else {
-            return Ok(claude_model_aliases());
-        };
-        let Some(url) = claude_discovery_url(&base) else {
-            return Ok(claude_model_aliases());
-        };
-        let request = crate::agent_providers::http_client()?
-            .get(url)
-            .timeout(CLAUDE_DISCOVERY_TIMEOUT);
-        // Same headers Claude Code itself sends: ANTHROPIC_AUTH_TOKEN as a
-        // bearer token, taking precedence over ANTHROPIC_API_KEY (x-api-key).
-        let request = if let Some(token) = claude_discovery_env("ANTHROPIC_AUTH_TOKEN") {
-            request.bearer_auth(token)
-        } else if let Some(key) = claude_discovery_env("ANTHROPIC_API_KEY") {
-            request.header("x-api-key", key)
-        } else {
-            request
-        };
-        let response = request
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await
-            .map_err(|error| {
-                AppError::ProviderUnavailable(format!("Claude model discovery failed: {error}"))
+        let fetch = async {
+            let Some(base) = claude_discovery_env("ANTHROPIC_BASE_URL") else {
+                return Ok(claude_model_aliases());
+            };
+            let Some(url) = claude_discovery_url(&base) else {
+                return Ok(claude_model_aliases());
+            };
+            let request = crate::agent_providers::http_client()?
+                .get(url)
+                .timeout(CLAUDE_DISCOVERY_TIMEOUT);
+            // Same headers Claude Code itself sends: ANTHROPIC_AUTH_TOKEN as a
+            // bearer token, taking precedence over ANTHROPIC_API_KEY (x-api-key).
+            let request = if let Some(token) = claude_discovery_env("ANTHROPIC_AUTH_TOKEN") {
+                request.bearer_auth(token)
+            } else if let Some(key) = claude_discovery_env("ANTHROPIC_API_KEY") {
+                request.header("x-api-key", key)
+            } else {
+                request
+            };
+            let response = request
+                .header("anthropic-version", "2023-06-01")
+                .send()
+                .await
+                .map_err(|error| {
+                    AppError::ProviderUnavailable(format!("Claude model discovery failed: {error}"))
+                })?;
+            let payload: Value = response.json().await.map_err(|error| {
+                AppError::ProviderUnavailable(format!("Claude model catalog invalid: {error}"))
             })?;
-        let payload: Value = response.json().await.map_err(|error| {
-            AppError::ProviderUnavailable(format!("Claude model catalog invalid: {error}"))
-        })?;
-        let models = payload
-            .get("data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|item| {
-                let id = item.get("id").and_then(Value::as_str)?.to_owned();
-                let family = claude_model_family(&id);
-                let efforts = claude_discovered_efforts(&id);
-                Some(super::types::ProviderModelDescriptor {
-                    display_name: item
-                        .get("display_name")
-                        .or_else(|| item.get("displayName"))
-                        .and_then(Value::as_str)
-                        .unwrap_or(&id)
-                        .to_owned(),
-                    id,
-                    description: "Claude gateway model".to_owned(),
-                    is_default: false,
-                    supported_reasoning_efforts: efforts
-                        .iter()
-                        .map(|effort| effort.to_string())
-                        .collect(),
-                    default_reasoning_effort: None,
-                    context_window: item
-                        .get("context_window")
-                        .or_else(|| item.get("contextWindow"))
-                        .and_then(Value::as_u64),
-                    image_input: Some(true),
-                    family,
+            let models = payload
+                .get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| {
+                    let id = item.get("id").and_then(Value::as_str)?.to_owned();
+                    let family = claude_model_family(&id);
+                    let efforts = claude_discovered_efforts(&id);
+                    Some(super::types::ProviderModelDescriptor {
+                        display_name: item
+                            .get("display_name")
+                            .or_else(|| item.get("displayName"))
+                            .and_then(Value::as_str)
+                            .unwrap_or(&id)
+                            .to_owned(),
+                        id,
+                        description: "Claude gateway model".to_owned(),
+                        is_default: false,
+                        supported_reasoning_efforts: efforts
+                            .iter()
+                            .map(|effort| effort.to_string())
+                            .collect(),
+                        default_reasoning_effort: None,
+                        context_window: item
+                            .get("context_window")
+                            .or_else(|| item.get("contextWindow"))
+                            .and_then(Value::as_u64),
+                        image_input: Some(true),
+                        family,
+                    })
                 })
+                .collect::<Vec<_>>();
+            Ok(if models.is_empty() {
+                claude_model_aliases()
+            } else {
+                models
             })
-            .collect::<Vec<_>>();
-        Ok(if models.is_empty() {
-            claude_model_aliases()
-        } else {
-            models
-        })
+        };
+        self.models.fetch(&self.binary, workspace, fetch).await
     }
 
     // Claude startup can wait on MCP servers before answering initialize, so

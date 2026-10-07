@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -12,7 +12,7 @@ use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{run_acp_turn_controlled, AcpConnectionState, AcpRuntimeOptions};
-use super::devin::DiscoverySnapshot;
+use super::discovery::{DiscoveryCache, DiscoveryKey, DiscoverySnapshot};
 use super::process::{executable_available, CommandSpec, JsonLineProcess};
 use super::profile::{
     CatalogProfile, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel, ProviderProfile,
@@ -91,7 +91,7 @@ pub struct OpencodeDriver {
     binary: String,
     env_allowlist: Vec<String>,
     sessions: Mutex<HashMap<String, OpencodeSessionHandle>>,
-    discovery: Mutex<HashMap<PathBuf, DiscoverySnapshot>>,
+    discovery: DiscoveryCache<DiscoveryKey, DiscoverySnapshot>,
 }
 
 #[derive(Clone)]
@@ -118,7 +118,7 @@ impl OpencodeDriver {
             binary: config.opencode_bin.clone(),
             env_allowlist: config.opencode_env_allowlist.clone(),
             sessions: Mutex::new(HashMap::new()),
-            discovery: Mutex::new(HashMap::new()),
+            discovery: DiscoveryCache::new(),
         }
     }
 
@@ -205,38 +205,40 @@ impl OpencodeDriver {
 
     /// One probe yields both catalogs. Clients ask for models and commands
     /// together, so sharing a cached probe per workspace turns two 4-8s cold
-    /// spawns into one; the lock makes the second query wait for the first.
+    /// spawns into one; the cache makes the second query wait for the first.
     async fn discovery_snapshot(&self, workspace: &Path) -> Result<DiscoverySnapshot, AppError> {
-        let mut cache = self.discovery.lock().await;
-        if let Some(snapshot) = cache.get(workspace).filter(|snapshot| snapshot.is_fresh()) {
-            return Ok(snapshot.clone());
-        }
-        let (mut process, session, updates) = self.session_probe(workspace).await?;
-        let mut models = super::devin::parse_devin_models(&session);
-        let complete = probe_efforts(&mut process, &session, &mut models).await;
-        close_probe_session(&mut process, &session).await;
-        process.terminate().await;
-        let commands = updates
-            .iter()
-            .rev()
-            .find_map(|update| {
-                update
-                    .pointer("/update/availableCommands")
-                    .filter(|commands| commands.is_array())
-                    .cloned()
+        let key = DiscoveryKey::new(&self.binary, workspace);
+        self.discovery
+            .get_or_fetch(&key, || async {
+                let (mut process, session, updates) = self.session_probe(workspace).await?;
+                let mut models = super::devin::parse_devin_models(&session);
+                let complete = probe_efforts(&mut process, &session, &mut models).await;
+                close_probe_session(&mut process, &session).await;
+                process.terminate().await;
+                let commands = updates
+                    .iter()
+                    .rev()
+                    .find_map(|update| {
+                        update
+                            .pointer("/update/availableCommands")
+                            .filter(|commands| commands.is_array())
+                            .cloned()
+                    })
+                    .map(|commands| {
+                        super::grok::parse_commands(
+                            &json!({ "_meta": { "availableCommands": commands } }),
+                        )
+                    })
+                    .unwrap_or_default();
+                let snapshot = DiscoverySnapshot {
+                    models,
+                    commands,
+                    complete,
+                };
+                let ttl = snapshot.ttl(PROFILE.discovery_cache_ttl.unwrap());
+                Ok((snapshot, ttl))
             })
-            .map(|commands| {
-                super::grok::parse_commands(&json!({ "_meta": { "availableCommands": commands } }))
-            })
-            .unwrap_or_default();
-        let snapshot = DiscoverySnapshot {
-            fetched_at: Instant::now(),
-            models,
-            commands,
-            complete,
-        };
-        cache.insert(workspace.to_path_buf(), snapshot.clone());
-        Ok(snapshot)
+            .await
     }
 }
 
@@ -784,7 +786,7 @@ mod tests {
                 binary: binary.to_string_lossy().to_string(),
                 env_allowlist: vec![],
                 sessions: Mutex::new(HashMap::new()),
-                discovery: Mutex::new(HashMap::new()),
+                discovery: DiscoveryCache::new(),
             });
             let store = crate::conversation::ConversationStore::new(root.join("data"))
                 .await

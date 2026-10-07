@@ -8,7 +8,11 @@ use crate::conversation::ProviderKind;
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
-use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
+use super::discovery::CatalogCache;
+use super::process::{
+    executable_available, executable_stamp, provider_exit_error, CommandSpec, ExecutableStamp,
+    JsonLineProcess,
+};
 use super::profile::{
     CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
     ProviderProfile, SkillInjection, UserConfigFile,
@@ -57,7 +61,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         idle: Some(std::time::Duration::from_secs(300)),
         max_sessions: 64,
     },
-    discovery_cache_ttl: None,
+    discovery_cache_ttl: Some(std::time::Duration::from_secs(60)),
     catalog: CatalogProfile {
         source: CatalogSource::Filesystem,
         config_home: ConfigHome {
@@ -75,7 +79,50 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
 pub struct CodexDriver {
     binary: String,
     sessions: runtime::Sessions,
-    control_probe: tokio::sync::OnceCell<capabilities::ControlProbe>,
+    control_probe: ControlProbeCache,
+    models: CatalogCache<Vec<super::types::ProviderModelDescriptor>>,
+}
+
+/// The live-control probe of the installed CLI, repeated when the executable
+/// changes (an upgrade), one probe at a time.
+#[derive(Default)]
+struct ControlProbeCache {
+    current: std::sync::Mutex<Option<(Option<ExecutableStamp>, capabilities::ControlProbe)>>,
+    refresh: tokio::sync::Mutex<()>,
+}
+
+impl ControlProbeCache {
+    fn get(&self) -> Option<capabilities::ControlProbe> {
+        self.current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(_, probe)| probe.clone())
+    }
+
+    fn probed(&self, stamp: &Option<ExecutableStamp>) -> bool {
+        self.current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|(probed, _)| probed == stamp)
+    }
+
+    async fn refresh(&self, binary: &str) {
+        if self.probed(&executable_stamp(binary)) {
+            return;
+        }
+        let _refresh = self.refresh.lock().await;
+        let stamp = executable_stamp(binary);
+        if self.probed(&stamp) {
+            return;
+        }
+        let probe = capabilities::probe(binary).await;
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((stamp, probe));
+    }
 }
 
 impl CodexDriver {
@@ -83,7 +130,8 @@ impl CodexDriver {
         Self {
             binary: config.codex_bin.clone(),
             sessions: runtime::Sessions::new(),
-            control_probe: tokio::sync::OnceCell::new(),
+            control_probe: ControlProbeCache::default(),
+            models: CatalogCache::new(PROFILE.discovery_cache_ttl),
         }
     }
 }
@@ -91,15 +139,13 @@ impl CodexDriver {
 #[async_trait]
 impl ProviderDriver for CodexDriver {
     async fn refresh_control_capabilities(&self) {
-        self.control_probe
-            .get_or_init(|| capabilities::probe(&self.binary))
-            .await;
+        self.control_probe.refresh(&self.binary).await;
     }
     fn control_probe(&self) -> Option<Value> {
         Some(
             self.control_probe
                 .get()
-                .map(|probe| probe.diagnostic.clone())
+                .map(|probe| probe.diagnostic)
                 .unwrap_or_else(|| json!({"status":"notChecked","source":"installed-schema"})),
         )
     }
@@ -262,104 +308,107 @@ impl ProviderDriver for CodexDriver {
         &self,
         workspace: &Path,
     ) -> Result<Vec<super::types::ProviderModelDescriptor>, AppError> {
-        let mut spec = CommandSpec::new(&self.binary, workspace);
-        spec.args = vec![
-            "app-server".to_owned(),
-            "--listen".to_owned(),
-            "stdio://".to_owned(),
-        ];
-        let mut process = JsonLineProcess::spawn(&spec).await?;
-        process.send(&json!({"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"todex-agentd","version":crate::version::APP_VERSION}}})).await?;
-        let _ = read_rpc_response(&mut process, "initialize").await?;
-        process.send(&json!({ "method": "initialized" })).await?;
-        let result = async {
-            let mut items = Vec::new();
-            let mut cursor = Value::Null;
-            let mut seen = std::collections::HashSet::new();
-            loop {
-                process
-                    .send(&json!({"id":"models","method":"model/list",
+        let fetch = async {
+            let mut spec = CommandSpec::new(&self.binary, workspace);
+            spec.args = vec![
+                "app-server".to_owned(),
+                "--listen".to_owned(),
+                "stdio://".to_owned(),
+            ];
+            let mut process = JsonLineProcess::spawn(&spec).await?;
+            process.send(&json!({"id":"initialize","method":"initialize","params":{"clientInfo":{"name":"todex-agentd","version":crate::version::APP_VERSION}}})).await?;
+            let _ = read_rpc_response(&mut process, "initialize").await?;
+            process.send(&json!({ "method": "initialized" })).await?;
+            let result = async {
+                let mut items = Vec::new();
+                let mut cursor = Value::Null;
+                let mut seen = std::collections::HashSet::new();
+                loop {
+                    process
+                        .send(&json!({"id":"models","method":"model/list",
                     "params":{"includeHidden":false,"cursor":cursor}}))
-                    .await?;
-                let response = read_rpc_response(&mut process, "models").await?;
-                let page = response
-                    .get("data")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| {
-                        AppError::ProviderUnavailable(
-                            "Codex model catalog has no data array".to_owned(),
-                        )
-                    })?;
-                items.extend(page.iter().cloned());
-                match response
-                    .get("nextCursor")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                {
-                    None => break,
-                    Some(next) if seen.insert(next.to_owned()) => cursor = json!(next),
-                    Some(_) => {
-                        return Err(AppError::ProviderUnavailable(
-                            "Codex model catalog repeated a cursor".to_owned(),
-                        ))
+                        .await?;
+                    let response = read_rpc_response(&mut process, "models").await?;
+                    let page = response
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            AppError::ProviderUnavailable(
+                                "Codex model catalog has no data array".to_owned(),
+                            )
+                        })?;
+                    items.extend(page.iter().cloned());
+                    match response
+                        .get("nextCursor")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        None => break,
+                        Some(next) if seen.insert(next.to_owned()) => cursor = json!(next),
+                        Some(_) => {
+                            return Err(AppError::ProviderUnavailable(
+                                "Codex model catalog repeated a cursor".to_owned(),
+                            ))
+                        }
                     }
                 }
+                Ok::<_, AppError>(items)
             }
-            Ok::<_, AppError>(items)
-        }
-        .await;
-        process.terminate().await;
-        Ok(result?
-            .iter()
-            .filter_map(|item| {
-                let id = item
-                    .get("model")
-                    .or_else(|| item.get("id"))
-                    .and_then(Value::as_str)?
-                    .to_owned();
-                Some(super::types::ProviderModelDescriptor {
-                    id,
-                    display_name: item
-                        .get("displayName")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Codex model")
-                        .to_owned(),
-                    description: item
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    is_default: item
-                        .get("isDefault")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    supported_reasoning_efforts: item
-                        .get("supportedReasoningEfforts")
-                        .and_then(Value::as_array)
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|x| {
-                                    x.get("reasoningEffort")
-                                        .and_then(Value::as_str)
-                                        .map(ToOwned::to_owned)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    default_reasoning_effort: item
-                        .get("defaultReasoningEffort")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    context_window: None,
-                    image_input: item
-                        .get("inputModalities")
-                        .and_then(Value::as_array)
-                        .map(|items| items.iter().any(|value| value.as_str() == Some("image"))),
-                    family: None,
+            .await;
+            process.terminate().await;
+            Ok(result?
+                .iter()
+                .filter_map(|item| {
+                    let id = item
+                        .get("model")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)?
+                        .to_owned();
+                    Some(super::types::ProviderModelDescriptor {
+                        id,
+                        display_name: item
+                            .get("displayName")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Codex model")
+                            .to_owned(),
+                        description: item
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        is_default: item
+                            .get("isDefault")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        supported_reasoning_efforts: item
+                            .get("supportedReasoningEfforts")
+                            .and_then(Value::as_array)
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(|x| {
+                                        x.get("reasoningEffort")
+                                            .and_then(Value::as_str)
+                                            .map(ToOwned::to_owned)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        default_reasoning_effort: item
+                            .get("defaultReasoningEffort")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        context_window: None,
+                        image_input: item
+                            .get("inputModalities")
+                            .and_then(Value::as_array)
+                            .map(|items| items.iter().any(|value| value.as_str() == Some("image"))),
+                        family: None,
+                    })
                 })
-            })
-            .collect())
+                .collect())
+        };
+        self.models.fetch(&self.binary, workspace, fetch).await
     }
 
     async fn discover_commands(
@@ -1770,7 +1819,8 @@ done
         let driver = CodexDriver {
             binary: script.display().to_string(),
             sessions: runtime::Sessions::new(),
-            control_probe: tokio::sync::OnceCell::new(),
+            control_probe: ControlProbeCache::default(),
+            models: CatalogCache::new(PROFILE.discovery_cache_ttl),
         };
         let catalog = driver.discover_models(&root).await.unwrap();
         assert_eq!(catalog.len(), 2);
@@ -1840,7 +1890,8 @@ done
         let driver = CodexDriver {
             binary: script.display().to_string(),
             sessions: runtime::Sessions::new(),
-            control_probe: tokio::sync::OnceCell::new(),
+            control_probe: ControlProbeCache::default(),
+            models: CatalogCache::new(PROFILE.discovery_cache_ttl),
         };
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut provider_state = ProviderState::new(ProviderKind::Codex);

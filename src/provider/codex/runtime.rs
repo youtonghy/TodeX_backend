@@ -780,7 +780,8 @@ done
         let driver = Arc::new(CodexDriver {
             binary: script.display().to_string(),
             sessions: Sessions::new(),
-            control_probe: tokio::sync::OnceCell::new(),
+            control_probe: ControlProbeCache::default(),
+            models: CatalogCache::new(None),
         });
         let prompt = DriverPrompt {
             turn_id: "local-turn".into(),

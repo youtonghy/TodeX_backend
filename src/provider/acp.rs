@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use agent_client_protocol::schema::{
     v1::{
@@ -15,7 +15,6 @@ use agent_client_protocol::schema::{
     ProtocolVersion,
 };
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 
@@ -24,6 +23,7 @@ use crate::conversation::ProviderKind;
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
+use super::discovery::DiscoveryCache;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
 use super::profile::{
     CatalogProfile, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel, ProviderProfile,
@@ -81,9 +81,9 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
 pub struct AcpDriver {
     profiles: BTreeMap<String, AcpProfileConfig>,
     /// Per-profile `sessionCapabilities.fork` probe results: profile name →
-    /// (declared fork support, probed at). Populated by
-    /// `refresh_control_capabilities` and `fork_session`.
-    fork_probe: DashMap<String, (bool, Instant)>,
+    /// declared fork support. Populated by `refresh_control_capabilities`
+    /// and `fork_session`.
+    fork_probe: DiscoveryCache<String, bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -105,7 +105,7 @@ impl AcpDriver {
     pub fn new(config: &AgentConfig) -> Self {
         Self {
             profiles: config.acp_profiles.clone(),
-            fork_probe: DashMap::new(),
+            fork_probe: DiscoveryCache::new(),
         }
     }
 
@@ -164,36 +164,24 @@ impl ProviderDriver for AcpDriver {
     }
 
     async fn refresh_control_capabilities(&self) {
-        let now = Instant::now();
-        let mut probes = tokio::task::JoinSet::new();
-        for (name, profile) in &self.profiles {
-            let fresh = self
-                .fork_probe
-                .get(name)
-                .is_some_and(|entry| now.duration_since(entry.1) < FORK_PROBE_TTL);
-            if fresh || !executable_available(&profile.command) {
-                continue;
-            }
-            let name = name.clone();
-            let profile = profile.clone();
-            probes.spawn(async move { (name, probe_fork_capability(&profile).await) });
-        }
-        while let Some(result) = probes.join_next().await {
-            match result {
-                Ok((name, capable)) => {
-                    self.fork_probe.insert(name, (capable, Instant::now()));
-                }
-                Err(error) => {
-                    tracing::warn!(error = %error, "ACP fork capability probe task failed");
-                }
-            }
-        }
+        let probes = self
+            .profiles
+            .iter()
+            .filter(|(name, profile)| {
+                !self.fork_probe.is_fresh(*name) && executable_available(&profile.command)
+            })
+            .map(|(name, profile)| {
+                self.fork_probe.get_or_fetch(name, || async {
+                    Ok((probe_fork_capability(profile).await, FORK_PROBE_TTL))
+                })
+            });
+        futures_util::future::join_all(probes).await;
     }
 
     fn supports_native_fork(&self) -> bool {
-        self.fork_probe
-            .iter()
-            .any(|entry| entry.value().0 && self.profiles.contains_key(entry.key()))
+        self.profiles
+            .keys()
+            .any(|name| self.fork_probe.peek(name).unwrap_or(false))
     }
 
     async fn fork_session(
@@ -225,7 +213,8 @@ impl ProviderDriver for AcpDriver {
             let initialize = acp_control_response(&mut process, &request_id).await?;
             let capable = declares_session_fork(&initialize);
             self.fork_probe
-                .insert(profile_name.clone(), (capable, Instant::now()));
+                .insert(&profile_name, capable, FORK_PROBE_TTL)
+                .await;
             if !capable {
                 return Err(AppError::Unsupported(
                     "ACP agent does not declare sessionCapabilities.fork".to_owned(),
