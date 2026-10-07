@@ -13,10 +13,19 @@
 //! at least one SSH host has agent access; `todex_desktop`: desktop tools
 //! are switched on), so provider arguments stay unchanged for everyone who
 //! never enables one.
+//!
+//! Tools are declared in a [`registry`]; every prompt they raise goes
+//! through the [`authorizer`], which also applies the conversation's
+//! permission mode to tools with side effects. The token only separates
+//! conversations: software running as the same OS user can read it from
+//! the provider's environment, so per-conversation grants are a guard
+//! against agents acting unasked, not a security boundary.
 
+mod authorizer;
 mod bridge;
 mod desktop_computer;
 mod desktop_server;
+mod registry;
 mod server;
 
 use std::{
@@ -24,6 +33,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
+    time::Instant,
 };
 
 use rand_core::{OsRng, RngCore};
@@ -31,8 +41,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::{agent_desktop::AgentDesktop, error::AppError, secure_fs, ssh::SshService};
+use crate::{
+    agent_desktop::AgentDesktop, error::AppError, provider::ConversationSupervisor, secure_fs,
+    ssh::SshService,
+};
 
+use authorizer::{Authorizer, AuthorizerState, ToolMode};
 pub(crate) use bridge::run_bridge;
 
 /// Every agent MCP endpoint, behind the same loopback + token guard.
@@ -56,8 +70,10 @@ pub(crate) const TOKEN_ENV: &str = "TODEX_AGENT_MCP_TOKEN";
 pub(crate) const LEGACY_URL_ENV: &str = "TODEX_SSH_MCP_URL";
 pub(crate) const LEGACY_TOKEN_ENV: &str = "TODEX_SSH_MCP_TOKEN";
 /// Codex and Claude stop waiting for a tool call after their own timeout;
-/// leave room for the longest `ssh_exec` plus connection setup.
-const SSH_TOOL_TIMEOUT_SECONDS: u64 = server::MAX_TIMEOUT_SECONDS + 60;
+/// leave room for an approval (ask mode), the longest `ssh_exec` and
+/// connection setup.
+const SSH_TOOL_TIMEOUT_SECONDS: u64 =
+    authorizer::CONFIRM_TIMEOUT.as_secs() + server::MAX_TIMEOUT_SECONDS + 60;
 pub(crate) const DESKTOP_SERVER: &str = "todex_desktop";
 pub(crate) const DESKTOP_ROUTE: &str = "/internal/agent-mcp/desktop";
 const STATE_DIR: &str = "agent-mcp";
@@ -73,6 +89,10 @@ struct Inner {
     desktop: AgentDesktop,
     /// conversation id → bearer token.
     tokens: Mutex<HashMap<String, String>>,
+    /// conversation id → MCP sessions using its token, for removing the
+    /// Claude config file once nothing needs it.
+    sessions: Mutex<HashMap<String, Sessions>>,
+    authorizer: Arc<AuthorizerState>,
     /// `http://<loopback>:<port>`, set once bound.
     endpoint: OnceLock<String>,
     /// The bridge binary; `None` disables injection.
@@ -120,6 +140,8 @@ impl AgentMcp {
                 ssh,
                 desktop,
                 tokens: Mutex::new(HashMap::new()),
+                sessions: Mutex::new(HashMap::new()),
+                authorizer: Arc::new(AuthorizerState::default()),
                 endpoint: OnceLock::new(),
                 bridge_command,
                 state_dir,
@@ -133,6 +155,84 @@ impl AgentMcp {
 
     pub(crate) fn desktop(&self) -> &AgentDesktop {
         &self.inner.desktop
+    }
+
+    /// The prompts of one tool call.
+    fn authorizer<'a>(&'a self, conversations: &'a ConversationSupervisor) -> Authorizer<'a> {
+        Authorizer {
+            state: &self.inner.authorizer,
+            conversations,
+            desktop: &self.inner.desktop,
+        }
+    }
+
+    /// The effective permission mode of the conversation's turn that just
+    /// started. Tools with side effects follow it: refused while planning,
+    /// approved per call in `ask`, free in `auto` / `full-access`.
+    pub(crate) fn record_turn_mode(
+        &self,
+        conversation_id: &str,
+        permission_mode: &str,
+        work_mode: &str,
+    ) {
+        self.inner.authorizer.set_mode(
+            conversation_id,
+            ToolMode::from_turn(permission_mode, work_mode),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_declines_for_tests(&self, conversation_id: &str) {
+        self.inner.authorizer.clear_declines(conversation_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authorizer_state(&self) -> &Arc<AuthorizerState> {
+        &self.inner.authorizer
+    }
+
+    fn claude_config_path(&self, conversation_id: &str) -> PathBuf {
+        self.inner
+            .state_dir
+            .join(format!("claude-{}.json", file_key(conversation_id)))
+    }
+
+    fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Sessions>> {
+        self.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// An agent's bridge opened an MCP session with the conversation's
+    /// token (Claude had read its config by then).
+    pub(crate) fn session_opened(&self, conversation_id: &str) {
+        let mut sessions = self.sessions();
+        let entry = sessions.entry(conversation_id.to_owned()).or_default();
+        entry.open += 1;
+        entry.last_opened = Some(Instant::now());
+    }
+
+    /// A bridge closed its MCP session (its agent exited). Once none is
+    /// open and no newer provider launch is still to read it, the Claude
+    /// config holding the token is removed. Claude Code reads
+    /// `--mcp-config` at startup; whether a manual `/mcp reconnect` reads it
+    /// again is undocumented, so it is kept while any session is open.
+    pub(crate) async fn session_closed(&self, conversation_id: &str) {
+        let remove = {
+            let mut sessions = self.sessions();
+            let Some(entry) = sessions.get_mut(conversation_id) else {
+                return;
+            };
+            entry.open = entry.open.saturating_sub(1);
+            entry.open == 0
+                && entry
+                    .last_opened
+                    .is_some_and(|opened| entry.launched.is_none_or(|launched| launched <= opened))
+        };
+        if remove {
+            remove_config(&self.claude_config_path(conversation_id)).await;
+        }
     }
 
     /// Records the bound listener. Agents connect over loopback; a listener
@@ -174,6 +274,10 @@ impl AgentMcp {
         let endpoint = self.inner.endpoint.get()?;
         let command = self.inner.bridge_command.clone()?;
         let token = self.token_for(conversation_id);
+        self.sessions()
+            .entry(conversation_id.to_owned())
+            .or_default()
+            .launched = Some(Instant::now());
         Some(AgentMcpLaunch {
             servers: enabled
                 .into_iter()
@@ -187,10 +291,7 @@ impl AgentMcp {
                     tool_timeout_seconds,
                 })
                 .collect(),
-            claude_config_path: self
-                .inner
-                .state_dir
-                .join(format!("claude-{}.json", file_key(conversation_id))),
+            claude_config_path: self.claude_config_path(conversation_id),
         })
     }
 
@@ -222,21 +323,32 @@ impl AgentMcp {
     /// deleted/expired).
     pub(crate) async fn revoke(&self, conversation_id: &str) {
         self.inner.desktop.forget(conversation_id).await;
+        self.inner.authorizer.forget(conversation_id);
         self.inner
             .tokens
             .lock()
             .expect("agent MCP token lock")
             .remove(conversation_id);
-        let path = self
-            .inner
-            .state_dir
-            .join(format!("claude-{}.json", file_key(conversation_id)));
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "failed to remove agent MCP config")
-            }
+        self.sessions().remove(conversation_id);
+        remove_config(&self.claude_config_path(conversation_id)).await;
+    }
+}
+
+/// MCP sessions of one conversation's token.
+#[derive(Default)]
+struct Sessions {
+    open: usize,
+    last_opened: Option<Instant>,
+    /// The latest provider launch, which may still have to read the config.
+    launched: Option<Instant>,
+}
+
+async fn remove_config(path: &std::path::Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to remove agent MCP config")
         }
     }
 }

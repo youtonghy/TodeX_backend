@@ -804,6 +804,31 @@ impl DriverEventSink {
             .map(|(decision, _)| decision)
     }
 
+    /// Like [`Self::request_permission`], also returning the paired device
+    /// that answered.
+    pub async fn request_permission_answered(
+        &self,
+        provider_request_id: String,
+        kind: impl Into<String>,
+        title: impl Into<String>,
+        details: Value,
+        options: Value,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(PermissionDecision, String), AppError> {
+        self.permissions
+            .request(
+                self.clone(),
+                provider_request_id,
+                kind.into(),
+                title.into(),
+                details,
+                options,
+                None,
+                cancel,
+            )
+            .await
+    }
+
     /// Like [`Self::request_permission`], but only the listed paired devices
     /// may answer; clients see them as `allowedDeviceIds`. Returns the
     /// device that answered with the decision.

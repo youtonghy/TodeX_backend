@@ -607,10 +607,17 @@ impl ConversationSupervisor {
                 )
                 .await
             }
-            None => sink
-                .request_permission(request_id, kind, title, details, options, &mut merged_rx)
+            None => {
+                sink.request_permission_answered(
+                    request_id,
+                    kind,
+                    title,
+                    details,
+                    options,
+                    &mut merged_rx,
+                )
                 .await
-                .map(|decision| (decision, String::new())),
+            }
         };
         forward.abort();
         result
@@ -1908,6 +1915,14 @@ impl ConversationSupervisor {
             }
         }
         drop(cli_start_permit);
+        // TodeX's own MCP tools follow this turn's permission mode.
+        if let Some(agent_mcp) = &self.agent_mcp {
+            agent_mcp.record_turn_mode(
+                conversation_id,
+                &effective_permissions.permission_mode,
+                &effective_permissions.work_mode,
+            );
+        }
 
         let launch_permit = match self
             .workspace_trust

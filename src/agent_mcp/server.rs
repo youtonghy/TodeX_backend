@@ -12,7 +12,7 @@ use std::{
 
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::{header, StatusCode},
+    http::{header, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Router,
@@ -20,15 +20,11 @@ use axum::{
 use dashmap::DashMap;
 use rmcp::{
     model::{
-        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-        Implementation, InitializeResult, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, Tool, ToolAnnotations,
+        CallToolRequestParams, CallToolResponse, CallToolResult, InitializeResult,
+        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+        PaginatedRequestParams, Tool, ToolAnnotations,
     },
     service::RequestContext,
-    transport::{
-        streamable_http_server::session::local::LocalSessionManager, StreamableHttpServerConfig,
-        StreamableHttpService,
-    },
     ErrorData, RoleServer, ServerHandler,
 };
 use serde::Deserialize;
@@ -36,7 +32,13 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Semaphore};
 use uuid::Uuid;
 
-use super::{AgentMcp, SSH_ROUTE as ROUTE, SSH_SERVER as SERVER_NAME};
+use super::{
+    registry::{
+        self, parse, schema, tool_error, BoxFuture, Caller, Invocation, Prepared, ToolEntry,
+        ToolHost, ToolRegistry,
+    },
+    AgentMcp, SSH_ROUTE as ROUTE, SSH_SERVER as SERVER_NAME,
+};
 use crate::{
     app_state::AppState,
     external_command::{
@@ -69,34 +71,23 @@ const _: () = assert!(EVENT_OUTPUT_LIMIT < OUTPUT_LIMIT);
 const OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const OUTPUT_FLUSH_BYTES: usize = 16 * 1024;
 const ERROR_DETAIL_LIMIT: usize = 4096;
-
-/// The conversation a request was authenticated for.
-#[derive(Clone, Debug)]
-pub(super) struct Caller {
-    pub(super) conversation_id: String,
-}
+/// Command text in an approval prompt.
+const SUMMARY_COMMAND_CHARS: usize = 200;
 
 pub(crate) fn routes(state: &AppState) -> Router<AppState> {
     let tools = SshTools {
         mcp: state.agent_mcp.clone(),
         conversations: state.conversations.clone(),
         host_slots: Arc::new(DashMap::new()),
+        registry: Arc::new(registry_of_tools()),
     };
-    // Defaults: loopback-only `Host` validation (DNS rebinding), sessions
-    // with an idle timeout, which the bridge transparently re-initializes.
-    let service = StreamableHttpService::new(
-        move || Ok(tools.clone()),
-        Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
-    );
-    Router::new()
-        .route_service(ROUTE, service)
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), guard))
+    registry::mcp_route(state, ROUTE, tools)
 }
 
 /// Only local, non-browser callers holding a conversation token get through.
 /// This route deliberately sits outside device auth: the agents calling it
-/// run on this machine and never hold a device key.
+/// run on this machine and never hold a device key. Also follows which MCP
+/// sessions use each token (initialize opens one, `DELETE` closes it).
 pub(super) async fn guard(
     State(state): State<AppState>,
     mut request: Request,
@@ -124,8 +115,22 @@ pub(super) async fn guard(
         )
             .into_response();
     };
-    request.extensions_mut().insert(Caller { conversation_id });
-    next.run(request).await
+    // Streamable HTTP: only `initialize` is posted without a session id.
+    let has_session = request.headers().contains_key("mcp-session-id");
+    let opens = request.method() == Method::POST && !has_session;
+    let closes = request.method() == Method::DELETE && has_session;
+    request.extensions_mut().insert(Caller {
+        conversation_id: conversation_id.clone(),
+    });
+    let response = next.run(request).await;
+    if response.status().is_success() {
+        if opens {
+            state.agent_mcp.session_opened(&conversation_id);
+        } else if closes {
+            state.agent_mcp.session_closed(&conversation_id).await;
+        }
+    }
+    response
 }
 
 #[derive(Clone)]
@@ -134,7 +139,12 @@ struct SshTools {
     conversations: ConversationSupervisor,
     /// Alias → slots; bounds concurrent agent commands per host.
     host_slots: Arc<DashMap<String, Arc<Semaphore>>>,
+    registry: Arc<ToolRegistry<SshTools, SshCall>>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListHostsArgs {}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -149,59 +159,129 @@ struct ExecArgs {
     timeout_sec: Option<u64>,
 }
 
-pub(super) fn schema(value: Value) -> Arc<serde_json::Map<String, Value>> {
-    match value {
-        Value::Object(map) => Arc::new(map),
-        _ => unreachable!("tool schemas are objects"),
-    }
+enum SshCall {
+    ListHosts,
+    Exec(ExecRequest),
 }
 
-fn tools() -> Vec<Tool> {
-    vec![
-        Tool::new(
-            "ssh_list_hosts",
-            "List the SSH hosts the user allowed agents to use. Only these aliases work with ssh_exec.",
-            schema(json!({ "type": "object", "properties": {}, "additionalProperties": false })),
-        )
-        .with_annotations(ToolAnnotations::new().read_only(true).open_world(false)),
-        Tool::new(
-            "ssh_exec",
-            "Run a shell command on an allowed SSH host (non-interactive, no TTY, no password prompts). \
-             Returns stdout, stderr and the exit code; a non-zero exit code is a normal result. \
-             stdout and stderr are each capped at 256 KiB (truncated=true when cut).",
-            schema(json!({
-                "type": "object",
-                "properties": {
-                    "host": { "type": "string", "description": "Host alias from ssh_list_hosts." },
-                    "command": { "type": "string", "description": "Command line for the remote login shell." },
-                    "cwd": { "type": "string", "description": "Remote working directory; the command runs after `cd` into it." },
-                    "stdin": { "type": "string", "description": "Text written to the command's standard input (max 1 MiB)." },
-                    "timeoutSec": { "type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECONDS, "description": "Kill the command after this many seconds (default 60)." }
-                },
-                "required": ["host", "command"],
-                "additionalProperties": false
-            })),
-        )
-        .with_annotations(
-            ToolAnnotations::new()
-                .read_only(false)
-                .destructive(true)
-                .open_world(true),
-        ),
-    ]
+fn prepare_list_hosts(arguments: Value) -> Result<Prepared<SshCall>, String> {
+    let _: ListHostsArgs = parse("ssh_list_hosts", arguments)?;
+    Ok(Prepared {
+        call: SshCall::ListHosts,
+        summary: "list SSH hosts".to_owned(),
+        input: json!({}),
+    })
+}
+
+fn prepare_exec(arguments: Value) -> Result<Prepared<SshCall>, String> {
+    let request = validate(parse("ssh_exec", arguments)?)?;
+    let command: String = request
+        .command
+        .chars()
+        .take(SUMMARY_COMMAND_CHARS)
+        .collect();
+    let mut input = json!({
+        "host": request.host,
+        "command": bounded_text(request.command.as_bytes(), EVENT_COMMAND_LIMIT),
+        "timeoutSec": request.timeout.as_secs(),
+    });
+    if let Some(cwd) = &request.cwd {
+        input["cwd"] = json!(cwd);
+    }
+    // Standard input may carry secrets: only its size is shown.
+    if let Some(stdin) = &request.stdin {
+        input["stdinBytes"] = json!(stdin.len());
+    }
+    Ok(Prepared {
+        summary: format!("run `{command}` on {}", request.host),
+        input,
+        call: SshCall::Exec(request),
+    })
+}
+
+fn run<'a>(
+    tools: &'a SshTools,
+    call: SshCall,
+    invocation: Invocation<'a>,
+) -> BoxFuture<'a, CallToolResult> {
+    Box::pin(async move {
+        match call {
+            SshCall::ListHosts => tools.list_hosts().await,
+            SshCall::Exec(request) => tools.exec(&invocation, request).await,
+        }
+    })
+}
+
+fn registry_of_tools() -> ToolRegistry<SshTools, SshCall> {
+    ToolRegistry::new(vec![
+        ToolEntry {
+            tool: Tool::new(
+                "ssh_list_hosts",
+                "List the SSH hosts the user allowed agents to use. Only these aliases work with ssh_exec.",
+                schema(json!({ "type": "object", "properties": {}, "additionalProperties": false })),
+            )
+            .with_annotations(ToolAnnotations::new().read_only(true).open_world(false)),
+            side_effect: false,
+            prepare: prepare_list_hosts,
+            run,
+        },
+        ToolEntry {
+            tool: Tool::new(
+                "ssh_exec",
+                "Run a shell command on an allowed SSH host (non-interactive, no TTY, no password prompts). \
+                 Returns stdout, stderr and the exit code; a non-zero exit code is a normal result. \
+                 stdout and stderr are each capped at 256 KiB (truncated=true when cut). Unavailable \
+                 in Plan mode; in ask mode the user approves each call.",
+                schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string", "description": "Host alias from ssh_list_hosts." },
+                        "command": { "type": "string", "description": "Command line for the remote login shell." },
+                        "cwd": { "type": "string", "description": "Remote working directory; the command runs after `cd` into it." },
+                        "stdin": { "type": "string", "description": "Text written to the command's standard input (max 1 MiB)." },
+                        "timeoutSec": { "type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECONDS, "description": "Kill the command after this many seconds (default 60)." }
+                    },
+                    "required": ["host", "command"],
+                    "additionalProperties": false
+                })),
+            )
+            .with_annotations(
+                ToolAnnotations::new()
+                    .read_only(false)
+                    .destructive(true)
+                    .open_world(true),
+            ),
+            side_effect: true,
+            prepare: prepare_exec,
+            run,
+        },
+    ])
+}
+
+impl ToolHost for SshTools {
+    type Call = SshCall;
+    const SERVER: &'static str = SERVER_NAME;
+
+    fn registry(&self) -> &ToolRegistry<Self, SshCall> {
+        &self.registry
+    }
+
+    fn mcp(&self) -> &AgentMcp {
+        &self.mcp
+    }
+
+    fn conversations(&self) -> &ConversationSupervisor {
+        &self.conversations
+    }
 }
 
 impl ServerHandler for SshTools {
     fn get_info(&self) -> InitializeResult {
-        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                SERVER_NAME,
-                crate::version::APP_VERSION,
-            ))
-            .with_instructions(
-                "Runs commands on the user's SSH hosts. Call ssh_list_hosts first; \
-                 only hosts listed there can be used.",
-            )
+        registry::server_info(
+            SERVER_NAME,
+            "Runs commands on the user's SSH hosts. Call ssh_list_hosts first; \
+             only hosts listed there can be used.",
+        )
     }
 
     async fn list_tools(
@@ -209,7 +289,7 @@ impl ServerHandler for SshTools {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(tool_list(tools()))
+        Ok(self.registry.list(|_| true))
     }
 
     async fn call_tool(
@@ -217,27 +297,31 @@ impl ServerHandler for SshTools {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let caller = context
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|parts| parts.extensions.get::<Caller>())
-            .cloned()
-            .ok_or_else(|| ErrorData::internal_error("request is not authenticated", None))?;
-        let arguments = Value::Object(request.arguments.unwrap_or_default());
-        let result = match request.name.as_ref() {
-            "ssh_list_hosts" => self.list_hosts().await,
-            "ssh_exec" => match serde_json::from_value::<ExecArgs>(arguments) {
-                Ok(args) => self.exec(&caller, args, &context).await,
-                Err(error) => tool_error(format!("invalid ssh_exec arguments: {error}")),
-            },
-            other => {
-                return Err(ErrorData::invalid_params(
-                    format!("unknown tool {other}"),
-                    None,
-                ))
-            }
-        };
-        Ok(result.into())
+        self.registry().call(self, request, &context).await
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        Ok(registry::no_prompts())
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(registry::no_resources())
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        Ok(registry::no_resource_templates())
     }
 }
 
@@ -259,16 +343,9 @@ impl SshTools {
         }
     }
 
-    async fn exec(
-        &self,
-        caller: &Caller,
-        args: ExecArgs,
-        context: &RequestContext<RoleServer>,
-    ) -> CallToolResult {
-        let request = match validate(args) {
-            Ok(request) => request,
-            Err(message) => return tool_error(message),
-        };
+    async fn exec(&self, invocation: &Invocation<'_>, request: ExecRequest) -> CallToolResult {
+        let caller = &invocation.caller;
+        let context = invocation.context;
         match self.mcp.ssh().is_agent_host(&request.host).await {
             Ok(true) => {}
             Ok(false) => {
@@ -301,6 +378,9 @@ impl SshTools {
         });
         if let Some(cwd) = &request.cwd {
             started["cwd"] = json!(cwd);
+        }
+        if let Some(device) = &invocation.approved_by {
+            started["approvedBy"] = json!(device);
         }
         // No audit trail, no command: a conversation that cannot record the
         // call (deleted, journal full) does not get to run it.
@@ -656,19 +736,6 @@ fn failure_hint(failure: SshFailureKind) -> Option<&'static str> {
     }
 }
 
-/// A complete `tools/list` result. MCP 2026-07-28 requires the cache hints
-/// (clients reject the list without them); lists are never cached because
-/// they follow settings and belong to one conversation's token.
-pub(super) fn tool_list(tools: Vec<Tool>) -> ListToolsResult {
-    ListToolsResult::with_all_items(tools)
-        .with_ttl_ms(0)
-        .with_cache_scope(CacheScope::Private)
-}
-
-pub(super) fn tool_error(message: String) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(message)])
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -676,6 +743,7 @@ mod tests {
     use crate::config::Config;
     use crate::conversation::ProviderKind;
     use axum::body::Body;
+    use rmcp::model::CacheScope;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use tower::ServiceExt;
@@ -1111,6 +1179,93 @@ exit 3
         assert_eq!(completed[3]["failure"], "timedOut");
 
         client.cancel().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn plan_mode_refuses_ssh_exec_but_lists_hosts() {
+        let harness = harness().await;
+        let client = bridged_client(&harness).await;
+        harness
+            .state
+            .agent_mcp
+            .record_turn_mode(&harness.conversation_id, "ask", "plan");
+        let hosts = call(&client, "ssh_list_hosts", json!({})).await;
+        assert_eq!(hosts.is_error, Some(false));
+        let refused = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "web", "command": "ls" }),
+        )
+        .await;
+        assert_eq!(refused.is_error, Some(true));
+        let log = std::fs::read_to_string(harness.root.join("ssh.log")).unwrap_or_default();
+        assert!(!log.lines().any(|line| line.contains("-- web ")));
+        let history = harness
+            .state
+            .conversations
+            .history_for_tests(&harness.conversation_id)
+            .await;
+        assert!(!history
+            .iter()
+            .any(|event| event.event_type == "ssh.exec.started"));
+        client.cancel().await.unwrap();
+    }
+
+    async fn open_session(harness: &Harness) -> String {
+        let response = crate::server::router(harness.state.clone())
+            .oneshot(mcp_request(
+                "127.0.0.1:5000",
+                Some(&harness.token),
+                initialize(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn close_session(harness: &Harness, session: &str) {
+        let mut request = mcp_request("127.0.0.1:5000", Some(&harness.token), json!({}));
+        *request.method_mut() = Method::DELETE;
+        request
+            .headers_mut()
+            .insert("mcp-session-id", session.parse().unwrap());
+        let status = crate::server::router(harness.state.clone())
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_success(), "{status}");
+    }
+
+    async fn write_claude_config(harness: &Harness) -> PathBuf {
+        let launch = harness
+            .state
+            .agent_mcp
+            .launch(&harness.conversation_id)
+            .await
+            .unwrap();
+        let args = launch.claude_args().await.unwrap();
+        PathBuf::from(args[0].strip_prefix("--mcp-config=").unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_claude_config_goes_once_no_session_needs_it() {
+        let harness = harness().await;
+        let path = write_claude_config(&harness).await;
+        let first = open_session(&harness).await;
+        assert!(path.is_file(), "kept while a session is open");
+        // A newer launch has not connected yet: its config must survive the
+        // previous session ending.
+        write_claude_config(&harness).await;
+        close_session(&harness, &first).await;
+        assert!(path.is_file());
+        let second = open_session(&harness).await;
+        close_session(&harness, &second).await;
+        assert!(!path.exists(), "removed once no session needs it");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

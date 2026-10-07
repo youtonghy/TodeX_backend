@@ -12,7 +12,6 @@ mod v2;
 pub(crate) mod websocket;
 
 pub(crate) use history_keys::spawn_history_watch;
-pub(crate) use v2::{is_allowed_browser_target, validate_browser_url};
 
 use std::time::Duration;
 
