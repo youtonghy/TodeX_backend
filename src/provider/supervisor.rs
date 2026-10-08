@@ -37,7 +37,7 @@ use super::grok::GrokBuildDriver;
 use super::pi::PiDriver;
 use super::process::same_executable;
 use super::profile::{profile, FileAttachmentStyle, SkillInjection};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use super::types::ProviderDescriptor;
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill,

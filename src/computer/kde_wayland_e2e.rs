@@ -8,6 +8,7 @@
 //! (`TODEX_KDE_WAYLAND_E2E_NO_GPU=1`, set by run.sh on hosted runners) the
 //! test covers observation and window focus only.
 
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -17,6 +18,7 @@ use crate::computer::ComputerError;
 
 const MAIN_TITLE: &str = "TodeX KDE Test";
 const SECOND_TITLE: &str = "TodeX KDE Second";
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 struct Harness {
     engine: Engine,
@@ -80,6 +82,7 @@ impl Harness {
                 Grants {
                     allowed_apps: &self.allowed,
                     confirmed: false,
+                    cancelled: &NEVER_CANCELLED,
                 },
                 std::process::id(),
             ) {
@@ -143,7 +146,10 @@ fn kde_wayland_end_to_end() {
     // The app starts, AT-SPI publishes it, and its bounds become global.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if let Ok(listing) = harness.engine.observe(&json!({ "screenshot": false })) {
+        if let Ok(listing) = harness
+            .engine
+            .observe(&json!({ "screenshot": false }), std::process::id())
+        {
             harness.windows = listing["windows"].clone();
             if harness.window_id(MAIN_TITLE).is_some() && harness.window_id(SECOND_TITLE).is_some()
             {
