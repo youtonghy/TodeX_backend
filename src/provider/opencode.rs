@@ -502,6 +502,7 @@ fn opencode_environment(allowlist: &[String]) -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::path::PathBuf;
 
     use super::*;

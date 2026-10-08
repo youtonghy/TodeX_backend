@@ -332,7 +332,7 @@ impl DriverRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn descriptors(&self) -> Vec<ProviderDescriptor> {
         self.drivers().map(|driver| driver.descriptor()).collect()
     }
@@ -809,7 +809,7 @@ impl ConversationSupervisor {
     }
 
     /// Descriptors without running capability probes.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn providers(&self) -> Vec<ProviderDescriptor> {
         self.registry.descriptors()
     }

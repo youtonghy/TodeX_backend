@@ -31,7 +31,7 @@ impl Harness {
     fn observe(&mut self, window_title: &str) -> Value {
         let listing = self
             .engine
-            .observe(&json!({ "screenshot": false }))
+            .observe(&json!({ "screenshot": false }), std::process::id())
             .unwrap();
         self.windows = listing["windows"].clone();
         let id = self
@@ -39,7 +39,10 @@ impl Harness {
             .unwrap_or_else(|| panic!("no window {window_title:?} in {}", listing["windows"]));
         let observed = self
             .engine
-            .observe(&json!({ "window": id, "screenshot": self.gpu }))
+            .observe(
+                &json!({ "window": id, "screenshot": self.gpu }),
+                std::process::id(),
+            )
             .unwrap();
         self.tree = observed["tree"].as_str().unwrap_or_default().to_owned();
         if self.allowed.is_empty() {

@@ -518,6 +518,7 @@ pub(super) fn parse_commands(initialize: &Value) -> Vec<ProviderCommandDescripto
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::path::PathBuf;
 
     use super::*;

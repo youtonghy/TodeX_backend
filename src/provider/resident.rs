@@ -223,7 +223,7 @@ impl ResidentSessions {
     }
 
     /// Whether a turn is queued behind the running one.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) async fn has_queued_turn(&self, conversation_id: &str) -> bool {
         self.sessions
             .lock()
