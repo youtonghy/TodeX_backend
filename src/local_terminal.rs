@@ -5,6 +5,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
 
 use dashmap::DashMap;
@@ -12,6 +13,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{mpsc, RwLock};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -21,6 +23,8 @@ use crate::{
 };
 
 const TERMINAL_OUTPUT_BUFFER_SIZE: usize = 8192;
+/// How long `terminal.exited` waits for the reader to reach end of output.
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DEFAULT_TERMINAL_COLS: u16 = 80;
 
@@ -257,7 +261,7 @@ impl LocalTerminalManager {
         let output_events = self.events.clone();
         let output_runtime = tokio::runtime::Handle::current();
         let output_info = TerminalEventInfo::from_handle(&terminal_id, &handle);
-        tokio::task::spawn_blocking(move || {
+        let output_task = tokio::task::spawn_blocking(move || {
             read_terminal_output(reader, output_events, output_info, output_runtime)
         });
 
@@ -269,6 +273,15 @@ impl LocalTerminalManager {
             let stopped_by_request = stop_requested.load(Ordering::Acquire);
 
             sessions.remove(&wait_info.terminal_id);
+            // Output is published by the reader thread: let it drain the PTY
+            // first so `terminal.exited` never overtakes the last output. A
+            // descendant that keeps the PTY open must not hold the exit back.
+            if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, output_task)
+                .await
+                .is_err()
+            {
+                warn!(terminal_id = %wait_info.terminal_id, "terminal output still open after exit; not waiting for it");
+            }
             let payload = match status_result {
                 Ok(Ok(status)) => json!({
                     "terminalId": wait_info.terminal_id,
@@ -815,6 +828,52 @@ mod tests {
         );
         assert!(saw_exit, "terminal should publish an exit event");
 
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_is_published_after_the_last_output() {
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+        let manager = LocalTerminalManager::new(events);
+        let cwd = make_temp_workspace("terminal-exit-order");
+
+        manager
+            .start(TerminalStartOptions {
+                request_id: "terminal-exit-order".to_string(),
+                terminal_id: Some("term-exit-order".to_string()),
+                tenant_id: "local".to_string(),
+                workspace_id: None,
+                cwd: cwd.display().to_string(),
+                shell: Some("/bin/sh".to_string()),
+                rows: None,
+                cols: None,
+                command: Some(TerminalCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".into(), "printf '__LAST__'".into()],
+                    env: Vec::new(),
+                    cwd: cwd.clone(),
+                    ssh_host: "web".to_string(),
+                }),
+            })
+            .await
+            .unwrap();
+
+        let mut output = String::new();
+        let exited = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = rx.recv().await.unwrap();
+                match event.event_type.as_str() {
+                    "terminal.output" => output.push_str(&payload_text(&event.payload, "data")),
+                    "terminal.exited" => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(exited.is_ok(), "terminal should publish an exit event");
+        assert!(output.contains("__LAST__"), "{output:?}");
         let _ = fs::remove_dir_all(cwd);
     }
 
