@@ -1,7 +1,8 @@
 //! A small Chrome DevTools Protocol client: requests with ids and timeouts,
 //! and events of flat sessions. Unix talks to Chromium over
 //! `--remote-debugging-pipe` (NUL-terminated JSON on fds 3/4), so no other
-//! local process can reach the browser; Windows uses a loopback WebSocket.
+//! local process can reach the browser; Windows hands it anonymous pipes
+//! by handle (`--remote-debugging-io-pipes`).
 //!
 //! Events take two paths so live video can never crowd out the navigation
 //! guard: the few events the browser session acts on ([`HANDLED_EVENTS`])
@@ -76,7 +77,16 @@ pub(crate) enum Transport {
         to_browser: tokio::net::unix::pipe::Sender,
         from_browser: tokio::net::unix::pipe::Receiver,
     },
-    #[cfg_attr(unix, allow(dead_code))]
+    /// Anonymous pipes handed to Chromium by handle
+    /// (`--remote-debugging-io-pipes`), read and written on threads.
+    #[cfg(windows)]
+    Pipe {
+        to_browser: std::io::PipeWriter,
+        from_browser: std::io::PipeReader,
+    },
+    /// Not started by the daemon on any platform now; kept for tests and
+    /// development against a remote debugging port.
+    #[allow(dead_code)]
     WebSocket(String),
 }
 
@@ -101,6 +111,11 @@ impl Cdp {
                 to_browser,
                 from_browser,
             } => cdp.run_pipe(to_browser, from_browser, outgoing_rx),
+            #[cfg(windows)]
+            Transport::Pipe {
+                to_browser,
+                from_browser,
+            } => cdp.run_blocking_pipe(to_browser, from_browser, outgoing_rx),
             Transport::WebSocket(url) => cdp.run_websocket(&url, outgoing_rx).await?,
         }
         Ok(cdp)
@@ -130,6 +145,48 @@ impl Cdp {
             loop {
                 buffer.clear();
                 match reader.read_until(0, &mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if buffer.last() == Some(&0) {
+                            buffer.pop();
+                        }
+                        dispatch(&inner, &buffer);
+                    }
+                }
+            }
+            close(&inner);
+        });
+    }
+
+    /// Windows: the same NUL-terminated framing over blocking anonymous
+    /// pipes, one thread each way. Both end when Chromium goes away (the
+    /// read sees EOF, the next write fails); `Process` ends Chromium by
+    /// closing its job. Plain threads rather than `spawn_blocking`, so a
+    /// read parked on a live browser cannot hold up runtime shutdown.
+    #[cfg(windows)]
+    fn run_blocking_pipe(
+        &self,
+        mut to_browser: std::io::PipeWriter,
+        from_browser: std::io::PipeReader,
+        mut outgoing: mpsc::UnboundedReceiver<String>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        std::thread::spawn(move || {
+            while let Some(message) = outgoing.blocking_recv() {
+                let mut bytes = message.into_bytes();
+                bytes.push(0);
+                if to_browser.write_all(&bytes).is_err() {
+                    break;
+                }
+            }
+        });
+        let inner = self.inner.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(from_browser);
+            let mut buffer = Vec::new();
+            loop {
+                buffer.clear();
+                match reader.read_until(0, &mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
                         if buffer.last() == Some(&0) {
