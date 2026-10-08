@@ -19,7 +19,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Duration,
 };
@@ -98,18 +98,33 @@ pub(crate) struct ComputerStatus {
 pub(crate) trait ComputerHost: Send + Sync {
     fn status(&self) -> ComputerStatus;
     async fn request_permissions(&self) -> ComputerStatus;
-    /// Asks the person at this computer; `None` when nobody can be asked.
-    async fn confirm(&self, title: String, message: String, timeout: Duration) -> Option<bool>;
-    async fn observe(&self, args: Value) -> Result<Value, ComputerError>;
+    /// Asks the person at this computer: their answer, `Ok(None)` when
+    /// nobody can be asked (no host UI or dialog tool), `Err` when asking
+    /// failed.
+    async fn confirm(
+        &self,
+        title: String,
+        message: String,
+        timeout: Duration,
+    ) -> Result<Option<bool>, ComputerError>;
+    /// `lease` identifies the screen lease the call belongs to: refs and
+    /// the screenshot mapping of another lease are forgotten.
+    async fn observe(&self, lease: u64, args: Value) -> Result<Value, ComputerError>;
     /// `allowed_apps` and `confirmed` come from the user, never the agent.
     async fn act(
         &self,
+        lease: u64,
         args: Value,
         allowed_apps: Vec<String>,
         confirmed: bool,
     ) -> Result<Value, ComputerError>;
     /// A JPEG of the controlled display for live viewers.
-    async fn frame(&self, max_width: u32, quality: u8) -> Result<Vec<u8>, ComputerError>;
+    async fn frame(
+        &self,
+        lease: u64,
+        max_width: u32,
+        quality: u8,
+    ) -> Result<Vec<u8>, ComputerError>;
     /// A conversation took the screen (`Some`) or gave it back (`None`).
     fn session(&self, summary: Option<&str>);
 }
@@ -133,9 +148,13 @@ impl Computer {
     }
 }
 
+/// How long a call waits for the engine while an earlier call (one whose
+/// caller gave up included) still holds it.
+const ENGINE_WAIT: Duration = Duration::from_secs(10);
+
 #[derive(Default)]
 struct NativeComputer {
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<tokio::sync::Mutex<Engine>>,
 }
 
 /// Marks the work of a call abandoned when its future is dropped (the
@@ -152,20 +171,36 @@ impl Drop for AbandonOnDrop {
 impl NativeComputer {
     async fn with_engine<T: Send + 'static>(
         &self,
+        lease: u64,
         work: impl FnOnce(&mut Engine, &AtomicBool) -> Result<T, ComputerError> + Send + 'static,
     ) -> Result<T, ComputerError> {
-        let engine = self.engine.clone();
+        self.with_engine_within(ENGINE_WAIT, lease, work).await
+    }
+
+    async fn with_engine_within<T: Send + 'static>(
+        &self,
+        wait: Duration,
+        lease: u64,
+        work: impl FnOnce(&mut Engine, &AtomicBool) -> Result<T, ComputerError> + Send + 'static,
+    ) -> Result<T, ComputerError> {
         let abandoned = Arc::new(AtomicBool::new(false));
         let _abandon = AbandonOnDrop(abandoned.clone());
+        // Waiting here rather than on a blocking thread keeps calls that
+        // queue behind a slow one from exhausting the blocking pool.
+        let mut engine = tokio::time::timeout(wait, self.engine.clone().lock_owned())
+            .await
+            .map_err(|_| {
+                ComputerError::new(
+                    "BUSY",
+                    "an earlier Computer Use call is still running on this computer; retry shortly",
+                )
+            })?;
         tokio::task::spawn_blocking(move || {
-            let mut engine = engine
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // An earlier call may have held the engine past this one's
-            // deadline.
+            // The caller may have given up while the engine was taken.
             if abandoned.load(Ordering::SeqCst) {
                 return Err(ComputerError::new("CANCELLED", "the call was abandoned"));
             }
+            engine.enter(lease);
             work(&mut engine, &abandoned)
         })
         .await
@@ -203,30 +238,39 @@ impl ComputerHost for NativeComputer {
 
     async fn request_permissions(&self) -> ComputerStatus {
         if platform::unsupported_reason().is_none() {
-            let _ = tokio::task::spawn_blocking(platform::request_permissions).await;
+            if let Err(error) = tokio::task::spawn_blocking(platform::request_permissions).await {
+                tracing::warn!(%error, "requesting Computer Use permissions failed");
+            }
         }
         self.status()
     }
 
-    async fn confirm(&self, title: String, message: String, timeout: Duration) -> Option<bool> {
+    async fn confirm(
+        &self,
+        title: String,
+        message: String,
+        timeout: Duration,
+    ) -> Result<Option<bool>, ComputerError> {
         tokio::task::spawn_blocking(move || host_ui::confirm(&title, &message, timeout))
             .await
-            .ok()
-            .flatten()
+            .map_err(ComputerError::platform)
     }
 
-    async fn observe(&self, args: Value) -> Result<Value, ComputerError> {
-        self.with_engine(move |engine, _| engine.observe(&args, std::process::id()))
-            .await
+    async fn observe(&self, lease: u64, args: Value) -> Result<Value, ComputerError> {
+        self.with_engine(lease, move |engine, _| {
+            engine.observe(&args, std::process::id())
+        })
+        .await
     }
 
     async fn act(
         &self,
+        lease: u64,
         args: Value,
         allowed_apps: Vec<String>,
         confirmed: bool,
     ) -> Result<Value, ComputerError> {
-        self.with_engine(move |engine, cancelled| {
+        self.with_engine(lease, move |engine, cancelled| {
             engine.act(
                 &args,
                 Grants {
@@ -240,9 +284,16 @@ impl ComputerHost for NativeComputer {
         .await
     }
 
-    async fn frame(&self, max_width: u32, quality: u8) -> Result<Vec<u8>, ComputerError> {
-        self.with_engine(move |engine, _| engine.frame(max_width, quality, std::process::id()))
-            .await
+    async fn frame(
+        &self,
+        lease: u64,
+        max_width: u32,
+        quality: u8,
+    ) -> Result<Vec<u8>, ComputerError> {
+        self.with_engine(lease, move |engine, _| {
+            engine.frame(max_width, quality, std::process::id())
+        })
+        .await
     }
 
     fn session(&self, summary: Option<&str>) {
@@ -282,5 +333,60 @@ pub(crate) fn host_name() -> String {
     #[cfg(not(unix))]
     {
         std::env::var("COMPUTERNAME").unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_call_waits_for_a_busy_engine_only_so_long() {
+        let computer = Arc::new(NativeComputer::default());
+        let first = {
+            let computer = computer.clone();
+            tokio::spawn(async move {
+                computer
+                    .with_engine_within(Duration::from_secs(5), 1, |_, _| {
+                        std::thread::sleep(Duration::from_millis(400));
+                        Ok("first")
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let busy = computer
+            .with_engine_within(Duration::from_millis(50), 1, |_, _| Ok("second"))
+            .await;
+        assert_eq!(busy.unwrap_err().code, "BUSY");
+        assert_eq!(first.await.unwrap().unwrap(), "first");
+        // Once free, the next call runs.
+        let after = computer
+            .with_engine_within(Duration::from_millis(50), 1, |_, _| Ok("third"))
+            .await;
+        assert_eq!(after.unwrap(), "third");
+    }
+
+    #[tokio::test]
+    async fn a_call_dropped_while_waiting_never_runs() {
+        let computer = Arc::new(NativeComputer::default());
+        let ran = Arc::new(AtomicBool::new(false));
+        let guard = computer.engine.clone().lock_owned().await;
+        let waiting = {
+            let (computer, ran) = (computer.clone(), ran.clone());
+            tokio::spawn(async move {
+                computer
+                    .with_engine_within(Duration::from_secs(5), 1, move |_, _| {
+                        ran.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waiting.abort();
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!ran.load(Ordering::SeqCst));
     }
 }

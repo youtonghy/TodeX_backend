@@ -36,15 +36,15 @@ use std::{
 use tokio::sync::broadcast;
 
 /// The global shortcut that stops a session on this OS, as shown to
-/// people; `None` where the only stop control is the status
-/// notification's Stop action (Linux outside KDE Plasma Wayland, or when
-/// KDE refused the shortcut).
+/// people; `None` where the only stop control is the pill's or the status
+/// notification's Stop (Linux outside KDE Plasma Wayland, or when the
+/// system refused the shortcut).
 pub(crate) fn stop_shortcut() -> Option<&'static str> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         native::stop_shortcut()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         native::STOP_SHORTCUT
     }
@@ -115,14 +115,15 @@ pub(crate) fn mark_point(x: f64, y: f64) {
 }
 
 /// Asks the person at this computer; blocks until they answer or
-/// `timeout` passes (`Some(false)`). `None` when there is no host UI.
+/// `timeout` passes (`Some(false)`). `None` when nobody can be asked: no
+/// host UI, or no dialog mechanism on this desktop.
 pub(crate) fn confirm(title: &str, message: &str, timeout: Duration) -> Option<bool> {
     if !available() {
         return None;
     }
     CONFIRMING.fetch_add(1, Ordering::SeqCst);
     let _open = Confirming;
-    Some(native::confirm(&strings(), title, message, timeout))
+    native::confirm(&strings(), title, message, timeout)
 }
 
 /// Confirmations on screen. While one is, agents may not act at all: on

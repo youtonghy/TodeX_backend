@@ -188,7 +188,24 @@ impl CancelSignal {
     }
 }
 
-type HostAnswer = Option<bool>;
+/// What a host dialog came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostAnswer {
+    Allowed,
+    Declined,
+    /// Nobody can be asked on this computer.
+    Nobody,
+    /// Asking failed.
+    Failed,
+}
+
+impl HostAnswer {
+    /// Whether the person at the host decided: only such an answer is kept
+    /// for the next ask when nobody was waiting.
+    fn is_decision(self) -> bool {
+        matches!(self, Self::Allowed | Self::Declined)
+    }
+}
 
 /// Daemon-wide prompt state, shared by every TodeX MCP server.
 #[derive(Default)]
@@ -245,6 +262,14 @@ impl AuthorizerState {
         locked(&self.modes).remove(conversation_id);
         locked(&self.always).remove(conversation_id);
         locked(&self.declined).retain(|(conversation, _), _| conversation != conversation_id);
+        self.forget_host_answers(conversation_id);
+    }
+
+    /// Voids the host answers given to nobody in particular (kept for the
+    /// next identical ask): a "yes" given before a revoke must not
+    /// authorize anything after it. Declines keep backing off, and an
+    /// answer given after this call stays valid.
+    pub(crate) fn forget_host_answers(&self, conversation_id: &str) {
         let prefix = prompt_key(conversation_id, "");
         locked(&self.late_answers).retain(|key, _| !key.starts_with(&prefix));
     }
@@ -414,25 +439,29 @@ impl Authorizer<'_> {
             None => {
                 let mut answer = self.host_dialog(key, prompt, cancel).await?;
                 let waited = tokio::select! {
-                    result = answer.wait_for(Option::is_some) => result.map(|answer| (*answer).flatten()).ok(),
+                    result = answer.wait_for(Option::is_some) => result.map(|answer| *answer).ok().flatten(),
                     () = cancel.cancelled() => return Err(dialog_stays()),
                 };
                 // The dialog task always sends before it ends.
-                waited.unwrap_or(None)
+                waited.unwrap_or(HostAnswer::Failed)
             }
         };
         match answer {
-            Some(true) => Ok(Approval {
+            HostAnswer::Allowed => Ok(Approval {
                 device_id: HOST_DEVICE_ID.to_owned(),
                 always: false,
             }),
-            Some(false) => Err(Denied::new(
+            HostAnswer::Declined => Err(Denied::new(
                 "DECLINED",
                 "the person at this computer declined",
             )),
-            None => Err(Denied::new(
+            HostAnswer::Nobody => Err(Denied::new(
                 "UNAVAILABLE",
                 "nobody can confirm on this computer; the TodeX backend must run in its desktop session.",
+            )),
+            HostAnswer::Failed => Err(Denied::new(
+                "FAILED",
+                "the confirmation dialog on this computer failed; try again",
             )),
         }
     }
@@ -478,12 +507,21 @@ impl Authorizer<'_> {
         let state = self.state.clone();
         let computer = self.desktop.computer();
         tokio::spawn(async move {
-            let answer = computer
+            let answer = match computer
                 .host()
                 .confirm(prompt.title, prompt.message, CONFIRM_TIMEOUT)
-                .await;
+                .await
+            {
+                Ok(Some(true)) => HostAnswer::Allowed,
+                Ok(Some(false)) => HostAnswer::Declined,
+                Ok(None) => HostAnswer::Nobody,
+                Err(error) => {
+                    tracing::warn!(%error, "the host confirmation failed");
+                    HostAnswer::Failed
+                }
+            };
             locked(&state.host_dialogs).remove(&key);
-            if sender.send(Some(answer)).is_err() && !prompt.once {
+            if sender.send(Some(answer)).is_err() && !prompt.once && answer.is_decision() {
                 // Everyone gave up waiting: keep it for the next ask.
                 locked(&state.late_answers).insert(key, (Instant::now(), answer));
             }

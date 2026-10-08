@@ -74,7 +74,8 @@ pub(super) fn routes(state: &AppState) -> Router<AppState> {
 /// grant, so its next call asks again. Stops once the server is gone.
 fn spawn_screen_sweeper(tools: &DesktopTools) {
     let weak = Arc::downgrade(&tools.alive);
-    let desktop = tools.mcp.desktop().clone();
+    let mcp = tools.mcp.clone();
+    let desktop = mcp.desktop().clone();
     let conversations = tools.conversations.clone();
     let mut stops = crate::computer::host_ui::stop_requests();
     spawn_browser_tab_journal(desktop.browser(), conversations.clone());
@@ -90,7 +91,7 @@ fn spawn_screen_sweeper(tools: &DesktopTools) {
             }
             if stopped {
                 if let Some(conversation_id) = desktop.screen_holder() {
-                    let (grant, _) = desktop.revoke_computer(&conversation_id);
+                    let (grant, _) = mcp.revoke_computer(&conversation_id);
                     if grant.is_some() {
                         if let Err(error) = conversations
                             .append_agent_event(
@@ -723,6 +724,8 @@ impl DesktopTools {
         let mut content = Vec::new();
         let text = if tool == "computer_observe" {
             desktop_computer::observation_text(&result)
+        } else if tool == "computer_act" {
+            desktop_computer::act_text(&result)
         } else if tool == "browser_snapshot" {
             let mut page = format!(
                 "URL: {}\nTitle: {}\n\n{}",
@@ -1281,6 +1284,12 @@ mod tests {
         sessions: std::sync::Mutex<Vec<Option<String>>>,
         /// While set, a dialog stays on screen until notified.
         hold: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+        /// This many next confirmations fail instead of answering.
+        confirm_failures: std::sync::Mutex<usize>,
+        /// Actions that ran (were not refused).
+        acted: std::sync::Mutex<Vec<Value>>,
+        /// While set, an allowed action is still running until notified.
+        act_block: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     #[async_trait::async_trait]
@@ -1308,16 +1317,27 @@ mod tests {
             title: String,
             _message: String,
             _timeout: Duration,
-        ) -> Option<bool> {
+        ) -> Result<Option<bool>, crate::computer::ComputerError> {
             self.confirmations.lock().unwrap().push(title);
             let hold = self.hold.lock().unwrap().clone();
             if let Some(hold) = hold {
                 hold.notified().await;
             }
-            self.answers.lock().unwrap().pop_front().flatten()
+            {
+                let mut failures = self.confirm_failures.lock().unwrap();
+                if *failures > 0 {
+                    *failures -= 1;
+                    return Err(crate::computer::ComputerError::platform("dialog crashed"));
+                }
+            }
+            Ok(self.answers.lock().unwrap().pop_front().flatten())
         }
 
-        async fn observe(&self, _args: Value) -> Result<Value, crate::computer::ComputerError> {
+        async fn observe(
+            &self,
+            _lease: u64,
+            _args: Value,
+        ) -> Result<Value, crate::computer::ComputerError> {
             Ok(json!({
                 "app": { "name": "TextEdit", "bundleId": "com.apple.TextEdit", "pid": 7 },
                 "windows": [], "displays": [],
@@ -1328,6 +1348,7 @@ mod tests {
 
         async fn act(
             &self,
+            _lease: u64,
             args: Value,
             allowed_apps: Vec<String>,
             confirmed: bool,
@@ -1353,6 +1374,11 @@ mod tests {
                     "typing into a password field",
                 ));
             }
+            let block = self.act_block.lock().unwrap().clone();
+            if let Some(block) = block {
+                block.notified().await;
+            }
+            self.acted.lock().unwrap().push(args);
             Ok(
                 json!({ "app": { "name": "TextEdit", "bundleId": "com.apple.TextEdit", "pid": 7 }, "path": "background" }),
             )
@@ -1360,6 +1386,7 @@ mod tests {
 
         async fn frame(
             &self,
+            _lease: u64,
             _max_width: u32,
             _quality: u8,
         ) -> Result<Vec<u8>, crate::computer::ComputerError> {
@@ -1376,6 +1403,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn computer_use_needs_its_switch_a_host_confirmed_grant_the_lease_and_app_approval() {
+        let _turn = LEASE_TESTS.lock().await;
         let (root, state, conversation_id, client) = harness().await;
         let fake = Arc::new(FakeComputer::default());
         state
@@ -1597,6 +1625,306 @@ mod tests {
         assert_eq!(state.agent_desktop.computer_grant(&other.id), None);
         let _ = client.cancel().await;
         let _ = other_client.cancel().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Tests holding a screen lease take turns: the host's stop button is
+    /// process-wide and revokes every daemon's lease holder.
+    static LEASE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A conversation with Computer Use on, granted by the (scripted) host.
+    async fn computer_harness() -> (
+        std::path::PathBuf,
+        AppState,
+        String,
+        Client,
+        Arc<FakeComputer>,
+        tokio::sync::MutexGuard<'static, ()>,
+    ) {
+        let turn = LEASE_TESTS.lock().await;
+        let (root, state, conversation_id, client) = harness().await;
+        let fake = Arc::new(FakeComputer::default());
+        state
+            .agent_desktop
+            .set_computer(crate::computer::Computer::with_host(fake.clone()));
+        state
+            .agent_desktop
+            .update_settings(None, Some(true))
+            .await
+            .unwrap();
+        fake.answers.lock().unwrap().push_back(Some(true));
+        let observed = call(&client, "computer_observe", json!({})).await;
+        assert_ne!(observed.is_error, Some(true), "{}", text(&observed));
+        (root, state, conversation_id, client, fake, turn)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_revoke_stops_a_call_waiting_on_the_host_and_nothing_runs_after_it() {
+        let (root, state, conversation_id, client, fake, _turn) = computer_harness().await;
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *fake.hold.lock().unwrap() = Some(hold.clone());
+        let asked = fake.confirmations.lock().unwrap().len();
+        let clicked = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                call(
+                    &client,
+                    "computer_act",
+                    json!({ "action": "click", "ref": "e1" }),
+                )
+                .await
+            })
+        };
+        // The first action in TextEdit: the host dialog is on screen.
+        for _ in 0..500 {
+            if fake.confirmations.lock().unwrap().len() > asked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fake.confirmations.lock().unwrap().len(), asked + 1);
+        // A call waiting on the host is in use: the lease is not idle and
+        // cannot be taken over, however long ago the last call ended.
+        state
+            .agent_desktop
+            .age_lease(crate::agent_desktop::SCREEN_IDLE + Duration::from_secs(1));
+        assert!(state.agent_desktop.expire_screens().is_empty());
+        assert_eq!(
+            state.agent_desktop.screen_holder().as_deref(),
+            Some(conversation_id.as_str())
+        );
+
+        let (grant, ended) = state.agent_mcp.revoke_computer(&conversation_id);
+        assert!(grant.is_some() && ended);
+        let stopped = tokio::time::timeout(Duration::from_secs(5), clicked)
+            .await
+            .expect("a revoke ends the call at once, dialog or not")
+            .unwrap();
+        assert_eq!(stopped.is_error, Some(true));
+        assert!(text(&stopped).starts_with("STOPPED"), "{}", text(&stopped));
+
+        // The person answers the dialog afterwards: nothing is approved or
+        // run for the revoked lease.
+        fake.answers.lock().unwrap().push_back(Some(true));
+        hold.notify_one();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(state
+            .agent_desktop
+            .approved_apps(&conversation_id)
+            .is_empty());
+        assert!(fake.acted.lock().unwrap().is_empty());
+        assert_eq!(state.agent_desktop.computer_grant(&conversation_id), None);
+        let _ = client.cancel().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_revoke_stops_an_action_the_host_is_running() {
+        let (root, state, conversation_id, client, fake, _turn) = computer_harness().await;
+        let lease = {
+            let desktop = &state.agent_desktop;
+            let screen = desktop.claim_screen(&conversation_id).unwrap();
+            assert!(desktop.approve_app_if_held(&conversation_id, "com.apple.TextEdit", screen.id));
+            screen.id
+        };
+        assert!(state.agent_desktop.holds(&conversation_id, lease));
+        let block = Arc::new(tokio::sync::Notify::new());
+        *fake.act_block.lock().unwrap() = Some(block.clone());
+        let clicked = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                call(
+                    &client,
+                    "computer_act",
+                    json!({ "action": "click", "ref": "e1" }),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!clicked.is_finished());
+        state.agent_mcp.revoke_computer(&conversation_id);
+        let stopped = tokio::time::timeout(Duration::from_secs(5), clicked)
+            .await
+            .expect("a revoke does not wait for the action")
+            .unwrap();
+        assert!(text(&stopped).starts_with("STOPPED"), "{}", text(&stopped));
+        block.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(fake.acted.lock().unwrap().is_empty());
+        let events = state
+            .conversations
+            .history_for_tests(&conversation_id)
+            .await;
+        assert!(events.iter().any(|event| {
+            event.event_type == "desktop.computer.action"
+                && event.payload["error"]["code"] == "STOPPED"
+        }));
+        let _ = client.cancel().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_revokes_the_holder_and_stops_its_running_call() {
+        let (root, state, conversation_id, client, fake, _turn) = computer_harness().await;
+        *fake.hold.lock().unwrap() = Some(Arc::new(tokio::sync::Notify::new()));
+        let asked = fake.confirmations.lock().unwrap().len();
+        let clicked = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                call(
+                    &client,
+                    "computer_act",
+                    json!({ "action": "click", "ref": "e1" }),
+                )
+                .await
+            })
+        };
+        for _ in 0..500 {
+            if fake.confirmations.lock().unwrap().len() > asked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        crate::computer::host_ui::request_stop();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), clicked)
+            .await
+            .expect("a stop ends the call at once")
+            .unwrap();
+        assert!(text(&stopped).starts_with("STOPPED"), "{}", text(&stopped));
+        assert_eq!(state.agent_desktop.screen_holder(), None);
+        assert_eq!(state.agent_desktop.computer_grant(&conversation_id), None);
+        assert!(fake.acted.lock().unwrap().is_empty());
+        let _ = client.cancel().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_revoke_voids_earlier_host_answers_but_not_later_ones() {
+        use super::super::authorizer::{Answerer, CancelSignal, Prompt};
+        let (root, state, conversation_id, client) = harness().await;
+        let fake = Arc::new(FakeComputer::default());
+        state
+            .agent_desktop
+            .set_computer(crate::computer::Computer::with_host(fake.clone()));
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *fake.hold.lock().unwrap() = Some(hold.clone());
+        let authorizer = state.agent_mcp.authorizer(&state.conversations);
+        let prompt = || Prompt {
+            key: "app:x".into(),
+            answerer: Answerer::Host,
+            kind: "desktop_computer_action",
+            title: "t".into(),
+            message: "m".into(),
+            details: Value::Null,
+            options: Value::Null,
+            once: false,
+        };
+        let late_answer = || {
+            state
+                .agent_mcp
+                .authorizer_state()
+                .has_late_answer(&conversation_id, "app:x")
+        };
+        let answer_after_everyone_left = |allow: bool| {
+            let (fake, hold) = (fake.clone(), hold.clone());
+            let authorizer = &authorizer;
+            let conversation_id = &conversation_id;
+            async move {
+                let (cancel_tx, cancel) = CancelSignal::manual();
+                let _ = cancel_tx.send(true);
+                let gone = authorizer.ask(conversation_id, prompt(), &cancel).await;
+                assert_eq!(gone.unwrap_err().code, "CANCELLED");
+                fake.answers.lock().unwrap().push_back(Some(allow));
+                hold.notify_one();
+            }
+        };
+
+        // A yes given while nobody waited is kept for the next ask ...
+        answer_after_everyone_left(true).await;
+        for _ in 0..100 {
+            if late_answer() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(late_answer());
+        // ... until the conversation's Computer Use is revoked.
+        state.agent_mcp.revoke_computer(&conversation_id);
+        assert!(!late_answer());
+        // A decline's backoff survives the revoke.
+        fake.answers.lock().unwrap().push_back(Some(false));
+        hold.notify_one();
+        let (_keep, cancel) = CancelSignal::manual();
+        let declined = authorizer.ask(&conversation_id, prompt(), &cancel).await;
+        assert_eq!(declined.unwrap_err().code, "DECLINED");
+        state.agent_mcp.revoke_computer(&conversation_id);
+        let backoff = authorizer.ask(&conversation_id, prompt(), &cancel).await;
+        assert!(backoff.unwrap_err().message.contains("not ask again"));
+        state.agent_mcp.clear_declines_for_tests(&conversation_id);
+        // An answer given after the revoke is valid.
+        answer_after_everyone_left(true).await;
+        for _ in 0..100 {
+            if late_answer() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(late_answer());
+        let _ = client.cancel().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_dialog_is_failed_and_nobody_to_ask_is_unavailable_neither_backs_off() {
+        use super::super::authorizer::{Answerer, CancelSignal, Prompt};
+        let (root, state, conversation_id, client) = harness().await;
+        let fake = Arc::new(FakeComputer::default());
+        state
+            .agent_desktop
+            .set_computer(crate::computer::Computer::with_host(fake.clone()));
+        let authorizer = state.agent_mcp.authorizer(&state.conversations);
+        let prompt = || Prompt {
+            key: "app:x".into(),
+            answerer: Answerer::Host,
+            kind: "desktop_computer_action",
+            title: "t".into(),
+            message: "m".into(),
+            details: Value::Null,
+            options: Value::Null,
+            once: false,
+        };
+        let (_keep, cancel) = CancelSignal::manual();
+
+        *fake.confirm_failures.lock().unwrap() = 1;
+        let failed = authorizer.ask(&conversation_id, prompt(), &cancel).await;
+        assert_eq!(failed.unwrap_err().code, "FAILED");
+        // No backoff: asking again shows the dialog again (no answer
+        // scripted: nobody to ask).
+        let nobody = authorizer.ask(&conversation_id, prompt(), &cancel).await;
+        assert_eq!(nobody.unwrap_err().code, "UNAVAILABLE");
+        fake.answers.lock().unwrap().push_back(Some(true));
+        assert!(authorizer
+            .ask(&conversation_id, prompt(), &cancel)
+            .await
+            .is_ok());
+        assert_eq!(fake.confirmations.lock().unwrap().len(), 3);
+
+        // A failure nobody waited for is not kept for the next ask.
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *fake.hold.lock().unwrap() = Some(hold.clone());
+        let (cancel_tx, gone) = CancelSignal::manual();
+        let _ = cancel_tx.send(true);
+        let left = authorizer.ask(&conversation_id, prompt(), &gone).await;
+        assert_eq!(left.unwrap_err().code, "CANCELLED");
+        *fake.confirm_failures.lock().unwrap() = 1;
+        hold.notify_one();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!state
+            .agent_mcp
+            .authorizer_state()
+            .has_late_answer(&conversation_id, "app:x"));
+        let _ = client.cancel().await;
         let _ = std::fs::remove_dir_all(root);
     }
 

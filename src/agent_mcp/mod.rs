@@ -156,6 +156,39 @@ impl AgentMcp {
         &self.inner.desktop
     }
 
+    /// Takes back a conversation's Computer Use: grant, approved apps and
+    /// screen lease (stopping the calls running under it), and voids the
+    /// host answers still waiting for it. Every user-facing revoke (stop
+    /// button, REST, settings) goes through here. Returns the grant and
+    /// whether a screen session ended.
+    pub(crate) fn revoke_computer(
+        &self,
+        conversation_id: &str,
+    ) -> (Option<crate::agent_desktop::Grant>, bool) {
+        let revoked = self.inner.desktop.revoke_computer(conversation_id);
+        self.inner.authorizer.forget_host_answers(conversation_id);
+        revoked
+    }
+
+    /// Persists the desktop switches; turning one off revokes what it
+    /// covered (see [`AgentDesktop::update_settings`]) and voids the revoked
+    /// conversations' pending host answers.
+    pub(crate) async fn update_desktop_settings(
+        &self,
+        enabled: Option<bool>,
+        computer_enabled: Option<bool>,
+    ) -> Result<crate::agent_desktop::SettingsChange, AppError> {
+        let change = self
+            .inner
+            .desktop
+            .update_settings(enabled, computer_enabled)
+            .await?;
+        for conversation_id in &change.computer_revoked {
+            self.inner.authorizer.forget_host_answers(conversation_id);
+        }
+        Ok(change)
+    }
+
     /// The prompts of one tool call.
     fn authorizer<'a>(&'a self, conversations: &'a ConversationSupervisor) -> Authorizer<'a> {
         Authorizer {

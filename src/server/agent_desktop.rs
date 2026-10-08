@@ -138,11 +138,11 @@ async fn set_settings(
             "set enabled and/or computerEnabled".to_owned(),
         ));
     }
-    let (_, ended) = state
-        .agent_desktop
-        .update_settings(request.enabled, request.computer_enabled)
+    let change = state
+        .agent_mcp
+        .update_desktop_settings(request.enabled, request.computer_enabled)
         .await?;
-    for conversation_id in ended {
+    for conversation_id in change.screen_ended {
         journal_screen_end(&state, &conversation_id, "revoked").await;
     }
     Ok(Json(settings_view(&state).await))
@@ -226,12 +226,12 @@ async fn revoke_conversation(
         .await?;
     let desktop = &state.agent_desktop;
     let (browser, (computer, screen_ended)) = match query.capability.as_deref() {
-        None => {
-            let revoked = desktop.revoke(&conversation_id);
-            (revoked.browser, (revoked.computer, revoked.screen_ended))
-        }
+        None => (
+            desktop.revoke_browser(&conversation_id),
+            state.agent_mcp.revoke_computer(&conversation_id),
+        ),
         Some("browser") => (desktop.revoke_browser(&conversation_id), (None, false)),
-        Some("screen") => (None, desktop.revoke_computer(&conversation_id)),
+        Some("screen") => (None, state.agent_mcp.revoke_computer(&conversation_id)),
         Some(other) => {
             return Err(AppError::InvalidRequest(format!(
                 "unknown capability {other}; use browser or screen"

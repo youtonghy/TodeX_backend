@@ -7,7 +7,7 @@
 use std::{
     cell::RefCell,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Mutex,
     },
     time::Duration,
@@ -30,7 +30,16 @@ use objc2_foundation::{NSLocale, NSObject, NSPoint, NSRect, NSSize, NSString};
 
 use super::Strings;
 
-pub(super) const STOP_SHORTCUT: Option<&str> = Some("⌘⇧⎋");
+const SHORTCUT_LABEL: &str = "⌘⇧⎋";
+
+/// Whether the stop shortcut can be used: true until the system refuses to
+/// register it (another app owns ⌘⇧⎋).
+static STOP_KEY_OK: AtomicBool = AtomicBool::new(true);
+
+/// The stop shortcut as shown to people; `None` when registering it failed.
+pub(super) fn stop_shortcut() -> Option<&'static str> {
+    STOP_KEY_OK.load(Ordering::SeqCst).then_some(SHORTCUT_LABEL)
+}
 
 /// `kCGStatusWindowLevel`: above normal and floating windows.
 const STATUS_LEVEL: isize = 25;
@@ -229,11 +238,27 @@ pub(super) fn show_status(strings: &Strings, summary: &str) {
     } else {
         format!("{} · {summary}", strings.controlling)
     };
-    let stop = format!("{} ⌘⇧⎋", strings.stop);
+    let stop_title = strings.stop;
     with_ui(move |ui, mtm| {
-        if !ui.stop_key_registered && ui.hotkeys.register(ui.stop_key).is_ok() {
-            ui.stop_key_registered = true;
+        if !ui.stop_key_registered {
+            match ui.hotkeys.register(ui.stop_key) {
+                Ok(()) => {
+                    ui.stop_key_registered = true;
+                    STOP_KEY_OK.store(true, Ordering::SeqCst);
+                }
+                Err(error) => {
+                    // Only the pill's Stop button remains.
+                    STOP_KEY_OK.store(false, Ordering::SeqCst);
+                    eprintln!(
+                        "todex-agentd: could not register the Computer Use stop shortcut {SHORTCUT_LABEL}: {error}"
+                    );
+                }
+            }
         }
+        let stop = match stop_shortcut() {
+            Some(shortcut) => format!("{stop_title} {shortcut}"),
+            None => stop_title.to_owned(),
+        };
         if ui.pill.is_none() {
             let Some(screen) = NSScreen::mainScreen(mtm) else {
                 return;
@@ -338,7 +363,12 @@ pub(super) fn marker_window() -> Option<u32> {
         .filter(|number| *number != 0)
 }
 
-pub(super) fn confirm(strings: &Strings, title: &str, message: &str, timeout: Duration) -> bool {
+pub(super) fn confirm(
+    strings: &Strings,
+    title: &str,
+    message: &str,
+    timeout: Duration,
+) -> Option<bool> {
     let _one_at_a_time = CONFIRMING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -384,5 +414,5 @@ pub(super) fn confirm(strings: &Strings, title: &str, message: &str, timeout: Du
             .take();
         run_on_main(|_| close_confirmation());
     }
-    answer.unwrap_or(false)
+    Some(answer.unwrap_or(false))
 }

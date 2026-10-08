@@ -26,6 +26,6 @@ pub(super) fn confirm(
     _title: &str,
     _message: &str,
     _timeout: Duration,
-) -> bool {
-    false
+) -> Option<bool> {
+    None
 }

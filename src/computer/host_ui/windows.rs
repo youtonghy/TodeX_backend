@@ -540,7 +540,12 @@ pub(super) fn mark_point(x: f64, y: f64) {
 /// A Yes/No message box (No by default) on its own thread; on timeout the
 /// box is answered No and this returns false. Message box buttons follow
 /// the system language, so `strings` is not needed.
-pub(super) fn confirm(_strings: &Strings, title: &str, message: &str, timeout: Duration) -> bool {
+pub(super) fn confirm(
+    _strings: &Strings,
+    title: &str,
+    message: &str,
+    timeout: Duration,
+) -> Option<bool> {
     let _one_at_a_time = CONFIRMING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -567,11 +572,14 @@ pub(super) fn confirm(_strings: &Strings, title: &str, message: &str, timeout: D
     };
     if let Err(error) = spawned {
         eprintln!("todex-agentd: could not show the Computer Use confirmation: {error}");
-        return false;
+        return None;
     }
     match answer_rx.recv_timeout(timeout) {
-        Ok(allowed) => allowed,
-        Err(mpsc::RecvTimeoutError::Disconnected) => false,
+        Ok(allowed) => Some(allowed),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("todex-agentd: the Computer Use confirmation ended without an answer");
+            None
+        }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             // Answer No for the person; the box may still be appearing.
             let thread = box_thread.load(Ordering::SeqCst);
@@ -586,7 +594,7 @@ pub(super) fn confirm(_strings: &Strings, title: &str, message: &str, timeout: D
                     break;
                 }
             }
-            false
+            Some(false)
         }
     }
 }

@@ -240,13 +240,20 @@ pub(super) fn hide_status() {
 
 pub(super) fn mark_point(_x: f64, _y: f64) {}
 
-pub(super) fn confirm(strings: &Strings, title: &str, message: &str, timeout: Duration) -> bool {
+/// `None` when no notification server with actions, `kdialog` or `zenity`
+/// exists: nobody can be asked.
+pub(super) fn confirm(
+    strings: &Strings,
+    title: &str,
+    message: &str,
+    timeout: Duration,
+) -> Option<bool> {
     let _one_at_a_time = CONFIRMING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(proxy) = notifications().filter(supports_actions) {
         if let Some(answer) = confirm_by_notification(&proxy, strings, title, message, timeout) {
-            return answer;
+            return Some(answer);
         }
     }
     confirm_by_dialog(strings, title, message, timeout)
@@ -300,8 +307,14 @@ fn confirm_by_notification(
     Some(allowed)
 }
 
-/// `kdialog`, else `zenity`; false when neither exists or on timeout.
-fn confirm_by_dialog(strings: &Strings, title: &str, message: &str, timeout: Duration) -> bool {
+/// `kdialog`, else `zenity`; `Some(false)` on timeout, `None` when neither
+/// could be run.
+fn confirm_by_dialog(
+    strings: &Strings,
+    title: &str,
+    message: &str,
+    timeout: Duration,
+) -> Option<bool> {
     let seconds = timeout.as_secs().max(1).to_string();
     let attempts: [(&str, Vec<&str>); 2] = [
         (
@@ -352,14 +365,14 @@ fn confirm_by_dialog(strings: &Strings, title: &str, message: &str, timeout: Dur
         let deadline = Instant::now() + timeout;
         loop {
             match child.try_wait() {
-                Ok(Some(status)) => return status.success(),
+                Ok(Some(status)) => return Some(status.success()),
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Ok(None) | Err(_) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return false;
+                    return Some(false);
                 }
             }
         }
@@ -367,7 +380,7 @@ fn confirm_by_dialog(strings: &Strings, title: &str, message: &str, timeout: Dur
     eprintln!(
         "todex-agentd: no notification server with actions, kdialog or zenity to confirm Computer Use"
     );
-    false
+    None
 }
 
 /// The stop shortcut through KDE's global shortcut service, which Wayland
