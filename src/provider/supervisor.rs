@@ -4520,6 +4520,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_late_task_notification_keeps_the_claude_turn_open() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-late-notification").await;
+        fs::write(root.join("late-notification"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "plan it".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(history.iter().any(
+            |event| event.event_type == "turn.completed" && event.payload["turnId"] == turn_id
+        ));
+        // The last task finished before the `result` that emptied the set;
+        // its hand-back is answered only by the follow-up invocation.
+        assert!(
+            history
+                .iter()
+                .any(|event| event.payload.to_string().contains("fixture hand-back")),
+            "{history:?}"
+        );
+        // The zero-turn invocation came after the prompt was answered, so the
+        // prompt is not resent.
+        let stdin = fs::read_to_string(root.join("stdin.log")).unwrap();
+        assert_eq!(stdin.matches("plan it").count(), 1, "{stdin}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelling_a_turn_resolves_an_open_permission_prompt() {
         let (root, store, supervisor, workspace) =
             control_fixture("todex-claude-permission-cancel").await;
@@ -5665,6 +5699,43 @@ elif [ "$mode" = "--mode" ]; then
         printf '{"type":"agent_settled"}\n'
         ;;
     esac
+  done
+elif [ -f "$(dirname "$0")/late-notification" ]; then
+  # Frame order captured from Claude Code: a subagent finishes while the main
+  # invocation is still answering, so its notification precedes that
+  # invocation's `result` and the hand-back is answered by a follow-up
+  # invocation. A redundant zero-turn invocation (the notification paired
+  # with an already-delivered hand-back) comes first. Frames are written from
+  # a subshell so every stdin line, including a resent prompt, is logged.
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$(dirname "$0")/stdin.log"
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{}}}\n'
+        continue
+        ;;
+    esac
+    [ -n "$started" ] && continue
+    started=1
+    (
+      printf '{"type":"system","subtype":"task_started","task_id":"bg-1","is_backgrounded":true}\n'
+      printf '{"type":"system","subtype":"task_started","task_id":"bg-2","is_backgrounded":true}\n'
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"launched"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"launched"}\n'
+      printf '{"type":"system","subtype":"task_notification","task_id":"bg-1","status":"completed"}\n'
+      printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bg-2"}]}\n'
+      printf '{"type":"system","subtype":"init"}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"session_id":"claude-native","result":""}\n'
+      sleep 0.3
+      printf '{"type":"system","subtype":"init"}\n'
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"one is back"}}}\n'
+      printf '{"type":"system","subtype":"task_notification","task_id":"bg-2","status":"completed"}\n'
+      printf '{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"one is back"}\n'
+      printf '{"type":"system","subtype":"init"}\n'
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"fixture hand-back"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"fixture hand-back"}\n'
+    ) &
   done
 else
   while IFS= read -r line; do

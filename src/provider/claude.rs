@@ -1344,12 +1344,12 @@ mod tests {
     #[test]
     fn background_tasks_track_live_set_until_notifications() {
         let mut tasks = BackgroundTasks::default();
-        assert!(tasks.is_empty());
+        assert!(tasks.ids().is_empty());
 
         tasks.apply(&json!({ "subtype": "task_started", "task_id": "a1" }));
         tasks
             .apply(&json!({ "subtype": "task_started", "task_id": "b2", "is_backgrounded": true }));
-        assert!(!tasks.is_empty());
+        assert_eq!(tasks.ids().len(), 2);
 
         // Foreground task starts are not background work that outlives a turn.
         tasks.apply(
@@ -1374,7 +1374,37 @@ mod tests {
         assert_eq!(ids, ["c3", "d4"]);
 
         tasks.apply(&json!({ "subtype": "background_tasks_changed", "tasks": [] }));
-        assert!(tasks.is_empty());
+        assert!(tasks.ids().is_empty());
+    }
+
+    #[test]
+    fn a_notification_owes_a_result_from_the_next_invocation() {
+        let mut tasks = BackgroundTasks::default();
+        assert!(!tasks.pending());
+        tasks
+            .apply(&json!({ "subtype": "task_started", "task_id": "a1", "is_backgrounded": true }));
+        assert!(tasks.pending());
+
+        // Finishing mid-invocation empties the set but keeps the turn open
+        // through the current `result`, until the follow-up starts.
+        tasks.apply(
+            &json!({ "subtype": "task_notification", "task_id": "a1", "status": "completed" }),
+        );
+        tasks.apply(&json!({ "subtype": "background_tasks_changed", "tasks": [] }));
+        assert!(tasks.ids().is_empty());
+        assert!(tasks.pending());
+        tasks.apply(&json!({ "subtype": "init" }));
+        assert!(!tasks.pending());
+
+        // A subagent's own tasks report back to that subagent; foreground
+        // tasks were never tracked.
+        tasks.apply(&json!({ "subtype": "task_started", "task_id": "sub",
+            "is_backgrounded": true, "owned_by_subagent": true }));
+        tasks.apply(&json!({ "subtype": "task_started", "task_id": "fg",
+            "is_backgrounded": false, "owned_by_subagent": true }));
+        tasks.apply(&json!({ "subtype": "task_notification", "task_id": "sub" }));
+        tasks.apply(&json!({ "subtype": "task_notification", "task_id": "fg" }));
+        assert!(!tasks.pending());
     }
 
     #[test]
@@ -2003,7 +2033,10 @@ async fn run_claude_turn(
     // A `result` with zero model turns means the invocation ended without an
     // API call — a task notification queued during resume consumes the prompt
     // without answering it. The process stays alive on the open stream, so
-    // resend the prompt instead of failing the turn.
+    // resend the prompt instead of failing the turn. Once the prompt has been
+    // answered, a zero-turn `result` is a follow-up invocation for a task
+    // notification another hand-back already covered; resending then would
+    // replay the user's prompt into the conversation.
     let mut empty_results = 0_u32;
     // `can_use_tool` waits on the user for up to the permission timeout, so
     // control requests are answered by detached tasks while this loop keeps
@@ -2073,18 +2106,19 @@ async fn run_claude_turn(
                     ));
                 }
                 if message.get("num_turns").and_then(Value::as_u64) == Some(0)
+                    && !saw_output
                     && empty_results < MAX_EMPTY_RESULT_RESENDS
                 {
                     empty_results += 1;
                     process.send(&user_message).await?;
                     continue;
                 }
-                // `result` ends the model turn, not the process: while live
-                // background tasks remain, Claude keeps the stream open,
+                // `result` ends the model turn, not the process: while
+                // background work remains, Claude keeps the stream open,
                 // delivers task_notification, and runs a follow-up turn that
                 // ends in another `result`. Terminating here kills those
-                // subagents mid-flight.
-                if !background_tasks.is_empty() {
+                // subagents mid-flight or drops their queued hand-back.
+                if background_tasks.pending() {
                     sink.emit(
                         "provider.event",
                         json!({
@@ -2584,33 +2618,56 @@ fn content_blocks<'a>(message: &'a Value, kind: &'a str) -> impl Iterator<Item =
 /// one but still bounded.
 const MAX_EMPTY_RESULT_RESENDS: u32 = 3;
 
-/// Live background-task set, mirroring the Agent SDK: `task_started` adds
-/// (unless explicitly foreground), `task_notification` removes, and
-/// `background_tasks_changed` replaces the whole set — its `tasks` payload is
-/// "every live background task after the change".
+/// Background work that keeps a Claude turn open.
+///
+/// `live` mirrors the Agent SDK: `task_started` adds (unless explicitly
+/// foreground), `task_notification` removes, and `background_tasks_changed`
+/// replaces the whole set — its `tasks` payload is "every live background
+/// task after the change".
+///
+/// An empty set is not enough to end the turn. Claude emits
+/// `task_notification` as soon as a task finishes, even mid-invocation, but
+/// only answers it in a follow-up invocation that starts (with `system/init`)
+/// after the current `result`. `followup_owed` covers that gap; ending on the
+/// earlier `result` kills the process with the hand-back still queued.
 #[derive(Default)]
-struct BackgroundTasks(HashSet<String>);
+struct BackgroundTasks {
+    live: HashSet<String>,
+    /// Main-session background tasks seen this turn. Tasks a subagent owns
+    /// notify that subagent, not the main session, so they owe no follow-up.
+    main: HashSet<String>,
+    followup_owed: bool,
+}
 
 impl BackgroundTasks {
     fn apply(&mut self, message: &Value) {
         match message.get("subtype").and_then(Value::as_str) {
+            // Each invocation starts with `init`, after it has taken the
+            // queued notifications.
+            Some("init") => self.followup_owed = false,
             Some("task_started") => {
                 if message.get("is_backgrounded").and_then(Value::as_bool) == Some(false) {
                     return;
                 }
                 if let Some(id) = message.get("task_id").and_then(Value::as_str) {
-                    self.0.insert(id.to_owned());
+                    self.live.insert(id.to_owned());
+                    if message.get("owned_by_subagent").and_then(Value::as_bool) != Some(true) {
+                        self.main.insert(id.to_owned());
+                    }
                 }
             }
             Some("task_notification") => {
                 if let Some(id) = message.get("task_id").and_then(Value::as_str) {
-                    self.0.remove(id);
+                    self.live.remove(id);
+                    if self.main.contains(id) {
+                        self.followup_owed = true;
+                    }
                 }
             }
             Some("background_tasks_changed") => {
-                self.0.clear();
+                self.live.clear();
                 if let Some(tasks) = message.get("tasks").and_then(Value::as_array) {
-                    self.0.extend(tasks.iter().filter_map(|task| {
+                    self.live.extend(tasks.iter().filter_map(|task| {
                         task.get("task_id")
                             .and_then(Value::as_str)
                             .map(str::to_owned)
@@ -2621,12 +2678,16 @@ impl BackgroundTasks {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    /// Whether Claude will still produce another `result` in this turn.
+    fn pending(&self) -> bool {
+        self.followup_owed || !self.live.is_empty()
     }
 
     fn ids(&self) -> Vec<Value> {
-        self.0.iter().map(|id| Value::String(id.clone())).collect()
+        self.live
+            .iter()
+            .map(|id| Value::String(id.clone()))
+            .collect()
     }
 }
 
