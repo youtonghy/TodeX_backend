@@ -181,6 +181,9 @@ pub struct ProviderCapabilitySnapshot {
     pub follow_up_queue: bool,
     /// Every provider can hold follow-ups in the daemon's queue.
     pub backend_queue: bool,
+    /// The queue also takes `conversation.queue.pause` and `.take`, and
+    /// `add` accepts `paused`.
+    pub backend_queue_control: bool,
     #[serde(flatten)]
     pub resident_runtime: Option<ResidentRuntimeCapabilities>,
 }
@@ -245,6 +248,7 @@ impl ProviderSnapshot {
                 live_configuration: live_controls,
                 follow_up_queue: native_queue,
                 backend_queue: true,
+                backend_queue_control: true,
                 resident_runtime: driver.supports_runtime_stop().then_some(
                     ResidentRuntimeCapabilities {
                         runtime_stop: true,

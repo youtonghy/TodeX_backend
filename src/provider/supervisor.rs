@@ -378,9 +378,10 @@ pub struct ConversationSupervisor {
     /// Set once [`Self::shutdown_all`] starts: the follow-up queue no longer
     /// starts items, so nothing new runs while turns are being stopped.
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
-    /// Conversations whose follow-up queue is unpaused and holds items, so
-    /// the next item is about to start; the updater waits for them.
-    pending_follow_ups: Arc<dashmap::DashSet<String>>,
+    /// Backend follow-up queues by conversation. In memory only: queued
+    /// prompts are never written to disk, so a restart loses them and the
+    /// updater waits while any queue holds an item.
+    follow_up_queues: Arc<dashmap::DashMap<String, follow_ups::FollowUpQueue>>,
     /// Shortest wait before a rate-limit continuation runs (doubled per
     /// consecutive failed continuation). Tests shorten it.
     rate_limit_retry_floor: Duration,
@@ -491,7 +492,7 @@ impl ConversationSupervisor {
                     .expect("the control result cache is not empty"),
             ))),
             shutting_down: Arc::default(),
-            pending_follow_ups: Arc::default(),
+            follow_up_queues: Arc::default(),
             rate_limit_retry_floor: follow_ups::RATE_LIMIT_RETRY_FLOOR,
         }
     }
@@ -693,7 +694,7 @@ impl ConversationSupervisor {
                     "conversation recovery failed; continuing startup"
                 );
             }
-            self.restore_follow_ups_after_restart(&manifest.id).await;
+            self.import_legacy_follow_ups(&manifest.id).await;
             if (index + 1) % 25 == 0 || index + 1 == total {
                 tracing::info!(
                     recovered = index + 1,
@@ -829,10 +830,12 @@ impl ConversationSupervisor {
         !self.active.is_empty()
     }
 
-    /// Whether some follow-up queue is unpaused with items waiting, so a
-    /// turn is about to start even if none runs right now.
+    /// Whether some follow-up queue holds items, paused or not: they exist
+    /// only in memory, so a restart would destroy them.
     pub fn has_pending_follow_ups(&self) -> bool {
-        !self.pending_follow_ups.is_empty()
+        self.follow_up_queues
+            .iter()
+            .any(|queue| queue.holds_items())
     }
 
     pub fn has_active_turns_for_cli(&self, cli: ManagedCli) -> bool {
@@ -1157,7 +1160,7 @@ impl ConversationSupervisor {
             .shutdown_session_with_reason(&manifest.id, "conversation_deleted")
             .await;
         self.store.delete(&manifest.id).await?;
-        self.pending_follow_ups.remove(&manifest.id);
+        self.follow_up_queues.remove(&manifest.id);
         self.revoke_agent_mcp(&manifest.id).await;
         // Close the broadcast channel so live websocket subscriptions exit
         // instead of holding their per-connection slot forever.
@@ -1182,7 +1185,7 @@ impl ConversationSupervisor {
                 .driver(manifest.provider)?
                 .shutdown_session_with_reason(&manifest.id, "conversation_expired")
                 .await;
-            self.pending_follow_ups.remove(&manifest.id);
+            self.follow_up_queues.remove(&manifest.id);
             self.revoke_agent_mcp(&manifest.id).await;
             self.hub.remove(&manifest.id);
         }
@@ -3246,12 +3249,12 @@ mod tests {
         read_only(
             "queue.add",
             supervisor
-                .queue_add_owned("local", &id, "queued-1", prompt(), false)
+                .queue_add_owned("local", &id, "queued-1", prompt(), false, false)
                 .await
                 .err()
                 .unwrap(),
         );
-        assert!(store.follow_up_queue(&id).await.unwrap().is_none());
+        assert!(!supervisor.has_pending_follow_ups());
         assert!(!root
             .join("data")
             .join("conversations")

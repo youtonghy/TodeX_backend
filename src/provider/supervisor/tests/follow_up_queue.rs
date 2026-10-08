@@ -1,4 +1,5 @@
 //! Backend follow-up queue: ordering, pausing, idempotency and restart.
+//! The queue is memory-only; a restart loses it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -161,9 +162,31 @@ async fn add(
     prompt: ConversationPrompt,
 ) -> FollowUpAddOutcome {
     supervisor
-        .queue_add_owned("local", id, item, prompt, false)
+        .queue_add_owned("local", id, item, prompt, false, false)
         .await
         .unwrap()
+}
+
+/// Where an older daemon persisted the queue; nothing writes it any more.
+fn queue_file(root: &Path, id: &str) -> PathBuf {
+    root.join("data")
+        .join("conversations")
+        .join(id)
+        .join("queue.json")
+}
+
+fn image_prompt(text: &str) -> ConversationPrompt {
+    let mut prompt = queued_prompt(text);
+    prompt.content = vec![
+        PromptContentRef::Text {
+            text: "notes".to_owned(),
+        },
+        PromptContentRef::Image {
+            data: "aGk=".to_owned(),
+            mime_type: "image/png".to_owned(),
+        },
+    ];
+    prompt
 }
 
 async fn queue_ids(supervisor: &ConversationSupervisor, id: &str) -> (Vec<String>, Value) {
@@ -261,7 +284,7 @@ async fn queued_follow_up_with_content_starts_after_the_turn_completes() {
 
 #[tokio::test]
 async fn adding_to_an_idle_conversation_starts_immediately() {
-    let (root, store, supervisor, workspace, gate) = gated_fixture("todex-queue-idle").await;
+    let (root, _store, supervisor, workspace, gate) = gated_fixture("todex-queue-idle").await;
     let manifest = supervisor
         .create(ProviderKind::ClaudeCode, workspace, None, None)
         .await
@@ -281,7 +304,7 @@ async fn adding_to_an_idle_conversation_starts_immediately() {
     gate.release();
     wait_until_idle(&supervisor).await;
     assert_eq!(gate.prompts().len(), 1);
-    assert!(store.follow_up_queue(&manifest.id).await.unwrap().is_none());
+    assert!(!queue_file(&root, &manifest.id).exists());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -375,7 +398,14 @@ async fn cancelled_turn_pauses_and_remove_and_clear_edit_the_queue() {
         add(&supervisor, &manifest.id, item, queued_prompt(item)).await;
     }
     supervisor
-        .queue_add_owned("local", &manifest.id, "front", queued_prompt("front"), true)
+        .queue_add_owned(
+            "local",
+            &manifest.id,
+            "front",
+            queued_prompt("front"),
+            true,
+            false,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -459,12 +489,12 @@ async fn enqueue_rejects_invalid_requests_and_a_full_queue() {
     }];
     fs::write(root.join("outside.txt"), "x").unwrap();
     assert!(supervisor
-        .queue_add_owned("local", &manifest.id, "bad", outside, false)
+        .queue_add_owned("local", &manifest.id, "bad", outside, false, false)
         .await
         .is_err());
     assert!(matches!(
         supervisor
-            .queue_add_owned("local", &manifest.id, "", queued_prompt("x"), false)
+            .queue_add_owned("local", &manifest.id, "", queued_prompt("x"), false, false)
             .await,
         Err(AppError::InvalidRequest(_))
     ));
@@ -479,7 +509,14 @@ async fn enqueue_rejects_invalid_requests_and_a_full_queue() {
     }
     assert!(matches!(
         supervisor
-            .queue_add_owned("local", &manifest.id, "overflow", queued_prompt("x"), false)
+            .queue_add_owned(
+                "local",
+                &manifest.id,
+                "overflow",
+                queued_prompt("x"),
+                false,
+                false
+            )
             .await,
         Err(AppError::ResourceExhausted(_))
     ));
@@ -492,8 +529,21 @@ async fn enqueue_rejects_invalid_requests_and_a_full_queue() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// A fresh daemon over the same data directory.
+fn restarted(
+    supervisor: &ConversationSupervisor,
+    store: &ConversationStore,
+) -> ConversationSupervisor {
+    ConversationSupervisor::new(
+        supervisor.config.clone(),
+        store.clone(),
+        ConversationEventHub::default(),
+        supervisor.workspace_trust.clone(),
+    )
+}
+
 #[tokio::test]
-async fn daemon_restart_pauses_a_waiting_queue() {
+async fn daemon_restart_loses_the_memory_only_queue() {
     let (root, store, supervisor, workspace, gate) = gated_fixture("todex-queue-restart").await;
     let manifest = supervisor
         .create(ProviderKind::ClaudeCode, workspace, None, None)
@@ -505,25 +555,337 @@ async fn daemon_restart_pauses_a_waiting_queue() {
         .unwrap();
     gate.wait_for_prompts(1).await;
     add(&supervisor, &manifest.id, "item-2", queued_prompt("second")).await;
+    assert!(supervisor.has_pending_follow_ups());
+    // Nothing queued reaches the disk, not even paused.
+    assert!(!queue_file(&root, &manifest.id).exists());
+    supervisor
+        .queue_pause_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    assert!(!queue_file(&root, &manifest.id).exists());
 
-    // A fresh daemon over the same data directory.
-    let restarted = ConversationSupervisor::new(
-        supervisor.config.clone(),
-        store.clone(),
-        ConversationEventHub::default(),
-        supervisor.workspace_trust.clone(),
-    );
+    let restarted = restarted(&supervisor, &store);
     restarted.recover_all().await.unwrap();
     let snapshot = restarted
         .queue_list_owned("local", &manifest.id)
         .await
         .unwrap();
-    assert_eq!(snapshot["paused"], true);
-    assert_eq!(snapshot["pauseReason"], "daemon_restarted");
-    assert_eq!(snapshot["items"][0]["id"], "item-2");
+    assert_eq!(snapshot["items"], json!([]));
+    assert_eq!(snapshot["paused"], false);
+    assert!(!restarted.has_pending_follow_ups());
     supervisor.cancel(&manifest.id).await.unwrap();
     wait_until_idle(&supervisor).await;
     assert_eq!(gate.prompts().len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn legacy_queue_json(paused_for_rate_limit: bool) -> String {
+    let reset = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let state = if paused_for_rate_limit {
+        format!(
+            r#","paused":true,"pauseReason":"rate_limited","resumeAt":"{reset}","rateLimitFailures":2"#
+        )
+    } else {
+        r#","paused":false"#.to_owned()
+    };
+    format!(
+        r#"{{"schemaVersion":1,"items":[{{"id":"legacy-1","queuedAt":"2026-10-01T00:00:00Z","request":{{"clientRequestId":"legacy-1","text":"old text","model":null,"reasoningEffort":null,"skills":[],"content":[{{"type":"text","text":"old notes"}}],"permissionProfile":null,"sandboxMode":null,"approvalPolicy":null}}}}]{state}}}"#
+    )
+}
+
+#[tokio::test]
+async fn legacy_queue_file_is_imported_paused_and_deleted() {
+    for rate_limited in [false, true] {
+        let (root, store, supervisor, workspace, gate) = gated_fixture("todex-queue-legacy").await;
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let file = queue_file(&root, &manifest.id);
+        fs::write(&file, legacy_queue_json(rate_limited)).unwrap();
+
+        let restarted = restarted(&supervisor, &store);
+        restarted.recover_all().await.unwrap();
+        let snapshot = restarted
+            .queue_list_owned("local", &manifest.id)
+            .await
+            .unwrap();
+        assert_eq!(snapshot["paused"], true, "{snapshot}");
+        assert_eq!(snapshot["pauseReason"], "daemon_restarted");
+        assert!(snapshot["resumeAt"].is_null());
+        assert_eq!(snapshot["items"][0]["id"], "legacy-1");
+        assert_eq!(snapshot["items"][0]["text"], "old text");
+        assert_eq!(snapshot["items"][0]["contentCount"], 1);
+        assert!(!file.exists(), "the legacy file is deleted once imported");
+        assert!(restarted.has_pending_follow_ups());
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "followups.updated"));
+        // A second recovery finds no file and keeps the imported queue.
+        restarted.recover_all().await.unwrap();
+        assert_eq!(
+            restarted
+                .queue_list_owned("local", &manifest.id)
+                .await
+                .unwrap()["items"][0]["id"],
+            "legacy-1"
+        );
+        assert!(gate.prompts().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_legacy_queue_file_is_kept() {
+    let (root, store, supervisor, workspace, _gate) =
+        gated_fixture("todex-queue-legacy-corrupt").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    let file = queue_file(&root, &manifest.id);
+    fs::write(&file, "{ not json").unwrap();
+    let restarted = restarted(&supervisor, &store);
+    restarted.recover_all().await.unwrap();
+    assert!(file.exists());
+    assert!(!restarted.has_pending_follow_ups());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_paused_queue_still_blocks_the_idle_update_check() {
+    let (root, _store, supervisor, workspace, gate) = gated_fixture("todex-queue-idle-check").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    supervisor
+        .prompt(&manifest.id, "first".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    assert!(!supervisor.has_pending_follow_ups());
+    add(&supervisor, &manifest.id, "item-2", queued_prompt("second")).await;
+    assert!(supervisor.has_pending_follow_ups());
+    supervisor.cancel(&manifest.id).await.unwrap();
+    wait_for_queue(&supervisor, &manifest.id, |q| q["paused"] == true).await;
+    wait_until_idle(&supervisor).await;
+    assert!(!supervisor.has_active_turns());
+    assert!(supervisor.has_pending_follow_ups(), "paused but not empty");
+    supervisor
+        .queue_remove_owned("local", &manifest.id, "item-2")
+        .await
+        .unwrap();
+    assert!(!supervisor.has_pending_follow_ups());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_user_pause_survives_a_completed_turn_until_resumed() {
+    let (root, _store, supervisor, workspace, gate) = gated_fixture("todex-queue-user-pause").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    // Pausing an empty queue shows no pause.
+    let empty = supervisor
+        .queue_pause_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    assert_eq!(empty["paused"], false);
+    supervisor
+        .prompt(&manifest.id, "first".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    add(&supervisor, &manifest.id, "item-2", queued_prompt("second")).await;
+    let paused = supervisor
+        .queue_pause_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    assert_eq!(paused["paused"], true);
+    assert_eq!(paused["pauseReason"], "user");
+
+    gate.release();
+    wait_until_idle(&supervisor).await;
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        gate.prompts().len(),
+        1,
+        "completion must not lift the pause"
+    );
+    let snapshot = queue_ids(&supervisor, &manifest.id).await;
+    assert_eq!(snapshot.0, ["item-2"]);
+    assert_eq!(snapshot.1["pauseReason"], "user");
+
+    supervisor
+        .queue_resume_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(2).await;
+    assert_eq!(gate.prompts()[1], "second");
+    gate.release();
+    wait_until_idle(&supervisor).await;
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_user_pause_outlasts_a_rate_limit_reset() {
+    let (root, _store, supervisor, workspace, gate) =
+        gated_fixture("todex-queue-user-pause-limit").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    supervisor
+        .prompt(&manifest.id, "first".to_owned(), None)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    add(&supervisor, &manifest.id, "item-2", queued_prompt("second")).await;
+    supervisor
+        .queue_pause_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    gate.limit_next(chrono::Duration::zero());
+    gate.release();
+    let snapshot = wait_for_queue(&supervisor, &manifest.id, |q| {
+        q["items"].as_array().unwrap().len() == 2
+    })
+    .await;
+    assert_eq!(snapshot["pauseReason"], "user", "{snapshot}");
+    assert!(snapshot["items"][0]["id"]
+        .as_str()
+        .unwrap()
+        .starts_with("rate-limit-continue-"));
+    wait_until_idle(&supervisor).await;
+
+    // The reset passes without a timer lifting the user's pause.
+    sleep(Duration::from_millis(2500)).await;
+    assert_eq!(gate.prompts().len(), 1);
+    assert_eq!(
+        queue_ids(&supervisor, &manifest.id).await.1["pauseReason"],
+        "user"
+    );
+    supervisor
+        .queue_clear_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    assert!(!supervisor.has_pending_follow_ups());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn adding_paused_to_an_idle_conversation_queues_without_starting() {
+    let (root, _store, supervisor, workspace, gate) = gated_fixture("todex-queue-add-paused").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    let outcome = supervisor
+        .queue_add_owned(
+            "local",
+            &manifest.id,
+            "held",
+            queued_prompt("candidate"),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, FollowUpAddOutcome::Queued);
+    // Re-adding the same id stays a no-op.
+    let again = supervisor
+        .queue_add_owned(
+            "local",
+            &manifest.id,
+            "held",
+            queued_prompt("candidate"),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again, FollowUpAddOutcome::Queued);
+    sleep(Duration::from_millis(200)).await;
+    assert!(gate.prompts().is_empty());
+    let (ids, snapshot) = queue_ids(&supervisor, &manifest.id).await;
+    assert_eq!(ids, ["held"]);
+    assert_eq!(snapshot["paused"], true);
+    assert_eq!(snapshot["pauseReason"], "user");
+    assert!(!queue_file(&root, &manifest.id).exists());
+
+    supervisor
+        .queue_resume_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    assert_eq!(gate.prompts()[0], "candidate");
+    gate.release();
+    wait_until_idle(&supervisor).await;
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn take_returns_the_whole_item_and_clears_an_emptied_pause() {
+    let (root, store, supervisor, workspace, _gate) = gated_fixture("todex-queue-take").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    for (item, prompt) in [
+        ("a", image_prompt("with image")),
+        ("b", queued_prompt("plain")),
+    ] {
+        supervisor
+            .queue_add_owned("local", &manifest.id, item, prompt, false, true)
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        supervisor
+            .queue_take_owned("local", &manifest.id, "missing")
+            .await,
+        Err(AppError::NotFound(_))
+    ));
+
+    let (item, queue) = supervisor
+        .queue_take_owned("local", &manifest.id, "a")
+        .await
+        .unwrap();
+    assert_eq!(item["id"], "a");
+    assert_eq!(item["text"], "with image");
+    assert_eq!(
+        item["content"],
+        json!([
+            { "type": "text", "text": "notes" },
+            { "type": "image", "data": "aGk=", "mimeType": "image/png" },
+        ])
+    );
+    assert_eq!(item["skills"], json!([]));
+    assert_eq!(queue["items"].as_array().unwrap().len(), 1);
+    assert_eq!(queue["paused"], true);
+    let history = store.complete_history(&manifest.id).await.unwrap();
+    let updates = history
+        .iter()
+        .filter(|event| event.event_type == "followups.updated")
+        .collect::<Vec<_>>();
+    let last = updates.last().unwrap();
+    assert_eq!(last.payload["items"].as_array().unwrap().len(), 1);
+    assert!(
+        !last.payload.to_string().contains("aGk="),
+        "events never carry image data"
+    );
+
+    let (_, queue) = supervisor
+        .queue_take_owned("local", &manifest.id, "b")
+        .await
+        .unwrap();
+    assert_eq!(queue["items"], json!([]));
+    assert_eq!(queue["paused"], false);
+    assert!(queue["pauseReason"].is_null());
+    assert!(!supervisor.has_pending_follow_ups());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -648,41 +1010,6 @@ async fn a_turn_completed_during_the_wait_drops_the_continuation() {
     fs::remove_dir_all(root).unwrap();
 }
 
-#[tokio::test]
-async fn daemon_restart_keeps_a_rate_limit_wait() {
-    let (root, store, supervisor, workspace, gate) =
-        gated_fixture("todex-queue-rate-limit-restart").await;
-    let manifest = supervisor
-        .create(ProviderKind::ClaudeCode, workspace, None, None)
-        .await
-        .unwrap();
-    supervisor
-        .prompt(&manifest.id, "first".to_owned(), None)
-        .await
-        .unwrap();
-    gate.wait_for_prompts(1).await;
-    gate.limit_next(chrono::Duration::hours(1));
-    gate.release();
-    let armed = wait_for_queue(&supervisor, &manifest.id, |q| q["paused"] == true).await;
-    wait_until_idle(&supervisor).await;
-
-    let restarted = ConversationSupervisor::new(
-        supervisor.config.clone(),
-        store.clone(),
-        ConversationEventHub::default(),
-        supervisor.workspace_trust.clone(),
-    );
-    restarted.recover_all().await.unwrap();
-    let snapshot = restarted
-        .queue_list_owned("local", &manifest.id)
-        .await
-        .unwrap();
-    assert_eq!(snapshot["pauseReason"], "rate_limited");
-    assert_eq!(snapshot["resumeAt"], armed["resumeAt"]);
-    assert_eq!(snapshot["items"], armed["items"]);
-    fs::remove_dir_all(root).unwrap();
-}
-
 #[test]
 fn continuations_wait_at_least_the_floor_and_back_off() {
     let now = chrono::Utc::now();
@@ -710,7 +1037,7 @@ fn continuations_wait_at_least_the_floor_and_back_off() {
 
 #[tokio::test]
 async fn continuations_stop_after_three_consecutive_limits() {
-    let (root, store, supervisor, workspace, gate) =
+    let (root, _store, supervisor, workspace, gate) =
         gated_fixture("todex-queue-rate-limit-cap").await;
     let manifest = supervisor
         .create(ProviderKind::ClaudeCode, workspace, None, None)
@@ -745,9 +1072,6 @@ async fn continuations_stop_after_three_consecutive_limits() {
         "{snapshot}"
     );
     wait_until_idle(&supervisor).await;
-    // The count survives a restart, since it lives in queue.json.
-    let saved = store.follow_up_queue(&manifest.id).await.unwrap().unwrap();
-    assert_eq!(saved["rateLimitFailures"], 3);
     sleep(Duration::from_millis(200)).await;
     assert_eq!(gate.prompts().len(), 4);
 
@@ -769,8 +1093,10 @@ async fn continuations_stop_after_three_consecutive_limits() {
     })
     .await;
     assert!(snapshot["pauseReason"].is_null());
-    let saved = store.follow_up_queue(&manifest.id).await.unwrap().unwrap();
-    assert!(saved.get("rateLimitFailures").is_none(), "{saved}");
+    assert!(
+        supervisor.follow_up_queues.is_empty(),
+        "an idle queue with no backoff count is dropped"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -840,7 +1166,7 @@ async fn a_rate_limit_keeps_a_pause_the_user_holds() {
 
 #[tokio::test]
 async fn nothing_starts_from_the_queue_once_shutdown_begins() {
-    let (root, store, supervisor, workspace, gate) = gated_fixture("todex-queue-shutdown").await;
+    let (root, _store, supervisor, workspace, gate) = gated_fixture("todex-queue-shutdown").await;
     let manifest = supervisor
         .create(ProviderKind::ClaudeCode, workspace, None, None)
         .await
@@ -871,20 +1197,9 @@ async fn nothing_starts_from_the_queue_once_shutdown_begins() {
     sleep(Duration::from_millis(100)).await;
     assert_eq!(gate.prompts().len(), 1, "resume does not start it either");
 
-    // The next daemon finds it waiting and holds it for the user.
-    let restarted = ConversationSupervisor::new(
-        supervisor.config.clone(),
-        store.clone(),
-        ConversationEventHub::default(),
-        supervisor.workspace_trust.clone(),
-    );
-    restarted.recover_all().await.unwrap();
-    let snapshot = restarted
-        .queue_list_owned("local", &manifest.id)
-        .await
-        .unwrap();
-    assert_eq!(snapshot["pauseReason"], "daemon_restarted");
-    assert!(!restarted.has_pending_follow_ups());
+    // Memory-only: the updater keeps waiting rather than destroy it.
+    assert!(supervisor.has_pending_follow_ups());
+    assert!(!queue_file(&root, &manifest.id).exists());
     fs::remove_dir_all(root).unwrap();
 }
 

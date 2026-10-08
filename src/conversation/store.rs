@@ -39,7 +39,7 @@ const LAST_REQUEST_FILE: &str = "last-request.json";
 pub(super) const EVENTS_FILE: &str = "events.jsonl";
 const SNAPSHOT_FILE: &str = "snapshot.json";
 const PROVIDER_STATE_FILE: &str = "provider-state.json";
-/// Prompts waiting for the running turn to finish; never copied by fork.
+/// Only read to import (and delete) the queue older daemons persisted here.
 const FOLLOW_UP_QUEUE_FILE: &str = "queue.json";
 pub(super) const MAX_REPLAY_LIMIT: usize = 1000;
 /// New prompts are refused with `STORAGE_LOW` while the filesystem holding
@@ -1668,9 +1668,12 @@ impl ConversationStore {
         ))
     }
 
-    /// The backend follow-up queue persisted beside the request snapshot;
-    /// `None` when the conversation never queued anything.
-    pub async fn follow_up_queue(&self, conversation_id: &str) -> Result<Option<Value>, AppError> {
+    /// The `queue.json` an older daemon persisted; follow-up queues now live
+    /// in memory, so this only feeds the one-time import at startup.
+    pub async fn legacy_follow_up_queue(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<Value>, AppError> {
         let _guard = self.lock(conversation_id).await;
         let path = self.directory(conversation_id)?.join(FOLLOW_UP_QUEUE_FILE);
         if !tokio::fs::try_exists(&path).await? {
@@ -1681,17 +1684,17 @@ impl ConversationStore {
         ))
     }
 
-    /// Replaces the follow-up queue file atomically. The conversation must
-    /// exist, so a deleted conversation cannot be recreated by a late write.
-    pub async fn save_follow_up_queue(
+    pub async fn remove_legacy_follow_up_queue(
         &self,
         conversation_id: &str,
-        queue: &Value,
     ) -> Result<(), AppError> {
         let _guard = self.lock(conversation_id).await;
-        let directory = self.directory(conversation_id)?;
-        self.get_unlocked(conversation_id).await?;
-        write_atomic_json(&directory.join(FOLLOW_UP_QUEUE_FILE), queue).await
+        let path = self.directory(conversation_id)?.join(FOLLOW_UP_QUEUE_FILE);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Every event, paged through replay into one vector. Only tests use

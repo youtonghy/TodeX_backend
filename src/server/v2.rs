@@ -83,6 +83,8 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.followUp"
             | "conversation.queue.add"
             | "conversation.queue.remove"
+            | "conversation.queue.take"
+            | "conversation.queue.pause"
             | "conversation.queue.clear"
             | "conversation.queue.resume"
             | "conversation.queue.list"
@@ -3178,6 +3180,7 @@ async fn dispatch_command_inner(
                         content: request.content,
                     },
                     request.front,
+                    request.paused,
                 )
                 .await?;
             Ok(match outcome {
@@ -3189,7 +3192,21 @@ async fn dispatch_command_inner(
                 }),
             })
         }
+        "conversation.queue.take" => {
+            let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
+            let item_id = request.item_id.as_deref().ok_or_else(|| {
+                AppError::InvalidRequest("conversation.queue.take requires itemId".to_owned())
+            })?;
+            let (item, snapshot) = state
+                .conversations
+                .queue_take_owned(owner_id, &request.conversation_id, item_id)
+                .await?;
+            Ok(json!({
+                "conversationId": request.conversation_id, "itemId": item_id, "item": item, "queue": snapshot,
+            }))
+        }
         "conversation.queue.remove"
+        | "conversation.queue.pause"
         | "conversation.queue.clear"
         | "conversation.queue.resume"
         | "conversation.queue.list" => {
@@ -3205,6 +3222,11 @@ async fn dispatch_command_inner(
                     })?;
                     conversations
                         .queue_remove_owned(owner_id, conversation_id, item_id)
+                        .await?
+                }
+                "conversation.queue.pause" => {
+                    conversations
+                        .queue_pause_owned(owner_id, conversation_id)
                         .await?
                 }
                 "conversation.queue.clear" => {
@@ -3835,6 +3857,10 @@ struct WsConversationRequest {
     /// `conversation.queue.add`: place the item ahead of the others.
     #[serde(default)]
     front: bool,
+    /// `conversation.queue.add`: queue the item and pause the queue (reason
+    /// `user`) instead of starting it.
+    #[serde(default)]
+    paused: bool,
     /// `conversation.retry` under history encryption: the decrypted text of
     /// the request being retried.
     #[serde(default)]
@@ -5279,6 +5305,68 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(absent.code(), "NOT_FOUND");
+
+        let added = run!(
+            "add",
+            "conversation.queue.add",
+            json!({
+                "conversationId": manifest.id,
+                "itemId": "held",
+                "text": "candidate",
+                "paused": true,
+                "content": [{ "type": "image", "data": "aGk=", "mimeType": "image/png" }],
+                "skills": [],
+            }),
+        )
+        .unwrap();
+        assert_eq!(added["status"], "queued");
+        let listed = run!(
+            "list-held",
+            "conversation.queue.list",
+            json!({ "conversationId": manifest.id }),
+        )
+        .unwrap();
+        assert_eq!(listed["queue"]["paused"], true);
+        assert_eq!(listed["queue"]["pauseReason"], "user");
+        assert_eq!(listed["queue"]["items"][0]["id"], "held");
+        let paused = run!(
+            "pause",
+            "conversation.queue.pause",
+            json!({ "conversationId": manifest.id }),
+        )
+        .unwrap();
+        assert_eq!(paused["conversationId"], manifest.id);
+        assert_eq!(paused["queue"]["pauseReason"], "user");
+
+        let missing_take_id = run!(
+            "take-no-id",
+            "conversation.queue.take",
+            json!({ "conversationId": manifest.id }),
+        )
+        .unwrap_err();
+        assert_eq!(missing_take_id.code(), "INVALID_REQUEST");
+        let taken = run!(
+            "take",
+            "conversation.queue.take",
+            json!({ "conversationId": manifest.id, "itemId": "held" }),
+        )
+        .unwrap();
+        assert_eq!(taken["conversationId"], manifest.id);
+        assert_eq!(taken["itemId"], "held");
+        assert_eq!(taken["item"]["text"], "candidate");
+        assert_eq!(
+            taken["item"]["content"],
+            json!([{ "type": "image", "data": "aGk=", "mimeType": "image/png" }])
+        );
+        assert_eq!(taken["queue"]["items"], json!([]));
+        assert_eq!(taken["queue"]["paused"], false);
+        let taken_again = run!(
+            "take-again",
+            "conversation.queue.take",
+            json!({ "conversationId": manifest.id, "itemId": "held" }),
+        )
+        .unwrap_err();
+        assert_eq!(taken_again.code(), "NOT_FOUND");
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1,16 +1,20 @@
 //! Backend follow-up queue: prompts submitted while a conversation is busy.
 //!
-//! The queue lives beside the conversation journal (`queue.json`) and holds
+//! The queue lives in daemon memory only (never written to disk) and holds
 //! complete prompt requests, attachments and skills included, for every
-//! provider. A turn that completes starts the head item; a turn that fails,
-//! is cancelled, or is interrupted pauses the queue until a client resumes
-//! it, and so does a daemon restart. A turn that failed on an exhausted plan
-//! window instead gets a continuation prompt at the head and the queue
-//! resumes on its own once the window resets, at least a minute later; a
-//! continuation that keeps hitting the limit backs off and gives up after
-//! [`MAX_RATE_LIMIT_CONTINUATIONS`] tries. Nothing starts once the daemon is
-//! shutting down. Clients learn the queue through `followups.updated` events
-//! and the list command; events never carry inline image data.
+//! provider; a restart loses it. A turn that completes starts the head item;
+//! a turn that fails, is cancelled, or is interrupted pauses the queue until
+//! a client resumes it, and so does the user (`pause`, or `add` with
+//! `paused`). A turn that failed on an exhausted plan window instead gets a
+//! continuation prompt at the head and the queue resumes on its own once the
+//! window resets, at least a minute later; a continuation that keeps hitting
+//! the limit backs off and gives up after [`MAX_RATE_LIMIT_CONTINUATIONS`]
+//! tries. Nothing starts once the daemon is shutting down. Clients learn the
+//! queue through `followups.updated` events and the list command; events
+//! never carry inline image data, `take` returns an item with it.
+//!
+//! A `queue.json` left by an older daemon is imported once at startup as a
+//! paused queue and deleted, so queued text is never dropped silently.
 
 use std::time::Duration;
 
@@ -24,10 +28,11 @@ use crate::error::AppError;
 pub(super) const MAX_FOLLOW_UP_ITEMS: usize = 32;
 /// Serialized size cap for one conversation's queue (inline images count).
 pub(super) const MAX_FOLLOW_UP_QUEUE_BYTES: usize = 32 * 1024 * 1024;
-const FOLLOW_UP_QUEUE_SCHEMA_VERSION: u32 = 1;
 pub(super) const FOLLOW_UP_QUEUE_EVENT: &str = "followups.updated";
 /// Pause reason of a queue waiting for a provider plan window to reset.
 const RATE_LIMITED: &str = "rate_limited";
+/// Pause reason of a queue the user paused.
+const USER_PAUSE: &str = "user";
 /// Item id prefix of the prompt that continues a rate-limited turn.
 const RATE_LIMIT_CONTINUE_PREFIX: &str = "rate-limit-continue-";
 /// Model-facing, so it stays English whatever the client locale: the
@@ -47,13 +52,16 @@ pub(super) const RATE_LIMIT_RETRY_FLOOR: Duration = Duration::from_secs(60);
 const MAX_RATE_LIMIT_CONTINUATIONS: u32 = 3;
 /// Pauses a rate-limit continuation must not override: they wait for the
 /// user, so the continuation joins the queue without lifting them.
-const USER_HELD_PAUSES: &[&str] = &["turn_cancelled", "start_failed", "daemon_restarted"];
+const USER_HELD_PAUSES: &[&str] = &[
+    USER_PAUSE,
+    "turn_cancelled",
+    "start_failed",
+    "daemon_restarted",
+];
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct FollowUpQueue {
-    #[serde(default)]
-    schema_version: u32,
     #[serde(default)]
     items: Vec<FollowUpItem>,
     #[serde(default)]
@@ -67,8 +75,7 @@ pub(super) struct FollowUpQueue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_at: Option<DateTime<Utc>>,
     /// Consecutive continuation turns that failed on an exhausted plan
-    /// window. Persisted so a restart does not restart the backoff; cleared
-    /// when a turn completes.
+    /// window; cleared when a turn completes.
     #[serde(default, skip_serializing_if = "is_zero")]
     rate_limit_failures: u32,
 }
@@ -148,9 +155,15 @@ impl FollowUpQueue {
                 .is_some_and(|reason| USER_HELD_PAUSES.contains(&reason))
     }
 
-    /// The next item starts as soon as the conversation is idle.
-    fn pending(&self) -> bool {
-        !self.paused && !self.items.is_empty()
+    /// Queued prompts exist, paused or not: restarting the daemon would
+    /// lose them.
+    pub(super) fn holds_items(&self) -> bool {
+        !self.items.is_empty()
+    }
+
+    /// Nothing worth keeping: no items, no pause, no backoff count.
+    fn is_idle(&self) -> bool {
+        self.items.is_empty() && !self.paused && self.rate_limit_failures == 0
     }
 }
 
@@ -184,38 +197,54 @@ fn validate_item_id(item_id: &str) -> Result<(), AppError> {
 }
 
 impl ConversationSupervisor {
-    async fn load_follow_ups(&self, conversation_id: &str) -> Result<FollowUpQueue, AppError> {
-        match self.store.follow_up_queue(conversation_id).await? {
-            Some(value) => Ok(serde_json::from_value(value)?),
-            None => Ok(FollowUpQueue::default()),
-        }
+    fn load_follow_ups(&self, conversation_id: &str) -> FollowUpQueue {
+        self.follow_up_queues
+            .get(conversation_id)
+            .map(|queue| queue.clone())
+            .unwrap_or_default()
     }
 
-    /// Persists, then publishes the client snapshot. Callers hold the
-    /// conversation's request gate.
-    async fn save_follow_ups(
+    /// Replaces the conversation's in-memory queue. The conversation must
+    /// exist, so a deleted conversation cannot get a queue back from a late
+    /// write. Callers hold the conversation's request gate.
+    async fn commit_follow_ups(
         &self,
         conversation_id: &str,
-        queue: &mut FollowUpQueue,
+        queue: &FollowUpQueue,
     ) -> Result<(), AppError> {
-        queue.schema_version = FOLLOW_UP_QUEUE_SCHEMA_VERSION;
-        let value = serde_json::to_value(&*queue)?;
-        let bytes = serde_json::to_vec(&value)?.len();
+        let bytes = serde_json::to_vec(queue)?.len();
         if bytes > MAX_FOLLOW_UP_QUEUE_BYTES {
             return Err(AppError::ResourceExhausted(format!(
                 "the follow-up queue would hold {bytes} bytes, above the {MAX_FOLLOW_UP_QUEUE_BYTES} byte limit"
             )));
         }
-        self.store
-            .save_follow_up_queue(conversation_id, &value)
-            .await?;
-        if queue.pending() {
-            self.pending_follow_ups.insert(conversation_id.to_owned());
+        self.store.get(conversation_id).await?;
+        if queue.is_idle() {
+            self.follow_up_queues.remove(conversation_id);
         } else {
-            self.pending_follow_ups.remove(conversation_id);
+            self.follow_up_queues
+                .insert(conversation_id.to_owned(), queue.clone());
         }
+        Ok(())
+    }
+
+    async fn publish_follow_ups(
+        &self,
+        conversation_id: &str,
+        queue: &FollowUpQueue,
+    ) -> Result<(), AppError> {
         self.emit(conversation_id, FOLLOW_UP_QUEUE_EVENT, queue.snapshot())
             .await
+    }
+
+    /// Commits, then publishes the client snapshot.
+    async fn save_follow_ups(
+        &self,
+        conversation_id: &str,
+        queue: &FollowUpQueue,
+    ) -> Result<(), AppError> {
+        self.commit_follow_ups(conversation_id, queue).await?;
+        self.publish_follow_ups(conversation_id, queue).await
     }
 
     /// Whether the journal already recorded a user message for this request.
@@ -235,8 +264,10 @@ impl ConversationSupervisor {
     }
 
     /// Queues `prompt` behind the running turn, or starts it when the
-    /// conversation is idle and nothing waits ahead of it. Re-adding an id
-    /// that is queued or already delivered is a no-op reporting its state.
+    /// conversation is idle and nothing waits ahead of it. With `paused` the
+    /// item is always queued and the queue is paused by the user, so nothing
+    /// starts. Re-adding an id that is queued or already delivered is a no-op
+    /// reporting its state.
     pub async fn queue_add_owned(
         &self,
         owner_id: &str,
@@ -244,14 +275,15 @@ impl ConversationSupervisor {
         item_id: &str,
         mut prompt: ConversationPrompt,
         front: bool,
+        paused: bool,
     ) -> Result<FollowUpAddOutcome, AppError> {
         validate_item_id(item_id)?;
-        // Legacy plaintext history is read-only: refused before queue.json
-        // is touched.
+        // Legacy plaintext history is read-only: refused before the queue is
+        // touched.
         let manifest = self.writable_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         prompt.client_request_id = Some(item_id.to_owned());
-        let mut queue = self.load_follow_ups(conversation_id).await?;
+        let mut queue = self.load_follow_ups(conversation_id);
         if queue.items.iter().any(|item| item.id == item_id) {
             return Ok(FollowUpAddOutcome::Queued);
         }
@@ -259,7 +291,7 @@ impl ConversationSupervisor {
             return Ok(FollowUpAddOutcome::Started(turn_id));
         }
         let busy = self.active.contains_key(conversation_id);
-        if !busy && queue.items.is_empty() {
+        if !busy && !paused && queue.items.is_empty() {
             return self
                 .prompt_inner(owner_id, conversation_id, prompt)
                 .await
@@ -300,7 +332,10 @@ impl ConversationSupervisor {
         } else {
             queue.items.push(item);
         }
-        self.save_follow_ups(conversation_id, &mut queue).await?;
+        if paused && !queue.held_by_user() {
+            queue.pause(USER_PAUSE, None);
+        }
+        self.save_follow_ups(conversation_id, &queue).await?;
         // An idle conversation with a paused queue keeps waiting for resume;
         // an idle one that is not paused (a turn ended while this request
         // waited for the gate) starts the head now.
@@ -320,7 +355,7 @@ impl ConversationSupervisor {
         validate_item_id(item_id)?;
         self.get_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
-        let mut queue = self.load_follow_ups(conversation_id).await?;
+        let mut queue = self.load_follow_ups(conversation_id);
         let before = queue.items.len();
         queue.items.retain(|item| item.id != item_id);
         if queue.items.len() == before {
@@ -329,7 +364,67 @@ impl ConversationSupervisor {
         if queue.items.is_empty() {
             queue.unpause();
         }
-        self.save_follow_ups(conversation_id, &mut queue).await?;
+        self.save_follow_ups(conversation_id, &queue).await?;
+        Ok(queue.snapshot())
+    }
+
+    /// Removes the item and returns it whole (inline images included) with
+    /// the queue as it is afterwards, so a client can edit it.
+    pub async fn queue_take_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<(Value, Value), AppError> {
+        validate_item_id(item_id)?;
+        self.get_owned(owner_id, conversation_id).await?;
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        let mut queue = self.load_follow_ups(conversation_id);
+        let Some(index) = queue.items.iter().position(|item| item.id == item_id) else {
+            return Err(AppError::NotFound(format!("follow-up {item_id}")));
+        };
+        let item = queue.items.remove(index);
+        if queue.items.is_empty() {
+            queue.unpause();
+        }
+        let content = serde_json::to_value(&item.request.content)?;
+        self.commit_follow_ups(conversation_id, &queue).await?;
+        // The item left the queue; failing to announce that must not lose it.
+        if let Err(error) = self.publish_follow_ups(conversation_id, &queue).await {
+            tracing::error!(conversation_id, item_id, error = %error, "failed to publish the follow-up queue after take");
+        }
+        let skills = item
+            .request
+            .skills
+            .iter()
+            .map(|skill| json!({ "resourceId": skill.resource_id, "name": skill.name }))
+            .collect::<Vec<_>>();
+        Ok((
+            json!({
+                "id": item.id,
+                "text": item.request.text,
+                "content": content,
+                "skills": skills,
+            }),
+            queue.snapshot(),
+        ))
+    }
+
+    /// Holds the queue until `resume` or `clear`: neither a completed turn
+    /// nor a rate-limit reset lifts it. An empty queue shows no pause.
+    pub async fn queue_pause_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+    ) -> Result<Value, AppError> {
+        self.get_owned(owner_id, conversation_id).await?;
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        let mut queue = self.load_follow_ups(conversation_id);
+        if queue.items.is_empty() || queue.held_by_user() {
+            return Ok(queue.snapshot());
+        }
+        queue.pause(USER_PAUSE, None);
+        self.save_follow_ups(conversation_id, &queue).await?;
         Ok(queue.snapshot())
     }
 
@@ -340,10 +435,10 @@ impl ConversationSupervisor {
     ) -> Result<Value, AppError> {
         self.get_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
-        let mut queue = self.load_follow_ups(conversation_id).await?;
+        let mut queue = self.load_follow_ups(conversation_id);
         queue.items.clear();
         queue.unpause();
-        self.save_follow_ups(conversation_id, &mut queue).await?;
+        self.save_follow_ups(conversation_id, &queue).await?;
         Ok(queue.snapshot())
     }
 
@@ -356,10 +451,10 @@ impl ConversationSupervisor {
         self.writable_owned(owner_id, conversation_id).await?;
         let snapshot = {
             let _request_guard = self.request_gate(conversation_id).lock_owned().await;
-            let mut queue = self.load_follow_ups(conversation_id).await?;
+            let mut queue = self.load_follow_ups(conversation_id);
             if queue.paused {
                 queue.unpause();
-                self.save_follow_ups(conversation_id, &mut queue).await?;
+                self.save_follow_ups(conversation_id, &queue).await?;
             }
             queue.snapshot()
         };
@@ -373,7 +468,7 @@ impl ConversationSupervisor {
         conversation_id: &str,
     ) -> Result<Value, AppError> {
         self.get_owned(owner_id, conversation_id).await?;
-        Ok(self.load_follow_ups(conversation_id).await?.snapshot())
+        Ok(self.load_follow_ups(conversation_id).snapshot())
     }
 
     /// Runs [`Self::after_turn`] on its own task. Turn tasks call this
@@ -423,12 +518,12 @@ impl ConversationSupervisor {
     async fn pause_follow_ups(&self, conversation_id: &str, reason: &str, message: Option<String>) {
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         let result = async {
-            let mut queue = self.load_follow_ups(conversation_id).await?;
+            let mut queue = self.load_follow_ups(conversation_id);
             if queue.items.is_empty() || queue.paused {
                 return Ok(());
             }
             queue.pause(reason, message);
-            self.save_follow_ups(conversation_id, &mut queue).await
+            self.save_follow_ups(conversation_id, &queue).await
         }
         .await;
         if let Err(error) = result {
@@ -450,7 +545,7 @@ impl ConversationSupervisor {
             return;
         }
         let result = async {
-            let mut queue = self.load_follow_ups(conversation_id).await?;
+            let mut queue = self.load_follow_ups(conversation_id);
             let Some(head) = queue.items.first().cloned() else {
                 return Ok(());
             };
@@ -464,12 +559,12 @@ impl ConversationSupervisor {
             {
                 Ok(_) => {
                     queue.items.retain(|item| item.id != head.id);
-                    self.save_follow_ups(conversation_id, &mut queue).await
+                    self.save_follow_ups(conversation_id, &queue).await
                 }
                 Err(error) => {
                     tracing::warn!(conversation_id, item_id = %head.id, error = %error, "queued follow-up could not start");
                     queue.pause("start_failed", Some(error.to_string()));
-                    self.save_follow_ups(conversation_id, &mut queue).await
+                    self.save_follow_ups(conversation_id, &queue).await
                 }
             }
         }
@@ -479,23 +574,38 @@ impl ConversationSupervisor {
         }
     }
 
-    /// A restart interrupted whatever ran before it; queued items wait for
-    /// an explicit resume instead of continuing on their own. A queue already
-    /// waiting for a plan window keeps that wait and its timer is re-armed.
-    pub(super) async fn restore_follow_ups_after_restart(&self, conversation_id: &str) {
-        let resume_at = match self.load_follow_ups(conversation_id).await {
-            Ok(queue) if queue.rate_limited() => queue.resume_at,
-            Ok(_) => None,
-            Err(error) => {
-                tracing::error!(conversation_id, error = %error, "failed to read follow-up queue after restart");
-                None
+    /// Imports a `queue.json` an older daemon left behind: its items become a
+    /// queue paused as `daemon_restarted`, waiting for an explicit resume
+    /// (their turn did not survive the restart), and the file is deleted. A
+    /// file that cannot be read stays for inspection.
+    pub(super) async fn import_legacy_follow_ups(&self, conversation_id: &str) {
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        let result = async {
+            let Some(value) = self.store.legacy_follow_up_queue(conversation_id).await? else {
+                return Ok(None);
+            };
+            let mut queue: FollowUpQueue = serde_json::from_value(value)?;
+            let imported = queue.holds_items();
+            if imported {
+                queue.pause("daemon_restarted", None);
+                queue.resume_at = None;
+                self.commit_follow_ups(conversation_id, &queue).await?;
             }
-        };
-        match resume_at {
-            Some(until) => self.spawn_rate_limit_timer(conversation_id, until),
-            None => {
-                self.pause_follow_ups(conversation_id, "daemon_restarted", None)
-                    .await
+            self.store
+                .remove_legacy_follow_up_queue(conversation_id)
+                .await?;
+            Ok::<_, AppError>(imported.then_some(queue))
+        }
+        .await;
+        match result {
+            Ok(Some(queue)) => {
+                if let Err(error) = self.publish_follow_ups(conversation_id, &queue).await {
+                    tracing::error!(conversation_id, error = %error, "failed to publish the imported follow-up queue");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(conversation_id, error = %error, "failed to import the legacy follow-up queue");
             }
         }
     }
@@ -516,7 +626,7 @@ impl ConversationSupervisor {
     ) {
         let result = async {
             let _request_guard = self.request_gate(conversation_id).lock_owned().await;
-            let mut queue = self.load_follow_ups(conversation_id).await?;
+            let mut queue = self.load_follow_ups(conversation_id);
             let failed_request = self.turn_request(conversation_id, turn_id).await?;
             let was_continuation = failed_request
                 .as_ref()
@@ -538,7 +648,7 @@ impl ConversationSupervisor {
                     );
                     queue.resume_at = None;
                 }
-                self.save_follow_ups(conversation_id, &mut queue).await?;
+                self.save_follow_ups(conversation_id, &queue).await?;
                 return Ok(None);
             }
             let resume_at = rate_limit_resume_at(
@@ -569,7 +679,7 @@ impl ConversationSupervisor {
                 queue.pause(RATE_LIMITED, None);
             }
             queue.resume_at = Some(resume_at);
-            self.save_follow_ups(conversation_id, &mut queue).await?;
+            self.save_follow_ups(conversation_id, &queue).await?;
             Ok::<_, AppError>((!held).then_some(resume_at))
         }
         .await;
@@ -626,18 +736,18 @@ impl ConversationSupervisor {
     /// Lifts the pause armed for `until`. A queue that was resumed, cleared or
     /// re-armed for a later reset in the meantime is left alone.
     async fn resume_after_rate_limit(&self, conversation_id: &str, until: DateTime<Utc>) {
-        // A shutdown leaves the wait persisted; recovery re-arms it.
+        // A shutdown ends the wait with the process: the queue is gone.
         if self.is_shutting_down() {
             return;
         }
         let result = async {
             let _request_guard = self.request_gate(conversation_id).lock_owned().await;
-            let mut queue = self.load_follow_ups(conversation_id).await?;
+            let mut queue = self.load_follow_ups(conversation_id);
             if !queue.rate_limited() || queue.resume_at != Some(until) {
                 return Ok(false);
             }
             queue.unpause();
-            self.save_follow_ups(conversation_id, &mut queue).await?;
+            self.save_follow_ups(conversation_id, &queue).await?;
             Ok::<_, AppError>(true)
         }
         .await;
@@ -657,7 +767,7 @@ impl ConversationSupervisor {
     async fn settle_rate_limit_after_completion(&self, conversation_id: &str) {
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         let result = async {
-            let mut queue = self.load_follow_ups(conversation_id).await?;
+            let mut queue = self.load_follow_ups(conversation_id);
             let mut changed = false;
             let gave_up = queue.rate_limit_failures >= MAX_RATE_LIMIT_CONTINUATIONS
                 && queue.paused
@@ -676,7 +786,7 @@ impl ConversationSupervisor {
             if !changed {
                 return Ok(());
             }
-            self.save_follow_ups(conversation_id, &mut queue).await
+            self.save_follow_ups(conversation_id, &queue).await
         }
         .await;
         if let Err(error) = result {

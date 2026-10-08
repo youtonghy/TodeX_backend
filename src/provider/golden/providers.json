@@ -41,7 +41,8 @@
       "steering": false,
       "liveConfiguration": false,
       "followUpQueue": false,
-      "backendQueue": true
+      "backendQueue": true,
+      "backendQueueControl": true
     },
     "models": []
   },
@@ -106,7 +107,8 @@
       "steering": false,
       "liveConfiguration": false,
       "followUpQueue": false,
-      "backendQueue": true
+      "backendQueue": true,
+      "backendQueueControl": true
     },
     "models": []
   },
@@ -155,6 +157,7 @@
       "liveConfiguration": true,
       "followUpQueue": true,
       "backendQueue": true,
+      "backendQueueControl": true,
       "runtimeStop": true,
       "sessionCommands": true,
       "extensionMessages": true,
@@ -226,7 +229,8 @@
       "steering": false,
       "liveConfiguration": false,
       "followUpQueue": false,
-      "backendQueue": true
+      "backendQueue": true,
+      "backendQueueControl": true
     },
     "models": [
       {
@@ -611,7 +615,8 @@
       "steering": true,
       "liveConfiguration": true,
       "followUpQueue": false,
-      "backendQueue": true
+      "backendQueue": true,
+      "backendQueueControl": true
     },
     "models": []
   },
@@ -658,6 +663,7 @@
       "liveConfiguration": true,
       "followUpQueue": false,
       "backendQueue": true,
+      "backendQueueControl": true,
       "runtimeStop": true,
       "sessionCommands": true,
       "extensionMessages": true,
@@ -720,6 +726,7 @@
       "liveConfiguration": true,
       "followUpQueue": false,
       "backendQueue": true,
+      "backendQueueControl": true,
       "runtimeStop": true,
       "sessionCommands": true,
       "extensionMessages": true,
