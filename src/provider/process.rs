@@ -197,7 +197,11 @@ impl JsonLineProcess {
             AppError::ProviderUnavailable("provider process did not expose stderr".to_owned())
         })?;
         let stderr = Arc::new(Mutex::new(VecDeque::new()));
-        let stderr_task = tokio::spawn(drain_stderr(stderr_reader, stderr.clone()));
+        let stderr_task = tokio::spawn(drain_stderr(
+            stderr_reader,
+            stderr.clone(),
+            MAX_STDERR_BYTES,
+        ));
         group.disarm();
 
         Ok(Self {
@@ -485,7 +489,7 @@ pub async fn provider_exit_error(process: &JsonLineProcess, message: &str) -> Ap
 /// login — is almost always in what it printed, so reporting only a byte count
 /// leaves the user with nothing to act on. `drain_stderr` already keeps the last
 /// MAX_STDERR_BYTES, so the tail is the part worth showing.
-fn stderr_excerpt(buffer: &[u8]) -> Option<String> {
+pub(crate) fn stderr_excerpt(buffer: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(buffer);
     // Providers pad their diagnostics with blank lines and progress spinners.
     let collapsed = text
@@ -853,8 +857,16 @@ pub(crate) fn secure_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
-async fn drain_stderr(stderr: tokio::process::ChildStderr, destination: Arc<Mutex<VecDeque<u8>>>) {
-    let mut reader = stderr;
+/// Copies `stderr` into `destination`, a ring buffer of the last `max_bytes`,
+/// until EOF. Run it for the process's whole lifetime: a full pipe would block
+/// the child.
+pub(crate) async fn drain_stderr<R>(
+    mut reader: R,
+    destination: Arc<Mutex<VecDeque<u8>>>,
+    max_bytes: usize,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut chunk = [0_u8; 4096];
     loop {
         match reader.read(&mut chunk).await {
@@ -864,7 +876,7 @@ async fn drain_stderr(stderr: tokio::process::ChildStderr, destination: Arc<Mute
                 destination.extend(&chunk[..count]);
                 // A ring buffer: dropping the oldest bytes is O(dropped), not
                 // a shift of the whole tail per chunk.
-                let excess = destination.len().saturating_sub(MAX_STDERR_BYTES);
+                let excess = destination.len().saturating_sub(max_bytes);
                 destination.drain(..excess);
             }
         }
@@ -1176,6 +1188,13 @@ mod tests {
         );
         assert_eq!(process.read().await.unwrap(), None);
         process.terminate().await;
+    }
+
+    #[tokio::test]
+    async fn drain_stderr_keeps_only_the_requested_tail() {
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        drain_stderr(&b"0123456789abcdef"[..], tail.clone(), 6).await;
+        assert_eq!(tail.lock().await.make_contiguous(), b"abcdef");
     }
 
     #[test]
