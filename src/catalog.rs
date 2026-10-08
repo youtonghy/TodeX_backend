@@ -1225,19 +1225,23 @@ mod tests {
             std::env::var_os(name).map(|value| (PathBuf::from(value), default))
         })
         .collect();
+        // Forward slashes on every platform, so one golden file serves all.
         let normalize = |path: &Path| -> String {
-            for (redirect, default) in &redirects {
-                if let Ok(rest) = path.strip_prefix(redirect) {
-                    return Path::new(default).join(rest).display().to_string();
+            let shown = 'shown: {
+                for (redirect, default) in &redirects {
+                    if let Ok(rest) = path.strip_prefix(redirect) {
+                        break 'shown Path::new(default).join(rest);
+                    }
                 }
-            }
-            if let Ok(rest) = path.strip_prefix(&workspace) {
-                return Path::new("<workspace>").join(rest).display().to_string();
-            }
-            if let Ok(rest) = path.strip_prefix(&home) {
-                return Path::new("~").join(rest).display().to_string();
-            }
-            path.display().to_string()
+                if let Ok(rest) = path.strip_prefix(&workspace) {
+                    break 'shown Path::new("<workspace>").join(rest);
+                }
+                if let Ok(rest) = path.strip_prefix(&home) {
+                    break 'shown Path::new("~").join(rest);
+                }
+                path.to_path_buf()
+            };
+            shown.display().to_string().replace('\\', "/")
         };
         let roots = |roots: Vec<SourceRoot>| -> Value {
             let mut roots = roots

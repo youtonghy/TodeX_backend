@@ -290,9 +290,10 @@ mod tests {
         let line: &[u8] = b"0123456789\n";
         fs::write(directory.join("audit.jsonl"), [line, line].concat()).unwrap();
         fs::write(directory.join("audit.jsonl.1"), b"one\n").unwrap();
-        // `.2` cannot be moved onto the file `.3`: the shift fails.
-        fs::create_dir_all(directory.join("audit.jsonl.2/inside")).unwrap();
-        fs::write(directory.join("audit.jsonl.3"), b"three\n").unwrap();
+        // The file `.2` cannot be moved onto the directory `.3`: the shift
+        // fails (a directory could replace a file on Windows instead).
+        fs::write(directory.join("audit.jsonl.2"), b"two\n").unwrap();
+        fs::create_dir_all(directory.join("audit.jsonl.3/inside")).unwrap();
 
         let mut open = None;
         append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
@@ -303,16 +304,13 @@ mod tests {
             [line, line, line, line].concat()
         );
         assert_eq!(fs::read(directory.join("audit.jsonl.1")).unwrap(), b"one\n");
-        assert!(directory.join("audit.jsonl.2/inside").is_dir());
-        assert_eq!(
-            fs::read(directory.join("audit.jsonl.3")).unwrap(),
-            b"three\n"
-        );
+        assert_eq!(fs::read(directory.join("audit.jsonl.2")).unwrap(), b"two\n");
+        assert!(directory.join("audit.jsonl.3/inside").is_dir());
         assert!(!directory.join("audit.jsonl.rotating").exists());
         assert!(open.as_ref().unwrap().rotation_retry_at.is_some());
 
         // Once the obstacle is gone, the next due rotation succeeds.
-        fs::remove_dir_all(directory.join("audit.jsonl.2")).unwrap();
+        fs::remove_dir_all(directory.join("audit.jsonl.3")).unwrap();
         open.as_mut().unwrap().rotation_retry_at = Some(Instant::now());
         append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
         assert_eq!(fs::read(directory.join("audit.jsonl")).unwrap(), line);
@@ -321,10 +319,7 @@ mod tests {
             [line, line, line, line].concat()
         );
         assert_eq!(fs::read(directory.join("audit.jsonl.2")).unwrap(), b"one\n");
-        assert_eq!(
-            fs::read(directory.join("audit.jsonl.3")).unwrap(),
-            b"three\n"
-        );
+        assert_eq!(fs::read(directory.join("audit.jsonl.3")).unwrap(), b"two\n");
         let _ = fs::remove_dir_all(&temp);
     }
 
