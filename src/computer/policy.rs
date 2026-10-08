@@ -67,6 +67,11 @@ const BLOCKED: &[&str] = &[
     "org.kde.systemsettings",
     "seahorse",
     "gnome-control-center",
+    // The confirmation dialog tools (see `host_ui`): only the person at
+    // the host may answer them.
+    "kdialog",
+    "org.kde.kdialog",
+    "zenity",
     "1password",
     "bitwarden",
     "keepassxc",
@@ -140,6 +145,52 @@ pub(crate) fn check_target(
     })
 }
 
+/// Whether two identities are one app: the same app id (helper processes
+/// and multi-process apps share it across pids) or the same process.
+fn same_app(a: &Target, b: &Target) -> bool {
+    (!a.id.is_empty() && a.id.eq_ignore_ascii_case(&b.id)) || (a.pid != 0 && a.pid == b.pid)
+}
+
+/// The failure to report for pointer input about to land on `landing` (the
+/// app the hit test found at the point; `None` when the platform cannot
+/// tell) after `target` was checked. Protected apps are always refused.
+/// Where the agent chose the point (`agent_point`), the app under it must
+/// still be `target`, else the screen changed since it looked
+/// (`TARGET_CHANGED`). Elsewhere (the centre of a ref, a scroll's default
+/// point, a drag's destination) another app is allowed only if the user
+/// approved it, else `APP_CONFIRM` names it.
+pub(crate) fn check_landing(
+    landing: Option<Target>,
+    target: &Target,
+    allowed_apps: &[String],
+    agent_point: bool,
+    own_pid: u32,
+) -> Option<PolicyFailure> {
+    // No hit test here: the target check stands, as before.
+    let landing = landing?;
+    if is_protected(&landing, own_pid) {
+        let label = if landing.name.is_empty() {
+            &landing.id
+        } else {
+            &landing.name
+        };
+        return Some(blocked(label));
+    }
+    if same_app(&landing, target) {
+        return None;
+    }
+    let target_known = !target.id.is_empty() || target.pid != 0;
+    if agent_point && target_known {
+        return Some(PolicyFailure {
+            code: "TARGET_CHANGED",
+            message: "a different app came to the front before the input was sent; observe again"
+                .to_owned(),
+            detail: None,
+        });
+    }
+    check_target(&landing, allowed_apps, own_pid)
+}
+
 /// TodeX itself (`own_pid`) or an app no agent may touch or see.
 pub(crate) fn is_protected(target: &Target, own_pid: u32) -> bool {
     (target.pid != 0 && target.pid == own_pid) || is_blocked(&target.id)
@@ -149,7 +200,8 @@ pub(crate) fn blocked(label: &str) -> PolicyFailure {
     PolicyFailure {
         code: "TARGET_BLOCKED",
         message: format!("{label} can never be controlled by an agent."),
-        detail: None,
+        // The app's name is screen text; the MCP layer fences it.
+        detail: Some(json!({ "label": label })),
     }
 }
 
@@ -350,6 +402,83 @@ mod tests {
         assert_eq!(
             check_target(&own, &[String::new()], 1).map(|f| f.code),
             Some("TARGET_BLOCKED")
+        );
+    }
+
+    #[test]
+    fn pointer_input_may_only_land_where_the_policy_allows() {
+        let editor = target("org.example.editor", 50);
+        let other = target("org.example.other", 60);
+        let approved = vec!["org.example.other".to_owned()];
+        let landing = |landing: Option<Target>, allowed: &[String], agent_point| {
+            check_landing(landing, &editor, allowed, agent_point, 1).map(|f| f.code)
+        };
+        // No hit test: today's behaviour (the target check stands).
+        assert_eq!(landing(None, &[], true), None);
+        // Protected apps are refused whoever chose the point.
+        for agent_point in [true, false] {
+            assert_eq!(
+                landing(Some(target(BLOCKED[0], 9)), &approved, agent_point),
+                Some("TARGET_BLOCKED")
+            );
+            assert_eq!(
+                landing(Some(target("org.example.renamed", 1)), &[], agent_point),
+                Some("TARGET_BLOCKED")
+            );
+        }
+        // The same app, by id (another process of it) or by process.
+        assert_eq!(
+            landing(Some(target("org.example.editor", 51)), &[], true),
+            None
+        );
+        assert_eq!(
+            landing(Some(target("ORG.EXAMPLE.EDITOR", 50)), &[], true),
+            None
+        );
+        // The agent's own point now shows another app: the screen moved.
+        assert_eq!(
+            landing(Some(other.clone()), &approved, true),
+            Some("TARGET_CHANGED")
+        );
+        assert_eq!(
+            landing(Some(other.clone()), &[], true),
+            Some("TARGET_CHANGED")
+        );
+        // Not the agent's point (a ref's centre, a drag's destination):
+        // an approved app passes, another one is asked about.
+        assert_eq!(landing(Some(other.clone()), &approved, false), None);
+        let ask = check_landing(Some(other.clone()), &editor, &[], false, 1).unwrap();
+        assert_eq!(ask.code, "APP_CONFIRM");
+        assert_eq!(
+            ask.detail,
+            Some(json!({ "bundleId": "org.example.other", "name": "org.example.other" }))
+        );
+        // Nothing identifiable under it is asked about once.
+        let nothing = check_landing(Some(Target::default()), &editor, &[], false, 1).unwrap();
+        assert_eq!(nothing.detail.unwrap()["unidentified"], true);
+        assert_eq!(
+            check_landing(Some(Target::default()), &editor, &[String::new()], false, 1),
+            None
+        );
+        // An unidentified target cannot tell the screen changed: the
+        // landing app is simply checked like any other.
+        assert_eq!(
+            check_landing(Some(other.clone()), &Target::default(), &approved, true, 1),
+            None
+        );
+        assert_eq!(
+            check_landing(Some(other), &Target::default(), &[], true, 1).map(|f| f.code),
+            Some("APP_CONFIRM")
+        );
+        // Same pid, no ids: the same process.
+        let anonymous = Target {
+            id: String::new(),
+            name: String::new(),
+            pid: 77,
+        };
+        assert_eq!(
+            check_landing(Some(anonymous.clone()), &anonymous, &[], true, 1),
+            None
         );
     }
 

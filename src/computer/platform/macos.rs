@@ -513,16 +513,53 @@ pub(crate) fn type_into_focused(pid: u32, text: &str, confirmed: bool) -> Typed 
         }
         let value = CFString::new(text);
         let selected = CFString::from_static_string("AXSelectedText");
+        let before = text_value(&focused);
         if AXUIElementSetAttributeValue(
             focused.as_CFTypeRef(),
             selected.as_concrete_TypeRef(),
             value.as_CFTypeRef(),
-        ) == AX_SUCCESS
+        ) != AX_SUCCESS
         {
+            return Typed::Unsupported;
+        }
+        // Some apps accept the setter and ignore it.
+        if insertion_took(before.as_deref(), text_value(&focused).as_deref(), text) {
             Typed::Inserted
         } else {
             Typed::Unsupported
         }
+    }
+}
+
+/// The element's `AXValue` when it is text.
+///
+/// # Safety
+/// `element` must be a valid AX element.
+unsafe fn text_value(element: &CFType) -> Option<String> {
+    let mut value: CFTypeRef = std::ptr::null();
+    let attribute = CFString::from_static_string("AXValue");
+    if AXUIElementCopyAttributeValue(
+        element.as_CFTypeRef(),
+        attribute.as_concrete_TypeRef(),
+        &mut value,
+    ) != AX_SUCCESS
+        || value.is_null()
+    {
+        return None;
+    }
+    CFType::wrap_under_create_rule(value)
+        .downcast::<CFString>()
+        .map(|value| value.to_string())
+}
+
+/// Whether setting the selected text took effect, given the element's
+/// value before and after (`None`: unreadable, as in secure fields, where
+/// the setter's success is all there is): inserting something must change
+/// the value.
+fn insertion_took(before: Option<&str>, after: Option<&str>, text: &str) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => text.is_empty() || before != after,
+        _ => true,
     }
 }
 
@@ -640,6 +677,19 @@ fn key_code(key: &Key) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ignored_text_insertion_is_noticed() {
+        // Readable before and after: the value must change.
+        assert!(insertion_took(Some("a"), Some("ab"), "b"));
+        assert!(!insertion_took(Some("a"), Some("a"), "b"));
+        // Nothing to insert changes nothing.
+        assert!(insertion_took(Some("a"), Some("a"), ""));
+        // Unreadable (secure fields): the setter's success stands.
+        assert!(insertion_took(None, None, "b"));
+        assert!(insertion_took(Some("a"), None, "b"));
+        assert!(insertion_took(None, Some("a"), "b"));
+    }
 
     fn window(layer: i64, pid: u32) -> CgWindow {
         CgWindow {

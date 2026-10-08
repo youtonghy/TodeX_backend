@@ -34,6 +34,8 @@ const MAX_DEPTH: usize = 60;
 const MAX_WAIT_MS: u64 = 10_000;
 /// How long an app just brought forward may take to own the keyboard.
 const FRONT_SETTLE: Duration = Duration::from_millis(500);
+/// Typed text goes out in pieces of this many characters.
+const TYPE_CHUNK_CHARS: usize = 32;
 
 /// A window listed by the latest observation; agents refer to it by `id`.
 struct WindowEntry {
@@ -56,6 +58,11 @@ pub(super) struct Engine {
     refs: HashMap<String, usize>,
     windows: Vec<WindowEntry>,
     shot: Option<ShotMapping>,
+    /// The app the latest observation looked at: what a ref without a
+    /// process id belongs to.
+    observed: Option<Target>,
+    /// The screen lease the observation above belongs to.
+    lease: u64,
 }
 
 /// What `act` may touch, decided by the daemon (never by the agent).
@@ -74,6 +81,16 @@ impl Engine {
         self.refs.clear();
         self.windows.clear();
         self.shot = None;
+        self.observed = None;
+    }
+
+    /// A call of screen lease `lease` starts: another lease's refs and
+    /// screenshot mapping are not its own.
+    pub(super) fn enter(&mut self, lease: u64) {
+        if self.lease != lease {
+            self.reset();
+            self.lease = lease;
+        }
     }
 
     fn provider(&mut self) -> Result<Arc<dyn Provider>, ComputerError> {
@@ -141,6 +158,7 @@ impl Engine {
         if protected && (target_window.is_some() || args["app"].is_string()) {
             return Err(ComputerError::from(policy::blocked(label(&app))));
         }
+        self.observed = Some(app.clone());
         // The front app is protected: show the display without its tree.
         let window_index = target_window.or_else(|| {
             self.windows
@@ -372,14 +390,16 @@ impl Engine {
                     })
             });
             return match shown {
-                Some(window) => Err(ComputerError::new(
-                    "TARGET_BLOCKED",
-                    format!(
+                Some(window) => Err(ComputerError {
+                    code: "TARGET_BLOCKED".to_owned(),
+                    message: format!(
                         "{} is on screen and this computer cannot hide it from a screenshot; \
                          observe with screenshot: false or ask the user to move it away.",
                         label(&window.app)
                     ),
-                )),
+                    // The app's name is screen text; the MCP layer fences it.
+                    detail: Some(json!({ "label": label(&window.app) })),
+                }),
                 None => Ok(()),
             };
         };
@@ -435,11 +455,8 @@ impl Engine {
     ) -> Result<Value, ComputerError> {
         let action = args["action"].as_str().unwrap_or_default().to_owned();
         let cancelled = grants.cancelled;
-        if action != "wait" && super::host_ui::confirming() {
-            return Err(ComputerError::new(
-                "TARGET_BLOCKED",
-                "a TodeX confirmation is open on this computer; only the person there may answer it. Retry after it closes.",
-            ));
+        if action != "wait" {
+            live(cancelled)?;
         }
         let chord = if action == "key" {
             let chord = keys::parse(args["keys"].as_str().unwrap_or_default())
@@ -492,10 +509,17 @@ impl Engine {
             target
         };
         // Pointer input lands wherever the pointer is: right before it is
-        // sent, nothing protected may be there, and a point the policy
-        // checked must still show the same app.
-        let landing = |at: (f64, f64), same_app: bool| {
-            check_landing(at, &target, same_app && point.is_some(), own_pid, cancelled)
+        // sent, the app under it must pass the policy too (see
+        // `policy::check_landing`).
+        let landing = |at: (f64, f64), agent_point: bool| {
+            check_landing(
+                at,
+                &target,
+                grants.allowed_apps,
+                agent_point,
+                own_pid,
+                cancelled,
+            )
         };
         if policy::uses_pointer(&action, point.is_some()) {
             if let Some(failure) =
@@ -527,7 +551,7 @@ impl Engine {
                             "show_menu"
                         };
                         element.actions.iter().any(|a| a == verb)
-                            && !cancelled.load(Ordering::SeqCst)
+                            && live(cancelled).is_ok()
                             && provider.as_ref().is_some_and(|provider| {
                                 provider.perform_action(element, verb).is_ok()
                             })
@@ -536,7 +560,7 @@ impl Engine {
                     "background"
                 } else {
                     let at = require_point(pointer_at)?;
-                    landing(at, true)?;
+                    landing(at, point.is_some())?;
                     super::host_ui::mark_point(at.0, at.1);
                     let button = if action == "click" {
                         MouseButton::Left
@@ -552,7 +576,7 @@ impl Engine {
             }
             "double_click" => {
                 let at = require_point(pointer_at)?;
-                landing(at, true)?;
+                landing(at, point.is_some())?;
                 super::host_ui::mark_point(at.0, at.1);
                 self.input()?
                     .backend()
@@ -562,7 +586,7 @@ impl Engine {
             }
             "hover" => {
                 let at = require_point(pointer_at)?;
-                landing(at, true)?;
+                landing(at, point.is_some())?;
                 self.input()?
                     .mouse()
                     .move_to(to_point(at))
@@ -572,7 +596,7 @@ impl Engine {
             "drag" => {
                 let from = require_point(pointer_at)?;
                 let to = to.ok_or_else(|| ComputerError::invalid("drag needs toX and toY"))?;
-                landing(from, true)?;
+                landing(from, point.is_some())?;
                 landing(to, false)?;
                 super::host_ui::mark_point(from.0, from.1);
                 self.input()?
@@ -590,7 +614,7 @@ impl Engine {
                     Some(at) => at,
                     None => self.default_point()?,
                 };
-                landing(at, true)?;
+                landing(at, point.is_some())?;
                 self.input()?
                     .mouse()
                     .scroll(to_point(at), delta)
@@ -598,12 +622,12 @@ impl Engine {
                 "pointer"
             }
             "type" => self.type_text(
-                args,
+                args["text"].as_str().unwrap_or_default(),
+                &target,
                 element.as_ref(),
                 provider.as_ref(),
-                grants.confirmed,
+                &grants,
                 own_pid,
-                cancelled,
             )?,
             "key" => {
                 let chord = chord.ok_or_else(|| ComputerError::invalid("key needs keys"))?;
@@ -732,8 +756,11 @@ impl Engine {
             return platform::installed_app(identifier)
                 .ok_or_else(|| ComputerError::invalid(format!("no app named {identifier}")));
         }
-        if let Some(pid) = element.and_then(|element| element.pid) {
-            return Ok(platform::app_identity(pid));
+        if let Some(element) = element {
+            if let Some(app) = ref_app(element.pid, self.observed.as_ref(), platform::app_identity)
+            {
+                return Ok(app);
+            }
         }
         if let Some((x, y)) = point {
             return Ok(platform::app_at(x, y)
@@ -766,14 +793,14 @@ impl Engine {
     /// cannot rewrite it and the app stays in the background.
     fn type_text(
         &mut self,
-        args: &Value,
+        text: &str,
+        target: &Target,
         element: Option<&ElementData>,
         provider: Option<&Arc<dyn Provider>>,
-        confirmed: bool,
+        grants: &Grants<'_>,
         own_pid: u32,
-        cancelled: &AtomicBool,
     ) -> Result<&'static str, ComputerError> {
-        let text = args["text"].as_str().unwrap_or_default();
+        let (confirmed, cancelled) = (grants.confirmed, grants.cancelled);
         live(cancelled)?;
         let provider =
             provider.ok_or_else(|| ComputerError::platform("no accessibility provider"))?;
@@ -795,14 +822,8 @@ impl Engine {
                 }
             }
         }
-        let pid = match (
-            element.and_then(|element| element.pid),
-            args["app"].as_str(),
-        ) {
-            (Some(pid), _) => Some(pid),
-            (None, Some(identifier)) => platform::running_app(identifier).map(|app| app.pid),
-            (None, None) => provider.focused_app().ok().and_then(|app| app.pid),
-        };
+        // The app the policy checked, not whatever is in front now.
+        let pid = typing_pid(element.and_then(|element| element.pid), target);
         // Never typed blind: keystrokes go to whatever has the keyboard.
         let pid = pid.ok_or_else(|| {
             ComputerError::new(
@@ -816,14 +837,24 @@ impl Engine {
             Typed::Unsupported => platform::activate(pid, None).map_err(ComputerError::platform)?,
         }
         check_front(Some(provider), pid, own_pid, cancelled)?;
-        self.input()?
-            .keyboard()
-            .type_text(text)
-            .map_err(ComputerError::platform)?;
+        let keyboard = self.input()?;
+        // In chunks, so a stop (or a confirmation opening) ends a long text
+        // within a moment instead of after the last character.
+        for chunk in text_chunks(text, TYPE_CHUNK_CHARS) {
+            live(cancelled)?;
+            keyboard
+                .keyboard()
+                .type_text(chunk)
+                .map_err(ComputerError::platform)?;
+        }
         Ok("keyboard")
     }
 }
 
+/// Whether input may still be sent: the caller has not given up, and no
+/// host confirmation is open (on Linux it is another process, so the hit
+/// test cannot tell it is ours, and only the person at the host may
+/// answer it).
 fn live(cancelled: &AtomicBool) -> Result<(), ComputerError> {
     if cancelled.load(Ordering::SeqCst) {
         return Err(ComputerError::new(
@@ -831,7 +862,45 @@ fn live(cancelled: &AtomicBool) -> Result<(), ComputerError> {
             "the call timed out or was cancelled before its input was sent",
         ));
     }
+    if super::host_ui::confirming() {
+        return Err(ComputerError::new(
+            "TARGET_BLOCKED",
+            "a TodeX confirmation is open on this computer; only the person there may answer it. Retry after it closes.",
+        ));
+    }
     Ok(())
+}
+
+/// The app a ref belongs to: its own process, else the app the latest
+/// observation looked at.
+fn ref_app(
+    element_pid: Option<u32>,
+    observed: Option<&Target>,
+    identify: impl FnOnce(u32) -> Target,
+) -> Option<Target> {
+    element_pid.map(identify).or_else(|| observed.cloned())
+}
+
+/// The process keystrokes go to: the ref's, else the checked target's.
+fn typing_pid(element_pid: Option<u32>, target: &Target) -> Option<u32> {
+    element_pid.or(Some(target.pid).filter(|pid| *pid != 0))
+}
+
+/// `text` in pieces of at most `size` characters.
+fn text_chunks(text: &str, size: usize) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let end = rest
+            .char_indices()
+            .nth(size)
+            .map_or(rest.len(), |(index, _)| index);
+        let (chunk, tail) = rest.split_at(end);
+        rest = tail;
+        Some(chunk)
+    })
 }
 
 fn changed() -> ComputerError {
@@ -845,22 +914,24 @@ fn changed() -> ComputerError {
 fn check_landing(
     at: (f64, f64),
     target: &Target,
-    same_app: bool,
+    allowed_apps: &[String],
+    agent_point: bool,
     own_pid: u32,
     cancelled: &AtomicBool,
 ) -> Result<(), ComputerError> {
     live(cancelled)?;
-    let Some(pid) = platform::app_at(at.0, at.1) else {
-        return Ok(());
-    };
-    let app = platform::app_identity(pid);
-    if policy::is_protected(&app, own_pid) {
-        return Err(ComputerError::from(policy::blocked(label(&app))));
+    let landing = platform::app_at(at.0, at.1).map(platform::app_identity);
+    if landing.is_none() {
+        tracing::debug!(
+            x = at.0,
+            y = at.1,
+            "no app found under the pointer target; relying on the target check"
+        );
     }
-    if same_app && target.pid != 0 && pid != target.pid {
-        return Err(changed());
+    match policy::check_landing(landing, target, allowed_apps, agent_point, own_pid) {
+        Some(failure) => Err(ComputerError::from(failure)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Waits briefly for `expected` to own the keyboard after activation;
@@ -1116,6 +1187,73 @@ mod tests {
             (clipped.x, clipped.y, clipped.width, clipped.height),
             (0, 700, 300, 100)
         );
+    }
+
+    fn app(id: &str, pid: u32) -> Target {
+        Target {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            pid,
+        }
+    }
+
+    #[test]
+    fn a_ref_without_a_process_belongs_to_the_observed_app() {
+        let observed = app("org.example.observed", 5);
+        let by_pid = |pid| app("org.example.by-pid", pid);
+        // Its own process wins.
+        assert_eq!(
+            ref_app(Some(9), Some(&observed), by_pid),
+            Some(app("org.example.by-pid", 9))
+        );
+        // Else what was observed, never the front app or an `app` argument.
+        assert_eq!(ref_app(None, Some(&observed), by_pid), Some(observed));
+        assert_eq!(ref_app(None, None, by_pid), None);
+    }
+
+    #[test]
+    fn typing_goes_to_the_checked_target() {
+        let target = app("org.example.target", 8);
+        assert_eq!(typing_pid(Some(3), &target), Some(3));
+        assert_eq!(typing_pid(None, &target), Some(8));
+        assert_eq!(typing_pid(None, &Target::default()), None);
+    }
+
+    #[test]
+    fn text_is_typed_in_character_chunks() {
+        assert_eq!(text_chunks("", 3).count(), 0);
+        assert_eq!(
+            text_chunks("abcdefgh", 3).collect::<Vec<_>>(),
+            ["abc", "def", "gh"]
+        );
+        assert_eq!(text_chunks("abc", 3).collect::<Vec<_>>(), ["abc"]);
+        // Never splits a character.
+        assert_eq!(
+            text_chunks("日本語テキスト", 3).collect::<Vec<_>>(),
+            ["日本語", "テキス", "ト"]
+        );
+        let long = "x".repeat(100);
+        assert_eq!(text_chunks(&long, TYPE_CHUNK_CHARS).count(), 4);
+    }
+
+    #[test]
+    fn another_lease_does_not_see_the_latest_observation() {
+        let mut engine = Engine::default();
+        engine.enter(1);
+        engine.refs.insert("e1".to_owned(), 0);
+        engine.observed = Some(app("org.example.observed", 5));
+        engine.windows.clear();
+        // The same lease keeps its observation.
+        engine.enter(1);
+        assert!(engine.refs.contains_key("e1"));
+        assert!(engine.observed.is_some());
+        // A new lease starts from nothing.
+        engine.enter(2);
+        assert!(engine.refs.is_empty());
+        assert!(engine.observed.is_none());
+        engine.refs.insert("e2".to_owned(), 0);
+        engine.enter(2);
+        assert!(engine.refs.contains_key("e2"));
     }
 
     #[test]
