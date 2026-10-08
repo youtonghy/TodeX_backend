@@ -243,6 +243,32 @@ impl Cdp {
         }
     }
 
+    /// A connection with no browser behind it, for tests: the commands sent
+    /// arrive on the returned receiver, and [`Self::inject`] /
+    /// [`Self::disconnect`] play the browser's side.
+    #[cfg(test)]
+    pub(crate) fn scripted() -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (inner, outgoing) = tests::inner();
+        (
+            Self {
+                inner: Arc::new(inner),
+            },
+            outgoing,
+        )
+    }
+
+    /// Delivers a message as if the browser had sent it.
+    #[cfg(test)]
+    pub(crate) fn inject(&self, message: &Value) {
+        dispatch(&self.inner, message.to_string().as_bytes());
+    }
+
+    /// The browser goes away (crash, exit).
+    #[cfg(test)]
+    pub(crate) fn disconnect(&self) {
+        close(&self.inner);
+    }
+
     fn forget(&self, id: u64) {
         self.inner
             .pending
@@ -360,7 +386,7 @@ fn close(inner: &Inner) {
 mod tests {
     use super::*;
 
-    fn inner() -> (Inner, mpsc::UnboundedReceiver<String>) {
+    pub(super) fn inner() -> (Inner, mpsc::UnboundedReceiver<String>) {
         let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
         let (events, event_receiver) = mpsc::unbounded_channel();
         (

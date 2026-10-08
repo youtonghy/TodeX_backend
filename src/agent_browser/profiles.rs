@@ -85,6 +85,11 @@ impl Profiles {
         self.lock().clone()
     }
 
+    /// Whether the profile exists (not deleted).
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.lock().profiles.iter().any(|profile| profile.id == id)
+    }
+
     pub(crate) fn dir_of(&self, id: &str) -> PathBuf {
         self.dir.join(id)
     }

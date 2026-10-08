@@ -2493,7 +2493,15 @@ async fn handle_agent_desktop_frame(
                     loop {
                         let current = watch.frames.borrow_and_update().clone();
                         let message = match current {
-                            Some(frame) => json!({
+                            // The tab exists but has shown nothing yet: not
+                            // "closed".
+                            crate::agent_browser::View::Pending => {
+                                if watch.frames.changed().await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            crate::agent_browser::View::Frame(frame) => json!({
                                 "type": "agentBrowser.frame",
                                 "payload": {
                                     "conversationId": watched,
@@ -2504,7 +2512,7 @@ async fn handle_agent_desktop_frame(
                                     "height": frame.height,
                                 },
                             }),
-                            None => json!({
+                            crate::agent_browser::View::Closed => json!({
                                 "type": "agentBrowser.frame",
                                 "payload": { "conversationId": watched, "closed": true },
                             }),
@@ -8058,6 +8066,74 @@ mod tests {
             wait_for_ws_message(&mut ws, |m| m["id"] == "u1").await["payload"]["watching"],
             false
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_ws_agent_browser_view_of_an_open_tab_never_starts_closed_and_ends_on_a_crash() {
+        let root = std::env::temp_dir().join(format!("todex-v2-browser-tab-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/v2/ws?{}",
+            device.sign_query("/v2/ws")
+        ))
+        .await
+        .unwrap();
+        let send = |value: Value| WsMessage::Text(value.to_string().into());
+        let manifest = state
+            .conversations
+            .create_for_tests(
+                ProviderKind::Codex,
+                std::fs::canonicalize(root.join("workspaces/project")).unwrap(),
+            )
+            .await
+            .unwrap();
+        // A tab exists (in a scripted Chromium) before anyone watches.
+        let browser = state.agent_desktop.browser().clone();
+        let chromium = browser.script_chromium();
+        browser
+            .invoke(
+                &manifest.id,
+                &json!({ "id": "w", "path": "/w" }),
+                "browser_open",
+                &json!({ "url": "http://localhost:5173/" }),
+                true,
+            )
+            .await
+            .unwrap();
+        ws.send(send(json!({ "id": "w1", "type": "agentBrowser.watch", "payload": { "conversationId": manifest.id } })))
+            .await
+            .unwrap();
+        wait_for_ws_message(&mut ws, |m| m["id"] == "w1").await;
+        // Nothing to show yet is not "closed".
+        let silent = tokio::time::timeout(
+            Duration::from_millis(400),
+            wait_for_ws_message(&mut ws, |m| m["type"] == "agentBrowser.frame"),
+        )
+        .await;
+        assert!(silent.is_err(), "no frame message before the first frame");
+        chromium.emit(
+            0,
+            &json!({ "method": "Page.screencastFrame", "sessionId": "S-T1",
+                "params": { "data": "AAAA", "sessionId": 1, "metadata": { "deviceWidth": 4, "deviceHeight": 2 } } }),
+        );
+        let frame = wait_for_ws_message(&mut ws, |m| m["type"] == "agentBrowser.frame").await;
+        assert_eq!(frame["payload"]["data"], "AAAA");
+        assert!(frame["payload"].get("closed").is_none());
+        // The browser crashes: the view ends.
+        chromium.crash(0);
+        let ended = wait_for_ws_message(&mut ws, |m| {
+            m["type"] == "agentBrowser.frame" && m["payload"]["closed"] == true
+        })
+        .await;
+        assert_eq!(ended["payload"]["conversationId"], manifest.id);
         let _ = fs::remove_dir_all(root);
     }
 

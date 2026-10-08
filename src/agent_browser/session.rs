@@ -15,7 +15,7 @@ use super::{
     cdp::Cdp,
     launch::Process,
     policy::{self, allowed_top_level, Navigation, Popup},
-    BrowserError, Frames,
+    BrowserError, CloseReason, Shared,
 };
 
 const VIEWPORT_WIDTH: u32 = 1280;
@@ -89,23 +89,90 @@ pub(crate) struct Running {
     /// Popup session → its pending popup.
     popups: Mutex<HashMap<String, PendingPopup>>,
     pub last_used: Mutex<Instant>,
-    frames: Weak<Frames>,
+    /// Slots, frames and tab-closure events of the browser service.
+    shared: Weak<Shared>,
+    /// The browser profile this Chromium runs.
+    profile: String,
+}
+
+/// Whether a `Page.javascriptDialogOpening` is accepted: leaving the page
+/// (`beforeunload`) goes ahead, so a tab can navigate and close; alerts,
+/// confirms and prompts are dismissed.
+fn dialog_accept(params: &Value) -> bool {
+    params["type"].as_str() == Some("beforeunload")
+}
+
+/// A target created for a tab that is not in [`Running::tabs`] yet. Dropped
+/// before [`Self::commit`] (an error, or the opening call cancelled), it
+/// closes the target again so no window is left behind.
+struct PendingTarget<'a> {
+    running: &'a Running,
+    target_id: String,
+    session_id: Option<String>,
+    armed: bool,
+}
+
+impl PendingTarget<'_> {
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingTarget<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(session_id) = &self.session_id {
+            self.running
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(session_id);
+        }
+        self.running.cdp.notify(
+            "Target.closeTarget",
+            json!({ "targetId": self.target_id }),
+            None,
+        );
+    }
 }
 
 impl Running {
     pub(crate) async fn start(
         process: Process,
-        frames: Weak<Frames>,
+        shared: Weak<Shared>,
+        profile: String,
     ) -> Result<Arc<Self>, BrowserError> {
         let cdp = process.cdp.clone();
+        Self::connect(cdp, Some(process), shared, profile).await
+    }
+
+    /// A browser session over a scripted connection (no process).
+    #[cfg(test)]
+    pub(crate) async fn start_scripted(
+        cdp: Cdp,
+        shared: Weak<Shared>,
+        profile: String,
+    ) -> Result<Arc<Self>, BrowserError> {
+        Self::connect(cdp, None, shared, profile).await
+    }
+
+    async fn connect(
+        cdp: Cdp,
+        process: Option<Process>,
+        shared: Weak<Shared>,
+        profile: String,
+    ) -> Result<Arc<Self>, BrowserError> {
         let running = Arc::new(Self {
             cdp: cdp.clone(),
-            process: Mutex::new(Some(process)),
+            process: Mutex::new(process),
             tabs: tokio::sync::Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             popups: Mutex::new(HashMap::new()),
             last_used: Mutex::new(Instant::now()),
-            frames,
+            shared,
+            profile,
         });
         cdp.call(
             "Browser.setDownloadBehavior",
@@ -233,7 +300,7 @@ impl Running {
                         // freeze the page for every later action.
                         running.cdp.notify(
                             "Page.handleJavaScriptDialog",
-                            json!({ "accept": false }),
+                            json!({ "accept": dialog_accept(&event.params) }),
                             event.session_id.as_deref(),
                         );
                     }
@@ -253,9 +320,20 @@ impl Running {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .remove(session_id);
                             if let Some(info) = removed {
-                                running.tabs.lock().await.remove(&info.conversation_id);
-                                if let Some(frames) = running.frames.upgrade() {
-                                    frames.tab_closed(&info.conversation_id);
+                                // A late detach of an earlier tab must not
+                                // take the conversation's current one.
+                                let mut tabs = running.tabs.lock().await;
+                                if tabs
+                                    .get(&info.conversation_id)
+                                    .is_some_and(|tab| tab.session_id == session_id)
+                                {
+                                    tabs.remove(&info.conversation_id);
+                                    drop(tabs);
+                                    running.gone(
+                                        &info.conversation_id,
+                                        &info.target_id,
+                                        CloseReason::User,
+                                    );
                                 }
                             }
                         }
@@ -263,7 +341,44 @@ impl Running {
                     _ => {}
                 }
             }
+            // The browser connection ended: whatever tabs were left went
+            // with it.
+            if let Some(running) = weak.upgrade() {
+                if running.cdp.is_closed() {
+                    running.release_all(CloseReason::Crash).await;
+                }
+            }
         });
+    }
+
+    /// The conversation's tab is gone: its slot, live view and clients are
+    /// told (see [`Shared::tab_gone`]).
+    pub(crate) fn gone(&self, conversation_id: &str, target_id: &str, reason: CloseReason) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.tab_gone(conversation_id, &self.profile, target_id, reason);
+        }
+    }
+
+    /// Forgets every tab of this Chromium (it exited, or is being replaced)
+    /// and reports each as closed. Idempotent.
+    pub(crate) async fn release_all(&self, reason: CloseReason) {
+        let tabs: Vec<(String, Tab)> = self.tabs.lock().await.drain().collect();
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (_, tab) in &tabs {
+                sessions.remove(&tab.session_id);
+            }
+        }
+        self.popups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        for (conversation_id, tab) in tabs {
+            self.gone(&conversation_id, &tab.target_id, reason);
+        }
     }
 
     /// A page the browser-wide auto-attach paused (`Target.attachedToTarget`
@@ -366,10 +481,12 @@ impl Running {
                         // The tab is gone; its screencast went with it.
                         continue;
                     };
-                    if let (Some(frames), Value::String(data)) =
-                        (running.frames.upgrade(), params["data"].take())
+                    if let (Some(shared), Value::String(data)) =
+                        (running.shared.upgrade(), params["data"].take())
                     {
-                        frames.publish(&info.conversation_id, data, &params["metadata"]);
+                        shared
+                            .frames
+                            .publish(&info.conversation_id, data, &params["metadata"]);
                     }
                     let now = Instant::now();
                     let due = last_ack
@@ -393,7 +510,8 @@ impl Running {
         });
     }
 
-    /// Opens the conversation's tab in a new background window.
+    /// Opens the conversation's tab in a new background window. A call that
+    /// fails or is dropped part-way closes the window again.
     pub(crate) async fn open_tab(&self, conversation_id: &str) -> Result<(), BrowserError> {
         let created = self
             .cdp
@@ -407,6 +525,12 @@ impl Running {
             .as_str()
             .ok_or_else(|| BrowserError::failed("Chromium opened no tab"))?
             .to_owned();
+        let mut pending = PendingTarget {
+            running: self,
+            target_id: target_id.clone(),
+            session_id: None,
+            armed: true,
+        };
         let attached = self
             .cdp
             .call(
@@ -419,6 +543,7 @@ impl Running {
             .as_str()
             .ok_or_else(|| BrowserError::failed("cannot attach to the tab"))?
             .to_owned();
+        pending.session_id = Some(session_id.clone());
         let session = Some(session_id.as_str());
         self.cdp.call("Page.enable", json!({}), session).await?;
         self.cdp.call("Runtime.enable", json!({}), session).await?;
@@ -449,7 +574,18 @@ impl Running {
             )
             .await?;
         self.place_window(&target_id).await;
-        self.tabs.lock().await.insert(
+        let mut tabs = self.tabs.lock().await;
+        // The window may have been closed meanwhile: its detach removed the
+        // session.
+        if !self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&session_id)
+        {
+            return Err(BrowserError::failed("the tab was closed while opening"));
+        }
+        tabs.insert(
             conversation_id.to_owned(),
             Tab {
                 target_id,
@@ -459,6 +595,7 @@ impl Running {
                 screencasting: false,
             },
         );
+        pending.commit();
         Ok(())
     }
 
@@ -521,23 +658,21 @@ impl Running {
         }
     }
 
-    pub(crate) async fn close_tab(&self, conversation_id: &str) -> bool {
-        let Some(tab) = self.tabs.lock().await.remove(conversation_id) else {
-            return false;
-        };
+    /// Forgets the conversation's tab and asks Chromium to close its window
+    /// (without waiting, so a cancelled caller cannot leave it half done).
+    /// Returns the tab's target id; `None` when it had no tab.
+    pub(crate) async fn close_tab(&self, conversation_id: &str) -> Option<String> {
+        let tab = self.tabs.lock().await.remove(conversation_id)?;
         self.sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&tab.session_id);
-        let _ = self
-            .cdp
-            .call(
-                "Target.closeTarget",
-                json!({ "targetId": tab.target_id }),
-                None,
-            )
-            .await;
-        true
+        self.cdp.notify(
+            "Target.closeTarget",
+            json!({ "targetId": tab.target_id }),
+            None,
+        );
+        Some(tab.target_id)
     }
 
     pub(crate) async fn tab(
@@ -601,6 +736,15 @@ impl Running {
         if let Some(tab) = self.tabs.lock().await.get_mut(conversation_id) {
             tab.last_used = Instant::now();
         }
+    }
+
+    /// The conversation has a tab that saw no tool call for `idle`.
+    pub(crate) async fn is_idle(&self, conversation_id: &str, idle: Duration) -> bool {
+        self.tabs
+            .lock()
+            .await
+            .get(conversation_id)
+            .is_some_and(|tab| tab.last_used.elapsed() >= idle)
     }
 
     /// Conversations whose tab saw no tool call for `idle`.
@@ -1198,6 +1342,97 @@ mod tests {
         // Already running (an explicit attach): left alone.
         let (commands, pending) = attached_target(&attached("", "about:blank", false), None);
         assert!(commands.is_empty() && pending.is_none());
+    }
+
+    #[test]
+    fn only_leaving_the_page_is_accepted() {
+        for (kind, accepted) in [
+            ("beforeunload", true),
+            ("alert", false),
+            ("confirm", false),
+            ("prompt", false),
+            ("", false),
+        ] {
+            assert_eq!(dialog_accept(&json!({ "type": kind })), accepted, "{kind}");
+        }
+        assert!(!dialog_accept(&json!({})));
+    }
+
+    #[tokio::test]
+    async fn dialogs_are_answered_by_kind() {
+        let root = std::env::temp_dir().join(format!("todex-browser-{}", uuid::Uuid::new_v4()));
+        let browser = crate::agent_browser::AgentBrowser::load(&root).unwrap();
+        let chromium = browser.script_chromium();
+        browser
+            .invoke(
+                "c",
+                &json!({ "id": "w", "path": "/w" }),
+                "browser_open",
+                &json!({ "url": "http://localhost:5173/" }),
+                true,
+            )
+            .await
+            .unwrap();
+        for kind in ["alert", "beforeunload"] {
+            chromium.emit(
+                0,
+                &json!({ "method": "Page.javascriptDialogOpening", "sessionId": "S-T1", "params": { "type": kind } }),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            chromium.calls("Page.handleJavaScriptDialog"),
+            vec![json!({ "accept": false }), json!({ "accept": true })]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_late_detach_of_an_earlier_session_keeps_the_live_tab() {
+        let root = std::env::temp_dir().join(format!("todex-browser-{}", uuid::Uuid::new_v4()));
+        let browser = crate::agent_browser::AgentBrowser::load(&root).unwrap();
+        let chromium = browser.script_chromium();
+        let mut closures = browser.tab_closures();
+        browser
+            .invoke(
+                "c",
+                &json!({ "id": "w", "path": "/w" }),
+                "browser_open",
+                &json!({ "url": "http://localhost:5173/" }),
+                true,
+            )
+            .await
+            .unwrap();
+        let running = browser.running_for("c").await.unwrap();
+        // An earlier session of the conversation still on record.
+        running.sessions.lock().unwrap().insert(
+            "S-old".into(),
+            SessionInfo {
+                conversation_id: "c".into(),
+                target_id: "T0".into(),
+                main_frame_id: "F".into(),
+            },
+        );
+        let detached = |session: &str| json!({ "method": "Target.detachedFromTarget", "params": { "sessionId": session } });
+        chromium.emit(0, &detached("S-old"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(running.tab("c").await.unwrap().1, "S-T1");
+        assert!(browser.inner.shared.slot_of("c").is_some());
+        assert!(closures.try_recv().is_err());
+        assert!(running.sessions.lock().unwrap().get("S-old").is_none());
+        // The live tab's own window closing does end it.
+        chromium.emit(0, &detached("S-T1"));
+        let closed = tokio::time::timeout(Duration::from_secs(2), closures.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (closed.conversation_id.as_str(), closed.reason),
+            ("c", CloseReason::User)
+        );
+        assert!(running.tab("c").await.is_err());
+        assert!(browser.inner.shared.slot_of("c").is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

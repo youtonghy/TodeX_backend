@@ -37,7 +37,7 @@ use super::{
     AgentMcp, DESKTOP_ROUTE, DESKTOP_SERVER,
 };
 use crate::{
-    agent_browser::{policy, BrowserError},
+    agent_browser::{policy, AgentBrowser, BrowserError, CloseReason},
     agent_desktop::{Grant, HOST_DEVICE_ID},
     app_state::AppState,
     provider::ConversationSupervisor,
@@ -77,6 +77,7 @@ fn spawn_screen_sweeper(tools: &DesktopTools) {
     let desktop = tools.mcp.desktop().clone();
     let conversations = tools.conversations.clone();
     let mut stops = crate::computer::host_ui::stop_requests();
+    spawn_browser_tab_journal(desktop.browser(), conversations.clone());
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(SCREEN_SWEEP_INTERVAL);
         loop {
@@ -113,6 +114,52 @@ fn spawn_screen_sweeper(tools: &DesktopTools) {
             }
         }
     });
+}
+
+/// Journals every browser tab that goes away (`desktop.browser.tab`), and
+/// the tabs a previous daemon left open as `restart`. Ends with the browser
+/// service.
+fn spawn_browser_tab_journal(browser: &AgentBrowser, conversations: ConversationSupervisor) {
+    let mut closures = browser.tab_closures();
+    let stale = browser.stale_tabs();
+    let browser = browser.clone();
+    tokio::spawn(async move {
+        for conversation_id in &stale {
+            journal_tab_closed(&conversations, conversation_id, CloseReason::Restart).await;
+        }
+        browser.settle_stale_tabs(&stale);
+        // Holding the service would keep its channel open for ever.
+        drop(browser);
+        loop {
+            match closures.recv().await {
+                Ok(closed) => {
+                    journal_tab_closed(&conversations, &closed.conversation_id, closed.reason)
+                        .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "browser tab closures were not journaled");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+async fn journal_tab_closed(
+    conversations: &ConversationSupervisor,
+    conversation_id: &str,
+    reason: CloseReason,
+) {
+    if let Err(error) = conversations
+        .append_agent_event(
+            conversation_id,
+            "desktop.browser.tab",
+            json!({ "status": "closed", "reason": reason.as_str() }),
+        )
+        .await
+    {
+        tracing::warn!(%error, conversation_id, "failed to journal a closed browser tab");
+    }
 }
 
 #[derive(Clone)]
@@ -1117,6 +1164,110 @@ mod tests {
         state.agent_desktop.set_enabled(false).await.unwrap();
         let off = call(&client, "browser_snapshot", json!({})).await;
         assert!(text(&off).contains("turned off"));
+        let _ = client.cancel().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The `desktop.browser.tab` events journaled so far, as reasons.
+    async fn tab_reasons(state: &AppState, conversation_id: &str) -> Vec<String> {
+        state
+            .conversations
+            .history_for_tests(conversation_id)
+            .await
+            .iter()
+            .filter(|event| event.event_type == "desktop.browser.tab")
+            .map(|event| {
+                assert_eq!(event.payload["status"], "closed");
+                event.payload["reason"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    }
+
+    async fn wait_for_tab_reasons(state: &AppState, conversation_id: &str, count: usize) {
+        for _ in 0..200 {
+            if tab_reasons(state, conversation_id).await.len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("tab events not journaled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn closed_browser_tabs_are_journaled_with_their_reason() {
+        let (root, state, conversation_id, client) = harness().await;
+        let browser = state.agent_desktop.browser().clone();
+        let chromium = browser.script_chromium();
+        let workspace = json!({ "id": "w", "path": "/w" });
+        let url = json!({ "url": "http://localhost:5173/" });
+        let open = || browser.invoke(&conversation_id, &workspace, "browser_open", &url, true);
+
+        // browser_close: user.
+        open().await.unwrap();
+        browser
+            .invoke(
+                &conversation_id,
+                &workspace,
+                "browser_close",
+                &json!({}),
+                true,
+            )
+            .await
+            .unwrap();
+        wait_for_tab_reasons(&state, &conversation_id, 1).await;
+        // A revoke: revoked.
+        open().await.unwrap();
+        state.agent_desktop.set_grant(
+            &conversation_id,
+            Grant {
+                device_id: HOST_DEVICE_ID.into(),
+                device_name: "Host".into(),
+            },
+        );
+        assert!(state
+            .agent_desktop
+            .revoke_browser(&conversation_id)
+            .is_some());
+        wait_for_tab_reasons(&state, &conversation_id, 2).await;
+        // A crash: crash.
+        open().await.unwrap();
+        chromium.crash(0);
+        wait_for_tab_reasons(&state, &conversation_id, 3).await;
+        // Closing what is not open adds nothing.
+        browser
+            .close_conversation(&conversation_id, CloseReason::User)
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            tab_reasons(&state, &conversation_id).await,
+            ["user", "revoked", "crash"]
+        );
+        let _ = client.cancel().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tabs_left_open_by_a_stopped_daemon_are_journaled_once_as_restart() {
+        let (root, state, conversation_id, client) = harness().await;
+        // The previous daemon had this conversation's tab open.
+        let data = root.join("restarted");
+        std::fs::create_dir_all(data.join("agent-browser")).unwrap();
+        let record = data.join("agent-browser").join("open-tabs.json");
+        std::fs::write(&record, serde_json::to_vec(&[&conversation_id]).unwrap()).unwrap();
+        let browser = AgentBrowser::load(&data).unwrap();
+        assert_eq!(browser.stale_tabs(), std::slice::from_ref(&conversation_id));
+        spawn_browser_tab_journal(&browser, state.conversations.clone());
+        wait_for_tab_reasons(&state, &conversation_id, 1).await;
+        assert_eq!(tab_reasons(&state, &conversation_id).await, ["restart"]);
+        // Reported once: the record is cleared.
+        for _ in 0..100 {
+            if browser.stale_tabs().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(browser.stale_tabs().is_empty());
+        assert_eq!(std::fs::read(&record).unwrap(), b"[]");
         let _ = client.cancel().await;
         let _ = std::fs::remove_dir_all(root);
     }

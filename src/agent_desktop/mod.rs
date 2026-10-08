@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    agent_browser::AgentBrowser,
+    agent_browser::{AgentBrowser, CloseReason},
     computer::{Computer, ComputerError},
     error::AppError,
     secure_fs,
@@ -440,7 +440,11 @@ impl AgentDesktop {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let browser = self.inner.browser.clone();
             let conversation_id = conversation_id.to_owned();
-            runtime.spawn(async move { browser.close_conversation(&conversation_id).await });
+            runtime.spawn(async move {
+                browser
+                    .close_conversation(&conversation_id, CloseReason::Revoked)
+                    .await
+            });
         }
         Some(grant)
     }
