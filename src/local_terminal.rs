@@ -857,6 +857,9 @@ mod tests {
         tokio::pin!(deadline);
         let mut output = String::new();
         let mut started_host = None;
+        let cwd_name = cwd.file_name().unwrap().to_string_lossy().into_owned();
+        // The exit event is published by a different task than the output,
+        // so it can arrive first: wait for the output itself.
         loop {
             tokio::select! {
                 _ = &mut deadline => break,
@@ -865,15 +868,16 @@ mod tests {
                     match event.event_type.as_str() {
                         "terminal.started" => started_host = event.payload["ssh"]["host"].as_str().map(str::to_owned),
                         "terminal.output" => output.push_str(&payload_text(&event.payload, "data")),
-                        "terminal.exited" => break,
                         _ => {}
+                    }
+                    if output.contains(&cwd_name) {
+                        break;
                     }
                 }
             }
         }
 
         assert!(output.contains("[arg-one|yes|]"), "{output:?}");
-        let cwd_name = cwd.file_name().unwrap().to_string_lossy().into_owned();
         assert!(output.contains(&cwd_name), "{output:?}");
         assert_eq!(started_host.as_deref(), Some("web"));
         let _ = fs::remove_dir_all(cwd);
