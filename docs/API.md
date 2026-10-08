@@ -205,21 +205,24 @@ MCP 真实调用只走 Backend：客户端只发送 `resourceId`、`toolName` �
 
 ### 后端追加队列
 
-Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追加消息（所有 Provider 都支持；`followUpQueue` 仍只表示 Provider 原生队列）。队列持久化在会话目录的 `queue.json`，保存完整请求（含附件与 Skill），fork 不复制，删除会话一并删除。每个会话最多 32 条、序列化后合计 32 MiB，超出返回 `RESOURCE_EXHAUSTED`。
+Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追加消息（所有 Provider 都支持；`followUpQueue` 仍只表示 Provider 原生队列）。队列只保存在 daemon 内存中，不写入磁盘（明文由 daemon 持有至投递，见 [history-encryption.md](history-encryption.md) §1），保存完整请求（含附件与 Skill），fork 不复制，删除会话一并丢弃；daemon 重启或崩溃会丢失全部未投递的追加消息。旧版 daemon 留下的 `queue.json` 在启动时一次性导入内存（按 `daemon_restarted` 暂停）并删除。能力 `backendQueueControl: true`（恒为 true）表示还支持 `conversation.queue.pause`、`conversation.queue.take` 与 `add` 的 `paused`。每个会话最多 32 条、序列化后合计 32 MiB，超出返回 `RESOURCE_EXHAUSTED`。
 
-- `conversation.queue.add`：payload 与 `conversation.prompt` 相同，另加 `itemId`（1–200 字节，省略时用命令 `id`）与可选 `front: true`（插到队首）。入队前按 prompt 的规则校验内容、路径与 Skill，不合法立即拒绝。会话空闲且队列为空时直接开始，结果为 `{ "conversationId", "itemId", "status": "started", "turnId" }`；否则入队，结果为 `{ ..., "status": "queued" }`。同一 `itemId` 已在队列中或已投递时幂等返回其状态，不会重复执行。
-- `conversation.queue.remove`（`itemId` 必填，不存在返回 `NOT_FOUND`）、`conversation.queue.clear`、`conversation.queue.resume`、`conversation.queue.list`：payload 为 `{ "conversationId", "itemId"? }`，结果为 `{ "conversationId", "queue": <快照> }`。`resume` 解除暂停，会话空闲时立即开始队首。
+- `conversation.queue.add`：payload 与 `conversation.prompt` 相同，另加 `itemId`（1–200 字节，省略时用命令 `id`）、可选 `front: true`（插到队首）与可选 `paused: true`（入队并以 `user` 暂停，即使会话空闲、队列为空也不开始；队列已被用户持有的暂停占用时保持原因不变）。入队前按 prompt 的规则校验内容、路径与 Skill，不合法立即拒绝。会话空闲且队列为空时直接开始，结果为 `{ "conversationId", "itemId", "status": "started", "turnId" }`；否则入队，结果为 `{ ..., "status": "queued" }`。同一 `itemId` 已在队列中或已投递时幂等返回其状态，不会重复执行。
+- `conversation.queue.remove`（`itemId` 必填，不存在返回 `NOT_FOUND`）、`conversation.queue.pause`、`conversation.queue.clear`、`conversation.queue.resume`、`conversation.queue.list`：payload 为 `{ "conversationId", "itemId"? }`，结果为 `{ "conversationId", "queue": <快照> }`。`resume` 解除暂停，会话空闲时立即开始队首。`pause` 以 `user` 暂停：队列为空时不产生暂停（快照 `paused` 仍为 false），已处于 `turn_cancelled` / `start_failed` / `daemon_restarted` / `user` 暂停时不改原因。
+- `conversation.queue.take`（`itemId` 必填，不存在返回 `NOT_FOUND`；旧版明文会话同 `remove` 可用）：原子移出该项并返回 `{ "conversationId", "itemId", "item": { "id", "text", "content": [<提示内容引用，与入队时一致：text / localImage / image{data,mimeType} / file>], "skills": [{ "resourceId", "name" }] }, "queue": <快照> }`，并追加 `followups.updated`。移出后队列为空则解除暂停（同 `remove`）。
 
 快照为 `{ "items": [{ "id", "text", "status": "queued", "queuedAt", "contentCount", "skills" }], "paused", "pauseReason", "pauseMessage", "resumeAt" }`，不含内联图片数据。每次变化都会追加 `followups.updated` 事件（payload 即快照）；懒加载窗口可能不含最近一次该事件，客户端打开会话或重连后应调用 `conversation.queue.list` 取当前快照。
 
-派发规则：turn 以 `turn.completed` 结束（或原生压缩结束）后，daemon 以队列项的 `itemId` 作为 `clientRequestId` 开始队首，成功后移出队列。`turn.failed` / `turn.cancelled` / `turn.interrupted` 使队列暂停（`pauseReason` 为 `turn_failed` / `turn_cancelled` / `turn_interrupted`）；队首无法开始时保留在队首并暂停（`start_failed`，`pauseMessage` 为原因）；daemon 重启后有待发项的队列暂停（`daemon_restarted`）。daemon 开始关停后不再从队列取下一项（关停期间完成的 turn 也不会带起队首），这些队列在下次启动时按 `daemon_restarted` 暂停；自动更新判定"空闲"时除没有运行中的 turn 外，还要求没有"未暂停且非空"的队列。暂停期间空闲会话仍可直接 `conversation.prompt`，该 turn 完成后队列保持暂停（队列已空时除外，见下文）。
+`pauseReason: "user"`（`pause` 或 `add` 的 `paused`）由用户持有：`turn.completed`、额度窗口重置都不会解除，只有 `resume`、`clear` 或移空队列才会；额度续写项照常插入队首，但不改原因、不设定时器。
 
-额度续写：turn 失败且该 turn 最近一次 `quota.updated` 显示套餐窗口已用尽时，daemon 不按普通失败处理，而是在队首插入一条续写项（`id` 为 `rate-limit-continue-<turnId>`，沿用失败请求的模型、思考强度与权限设置，正文为固定英文续写指令，不重复附件与 skills）——队列为空时也插入，已有续写项时不重复插入——并以 `rate_limited` 暂停，`resumeAt`（ISO 8601）为续写项可开始的时间。到点后 daemon 自行解除暂停并开始队首（按墙钟时间每 30 秒复核，机器休眠后也会补上），daemon 重启后继续等待。等待期间客户端可移除续写项或 `resume` 提前开始；若期间有 turn 以 `turn.completed` 结束（用户已手动继续），续写项被移除、暂停解除。具体规则：
+派发规则：turn 以 `turn.completed` 结束（或原生压缩结束）后，daemon 以队列项的 `itemId` 作为 `clientRequestId` 开始队首，成功后移出队列。`turn.failed` / `turn.cancelled` / `turn.interrupted` 使队列暂停（`pauseReason` 为 `turn_failed` / `turn_cancelled` / `turn_interrupted`）；队首无法开始时保留在队首并暂停（`start_failed`，`pauseMessage` 为原因）；导入旧版 `queue.json` 的队列以 `daemon_restarted` 暂停。daemon 开始关停后不再从队列取下一项（关停期间完成的 turn 也不会带起队首）；自动更新判定"空闲"时除没有运行中的 turn 外，还要求没有任何非空队列（含已暂停的），避免空闲自重启丢掉追加消息。暂停期间空闲会话仍可直接 `conversation.prompt`，该 turn 完成后队列保持暂停（队列已空时除外，见下文）。
+
+额度续写：turn 失败且该 turn 最近一次 `quota.updated` 显示套餐窗口已用尽时，daemon 不按普通失败处理，而是在队首插入一条续写项（`id` 为 `rate-limit-continue-<turnId>`，沿用失败请求的模型、思考强度与权限设置，正文为固定英文续写指令，不重复附件与 skills）——队列为空时也插入，已有续写项时不重复插入——并以 `rate_limited` 暂停，`resumeAt`（ISO 8601）为续写项可开始的时间。到点后 daemon 自行解除暂停并开始队首（按墙钟时间每 30 秒复核，机器休眠后也会补上），等待计时器同样只在内存中，重启后队列与等待一并丢失。等待期间客户端可移除续写项或 `resume` 提前开始；若期间有 turn 以 `turn.completed` 结束（用户已手动继续），续写项被移除、暂停解除。具体规则：
 
 - 用尽判定：快照带 `status` 时只有 `status: "rejected"` 算用尽（`allowed` / `allowed_warning` 即使某窗口达到 100 % 也不算）；不带 `status` 时需某窗口 `usedPercent` ≥ 100 且 `isUsingOverage` 不为 `true`。
 - 等待下限：`resumeAt` = max(窗口重置时间, 现在 + 60 秒)，重置时间已过去时也至少等 60 秒。Claude 只在错误文本中给出重置时刻（如 "resets 5:30pm (UTC)"）时，解析出的时刻早于现在但不超过 10 分钟按"现在"处理（再套 60 秒下限），不再顺延到次日或下周。
-- 退避与上限：续写项本身再次因用尽失败时，第 n 次（n 从 1 起）等待 max(重置时间, 现在 + 60 秒 × 2^(n−1))。连续 3 个续写项都因用尽失败后不再插入续写项，队列以 `turn_failed` 暂停（队列为空时也暂停），`pauseMessage` 说明已停止自动续写；计数随 `queue.json` 持久化，重启不清零，任一 turn 以 `turn.completed` 结束时清零，这一暂停也随之解除（窗口已恢复，此前排在其后的项照常开始）。
-- 用户持有的暂停：队列已因 `turn_cancelled` / `start_failed` / `daemon_restarted` 暂停时（例如暂停期间手动发送的 prompt 遇到额度用尽），续写项照常插到队首，但 `pauseReason` 不变、不设定时器，`resumeAt` 照常下发仅供显示；用户 `resume` 后从续写项开始。
+- 退避与上限：续写项本身再次因用尽失败时，第 n 次（n 从 1 起）等待 max(重置时间, 现在 + 60 秒 × 2^(n−1))。连续 3 个续写项都因用尽失败后不再插入续写项，队列以 `turn_failed` 暂停（队列为空时也暂停），`pauseMessage` 说明已停止自动续写；任一 turn 以 `turn.completed` 结束时清零，这一暂停也随之解除（窗口已恢复，此前排在其后的项照常开始）。
+- 用户持有的暂停：队列已因 `turn_cancelled` / `start_failed` / `daemon_restarted` / `user` 暂停时（例如暂停期间手动发送的 prompt 遇到额度用尽），续写项照常插到队首，但 `pauseReason` 不变、不设定时器，`resumeAt` 照常下发仅供显示；用户 `resume` 后从续写项开始。
 
 ### 历史加密密钥（`history.*`）
 
@@ -251,7 +254,7 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 
 客户端须声明能解密历史：`/v2/ws` 握手 query 与 `GET /v2/conversations/{id}/events` query 带 `historyEncryption=1`（握手 query 受设备签名覆盖）。未声明的 `conversation.subscribe` 与 HTTP 回放返回 `CLIENT_UPGRADE_REQUIRED`（HTTP 426）。`/v2/version` 的 `historyEncryption` 字段给出后端支持的版本；旧后端对 `history.*` 返回 `UNSUPPORTED`。旧版明文会话（`legacyPlaintext`）同样只发给已声明的客户端。
 
-旧版明文历史（规格见 [history-encryption.md](history-encryption.md) §8）：强制加密之前写下、含任何明文记录、明文标题或明文请求快照的会话，manifest 带 `legacyPlaintext: true`（为 `false` 时省略），出现在会话列表、详情、创建/更新结果中，`conversation.subscribe` 的结果也带 `legacyPlaintext: true`。这类会话保持原样不迁移、不改写，并且只读：可读取、订阅、回放、导出、归档/取消归档与删除；prompt/followUp、`conversation.retry`、`conversation.queue.add`/`resume`、`conversation.compact`、`conversation.fork`、改名（`PATCH` 的 `title`）、权限应答与 `conversation.control` 均返回 `HISTORY_READ_ONLY`（HTTP 409），队列被拒绝时不写入 `queue.json`。daemon 启动后在后台一次性扫描所有会话写入该标记（不阻塞读取与 `/health`），尚未扫描到的会话在第一次写入尝试时当场判定。
+旧版明文历史（规格见 [history-encryption.md](history-encryption.md) §8）：强制加密之前写下、含任何明文记录、明文标题或明文请求快照的会话，manifest 带 `legacyPlaintext: true`（为 `false` 时省略），出现在会话列表、详情、创建/更新结果中，`conversation.subscribe` 的结果也带 `legacyPlaintext: true`。这类会话保持原样不迁移、不改写，并且只读：可读取、订阅、回放、导出、归档/取消归档与删除；prompt/followUp、`conversation.retry`、`conversation.queue.add`/`resume`、`conversation.compact`、`conversation.fork`、改名（`PATCH` 的 `title`）、权限应答与 `conversation.control` 均返回 `HISTORY_READ_ONLY`（HTTP 409），队列被拒绝时不会入队。daemon 启动后在后台一次性扫描所有会话写入该标记（不阻塞读取与 `/health`），尚未扫描到的会话在第一次写入尝试时当场判定。
 
 加密历史的线上形状（细节见 [history-encryption.md](history-encryption.md) §5）：
 

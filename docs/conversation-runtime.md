@@ -303,27 +303,28 @@ Daemon startup waits up to 120 seconds for initialization; on timeout the
 spawned child is terminated and the daemon log identifies the last recovery
 progress. No in-progress turn is replayed automatically.
 
-The backend follow-up queue (`queue.json`, see API.md "后端追加队列") is held
-by the supervisor for every provider. A turn task releases its active slot
-before it schedules the queue, so the next item starts through the normal
-prompt path under the conversation's request gate, with the item id as its
-`clientRequestId`; a start replayed after a crash is therefore recognized as
-already delivered. Only `turn.completed` (or a finished native compaction)
-advances the queue; other terminals pause it, and so does recovery: every
-queue with waiting items is paused with `daemon_restarted` at startup. A
-`turn.failed` whose turn last reported an exhausted plan window (tracked per
-turn in the quota store, since concurrent conversations overwrite the
-provider snapshot) instead inserts one continuation item at the head and
-pauses with `rate_limited` until `resumeAt`; a wall-clock timer, re-armed on
-recovery, lifts that pause and drains the queue. `resumeAt` is never less
-than a minute away, doubles for each consecutive continuation that hits the
-limit again (the count lives in `queue.json` and resets when a turn
-completes), and after three such continuations the queue pauses with
-`turn_failed` instead. A pause the user holds (`turn_cancelled`,
-`start_failed`, `daemon_restarted`) is kept: the continuation joins the head
-without a timer. Once `shutdown_all` starts, neither a completed turn nor a
-timer starts a queued item, and the updater treats an unpaused, non-empty
-queue as work in progress.
+The backend follow-up queue (see API.md "后端追加队列") is held in the
+supervisor's memory, never on disk, for every provider; a restart loses it.
+A turn task releases its active slot before it schedules the queue, so the
+next item starts through the normal prompt path under the conversation's
+request gate, with the item id as its `clientRequestId`; a start replayed
+after a crash is therefore recognized as already delivered. Only
+`turn.completed` (or a finished native compaction) advances the queue; other
+terminals pause it, and so does the user (`conversation.queue.pause`, or
+`add` with `paused`, reason `user`). Recovery imports a `queue.json` left by
+an older daemon as a queue paused with `daemon_restarted` and deletes the
+file. A `turn.failed` whose turn last reported an exhausted plan window
+(tracked per turn in the quota store, since concurrent conversations
+overwrite the provider snapshot) instead inserts one continuation item at
+the head and pauses with `rate_limited` until `resumeAt`; an in-memory
+wall-clock timer lifts that pause and drains the queue. `resumeAt` is never
+less than a minute away, doubles for each consecutive continuation that hits
+the limit again (the count resets when a turn completes), and after three
+such continuations the queue pauses with `turn_failed` instead. A pause the
+user holds (`turn_cancelled`, `start_failed`, `daemon_restarted`, `user`) is
+kept: the continuation joins the head without a timer. Once `shutdown_all`
+starts, neither a completed turn nor a timer starts a queued item, and the
+updater treats any non-empty queue, paused or not, as work in progress.
 
 Regression coverage includes malformed approvals, provider wire parameters,
 quiet processes and blocked writes, replay/live races, late acknowledgements,

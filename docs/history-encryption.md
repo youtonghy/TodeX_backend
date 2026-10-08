@@ -7,7 +7,7 @@
 - 单个会话没有体积上限；只有数据目录所在磁盘可用空间低于 1 GiB 时新 prompt 返回 `STORAGE_LOW`（HTTP 507）。
 - 历史始终端到端加密（没有 off 模式与开关）：会话内容以密文落盘，后端磁盘上不存在能解密历史的私钥；实时推送与历史回放发送同一份密文，后端不解密、不重加密，原样转发（外层传输加密照常）。
 - 保护：TodeX 数据目录被盗、被备份或泄露；事后攻破后端时读取已写入的历史。
-- 不保护：后端运行 agent 时看到的明文（它必须处理模型输出）；provider 自身在后端保存的明文 transcript（`~/.claude/projects`、`~/.codex/sessions` 等）；排队中的追加 prompt（`queue.json`，投递后删除）；元数据（sequence、时间、事件类型、大小、下文 §5.2 的信封字段）。
+- 不保护：后端运行 agent 时看到的明文（它必须处理模型输出）；provider 自身在后端保存的明文 transcript（`~/.claude/projects`、`~/.codex/sessions` 等）；排队中的追加 prompt（daemon 内存中的明文候选消息，投递前不落盘，daemon 重启即丢失；`queue.json` 不再写入，旧版遗留的文件在启动时导入内存并删除）；元数据（sequence、时间、事件类型、大小、下文 §5.2 的信封字段）。
 - 强制加密之前写下的明文历史不迁移、不改写，标记为 `legacyPlaintext` 后只读（§8）。
 - 范围是机密性，不是顺序与完整性：AEAD 只保证单条事件密文或单个内容帧未被篡改且属于该会话、`kid`、stream 与 counter。封存分片的帧头位置（首 sequence、条数）与信封流（stream 0，明文 raw DEFLATE）不在 AEAD 内，journal 行与帧的先后也没有链式校验；能改写数据目录的人可以删除、截断、重排记录或帧，或改动信封字段而不被发现，只是读不到内容。
 
@@ -84,7 +84,7 @@ events.000007.jsonl     刚封存、待压缩的分片（短暂）
 events.000006.seg       封存分片：分帧 raw DEFLATE（e2e 下再加密）
 events.000006.idx       sidecar 索引（JSON，含校验和）
 keyring.json            e2e 才有
-manifest.json  snapshot.json  provider-state.json  last-request.json  queue.json
+manifest.json  snapshot.json  provider-state.json  last-request.json
 ```
 
 活动分片原始大小超过 64 MiB 时封存（改名为 `events.NNNNNN.jsonl`），后台任务转为 `.seg + .idx`：写临时文件 → fsync → rename `.idx` → rename `.seg` → fsync 目录 → 删除明文分片 → fsync 目录。恢复规则：同号 `.jsonl` 与 `.seg` 并存且 `.idx` 校验通过时删除 `.jsonl`，否则删除 `.seg/.idx` 重做。
@@ -220,5 +220,5 @@ control 幂等（`conversation.control` 以 `requestId` 去重）：加密记录
 - 不迁移：强制加密之前写下的明文历史（v2 journal、off 模式写入的 v3 明文记录、明文标题、含原文的 `last-request.json`）保持原样，不重打包、不加密、不做 v2 → v3 转换。后台维护任务只把新会话轮换出的分片转为 `.seg`，并删除旧版本迁移留下的、超过 7 天的 `journal-v2-backup/`。
 - 标记：manifest 新增 `legacyPlaintext: bool`（`false` 时省略）。会话含任何明文记录（`journal.recordLost` 占位除外）、明文标题或不带 `textMac` 的请求快照即为旧版明文会话，写入 `legacyPlaintext: true`；否则确认完全加密，写入 `historyEncryptedAt`。已带其一的会话不再检查；新建、导入与 fork 的会话创建时即带 `historyEncryptedAt`。
 - 标记任务：daemon 启动后在后台逐个检查尚未判定的会话（按回放分页读取，遇到第一条明文即停），不阻塞读取与 `/health`，耗时与统计写入日志。每个会话的结果立即写进 manifest，所以中断后下次启动从未判定处继续；全部成功后写 `$DATA_DIR/legacy-plaintext-scan.json`（`{completedAt, conversations, legacy}`），之后启动跳过扫描。有会话检查失败时不写该文件，下次启动重试。任务尚未到达的会话在第一次写入尝试时当场判定，所以写入不会落进未判定的旧历史。
-- 只读：`legacyPlaintext` 会话的 prompt/followUp、`conversation.retry`、`conversation.queue.add`（在写 `queue.json` 之前拒绝）与 `conversation.queue.resume`、`conversation.compact`、`conversation.fork`（否则会把明文复制进可写会话）、改名、权限应答与 `conversation.control` 返回 `HISTORY_READ_ONLY`（HTTP 409，WS 错误码同名）；存储层的追加入口同样拒绝，作为最后防线。读取、订阅、回放、导出、归档与取消归档（只改 manifest 的归档字段）以及删除照常可用。客户端应据 `legacyPlaintext`（会话列表、详情与 `conversation.subscribe` 结果中都有）禁用输入，并提示该对话为旧版未加密历史、只读。
+- 只读：`legacyPlaintext` 会话的 prompt/followUp、`conversation.retry`、`conversation.queue.add`（入队前拒绝）与 `conversation.queue.resume`、`conversation.compact`、`conversation.fork`（否则会把明文复制进可写会话）、改名、权限应答与 `conversation.control` 返回 `HISTORY_READ_ONLY`（HTTP 409，WS 错误码同名）；存储层的追加入口同样拒绝，作为最后防线。读取、订阅、回放、导出、归档与取消归档（只改 manifest 的归档字段）以及删除照常可用。客户端应据 `legacyPlaintext`（会话列表、详情与 `conversation.subscribe` 结果中都有）禁用输入，并提示该对话为旧版未加密历史、只读。
 - 仍在磁盘上的明文：旧版明文会话本身（用户可删除）、旧版本迁移留下的 `journal-v2-backup/`（7 天内）、`events.corrupt.*` 打捞副本与 Time Machine / APFS 快照。
