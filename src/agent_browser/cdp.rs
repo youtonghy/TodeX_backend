@@ -30,7 +30,7 @@ const SCREENCAST_FRAME: &str = "Page.screencastFrame";
 const HANDLED_EVENTS: &[&str] = &[
     "Fetch.requestPaused",
     "Page.javascriptDialogOpening",
-    "Target.targetCreated",
+    "Target.attachedToTarget",
     "Target.detachedFromTarget",
 ];
 
@@ -436,5 +436,22 @@ mod tests {
         assert_eq!(ack["params"]["sessionId"], 1);
         assert_eq!(ack["sessionId"], "s1");
         assert!(outgoing.try_recv().is_err());
+    }
+
+    #[test]
+    fn auto_attach_events_reach_the_session() {
+        // With `waitForDebuggerOnStart`, a page only runs once the session
+        // sees its `attachedToTarget`; dropping it leaves every tab paused.
+        let (inner, _outgoing) = inner();
+        let mut events = inner.event_receiver.lock().unwrap().take().unwrap();
+        dispatch(
+            &inner,
+            json!({ "method": "Target.attachedToTarget", "params": { "sessionId": "s2", "waitingForDebugger": true } })
+                .to_string()
+                .as_bytes(),
+        );
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.method, "Target.attachedToTarget");
+        assert_eq!(event.params["sessionId"], "s2");
     }
 }

@@ -241,7 +241,9 @@ impl ComputerHost for NativeComputer {
     }
 
     async fn frame(&self, max_width: u32, quality: u8) -> Result<Vec<u8>, ComputerError> {
-        self.with_engine(move |engine, _| engine.frame(max_width, quality))
+        self.with_engine(move |engine, _| {
+            engine.frame(max_width, quality, std::process::id())
+        })
             .await
     }
 

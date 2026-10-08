@@ -389,8 +389,15 @@ impl Engine {
         Ok(())
     }
 
-    /// A JPEG of the display a session works on, for live viewers.
-    pub(super) fn frame(&mut self, max_width: u32, quality: u8) -> Result<Vec<u8>, ComputerError> {
+    /// A JPEG of the display a session works on, for live viewers. Protected
+    /// apps are painted over as in `observe`: viewers never see more than
+    /// the agent does.
+    pub(super) fn frame(
+        &mut self,
+        max_width: u32,
+        quality: u8,
+        own_pid: u32,
+    ) -> Result<Vec<u8>, ComputerError> {
         let displays = platform::displays();
         let display = self
             .shot
@@ -401,10 +408,12 @@ impl Engine {
             })
             .or_else(|| displays.first())
             .ok_or_else(|| ComputerError::platform("no display to capture"))?;
-        let shot = self
+        let rect = display_rect(display);
+        let mut shot = self
             .screenshots()?
-            .capture_region(display_rect(display))
+            .capture_region(rect)
             .map_err(ComputerError::platform)?;
+        self.hide_protected(&mut shot, rect, own_pid)?;
         let shot = if shot.width > max_width {
             let height = (u64::from(shot.height) * u64::from(max_width) / u64::from(shot.width))
                 .max(1) as u32;
