@@ -94,5 +94,21 @@
     "runsAcpProfileCli": false,
     "runsOwnCli": true,
     "runsOtherCli": false
+  },
+  "antigravity": {
+    "recoveryIsSettled": true,
+    "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
+    "attachedFileText": "Attached file: @notes.txt",
+    "attachedFileItems": 1,
+    "typedImages": {
+      "error": "unsupported capability: provider Antigravity does not support typed prompt images"
+    },
+    "profileExplicit": {
+      "error": "invalid request: providerProfile is only valid for ACP conversations"
+    },
+    "profileOmitted": null,
+    "runsAcpProfileCli": false,
+    "runsOwnCli": true,
+    "runsOtherCli": false
   }
 }

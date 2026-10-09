@@ -22,10 +22,11 @@ pub enum ProviderKind {
     GrokBuild,
     Devin,
     Opencode,
+    Antigravity,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Acp,
         Self::Codex,
         Self::Pi,
@@ -33,6 +34,7 @@ impl ProviderKind {
         Self::GrokBuild,
         Self::Devin,
         Self::Opencode,
+        Self::Antigravity,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -44,6 +46,7 @@ impl ProviderKind {
             Self::GrokBuild => "grok-build",
             Self::Devin => "devin",
             Self::Opencode => "opencode",
+            Self::Antigravity => "antigravity",
         }
     }
 }
@@ -60,6 +63,7 @@ impl std::str::FromStr for ProviderKind {
             "grok" | "grok-build" | "grok_build" => Ok(Self::GrokBuild),
             "devin" | "devin-cli" | "devin_cli" => Ok(Self::Devin),
             "opencode" | "open-code" | "open_code" => Ok(Self::Opencode),
+            "antigravity" | "agy" | "antigravity-cli" => Ok(Self::Antigravity),
             other => Err(format!("unsupported provider: {other}")),
         }
     }

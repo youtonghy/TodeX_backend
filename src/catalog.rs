@@ -1327,6 +1327,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                antigravity_bin: "agy".to_owned(),
+                antigravity_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,

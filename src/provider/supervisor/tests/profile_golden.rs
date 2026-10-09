@@ -40,6 +40,8 @@ fn golden_config(root: &Path, executable: Option<&str>) -> Config {
             devin_env_allowlist: Vec::new(),
             opencode_bin: bin("opencode"),
             opencode_env_allowlist: Vec::new(),
+            antigravity_bin: "agy".to_owned(),
+            antigravity_env_allowlist: Vec::new(),
             acp_profiles: BTreeMap::from([(
                 ACP_PROFILE.to_owned(),
                 AcpProfileConfig {

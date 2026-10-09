@@ -143,7 +143,8 @@ pub(crate) enum BoundedLine {
 
 pub struct JsonLineProcess {
     child: Child,
-    stdin: ChildStdin,
+    /// `None` once [`Self::close_stdin`] signalled end of input.
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     stdout_pending: Vec<u8>,
     /// Bytes skipped so far of an oversized line whose end has not arrived.
@@ -206,7 +207,7 @@ impl JsonLineProcess {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout),
             stdout_pending: Vec::new(),
             stdout_discarding: None,
@@ -242,15 +243,51 @@ impl JsonLineProcess {
             ));
         }
         bytes.push(b'\n');
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            AppError::ProviderUnavailable("provider stdin is already closed".to_owned())
+        })?;
         timeout(deadline, async {
-            self.stdin.write_all(&bytes).await?;
-            self.stdin.flush().await
+            stdin.write_all(&bytes).await?;
+            stdin.flush().await
         })
         .await
         .map_err(|_| {
             AppError::ProviderUnavailable("provider protocol write timed out".to_owned())
         })??;
         Ok(())
+    }
+
+    /// Closes stdin so a provider that reads prompts until end of input
+    /// finishes its work and exits on its own.
+    pub fn close_stdin(&mut self) {
+        self.stdin = None;
+    }
+
+    /// Waits up to `deadline` for the provider to exit on its own; `false`
+    /// when it is still running. On Unix the leader is not reaped, so a
+    /// following [`Self::terminate`] still reaches only its process group.
+    pub async fn wait_exit(&mut self, deadline: Duration) -> bool {
+        let Some(pid) = self.pid else {
+            return true;
+        };
+        #[cfg(unix)]
+        {
+            let deadline = Instant::now() + deadline;
+            loop {
+                if leader_exited(pid) {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(LEADER_EXIT_POLL).await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            matches!(timeout(deadline, self.child.wait()).await, Ok(Ok(_)))
+        }
     }
 
     /// A single control exchange keeps the same deadline across unrelated notifications.

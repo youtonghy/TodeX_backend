@@ -1128,5 +1128,151 @@
     "mode=bogus work=plan profile=- sandbox=danger-full-access approval=on-request": {
       "error": "unsupported capability: opencode does not support permission mode bogus"
     }
+  },
+  "antigravity": {
+    "mode=- work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=- work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=- work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode ask"
+    },
+    "mode=ask work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode ask"
+    },
+    "mode=ask work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not support permission mode ask"
+    },
+    "mode=ask work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not support permission mode ask"
+    },
+    "mode=ask work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode ask"
+    },
+    "mode=ask work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode ask"
+    },
+    "mode=ask work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not support permission mode ask"
+    },
+    "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not support permission mode ask"
+    },
+    "mode=auto work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode auto"
+    },
+    "mode=auto work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode auto"
+    },
+    "mode=auto work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not support permission mode auto"
+    },
+    "mode=auto work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not support permission mode auto"
+    },
+    "mode=auto work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode auto"
+    },
+    "mode=auto work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode auto"
+    },
+    "mode=auto work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not support permission mode auto"
+    },
+    "mode=auto work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not support permission mode auto"
+    },
+    "mode=full-access work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=full-access work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=plan profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "plan",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=full-access work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
+    },
+    "mode=bogus work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: antigravity does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: antigravity does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: antigravity does not support permission mode bogus"
+    }
   }
 }

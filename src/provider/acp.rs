@@ -188,9 +188,11 @@ fn quirks(provider: ProviderKind) -> &'static AcpQuirks {
         ProviderKind::GrokBuild => &super::grok::ACP_QUIRKS,
         ProviderKind::Devin => &super::devin::ACP_QUIRKS,
         ProviderKind::Opencode => &super::opencode::ACP_QUIRKS,
-        ProviderKind::Acp | ProviderKind::Codex | ProviderKind::Pi | ProviderKind::ClaudeCode => {
-            &PLAIN_ACP
-        }
+        ProviderKind::Acp
+        | ProviderKind::Codex
+        | ProviderKind::Pi
+        | ProviderKind::ClaudeCode
+        | ProviderKind::Antigravity => &PLAIN_ACP,
     }
 }
 

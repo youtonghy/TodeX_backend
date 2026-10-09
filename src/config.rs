@@ -95,6 +95,8 @@ pub struct AgentConfig {
     pub devin_env_allowlist: Vec<String>,
     pub opencode_bin: String,
     pub opencode_env_allowlist: Vec<String>,
+    pub antigravity_bin: String,
+    pub antigravity_env_allowlist: Vec<String>,
     pub acp_profiles: BTreeMap<String, AcpProfileConfig>,
     /// OpenSSH client used for remote hosts; `ssh-add` is looked up next to it.
     pub ssh_bin: String,
@@ -156,6 +158,8 @@ struct PartialAgentConfig {
     devin_env_allowlist: Option<Vec<String>>,
     opencode_bin: Option<String>,
     opencode_env_allowlist: Option<Vec<String>>,
+    antigravity_bin: Option<String>,
+    antigravity_env_allowlist: Option<Vec<String>>,
     acp_profiles: Option<BTreeMap<String, AcpProfileConfig>>,
     ssh_bin: Option<String>,
     provider_idle_timeout_minutes: Option<u64>,
@@ -325,6 +329,15 @@ impl Config {
                 opencode_env_allowlist: env_list("TODEX_AGENTD_OPENCODE_ENV_ALLOWLIST")
                     .or(agent_file.opencode_env_allowlist)
                     .unwrap_or(defaults.agent.opencode_env_allowlist),
+                antigravity_bin: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_ANTIGRAVITY_BIN").ok(),
+                    agent_file.antigravity_bin,
+                    defaults.agent.antigravity_bin,
+                ),
+                antigravity_env_allowlist: env_list("TODEX_AGENTD_ANTIGRAVITY_ENV_ALLOWLIST")
+                    .or(agent_file.antigravity_env_allowlist)
+                    .unwrap_or(defaults.agent.antigravity_env_allowlist),
                 acp_profiles: agent_file
                     .acp_profiles
                     .unwrap_or(defaults.agent.acp_profiles),
@@ -475,6 +488,8 @@ impl Default for Config {
                 opencode_bin: "opencode".to_owned(),
                 ssh_bin: "ssh".to_owned(),
                 opencode_env_allowlist: default_opencode_env_allowlist(),
+                antigravity_bin: "agy".to_owned(),
+                antigravity_env_allowlist: default_antigravity_env_allowlist(),
                 acp_profiles: BTreeMap::new(),
                 provider_idle_timeout_minutes: DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
             },
@@ -588,6 +603,11 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
             base_agent.opencode_env_allowlist,
             overlay_agent.opencode_env_allowlist
         );
+        replace_some!(base_agent.antigravity_bin, overlay_agent.antigravity_bin);
+        replace_some!(
+            base_agent.antigravity_env_allowlist,
+            overlay_agent.antigravity_env_allowlist
+        );
         replace_some!(base_agent.acp_profiles, overlay_agent.acp_profiles);
         replace_some!(
             base_agent.provider_idle_timeout_minutes,
@@ -698,6 +718,18 @@ fn default_opencode_env_allowlist() -> Vec<String> {
         "OPENCODE_DISABLE_PROJECT_CONFIG",
         "OPENCODE_EXPERIMENTAL",
         "OPENCODE_PERMISSION",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn default_antigravity_env_allowlist() -> Vec<String> {
+    [
+        "GEMINI_API_KEY",
+        "GOOGLE_GEMINI_BASE_URL",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_APPLICATION_CREDENTIALS",
     ]
     .into_iter()
     .map(str::to_owned)

@@ -1,6 +1,7 @@
 //! `/v2/providers/quota` — account-level plan quota snapshots. Codex is
-//! refreshed on demand through an ephemeral app-server; Claude Code reports
-//! only during turns, so its entry is whatever `quota.updated` last recorded.
+//! refreshed on demand through an ephemeral app-server and Antigravity
+//! through `agy -p /usage`; Claude Code reports only during turns, so its
+//! entry is whatever `quota.updated` last recorded.
 
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -25,7 +26,8 @@ async fn provider_quota(
     require_auth(&state, &headers)?;
     let mut providers = serde_json::Map::new();
 
-    let codex = match fetch_codex(&state).await {
+    let (codex, antigravity) = tokio::join!(fetch_codex(&state), fetch_antigravity(&state));
+    let codex = match codex {
         Ok(quota) => {
             state.quota.record(&quota);
             quota
@@ -35,6 +37,17 @@ async fn provider_quota(
         ),
     };
     providers.insert("codex".to_owned(), codex);
+
+    let antigravity = match antigravity {
+        Ok(quota) => {
+            state.quota.record(&quota);
+            quota
+        }
+        Err(reason) => state.quota.get("antigravity").unwrap_or_else(
+            || json!({"provider":"antigravity","scope":"account","state":"unavailable","reason":reason}),
+        ),
+    };
+    providers.insert("antigravity".to_owned(), antigravity);
 
     let claude = state.quota.get("claude-code").unwrap_or_else(|| {
         json!({"provider":"claude-code","scope":"account","state":"idle","reason":"Claude Code reports plan limits during a turn; run a session first."})
@@ -50,6 +63,17 @@ async fn provider_quota(
     );
 
     Ok(Json(json!({ "providers": providers })))
+}
+
+async fn fetch_antigravity(state: &AppState) -> Result<Value, String> {
+    let binary = &state.config.agent.antigravity_bin;
+    if !executable_available(binary) {
+        return Err(format!("executable '{binary}' was not found"));
+    }
+    crate::provider::antigravity::fetch_usage(binary, &state.config.agent.antigravity_env_allowlist)
+        .await
+        .map(|usage| crate::provider::antigravity::quota_payload(&usage))
+        .map_err(|error| error.to_string())
 }
 
 async fn fetch_codex(state: &AppState) -> Result<Value, String> {

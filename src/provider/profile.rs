@@ -217,6 +217,7 @@ pub fn profile(kind: ProviderKind) -> &'static ProviderProfile {
         ProviderKind::GrokBuild => &super::grok::PROFILE,
         ProviderKind::Devin => &super::devin::PROFILE,
         ProviderKind::Opencode => &super::opencode::PROFILE,
+        ProviderKind::Antigravity => &super::antigravity::PROFILE,
     };
     debug_assert_eq!(profile.kind, kind);
     profile

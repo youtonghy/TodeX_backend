@@ -828,7 +828,7 @@ fn projection(agent: ProviderKind) -> Option<ConfigProjection> {
         ProviderKind::GrokBuild => Some(ConfigProjection::Exclusive(&grok::Projection)),
         ProviderKind::Opencode => Some(ConfigProjection::Additive(&opencode::Projection)),
         ProviderKind::Pi => Some(ConfigProjection::Additive(&pi::Projection)),
-        ProviderKind::Acp | ProviderKind::Devin => None,
+        ProviderKind::Acp | ProviderKind::Devin | ProviderKind::Antigravity => None,
     }
 }
 

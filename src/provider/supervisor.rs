@@ -326,6 +326,11 @@ impl DriverRegistry {
                 Arc::new(super::opencode::OpencodeDriver::new(&config.agent))
                     as Arc<dyn ProviderDriver>,
             ),
+            (
+                ProviderKind::Antigravity,
+                Arc::new(super::antigravity::AntigravityDriver::new(&config.agent))
+                    as Arc<dyn ProviderDriver>,
+            ),
         ]);
         Self {
             drivers: Arc::new(drivers),
@@ -3166,6 +3171,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                antigravity_bin: "agy".to_owned(),
+                antigravity_env_allowlist: Vec::new(),
                 acp_profiles,
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
@@ -3971,6 +3978,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                antigravity_bin: "agy".to_owned(),
+                antigravity_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
@@ -4017,6 +4026,7 @@ mod tests {
             ManagedCli::GrokBuild,
             ManagedCli::Devin,
             ManagedCli::Opencode,
+            ManagedCli::Antigravity,
         ] {
             assert!(!supervisor.has_active_turns_for_cli(cli));
         }
@@ -4985,8 +4995,10 @@ mod tests {
                 devin_auth_method: None,
                 devin_api_key_env: None,
                 devin_env_allowlist: Vec::new(),
-                opencode_bin: fixture_text,
+                opencode_bin: fixture_text.clone(),
                 opencode_env_allowlist: Vec::new(),
+                antigravity_bin: fixture_text,
+                antigravity_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
@@ -5254,6 +5266,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                antigravity_bin: "agy".to_owned(),
+                antigravity_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
@@ -5476,6 +5490,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                antigravity_bin: "agy".to_owned(),
+                antigravity_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
@@ -5536,6 +5552,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                antigravity_bin: "agy".to_owned(),
+                antigravity_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
@@ -5685,6 +5703,14 @@ elif [ "$mode" = "app-server" ]; then
         ;;
     esac
   done
+elif [ "$mode" = "--input-format" ]; then
+  # Antigravity print mode: one prompt in, then like agy it exits only once
+  # stdin closes.
+  IFS= read -r line
+  printf '{"event":"init","conversation_id":"agy-native","init":{"permission_mode":"request-review"}}\n'
+  printf '{"event":"step_update","step_update":{"conversation_id":"agy-native","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"agy fixture"}}\n'
+  printf '{"event":"result","result":{"conversation_id":"agy-native","status":"SUCCESS","response":"agy fixture","num_turns":1}}\n'
+  cat > /dev/null
 elif [ "$mode" = "--mode" ]; then
   while IFS= read -r line; do
     case "$line" in
@@ -5967,6 +5993,8 @@ done
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                antigravity_bin: "agy".to_owned(),
+                antigravity_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,

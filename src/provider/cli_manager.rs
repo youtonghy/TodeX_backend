@@ -31,6 +31,7 @@ pub enum ManagedCli {
     GrokBuild,
     Devin,
     Opencode,
+    Antigravity,
 }
 
 impl ManagedCli {
@@ -42,6 +43,7 @@ impl ManagedCli {
             Self::GrokBuild => "grok-build",
             Self::Devin => "devin",
             Self::Opencode => "opencode",
+            Self::Antigravity => "antigravity",
         }
     }
 
@@ -53,6 +55,7 @@ impl ManagedCli {
             Self::GrokBuild => "Grok Build",
             Self::Devin => "Devin",
             Self::Opencode => "OpenCode",
+            Self::Antigravity => "Antigravity CLI",
         }
     }
 
@@ -64,6 +67,7 @@ impl ManagedCli {
             Self::GrokBuild => ProviderKind::GrokBuild,
             Self::Devin => ProviderKind::Devin,
             Self::Opencode => ProviderKind::Opencode,
+            Self::Antigravity => ProviderKind::Antigravity,
         }
     }
 
@@ -75,6 +79,7 @@ impl ManagedCli {
             Self::GrokBuild => &config.agent.grok_bin,
             Self::Devin => &config.agent.devin_bin,
             Self::Opencode => &config.agent.opencode_bin,
+            Self::Antigravity => &config.agent.antigravity_bin,
         }
     }
 
@@ -86,6 +91,7 @@ impl ManagedCli {
             Self::GrokBuild => &["update"],
             Self::Devin => &["update"],
             Self::Opencode => &["upgrade"],
+            Self::Antigravity => &["update"],
         }
     }
 
@@ -126,6 +132,11 @@ impl ManagedCli {
             },
             Self::Opencode => InstallScript {
                 url: "https://opencode.ai/install",
+                shell: "bash",
+                env: &[],
+            },
+            Self::Antigravity => InstallScript {
+                url: "https://antigravity.google/cli/install.sh",
                 shell: "bash",
                 env: &[],
             },
@@ -225,15 +236,16 @@ impl CliManager {
         if let Some(cached) = self.cached_versions().await {
             return self.with_active_operation(cached).await;
         }
-        let (codex, pi, claude, grok, devin, opencode) = tokio::join!(
+        let (codex, pi, claude, grok, devin, opencode, antigravity) = tokio::join!(
             inspect_cli(config, ManagedCli::Codex),
             inspect_cli(config, ManagedCli::Pi),
             inspect_cli(config, ManagedCli::ClaudeCode),
             inspect_cli(config, ManagedCli::GrokBuild),
             inspect_cli(config, ManagedCli::Devin),
             inspect_cli(config, ManagedCli::Opencode),
+            inspect_cli(config, ManagedCli::Antigravity),
         );
-        let mut clis = vec![codex, pi, claude, grok, devin, opencode];
+        let mut clis = vec![codex, pi, claude, grok, devin, opencode, antigravity];
         clis.extend(config.agent.acp_profiles.keys().map(|name| CliVersionInfo {
             id: format!("acp:{name}"),
             name: name.clone(),
@@ -578,6 +590,7 @@ async fn latest_version(config: &Config, provider: ManagedCli) -> Result<Option<
         .user_agent(format!("todex-agentd/{}", crate::version::APP_VERSION))
         .build()
         .map_err(|error| AppError::Anyhow(error.into()))?;
+    let antigravity_manifest;
     let (url, field) = match provider {
         // GitHub's unauthenticated API is rate-limited per IP; the npm registry
         // mirrors the published CLI version without that cap.
@@ -596,6 +609,11 @@ async fn latest_version(config: &Config, provider: ManagedCli) -> Result<Option<
             "version",
         ),
         ManagedCli::Opencode => ("https://registry.npmjs.org/opencode-ai/latest", "version"),
+        // The per-platform manifest the official installer and `agy update` read.
+        ManagedCli::Antigravity => {
+            antigravity_manifest = antigravity_manifest_url();
+            (antigravity_manifest.as_str(), "version")
+        }
         ManagedCli::GrokBuild => unreachable!(),
     };
     let response = client
@@ -635,6 +653,21 @@ async fn latest_version(config: &Config, provider: ManagedCli) -> Result<Option<
     extract_version(&body).map(Some).ok_or_else(|| {
         AppError::ProviderUnavailable(format!("{} latest version is unavailable", provider.name()))
     })
+}
+
+fn antigravity_manifest_url() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+    format!(
+        "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/{os}_{arch}.json"
+    )
 }
 
 async fn bounded_response_text(response: reqwest::Response) -> Result<String, AppError> {

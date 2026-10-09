@@ -1,6 +1,7 @@
 //! Native provider drivers for TodeX 2.0.
 
 mod acp;
+pub(crate) mod antigravity;
 mod claude;
 mod cli_manager;
 pub(crate) mod codex;

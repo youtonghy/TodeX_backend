@@ -39,7 +39,7 @@ cd TodeX_desktop && pnpm run dev
 - Rust 工具链
 - `cargo`
 - 至少安装要使用的 Provider CLI，并放在 `PATH` 中或通过对应环境变量指定路径
-- Codex、Pi、Claude Code、Grok Build 和 OpenCode 使用 daemon 所属系统用户的原生配置与登录状态；Devin 的 `devin acp` 自身不读本地登录态，TodeX 默认回退读取 `devin auth login` 写入的凭据，见下文认证说明
+- Codex、Pi、Claude Code、Grok Build、OpenCode 和 Antigravity（`agy`）使用 daemon 所属系统用户的原生配置与登录状态；Devin 的 `devin acp` 自身不读本地登录态，TodeX 默认回退读取 `devin auth login` 写入的凭据，见下文认证说明
 
 建议先检查版本：
 
@@ -52,6 +52,7 @@ claude --version
 grok --version
 devin --version
 opencode --version
+agy --version
 ```
 
 ## 配置方式
@@ -85,6 +86,8 @@ opencode --version
 | `TODEX_AGENTD_DEVIN_ENV_ALLOWLIST` | 允许传给 Devin 的逗号分隔环境变量名 |
 | `TODEX_AGENTD_OPENCODE_BIN` | `opencode` 命令路径 |
 | `TODEX_AGENTD_OPENCODE_ENV_ALLOWLIST` | 允许传给 OpenCode 的逗号分隔环境变量名 |
+| `TODEX_AGENTD_ANTIGRAVITY_BIN` | `agy` 命令路径 |
+| `TODEX_AGENTD_ANTIGRAVITY_ENV_ALLOWLIST` | 允许传给 Antigravity 的逗号分隔环境变量名 |
 | `TODEX_AGENTD_PROVIDER_IDLE_TIMEOUT_MINUTES` | Provider 空闲超时分钟数（默认 60，`0` 关闭） |
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
@@ -116,6 +119,8 @@ devin_bin = "devin"
 devin_env_allowlist = ["DEVIN_API_KEY", "DEVIN_MODEL", "WINDSURF_API_KEY"]
 opencode_bin = "opencode"
 opencode_env_allowlist = ["OPENCODE_CONFIG", "OPENCODE_API_KEY", "OPENCODE_PERMISSION"]
+antigravity_bin = "agy"
+antigravity_env_allowlist = ["GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL"]
 provider_idle_timeout_minutes = 60   # Provider 连续无输出超过该分钟数时停止当前 turn（PROVIDER_IDLE_TIMEOUT）；0 关闭
 
 [agent.acp_profiles.example]
@@ -143,6 +148,8 @@ Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径
 Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。`devin acp` 自身有意不读取本地 `devin auth login` 登录态（官方理由是避免用量归属到错误账号），daemon 会在每个 ACP 进程启动时执行 `authenticate`，按以下顺序解析 API key 并以 `_meta.api_key` 无头发送（不写入日志）：先读 `devin_api_key_env`（例如 `"DEVIN_API_KEY"`）指向的 daemon 环境变量，再默认回退读取 `devin auth login` 写入的 `~/.local/share/devin/credentials.toml` 中的 `windsurf_api_key`——因此已登录的 CLI 开箱即用；将 `TODEX_AGENTD_DEVIN_CLI_CREDENTIALS` 设为 `false` 可禁用该回退。两者都不可用时按上游声明的 `devin-browser` 方法执行一次浏览器授权，daemon 最多等待 5 分钟供用户完成批准。会话分叉能力按已安装 CLI 动态探测：daemon 在 `devin acp` 的 `initialize` 响应中检查 `sessionCapabilities.fork`（结果缓存约 5 分钟），声明后自动开放；当前版本未声明时 fork 保持不可用。
 
 OpenCode 通过 `opencode acp` 接入，每个对话对应一个常驻 ACP 进程（空闲 300 秒回收，上限 32 个）。与 Devin 不同，`opencode acp` 直接读取 `opencode auth login` 保存的本地凭据，其 `opencode-login` authMethod 仅是指向该终端命令的说明，daemon 不发送 ACP `authenticate`；首次使用前用 daemon 用户执行一次 `opencode auth login` 即可。权限模式支持 `ask`/`auto`/`full-access`：`ask` 把每个 `session/request_permission` 转交用户逐条决定；`auto` 自动选 `allow_once`，`full-access` 优先 `allow_always`，自动批准写入 `permission.resolved`（`autoApproved: true`）事件留痕。OpenCode 原生 `permission` 配置（`opencode.json` 或白名单转发的 `OPENCODE_PERMISSION`）仍先生效。plan 工作模式经 `configOptions.mode` 映射为 `plan`/`build`。模型目录与 slash 命令来自真实 ACP 会话探测（探测会话随后 `session/close`）；模型以 `provider/model` 形式选择并支持会话内切换；reasoning effort 经 `configOptions.effort` 下发，仅当所选模型有 variant 时可用，模型探测会逐个读取各模型的 `supportedReasoningEfforts`。恢复对话优先用 `session/resume`（不回放历史），会话分叉走 `session/fork`。默认环境白名单转发 `OPENCODE_CONFIG*`、`OPENCODE_AUTH_CONTENT`、`OPENCODE_API_KEY` 等 `OPENCODE_*` 变量；进程固定注入 `OPENCODE_DISABLE_AUTOUPDATE=1`，自升级走 `POST /v2/providers/opencode/upgrade`（`opencode upgrade`）。
+
+Antigravity 通过 `agy` 的 stream-json print 模式接入，每个 turn 一个进程，结束后以 `--conversation` 续接同一会话。先在 daemon 所属用户的终端运行一次 `agy` 完成登录；也可把 `GEMINI_API_KEY` 加入 `antigravity_env_allowlist` 并在 `~/.gemini/antigravity-cli/settings.json` 设置 `modelProvider: "gemini"`。headless `agy` 无法请求审批，TodeX 因此以 `--dangerously-skip-permissions` 运行 implement turn（唯一的权限模式），Plan turn 用 `--mode plan` 且只允许读取。
 
 ## Conversation 数据目录
 

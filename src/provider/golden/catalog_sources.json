@@ -404,5 +404,40 @@
     "mcpTarget": {
       "error": "resource not found: mcp resource missing"
     }
+  },
+  "antigravity": {
+    "skillRoots": [
+      {
+        "path": "<workspace>/.agents/skills",
+        "scope": "project",
+        "source": "provider-project",
+        "priority": 40
+      },
+      {
+        "path": "~/.agents/skills",
+        "scope": "user",
+        "source": "shared-user",
+        "priority": 10
+      },
+      {
+        "path": "~/.gemini/config/skills",
+        "scope": "user",
+        "source": "provider-user",
+        "priority": 20
+      }
+    ],
+    "mcpSources": [
+      {
+        "path": "~/.gemini/config/mcp_config.json",
+        "scope": "user",
+        "source": "antigravity-user",
+        "priority": 20
+      }
+    ],
+    "skills": 0,
+    "mcp": [],
+    "mcpTarget": {
+      "error": "resource not found: mcp resource missing"
+    }
   }
 }

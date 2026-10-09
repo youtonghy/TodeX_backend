@@ -348,12 +348,10 @@ pub fn resolve_permission_config(
             )));
         }
         return Ok(EffectivePermissionConfig {
-            permission_mode: if provider == ProviderKind::Pi {
-                "full-access"
-            } else {
-                "ask"
-            }
-            .to_owned(),
+            permission_mode: super::profile::profile(provider)
+                .permission_config
+                .default_mode
+                .to_owned(),
             work_mode: "implement".to_owned(),
             approvals_reviewer: None,
             sandbox_mode: None,

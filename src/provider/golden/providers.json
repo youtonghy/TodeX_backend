@@ -743,5 +743,49 @@
       ]
     },
     "models": []
+  },
+  {
+    "id": "antigravity",
+    "displayName": "Antigravity",
+    "available": true,
+    "profiles": [],
+    "capabilities": {
+      "permissionConfig": {
+        "modes": [
+          "full-access"
+        ],
+        "defaultMode": "full-access",
+        "supportsPlan": true,
+        "sandboxModes": [],
+        "approvalPolicies": [],
+        "permissionProfiles": [],
+        "enforcement": "unsupported",
+        "description": "Headless agy cannot ask for approval, so turns run with --dangerously-skip-permissions; Plan mode uses agy --mode plan and refuses anything beyond reading."
+      },
+      "nativeFork": false,
+      "nativeCompact": false,
+      "nativeResume": true,
+      "cancel": true,
+      "permissions": false,
+      "toolEvents": true,
+      "nativeSkills": true,
+      "nativeMcp": true,
+      "managedMcp": false,
+      "modelSelection": true,
+      "imageInput": false,
+      "imageInputMode": "model",
+      "controlActions": [
+        "cancel",
+        "interrupt",
+        "followUp",
+        "retry"
+      ],
+      "steering": false,
+      "liveConfiguration": false,
+      "followUpQueue": false,
+      "backendQueue": true,
+      "backendQueueControl": true
+    },
+    "models": []
   }
 ]
