@@ -8461,6 +8461,127 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A host that only lists apps, for the `@app:` route.
+    struct AppsComputer;
+
+    #[async_trait::async_trait]
+    impl crate::computer::ComputerHost for AppsComputer {
+        fn status(&self) -> crate::computer::ComputerStatus {
+            crate::computer::ComputerStatus {
+                supported: true,
+                available: true,
+                reason: None,
+                host: "test-host".into(),
+                platform: "macos",
+                permissions: crate::computer::platform::Permissions::default(),
+            }
+        }
+
+        async fn request_permissions(
+            &self,
+            _which: Option<crate::computer::platform::Permission>,
+        ) -> crate::computer::ComputerStatus {
+            self.status()
+        }
+
+        async fn confirm(
+            &self,
+            _title: String,
+            _message: String,
+            _timeout: Duration,
+        ) -> Result<Option<bool>, crate::computer::ComputerError> {
+            Ok(None)
+        }
+
+        async fn observe(
+            &self,
+            _lease: u64,
+            _args: Value,
+        ) -> Result<Value, crate::computer::ComputerError> {
+            Err(crate::computer::ComputerError::invalid("not in this test"))
+        }
+
+        async fn act(
+            &self,
+            _lease: u64,
+            _args: Value,
+            _allowed_apps: Vec<String>,
+            _confirmed: bool,
+        ) -> Result<Value, crate::computer::ComputerError> {
+            Err(crate::computer::ComputerError::invalid("not in this test"))
+        }
+
+        async fn frame(
+            &self,
+            _lease: u64,
+            _max_width: u32,
+            _quality: u8,
+        ) -> Result<Vec<u8>, crate::computer::ComputerError> {
+            Err(crate::computer::ComputerError::invalid("not in this test"))
+        }
+
+        fn session(&self, _summary: Option<&str>) {}
+
+        async fn apps(
+            &self,
+        ) -> Result<Vec<crate::computer::ListedApp>, crate::computer::ComputerError> {
+            Ok(vec![crate::computer::ListedApp {
+                id: "com.apple.TextEdit".into(),
+                name: "TextEdit".into(),
+                running: true,
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_apps_route_lists_apps_only_while_computer_use_is_on() {
+        let root = std::env::temp_dir().join(format!("todex-v2-computer-apps-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let device = enroll(&root.join("data"));
+        state
+            .agent_desktop
+            .set_computer(crate::computer::Computer::with_host(Arc::new(AppsComputer)));
+        let app = crate::server::loopback_test_router(state.clone());
+        let send = |request: Request<Body>| {
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+                )
+            }
+        };
+        let uri = "/v2/agent-desktop/computer/apps";
+
+        let unsigned = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        assert_eq!(send(unsigned).await.0, StatusCode::UNAUTHORIZED);
+        // Off by default; agent desktop tools alone are not enough.
+        let (status, _) = send(signed_request(&device, "GET", uri, "")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        state
+            .agent_desktop
+            .update_settings(Some(true), None)
+            .await
+            .unwrap();
+        let (status, _) = send(signed_request(&device, "GET", uri, "")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        state
+            .agent_desktop
+            .update_settings(None, Some(true))
+            .await
+            .unwrap();
+        let (status, body) = send(signed_request(&device, "GET", uri, "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({ "apps": [{ "id": "com.apple.TextEdit", "name": "TextEdit", "running": true }] })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     async fn wait_for_ws_message<Filter>(
         ws: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,

@@ -3,6 +3,7 @@
 
 use std::{
     ffi::{c_void, CString},
+    path::{Path, PathBuf},
     process::Command,
     time::Duration,
 };
@@ -11,8 +12,10 @@ use core_foundation::{
     array::CFArray,
     base::{CFType, CFTypeRef, TCFType},
     boolean::CFBoolean,
+    data::CFData,
     dictionary::{CFDictionary, CFDictionaryRef},
     number::CFNumber,
+    propertylist::{self, kCFPropertyListImmutable, CFPropertyList},
     string::{CFString, CFStringRef},
 };
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
@@ -308,6 +311,74 @@ pub(crate) fn installed_app(identifier: &str) -> Option<Target> {
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
     (!id.is_empty()).then_some(Target { id, name, pid: 0 })
+}
+
+/// Folders apps are installed in, scanned one level deep.
+fn application_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = [
+        "/Applications",
+        "/Applications/Utilities",
+        "/System/Applications",
+        "/System/Applications/Utilities",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join("Applications"));
+    }
+    dirs
+}
+
+/// App bundles in the usual folders (not those nested in other bundles),
+/// by bundle id: what `installed_app` finds through Spotlight. Reads each
+/// `Info.plist` directly; `defaults` per app would take seconds.
+pub(crate) fn installed_apps() -> Vec<Target> {
+    let mut apps = Vec::new();
+    for dir in application_dirs() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in read.flatten() {
+            let path = item.path();
+            if path.extension().is_some_and(|ext| ext == "app") {
+                if let Some(app) = bundle_app(&path) {
+                    apps.push(app);
+                }
+            }
+        }
+    }
+    apps
+}
+
+/// A bundle's id and name from its `Info.plist` (XML or binary).
+fn bundle_app(bundle: &Path) -> Option<Target> {
+    let data = std::fs::read(bundle.join("Contents/Info.plist")).ok()?;
+    let (plist, _) =
+        propertylist::create_with_data(CFData::from_buffer(&data), kCFPropertyListImmutable)
+            .ok()?;
+    // SAFETY: a successful parse returns an owned property list.
+    let plist = unsafe { CFPropertyList::wrap_under_create_rule(plist) };
+    let info = plist.downcast_into::<CFDictionary>()?;
+    // SAFETY: Info.plist keys are strings; values are checked on use.
+    let info: CFDictionary<CFString, CFType> =
+        unsafe { CFDictionary::wrap_under_get_rule(info.as_concrete_TypeRef()) };
+    let text = |key: &'static str| {
+        info.find(CFString::from_static_string(key))
+            .and_then(|value| value.downcast::<CFString>())
+            .map(|value| value.to_string().trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let id = text("CFBundleIdentifier")?;
+    let name = text("CFBundleDisplayName")
+        .or_else(|| text("CFBundleName"))
+        .or_else(|| {
+            bundle
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    Some(Target { id, name, pid: 0 })
 }
 
 pub(crate) fn open_app(identifier: &str) -> Result<(), String> {
@@ -720,6 +791,21 @@ mod tests {
             width: 100.0,
             height: 100.0,
         }
+    }
+
+    #[test]
+    #[ignore = "scans this Mac's apps; run with --ignored to see the list and timing"]
+    fn installed_apps_lists_this_macs_apps() {
+        let started = std::time::Instant::now();
+        let apps = installed_apps();
+        eprintln!("{} installed apps in {:?}", apps.len(), started.elapsed());
+        for app in apps.iter().take(10) {
+            eprintln!("  {} ({})", app.name, app.id);
+        }
+        assert!(apps
+            .iter()
+            .any(|app| app.id == "com.apple.finder"
+                || app.id.eq_ignore_ascii_case("com.apple.TextEdit")));
     }
 
     #[test]

@@ -44,6 +44,11 @@ pub(crate) fn installed_app(_identifier: &str) -> Option<Target> {
     None
 }
 
+/// Apps installed on this host, for `@app:` mentions.
+pub(crate) fn installed_apps() -> Vec<Target> {
+    Vec::new()
+}
+
 pub(crate) fn open_app(identifier: &str) -> Result<(), String> {
     Err(format!("cannot open {identifier} on this platform"))
 }

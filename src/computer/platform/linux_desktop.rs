@@ -70,6 +70,9 @@ pub(super) struct DesktopEntry {
     pub name: String,
     /// `Exec` split into arguments, field codes removed.
     pub argv: Vec<String>,
+    /// `NoDisplay=true`: launchable, but menus (and `@app:` lists) leave
+    /// it out.
+    pub no_display: bool,
 }
 
 impl DesktopEntry {
@@ -90,7 +93,8 @@ pub(super) fn desktop_id(relative_path: &str) -> Option<String> {
 /// other types and hidden entries.
 pub(super) fn parse_desktop_entry(id: &str, contents: &str) -> Option<DesktopEntry> {
     let mut in_entry = false;
-    let (mut name, mut exec, mut kind, mut hidden) = (None, None, None, false);
+    let (mut name, mut exec, mut kind) = (None, None, None);
+    let (mut hidden, mut no_display) = (false, false);
     for line in contents.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -109,6 +113,7 @@ pub(super) fn parse_desktop_entry(id: &str, contents: &str) -> Option<DesktopEnt
             "Exec" => exec = Some(value.to_owned()),
             "Type" => kind = Some(value.to_owned()),
             "Hidden" => hidden = value == "true",
+            "NoDisplay" => no_display = value == "true",
             _ => {}
         }
     }
@@ -120,6 +125,7 @@ pub(super) fn parse_desktop_entry(id: &str, contents: &str) -> Option<DesktopEnt
         id: id.to_owned(),
         name: name.unwrap_or_else(|| id.to_owned()),
         argv,
+        no_display,
     })
 }
 
@@ -264,6 +270,15 @@ mod tests {
         assert_eq!(entry.name, "Dolphin");
         assert_eq!(entry.argv, ["dolphin"]);
         assert_eq!(entry.exe().as_deref(), Some("dolphin"));
+        assert!(!entry.no_display);
+        // NoDisplay entries stay launchable but are marked unlisted.
+        let helper = parse_desktop_entry(
+            "org.kde.helper",
+            "[Desktop Entry]\nType=Application\nName=Helper\nExec=helper\nNoDisplay=true\n",
+        )
+        .unwrap();
+        assert!(helper.no_display);
+        assert_eq!(helper.argv, ["helper"]);
         assert_eq!(
             parse_desktop_entry("x", "[Desktop Entry]\nType=Link\nName=X\n"),
             None

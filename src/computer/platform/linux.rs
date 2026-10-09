@@ -729,17 +729,51 @@ fn process_exe(pid: u32) -> Option<String> {
         .filter(|comm| !comm.is_empty())
 }
 
-/// The first application `.desktop` entry matching `wanted`. Entries come
-/// from the XDG data dirs, earlier dirs winning, re-read at most every
-/// [`DESKTOP_INDEX_TTL`].
+/// The first application `.desktop` entry matching `wanted`.
 fn find_desktop_entry(wanted: impl Fn(&DesktopEntry) -> bool) -> Option<DesktopEntry> {
+    with_desktop_entries(|entries| entries.iter().find(|entry| wanted(entry)).cloned())
+}
+
+/// Installed applications for `@app:` mentions, by desktop id (which
+/// `names_app` matches): entries with a command that menus show, without
+/// blocked executables.
+pub(crate) fn installed_apps() -> Vec<Target> {
+    with_desktop_entries(|entries| {
+        entries
+            .iter()
+            .filter(|entry| {
+                !entry.no_display
+                    && entry
+                        .exe()
+                        .is_some_and(|exe| !crate::computer::policy::is_blocked(&exe))
+            })
+            .map(|entry| Target {
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                pid: 0,
+            })
+            .collect()
+    })
+}
+
+/// The id `@app:` mentions use for a running app: its desktop id when an
+/// entry runs its executable (the id [`installed_apps`] lists), else the
+/// executable.
+pub(crate) fn listed_id(app: &Target) -> String {
+    desktop_entry_for_exe(&app.id).map_or_else(|| app.id.clone(), |entry| entry.id)
+}
+
+/// Runs `work` on the application `.desktop` entries. Entries come from
+/// the XDG data dirs, earlier dirs winning, re-read at most every
+/// [`DESKTOP_INDEX_TTL`].
+fn with_desktop_entries<T>(work: impl FnOnce(&[DesktopEntry]) -> T) -> T {
     static INDEX: Mutex<Option<(Instant, Vec<DesktopEntry>)>> = Mutex::new(None);
     let mut index = INDEX
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((read_at, entries)) = index.as_ref() {
         if read_at.elapsed() < DESKTOP_INDEX_TTL {
-            return entries.iter().find(|entry| wanted(entry)).cloned();
+            return work(entries);
         }
     }
     let mut entries: Vec<DesktopEntry> = Vec::new();
@@ -761,9 +795,9 @@ fn find_desktop_entry(wanted: impl Fn(&DesktopEntry) -> bool) -> Option<DesktopE
             }
         }
     }
-    let found = entries.iter().find(|entry| wanted(entry)).cloned();
+    let result = work(&entries);
     *index = Some((Instant::now(), entries));
-    found
+    result
 }
 
 fn application_dirs() -> Vec<PathBuf> {

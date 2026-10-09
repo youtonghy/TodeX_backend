@@ -89,6 +89,7 @@ pub(super) fn routes() -> Router<AppState> {
             "/v2/agent-desktop/computer/permissions",
             post(request_computer_permissions),
         )
+        .route("/v2/agent-desktop/computer/apps", get(list_computer_apps))
         .route(
             "/v2/conversations/{id}/agent-desktop/frame",
             get(read_frame),
@@ -182,6 +183,27 @@ async fn request_computer_permissions(
         .request_permissions(which)
         .await;
     Ok(Json(settings_view(&state).await))
+}
+
+/// Apps on this host for the composer's `@app:` mentions: running ones
+/// first, then installed ones, without TodeX and the apps agents may never
+/// control.
+async fn list_computer_apps(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    if !state.agent_desktop.computer_enabled().await {
+        return Err(AppError::Conflict("Computer Use is off".to_owned()));
+    }
+    let apps = state
+        .agent_desktop
+        .computer()
+        .host()
+        .apps()
+        .await
+        .map_err(|error| AppError::Conflict(error.to_string()))?;
+    Ok(Json(json!({ "apps": apps })))
 }
 
 /// The host's screen right now, for a live view of the conversation that

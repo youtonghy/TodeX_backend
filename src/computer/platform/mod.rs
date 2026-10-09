@@ -63,6 +63,12 @@ pub(crate) fn paste_text(_pid: u32, _text: &str) -> Result<bool, String> {
     Ok(false)
 }
 
+/// The id `@app:` mentions use for a running app: its own id here.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn listed_id(app: &crate::computer::policy::Target) -> String {
+    app.id.clone()
+}
+
 /// What the settings screen says when permissions are missing.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn missing_permissions_reason(_permissions: Permissions) -> String {

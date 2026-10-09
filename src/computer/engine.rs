@@ -236,6 +236,37 @@ impl Engine {
         Ok(result)
     }
 
+    /// Running apps as `@app:` mentions name them, with the front app's
+    /// pid; protected apps (TodeX, [`policy::is_blocked`]) left out, as
+    /// observations hide them. Leaves the latest observation alone.
+    pub(super) fn running_apps(
+        &mut self,
+        own_pid: u32,
+    ) -> Result<(Vec<Target>, Option<u32>), ComputerError> {
+        let provider = self.provider()?;
+        let front = provider.focused_app().ok().and_then(|app| app.pid);
+        let apps = provider.list_apps().map_err(ComputerError::platform)?;
+        let running = apps
+            .into_iter()
+            .filter_map(|app| {
+                let identity = platform::app_identity(app.pid?);
+                if policy::is_protected(&identity, own_pid) {
+                    return None;
+                }
+                Some(Target {
+                    id: platform::listed_id(&identity),
+                    name: if identity.name.is_empty() {
+                        app.name.unwrap_or_default()
+                    } else {
+                        identity.name
+                    },
+                    pid: identity.pid,
+                })
+            })
+            .collect();
+        Ok((running, front))
+    }
+
     /// Windows of every app, front app first, numbered from 1.
     fn list_windows(&mut self, provider: &Arc<dyn Provider>) {
         let front = provider.focused_app().ok().and_then(|app| app.pid);

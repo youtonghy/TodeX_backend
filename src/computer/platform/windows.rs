@@ -20,11 +20,11 @@ use std::{
     ffi::c_void,
     path::{Path, PathBuf},
     sync::{Mutex, Once},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ::windows::{
-    core::{w, BOOL, HSTRING, PCWSTR, PWSTR},
+    core::{w, Interface, BOOL, HSTRING, PCWSTR, PWSTR},
     Win32::{
         Foundation::{CloseHandle, ERROR_SUCCESS, HWND, LPARAM, POINT, RECT},
         Graphics::{
@@ -33,12 +33,18 @@ use ::windows::{
         },
         Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
         System::{
-            Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED},
+            Com::{
+                CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER,
+                COINIT_MULTITHREADED, STGM_READ,
+            },
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
                 TH32CS_SNAPPROCESS,
             },
-            Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ},
+            Registry::{
+                RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER,
+                HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ,
+            },
             RemoteDesktop::ProcessIdToSessionId,
             StationsAndDesktops::{
                 CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
@@ -58,7 +64,7 @@ use ::windows::{
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
             },
             Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
-            Shell::ShellExecuteW,
+            Shell::{IShellLinkW, ShellExecuteW, ShellLink},
             WindowsAndMessaging::{
                 EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
                 GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
@@ -800,8 +806,182 @@ fn read_file_description(path: &str) -> Option<String> {
     }
 }
 
+/// Where executables register under HKCU and HKLM, one subkey per file
+/// name (`chrome.exe`).
+const APP_PATHS: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths";
+/// How long the Start Menu scan is reused.
+const START_MENU_TTL: Duration = Duration::from_secs(60);
+
+/// Installed apps for `@app:` mentions, by executable name (what
+/// [`resolve_executable`] finds): App Paths registrations, then the
+/// `.exe` targets of Start Menu shortcuts.
+pub(crate) fn installed_apps() -> Vec<Target> {
+    let mut apps = Vec::new();
+    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        for file_name in registry_subkeys(root, APP_PATHS) {
+            if !file_name.to_ascii_lowercase().ends_with(".exe") {
+                continue;
+            }
+            let Some(path) = registry_default(root, &format!("{APP_PATHS}\\{file_name}")) else {
+                continue;
+            };
+            let path = unquote(&path).to_owned();
+            if !Path::new(&path).is_file() {
+                continue;
+            }
+            let id = exe_id(&file_name);
+            apps.push(Target {
+                name: file_description(&path).unwrap_or_else(|| exe_stem(&id).to_owned()),
+                id,
+                pid: 0,
+            });
+        }
+    }
+    for shortcut in start_menu_shortcuts() {
+        let id = exe_id(&shortcut.target.to_string_lossy());
+        if is_uninstaller(&id) {
+            continue;
+        }
+        apps.push(Target {
+            id,
+            name: shortcut.name,
+            pid: 0,
+        });
+    }
+    apps
+}
+
+/// Uninstallers come with many Start Menu folders; nobody mentions them.
+fn is_uninstaller(id: &str) -> bool {
+    id.starts_with("unins") || id.contains("uninstall")
+}
+
+/// A Start Menu shortcut to an executable.
+#[derive(Clone)]
+struct Shortcut {
+    /// The shortcut's file name without `.lnk`.
+    name: String,
+    target: PathBuf,
+}
+
+/// Shortcuts to existing `.exe` files in the per-machine and per-user
+/// Start Menus, re-read at most every [`START_MENU_TTL`]. Advertised
+/// (MSI) and Store shortcuts have no file target and are left out.
+fn start_menu_shortcuts() -> Vec<Shortcut> {
+    static INDEX: Mutex<Option<(Instant, Vec<Shortcut>)>> = Mutex::new(None);
+    let mut index = INDEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((read_at, shortcuts)) = index.as_ref() {
+        if read_at.elapsed() < START_MENU_TTL {
+            return shortcuts.clone();
+        }
+    }
+    let mut links = Vec::new();
+    for base in ["ProgramData", "APPDATA"] {
+        if let Some(dir) = std::env::var_os(base) {
+            let programs = PathBuf::from(dir).join("Microsoft\\Windows\\Start Menu\\Programs");
+            collect_links(&programs, &mut links, 0);
+        }
+    }
+    // SAFETY: COM initialisation for this thread (MTA, as in
+    // `with_automation`; an existing apartment is kept).
+    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let shortcuts: Vec<Shortcut> = links
+        .into_iter()
+        .filter_map(|link| {
+            let target = shortcut_target(&link)?;
+            let name = link.file_stem()?.to_string_lossy().into_owned();
+            Some(Shortcut { name, target })
+        })
+        .collect();
+    *index = Some((Instant::now(), shortcuts.clone()));
+    shortcuts
+}
+
+fn collect_links(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for item in read.flatten() {
+        let path = item.path();
+        if path.is_dir() {
+            if depth < 4 {
+                collect_links(&path, out, depth + 1);
+            }
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// The existing `.exe` a shortcut points at, through the shell's link
+/// object (which also expands environment variables in the target).
+fn shortcut_target(link: &Path) -> Option<PathBuf> {
+    // SAFETY: COM is initialised on this thread (see the caller); the
+    // buffer outlives the call that writes into it.
+    let target = unsafe {
+        let shell_link: IShellLinkW =
+            CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let file: IPersistFile = shell_link.cast().ok()?;
+        file.Load(&HSTRING::from(link.as_os_str()), STGM_READ)
+            .ok()?;
+        let mut buffer = [0u16; 1024];
+        shell_link
+            .GetPath(&mut buffer, std::ptr::null_mut(), 0)
+            .ok()?;
+        let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+        String::from_utf16_lossy(&buffer[..end])
+    };
+    let target = PathBuf::from(target);
+    (target
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+        && target.is_file())
+    .then_some(target)
+}
+
+/// The names of a registry key's subkeys.
+fn registry_subkeys(root: HKEY, subkey: &str) -> Vec<String> {
+    let mut key = HKEY::default();
+    let mut names = Vec::new();
+    // SAFETY: `key` is opened here and closed below; each enumeration
+    // writes at most `len` characters into the buffer (key names are at
+    // most 255).
+    unsafe {
+        if RegOpenKeyExW(root, &HSTRING::from(subkey), None, KEY_READ, &mut key) != ERROR_SUCCESS {
+            return names;
+        }
+        for index in 0u32.. {
+            let mut buffer = [0u16; 256];
+            let mut len = buffer.len() as u32;
+            // Stops at ERROR_NO_MORE_ITEMS (or any failure).
+            if RegEnumKeyExW(
+                key,
+                index,
+                Some(PWSTR(buffer.as_mut_ptr())),
+                &mut len,
+                None,
+                None,
+                None,
+                None,
+            ) != ERROR_SUCCESS
+            {
+                break;
+            }
+            names.push(String::from_utf16_lossy(&buffer[..len as usize]));
+        }
+        let _ = RegCloseKey(key);
+    }
+    names
+}
+
 /// An executable for `identifier`: an existing absolute path, an App Paths
-/// registration (per user, then machine), or a file on `PATH`.
+/// registration (per user, then machine), a Start Menu shortcut's target,
+/// or a file on `PATH`.
 fn resolve_executable(identifier: &str) -> Option<PathBuf> {
     let identifier = unquote(identifier);
     if identifier.is_empty() {
@@ -815,7 +995,7 @@ fn resolve_executable(identifier: &str) -> Option<PathBuf> {
         return None;
     }
     let file_name = exe_file_name(identifier);
-    let subkey = format!("Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\{file_name}");
+    let subkey = format!("{APP_PATHS}\\{file_name}");
     for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
         if let Some(path) = registry_default(root, &subkey) {
             let path = PathBuf::from(unquote(&path));
@@ -823,6 +1003,13 @@ fn resolve_executable(identifier: &str) -> Option<PathBuf> {
                 return Some(path);
             }
         }
+    }
+    let wanted = file_name.to_lowercase();
+    if let Some(shortcut) = start_menu_shortcuts()
+        .into_iter()
+        .find(|shortcut| exe_id(&shortcut.target.to_string_lossy()) == wanted)
+    {
+        return Some(shortcut.target);
     }
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|dir| dir.join(&file_name))

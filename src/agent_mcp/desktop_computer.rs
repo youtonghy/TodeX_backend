@@ -294,7 +294,7 @@ pub(super) fn tools(
             schema(json!({
                 "type": "object",
                 "properties": {
-                    "app": { "type": "string", "description": "App id (macOS bundle id, Windows exe name, Linux desktop id) or name; default: the front app." },
+                    "app": { "type": "string", "description": "App id (macOS bundle id, Windows exe name, Linux desktop id) or name; default: the front app. An `@app:<id>` mention in the user's message names an app on this computer: pass its id here as is." },
                     "window": { "type": "integer", "description": "Window id from a previous observation." },
                     "display": { "type": "integer", "description": "Capture this display index instead of a window." },
                     "screenshot": { "type": "boolean", "description": "Default true." }
@@ -329,7 +329,7 @@ pub(super) fn tools(
                     "toY": { "type": "number" },
                     "text": { "type": "string" },
                     "keys": { "type": "string" },
-                    "app": { "type": "string" },
+                    "app": { "type": "string", "description": "App for open_app (id or name). An `@app:<id>` mention in the user's message names an app on this computer: pass its id here as is." },
                     "window": { "type": "integer" },
                     "deltaX": { "type": "number" },
                     "deltaY": { "type": "number" },
