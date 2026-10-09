@@ -37,6 +37,15 @@ Reference: [Official model guidance — prompting best practices](https://develo
 - Validate tool inputs and outputs at application boundaries. Check relevant timeouts, retries, streaming, errors, and state preservation; avoid repeating non-idempotent actions during retries.
 - Evaluate representative tasks after model or application-prompt changes. Record effective model and reasoning settings without logging secrets or sensitive content; update affected configuration examples.
 
+## Sibling repositories (cross-repo access)
+
+TodeX lives in sibling checkouts under the same parent directory:
+
+- `../TodeX_desktop` — Electron desktop client (React + HeroUI, `src/renderer/`)
+- `../TodeX_web` — Web client (React + HeroUI, `src/renderer/`)
+
+When a task requires it — aligning the API contract in `docs/API.md` with client usage, tracing a request or payload end to end, or a change that explicitly spans repos — read and edit those sibling repositories directly at their paths, even though they sit outside this repository. Follow each repo's own `AGENTS.md` while working inside it. Commit and push in each repository separately per its Git delivery rules; never mix another repo's changes into this repository's commits.
+
 ## Git delivery
 
 - Do every complex task — anything beyond a parameter change or a few localized lines — in a dedicated Git worktree on its own branch, not in the main checkout, which may hold the user's uncommitted work. Give the worktree its own `CARGO_TARGET_DIR`; seeding it with an APFS clone (`cp -cR target/debug <dir>/debug`) keeps the first build incremental.
