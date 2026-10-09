@@ -21,6 +21,12 @@
 cd TodeX_backend && cargo run -- tui
 # 或非交互：cargo run -- serve --host 127.0.0.1 --port 7345
 
+# macOS 上 cargo run 会经 scripts/cargo-runner-macos.sh 用固定证书给
+# target/debug/todex-agentd 签名（标识符与发布一致），Computer Use 的
+# 屏幕录制/辅助功能授权才不会随每次重编译失效。证书用
+# export TODEX_DEV_SIGN_IDENTITY="<证书名或 SHA-1>" 指定（钥匙串里只有
+# 一个有效代码签名身份时可省略）；找不到则警告并以未签名运行。
+
 # Desktop（三栏）
 cd TodeX_desktop && pnpm run dev
 

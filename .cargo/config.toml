@@ -1,0 +1,7 @@
+# Sign the macOS dev binary on `cargo run` so Computer Use permissions persist;
+# see scripts/cargo-runner-macos.sh.
+[target.aarch64-apple-darwin]
+runner = "scripts/cargo-runner-macos.sh"
+
+[target.x86_64-apple-darwin]
+runner = "scripts/cargo-runner-macos.sh"
