@@ -1378,6 +1378,40 @@ mod tests {
     }
 
     #[test]
+    fn background_tasks_report_details_for_clients() {
+        let mut tasks = BackgroundTasks::default();
+        tasks.apply(&json!({
+            "subtype": "task_started", "task_id": "sh-1", "task_type": "local_bash",
+            "description": "Watch CI run", "tool_use_id": "toolu_1"
+        }));
+        tasks.apply(&json!({
+            "subtype": "task_progress", "task_id": "sh-1", "description": "Still watching CI"
+        }));
+        // Progress for an unknown task does not resurrect it.
+        tasks.apply(&json!({ "subtype": "task_progress", "task_id": "gone" }));
+
+        let listed = tasks.tasks();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["taskId"], "sh-1");
+        assert_eq!(listed[0]["description"], "Still watching CI");
+        assert_eq!(listed[0]["taskType"], "local_bash");
+        assert_eq!(listed[0]["toolUseId"], "toolu_1");
+        assert!(listed[0]["startedAt"].is_string());
+
+        // A replacement set keeps known details and takes new tasks' own.
+        tasks.apply(&json!({
+            "subtype": "background_tasks_changed",
+            "tasks": [{ "task_id": "sh-1" }, { "task_id": "ag-2", "description": "Review" }]
+        }));
+        let listed = tasks.tasks();
+        assert_eq!(listed[0]["description"], "Still watching CI");
+        assert_eq!(listed[1]["taskId"], "ag-2");
+        assert_eq!(listed[1]["description"], "Review");
+        assert!(listed[1].get("startedAt").is_none());
+        assert_eq!(tasks.ids(), [json!("sh-1"), json!("ag-2")]);
+    }
+
+    #[test]
     fn a_notification_owes_a_result_from_the_next_invocation() {
         let mut tasks = BackgroundTasks::default();
         assert!(!tasks.pending());
@@ -2154,7 +2188,10 @@ async fn run_claude_turn(
                         json!({
                             "provider": "claude-code",
                             "providerMethod": "background_tasks_pending",
-                            "metadata": { "taskIds": background_tasks.ids() },
+                            "metadata": {
+                                "taskIds": background_tasks.ids(),
+                                "tasks": background_tasks.tasks(),
+                            },
                         }),
                     )
                     .await?;
@@ -2666,13 +2703,53 @@ const MAX_EMPTY_RESULT_RESENDS: u32 = 3;
 /// queued, while waiting for a hand-back that already happened never ends.
 #[derive(Default)]
 struct BackgroundTasks {
-    live: HashSet<String>,
+    /// Live background tasks by task_id, with what clients show while the
+    /// turn only waits on them.
+    live: HashMap<String, BackgroundTaskInfo>,
     /// Main-session background tasks seen this turn. Tasks a subagent owns
     /// notify that subagent, not the main session, so they owe no follow-up.
     main: HashSet<String>,
     /// Notified main-session tasks (task_id → run_id) whose notification the
     /// model has not received yet.
     owed: HashMap<String, Option<String>>,
+}
+
+/// Display details from the frame that announced a background task.
+#[derive(Debug, Default)]
+struct BackgroundTaskInfo {
+    description: Option<String>,
+    task_type: Option<String>,
+    tool_use_id: Option<String>,
+    started_at: Option<String>,
+}
+
+impl BackgroundTaskInfo {
+    fn from_frame(frame: &Value, started_at: Option<String>) -> Self {
+        let text = |key: &str| {
+            frame
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        Self {
+            description: text("description"),
+            task_type: text("task_type"),
+            tool_use_id: text("tool_use_id"),
+            started_at,
+        }
+    }
+
+    /// Fills fields the earlier frame lacked; a later description wins since
+    /// `task_progress` refreshes it.
+    fn merge(&mut self, newer: Self) {
+        if newer.description.is_some() {
+            self.description = newer.description;
+        }
+        self.task_type = self.task_type.take().or(newer.task_type);
+        self.tool_use_id = self.tool_use_id.take().or(newer.tool_use_id);
+        self.started_at = self.started_at.take().or(newer.started_at);
+    }
 }
 
 impl BackgroundTasks {
@@ -2686,7 +2763,9 @@ impl BackgroundTasks {
                     return;
                 }
                 if let Some(id) = message.get("task_id").and_then(Value::as_str) {
-                    self.live.insert(id.to_owned());
+                    let info =
+                        BackgroundTaskInfo::from_frame(message, Some(Utc::now().to_rfc3339()));
+                    self.live.entry(id.to_owned()).or_default().merge(info);
                     if message.get("owned_by_subagent").and_then(Value::as_bool) != Some(true) {
                         self.main.insert(id.to_owned());
                     }
@@ -2701,14 +2780,26 @@ impl BackgroundTasks {
                     }
                 }
             }
+            Some("task_progress") => {
+                if let Some(info) = message
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.live.get_mut(id))
+                {
+                    info.merge(BackgroundTaskInfo::from_frame(message, None));
+                }
+            }
             Some("background_tasks_changed") => {
-                self.live.clear();
+                let mut previous = std::mem::take(&mut self.live);
                 if let Some(tasks) = message.get("tasks").and_then(Value::as_array) {
-                    self.live.extend(tasks.iter().filter_map(|task| {
-                        task.get("task_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    }));
+                    for task in tasks {
+                        let Some(id) = task.get("task_id").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let mut info = previous.remove(id).unwrap_or_default();
+                        info.merge(BackgroundTaskInfo::from_frame(task, None));
+                        self.live.insert(id.to_owned(), info);
+                    }
                 }
             }
             _ => {}
@@ -2756,9 +2847,42 @@ impl BackgroundTasks {
     }
 
     fn ids(&self) -> Vec<Value> {
-        self.live
-            .iter()
-            .map(|id| Value::String(id.clone()))
+        self.tasks()
+            .into_iter()
+            .filter_map(|task| task.get("taskId").cloned())
+            .collect()
+    }
+
+    /// Live tasks, oldest first, as `{ taskId, description?, taskType?,
+    /// toolUseId?, startedAt? }`.
+    fn tasks(&self) -> Vec<Value> {
+        let mut tasks = self.live.iter().collect::<Vec<_>>();
+        // RFC 3339 UTC strings from one clock sort chronologically; unknown
+        // start times go last.
+        tasks.sort_by(|(a_id, a), (b_id, b)| {
+            (a.started_at.is_none(), &a.started_at, a_id).cmp(&(
+                b.started_at.is_none(),
+                &b.started_at,
+                b_id,
+            ))
+        });
+        tasks
+            .into_iter()
+            .map(|(id, info)| {
+                let mut task = Map::new();
+                task.insert("taskId".to_owned(), json!(id));
+                for (key, value) in [
+                    ("description", &info.description),
+                    ("taskType", &info.task_type),
+                    ("toolUseId", &info.tool_use_id),
+                    ("startedAt", &info.started_at),
+                ] {
+                    if let Some(value) = value {
+                        task.insert(key.to_owned(), json!(value));
+                    }
+                }
+                Value::Object(task)
+            })
             .collect()
     }
 }
