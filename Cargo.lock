@@ -4385,6 +4385,7 @@ dependencies = [
  "global-hotkey",
  "hkdf",
  "hmac",
+ "iana-time-zone",
  "if-addrs",
  "jpeg-encoder",
  "json5",

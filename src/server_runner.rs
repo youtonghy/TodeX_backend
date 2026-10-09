@@ -19,6 +19,8 @@ pub struct ManagedServer {
     shutdown: Option<oneshot::Sender<()>>,
     handle: JoinHandle<Result<()>>,
     retention_task: Option<JoinHandle<()>>,
+    /// Runs due kanban task schedules.
+    kanban_schedule_task: Option<JoinHandle<()>>,
     migration_task: Option<JoinHandle<()>>,
     /// Journal segment conversion, v2 migration and backup cleanup.
     maintenance_task: Option<JoinHandle<()>>,
@@ -128,6 +130,7 @@ impl ManagedServer {
         let maintenance_task = Some(state.spawn_journal_maintenance());
         let legacy_scan_task = state.spawn_legacy_history_scan();
         let history_watch_task = Some(server::spawn_history_watch(state.clone()));
+        let kanban_schedule_task = Some(crate::kanban_scheduler::spawn(state.clone()));
 
         Ok(Self {
             config,
@@ -136,6 +139,7 @@ impl ManagedServer {
             shutdown: Some(shutdown_tx),
             handle,
             retention_task,
+            kanban_schedule_task,
             migration_task,
             maintenance_task,
             legacy_scan_task,
@@ -181,6 +185,9 @@ impl ManagedServer {
         if let Some(task) = self.retention_task.take() {
             task.abort();
         }
+        if let Some(task) = self.kanban_schedule_task.take() {
+            task.abort();
+        }
         self.state.conversations.shutdown_all().await;
         self.state.codex_local_adapters.shutdown_all().await;
         if let Some(shutdown) = self.shutdown.take() {
@@ -191,6 +198,9 @@ impl ManagedServer {
 
     pub async fn wait(mut self) -> Result<()> {
         if let Some(task) = self.retention_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.kanban_schedule_task.take() {
             task.abort();
         }
         let result = self.handle.await.context("server task join failed");

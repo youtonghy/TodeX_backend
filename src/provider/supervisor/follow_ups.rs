@@ -712,7 +712,7 @@ impl ConversationSupervisor {
         }
     }
 
-    fn is_shutting_down(&self) -> bool {
+    pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
     }
 

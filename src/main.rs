@@ -18,6 +18,7 @@ mod event;
 mod external_command;
 mod history_crypto;
 mod history_keys;
+mod kanban_scheduler;
 mod kanban_store;
 mod listen_addrs;
 mod local_terminal;

@@ -450,6 +450,7 @@ pub(super) async fn kanban_tasks(
     Ok(Json(KanbanTasksResponse {
         tasks: snapshot.tasks,
         updated_at: snapshot.updated_at,
+        time_zone: crate::kanban_scheduler::backend_time_zone(),
     }))
 }
 
@@ -466,6 +467,7 @@ pub(super) async fn replace_kanban_tasks(
     Ok(Json(KanbanTasksResponse {
         tasks: snapshot.tasks,
         updated_at: snapshot.updated_at,
+        time_zone: crate::kanban_scheduler::backend_time_zone(),
     }))
 }
 
@@ -3598,6 +3600,8 @@ pub(super) struct ReplaceKanbanTasksRequest {
 pub(super) struct KanbanTasksResponse {
     tasks: Vec<crate::kanban_store::KanbanTaskRecord>,
     updated_at: u64,
+    /// Zone task schedules' wall-clock `at` is interpreted in.
+    time_zone: crate::kanban_scheduler::BackendTimeZone,
 }
 
 #[derive(Debug, Deserialize)]

@@ -5,6 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
@@ -17,6 +18,13 @@ const KANBAN_TASK_TITLE_LIMIT: usize = 200;
 const KANBAN_TASK_DESCRIPTION_LIMIT: usize = 2000;
 const KANBAN_TASK_LIMIT_PER_TENANT: usize = 500;
 const KANBAN_TOMBSTONE_RETENTION_MILLIS: u64 = 30 * 24 * 60 * 60 * 1000;
+const KANBAN_CONVERSATION_LIMIT: usize = 100;
+const KANBAN_ID_LIMIT: usize = 128;
+const KANBAN_SCHEDULE_TEXT_LIMIT: usize = 20_000;
+const KANBAN_SCHEDULE_FIELD_LIMIT: usize = 200;
+const KANBAN_SCHEDULE_ERROR_LIMIT: usize = 500;
+/// `KanbanTaskSchedule::at` layout.
+pub const KANBAN_SCHEDULE_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -40,10 +48,98 @@ pub struct KanbanTaskRecord {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
+    /// Conversations started for the task, in display order; `conversationId`
+    /// mirrors the first one for clients that only know the single field.
+    /// Absent (not empty) from such clients, which then keep the stored list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_ids: Option<Vec<String>>,
+    /// Manual order within the workspace status group; opaque to the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<serde_json::Number>,
+    /// Timed start/send run by the backend scheduler (`kanban_scheduler`).
+    /// Clients cancel it through `status` rather than dropping the field, so
+    /// an absent schedule always means a client that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<KanbanTaskSchedule>,
     pub created_at: u64,
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KanbanScheduleAction {
+    /// Start a new conversation for the task and send `text` as its prompt.
+    Start,
+    /// Send `text` to the task's existing `conversationId`, queued behind a
+    /// running turn.
+    Send,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KanbanScheduleStatus {
+    Pending,
+    /// Claimed by the scheduler; only the backend sets it.
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl KanbanScheduleStatus {
+    /// States only the scheduler produces; a client write never replaces them.
+    fn backend_owned(self) -> bool {
+        matches!(self, Self::Running | Self::Done | Self::Failed)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KanbanTaskSchedule {
+    /// Client-chosen id; also the idempotency key of the prompt it sends.
+    pub id: String,
+    /// Wall-clock time in the backend's local time zone, `YYYY-MM-DDTHH:MM`.
+    pub at: String,
+    pub action: KanbanScheduleAction,
+    /// Backend conversation id the `send` action targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_mode: Option<String>,
+    pub status: KanbanScheduleStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fired_at: Option<u64>,
+    /// Conversation the run started or sent to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_conversation_id: Option<String>,
+    /// Turn the prompt started; absent when it was queued behind a running one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A pending schedule whose time has come, as reported by
+/// [`KanbanTaskStore::due_schedules`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DueKanbanSchedule {
+    pub tenant_id: String,
+    pub task_id: String,
+    pub schedule_id: String,
+    pub due_at: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -99,7 +195,11 @@ impl KanbanTaskStore {
             let key = (task.tenant_id.clone(), task.id.clone());
             match by_id.get(&key) {
                 Some(existing) if existing.updated_at > task.updated_at => {}
-                _ => {
+                Some(existing) => {
+                    let merged = merge_incoming(existing, task);
+                    by_id.insert(key, merged);
+                }
+                None => {
                     by_id.insert(key, task);
                 }
             }
@@ -121,6 +221,142 @@ impl KanbanTaskStore {
         drop(current);
         Ok(self.snapshot_owned(owner_id).await)
     }
+
+    /// Pending schedules of live tasks whose time is at or before `now`.
+    pub async fn due_schedules(&self, now: DateTime<Utc>) -> Vec<DueKanbanSchedule> {
+        let snapshot = self.inner.read().await;
+        snapshot
+            .tasks
+            .iter()
+            .filter(|task| task.deleted_at.is_none())
+            .filter_map(|task| {
+                let schedule = task.schedule.as_ref()?;
+                if schedule.status != KanbanScheduleStatus::Pending {
+                    return None;
+                }
+                let due_at = schedule_instant(&schedule.at)?;
+                (due_at <= now).then(|| DueKanbanSchedule {
+                    tenant_id: task.tenant_id.clone(),
+                    task_id: task.id.clone(),
+                    schedule_id: schedule.id.clone(),
+                    due_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Schedules a previous process claimed but never finished.
+    pub async fn running_schedules(&self) -> Vec<(String, String, String)> {
+        let snapshot = self.inner.read().await;
+        snapshot
+            .tasks
+            .iter()
+            .filter(|task| task.deleted_at.is_none())
+            .filter_map(|task| {
+                let schedule = task.schedule.as_ref()?;
+                (schedule.status == KanbanScheduleStatus::Running)
+                    .then(|| (task.tenant_id.clone(), task.id.clone(), schedule.id.clone()))
+            })
+            .collect()
+    }
+
+    /// Applies a scheduler-side change to the task carrying schedule
+    /// `schedule_id` and persists it when `update` reports a change. The
+    /// write gets an `updatedAt` newer than any copy a client could hold, so
+    /// it wins the next merge. Returns the updated task, or `None` when the
+    /// task is gone or carries another schedule by now.
+    pub async fn update_schedule<F>(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+        schedule_id: &str,
+        update: F,
+    ) -> Result<Option<KanbanTaskRecord>, AppError>
+    where
+        F: FnOnce(&mut KanbanTaskRecord) -> bool,
+    {
+        let mut current = self.inner.write().await;
+        let Some(index) = current.tasks.iter().position(|task| {
+            task.tenant_id == tenant_id
+                && task.id == task_id
+                && task.deleted_at.is_none()
+                && task
+                    .schedule
+                    .as_ref()
+                    .is_some_and(|schedule| schedule.id == schedule_id)
+        }) else {
+            return Ok(None);
+        };
+        let mut task = current.tasks[index].clone();
+        if !update(&mut task) {
+            return Ok(Some(task));
+        }
+        let now = now_millis();
+        task.updated_at = now.max(task.updated_at + 1);
+        let mut next = current.clone();
+        next.tasks[index] = task.clone();
+        next.updated_at = now;
+        write_snapshot(&self.path, &next).await?;
+        *current = next;
+        Ok(Some(task))
+    }
+}
+
+/// The instant `at` (backend local wall time) names. A time skipped by a DST
+/// jump runs an hour later; an ambiguous one at its first occurrence.
+pub fn schedule_instant(at: &str) -> Option<DateTime<Utc>> {
+    let naive = NaiveDateTime::parse_from_str(at, KANBAN_SCHEDULE_TIME_FORMAT).ok()?;
+    let local = Local.from_local_datetime(&naive).earliest().or_else(|| {
+        Local
+            .from_local_datetime(&(naive + chrono::Duration::hours(1)))
+            .earliest()
+    })?;
+    Some(local.with_timezone(&Utc))
+}
+
+/// Merges a client write that won on `updatedAt` into the stored record.
+/// Fields an older client does not know (absent conversation list, sort
+/// order, schedule) keep their stored value, and scheduler-owned schedule
+/// state is never rolled back by a client copy made before the run.
+fn merge_incoming(existing: &KanbanTaskRecord, mut task: KanbanTaskRecord) -> KanbanTaskRecord {
+    if task.conversation_ids.is_none() {
+        if let Some(stored) = &existing.conversation_ids {
+            let mut ids = stored.clone();
+            if let Some(id) = &task.conversation_id {
+                if !ids.contains(id) {
+                    ids.insert(0, id.clone());
+                }
+            }
+            task.conversation_ids = Some(ids);
+        }
+    }
+    if task.sort_order.is_none() {
+        task.sort_order = existing.sort_order.clone();
+    }
+    match (&existing.schedule, &task.schedule) {
+        (Some(stored), None) => task.schedule = Some(stored.clone()),
+        (Some(stored), Some(incoming))
+            if stored.status.backend_owned()
+                && (incoming.id == stored.id || stored.status == KanbanScheduleStatus::Running) =>
+        {
+            // The client never saw the run: keep its result, including the
+            // conversation the run started.
+            if incoming.id == stored.id && !incoming.status.backend_owned() {
+                if let Some(id) = &stored.result_conversation_id {
+                    let ids = task.conversation_ids.get_or_insert_with(Vec::new);
+                    if !ids.contains(id) {
+                        ids.push(id.clone());
+                    }
+                }
+            }
+            task.schedule = Some(stored.clone());
+        }
+        _ => {}
+    }
+    if let Some(ids) = &task.conversation_ids {
+        task.conversation_id = ids.first().cloned();
+    }
+    task
 }
 
 async fn load_snapshot(path: &Path) -> Result<KanbanTaskSnapshot, AppError> {
@@ -248,12 +484,94 @@ fn normalize_tasks(
             .conversation_id
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
+        if let Some(ids) = task.conversation_ids.take() {
+            let mut unique: Vec<String> = Vec::with_capacity(ids.len());
+            for id in ids {
+                let id = id.trim().to_owned();
+                if !id.is_empty() && !unique.contains(&id) {
+                    unique.push(id);
+                }
+            }
+            if unique.len() > KANBAN_CONVERSATION_LIMIT
+                || unique.iter().any(|id| id.len() > KANBAN_ID_LIMIT)
+            {
+                return Err(AppError::InvalidRequest(format!(
+                    "kanban task conversationIds must hold at most {KANBAN_CONVERSATION_LIMIT} ids of at most {KANBAN_ID_LIMIT} bytes"
+                )));
+            }
+            // An explicit empty list clears the conversations.
+            task.conversation_id = unique.first().cloned();
+            task.conversation_ids = Some(unique);
+        }
+        if let Some(schedule) = task.schedule.as_mut() {
+            normalize_schedule(schedule)?;
+        }
         if !owner_id.is_empty() {
             task.tenant_id = owner_id.to_owned();
         }
         normalized.push(task);
     }
     Ok(normalized)
+}
+
+fn normalize_schedule(schedule: &mut KanbanTaskSchedule) -> Result<(), AppError> {
+    let invalid = |message: &str| {
+        Err(AppError::InvalidRequest(format!(
+            "kanban task schedule {message}"
+        )))
+    };
+    schedule.id = schedule.id.trim().to_owned();
+    if schedule.id.is_empty()
+        || schedule.id.len() > KANBAN_ID_LIMIT
+        || !schedule
+            .id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return invalid("id must be 1-128 characters of [A-Za-z0-9_-]");
+    }
+    schedule.at = schedule.at.trim().to_owned();
+    if NaiveDateTime::parse_from_str(&schedule.at, KANBAN_SCHEDULE_TIME_FORMAT).is_err() {
+        return invalid("at must be YYYY-MM-DDTHH:MM");
+    }
+    schedule.text = schedule.text.trim().to_owned();
+    if schedule.text.is_empty() || schedule.text.chars().count() > KANBAN_SCHEDULE_TEXT_LIMIT {
+        return invalid(&format!(
+            "text must be 1-{KANBAN_SCHEDULE_TEXT_LIMIT} characters"
+        ));
+    }
+    for field in [
+        &mut schedule.conversation_id,
+        &mut schedule.provider,
+        &mut schedule.provider_profile,
+        &mut schedule.model,
+        &mut schedule.reasoning_effort,
+        &mut schedule.permission_mode,
+        &mut schedule.work_mode,
+        &mut schedule.result_conversation_id,
+        &mut schedule.turn_id,
+    ] {
+        *field = field
+            .take()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if field
+            .as_ref()
+            .is_some_and(|value| value.chars().count() > KANBAN_SCHEDULE_FIELD_LIMIT)
+        {
+            return invalid(&format!(
+                "fields must be at most {KANBAN_SCHEDULE_FIELD_LIMIT} characters"
+            ));
+        }
+    }
+    if schedule.action == KanbanScheduleAction::Send && schedule.conversation_id.is_none() {
+        return invalid("send needs a conversationId");
+    }
+    schedule.error = schedule
+        .error
+        .take()
+        .map(|value| value.chars().take(KANBAN_SCHEDULE_ERROR_LIMIT).collect());
+    Ok(())
 }
 
 fn is_valid_due_date(value: &str) -> bool {
@@ -310,6 +628,9 @@ mod tests {
             due_date: None,
             status: "planned".to_owned(),
             conversation_id: None,
+            conversation_ids: None,
+            sort_order: None,
+            schedule: None,
             created_at: updated_at,
             updated_at,
             deleted_at: None,
@@ -448,6 +769,150 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.snapshot_owned("other").await.tasks.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn schedule(id: &str, status: KanbanScheduleStatus) -> KanbanTaskSchedule {
+        KanbanTaskSchedule {
+            id: id.to_owned(),
+            at: "2026-10-09T09:30".to_owned(),
+            action: KanbanScheduleAction::Start,
+            conversation_id: None,
+            text: "do it".to_owned(),
+            provider: None,
+            provider_profile: None,
+            model: None,
+            reasoning_effort: None,
+            permission_mode: None,
+            work_mode: None,
+            status,
+            fired_at: None,
+            result_conversation_id: None,
+            turn_id: None,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn kanban_store_keeps_fields_older_clients_omit() {
+        let root = make_temp_dir("todex-kanban-legacy-client");
+        let store = KanbanTaskStore::new(root.clone()).await.unwrap();
+        let mut current = task("task-1", "t", 10);
+        current.conversation_ids = Some(vec!["c1".to_owned(), "c2".to_owned()]);
+        current.sort_order = Some(3.into());
+        current.schedule = Some(schedule("s1", KanbanScheduleStatus::Pending));
+        store.merge_owned("local", vec![current]).await.unwrap();
+
+        // A client that knows only `conversationId` renames the task.
+        let mut legacy = task("task-1", "renamed", 20);
+        legacy.conversation_id = Some("c1".to_owned());
+        let snapshot = store.merge_owned("local", vec![legacy]).await.unwrap();
+        let merged = &snapshot.tasks[0];
+        assert_eq!(merged.title, "renamed");
+        assert_eq!(
+            merged.conversation_ids,
+            Some(vec!["c1".to_owned(), "c2".to_owned()])
+        );
+        assert_eq!(merged.conversation_id.as_deref(), Some("c1"));
+        assert_eq!(merged.sort_order, Some(3.into()));
+        assert_eq!(merged.schedule.as_ref().unwrap().id, "s1");
+
+        // An explicit empty list clears the conversations.
+        let mut cleared = merged.clone();
+        cleared.updated_at = 30;
+        cleared.conversation_ids = Some(Vec::new());
+        let snapshot = store.merge_owned("local", vec![cleared]).await.unwrap();
+        assert_eq!(snapshot.tasks[0].conversation_ids, Some(Vec::new()));
+        assert_eq!(snapshot.tasks[0].conversation_id, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn kanban_store_never_rolls_back_a_schedule_run() {
+        let root = make_temp_dir("todex-kanban-schedule-merge");
+        let store = KanbanTaskStore::new(root.clone()).await.unwrap();
+        let mut pending = task("task-1", "t", 10);
+        pending.schedule = Some(schedule("s1", KanbanScheduleStatus::Pending));
+        store
+            .merge_owned("local", vec![pending.clone()])
+            .await
+            .unwrap();
+
+        store
+            .update_schedule("local", "task-1", "s1", |task| {
+                let schedule = task.schedule.as_mut().unwrap();
+                schedule.status = KanbanScheduleStatus::Done;
+                schedule.result_conversation_id = Some("conv_new".to_owned());
+                task.conversation_ids = Some(vec!["conv_new".to_owned()]);
+                true
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A client edit made before it saw the run, stamped later than it.
+        let mut stale = pending.clone();
+        stale.title = "edited".to_owned();
+        stale.updated_at = u64::MAX / 2;
+        let snapshot = store.merge_owned("local", vec![stale]).await.unwrap();
+        let merged = &snapshot.tasks[0];
+        assert_eq!(merged.title, "edited");
+        let kept = merged.schedule.as_ref().unwrap();
+        assert_eq!(kept.status, KanbanScheduleStatus::Done);
+        assert_eq!(kept.result_conversation_id.as_deref(), Some("conv_new"));
+        assert_eq!(merged.conversation_ids, Some(vec!["conv_new".to_owned()]));
+
+        // A new schedule replaces a finished one.
+        let mut next = merged.clone();
+        next.updated_at = u64::MAX / 2 + 1;
+        next.schedule = Some(schedule("s2", KanbanScheduleStatus::Pending));
+        let snapshot = store.merge_owned("local", vec![next]).await.unwrap();
+        assert_eq!(snapshot.tasks[0].schedule.as_ref().unwrap().id, "s2");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn kanban_store_reports_due_schedules_and_validates_them() {
+        let root = make_temp_dir("todex-kanban-due");
+        let store = KanbanTaskStore::new(root.clone()).await.unwrap();
+        let mut past = task("task-past", "t", 10);
+        past.schedule = Some(schedule("s-past", KanbanScheduleStatus::Pending));
+        let mut future = task("task-future", "t", 10);
+        let mut later = schedule("s-future", KanbanScheduleStatus::Pending);
+        later.at = "2999-01-01T00:00".to_owned();
+        future.schedule = Some(later);
+        let mut cancelled = task("task-cancelled", "t", 10);
+        cancelled.schedule = Some(schedule("s-cancelled", KanbanScheduleStatus::Cancelled));
+        store
+            .merge_owned("local", vec![past, future, cancelled])
+            .await
+            .unwrap();
+        let due = store.due_schedules(Utc::now()).await;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].schedule_id, "s-past");
+
+        for broken in [
+            KanbanTaskSchedule {
+                at: "2026-10-09 09:30".to_owned(),
+                ..schedule("s", KanbanScheduleStatus::Pending)
+            },
+            KanbanTaskSchedule {
+                id: "bad id".to_owned(),
+                ..schedule("s", KanbanScheduleStatus::Pending)
+            },
+            KanbanTaskSchedule {
+                text: "  ".to_owned(),
+                ..schedule("s", KanbanScheduleStatus::Pending)
+            },
+            KanbanTaskSchedule {
+                action: KanbanScheduleAction::Send,
+                ..schedule("s", KanbanScheduleStatus::Pending)
+            },
+        ] {
+            let mut record = task("task-broken", "t", 10);
+            record.schedule = Some(broken);
+            assert!(store.merge_owned("local", vec![record]).await.is_err());
+        }
         let _ = fs::remove_dir_all(root);
     }
 

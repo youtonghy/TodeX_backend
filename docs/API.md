@@ -428,14 +428,42 @@ PUT /v2/kanban/tasks
       "dueDate": "2026-10-01",
       "status": "planned",
       "conversationId": "conv_abc",
+      "conversationIds": ["conv_abc", "conv_def"],
+      "sortOrder": 0,
+      "schedule": {
+        "id": "sched-m9k3a0-x1y2z3",
+        "at": "2026-10-10T09:30",
+        "action": "start",
+        "text": "任务：Ship the release",
+        "provider": "codex",
+        "model": "gpt-5.5",
+        "permissionMode": "auto",
+        "workMode": "implement",
+        "status": "done",
+        "firedAt": 1700000003000,
+        "resultConversationId": "conv_def",
+        "turnId": "turn_123"
+      },
       "createdAt": 1700000000000,
       "updatedAt": 1700000001000,
       "deletedAt": null
     }
   ],
-  "updatedAt": 1700000002000
+  "updatedAt": 1700000002000,
+  "timeZone": { "name": "Asia/Shanghai", "offsetMinutes": 480 }
 }
 ```
+
+`conversationIds` 是任务名下新建的对话（顺序即显示顺序），`conversationId` 镜像第一项供只认单字段的旧客户端使用；推送时字段缺失表示客户端不认识它，后端保留已存的列表，显式的空数组才表示清空。`sortOrder` 缺失时同样保留原值。
+
+### 任务定时
+
+`schedule` 由后端调度器执行，客户端无需在线。`at` 是**后端本地时区**的墙上时间 `YYYY-MM-DDTHH:MM`，响应中的 `timeZone` 给出该时区（`name` 为 IANA 名称，平台未报告时省略；`offsetMinutes` 为当前 UTC 偏移）。DST 跳过的时刻顺延一小时，重复的时刻取第一次。
+
+- `action: "start"`：在任务所在工作区用 `provider`/`providerProfile`（缺省为 `[agent] default_agent`）新建对话并发送 `text`；`"send"`：把 `text` 发到 `conversationId`（后端对话 ID），对话正在运行时进入后端追加队列。`model`、`reasoningEffort`、`permissionMode`、`workMode` 是设定时由客户端快照的发送参数。
+- `status`：客户端只写 `pending`（新建，`id` 由客户端生成）或 `cancelled`（取消，不得删除字段，缺失会被视为不认识该字段的旧客户端）。`running`、`done`、`failed` 只由后端写入，客户端以更新的 `updatedAt` 提交同一 `id` 的旧副本也不会回滚它们；后端写入时把 `updatedAt` 推到最新。
+- 调度器约每 15 秒按墙上时间检查一次（机器休眠后仍会补跑）。执行前先置 `running` 并持久化；新建的对话 ID 在发送前写入 `resultConversationId` 并追加到 `conversationIds`。prompt 以 `kanban-<scheduleId>` 作为幂等键，后端重启后重跑不会重复发送；若重启时尚未记录新建的对话，则置 `failed` 而不冒险重复建对话。
+- 结果：`done` 带 `resultConversationId`，`turnId` 缺失表示已排在运行中的 turn 之后；`failed` 带 `error`。后端停机超过 24 小时才到点的计划不再执行，记为 `failed`（`missed: …`）。发送遵循普通 prompt 的前提：工作区已信任、存在历史接收者（否则 `HISTORY_KEY_REQUIRED`）、对话不是只读的旧明文历史。
 
 `PUT` 请求体使用同样的 `tasks` 数组，是合并而非全量替换：后端按 `(tenantId, id)` upsert，`updatedAt` 较新的记录胜出，同毫秒时采用提交方记录。`tenantId` 一律由后端覆盖为当前认证 owner，客户端伪造无效。
 
