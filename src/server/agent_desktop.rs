@@ -2,6 +2,7 @@
 //! on this host, plus per-conversation access, screenshots and the live
 //! frame. See [`crate::agent_desktop`] and [`crate::computer`].
 
+use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
@@ -11,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::app_state::AppState;
+use crate::computer::platform::Permission;
 use crate::error::AppError;
 
 use super::v2::require_auth;
@@ -22,6 +24,14 @@ struct SettingsRequest {
     enabled: Option<bool>,
     #[serde(default)]
     computer_enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PermissionRequest {
+    /// `screen` or `accessibility`; absent requests every missing one.
+    #[serde(default)]
+    permission: Option<Permission>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,18 +158,28 @@ async fn set_settings(
     Ok(Json(settings_view(&state).await))
 }
 
-/// Shows the OS permission prompts on this host (Screen Recording,
-/// Accessibility) for what is missing.
+/// Shows the OS permission prompt on this host for one permission (Screen
+/// Recording or Accessibility), or for each missing one when none is named.
 async fn request_computer_permissions(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<Value>, AppError> {
     require_auth(&state, &headers)?;
+    let which = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<PermissionRequest>(&body)
+            .map_err(|error| {
+                AppError::InvalidRequest(format!("invalid permission request: {error}"))
+            })?
+            .permission
+    };
     state
         .agent_desktop
         .computer()
         .host()
-        .request_permissions()
+        .request_permissions(which)
         .await;
     Ok(Json(settings_view(&state).await))
 }

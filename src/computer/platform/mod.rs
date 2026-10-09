@@ -35,7 +35,7 @@ mod linux_desktop;
 #[cfg(any(target_os = "windows", test))]
 mod windows_names;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // Hooks only the Linux layer needs (KDE Wayland); no-ops elsewhere.
 
@@ -81,6 +81,23 @@ pub(crate) struct Permissions {
 impl Permissions {
     pub(crate) fn all(self) -> bool {
         self.screen && self.accessibility
+    }
+}
+
+/// One of the [`Permissions`], for asking the person at the host for it
+/// alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum Permission {
+    Screen,
+    Accessibility,
+}
+
+impl Permission {
+    /// Whether a request for `which` (`None`: every permission) covers `self`.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    pub(crate) fn requested(self, which: Option<Permission>) -> bool {
+        which.is_none_or(|which| which == self)
     }
 }
 
@@ -218,5 +235,15 @@ mod tests {
         // The user was active before our click and nothing since.
         assert_eq!(user_idle(5.0, 1.0, 0.9, 0.5), 5.0);
         assert_eq!(user_idle(f64::INFINITY, 1.0, 0.9, 0.5), f64::INFINITY);
+    }
+
+    #[test]
+    fn a_request_covers_only_the_named_permission() {
+        assert!(Permission::Screen.requested(None));
+        assert!(Permission::Accessibility.requested(None));
+        assert!(Permission::Screen.requested(Some(Permission::Screen)));
+        assert!(!Permission::Accessibility.requested(Some(Permission::Screen)));
+        let named: Permission = serde_json::from_str("\"accessibility\"").unwrap();
+        assert_eq!(named, Permission::Accessibility);
     }
 }

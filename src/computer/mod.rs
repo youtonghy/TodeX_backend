@@ -97,7 +97,8 @@ pub(crate) struct ComputerStatus {
 #[async_trait]
 pub(crate) trait ComputerHost: Send + Sync {
     fn status(&self) -> ComputerStatus;
-    async fn request_permissions(&self) -> ComputerStatus;
+    /// `which`: one permission, or `None` for every missing one.
+    async fn request_permissions(&self, which: Option<platform::Permission>) -> ComputerStatus;
     /// Asks the person at this computer: their answer, `Ok(None)` when
     /// nobody can be asked (no host UI or dialog tool), `Err` when asking
     /// failed.
@@ -236,9 +237,11 @@ impl ComputerHost for NativeComputer {
         }
     }
 
-    async fn request_permissions(&self) -> ComputerStatus {
+    async fn request_permissions(&self, which: Option<platform::Permission>) -> ComputerStatus {
         if platform::unsupported_reason().is_none() {
-            if let Err(error) = tokio::task::spawn_blocking(platform::request_permissions).await {
+            if let Err(error) =
+                tokio::task::spawn_blocking(move || platform::request_permissions(which)).await
+            {
                 tracing::warn!(%error, "requesting Computer Use permissions failed");
             }
         }

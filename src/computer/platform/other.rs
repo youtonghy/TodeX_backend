@@ -2,7 +2,7 @@
 
 use xa11y::ElementData;
 
-use super::{Display, Permissions, Typed};
+use super::{Display, Permission, Permissions, Typed};
 use crate::computer::{
     keys::Chord,
     policy::{StackWindow, Target},
@@ -21,7 +21,7 @@ pub(crate) fn permissions() -> Permissions {
     Permissions::default()
 }
 
-pub(crate) fn request_permissions() -> Permissions {
+pub(crate) fn request_permissions(_which: Option<Permission>) -> Permissions {
     permissions()
 }
 

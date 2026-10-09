@@ -1308,7 +1308,10 @@ mod tests {
             }
         }
 
-        async fn request_permissions(&self) -> crate::computer::ComputerStatus {
+        async fn request_permissions(
+            &self,
+            _which: Option<crate::computer::platform::Permission>,
+        ) -> crate::computer::ComputerStatus {
             self.status()
         }
 

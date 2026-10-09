@@ -51,7 +51,7 @@ use super::{
         desktop_id, exe_name, names_app, parse_desktop_entry, parse_xft_dpi, scale_from_dpi,
         session_kind, session_problem, DesktopEntry, Session,
     },
-    Display, Permissions, Typed,
+    Display, Permission, Permissions, Typed,
 };
 use crate::computer::{
     keys::Chord,
@@ -144,13 +144,15 @@ pub(crate) fn missing_permissions_reason(permissions: Permissions) -> String {
 /// On KDE Wayland also installs the screenshot authorization and asks for
 /// remote control of the pointer and keyboard (KDE's consent dialog), so
 /// later sessions start without prompts.
-pub(crate) fn request_permissions() -> Permissions {
-    if let Some(proxy) = a11y_status_proxy() {
-        if let Err(error) = proxy.set_property("IsEnabled", true) {
-            eprintln!("todex-agentd: could not enable AT-SPI: {error}");
+pub(crate) fn request_permissions(which: Option<Permission>) -> Permissions {
+    if Permission::Accessibility.requested(which) {
+        if let Some(proxy) = a11y_status_proxy() {
+            if let Err(error) = proxy.set_property("IsEnabled", true) {
+                eprintln!("todex-agentd: could not enable AT-SPI: {error}");
+            }
         }
     }
-    if kde_wayland_session() {
+    if Permission::Screen.requested(which) && kde_wayland_session() {
         if let Err(error) = kde_wayland::ensure_identity() {
             eprintln!("todex-agentd: could not install the KDE screenshot authorization: {error}");
         }

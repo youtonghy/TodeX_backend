@@ -76,7 +76,7 @@ use super::{
         exe_file_name, exe_id, exe_stem, idle_from_ticks, looks_like_password, names_app,
         session_problem, unquote,
     },
-    Display, Permissions, Typed,
+    Display, Permission, Permissions, Typed,
 };
 use crate::computer::{
     keys::Chord,
@@ -136,7 +136,7 @@ pub(crate) fn permissions() -> Permissions {
     }
 }
 
-pub(crate) fn request_permissions() -> Permissions {
+pub(crate) fn request_permissions(_which: Option<Permission>) -> Permissions {
     permissions()
 }
 

@@ -18,7 +18,7 @@ use core_foundation::{
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
 use xa11y::{input::Key, ElementData};
 
-use super::{Display, Permissions, Typed};
+use super::{Display, Permission, Permissions, Typed};
 use crate::computer::{
     keys::Chord,
     policy::{StackWindow, Target},
@@ -194,21 +194,40 @@ pub(crate) fn permissions() -> Permissions {
     }
 }
 
-/// Shows the system prompts for what is missing.
-pub(crate) fn request_permissions() -> Permissions {
+/// Shows the system prompt for each requested permission that is missing.
+/// macOS asks once per identity: after an answer, or a dismissed prompt,
+/// the request calls do nothing, so a permission still missing afterwards
+/// also opens its pane in System Settings.
+pub(crate) fn request_permissions(which: Option<Permission>) -> Permissions {
     let current = permissions();
     // SAFETY: the options dictionary lives across the call.
     unsafe {
-        if !current.accessibility {
+        if Permission::Accessibility.requested(which) && !current.accessibility {
             let key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
             let options = CFDictionary::from_CFType_pairs(&[(key, CFBoolean::true_value())]);
             AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef());
         }
-        if !current.screen {
+        if Permission::Screen.requested(which) && !current.screen {
             CGRequestScreenCaptureAccess();
         }
     }
-    permissions()
+    let after = permissions();
+    if Permission::Accessibility.requested(which) && !after.accessibility {
+        open_privacy_pane("Privacy_Accessibility");
+    }
+    if Permission::Screen.requested(which) && !after.screen {
+        open_privacy_pane("Privacy_ScreenCapture");
+    }
+    after
+}
+
+fn open_privacy_pane(anchor: &str) {
+    let url = format!("x-apple.systempreferences:com.apple.preference.security?{anchor}");
+    match Command::new("open").arg(url).status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("todex-agentd: open System Settings ({anchor}) failed: {status}"),
+        Err(error) => eprintln!("todex-agentd: could not open System Settings ({anchor}): {error}"),
+    }
 }
 
 /// Seconds since the user last touched the mouse or keyboard. Events this
