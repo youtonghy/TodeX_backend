@@ -1396,6 +1396,36 @@ mod tests {
         tasks.apply(&json!({ "subtype": "init" }));
         assert!(!tasks.pending());
 
+        // A notification the model already received in the same invocation
+        // (replayed user message) owes no follow-up; one still queued does.
+        for (id, run) in [("b1", "run-b1"), ("c1", "run-c1"), ("d1", "run-d1")] {
+            tasks.apply(
+                &json!({ "subtype": "task_started", "task_id": id, "run_id": run,
+                "is_backgrounded": true }),
+            );
+            tasks.apply(&json!({ "subtype": "task_notification", "task_id": id, "run_id": run }));
+        }
+        tasks.delivered(&json!({ "type": "user", "isReplay": true,
+            "origin": { "kind": "task-notification", "runId": "run-b1" },
+            "message": { "role": "user", "content": "<task-notification>\n<task-id>b1</task-id>\n</task-notification>" } }));
+        assert!(tasks.pending());
+        // Matched by the task id in the content when the run id is absent.
+        tasks.delivered(
+            &json!({ "type": "user", "origin": { "kind": "task-notification" },
+            "message": { "role": "user", "content": [{ "type": "text",
+                "text": "<task-notification>\n<task-id>c1</task-id>\n</task-notification>" }] } }),
+        );
+        assert!(tasks.pending());
+        // Ordinary user messages never settle a notification.
+        tasks.delivered(&json!({ "type": "user",
+            "message": { "role": "user", "content": "<task-id>d1</task-id>" } }));
+        assert!(tasks.pending());
+        tasks.delivered(
+            &json!({ "type": "user", "origin": { "kind": "task-notification", "runId": "run-d1" },
+            "message": { "role": "user", "content": "" } }),
+        );
+        assert!(!tasks.pending());
+
         // A subagent's own tasks report back to that subagent; foreground
         // tasks were never tracked.
         tasks.apply(&json!({ "subtype": "task_started", "task_id": "sub",
@@ -2186,6 +2216,7 @@ async fn run_claude_turn(
                 }
             }
             Some("user") => {
+                background_tasks.delivered(&message);
                 let subagent = message.get("parent_tool_use_id").and_then(Value::as_str);
                 for block in content_blocks(&message, "tool_result") {
                     if let Some(id) = tools.complete(block, subagent) {
@@ -2626,17 +2657,22 @@ const MAX_EMPTY_RESULT_RESENDS: u32 = 3;
 /// task after the change".
 ///
 /// An empty set is not enough to end the turn. Claude emits
-/// `task_notification` as soon as a task finishes, even mid-invocation, but
-/// only answers it in a follow-up invocation that starts (with `system/init`)
-/// after the current `result`. `followup_owed` covers that gap; ending on the
-/// earlier `result` kills the process with the hand-back still queued.
+/// `task_notification` as soon as a task finishes, even mid-invocation, and
+/// hands the notification to the model either later in the same invocation
+/// (replayed as a user message with `origin.kind == "task-notification"`) or
+/// in a follow-up invocation that starts (with `system/init`) after the
+/// current `result`. `owed` holds notified tasks not handed over yet; ending
+/// on the earlier `result` would kill the process with the hand-back still
+/// queued, while waiting for a hand-back that already happened never ends.
 #[derive(Default)]
 struct BackgroundTasks {
     live: HashSet<String>,
     /// Main-session background tasks seen this turn. Tasks a subagent owns
     /// notify that subagent, not the main session, so they owe no follow-up.
     main: HashSet<String>,
-    followup_owed: bool,
+    /// Notified main-session tasks (task_id → run_id) whose notification the
+    /// model has not received yet.
+    owed: HashMap<String, Option<String>>,
 }
 
 impl BackgroundTasks {
@@ -2644,7 +2680,7 @@ impl BackgroundTasks {
         match message.get("subtype").and_then(Value::as_str) {
             // Each invocation starts with `init`, after it has taken the
             // queued notifications.
-            Some("init") => self.followup_owed = false,
+            Some("init") => self.owed.clear(),
             Some("task_started") => {
                 if message.get("is_backgrounded").and_then(Value::as_bool) == Some(false) {
                     return;
@@ -2660,7 +2696,8 @@ impl BackgroundTasks {
                 if let Some(id) = message.get("task_id").and_then(Value::as_str) {
                     self.live.remove(id);
                     if self.main.contains(id) {
-                        self.followup_owed = true;
+                        let run_id = message.get("run_id").and_then(Value::as_str);
+                        self.owed.insert(id.to_owned(), run_id.map(str::to_owned));
                     }
                 }
             }
@@ -2678,9 +2715,44 @@ impl BackgroundTasks {
         }
     }
 
+    /// A replayed user message delivering task notifications to the model in
+    /// the current invocation: those tasks owe no follow-up invocation.
+    fn delivered(&mut self, message: &Value) {
+        let origin = message.get("origin");
+        if origin
+            .and_then(|origin| origin.get("kind"))
+            .and_then(Value::as_str)
+            != Some("task-notification")
+        {
+            return;
+        }
+        if let Some(run_id) = origin
+            .and_then(|origin| origin.get("runId"))
+            .and_then(Value::as_str)
+        {
+            self.owed
+                .retain(|_, owed_run| owed_run.as_deref() != Some(run_id));
+        }
+        // The content names each delivered task as `<task-id>…</task-id>`.
+        let text = match message.pointer("/message/content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        for part in text.split("<task-id>").skip(1) {
+            if let Some((id, _)) = part.split_once("</task-id>") {
+                self.owed.remove(id.trim());
+            }
+        }
+    }
+
     /// Whether Claude will still produce another `result` in this turn.
     fn pending(&self) -> bool {
-        self.followup_owed || !self.live.is_empty()
+        !self.owed.is_empty() || !self.live.is_empty()
     }
 
     fn ids(&self) -> Vec<Value> {
