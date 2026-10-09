@@ -21,6 +21,7 @@
 //! the provider's environment, so per-conversation grants are a guard
 //! against agents acting unasked, not a security boundary.
 
+mod agy_hook;
 mod authorizer;
 mod bridge;
 mod desktop_computer;
@@ -45,6 +46,7 @@ use crate::{
     ssh::SshService,
 };
 
+pub(crate) use agy_hook::run_hook as run_agy_hook;
 use authorizer::{Authorizer, AuthorizerState, ToolMode};
 pub(crate) use bridge::run_bridge;
 
@@ -52,7 +54,9 @@ pub(crate) use bridge::run_bridge;
 pub(crate) fn routes(
     state: &crate::app_state::AppState,
 ) -> axum::Router<crate::app_state::AppState> {
-    server::routes(state).merge(desktop_server::routes(state))
+    server::routes(state)
+        .merge(desktop_server::routes(state))
+        .merge(agy_hook::routes())
 }
 
 /// MCP server name the agents see; tools appear as e.g. `todex_ssh.ssh_exec`.
@@ -73,6 +77,17 @@ pub(crate) const LEGACY_TOKEN_ENV: &str = "TODEX_SSH_MCP_TOKEN";
 /// connection setup.
 const SSH_TOOL_TIMEOUT_SECONDS: u64 =
     authorizer::CONFIRM_TIMEOUT.as_secs() + server::MAX_TIMEOUT_SECONDS + 60;
+/// For providers whose MCP servers and hooks come from one static global
+/// config (Antigravity): the daemon's base URL and the routes enabled for
+/// the turn, passed in the provider's environment; each static entry names
+/// its route with `--route`.
+pub(crate) const ENDPOINT_ENV: &str = "TODEX_AGENT_MCP_ENDPOINT";
+pub(crate) const ROUTES_ENV: &str = "TODEX_AGENT_MCP_ROUTES";
+/// Bridge argument naming the route of a static config entry.
+pub(crate) const ROUTE_ARG: &str = "--route";
+/// Hidden subcommand an Antigravity `PreToolUse` hook runs; see [`agy_hook`].
+pub(crate) const AGY_HOOK_SUBCOMMAND: &str = "agy-hook";
+pub(crate) const AGY_HOOK_ROUTE: &str = "/internal/agent-mcp/agy-permission";
 pub(crate) const DESKTOP_SERVER: &str = "todex_desktop";
 pub(crate) const DESKTOP_ROUTE: &str = "/internal/agent-mcp/desktop";
 const STATE_DIR: &str = "agent-mcp";
@@ -92,6 +107,9 @@ struct Inner {
     /// Claude config file once nothing needs it.
     sessions: Mutex<HashMap<String, Sessions>>,
     authorizer: Arc<AuthorizerState>,
+    /// conversation id → the running turn's (permission mode, work mode),
+    /// for gates that tell `auto` and `full-access` apart.
+    turn_modes: Mutex<HashMap<String, (String, String)>>,
     /// `http://<loopback>:<port>`, set once bound.
     endpoint: OnceLock<String>,
     /// The bridge binary; `None` disables injection.
@@ -141,6 +159,7 @@ impl AgentMcp {
                 tokens: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
                 authorizer: Arc::new(AuthorizerState::default()),
+                turn_modes: Mutex::new(HashMap::new()),
                 endpoint: OnceLock::new(),
                 bridge_command,
                 state_dir,
@@ -212,12 +231,29 @@ impl AgentMcp {
             conversation_id,
             ToolMode::from_turn(permission_mode, work_mode),
         );
+        self.turn_modes().insert(
+            conversation_id.to_owned(),
+            (permission_mode.to_owned(), work_mode.to_owned()),
+        );
+    }
+
+    /// The running turn's (permission mode, work mode); `None` between turns.
+    pub(crate) fn turn_mode(&self, conversation_id: &str) -> Option<(String, String)> {
+        self.turn_modes().get(conversation_id).cloned()
+    }
+
+    fn turn_modes(&self) -> std::sync::MutexGuard<'_, HashMap<String, (String, String)>> {
+        self.inner
+            .turn_modes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The conversation's turn ended (completed, failed or cancelled): its
     /// side-effect tools ask again until the next turn records its mode.
     pub(crate) fn end_turn_mode(&self, conversation_id: &str) {
         self.inner.authorizer.clear_mode(conversation_id);
+        self.turn_modes().remove(conversation_id);
     }
 
     #[cfg(test)]
@@ -296,6 +332,39 @@ impl AgentMcp {
     /// The MCP servers to inject for `conversation_id`, or `None` when no
     /// server is enabled (or the endpoint is unavailable).
     pub(crate) async fn launch(&self, conversation_id: &str) -> Option<AgentMcpLaunch> {
+        let enabled = self.enabled_servers().await;
+        if enabled.is_empty() {
+            return None;
+        }
+        self.launch_servers(conversation_id, enabled)
+    }
+
+    /// For a provider reading TodeX's servers and approval hook from a static
+    /// global config: the enabled servers (possibly none) plus the variables
+    /// that point the static entries at this conversation. `None` only when
+    /// the endpoint or the daemon executable is unavailable.
+    pub(crate) async fn launch_global(&self, conversation_id: &str) -> Option<AgentMcpLaunch> {
+        let enabled = self.enabled_servers().await;
+        let mut launch = self.launch_servers(conversation_id, enabled)?;
+        let endpoint = self.inner.endpoint.get()?.clone();
+        let routes = launch
+            .servers
+            .iter()
+            .map(|server| server.route)
+            .collect::<Vec<_>>()
+            .join(",");
+        launch.global = Some(GlobalLaunch {
+            daemon: self.inner.bridge_command.clone()?,
+            env: vec![
+                (ENDPOINT_ENV.to_owned(), endpoint),
+                (TOKEN_ENV.to_owned(), self.token_for(conversation_id)),
+                (ROUTES_ENV.to_owned(), routes),
+            ],
+        });
+        Some(launch)
+    }
+
+    async fn enabled_servers(&self) -> Vec<(&'static str, &'static str, u64)> {
         let mut enabled = Vec::new();
         if self.inner.ssh.has_agent_hosts().await {
             enabled.push((SSH_SERVER, SSH_ROUTE, SSH_TOOL_TIMEOUT_SECONDS));
@@ -307,9 +376,14 @@ impl AgentMcp {
                 desktop_server::PROVIDER_TOOL_TIMEOUT_SECONDS,
             ));
         }
-        if enabled.is_empty() {
-            return None;
-        }
+        enabled
+    }
+
+    fn launch_servers(
+        &self,
+        conversation_id: &str,
+        enabled: Vec<(&'static str, &'static str, u64)>,
+    ) -> Option<AgentMcpLaunch> {
         let endpoint = self.inner.endpoint.get()?;
         let command = self.inner.bridge_command.clone()?;
         let token = self.token_for(conversation_id);
@@ -322,6 +396,7 @@ impl AgentMcp {
                 .into_iter()
                 .map(|(name, route, tool_timeout_seconds)| AgentMcpServer {
                     name,
+                    route,
                     command: command.clone(),
                     env: vec![
                         (URL_ENV.to_owned(), format!("{endpoint}{route}")),
@@ -331,6 +406,7 @@ impl AgentMcp {
                 })
                 .collect(),
             config_file: self.claude_config_path(conversation_id),
+            global: None,
         })
     }
 
@@ -363,6 +439,7 @@ impl AgentMcp {
     pub(crate) async fn revoke(&self, conversation_id: &str) {
         self.inner.desktop.forget(conversation_id).await;
         self.inner.authorizer.forget(conversation_id);
+        self.turn_modes().remove(conversation_id);
         self.inner
             .tokens
             .lock()
@@ -413,6 +490,8 @@ fn file_key(conversation_id: &str) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentMcpServer {
     pub name: &'static str,
+    /// The daemon route the bridge relays to.
+    pub(crate) route: &'static str,
     pub command: PathBuf,
     pub env: Vec<(String, String)>,
     /// How long the provider waits for one tool call.
@@ -432,6 +511,17 @@ pub struct AgentMcpLaunch {
     /// Owner-only file for providers that read their MCP config from disk
     /// (removed on [`AgentMcp::revoke`]).
     pub(crate) config_file: PathBuf,
+    /// Set by [`AgentMcp::launch_global`].
+    pub(crate) global: Option<GlobalLaunch>,
+}
+
+/// What a provider with a static global config of TodeX's servers and hook
+/// needs per turn: the executable those entries run, and the variables its
+/// process must carry so they reach this conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlobalLaunch {
+    pub(crate) daemon: PathBuf,
+    pub(crate) env: Vec<(String, String)>,
 }
 
 #[cfg(test)]

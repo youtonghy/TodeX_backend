@@ -25,6 +25,10 @@ pub enum McpInjection {
     AcpServers,
     /// Claude Code `--mcp-config` file plus `--allowedTools`.
     ClaudeArgs,
+    /// Static entries in the provider's global config (Antigravity
+    /// `mcp_config.json`, plus its approval hook) pointed at the
+    /// conversation through the provider process's environment.
+    GlobalConfigEnv,
 }
 
 /// How selected skills reach the provider.

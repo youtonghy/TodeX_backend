@@ -1,6 +1,12 @@
 //! `todex-agentd agent-mcp-bridge`: a stdio MCP server for agents that
 //! relays every JSON-RPC message, unchanged, to one of the daemon's
 //! Streamable HTTP endpoints and back. Tools live only in the daemon.
+//!
+//! With `--route`, the bridge runs from a static global config entry
+//! (Antigravity): the daemon URL, token and the routes enabled for the turn
+//! come from the provider's environment. Started outside a TodeX turn, or
+//! for a route the turn did not enable, it serves no tools instead of
+//! failing, so the agent's own sessions are unaffected.
 
 use rmcp::{
     transport::{
@@ -9,16 +15,35 @@ use rmcp::{
     },
     RoleServer,
 };
+use serde_json::{json, Value};
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     sync::mpsc,
 };
 
-use super::{LEGACY_TOKEN_ENV, LEGACY_URL_ENV, TOKEN_ENV, URL_ENV};
+use super::{ENDPOINT_ENV, LEGACY_TOKEN_ENV, LEGACY_URL_ENV, ROUTES_ENV, TOKEN_ENV, URL_ENV};
 
 /// Runs the bridge on stdin/stdout. stdout carries the protocol, so errors
 /// are returned for `main` to print on stderr with a non-zero exit status.
-pub(crate) async fn run_bridge() -> anyhow::Result<()> {
+pub(crate) async fn run_bridge(route: Option<String>) -> anyhow::Result<()> {
+    if let Some(route) = route {
+        let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+        let enabled =
+            env(ROUTES_ENV).is_some_and(|routes| routes.split(',').any(|enabled| enabled == route));
+        return match (env(ENDPOINT_ENV), env(TOKEN_ENV)) {
+            (Some(endpoint), Some(token)) if enabled => {
+                proxy(
+                    &format!("{endpoint}{route}"),
+                    &token,
+                    tokio::io::stdin(),
+                    tokio::io::stdout(),
+                )
+                .await?;
+                Ok(())
+            }
+            _ => Ok(serve_inert(BufReader::new(tokio::io::stdin()), tokio::io::stdout()).await?),
+        };
+    }
     let var = |name: &str, legacy: &str| {
         std::env::var(name)
             .or_else(|_| std::env::var(legacy))
@@ -121,4 +146,76 @@ where
     }
     let _ = agent.close().await;
     outcome
+}
+
+/// An MCP server without tools, for a static config entry started where it
+/// has nothing to relay to. Answers the handshake and listings, rejects
+/// everything else, and ends with the agent's stdin.
+pub(crate) async fn serve_inert<R, W>(reader: R, mut writer: W) -> std::io::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await? {
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        // Notifications get no answer.
+        let Some(id) = message.get("id").filter(|id| !id.is_null()).cloned() else {
+            continue;
+        };
+        let reply = match message.get("method").and_then(Value::as_str) {
+            Some("initialize") => json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "protocolVersion": message
+                    .pointer("/params/protocolVersion")
+                    .cloned()
+                    .unwrap_or_else(|| json!("2025-06-18")),
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "todex", "version": crate::version::APP_VERSION },
+                "instructions": "TodeX tools are only available in conversations TodeX runs.",
+            }}),
+            Some("tools/list") => json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": [] } }),
+            Some("ping") => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            _ => json!({ "jsonrpc": "2.0", "id": id, "error": {
+                "code": -32601,
+                "message": "TodeX tools are only available in conversations TodeX runs",
+            }}),
+        };
+        let mut bytes = serde_json::to_vec(&reply)?;
+        bytes.push(b'\n');
+        writer.write_all(&bytes).await?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod inert_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_inert_server_lists_no_tools_and_rejects_the_rest() {
+        let input = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ssh_exec"}}"#,
+        ]
+        .join("\n");
+        let mut output = Vec::new();
+        serve_inert(input.as_bytes(), &mut output).await.unwrap();
+        let replies: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 4);
+        assert_eq!(replies[0]["error"]["code"], -32601);
+        assert_eq!(replies[1]["result"]["protocolVersion"], "2025-11-25");
+        assert_eq!(replies[2]["result"]["tools"], json!([]));
+        assert_eq!(replies[3]["id"], 4);
+        assert!(replies[3]["error"].is_object());
+    }
 }

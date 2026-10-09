@@ -186,6 +186,7 @@ async fn agent_mcp_injection_matrix_is_frozen() {
             McpInjection::CodexConfig => Some("codex-config"),
             McpInjection::AcpServers => Some("acp-servers"),
             McpInjection::ClaudeArgs => Some("claude-args"),
+            McpInjection::GlobalConfigEnv => Some("global-config-env"),
         };
         assert_eq!(declared, format, "{provider:?}");
     }

@@ -93,27 +93,9 @@ pub(super) async fn guard(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let loopback = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .is_some_and(|ConnectInfo(peer)| peer.ip().to_canonical().is_loopback());
-    // Browsers always send `Origin` on cross-origin POSTs; agents never do.
-    if !loopback || request.headers().contains_key(header::ORIGIN) {
-        return (StatusCode::FORBIDDEN, "local agents only").into_response();
-    }
-    let caller = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .and_then(|token| state.agent_mcp.authenticate(token.trim()));
-    let Some(conversation_id) = caller else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            "invalid agent token",
-        )
-            .into_response();
+    let conversation_id = match local_caller(&state, &request) {
+        Ok(conversation_id) => conversation_id,
+        Err(response) => return *response,
     };
     // Streamable HTTP: only `initialize` is posted without a session id.
     let has_session = request.headers().contains_key("mcp-session-id");
@@ -131,6 +113,36 @@ pub(super) async fn guard(
         }
     }
     response
+}
+
+/// The conversation of a local, non-browser caller presenting its token.
+pub(super) fn local_caller(state: &AppState, request: &Request) -> Result<String, Box<Response>> {
+    let loopback = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|ConnectInfo(peer)| peer.ip().to_canonical().is_loopback());
+    // Browsers always send `Origin` on cross-origin POSTs; agents never do.
+    if !loopback || request.headers().contains_key(header::ORIGIN) {
+        return Err(Box::new(
+            (StatusCode::FORBIDDEN, "local agents only").into_response(),
+        ));
+    }
+    request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(|token| state.agent_mcp.authenticate(token.trim()))
+        .ok_or_else(|| {
+            Box::new(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::WWW_AUTHENTICATE, "Bearer")],
+                    "invalid agent token",
+                )
+                    .into_response(),
+            )
+        })
 }
 
 #[derive(Clone)]
@@ -1007,6 +1019,57 @@ exit 3
             .serve((read, write))
             .await
             .unwrap()
+    }
+
+    /// Antigravity opens with the MCP 2026 `server/discover` before
+    /// `initialize`; each request must get an answer through the bridge,
+    /// or agy waits on the server for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bridge_answers_a_discover_first_handshake() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let harness = harness().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::loopback_test_router(harness.state.clone());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let (client_side, bridge_side) = tokio::io::duplex(1 << 20);
+        let (bridge_read, bridge_write) = tokio::io::split(bridge_side);
+        let url = format!("http://{addr}{ROUTE}");
+        let token = harness.token.clone();
+        tokio::spawn(async move {
+            let _ = super::super::bridge::proxy(&url, &token, bridge_read, bridge_write).await;
+        });
+        let (read, mut write) = tokio::io::split(client_side);
+        let mut lines = tokio::io::BufReader::new(read).lines();
+        for (id, message) in [
+            (
+                1,
+                json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{}}}),
+            ),
+            (
+                2,
+                json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"antigravity-client","version":"v1.0.0"}}}),
+            ),
+        ] {
+            write
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .unwrap_or_else(|_| panic!("no answer to request {id}"))
+                .unwrap()
+                .unwrap();
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["id"], id, "{reply}");
+        }
     }
 
     fn structured(result: &CallToolResult) -> &Value {

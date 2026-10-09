@@ -93,7 +93,14 @@ enum Command {
         alias = agent_mcp::LEGACY_BRIDGE_SUBCOMMAND,
         hide = true
     )]
-    AgentMcpBridge,
+    AgentMcpBridge {
+        /// Route of a static config entry; see `agent_mcp::ROUTE_ARG`.
+        #[arg(long)]
+        route: Option<String>,
+    },
+    /// `PreToolUse` hook TodeX installs for the Antigravity CLI.
+    #[command(name = agent_mcp::AGY_HOOK_SUBCOMMAND, hide = true)]
+    AgyHook,
     /// `SSH_ASKPASS` helper for password-authenticated SFTP sessions.
     #[command(name = "ssh-askpass", hide = true)]
     SshAskpass {
@@ -240,7 +247,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             daemon_run(args).await
         }
         // No logging: stdout carries the MCP protocol.
-        Command::AgentMcpBridge => agent_mcp::run_bridge().await,
+        Command::AgentMcpBridge { route } => agent_mcp::run_bridge(route).await,
+        // No logging: stdout carries the hook's decision.
+        Command::AgyHook => agent_mcp::run_agy_hook().await,
         Command::SshAskpass { prompt } => {
             std::process::exit(remote_fs::askpass::run(prompt.as_deref()))
         }

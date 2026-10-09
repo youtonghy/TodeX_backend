@@ -164,7 +164,7 @@ impl CancelSignal {
         Self(receiver)
     }
 
-    #[cfg(test)]
+    /// Cancelled through the returned sender (never, once it is dropped).
     pub(super) fn manual() -> (watch::Sender<bool>, Self) {
         let (sender, receiver) = watch::channel(false);
         (sender, Self(receiver))
@@ -282,6 +282,20 @@ impl AuthorizerState {
     #[cfg(test)]
     pub(crate) fn clear_declines(&self, conversation_id: &str) {
         locked(&self.declined).retain(|(conversation, _), _| conversation != conversation_id);
+    }
+
+    /// Whether `key` was allowed for the rest of the conversation.
+    pub(super) fn always_allows(&self, conversation_id: &str, key: &str) -> bool {
+        locked(&self.always)
+            .get(conversation_id)
+            .is_some_and(|keys| keys.contains(key))
+    }
+
+    pub(super) fn allow_always(&self, conversation_id: &str, key: &str) {
+        locked(&self.always)
+            .entry(conversation_id.to_owned())
+            .or_default()
+            .insert(key.to_owned());
     }
 
     /// Recently declined: the remaining backoff.

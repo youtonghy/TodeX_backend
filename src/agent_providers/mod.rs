@@ -10,7 +10,7 @@
 mod auth_config;
 mod claude;
 mod codex;
-mod files;
+pub(crate) mod files;
 mod grok;
 mod model_fetch;
 mod opencode;

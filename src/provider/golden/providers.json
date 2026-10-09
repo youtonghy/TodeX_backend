@@ -752,25 +752,27 @@
     "capabilities": {
       "permissionConfig": {
         "modes": [
+          "ask",
+          "auto",
           "full-access"
         ],
-        "defaultMode": "full-access",
+        "defaultMode": "ask",
         "supportsPlan": true,
         "sandboxModes": [],
         "approvalPolicies": [],
         "permissionProfiles": [],
-        "enforcement": "unsupported",
-        "description": "Headless agy cannot ask for approval, so turns run with --dangerously-skip-permissions; Plan mode uses agy --mode plan and refuses anything beyond reading."
+        "enforcement": "agent-policy",
+        "description": "agy runs with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network and MCP tools; auto allows workspace edits and MCP tools; full-access allows everything. Plan uses agy --mode plan and only reads. Not an operating-system sandbox."
       },
       "nativeFork": false,
       "nativeCompact": false,
       "nativeResume": true,
       "cancel": true,
-      "permissions": false,
+      "permissions": true,
       "toolEvents": true,
       "nativeSkills": true,
       "nativeMcp": true,
-      "managedMcp": false,
+      "managedMcp": true,
       "modelSelection": true,
       "imageInput": false,
       "imageInputMode": "model",

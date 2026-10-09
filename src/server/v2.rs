@@ -202,6 +202,10 @@ fn authenticated_routes() -> Router<AppState> {
             post(install_provider_cli),
         )
         .route(
+            "/v2/providers/antigravity/integration",
+            delete(remove_antigravity_integration),
+        )
+        .route(
             "/v2/providers/upgrades/{operation_id}",
             get(provider_upgrade_operation),
         )
@@ -1424,6 +1428,31 @@ async fn install_provider_cli(
     AxumPath(provider): AxumPath<ManagedCli>,
 ) -> Result<Json<CliUpgradeOperation>, AppError> {
     start_cli_operation(state, headers, provider, CliOperationAction::Install).await
+}
+
+/// Removes TodeX's approval hook and MCP entries from the Antigravity global
+/// config. The next Antigravity turn TodeX runs installs them again.
+async fn remove_antigravity_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    if state
+        .conversations
+        .has_active_turns_for_cli(ManagedCli::Antigravity)
+    {
+        return Err(AppError::Conflict(
+            "finish active Antigravity turns before removing TodeX's hook".to_owned(),
+        ));
+    }
+    let removed = tokio::task::spawn_blocking(|| {
+        crate::provider::antigravity::remove_integration(
+            &crate::provider::antigravity::integration_dir(),
+        )
+    })
+    .await
+    .map_err(|error| AppError::Anyhow(error.into()))??;
+    Ok(Json(json!({ "removed": removed })))
 }
 
 /// Install and upgrade share the single-flight operation, the execution gate

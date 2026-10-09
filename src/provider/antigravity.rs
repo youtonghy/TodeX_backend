@@ -8,11 +8,19 @@
 //! `~/.gemini/antigravity-cli`; the next turn resumes it with
 //! `--conversation <id>`.
 //!
-//! Headless `agy` cannot ask for approval: a tool needing it is denied. Until
-//! TodeX answers those prompts itself, implement turns run with
-//! `--dangerously-skip-permissions` (the only permission mode offered) and
-//! Plan turns run with `--mode plan` under agy's own review, so anything
-//! beyond reading is refused.
+//! Headless `agy` cannot ask for approval: a tool needing it is denied. So
+//! implement turns run with `--dangerously-skip-permissions` and TodeX gates
+//! tools itself through a global `PreToolUse` hook ([`integration`],
+//! decided in `agent_mcp::agy_hook` by the turn's ask / auto / full-access
+//! mode). The same static config carries TodeX's MCP servers; both reach the
+//! conversation through variables in the `agy` process environment. When
+//! the hook cannot be installed or reached, ask / auto turns keep agy's own
+//! review instead, which refuses whatever would need approval. Plan turns
+//! always keep it (`--mode plan`), so anything beyond reading is refused.
+
+mod integration;
+
+pub(crate) use integration::{config_dir as integration_dir, remove as remove_integration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -48,27 +56,27 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     kind: ProviderKind::Antigravity,
     display_name: "Antigravity",
     permission_config: PermissionConfigCapabilities {
-        modes: &["full-access"],
-        default_mode: "full-access",
+        modes: &["ask", "auto", "full-access"],
+        default_mode: "ask",
         supports_plan: true,
         sandbox_modes: &[],
         approval_policies: &[],
         permission_profiles: &[],
-        enforcement: "unsupported",
-        description: "Headless agy cannot ask for approval, so turns run with --dangerously-skip-permissions; Plan mode uses agy --mode plan and refuses anything beyond reading.",
+        enforcement: "agent-policy",
+        description: "agy runs with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network and MCP tools; auto allows workspace edits and MCP tools; full-access allows everything. Plan uses agy --mode plan and only reads. Not an operating-system sandbox.",
     },
     native_fork: false,
     native_compact: false,
     native_resume: true,
     cancel: true,
-    permissions: false,
+    permissions: true,
     tool_events: true,
     native_skills: true,
     native_mcp: true,
     model_selection: true,
     image_input: false,
     image_input_mode: ImageInputMode::Model,
-    mcp_injection: McpInjection::None,
+    mcp_injection: McpInjection::GlobalConfigEnv,
     skill_injection: SkillInjection::PromptText,
     file_attachments: FileAttachmentStyle::AtMention,
     profile_required: false,
@@ -206,6 +214,20 @@ impl ProviderDriver for AntigravityDriver {
             prompt.approval_policy.as_deref(),
         )?;
         let workspace = context.manifest.workspace.clone();
+        let global = context
+            .agent_mcp
+            .as_ref()
+            .and_then(|launch| launch.global.clone());
+        let bridged = match &global {
+            Some(global) => match install_integration(&global.daemon).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(%error, "could not install TodeX's Antigravity hook and MCP entries");
+                    false
+                }
+            },
+            None => false,
+        };
         let mut spec = self.command_spec(
             &workspace,
             &[
@@ -215,10 +237,27 @@ impl ProviderDriver for AntigravityDriver {
                 "stream-json",
             ],
         );
+        if let (true, Some(global)) = (bridged, &global) {
+            spec.env.extend(global.env.iter().cloned());
+        }
         if controls.work_mode == "plan" {
             spec.args.extend(["--mode".to_owned(), "plan".to_owned()]);
-        } else {
+        } else if bridged || controls.permission_mode == "full-access" {
             spec.args.push("--dangerously-skip-permissions".to_owned());
+        } else {
+            // Without TodeX's hook nothing would gate tools: keep agy's own
+            // review, which refuses what needs approval.
+            sink.emit(
+                "provider.event",
+                json!({
+                    "provider": PROVIDER,
+                    "providerMethod": "approval_bridge_unavailable",
+                    "metadata": {
+                        "reason": "TodeX could not install its Antigravity approval hook; tools that need approval are refused. Use full access or check the daemon log.",
+                    },
+                }),
+            )
+            .await?;
         }
         let requested = context.provider_state.native_session_id.clone();
         if let Some(conversation) = &requested {
@@ -452,6 +491,23 @@ fn command_spec(binary: &str, env_allowlist: &[String], cwd: &Path, args: &[&str
     spec.args = args.iter().map(|arg| (*arg).to_owned()).collect();
     spec.env = super::resident::allowlisted_environment(&[("NO_COLOR", "1")], env_allowlist);
     spec
+}
+
+/// Serializes writes to agy's global config between concurrent turns.
+static INTEGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Brings TodeX's hook and MCP entries in `~/.gemini/config` up to date,
+/// retrying once when another tool edited a file meanwhile.
+async fn install_integration(daemon: &Path) -> Result<(), AppError> {
+    let _serial = INTEGRATION_LOCK.lock().await;
+    let daemon = daemon.to_owned();
+    let dir = integration::config_dir();
+    tokio::task::spawn_blocking(move || match integration::ensure(&dir, &daemon) {
+        Err(AppError::Conflict(_)) => integration::ensure(&dir, &daemon),
+        other => other,
+    })
+    .await
+    .map_err(|error| AppError::Anyhow(error.into()))?
 }
 
 /// One emitted conversation event.
@@ -1121,7 +1177,8 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 &self,
                 turn_id: &str,
                 text: &str,
-                work_mode: Option<&str>,
+                // `plan`, a permission mode, or `None` for full access.
+                mode: Option<&str>,
                 cancel_after: Option<Duration>,
             ) -> Result<DriverTurnResult, AppError> {
                 let context = DriverContext {
@@ -1136,8 +1193,14 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     skills: vec![],
                     model: Some("gemini-3.8-flash".to_owned()),
                     reasoning_effort: Some("low".to_owned()),
-                    permission_mode: None,
-                    work_mode: work_mode.map(ToOwned::to_owned),
+                    permission_mode: Some(
+                        match mode {
+                            None | Some("plan") => "full-access",
+                            Some(mode) => mode,
+                        }
+                        .to_owned(),
+                    ),
+                    work_mode: mode.filter(|mode| *mode == "plan").map(ToOwned::to_owned),
                     permission_profile: None,
                     sandbox_mode: None,
                     approval_policy: None,
@@ -1238,6 +1301,22 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             assert!(!launch.contains(&"--dangerously-skip-permissions".to_owned()));
             let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
             assert_eq!(launch[mode + 1], "plan");
+        }
+
+        #[tokio::test]
+        async fn ask_without_the_approval_hook_keeps_agys_own_review() {
+            let fixture = Fixture::new().await;
+            fixture
+                .run("turn-1", "hello", Some("ask"), None)
+                .await
+                .unwrap();
+            assert!(!fixture.launches()[0].contains(&"--dangerously-skip-permissions".to_owned()));
+            assert!(fixture
+                .events()
+                .await
+                .iter()
+                .any(|(kind, payload)| kind == "provider.event"
+                    && payload["providerMethod"] == "approval_bridge_unavailable"));
         }
 
         #[tokio::test]

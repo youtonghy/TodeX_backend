@@ -36,7 +36,7 @@ use super::codex::CodexDriver;
 use super::grok::GrokBuildDriver;
 use super::pi::PiDriver;
 use super::process::same_executable;
-use super::profile::{profile, FileAttachmentStyle, SkillInjection};
+use super::profile::{profile, FileAttachmentStyle, McpInjection, SkillInjection};
 #[cfg(all(test, unix))]
 use super::types::ProviderDescriptor;
 use super::types::{
@@ -538,10 +538,12 @@ impl ConversationSupervisor {
         provider: ProviderKind,
         conversation_id: &str,
     ) -> Option<AgentMcpLaunch> {
-        if !profile(provider).managed_mcp() {
-            return None;
+        let agent_mcp = self.agent_mcp.as_ref()?;
+        match profile(provider).mcp_injection {
+            McpInjection::None => None,
+            McpInjection::GlobalConfigEnv => agent_mcp.launch_global(conversation_id).await,
+            _ => agent_mcp.launch(conversation_id).await,
         }
-        self.agent_mcp.as_ref()?.launch(conversation_id).await
     }
 
     async fn revoke_agent_mcp(&self, conversation_id: &str) {

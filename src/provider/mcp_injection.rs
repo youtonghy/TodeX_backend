@@ -111,6 +111,7 @@ mod tests {
     fn server(name: &'static str, url: &str) -> AgentMcpServer {
         AgentMcpServer {
             name,
+            route: "/internal/agent-mcp/test",
             command: PathBuf::from("/opt/todex/todex-agentd"),
             env: vec![
                 (URL_ENV.to_owned(), url.to_owned()),
@@ -130,6 +131,7 @@ mod tests {
                 server("todex_other", "http://127.0.0.1:1/other"),
             ],
             config_file: root.join("claude.json"),
+            global: None,
         };
 
         let codex = codex_configs(&launch);
