@@ -747,7 +747,8 @@
   {
     "id": "antigravity",
     "displayName": "Antigravity",
-    "available": true,
+    "available": false,
+    "unavailableReason": "executable '/nonexistent/todex-golden/agy' was not found",
     "profiles": [],
     "capabilities": {
       "permissionConfig": {

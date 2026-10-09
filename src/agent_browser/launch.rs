@@ -3,12 +3,9 @@
 //! no throttling of covered windows (the live view keeps its frame rate),
 //! and the DevTools connection on a pipe where the OS allows it.
 
-use std::{
-    collections::VecDeque,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::{collections::VecDeque, path::Path, sync::Arc, time::Duration};
 
 use tokio::{
     process::{Child, Command},
@@ -796,6 +793,8 @@ mod x11 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
