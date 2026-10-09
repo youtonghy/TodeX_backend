@@ -835,13 +835,33 @@ impl Engine {
         live(cancelled)?;
         let provider =
             provider.ok_or_else(|| ComputerError::platform("no accessibility provider"))?;
+        // Set once the app accepted inserted text but did not show it, as
+        // web editors (Electron, browsers) do: inserting again is pointless.
+        let mut ignored = false;
         if let Some(element) = element {
             if (platform::is_secure(element) || is_secure_role(element)) && !confirmed {
                 return Err(sensitive());
             }
             let focused = provider.focus(element).is_ok();
+            // Only a focused ref is the element whose text can be read back.
+            let read = || {
+                element
+                    .pid
+                    .filter(|_| focused)
+                    .and_then(platform::focused_text)
+            };
+            let before = read();
             if provider.type_text(element, text).is_ok() {
-                return Ok("background");
+                if platform::insertion_settled(
+                    before.as_deref(),
+                    read,
+                    text,
+                    platform::INSERT_SETTLE,
+                ) {
+                    return Ok("background");
+                }
+                tracing::debug!("the app ignored the inserted text; typing it instead");
+                ignored = true;
             }
             // A focused field known not to be a password field: the
             // platform may paste text its keystrokes cannot type.
@@ -862,12 +882,22 @@ impl Engine {
                 "cannot tell which app would receive the text; observe again",
             )
         })?;
-        match platform::type_into_focused(pid, text, confirmed) {
-            Typed::Inserted => return Ok("background"),
-            Typed::Secure => return Err(sensitive()),
-            Typed::Unsupported => platform::activate(pid, None).map_err(ComputerError::platform)?,
+        if !ignored {
+            match platform::type_into_focused(pid, text, confirmed) {
+                Typed::Inserted => return Ok("background"),
+                Typed::Secure => return Err(sensitive()),
+                Typed::Unsupported => {}
+            }
         }
+        platform::activate(pid, None).map_err(ComputerError::platform)?;
         check_front(Some(provider), pid, own_pid, cancelled)?;
+        // Enter can submit and clear a field, Tab move focus elsewhere:
+        // then an unchanged value says nothing about the typing.
+        let before = if text.contains(['\n', '\r', '\t']) {
+            None
+        } else {
+            platform::focused_text(pid)
+        };
         let keyboard = self.input()?;
         // In chunks, so a stop (or a confirmation opening) ends a long text
         // within a moment instead of after the last character.
@@ -877,6 +907,17 @@ impl Engine {
                 .keyboard()
                 .type_text(chunk)
                 .map_err(ComputerError::platform)?;
+        }
+        if !platform::insertion_settled(
+            before.as_deref(),
+            || platform::focused_text(pid),
+            text,
+            platform::KEYSTROKE_SETTLE,
+        ) {
+            return Err(ComputerError::new(
+                "TYPE_NOT_APPLIED",
+                "the focused field's text did not change after typing; observe to check before typing again",
+            ));
         }
         Ok("keyboard")
     }

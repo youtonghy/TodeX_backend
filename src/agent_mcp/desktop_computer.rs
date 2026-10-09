@@ -313,8 +313,9 @@ pub(super) fn tools(
              computer_observe: the action goes to that element in the background without moving \
              the user's pointer. x/y are screenshot pixels of the latest observation and move the \
              pointer (refused while the user is using it; retry shortly). type inserts text (into \
-             ref, or the focused field); key sends a chord such as cmd+c (cmd is ⌘ on macOS and \
-             Ctrl elsewhere), enter, shift+tab. The first action in each app and typing into \
+             ref, or the focused field); where the app ignores inserted text (web editors) it \
+             brings the app forward and types instead (path: keyboard); key sends a chord such as \
+             cmd+c (cmd is ⌘ on macOS and Ctrl elsewhere), enter, shift+tab. The first action in each app and typing into \
              password fields ask the user; some apps (TodeX, system settings, credential stores, \
              password managers) can never be controlled. Unavailable in Plan mode; in ask mode the \
              user approves each call.",

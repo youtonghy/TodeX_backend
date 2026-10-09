@@ -21,7 +21,7 @@ use core_foundation::{
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
 use xa11y::{input::Key, ElementData};
 
-use super::{Display, Permission, Permissions, Typed};
+use super::{insertion_settled, Display, Permission, Permissions, Typed, INSERT_SETTLE};
 use crate::computer::{
     keys::Chord,
     policy::{StackWindow, Target},
@@ -564,29 +564,12 @@ pub(crate) fn is_secure(element: &ElementData) -> bool {
 /// Inserts text into `pid`'s focused element without keystrokes, so input
 /// methods cannot rewrite it and the app stays in the background.
 pub(crate) fn type_into_focused(pid: u32, text: &str, confirmed: bool) -> Typed {
-    let Ok(pid) = i32::try_from(pid) else {
+    let Some(focused) = focused_element(pid) else {
         return Typed::Unsupported;
     };
     // SAFETY: every AX object we get under the create rule is wrapped and
     // released by its CFType.
     unsafe {
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
-            return Typed::Unsupported;
-        }
-        let app = CFType::wrap_under_create_rule(app);
-        let mut focused: CFTypeRef = std::ptr::null();
-        let attribute = CFString::from_static_string("AXFocusedUIElement");
-        if AXUIElementCopyAttributeValue(
-            app.as_CFTypeRef(),
-            attribute.as_concrete_TypeRef(),
-            &mut focused,
-        ) != AX_SUCCESS
-            || focused.is_null()
-        {
-            return Typed::Unsupported;
-        }
-        let focused = CFType::wrap_under_create_rule(focused);
         let mut subrole: CFTypeRef = std::ptr::null();
         let subrole_attribute = CFString::from_static_string("AXSubrole");
         let secure = AXUIElementCopyAttributeValue(
@@ -613,11 +596,49 @@ pub(crate) fn type_into_focused(pid: u32, text: &str, confirmed: bool) -> Typed 
             return Typed::Unsupported;
         }
         // Some apps accept the setter and ignore it.
-        if insertion_took(before.as_deref(), text_value(&focused).as_deref(), text) {
+        if insertion_settled(
+            before.as_deref(),
+            || text_value(&focused),
+            text,
+            INSERT_SETTLE,
+        ) {
             Typed::Inserted
         } else {
             Typed::Unsupported
         }
+    }
+}
+
+/// The text of `pid`'s focused element.
+pub(crate) fn focused_text(pid: u32) -> Option<String> {
+    let focused = focused_element(pid)?;
+    // SAFETY: `focused` is a valid AX element.
+    unsafe { text_value(&focused) }
+}
+
+/// `pid`'s focused accessibility element.
+fn focused_element(pid: u32) -> Option<CFType> {
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: every AX object we get under the create rule is wrapped and
+    // released by its CFType.
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let app = CFType::wrap_under_create_rule(app);
+        let mut focused: CFTypeRef = std::ptr::null();
+        let attribute = CFString::from_static_string("AXFocusedUIElement");
+        if AXUIElementCopyAttributeValue(
+            app.as_CFTypeRef(),
+            attribute.as_concrete_TypeRef(),
+            &mut focused,
+        ) != AX_SUCCESS
+            || focused.is_null()
+        {
+            return None;
+        }
+        Some(CFType::wrap_under_create_rule(focused))
     }
 }
 
@@ -640,17 +661,6 @@ unsafe fn text_value(element: &CFType) -> Option<String> {
     CFType::wrap_under_create_rule(value)
         .downcast::<CFString>()
         .map(|value| value.to_string())
-}
-
-/// Whether setting the selected text took effect, given the element's
-/// value before and after (`None`: unreadable, as in secure fields, where
-/// the setter's success is all there is): inserting something must change
-/// the value.
-fn insertion_took(before: Option<&str>, after: Option<&str>, text: &str) -> bool {
-    match (before, after) {
-        (Some(before), Some(after)) => text.is_empty() || before != after,
-        _ => true,
-    }
 }
 
 /// Posts a chord to one app without activating it. `Ok(false)` when the
@@ -767,19 +777,6 @@ fn key_code(key: &Key) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_ignored_text_insertion_is_noticed() {
-        // Readable before and after: the value must change.
-        assert!(insertion_took(Some("a"), Some("ab"), "b"));
-        assert!(!insertion_took(Some("a"), Some("a"), "b"));
-        // Nothing to insert changes nothing.
-        assert!(insertion_took(Some("a"), Some("a"), ""));
-        // Unreadable (secure fields): the setter's success stands.
-        assert!(insertion_took(None, None, "b"));
-        assert!(insertion_took(Some("a"), None, "b"));
-        assert!(insertion_took(None, Some("a"), "b"));
-    }
 
     fn window(layer: i64, pid: u32) -> CgWindow {
         CgWindow {

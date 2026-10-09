@@ -35,6 +35,8 @@ mod linux_desktop;
 #[cfg(any(target_os = "windows", test))]
 mod windows_names;
 
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 
 // Hooks only the Linux layer needs (KDE Wayland); no-ops elsewhere.
@@ -61,6 +63,13 @@ pub(crate) fn end_session() {}
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn paste_text(_pid: u32, _text: &str) -> Result<bool, String> {
     Ok(false)
+}
+
+/// The text of `pid`'s focused element, to tell whether typing into it
+/// took effect; `None` when unreadable or not checked on this OS.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn focused_text(_pid: u32) -> Option<String> {
+    None
 }
 
 /// The id `@app:` mentions use for a running app: its own id here.
@@ -134,8 +143,49 @@ pub(crate) enum Typed {
     /// confirmed.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     Secure,
-    /// No insertable focused element; the caller falls back to keystrokes.
+    /// No insertable focused element, or the app ignored the insertion;
+    /// the caller falls back to keystrokes.
     Unsupported,
+}
+
+/// How long an app may take to show text it accepted (Electron apps
+/// update their accessibility value asynchronously).
+pub(crate) const INSERT_SETTLE: Duration = Duration::from_millis(300);
+/// The same for keystrokes, which the app receives through its event queue.
+pub(crate) const KEYSTROKE_SETTLE: Duration = Duration::from_secs(1);
+
+/// Whether inserting `text` took effect, given the element's value before
+/// and after (`None`: unreadable, as in secure fields, where the input's
+/// own success is all there is): inserting something must change the value.
+fn insertion_took(before: Option<&str>, after: Option<&str>, text: &str) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => text.is_empty() || before != after,
+        _ => true,
+    }
+}
+
+/// [`insertion_took`], reading the value again until it changes or
+/// `settle` passes, so a late update is not mistaken for an ignored
+/// insertion (and the text then typed twice).
+pub(crate) fn insertion_settled(
+    before: Option<&str>,
+    mut read: impl FnMut() -> Option<String>,
+    text: &str,
+    settle: Duration,
+) -> bool {
+    if before.is_none() || text.is_empty() {
+        return true;
+    }
+    let deadline = Instant::now() + settle;
+    loop {
+        if insertion_took(before, read().as_deref(), text) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Held while an action injects pointer or keyboard input. Windows
@@ -229,6 +279,44 @@ fn user_idle(raw: f64, start_age: f64, end_age: f64, idle_before: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ignored_text_insertion_is_noticed() {
+        // Readable before and after: the value must change.
+        assert!(insertion_took(Some("a"), Some("ab"), "b"));
+        assert!(!insertion_took(Some("a"), Some("a"), "b"));
+        // Nothing to insert changes nothing.
+        assert!(insertion_took(Some("a"), Some("a"), ""));
+        // Unreadable (secure fields): the input's own success stands.
+        assert!(insertion_took(None, None, "b"));
+        assert!(insertion_took(Some("a"), None, "b"));
+        assert!(insertion_took(None, Some("a"), "b"));
+    }
+
+    #[test]
+    fn a_late_text_update_still_counts() {
+        let settle = Duration::from_millis(200);
+        // The value changes on the third read: inserted, not retyped.
+        let mut reads = 0;
+        let late = || {
+            reads += 1;
+            Some(if reads < 3 { "a" } else { "ab" }.to_owned())
+        };
+        assert!(insertion_settled(Some("a"), late, "b", settle));
+        // Never changes: ignored, after waiting out the settle time.
+        let started = Instant::now();
+        assert!(!insertion_settled(
+            Some("a"),
+            || Some("a".to_owned()),
+            "b",
+            settle
+        ));
+        assert!(started.elapsed() >= settle);
+        // Unreadable before, or nothing to insert: no reads, no wait.
+        let unread = || -> Option<String> { panic!("must not read") };
+        assert!(insertion_settled(None, unread, "b", settle));
+        assert!(insertion_settled(Some("a"), unread, "", settle));
+    }
 
     #[test]
     fn injected_input_does_not_count_as_user_activity() {
