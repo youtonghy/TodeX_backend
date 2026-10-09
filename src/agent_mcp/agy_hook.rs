@@ -5,13 +5,13 @@
 //! `PreToolUse` hook (installed by `provider::antigravity`) runs
 //! `todex-agentd agy-hook`, which posts the hook payload to
 //! [`AGY_HOOK_ROUTE`] with the conversation's token and prints the answer.
-//! The decision follows the turn's permission mode and, where it asks,
+//! The decision follows the turn's permission mode (ask or full access;
+//! agy has no auto-review tier) and, where it asks,
 //! raises the same `permission.requested` prompt as other provider tools.
 //!
 //! agy reads a hook's empty or failed answer as a denial, so every path
 //! that cannot reach a decision denies.
 
-use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use axum::{
@@ -150,7 +150,7 @@ enum Policy {
     Deny(String),
 }
 
-fn policy(permission_mode: &str, work_mode: &str, class: ToolClass, in_workspace: bool) -> Policy {
+fn policy(permission_mode: &str, work_mode: &str, class: ToolClass) -> Policy {
     use ToolClass::*;
     if work_mode == "plan" {
         // agy's own review also refuses these: Plan turns keep it on.
@@ -166,8 +166,7 @@ fn policy(permission_mode: &str, work_mode: &str, class: ToolClass, in_workspace
     match (permission_mode, class) {
         ("full-access", _) => Policy::Allow,
         (_, Read | Internal | Mcp { todex: true }) => Policy::Allow,
-        ("auto", Mcp { todex: false }) => Policy::Allow,
-        ("auto", Edit) if in_workspace => Policy::Allow,
+        // `ask`, and anything else (agy has no auto-review tier), asks.
         _ => Policy::Ask,
     }
 }
@@ -185,16 +184,7 @@ async fn decide(state: &AppState, conversation_id: &str, payload: &Value) -> Dec
         .cloned()
         .unwrap_or(Value::Null);
     let class = classify(name, &args);
-    let workspace = state
-        .conversations
-        .get(conversation_id)
-        .await
-        .ok()
-        .map(|manifest| manifest.workspace);
-    let in_workspace = workspace
-        .as_deref()
-        .is_some_and(|workspace| edit_paths(&args).all(|path| inside(workspace, &path)));
-    match policy(&permission_mode, &work_mode, class, in_workspace) {
+    match policy(&permission_mode, &work_mode, class) {
         Policy::Allow => Decision::Allow,
         Policy::Deny(reason) => Decision::Deny(reason),
         Policy::Ask => ask(state, conversation_id, name, args).await,
@@ -280,33 +270,6 @@ fn summary(name: &str, args: &Value) -> String {
     }
 }
 
-/// Files an edit tool would write.
-fn edit_paths(args: &Value) -> impl Iterator<Item = PathBuf> + '_ {
-    ["TargetFile", "AbsolutePath", "File", "Path", "NotebookPath"]
-        .into_iter()
-        .filter_map(|key| args.get(key).and_then(Value::as_str))
-        .map(PathBuf::from)
-}
-
-/// Whether `path` lies in `workspace`, compared lexically (`..` resolved,
-/// links not followed). Relative paths count as outside.
-fn inside(workspace: &Path, path: &Path) -> bool {
-    if !path.is_absolute() {
-        return false;
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::CurDir => {}
-            other => normalized.push(other),
-        }
-    }
-    normalized.starts_with(workspace)
-}
-
 /// `todex-agentd agy-hook`: reads the hook payload on stdin, asks the daemon
 /// and prints its decision. Started outside a TodeX turn it allows, which
 /// leaves agy's own permissions in charge; a failed exchange denies.
@@ -384,42 +347,26 @@ mod tests {
     #[test]
     fn modes_decide_which_calls_ask() {
         use ToolClass::*;
+        assert_eq!(policy("full-access", "implement", Command), Policy::Allow);
+        assert_eq!(policy("ask", "implement", Read), Policy::Allow);
+        assert_eq!(policy("ask", "implement", Edit), Policy::Ask);
+        assert_eq!(policy("ask", "implement", Command), Policy::Ask);
         assert_eq!(
-            policy("full-access", "implement", Command, false),
-            Policy::Allow
-        );
-        assert_eq!(policy("ask", "implement", Read, false), Policy::Allow);
-        assert_eq!(policy("ask", "implement", Edit, true), Policy::Ask);
-        assert_eq!(
-            policy("ask", "implement", Mcp { todex: false }, false),
+            policy("ask", "implement", Mcp { todex: false }),
             Policy::Ask
         );
-        assert_eq!(policy("auto", "implement", Edit, true), Policy::Allow);
-        assert_eq!(policy("auto", "implement", Edit, false), Policy::Ask);
-        assert_eq!(policy("auto", "implement", Command, true), Policy::Ask);
-        assert_eq!(policy("auto", "implement", Unknown, true), Policy::Ask);
         assert_eq!(
-            policy("auto", "implement", Mcp { todex: false }, false),
+            policy("ask", "implement", Mcp { todex: true }),
             Policy::Allow
         );
         assert!(matches!(
-            policy("full-access", "plan", Edit, true),
+            policy("full-access", "plan", Edit),
             Policy::Deny(_)
         ));
-        assert_eq!(policy("ask", "plan", Read, false), Policy::Allow);
-        // An unknown permission mode never skips approval.
-        assert_eq!(policy("bogus", "implement", Command, true), Policy::Ask);
-    }
-
-    #[test]
-    fn workspace_containment_resolves_dot_dot_and_rejects_relative_paths() {
-        let workspace = Path::new("/work/project");
-        assert!(inside(workspace, Path::new("/work/project/src/a.rs")));
-        assert!(!inside(workspace, Path::new("/work/project/../other/a.rs")));
-        assert!(!inside(workspace, Path::new("/work/projectile/a.rs")));
-        assert!(!inside(workspace, Path::new("src/a.rs")));
-        let args = json!({ "TargetFile": "/work/project/a", "AbsolutePath": "/etc/passwd" });
-        assert!(!edit_paths(&args).all(|path| inside(workspace, &path)));
+        assert_eq!(policy("ask", "plan", Read), Policy::Allow);
+        // `auto` (not offered for agy) and unknown modes never skip approval.
+        assert_eq!(policy("auto", "implement", Edit), Policy::Ask);
+        assert_eq!(policy("bogus", "implement", Command), Policy::Ask);
     }
 
     #[test]
@@ -625,7 +572,7 @@ mod tests {
             harness
                 .state
                 .agent_mcp
-                .record_turn_mode(id, "auto", "implement");
+                .record_turn_mode(id, "full-access", "implement");
             assert_eq!(
                 harness.decide("write_to_file", inside.clone()).await["decision"],
                 "allow"

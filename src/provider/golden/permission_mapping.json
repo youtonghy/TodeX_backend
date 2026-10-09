@@ -1203,7 +1203,7 @@
       "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
     },
     "mode=auto work=- profile=- sandbox=- approval=-": {
-      "permissionMode": "auto",
+      "permissionMode": "ask",
       "workMode": "implement",
       "approvalsReviewer": null,
       "sandboxMode": null,
@@ -1221,7 +1221,7 @@
       "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
     },
     "mode=auto work=plan profile=- sandbox=- approval=-": {
-      "permissionMode": "auto",
+      "permissionMode": "ask",
       "workMode": "plan",
       "approvalsReviewer": null,
       "sandboxMode": null,

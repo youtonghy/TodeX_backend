@@ -11,10 +11,11 @@
 //! Headless `agy` cannot ask for approval: a tool needing it is denied. So
 //! implement turns run with `--dangerously-skip-permissions` and TodeX gates
 //! tools itself through a global `PreToolUse` hook ([`integration`],
-//! decided in `agent_mcp::agy_hook` by the turn's ask / auto / full-access
-//! mode). The same static config carries TodeX's MCP servers; both reach the
-//! conversation through variables in the `agy` process environment. When
-//! the hook cannot be installed or reached, ask / auto turns keep agy's own
+//! decided in `agent_mcp::agy_hook` by the turn's ask / full-access mode;
+//! agy has no auto-review tier, so `auto` is not offered). The same static
+//! config carries TodeX's MCP servers; both reach the conversation through
+//! variables in the `agy` process environment. When
+//! the hook cannot be installed or reached, ask turns keep agy's own
 //! review instead, which refuses whatever would need approval. Plan turns
 //! always keep it (`--mode plan`), so anything beyond reading is refused.
 
@@ -56,14 +57,14 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     kind: ProviderKind::Antigravity,
     display_name: "Antigravity",
     permission_config: PermissionConfigCapabilities {
-        modes: &["ask", "auto", "full-access"],
+        modes: &["ask", "full-access"],
         default_mode: "ask",
         supports_plan: true,
         sandbox_modes: &[],
         approval_policies: &[],
         permission_profiles: &[],
         enforcement: "agent-policy",
-        description: "agy runs with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network and MCP tools; auto allows workspace edits and MCP tools; full-access allows everything. Plan uses agy --mode plan and only reads. Not an operating-system sandbox.",
+        description: "agy runs with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network and non-TodeX MCP tools; full-access allows everything. agy has no auto-review tier, so auto is not offered. Plan uses agy --mode plan and only reads. Not an operating-system sandbox.",
     },
     native_fork: false,
     native_compact: false,

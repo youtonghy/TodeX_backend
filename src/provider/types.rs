@@ -443,13 +443,14 @@ pub fn resolve_execution_config(
         return Ok(legacy);
     }
     let mode = permission_mode.unwrap_or(capabilities.default_mode);
-    // Devin exposes no auto-approval tier; a stale `auto` selection degrades to
-    // manual approval rather than failing the prompt.
-    let mode = if provider == ProviderKind::Devin && mode == "auto" {
-        "ask"
-    } else {
-        mode
-    };
+    // Devin and Antigravity expose no auto-approval tier; a stale `auto`
+    // selection degrades to manual approval rather than failing the prompt.
+    let mode =
+        if matches!(provider, ProviderKind::Devin | ProviderKind::Antigravity) && mode == "auto" {
+            "ask"
+        } else {
+            mode
+        };
     if !capabilities.modes.contains(&mode) {
         return Err(AppError::Unsupported(format!(
             "{} does not support permission mode {mode}",
