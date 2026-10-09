@@ -538,7 +538,7 @@ async fn active_turn(
                         let sink = sink.clone(); let mut cancel = cancel.clone(); let method = method.to_owned();
                         permissions.spawn(async move {
                             let decision = sink.request_permission(jsonrpc_id_text(&request_id).unwrap_or_default(),
-                                codex_permission_kind(&method),codex_permission_title(&method,&params),params.clone(),codex_permission_options(&method),&mut cancel).await;
+                                codex_permission_kind(&method,&params),codex_permission_title(&method,&params),codex_permission_details(&method,&params),codex_permission_options(&method,&params),&mut cancel).await;
                             (request_id, method, params, decision)
                         });
                     } else { process.send(&json!({"id":request_id,"error":{"code":-32601,"message":"request is not supported by TodeX"}})).await?; }

@@ -771,8 +771,8 @@ async fn wait_for_response(
                         let id = id.clone(); let method = method.to_owned(); let params = message.get("params").cloned().unwrap_or(Value::Null);
                         let sink = sink.clone(); let mut cancel = cancel.clone();
                         permissions.spawn(async move {
-                            let decision = sink.request_permission(jsonrpc_id_text(&id).unwrap_or_default(), codex_permission_kind(&method),
-                                codex_permission_title(&method,&params),params.clone(),codex_permission_options(&method),&mut cancel).await;
+                            let decision = sink.request_permission(jsonrpc_id_text(&id).unwrap_or_default(), codex_permission_kind(&method,&params),
+                                codex_permission_title(&method,&params),codex_permission_details(&method,&params),codex_permission_options(&method,&params),&mut cancel).await;
                             (id,method,params,decision)
                         });
                         continue;
@@ -800,10 +800,10 @@ async fn handle_codex_message(
             let decision = sink
                 .request_permission(
                     jsonrpc_id_text(&request_id)?,
-                    codex_permission_kind(method),
+                    codex_permission_kind(method, &params),
                     codex_permission_title(method, &params),
-                    params.clone(),
-                    codex_permission_options(method),
+                    codex_permission_details(method, &params),
+                    codex_permission_options(method, &params),
                     cancel,
                 )
                 .await?;
@@ -1232,7 +1232,30 @@ fn is_codex_permission_method(method: &str) -> bool {
     )
 }
 
-fn codex_permission_kind(method: &str) -> &'static str {
+/// `_meta` of an elicitation Codex raises to approve an MCP tool call (rather
+/// than a form an MCP server asks the user to fill).
+fn codex_mcp_tool_approval<'a>(method: &str, params: &'a Value) -> Option<&'a Value> {
+    (method == "mcpServer/elicitation/request")
+        .then(|| params.get("_meta"))
+        .flatten()
+        .filter(|meta| meta["codex_approval_kind"] == "mcp_tool_call")
+}
+
+/// Codex only honours a remembered approval it offered in `_meta.persist`.
+/// `always` is not offered: Codex would write it into the user's own
+/// `config.toml`.
+fn codex_mcp_tool_approval_persists(meta: &Value) -> bool {
+    meta["persist"]
+        .as_array()
+        .is_some_and(|scopes| scopes.iter().any(|scope| scope == "session"))
+}
+
+fn codex_permission_kind(method: &str, params: &Value) -> &'static str {
+    // Shown as a regular tool approval: clients render `elicitation` as a
+    // form with only Submit and Decline.
+    if codex_mcp_tool_approval(method, params).is_some() {
+        return "tool";
+    }
     match method {
         "item/commandExecution/requestApproval" => "command",
         "item/fileChange/requestApproval" => "file_change",
@@ -1258,7 +1281,38 @@ fn codex_permission_title(method: &str, params: &Value) -> String {
         .to_owned()
 }
 
-fn codex_permission_options(method: &str) -> Value {
+/// Request details for clients: the raw request, plus for an MCP tool
+/// approval the `tool_name` / `input` fields tool approval cards show.
+fn codex_permission_details(method: &str, params: &Value) -> Value {
+    let Some(meta) = codex_mcp_tool_approval(method, params) else {
+        return params.clone();
+    };
+    let mut details = params.clone();
+    // Computer Use sends the action (`get_app_state`) as `tool_name`.
+    if let Some(name) = ["tool_title", "tool_name"]
+        .into_iter()
+        .find_map(|key| meta[key].as_str().filter(|name| !name.is_empty()))
+    {
+        details["tool_name"] = json!(name);
+    }
+    if meta["tool_params"].is_object() {
+        details["input"] = meta["tool_params"].clone();
+    }
+    details
+}
+
+fn codex_permission_options(method: &str, params: &Value) -> Value {
+    if let Some(meta) = codex_mcp_tool_approval(method, params) {
+        let mut options =
+            vec![json!({ "id": "allow_once", "kind": "allow_once", "name": "Allow once" })];
+        if codex_mcp_tool_approval_persists(meta) {
+            options.push(
+                json!({ "id": "allow_always", "kind": "allow_always", "name": "Allow for session" }),
+            );
+        }
+        options.push(json!({ "id": "reject_once", "kind": "reject_once", "name": "Reject" }));
+        return Value::Array(options);
+    }
     if method == "mcpServer/elicitation/request" {
         return json!([
             {"id":"answer", "kind":"answer", "name":"Submit"},
@@ -1292,6 +1346,24 @@ fn codex_permission_response(
     params: &Value,
     decision: super::types::PermissionDecision,
 ) -> Value {
+    if let Some(meta) = codex_mcp_tool_approval(method, params) {
+        return match decision.outcome {
+            PermissionOutcome::AllowAlways if codex_mcp_tool_approval_persists(meta) => {
+                json!({"action":"accept", "content":{}, "_meta":{"persist":"session"}})
+            }
+            PermissionOutcome::AllowOnce
+            | PermissionOutcome::AllowAlways
+            | PermissionOutcome::Answer => {
+                json!({"action":"accept", "content":{}, "_meta":null})
+            }
+            PermissionOutcome::AbortTurn => {
+                json!({"action":"cancel", "content":null, "_meta":null})
+            }
+            PermissionOutcome::RejectOnce | PermissionOutcome::RejectAlways => {
+                json!({"action":"decline", "content":null, "_meta":null})
+            }
+        };
+    }
     if method == "mcpServer/elicitation/request" {
         return match decision.outcome {
             PermissionOutcome::Answer => {
@@ -1516,7 +1588,7 @@ mod tests {
     fn elicitation_maps_form_answers_and_rejection_to_upstream_shape() {
         assert!(is_codex_permission_method("mcpServer/elicitation/request"));
         assert_eq!(
-            codex_permission_kind("mcpServer/elicitation/request"),
+            codex_permission_kind("mcpServer/elicitation/request", &Value::Null),
             "elicitation"
         );
         let response = codex_permission_response(
@@ -2000,12 +2072,90 @@ done
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
     #[test]
+    fn mcp_tool_approval_offers_session_approval_only_when_codex_does() {
+        let method = "mcpServer/elicitation/request";
+        // As sent by Codex 0.153.4.
+        let params = json!({
+            "threadId": "t", "turnId": "u", "serverName": "probe", "mode": "form",
+            "_meta": {
+                "codex_approval_kind": "mcp_tool_call",
+                "persist": ["session", "always"],
+                "tool_description": "Returns pong.",
+                "tool_params": {"n": 1},
+                "tool_params_display": [{"name": "n", "value": 1, "display_name": "n"}]
+            },
+            "message": "Allow the probe MCP server to run tool \"ping\"?",
+            "requestedSchema": {"type": "object", "properties": {}}
+        });
+        let decide = |params: &Value, outcome, option_id: &str| {
+            codex_permission_response(
+                method,
+                params,
+                super::super::types::PermissionDecision {
+                    outcome,
+                    option_id: Some(option_id.to_owned()),
+                    data: None,
+                },
+            )
+        };
+        let kinds = |params: &Value| -> Vec<String> {
+            codex_permission_options(method, params)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|option| option["kind"].as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        assert_eq!(codex_permission_kind(method, &params), "tool");
+        assert_eq!(
+            codex_permission_details(method, &params)["input"],
+            json!({"n": 1})
+        );
+        assert_eq!(
+            kinds(&params),
+            ["allow_once", "allow_always", "reject_once"]
+        );
+        assert_eq!(
+            decide(&params, PermissionOutcome::AllowAlways, "allow_always"),
+            json!({"action":"accept","content":{},"_meta":{"persist":"session"}})
+        );
+        assert_eq!(
+            decide(&params, PermissionOutcome::AllowOnce, "allow_once"),
+            json!({"action":"accept","content":{},"_meta":null})
+        );
+        assert_eq!(
+            decide(&params, PermissionOutcome::RejectOnce, "reject_once")["action"],
+            "decline"
+        );
+
+        // Without `persist`, Codex ignores a remembered approval: not offered.
+        let mut once_only = params.clone();
+        once_only["_meta"]
+            .as_object_mut()
+            .unwrap()
+            .remove("persist");
+        assert_eq!(kinds(&once_only), ["allow_once", "reject_once"]);
+        assert_eq!(
+            decide(&once_only, PermissionOutcome::AllowAlways, "allow_always")["_meta"],
+            Value::Null
+        );
+
+        // Other elicitations stay forms.
+        let mut form = params.clone();
+        form.as_object_mut().unwrap().remove("_meta");
+        assert_eq!(codex_permission_kind(method, &form), "elicitation");
+        assert_eq!(kinds(&form), ["answer", "reject_once"]);
+        assert_eq!(codex_permission_details(method, &form), form);
+    }
+
+    #[test]
     fn abort_turn_is_only_advertised_for_supported_codex_requests() {
         for method in [
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
         ] {
-            assert!(codex_permission_options(method)
+            assert!(codex_permission_options(method, &Value::Null)
                 .as_array()
                 .unwrap()
                 .iter()
@@ -2024,7 +2174,7 @@ done
             );
         }
         assert!(
-            !codex_permission_options("item/permissions/requestApproval")
+            !codex_permission_options("item/permissions/requestApproval", &Value::Null)
                 .as_array()
                 .unwrap()
                 .iter()
