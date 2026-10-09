@@ -602,9 +602,21 @@ mod tests {
         let state = installer.state();
         assert!(!state.downloading);
         assert_eq!(state.error.as_deref(), Some("offline"));
-        // The lock was released with the failed attempt.
+        // The lock was released with the failed attempt. A process another
+        // test forks meanwhile inherits the open lock file until it execs
+        // (CLOEXEC), holding the flock that long, so retry briefly like
+        // `acquire_lock` does instead of failing on one `WouldBlock`.
         let file = std::fs::File::open(installer.root.join(LOCK_FILE)).unwrap();
-        file.try_lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("the failed install kept its lock: {error}"),
+            }
+        }
         drop(file);
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
