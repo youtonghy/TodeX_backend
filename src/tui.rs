@@ -32,7 +32,7 @@ use crate::transport_crypto::{render_qr_text_for_bounds, PairingKeys};
 use crate::update;
 use crate::workspace_paths::canonical_workspace_root;
 
-const ACTION_COUNT: usize = 14;
+const ACTION_COUNT: usize = 17;
 const MAX_LOG_LINES: usize = 256;
 const LOG_SCROLL_STEP: usize = 6;
 const QR_POPUP_MARGIN: u16 = 1;
@@ -72,6 +72,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         app.refresh_daemon_status();
         app.refresh_connect_addresses();
         app.refresh_device_pairing(false);
+        app.refresh_api_keys(false);
         while let Ok(result) = app.daemon_op_rx.try_recv() {
             app.apply_daemon_op_result(result);
         }
@@ -308,6 +309,79 @@ fn device_display_name(value: &str) -> String {
         .collect()
 }
 
+/// A key created in this session. Its full text exists only here and is
+/// dropped (and zeroed) when the popup closes.
+struct CreatedApiKey {
+    name: String,
+    key: zeroize::Zeroizing<String>,
+}
+
+#[derive(Default)]
+struct ApiKeysState {
+    open: bool,
+    /// Keys from `api-keys.json`, oldest first.
+    keys: Vec<crate::api_keys::ApiKeyRecord>,
+    selected: Option<String>,
+    created: Option<CreatedApiKey>,
+    /// The key id a first `x` asked to revoke; a second `x` confirms.
+    confirm_revoke: Option<String>,
+    refreshed_at: Option<Instant>,
+    error: Option<String>,
+}
+
+impl ApiKeysState {
+    fn replace(&mut self, keys: Vec<crate::api_keys::ApiKeyRecord>) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|id| !keys.iter().any(|key| &key.id == id))
+        {
+            self.selected = None;
+        }
+        if self.selected.is_none() {
+            self.selected = keys.first().map(|key| key.id.clone());
+        }
+        self.keys = keys;
+    }
+
+    fn navigate(&mut self, down: bool) {
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.keys.iter().position(|key| &key.id == id));
+        let index = match current {
+            Some(index) if down => (index + 1).min(self.keys.len().saturating_sub(1)),
+            Some(index) => index.saturating_sub(1),
+            None => 0,
+        };
+        self.selected = self.keys.get(index).map(|key| key.id.clone());
+    }
+
+    fn selected_key(&self) -> Option<&crate::api_keys::ApiKeyRecord> {
+        self.selected
+            .as_ref()
+            .and_then(|id| self.keys.iter().find(|key| &key.id == id))
+    }
+}
+
+fn next_approval_policy(value: crate::api_keys::ApprovalPolicy) -> crate::api_keys::ApprovalPolicy {
+    use crate::api_keys::ApprovalPolicy;
+    match value {
+        ApprovalPolicy::Ask => ApprovalPolicy::AutoApprove,
+        ApprovalPolicy::AutoApprove => ApprovalPolicy::Reject,
+        ApprovalPolicy::Reject => ApprovalPolicy::Ask,
+    }
+}
+
+fn format_unix_ms(value: Option<u64>) -> String {
+    value
+        .and_then(|value| {
+            chrono::DateTime::from_timestamp_millis(i64::try_from(value).unwrap_or_default())
+        })
+        .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TuiLanguage {
     English,
@@ -369,6 +443,7 @@ struct TuiApp {
     pairing_browser_pages: Vec<crate::transport_crypto::pairing_browser::PairingQrBrowserPage>,
     credentials: Option<CredentialsPopup>,
     device_pairing: DevicePairingState,
+    api_keys: ApiKeysState,
     folder_picker: Option<FolderPicker>,
     roots_picker: Option<usize>,
     daemon_op: Option<DaemonOpKind>,
@@ -426,6 +501,7 @@ impl TuiApp {
             pairing_browser_pages: Vec::new(),
             credentials: None,
             device_pairing: DevicePairingState::default(),
+            api_keys: ApiKeysState::default(),
             folder_picker: None,
             roots_picker: None,
             daemon_op: None,
@@ -588,6 +664,10 @@ impl TuiApp {
                 .to_owned();
             return;
         };
+        self.copy_to_clipboard(&label, value);
+    }
+
+    fn copy_to_clipboard(&mut self, label: &str, value: String) {
         match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(value)) {
             Ok(()) => {
                 self.notice = match self.language {
@@ -914,6 +994,442 @@ impl TuiApp {
             }
         }
         self.refresh_device_pairing(true);
+    }
+
+    /// `api-keys.json` in the running daemon's data directory; the daemon
+    /// reloads it by mtime, so changes here apply without a restart.
+    fn api_key_store(
+        &self,
+    ) -> std::result::Result<crate::api_keys::ApiKeyStore, crate::error::AppError> {
+        let data_dir = self
+            .daemon
+            .as_ref()
+            .map(|process| process.data_dir.as_path())
+            .unwrap_or(self.config.data_dir.as_path());
+        crate::api_keys::ApiKeyStore::load(data_dir)
+    }
+
+    fn refresh_api_keys(&mut self, force: bool) {
+        if !force
+            && self
+                .api_keys
+                .refreshed_at
+                .is_some_and(|time| time.elapsed() < Duration::from_millis(500))
+        {
+            return;
+        }
+        self.api_keys.refreshed_at = Some(Instant::now());
+        match self.api_key_store().and_then(|store| store.list()) {
+            Ok(keys) => self.api_keys.replace(keys),
+            Err(_) => {
+                self.api_keys.error = Some(
+                    self.text(
+                        "Cannot read the API key registry.",
+                        "无法读取 API 密钥注册表。",
+                    )
+                    .to_owned(),
+                );
+            }
+        }
+    }
+
+    fn open_api_keys(&mut self) {
+        self.api_keys.open = true;
+        self.api_keys.error = None;
+        self.api_keys.confirm_revoke = None;
+        self.refresh_api_keys(true);
+        self.notice = self
+            .text(
+                "API keys panel is open. n creates a key; Esc closes.",
+                "API 密钥面板已打开。n 新建密钥，Esc 关闭。",
+            )
+            .to_owned();
+    }
+
+    fn start_api_key_name_edit(&mut self) {
+        self.edit = Some(EditMode::Text {
+            field: EditField::ApiKeyName,
+            value: String::new(),
+        });
+    }
+
+    fn create_api_key(&mut self, name: &str) {
+        let result = self.api_key_store().and_then(|store| {
+            store.create(crate::api_keys::NewApiKey {
+                name: name.to_owned(),
+                scopes: crate::api_keys::ApiKeyScopes::default(),
+                approval: crate::api_keys::ApprovalPolicy::Ask,
+                expires_at: None,
+            })
+        });
+        match result {
+            Ok((record, key)) => {
+                self.api_keys.selected = Some(record.id.clone());
+                self.api_keys.created = Some(CreatedApiKey {
+                    name: record.name,
+                    key,
+                });
+                self.api_keys.error = None;
+                self.last_error = None;
+                self.notice = self
+                    .text(
+                        "API key created. Copy it now; it will not be shown again.",
+                        "API 密钥已创建。请立即复制，之后不会再显示。",
+                    )
+                    .to_owned();
+            }
+            Err(error) => {
+                self.api_keys.error = Some(
+                    self.text("Could not create the API key.", "无法创建 API 密钥。")
+                        .to_owned(),
+                );
+                self.last_error = Some(error.to_string());
+            }
+        }
+        self.refresh_api_keys(true);
+    }
+
+    fn close_created_api_key(&mut self) {
+        if self.api_keys.created.take().is_some() {
+            self.notice = self
+                .text(
+                    "The new API key is hidden and cannot be shown again.",
+                    "新 API 密钥已隐藏，无法再次显示。",
+                )
+                .to_owned();
+        }
+    }
+
+    fn revoke_selected_api_key(&mut self) {
+        let Some(id) = self.api_keys.selected_key().map(|key| key.id.clone()) else {
+            return;
+        };
+        match self.api_key_store().and_then(|store| store.revoke(&id)) {
+            Ok(true) => {
+                self.notice = self.text("API key revoked.", "API 密钥已吊销。").to_owned();
+                self.api_keys.error = None;
+            }
+            Ok(false) => {
+                self.notice = self
+                    .text(
+                        "API key was already revoked or removed.",
+                        "API 密钥已被吊销或移除。",
+                    )
+                    .to_owned();
+            }
+            Err(error) => {
+                self.api_keys.error = Some(
+                    self.text("Could not revoke the API key.", "无法吊销 API 密钥。")
+                        .to_owned(),
+                );
+                self.last_error = Some(error.to_string());
+            }
+        }
+        self.refresh_api_keys(true);
+    }
+
+    fn cycle_selected_api_key_approval(&mut self) {
+        let Some(key) = self.api_keys.selected_key() else {
+            return;
+        };
+        let id = key.id.clone();
+        let approval = next_approval_policy(key.approval);
+        let update = crate::api_keys::ApiKeyUpdate {
+            approval: Some(approval),
+            ..Default::default()
+        };
+        match self
+            .api_key_store()
+            .and_then(|store| store.update(&id, update))
+        {
+            Ok(record) => {
+                self.notice = match self.language {
+                    TuiLanguage::English => {
+                        format!("API key approval set to {}.", record.approval.as_str())
+                    }
+                    TuiLanguage::Chinese => {
+                        format!("API 密钥审批策略已设为 {}。", record.approval.as_str())
+                    }
+                };
+                self.api_keys.error = None;
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.api_keys.error = Some(
+                    self.text(
+                        "Could not change the approval policy.",
+                        "无法更改审批策略。",
+                    )
+                    .to_owned(),
+                );
+                self.last_error = Some(error.to_string());
+            }
+        }
+        self.refresh_api_keys(true);
+    }
+
+    fn handle_api_keys_key(&mut self, key: KeyEvent) {
+        // Revocation and approval changes must not fire twice on terminals
+        // that also report key releases.
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return;
+        }
+        if let Some(created) = self.api_keys.created.as_ref() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('c') => {
+                    let label = self.text("API key", "API 密钥").to_owned();
+                    let value = created.key.to_string();
+                    self.copy_to_clipboard(&label, value);
+                }
+                KeyCode::Esc | KeyCode::Char('q') => self.close_created_api_key(),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(pending) = self.api_keys.confirm_revoke.take() {
+            if key.code == KeyCode::Char('x')
+                && self.api_keys.selected.as_deref() == Some(pending.as_str())
+            {
+                self.revoke_selected_api_key();
+            } else {
+                self.notice = self
+                    .text("API key revocation canceled.", "已取消吊销 API 密钥。")
+                    .to_owned();
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.api_keys.open = false,
+            KeyCode::Up | KeyCode::Char('k') => self.api_keys.navigate(false),
+            KeyCode::Down | KeyCode::Char('j') => self.api_keys.navigate(true),
+            KeyCode::Char('n') => self.start_api_key_name_edit(),
+            KeyCode::Char('a') => self.cycle_selected_api_key_approval(),
+            KeyCode::Char('x') => {
+                if let Some(key) = self
+                    .api_keys
+                    .selected_key()
+                    .filter(|key| key.revoked_at.is_none())
+                {
+                    self.api_keys.confirm_revoke = Some(key.id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render_api_keys(&self, frame: &mut Frame<'_>) {
+        let area = centered_area(frame.area(), 96, 22);
+        frame.render_widget(Clear, area);
+        let block = panel_block()
+            .borders(Borders::ALL)
+            .title(self.text("API keys", "API 密钥"));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(3),
+                Constraint::Length(3),
+                Constraint::Length(2),
+            ])
+            .split(inner);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(self.api_listener_label()),
+                Line::from(self.text(
+                    "Keys apply to a running daemon at once. Listener changes apply on restart.",
+                    "密钥更改立即对运行中的 daemon 生效；监听设置在重启后生效。",
+                )),
+            ])
+            .wrap(Wrap { trim: true }),
+            sections[0],
+        );
+
+        let now = crate::api_keys::unix_ms();
+        let mut lines: Vec<Line<'static>> = vec![Line::styled(
+            format!(
+                "  {:<20} {:<8} {:<12} {:<16} {}",
+                self.text("Prefix", "前缀"),
+                self.text("Status", "状态"),
+                self.text("Approval", "审批"),
+                self.text("Last used", "最近使用"),
+                self.text("Name", "名称"),
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        if self.api_keys.keys.is_empty() {
+            lines.push(Line::from(
+                self.text(
+                    "  No API keys. Press n to create one.",
+                    "  暂无 API 密钥。按 n 新建。",
+                )
+                .to_owned(),
+            ));
+        } else {
+            let selected_index = self
+                .api_keys
+                .selected
+                .as_ref()
+                .and_then(|id| self.api_keys.keys.iter().position(|key| &key.id == id))
+                .unwrap_or(0);
+            let offset =
+                selected_index.saturating_sub(sections[1].height.saturating_sub(2) as usize);
+            lines.extend(self.api_keys.keys.iter().skip(offset).map(|key| {
+                let selected = self.api_keys.selected.as_deref() == Some(key.id.as_str());
+                let status = key.status(now);
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else if status == "active" {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                Line::styled(
+                    format!(
+                        "{}{:<20} {:<8} {:<12} {:<16} {}",
+                        if selected { "> " } else { "  " },
+                        key.prefix(),
+                        status,
+                        key.approval.as_str(),
+                        format_unix_ms(key.last_used_at),
+                        device_display_name(&key.name),
+                    ),
+                    style,
+                )
+            }));
+        }
+        frame.render_widget(Paragraph::new(lines), sections[1]);
+
+        let details = self
+            .api_keys
+            .selected_key()
+            .map(|key| {
+                vec![
+                    Line::from(format!(
+                        "{}{}   {}{}",
+                        self.text("Created: ", "创建于："),
+                        format_unix_ms(Some(key.created_at)),
+                        self.text("Expires: ", "过期于："),
+                        format_unix_ms(key.expires_at),
+                    )),
+                    Line::from(format!(
+                        "{}{}",
+                        self.text("Revoked: ", "吊销于："),
+                        format_unix_ms(key.revoked_at),
+                    )),
+                ]
+            })
+            .unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(details).wrap(Wrap { trim: true }),
+            sections[2],
+        );
+
+        let footer = if self.api_keys.confirm_revoke.is_some() {
+            Line::styled(
+                self.text(
+                    "Press x again to revoke the selected key; any other key cancels.",
+                    "再次按 x 吊销所选密钥，按其他键取消。",
+                )
+                .to_owned(),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )
+        } else if let Some(error) = &self.api_keys.error {
+            Line::styled(error.clone(), Style::default().fg(Color::Red))
+        } else {
+            Line::from(
+                self.text(
+                    "n new · a cycle approval (ask/auto-approve/reject) · x revoke · Up/Down select · Esc close",
+                    "n 新建 · a 切换审批（ask/auto-approve/reject）· x 吊销 · 上下选择 · Esc 关闭",
+                )
+                .to_owned(),
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(footer).wrap(Wrap { trim: true }),
+            sections[3],
+        );
+
+        if let Some(created) = &self.api_keys.created {
+            let area = centered_area(frame.area(), 80, 10);
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!(
+                        "{}{}",
+                        self.text("Name: ", "名称："),
+                        device_display_name(&created.name)
+                    )),
+                    Line::from(""),
+                    Line::styled(
+                        created.key.to_string(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Line::from(""),
+                    Line::styled(
+                        self.text(
+                            "Copy this key now. It will not be shown again.",
+                            "请立即复制此密钥，之后不会再显示。",
+                        )
+                        .to_owned(),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    Line::from(
+                        self.text("c / Enter copy · Esc close", "c / Enter 复制 · Esc 关闭")
+                            .to_owned(),
+                    ),
+                ])
+                .wrap(Wrap { trim: false })
+                .block(
+                    panel_block()
+                        .borders(Borders::ALL)
+                        .title(self.text("New API key", "新 API 密钥")),
+                ),
+                area,
+            );
+        }
+    }
+
+    /// The configured API listener, noting when the running daemon still
+    /// uses other settings.
+    fn api_listener_label(&self) -> String {
+        let configured = self
+            .config
+            .api
+            .enabled
+            .then(|| format!("{}:{}", self.config.api.host, self.config.api.port));
+        let pending = self
+            .daemon
+            .as_ref()
+            .is_some_and(|process| process.api_listen != configured);
+        let state = match &configured {
+            Some(address) => match self.language {
+                TuiLanguage::English => format!("on {address}"),
+                TuiLanguage::Chinese => format!("开启 {address}"),
+            },
+            None => self.text("off", "关闭").to_owned(),
+        };
+        let active = self
+            .api_keys
+            .keys
+            .iter()
+            .filter(|key| key.is_active(crate::api_keys::unix_ms()))
+            .count();
+        match self.language {
+            TuiLanguage::English => format!(
+                "API: {state}{} · {active} keys (i)",
+                if pending { " (restart to apply)" } else { "" }
+            ),
+            TuiLanguage::Chinese => format!(
+                "API：{state}{} · {active} 个密钥（i）",
+                if pending { "（重启后生效）" } else { "" }
+            ),
+        }
     }
 
     fn handle_device_pairing_key(&mut self, key: KeyEvent) {
@@ -1335,6 +1851,11 @@ impl TuiApp {
             return Ok(false);
         }
 
+        if self.api_keys.open {
+            self.handle_api_keys_key(key);
+            return Ok(false);
+        }
+
         if self.view == TuiView::Observer {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('o') | KeyCode::Tab => {
@@ -1390,12 +1911,15 @@ impl TuiApp {
             KeyCode::Char('a') => self.toggle_autostart(),
             KeyCode::Char('h') => self.start_host_edit(),
             KeyCode::Char('p') => self.start_port_edit(),
+            KeyCode::Char('n') => self.toggle_api_listener(),
+            KeyCode::Char('t') => self.start_api_port_edit(),
             KeyCode::Char('w') => self.start_workspace_roots_manager(),
             KeyCode::Char('e') => self.start_pairing_encryption_edit(),
             KeyCode::Char('x') => self.start_reset_edit(),
             KeyCode::Char('g') => self.show_pairing_qr().await,
             KeyCode::Char('c') => self.show_credentials().await,
             KeyCode::Char('d') => self.open_device_pairing(),
+            KeyCode::Char('i') => self.open_api_keys(),
             KeyCode::Char('l') => self.toggle_language(),
             KeyCode::Char('u') => self.open_about(),
             KeyCode::PageUp => self.scroll_logs_up(LOG_SCROLL_STEP),
@@ -1522,15 +2046,18 @@ impl TuiApp {
             2 => self.toggle_autostart(),
             3 => self.start_host_edit(),
             4 => self.start_port_edit(),
-            5 => self.start_workspace_roots_manager(),
-            6 => self.start_pairing_encryption_edit(),
-            7 => self.start_reset_edit(),
-            8 => self.show_pairing_qr().await,
-            9 => self.show_credentials().await,
-            10 => self.toggle_language(),
-            11 => self.open_device_pairing(),
-            12 => self.open_about(),
-            13 => return Ok(true),
+            5 => self.toggle_api_listener(),
+            6 => self.start_api_port_edit(),
+            7 => self.start_workspace_roots_manager(),
+            8 => self.start_pairing_encryption_edit(),
+            9 => self.start_reset_edit(),
+            10 => self.show_pairing_qr().await,
+            11 => self.show_credentials().await,
+            12 => self.toggle_language(),
+            13 => self.open_device_pairing(),
+            14 => self.open_api_keys(),
+            15 => self.open_about(),
+            16 => return Ok(true),
             _ => {}
         }
         Ok(false)
@@ -1845,6 +2372,39 @@ impl TuiApp {
             .to_owned();
     }
 
+    fn start_api_port_edit(&mut self) {
+        self.edit = Some(EditMode::Text {
+            field: EditField::ApiPort,
+            value: self.config.api.port.to_string(),
+        });
+        self.notice = self
+            .text(
+                "API port edit window is open. Press Enter to apply or Esc to cancel.",
+                "API 端口编辑窗口已打开。按 Enter 应用，按 Esc 取消。",
+            )
+            .to_owned();
+    }
+
+    fn toggle_api_listener(&mut self) {
+        let mut candidate = self.config.clone();
+        candidate.api.enabled = !candidate.api.enabled;
+        if let Err(error) = candidate.ensure_api_listener_is_valid() {
+            self.last_error = Some(error.to_string());
+            self.notice = self
+                .text("API listener was not changed.", "API 监听未更改。")
+                .to_owned();
+            return;
+        }
+        self.config.api.enabled = candidate.api.enabled;
+        let subject = if self.config.api.enabled {
+            self.text("API listener enabled", "API 监听已开启")
+        } else {
+            self.text("API listener disabled", "API 监听已关闭")
+        }
+        .to_owned();
+        self.auto_save_api_settings(&subject);
+    }
+
     fn start_workspace_roots_manager(&mut self) {
         self.roots_picker = Some(0);
         self.notice = self
@@ -2024,7 +2584,13 @@ impl TuiApp {
             EditMode::Text {
                 field: EditField::Port,
                 value,
-            } => match validate_port(&value) {
+            } => match validate_port(&value).and_then(|port| {
+                if self.config.api.enabled && port == self.config.api.port {
+                    Err(format!("port {port} is the API listener's port"))
+                } else {
+                    Ok(port)
+                }
+            }) {
                 Ok(port) => {
                     self.config.port = port;
                     let subject = self
@@ -2039,6 +2605,34 @@ impl TuiApp {
                         .to_owned();
                 }
             },
+            EditMode::Text {
+                field: EditField::ApiPort,
+                value,
+            } => match validate_port(&value).and_then(|port| {
+                if port == self.config.port {
+                    Err(format!(
+                        "API port {port} is the main listener's port; choose another port"
+                    ))
+                } else {
+                    Ok(port)
+                }
+            }) {
+                Ok(port) => {
+                    self.config.api.port = port;
+                    let subject = self.text("API port updated", "API 端口已更新").to_owned();
+                    self.auto_save_api_settings(&subject);
+                }
+                Err(error) => {
+                    self.last_error = Some(error);
+                    self.notice = self
+                        .text("API port was not changed.", "API 端口未更改。")
+                        .to_owned();
+                }
+            },
+            EditMode::Text {
+                field: EditField::ApiKeyName,
+                value,
+            } => self.create_api_key(&value),
             EditMode::Encryption { value } => {
                 // Same rule as the host editor: never save a configuration
                 // the daemon refuses to start with.
@@ -2210,6 +2804,40 @@ impl TuiApp {
         }
     }
 
+    /// Saves `[api]`; the listener changes on the next daemon (re)start.
+    fn auto_save_api_settings(&mut self, subject: &str) -> bool {
+        let data_dir = self.config.data_dir.clone();
+        let config_path = data_dir.join("config.toml");
+        match Config::save_api_settings(data_dir, self.config.api.enabled, self.config.api.port) {
+            Ok(()) => {
+                self.notice = match self.language {
+                    TuiLanguage::English => format!(
+                        "{subject} and auto-saved to {}. It applies the next time the daemon starts.",
+                        config_path.display()
+                    ),
+                    TuiLanguage::Chinese => format!(
+                        "{subject}，并已自动保存到 {}，将在 daemon 下次启动时生效。",
+                        config_path.display()
+                    ),
+                };
+                self.last_error = None;
+                self.push_log(self.notice.clone());
+                true
+            }
+            Err(error) => {
+                self.notice = match self.language {
+                    TuiLanguage::English => {
+                        format!("{subject}, but settings auto-save failed.")
+                    }
+                    TuiLanguage::Chinese => format!("{subject}，但设置自动保存失败。"),
+                };
+                self.last_error = Some(error.to_string());
+                self.push_log(format!("{} {}", self.notice.clone(), error));
+                false
+            }
+        }
+    }
+
     fn save_logs(&mut self) -> Result<()> {
         let dir = self.config.data_dir.join("tui-logs");
         fs::create_dir_all(&dir)
@@ -2334,7 +2962,7 @@ impl TuiApp {
         .spacing(u16::from(wide))
         .split(chunks[0]);
         if wide {
-            let status_height = if main[0].height >= 26 { 15 } else { 7 };
+            let status_height = if main[0].height >= 26 { 16 } else { 7 };
             let left = Layout::vertical([Constraint::Length(status_height), Constraint::Min(3)])
                 .spacing(1)
                 .split(main[0]);
@@ -2383,6 +3011,9 @@ impl TuiApp {
                 popup.area,
             );
         }
+        if self.api_keys.open {
+            self.render_api_keys(frame);
+        }
         if let Some(edit) = &self.edit {
             let area = self.edit_popup_area(frame.area(), edit);
             frame.render_widget(Clear, area);
@@ -2417,6 +3048,7 @@ impl TuiApp {
         if self.pairing_qr.is_some()
             || self.credentials.is_some()
             || self.device_pairing.open
+            || self.api_keys.open
             || self.about.is_some()
             || (self.view == TuiView::Control
                 && (self.edit.is_some()
@@ -2565,7 +3197,7 @@ impl TuiApp {
             )
         };
 
-        if area.height < 14 {
+        if area.height < 15 {
             return Paragraph::new(vec![
                 Line::from(vec![Span::raw(self.text("Status: ", "状态：")), status]),
                 Line::from(if connect_host == listen_host {
@@ -2644,6 +3276,7 @@ impl TuiApp {
             )),
             Line::from(vec![Span::raw(self.text("Auth: ", "认证：")), auth_state]),
             devices_line,
+            Line::from(self.api_listener_label()),
             Line::from(match self.language {
                 TuiLanguage::English => format!("Data dir: {}", data_dir.display()),
                 TuiLanguage::Chinese => format!("数据目录：{}", data_dir.display()),
@@ -2715,12 +3348,19 @@ impl TuiApp {
         } else {
             self.text("Launch at login: off", "开机自启：关")
         };
+        let api_listener = if self.config.api.enabled {
+            self.text("API listener: on", "API 监听：开")
+        } else {
+            self.text("API listener: off", "API 监听：关")
+        };
         let actions = [
             start_stop,
             self.text("Restart daemon", "重启 daemon"),
             autostart,
             self.text("Edit listen IP", "编辑监听 IP"),
             self.text("Edit listen port", "编辑监听端口"),
+            api_listener,
+            self.text("Edit API port", "编辑 API 端口"),
             self.text("Manage workspace roots", "管理工作区根目录"),
             self.text("Edit required encryption", "编辑强制加密"),
             self.text("Reset", "重置"),
@@ -2728,11 +3368,12 @@ impl TuiApp {
             self.text("Credentials & copy", "凭据与复制"),
             self.text("Language: English", "语言：中文"),
             self.text("Device verification", "设备验证"),
+            self.text("API keys", "API 密钥"),
             self.text("About & updates", "关于与更新"),
             self.text("Quit", "退出"),
         ];
         let shortcuts = [
-            "s", "r", "a", "h", "p", "w", "e", "x", "g", "c", "l", "d", "u", "q",
+            "s", "r", "a", "h", "p", "n", "t", "w", "e", "x", "g", "c", "l", "d", "i", "u", "q",
         ];
         let items = actions
             .iter()
@@ -2988,6 +3629,66 @@ impl TuiApp {
                     )),
                 ],
             ),
+            EditMode::Text {
+                field: field @ (EditField::ApiPort | EditField::ApiKeyName),
+                value,
+            } => {
+                let api_port = matches!(field, EditField::ApiPort);
+                (
+                    if api_port {
+                        self.text("Edit API Port", "编辑 API 端口")
+                    } else {
+                        self.text("New API Key", "新建 API 密钥")
+                    }
+                    .to_owned(),
+                    vec![
+                        Line::from(vec![
+                            Span::styled(
+                                if api_port {
+                                    self.text("API port: ", "API 端口：")
+                                } else {
+                                    self.text("Key name: ", "密钥名称：")
+                                }
+                                .to_owned(),
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                if value.is_empty() {
+                                    " ".to_owned()
+                                } else {
+                                    value.clone()
+                                },
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]),
+                        Line::from(""),
+                        Line::from(if api_port {
+                            self.text(
+                                "1 to 65535, not the listen port.",
+                                "范围为 1 到 65535，且不能与监听端口相同。",
+                            )
+                        } else {
+                            self.text(
+                                "New keys use every agent and workspace, approval ask.",
+                                "新密钥可用于全部 agent 和工作区，审批策略为 ask。",
+                            )
+                        }),
+                        Line::from(if api_port {
+                            self.text(
+                                "Enter saves; applies on the next daemon start. Esc cancels.",
+                                "Enter 保存，daemon 下次启动时生效。Esc 取消。",
+                            )
+                        } else {
+                            self.text(
+                                "Enter creates the key. Esc cancels.",
+                                "Enter 创建密钥，Esc 取消。",
+                            )
+                        }),
+                    ],
+                )
+            }
             EditMode::Encryption { value } => (
                 self.text("Required Transport Encryption", "强制传输加密")
                     .to_owned(),
@@ -4342,6 +5043,8 @@ enum EditMode {
 enum EditField {
     Host,
     Port,
+    ApiPort,
+    ApiKeyName,
 }
 
 #[derive(Clone, Copy)]
@@ -4496,7 +5199,8 @@ mod tests {
                         .map(|cell| cell.symbol())
                         .collect::<String>();
                     let shortcut = [
-                        "s", "r", "a", "h", "p", "w", "e", "x", "g", "c", "l", "d", "u", "q",
+                        "s", "r", "a", "h", "p", "n", "t", "w", "e", "x", "g", "c", "l", "d", "i",
+                        "u", "q",
                     ][selected];
                     assert!(
                         contents.contains(&format!("> [{shortcut}]")),
@@ -4783,6 +5487,129 @@ mod tests {
         assert!(app.daemon_op.is_none());
         assert!(app.daemon.is_none());
         assert!(app.last_error.is_none());
+    }
+
+    fn api_keys_app(name: &str) -> (super::TuiApp, std::path::PathBuf) {
+        let data_dir = std::env::temp_dir().join(format!(
+            "todex-tui-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut app = super::TuiApp::new(crate::config::Config {
+            data_dir: data_dir.clone(),
+            ..crate::config::Config::default()
+        });
+        app.language = TuiLanguage::English;
+        (app, data_dir)
+    }
+
+    fn stored_api_keys(data_dir: &std::path::Path) -> Vec<crate::api_keys::ApiKeyRecord> {
+        crate::api_keys::ApiKeyStore::load(data_dir)
+            .unwrap()
+            .list()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_keys_panel_creates_cycles_approval_and_revokes_keys() {
+        use crate::api_keys::ApprovalPolicy;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (mut app, data_dir) = api_keys_app("api-keys");
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        app.handle_key(key(KeyCode::Char('i'))).await.unwrap();
+        assert!(app.api_keys.open);
+        app.handle_key(key(KeyCode::Char('n'))).await.unwrap();
+        assert!(app.edit.is_some());
+        for ch in "ci bot".chars() {
+            app.handle_key(key(KeyCode::Char(ch))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+
+        let keys = stored_api_keys(&data_dir);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "ci bot");
+        assert_eq!(keys[0].approval, ApprovalPolicy::Ask);
+        // The full key is shown once, then gone for good.
+        let created = app.api_keys.created.as_ref().unwrap().key.to_string();
+        assert!(created.starts_with(&format!("{}_", keys[0].prefix())));
+        let rendered = render_preview(&app, 100, 30)
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(&created), "{rendered}");
+        assert!(rendered.contains("It will not be shown again."));
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.api_keys.created.is_none());
+        assert!(app.api_keys.open);
+
+        for expected in [
+            ApprovalPolicy::AutoApprove,
+            ApprovalPolicy::Reject,
+            ApprovalPolicy::Ask,
+        ] {
+            app.handle_key(key(KeyCode::Char('a'))).await.unwrap();
+            assert_eq!(stored_api_keys(&data_dir)[0].approval, expected);
+        }
+
+        // A first x only asks; any other key cancels.
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        app.handle_key(key(KeyCode::Char('j'))).await.unwrap();
+        assert!(stored_api_keys(&data_dir)[0].revoked_at.is_none());
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        let keys = stored_api_keys(&data_dir);
+        assert!(keys[0].revoked_at.is_some());
+        assert_eq!(keys[0].status(crate::api_keys::unix_ms()), "revoked");
+
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(!app.api_keys.open);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn api_listener_settings_validate_and_persist() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (mut app, data_dir) = api_keys_app("api-settings");
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let main_port = app.config.port;
+
+        app.start_api_port_edit();
+        app.edit = Some(super::EditMode::Text {
+            field: super::EditField::ApiPort,
+            value: main_port.to_string(),
+        });
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.last_error.is_some());
+        assert_ne!(app.config.api.port, main_port);
+
+        app.start_api_port_edit();
+        app.edit = Some(super::EditMode::Text {
+            field: super::EditField::ApiPort,
+            value: "0".to_owned(),
+        });
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.last_error.is_some());
+
+        app.start_api_port_edit();
+        app.edit = Some(super::EditMode::Text {
+            field: super::EditField::ApiPort,
+            value: "7400".to_owned(),
+        });
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.last_error.is_none());
+        app.handle_key(key(KeyCode::Char('n'))).await.unwrap();
+        assert!(app.config.api.enabled);
+
+        let saved = std::fs::read_to_string(data_dir.join("config.toml")).unwrap();
+        let saved: toml::Value = toml::from_str(&saved).unwrap();
+        assert_eq!(saved["api"]["enabled"].as_bool(), Some(true));
+        assert_eq!(saved["api"]["port"].as_integer(), Some(7400));
+        assert!(app.api_listener_label().contains("on 127.0.0.1:7400"));
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     fn render_pairing(app: &super::TuiApp) -> String {
@@ -5076,7 +5903,7 @@ mod tests {
         assert_eq!(TuiLanguage::parse("invalid"), None);
         assert_eq!(TuiLanguage::Chinese.as_str(), "zh-CN");
         assert_eq!(TuiLanguage::English.as_str(), "en");
-        assert_eq!(ACTION_COUNT, 14);
+        assert_eq!(ACTION_COUNT, 17);
     }
 
     #[test]
