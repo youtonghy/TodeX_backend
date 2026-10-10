@@ -628,6 +628,12 @@ impl ProviderDriver for ClaudeDriver {
                 .provider_mode
                 .expect("Claude permission mode validated"),
         ];
+        // `session_state_changed: idle` marks the real end of a turn; see
+        // `run_claude_turn`.
+        spec.env.insert(
+            "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".to_owned(),
+            "1".to_owned(),
+        );
         // `--resume` replays a transcript Claude already wrote; it fails
         // initialization outright ("No conversation found") when the file is
         // missing or unloadable — transcript cleanup, manual deletion, or a
@@ -2102,6 +2108,17 @@ async fn run_claude_turn(
     // notification another hand-back already covered; resending then would
     // replay the user's prompt into the conversation.
     let mut empty_results = 0_u32;
+    // With `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` Claude reports
+    // `session_state_changed`, and `idle` comes only once its input queue and
+    // background work are drained. That is the authoritative end of the turn:
+    // a subagent's `SubagentHandback` reaches the main session as a queued
+    // `peer` message with no `task_notification`, so `BackgroundTasks` alone
+    // can end the turn on a `result` with a hand-back still queued and kill
+    // the process before the model reads it. `settled` holds the latest
+    // successful `result` until `idle`; a CLI that never reports session
+    // state falls back to `BackgroundTasks`.
+    let mut session_states = false;
+    let mut settled: Option<Value> = None;
     // `can_use_tool` waits on the user for up to the permission timeout, so
     // control requests are answered by detached tasks while this loop keeps
     // draining stdout — awaiting a prompt inline would let the pipe fill and
@@ -2111,7 +2128,7 @@ async fn run_claude_turn(
     // closes, which resolves any prompt still waiting, and the closed
     // response channel drops the answer.
     let (response_tx, mut response_rx) = mpsc::unbounded_channel::<Value>();
-    loop {
+    let result = loop {
         let message = tokio::select! {
             message = process.read_frame() => sink.provider_frame(message?).await?,
             response = response_rx.recv() => {
@@ -2142,11 +2159,6 @@ async fn run_claude_turn(
                 if let Some(usage) = message.get("usage").filter(|usage| usage.is_object()) {
                     sink.emit("usage.updated", json!({ "provider": "claude-code", "turnId": prompt.turn_id, "source": "provider", "scope": "turn", "usage": usage, "costUsd": message.get("total_cost_usd") })).await?;
                 }
-                let native_session_id = message
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&requested_session_id)
-                    .to_owned();
                 let is_error = message
                     .get("is_error")
                     .and_then(Value::as_bool)
@@ -2181,7 +2193,9 @@ async fn run_claude_turn(
                 // background work remains, Claude keeps the stream open,
                 // delivers task_notification, and runs a follow-up turn that
                 // ends in another `result`. Terminating here kills those
-                // subagents mid-flight or drops their queued hand-back.
+                // subagents mid-flight or drops their queued hand-back. With
+                // session state events the pending notice is only for clients;
+                // `idle` decides when the turn ends.
                 if background_tasks.pending() {
                     sink.emit(
                         "provider.event",
@@ -2195,27 +2209,15 @@ async fn run_claude_turn(
                         }),
                     )
                     .await?;
+                    if !session_states {
+                        continue;
+                    }
+                }
+                if session_states {
+                    settled = Some(message);
                     continue;
                 }
-                if !saw_output {
-                    return Err(AppError::ProviderUnavailable(
-                        "Claude Code completed without producing output; please retry".to_owned(),
-                    ));
-                }
-                let mut provider_state = context.provider_state;
-                provider_state.native_session_id = Some(native_session_id.clone());
-                provider_state.recoverable = true;
-                provider_state.last_error = None;
-                sink.save_provider_state(provider_state).await?;
-                return Ok(DriverTurnResult {
-                    native_session_id: Some(native_session_id),
-                    stop_reason: message
-                        .get("subtype")
-                        .and_then(Value::as_str)
-                        .unwrap_or("completed")
-                        .to_owned(),
-                    cancelled: false,
-                });
+                break message;
             }
             Some("stream_event") => {
                 saw_output = true;
@@ -2287,6 +2289,17 @@ async fn run_claude_turn(
                 spawn_control_request(&response_tx, message, sink, cancel);
             }
             Some("system") => {
+                if message.get("subtype").and_then(Value::as_str) == Some("session_state_changed") {
+                    session_states = true;
+                    // An `idle` before any successful `result` follows a
+                    // zero-turn `result` whose prompt was just resent.
+                    if message.get("state").and_then(Value::as_str) == Some("idle") {
+                        if let Some(result) = settled.take() {
+                            break result;
+                        }
+                    }
+                    continue;
+                }
                 background_tasks.apply(&message);
                 if let Some((event, payload)) = subagents.system_event(&message, &prompt.turn_id) {
                     sink.emit(event, payload).await?;
@@ -2357,7 +2370,31 @@ async fn run_claude_turn(
             }
             None => {}
         }
+    };
+    if !saw_output {
+        return Err(AppError::ProviderUnavailable(
+            "Claude Code completed without producing output; please retry".to_owned(),
+        ));
     }
+    let native_session_id = result
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or(&requested_session_id)
+        .to_owned();
+    let mut provider_state = context.provider_state;
+    provider_state.native_session_id = Some(native_session_id.clone());
+    provider_state.recoverable = true;
+    provider_state.last_error = None;
+    sink.save_provider_state(provider_state).await?;
+    Ok(DriverTurnResult {
+        native_session_id: Some(native_session_id),
+        stop_reason: result
+            .get("subtype")
+            .and_then(Value::as_str)
+            .unwrap_or("completed")
+            .to_owned(),
+        cancelled: false,
+    })
 }
 
 /// Normalizes a Claude Code `rate_limit_event` into the shared account-quota

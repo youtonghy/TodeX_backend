@@ -4579,6 +4579,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_queued_peer_hand_back_keeps_the_claude_turn_open_until_idle() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-peer-handback").await;
+        fs::write(root.join("peer-handback"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let turn_id = supervisor
+            .prompt(&manifest.id, "plan it".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(history.iter().any(
+            |event| event.event_type == "turn.completed" && event.payload["turnId"] == turn_id
+        ));
+        // Nothing was pending at the "waiting on the second" `result`; the
+        // queued hand-back is answered only because the turn waits for idle.
+        assert!(
+            history
+                .iter()
+                .any(|event| event.payload.to_string().contains("fixture hand-back")),
+            "{history:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelling_a_turn_resolves_an_open_permission_prompt() {
         let (root, store, supervisor, workspace) =
             control_fixture("todex-claude-permission-cancel").await;
@@ -5780,6 +5810,39 @@ elif [ -f "$(dirname "$0")/late-notification" ]; then
       printf '{"type":"system","subtype":"init"}\n'
       printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"fixture hand-back"}}}\n'
       printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"fixture hand-back"}\n'
+    ) &
+  done
+elif [ -f "$(dirname "$0")/peer-handback" ]; then
+  # Background subagents that report through `SubagentHandback`: their
+  # hand-backs reach the main session as queued `peer` messages with no
+  # `task_notification`, so nothing is pending at the second `result` even
+  # though the second hand-back is still queued. Only `idle` ends the turn.
+  while IFS= read -r line; do
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{}}}\n'
+        continue
+        ;;
+    esac
+    [ -n "$started" ] && continue
+    started=1
+    (
+      printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+      printf '{"type":"system","subtype":"task_started","task_id":"a-1","is_backgrounded":true}\n'
+      printf '{"type":"system","subtype":"task_started","task_id":"a-2","is_backgrounded":true}\n'
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"launched"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"launched"}\n'
+      printf '{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n'
+      printf '{"type":"system","subtype":"init"}\n'
+      printf '{"type":"user","origin":{"kind":"peer","senderTaskId":"a-1"},"message":{"role":"user","content":"report one"}}\n'
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"waiting on the second"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"waiting on the second"}\n'
+      sleep 0.3
+      printf '{"type":"system","subtype":"init"}\n'
+      printf '{"type":"user","origin":{"kind":"peer","senderTaskId":"a-2"},"message":{"role":"user","content":"report two"}}\n'
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"fixture hand-back"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"fixture hand-back"}\n'
+      printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
     ) &
   done
 else

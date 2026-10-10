@@ -21,8 +21,12 @@ optional and canonical aliases are recomputed when old journals are replayed.
 - Usage belongs to a turn/message and updates a stable snapshot. Unknown usage
   is not zero. TPS is omitted without a reliable generation interval. Automatic
   compaction updates its own state without ending the parent turn.
-- Claude Code `result` frames close a model turn, not the process. A turn stays
-  open while provider-reported background tasks remain; a zero-iteration result
+- Claude Code `result` frames close a model turn, not the process. Claude runs
+  with `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`, and the turn ends at the
+  `session_state_changed` `idle` frame that follows the last successful
+  `result`. Only then are background tasks and queued subagent hand-backs
+  drained. A CLI without session state events falls back to keeping the turn
+  open while provider-reported background tasks remain. A zero-iteration result
   means the prompt was consumed unanswered and is resent on the open stream.
 - Subagent runs are normalized to `subagent.*` events carrying a stable
   `subagentId`, `title`, `task`, `status` and optional `parentId`, `turnId`,
