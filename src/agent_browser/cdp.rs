@@ -272,6 +272,18 @@ impl Cdp {
         params: Value,
         session_id: Option<&str>,
     ) -> Result<Value, BrowserError> {
+        self.call_within(method, params, session_id, CALL_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::call`] that gives up after `timeout`.
+    pub(crate) async fn call_within(
+        &self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value, BrowserError> {
         if self.is_closed() {
             return Err(BrowserError::failed("the browser is not running"));
         }
@@ -290,12 +302,12 @@ impl Cdp {
             self.forget(id);
             return Err(BrowserError::failed("the browser is not running"));
         }
-        match tokio::time::timeout(CALL_TIMEOUT, receiver).await {
+        match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(BrowserError::failed("the browser connection closed")),
             Err(_) => {
                 self.forget(id);
-                Err(BrowserError::failed(format!("{method} timed out")))
+                Err(BrowserError::new("TIMEOUT", format!("{method} timed out")))
             }
         }
     }

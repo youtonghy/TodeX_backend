@@ -23,6 +23,16 @@ const VIEWPORT_HEIGHT: u32 = 800;
 const SCREENSHOT_MAX_WIDTH: f64 = 1280.0;
 const SCREENSHOT_QUALITY: u8 = 70;
 const SETTLE_LIMIT: Duration = Duration::from_secs(10);
+/// How long a loaded page gets to paint something (a script-rendered app
+/// is still empty when its document finishes loading).
+const PAINT_LIMIT: Duration = Duration::from_secs(5);
+/// A window that renders nothing (minimized, hidden) never answers a
+/// capture; a visible one answers within a fraction of a second.
+const SCREENSHOT_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(10)
+};
 const MAX_WAIT_MS: u64 = 10_000;
 /// Live frames arrive at most this often: each frame is acked only once
 /// this long has passed since the previous one, and Chromium encodes the
@@ -800,6 +810,7 @@ impl Running {
             tracing::debug!(error, "agent browser load failed");
         }
         self.settle(&session_id).await;
+        self.painted(&session_id).await;
         self.page(&target_id).await
     }
 
@@ -812,6 +823,7 @@ impl Running {
             return self.load(conversation_id, url).await;
         }
         let (target_id, session_id) = self.tab(conversation_id).await?;
+        self.unminimize(&target_id).await;
         let session = Some(session_id.as_str());
         match args["action"].as_str() {
             Some("reload") => {
@@ -852,6 +864,7 @@ impl Running {
             }
         }
         self.settle(&session_id).await;
+        self.painted(&session_id).await;
         self.page(&target_id).await
     }
 
@@ -879,6 +892,7 @@ impl Running {
         result["tree"] = Value::from(formatted.tree);
         result["truncated"] = Value::from(formatted.truncated);
         if screenshot {
+            self.unminimize(&target_id).await;
             result["screenshot"] = self.screenshot(&session_id).await?;
         }
         Ok(result)
@@ -902,7 +916,7 @@ impl Running {
         let scale = (SCREENSHOT_MAX_WIDTH / width).min(1.0);
         let shot = self
             .cdp
-            .call(
+            .call_within(
                 "Page.captureScreenshot",
                 json!({
                     "format": "jpeg",
@@ -914,8 +928,21 @@ impl Running {
                     },
                 }),
                 session,
+                SCREENSHOT_TIMEOUT,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                if error.code == "TIMEOUT" {
+                    BrowserError::new(
+                        "NOT_RENDERING",
+                        "The browser window is not drawing the page (it may be minimized or \
+                         hidden), so no screenshot could be taken. Ask the user to restore the \
+                         window, then try again; browser_snapshot without a screenshot still works.",
+                    )
+                } else {
+                    error
+                }
+            })?;
         let data = shot["data"]
             .as_str()
             .ok_or_else(|| BrowserError::failed("the page could not be captured"))?;
@@ -929,7 +956,8 @@ impl Running {
 
     /// A JPEG of the tab now (the live frame's fallback).
     pub(crate) async fn frame(&self, conversation_id: &str) -> Result<Vec<u8>, BrowserError> {
-        let (_, session_id) = self.tab(conversation_id).await?;
+        let (target_id, session_id) = self.tab(conversation_id).await?;
+        self.unminimize(&target_id).await;
         let shot = self.screenshot(&session_id).await?;
         BASE64
             .decode(shot["data"].as_str().unwrap_or_default())
@@ -1186,6 +1214,39 @@ impl Running {
             }
         }
     }
+
+    /// Waits (bounded) until the page shows something: text or a media or
+    /// form element, checked after two animation frames so it has been
+    /// drawn. A window that draws nothing runs no animation frames; the
+    /// bound covers that too.
+    async fn painted(&self, session_id: &str) {
+        const PAINTED: &str = "new Promise(resolve => requestAnimationFrame(() => \
+            requestAnimationFrame(() => resolve(!!document.body && \
+            (document.body.innerText.trim().length > 0 || \
+            !!document.body.querySelector('img,svg,canvas,video,iframe,input,button,select,textarea'))))))";
+        let deadline = Instant::now() + PAINT_LIMIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            let painted = self
+                .cdp
+                .call_within(
+                    "Runtime.evaluate",
+                    json!({ "expression": PAINTED, "awaitPromise": true, "returnByValue": true }),
+                    Some(session_id),
+                    left,
+                )
+                .await;
+            match painted {
+                Ok(painted) if painted["result"]["value"] == true => return,
+                Err(_) if self.cdp.is_closed() => return,
+                Err(error) if error.code == "TIMEOUT" => return,
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    }
 }
 
 /// The CDP commands for a target auto-attach reported (`opener_session`
@@ -1356,6 +1417,86 @@ mod tests {
             assert_eq!(dialog_accept(&json!({ "type": kind })), accepted, "{kind}");
         }
         assert!(!dialog_accept(&json!({})));
+    }
+
+    /// A browser with a scripted Chromium and conversation "c"'s tab open
+    /// on a local page.
+    async fn opened() -> (
+        std::path::PathBuf,
+        crate::agent_browser::AgentBrowser,
+        crate::agent_browser::scripted::ScriptedChromium,
+    ) {
+        let root = std::env::temp_dir().join(format!("todex-browser-{}", uuid::Uuid::new_v4()));
+        let browser = crate::agent_browser::AgentBrowser::load(&root).unwrap();
+        let chromium = browser.script_chromium();
+        chromium.set_unpainted(2);
+        browser
+            .invoke(
+                "c",
+                &json!({ "id": "w", "path": "/w" }),
+                "browser_open",
+                &json!({ "url": "http://localhost:5173/" }),
+                true,
+            )
+            .await
+            .unwrap();
+        (root, browser, chromium)
+    }
+
+    async fn screenshot(
+        browser: &crate::agent_browser::AgentBrowser,
+    ) -> Result<Value, BrowserError> {
+        browser
+            .invoke(
+                "c",
+                &json!({ "id": "w", "path": "/w" }),
+                "browser_snapshot",
+                &json!({ "screenshot": true }),
+                true,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn opening_returns_once_the_page_has_drawn() {
+        let (root, _browser, chromium) = opened().await;
+        // Two checks found nothing drawn; the third found the page.
+        let paint_checks = chromium
+            .calls("Runtime.evaluate")
+            .into_iter()
+            .filter(|params| params["awaitPromise"] == true)
+            .count();
+        assert_eq!(paint_checks, 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_screenshot_restores_a_minimized_window_first() {
+        let (root, browser, chromium) = opened().await;
+        chromium.minimize();
+        let snapshot = screenshot(&browser).await.unwrap();
+        assert_eq!(snapshot["screenshot"]["data"], "AAAA");
+        let methods = chromium.methods();
+        let restored = methods
+            .iter()
+            .rposition(|method| method == "Browser.setWindowBounds")
+            .unwrap();
+        let captured = methods
+            .iter()
+            .rposition(|method| method == "Page.captureScreenshot")
+            .unwrap();
+        assert!(restored < captured);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_window_that_draws_nothing_fails_the_screenshot_in_time() {
+        let (root, browser, chromium) = opened().await;
+        // Restoring does not help (a minimized Wayland window stays so).
+        chromium.hold("Page.captureScreenshot");
+        let error = screenshot(&browser).await.unwrap_err();
+        assert_eq!(error.code, "NOT_RENDERING");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

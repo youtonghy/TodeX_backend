@@ -5,7 +5,7 @@
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, Weak,
     },
     time::Duration,
@@ -29,6 +29,11 @@ struct State {
     launch_delay: Mutex<Duration>,
     /// Profile → its connection, in launch order.
     connections: Mutex<Vec<(String, Cdp)>>,
+    /// The tab windows are minimized: captures go unanswered until a
+    /// window is restored.
+    minimized: AtomicBool,
+    /// Paint checks still to answer "nothing drawn yet".
+    unpainted: AtomicUsize,
 }
 
 #[derive(Clone, Default)]
@@ -79,6 +84,27 @@ impl ScriptedChromium {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(method);
+    }
+
+    /// Minimizes the tab windows (as the person can).
+    pub(crate) fn minimize(&self) {
+        self.state.minimized.store(true, Ordering::SeqCst);
+    }
+
+    /// The next `checks` paint checks find nothing drawn.
+    pub(crate) fn set_unpainted(&self, checks: usize) {
+        self.state.unpainted.store(checks, Ordering::SeqCst);
+    }
+
+    /// The methods of every command sent so far, in order.
+    pub(crate) fn methods(&self) -> Vec<String> {
+        self.state
+            .log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(method, _, _)| method.clone())
+            .collect()
     }
 
     /// The params of every `method` command sent so far.
@@ -170,7 +196,37 @@ impl ScriptedChromium {
                         json!({ "sessionId": format!("S-{}", params["targetId"].as_str().unwrap_or_default()) })
                     }
                     "Page.getFrameTree" => json!({ "frameTree": { "frame": { "id": "F" } } }),
-                    "Runtime.evaluate" => json!({ "result": { "value": "complete" } }),
+                    "Runtime.evaluate" => {
+                        let expression = params["expression"].as_str().unwrap_or_default();
+                        if expression.contains("readyState") {
+                            json!({ "result": { "value": "complete" } })
+                        } else {
+                            // One responder per connection: no other decrement
+                            // lands between the load and the sub.
+                            let unpainted = state.unpainted.load(Ordering::SeqCst) > 0;
+                            if unpainted {
+                                state.unpainted.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            json!({ "result": { "value": !unpainted } })
+                        }
+                    }
+                    "Browser.getWindowForTarget" => {
+                        let state = if state.minimized.load(Ordering::SeqCst) {
+                            "minimized"
+                        } else {
+                            "normal"
+                        };
+                        json!({ "windowId": 1, "bounds": { "windowState": state } })
+                    }
+                    "Browser.setWindowBounds" => {
+                        if params["bounds"]["windowState"] == "normal" {
+                            state.minimized.store(false, Ordering::SeqCst);
+                        }
+                        json!({})
+                    }
+                    // A minimized window draws nothing and never answers.
+                    "Page.captureScreenshot" if state.minimized.load(Ordering::SeqCst) => continue,
+                    "Page.captureScreenshot" => json!({ "data": "AAAA" }),
                     "Target.getTargetInfo" => {
                         json!({ "targetInfo": { "url": "http://localhost:5173/", "title": "App" } })
                     }

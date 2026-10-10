@@ -173,6 +173,13 @@ async fn launch_in(
     if cfg!(target_os = "linux") {
         command.arg("--password-store=basic");
     }
+    // A minimized Wayland window cannot be restored by the app (xdg-shell
+    // has no request for it) and renders nothing, so screenshots and live
+    // frames stop for good. An X11 window (XWayland in a Wayland session)
+    // can be restored.
+    if cfg!(target_os = "linux") && std::env::var_os("DISPLAY").is_some() {
+        command.arg("--ozone-platform=x11");
+    }
     let mut display = if virtual_display {
         self::virtual_display(&mut command, profile_dir).await?
     } else {
