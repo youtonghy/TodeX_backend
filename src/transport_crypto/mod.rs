@@ -767,6 +767,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         }
     }
 

@@ -3907,6 +3907,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .expect("create app state")

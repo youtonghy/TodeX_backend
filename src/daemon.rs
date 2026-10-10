@@ -36,6 +36,9 @@ pub struct DaemonProcess {
     pub workspace_roots: Vec<PathBuf>,
     pub started_at: DateTime<Utc>,
     pub executable: PathBuf,
+    /// The external API listener (`host:port`), when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_listen: Option<String>,
 }
 
 impl DaemonProcess {
@@ -57,6 +60,14 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
             "cannot start daemon because {}:{} is already in use by an unmanaged process; stop that service or choose another port",
             config.host,
             config.port
+        );
+    }
+    config.ensure_api_listener_is_valid()?;
+    if config.api.enabled && port_is_listening(&config.api.host, config.api.port) {
+        bail!(
+            "cannot start daemon because the API port {}:{} is already in use; stop that service or choose another api.port",
+            config.api.host,
+            config.api.port
         );
     }
 
@@ -120,6 +131,15 @@ pub fn daemon_run_args(config: &Config) -> Vec<std::ffi::OsString> {
     for root in &config.workspace_roots {
         args.push("--workspace-root".into());
         args.push(root.clone().into_os_string());
+    }
+    if config.api.enabled {
+        args.extend([
+            "--enable-api".into(),
+            "--api-host".into(),
+            config.api.host.clone().into(),
+            "--api-port".into(),
+            config.api.port.to_string().into(),
+        ]);
     }
     args
 }
@@ -258,7 +278,10 @@ pub async fn run(config: Config) -> Result<()> {
     // gone so the restart can claim it.
     remove_stale_pid_file(&config.data_dir)?;
     let server = ManagedServer::start(config, ProviderProcessTracking::Enabled).await?;
-    let process = write_pid_file(server.config(), server.addr().port())?;
+    let api_listen = server
+        .api_addr()
+        .map(|addr| format!("{}:{}", server.config().api.host, addr.port()));
+    let process = write_pid_file(server.config(), server.addr().port(), api_listen)?;
     let pid_file = PidFileGuard {
         data_dir: server.config().data_dir.clone(),
         pid: process.pid,
@@ -376,7 +399,7 @@ fn read_pid_file(data_dir: &Path) -> Result<Option<DaemonProcess>> {
     Ok(Some(process))
 }
 
-fn write_pid_file(config: &Config, port: u16) -> Result<DaemonProcess> {
+fn write_pid_file(config: &Config, port: u16, api_listen: Option<String>) -> Result<DaemonProcess> {
     fs::create_dir_all(&config.data_dir).with_context(|| {
         format!(
             "failed to create data directory {}",
@@ -393,6 +416,7 @@ fn write_pid_file(config: &Config, port: u16) -> Result<DaemonProcess> {
         workspace_roots: config.workspace_roots.clone(),
         started_at: Utc::now(),
         executable: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("todex-agentd")),
+        api_listen,
     };
     let raw = serde_json::to_string_pretty(&process)?;
     let mut file = OpenOptions::new()
@@ -915,6 +939,7 @@ mod tests {
             workspace_roots: config.workspace_roots.clone(),
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
+            api_listen: None,
         };
         fs::write(
             pid_file_path(&config.data_dir),
@@ -942,6 +967,7 @@ mod tests {
             workspace_roots: config.workspace_roots.clone(),
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
+            api_listen: None,
         };
         fs::write(
             pid_file_path(&config.data_dir),
@@ -964,6 +990,7 @@ mod tests {
             workspace_roots: vec![std::env::temp_dir()],
             started_at: Utc::now(),
             executable: std::env::temp_dir().join("definitely-not-todex-agentd"),
+            api_listen: None,
         };
         assert!(!process_matches_record(&process));
     }
@@ -997,6 +1024,7 @@ mod tests {
             workspace_roots: config.workspace_roots.clone(),
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
+            api_listen: None,
         };
         fs::write(
             pid_file_path(&config.data_dir),
@@ -1081,6 +1109,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         }
     }
 

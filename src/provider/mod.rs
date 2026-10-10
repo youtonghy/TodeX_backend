@@ -30,8 +30,7 @@ pub use supervisor::{
     CancelOutcome, ConversationPrompt, ConversationSupervisor, FollowUpAddOutcome,
     PromptContentRef, PromptSkillRef,
 };
-pub use types::PermissionDecision;
-pub(crate) use types::PermissionOutcome;
+pub use types::{PermissionDecision, PermissionOutcome, PermissionPolicy};
 
 #[cfg(test)]
 mod control_tests;

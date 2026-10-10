@@ -1,5 +1,7 @@
 mod agent_desktop;
 mod agent_providers;
+pub(crate) mod api;
+mod api_keys;
 mod device_pairing;
 mod enforcement;
 mod git;
@@ -16,6 +18,7 @@ mod v2;
 pub(crate) mod websocket;
 mod ws;
 
+pub(crate) use api::api_router;
 pub(crate) use history_keys::spawn_history_watch;
 
 use std::time::Duration;

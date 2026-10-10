@@ -27,6 +27,30 @@ pub struct ManagedServer {
     legacy_scan_task: Option<JoinHandle<()>>,
     /// Pushes history key changes made by other processes (the TUI).
     history_watch_task: Option<JoinHandle<()>>,
+    /// The external API listener (`[api]`), when enabled.
+    api: Option<ApiListener>,
+}
+
+struct ApiListener {
+    addr: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    handle: JoinHandle<Result<()>>,
+    /// Cancels turns of keys revoked or expired outside the daemon.
+    revocation_task: JoinHandle<()>,
+}
+
+impl ApiListener {
+    async fn stop(mut self) {
+        self.revocation_task.abort();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        match self.handle.await {
+            Ok(Err(error)) => tracing::warn!(error = %error, "API listener failed"),
+            Err(error) => tracing::warn!(error = %error, "API listener task failed"),
+            Ok(Ok(())) => {}
+        }
+    }
 }
 
 /// Whether the server records the provider processes it spawns and reaps the
@@ -47,6 +71,7 @@ impl ManagedServer {
             );
         }
         config.ensure_listener_matches_auth()?;
+        config.ensure_api_listener_is_valid()?;
         let addr = bind_addr(&config)?;
         let listener = TcpListener::bind(addr)
             .await
@@ -54,6 +79,17 @@ impl ManagedServer {
         let addr = listener
             .local_addr()
             .context("failed to read bound address")?;
+        // Bound before any state exists, so a taken API port fails the start
+        // as cleanly as a taken main port.
+        let api_listener = if config.api.enabled {
+            let api_addr = api_bind_addr(&config)?;
+            let api_listener = TcpListener::bind(api_addr)
+                .await
+                .with_context(|| format!("failed to bind the API listener {api_addr}"))?;
+            Some(api_listener)
+        } else {
+            None
+        };
         // After the bind, so a second server on the same data directory that
         // cannot listen never kills the running one's providers; before
         // AppState::new, so conversation recovery sees no live orphans.
@@ -126,6 +162,40 @@ impl ManagedServer {
             .await
             .context("server failed")
         });
+        let api = match api_listener {
+            Some(listener) => {
+                let api_addr = listener
+                    .local_addr()
+                    .context("failed to read the API listener address")?;
+                if !listen_addrs::is_loopback_host(&config.api.host) {
+                    tracing::warn!(
+                        host = %config.api.host,
+                        "the API listener is not loopback-only; API keys travel over plaintext HTTP unless a TLS proxy terminates in front of it"
+                    );
+                }
+                info!(addr = %api_addr, "todex-agentd API listening");
+                let app = server::api_router(state.clone());
+                let (api_shutdown_tx, api_shutdown_rx) = oneshot::channel();
+                let handle = tokio::spawn(async move {
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(async {
+                        let _ = api_shutdown_rx.await;
+                    })
+                    .await
+                    .context("API server failed")
+                });
+                Some(ApiListener {
+                    addr: api_addr,
+                    shutdown: Some(api_shutdown_tx),
+                    handle,
+                    revocation_task: server::api::spawn_revocation_watch(state.clone()),
+                })
+            }
+            None => None,
+        };
         let migration_task = Some(state.spawn_legacy_conversation_migration());
         let maintenance_task = Some(state.spawn_journal_maintenance());
         let legacy_scan_task = state.spawn_legacy_history_scan();
@@ -144,7 +214,13 @@ impl ManagedServer {
             maintenance_task,
             legacy_scan_task,
             history_watch_task,
+            api,
         })
+    }
+
+    /// The bound API listener address, when `[api]` is enabled.
+    pub fn api_addr(&self) -> Option<SocketAddr> {
+        self.api.as_ref().map(|api| api.addr)
     }
 
     pub fn config(&self) -> &Config {
@@ -188,6 +264,9 @@ impl ManagedServer {
         if let Some(task) = self.kanban_schedule_task.take() {
             task.abort();
         }
+        if let Some(api) = self.api.take() {
+            api.stop().await;
+        }
         self.state.conversations.shutdown_all().await;
         self.state.codex_local_adapters.shutdown_all().await;
         if let Some(shutdown) = self.shutdown.take() {
@@ -204,6 +283,9 @@ impl ManagedServer {
             task.abort();
         }
         let result = self.handle.await.context("server task join failed");
+        if let Some(api) = self.api.take() {
+            api.stop().await;
+        }
         if let Some(task) = self.migration_task.take() {
             task.abort();
         }
@@ -222,6 +304,18 @@ impl ManagedServer {
     }
 }
 
+pub fn api_bind_addr(config: &Config) -> Result<SocketAddr> {
+    let host = &config.api.host;
+    let port = config.api.port;
+    let text = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    text.parse()
+        .with_context(|| format!("invalid API bind address {host}:{port}"))
+}
+
 pub fn bind_addr(config: &Config) -> Result<SocketAddr> {
     format!("{}:{}", config.host, config.port)
         .parse()
@@ -234,6 +328,52 @@ mod tests {
 
     use super::{ManagedServer, ProviderProcessTracking};
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
+
+    #[tokio::test]
+    async fn managed_server_serves_the_api_listener_only_when_enabled() {
+        let root = env::temp_dir().join(format!("todex-server-api-{}", uuid::Uuid::new_v4()));
+        let base = Config {
+            port: 0,
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..Config::default()
+        };
+        let server = ManagedServer::start(base.clone(), ProviderProcessTracking::Disabled)
+            .await
+            .unwrap();
+        assert!(server.api_addr().is_none());
+        server.stop().await.unwrap();
+
+        let mut config = base;
+        config.api.enabled = true;
+        config.api.port = 0;
+        let server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
+            .await
+            .unwrap();
+        let api = server.api_addr().unwrap();
+        assert_ne!(api.port(), server.addr().port());
+        let health: serde_json::Value = reqwest::get(format!("http://{api}/api/v1/health"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["ok"], true);
+        let me = reqwest::get(format!("http://{api}/api/v1/me"))
+            .await
+            .unwrap();
+        assert_eq!(me.status(), reqwest::StatusCode::UNAUTHORIZED);
+        // The device listener does not serve the API routes.
+        let device = reqwest::get(format!("http://{}/api/v1/health", server.addr()))
+            .await
+            .unwrap();
+        assert_eq!(device.status(), reqwest::StatusCode::NOT_FOUND);
+        server.stop().await.unwrap();
+        assert!(reqwest::get(format!("http://{api}/api/v1/health"))
+            .await
+            .is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[tokio::test]
     async fn managed_server_starts_and_stops() {
@@ -274,6 +414,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         };
 
         let server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
@@ -340,6 +481,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         };
 
         let mut server = ManagedServer::start(config, ProviderProcessTracking::Disabled)
@@ -413,6 +555,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: true,
             },
+            api: Default::default(),
         };
         assert!(
             ManagedServer::start(config, ProviderProcessTracking::Disabled)

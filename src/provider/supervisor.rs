@@ -526,6 +526,11 @@ impl ConversationSupervisor {
         self
     }
 
+    /// Standing answers for permission requests (API key approval policies).
+    pub fn set_permission_policy(&self, policy: Arc<dyn super::types::PermissionPolicy>) {
+        self.permissions.set_policy(policy);
+    }
+
     pub fn with_quota(mut self, quota: crate::quota_store::QuotaStore) -> Self {
         self.quota = quota;
         self
@@ -1888,7 +1893,13 @@ impl ConversationSupervisor {
             ));
         }
         let provider_state = self.store.provider_state(conversation_id).await?;
-        let agent_mcp = self.agent_mcp_for(manifest.provider, conversation_id).await;
+        // API key conversations get the provider's own tools only: TodeX's
+        // SSH, desktop and browser tools reach past the key's scope.
+        let agent_mcp = if manifest.owner_id.starts_with(crate::api_keys::OWNER_PREFIX) {
+            None
+        } else {
+            self.agent_mcp_for(manifest.provider, conversation_id).await
+        };
 
         let mut snapshot_files = Vec::new();
         for item in &driver_content {
@@ -3183,6 +3194,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         });
         let mut store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -3990,6 +4002,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -5009,6 +5022,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -5278,6 +5292,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -5502,6 +5517,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await
@@ -5564,6 +5580,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         });
         let store = ConversationStore::new(data_dir.clone()).await.unwrap();
         let trust = trust_store(&config, "local", Some(&workspace)).await;
@@ -6005,6 +6022,7 @@ done
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         });
         let store = ConversationStore::new(config.data_dir.clone())
             .await

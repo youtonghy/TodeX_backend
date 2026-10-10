@@ -12,6 +12,7 @@ use crate::{
     agent_desktop::AgentDesktop,
     agent_mcp::AgentMcp,
     agent_providers::AgentProviderService,
+    api_keys::ApiKeyStore,
     catalog::CatalogService,
     codex_gateway::{CodexGatewayStore, CodexLocalAdapterSupervisor},
     config::Config,
@@ -54,6 +55,9 @@ pub struct AppState {
     /// History encryption recipients, keyrings and DEKs; see
     /// [`crate::history_keys`].
     pub(crate) history_keys: HistoryKeys,
+    /// Keys of the external API listener; see [`crate::api_keys`].
+    pub(crate) api_keys: ApiKeyStore,
+    pub(crate) api_auth_failures: crate::server::api::AuthFailures,
     pub workspaces: WorkspaceStore,
     pub kanban_tasks: KanbanTaskStore,
     pub agent_providers: AgentProviderService,
@@ -134,6 +138,12 @@ impl AppState {
             &config.data_dir,
             config.security.enable_auth.then(|| devices.clone()),
         )?;
+        let api_keys = ApiKeyStore::load(&config.data_dir)?;
+        // Before the store opens: recovery may journal into API key
+        // conversations, whose keys are also wrapped for the key's recipient.
+        history_keys
+            .deks()
+            .set_owner_recipients(std::sync::Arc::new(api_keys.clone()));
         let conversation_store =
             ConversationStore::open(config.data_dir.clone(), history_keys.clone()).await?;
         let conversation_hub = ConversationEventHub::default();
@@ -147,6 +157,12 @@ impl AppState {
         )
         .with_quota(quota.clone())
         .with_agent_mcp(agent_mcp.clone());
+        conversations.set_permission_policy(std::sync::Arc::new(
+            crate::server::api::ApiKeyPermissionPolicy {
+                state_conversations: conversation_store.clone(),
+                keys: api_keys.clone(),
+            },
+        ));
         conversations.recover_all().await?;
         let local_terminals = LocalTerminalManager::new(events.clone());
         let cli_manager = CliManager::default();
@@ -180,6 +196,8 @@ impl AppState {
             device_auth,
             device_pairing,
             history_keys,
+            api_keys,
+            api_auth_failures: Default::default(),
             workspaces,
             kanban_tasks,
             agent_providers,

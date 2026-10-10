@@ -1107,9 +1107,25 @@ pub struct PendingProviderControl {
     pub respond_to: oneshot::Sender<Result<Value, AppError>>,
 }
 
+/// Answers permission requests without a client for conversations whose
+/// owner has a standing policy (API keys set to auto-approve or reject).
+#[async_trait]
+pub trait PermissionPolicy: Send + Sync {
+    /// The decision and the answering principal for a request, or `None` to
+    /// leave it to the conversation's clients. `device_bound` requests name
+    /// the devices that may answer them.
+    async fn decide(
+        &self,
+        conversation_id: &str,
+        options: &Value,
+        device_bound: bool,
+    ) -> Option<(PermissionDecision, String)>;
+}
+
 #[derive(Clone, Default)]
 pub struct PermissionBroker {
     pending: Arc<DashMap<String, PendingPermission>>,
+    policy: Arc<std::sync::RwLock<Option<Arc<dyn PermissionPolicy>>>>,
 }
 
 struct PendingPermission {
@@ -1135,6 +1151,20 @@ impl Drop for PendingPermissionCleanup {
 }
 
 impl PermissionBroker {
+    pub fn set_policy(&self, policy: Arc<dyn PermissionPolicy>) {
+        *self
+            .policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(policy);
+    }
+
+    fn policy(&self) -> Option<Arc<dyn PermissionPolicy>> {
+        self.policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn request(
         &self,
@@ -1178,6 +1208,18 @@ impl PermissionBroker {
         }
         if let Err(error) = sink.emit("permission.requested", requested).await {
             return Err(error);
+        }
+        // A standing policy answers right away; the request and its
+        // resolution are journalled like any other.
+        if let Some(policy) = self.policy() {
+            if let Some(answer) = policy
+                .decide(&sink.conversation_id, &options, allowed_devices.is_some())
+                .await
+            {
+                if let Some((_, pending)) = self.pending.remove(&permission_id) {
+                    let _ = pending.sender.send(answer);
+                }
+            }
         }
 
         let decision = tokio::select! {

@@ -2,6 +2,8 @@ mod agent_browser;
 mod agent_desktop;
 mod agent_mcp;
 mod agent_providers;
+mod api_key_cli;
+mod api_keys;
 mod app_state;
 mod autostart;
 mod catalog;
@@ -84,6 +86,11 @@ enum Command {
     Browser {
         #[command(subcommand)]
         command: BrowserCommand,
+    },
+    #[command(about = "Manage API keys of the external API listener ([api])")]
+    ApiKey {
+        #[command(subcommand)]
+        command: api_key_cli::ApiKeyCommand,
     },
     #[command(name = "daemon-run", hide = true)]
     DaemonRun(ServeArgs),
@@ -211,6 +218,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             daemon_command(command).await
         }
         Command::Doctor { command } => doctor_command(command).await,
+        Command::ApiKey { command } => api_key_cli::run(command),
         Command::Browser {
             command: BrowserCommand::Install { data_dir },
         } => {
@@ -220,6 +228,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 data_dir,
                 workspace_root: Vec::new(),
                 history_retention_days: None,
+                ..Default::default()
             })?;
             agent_browser::install_cli(&config.data_dir).await
         }
@@ -268,6 +277,7 @@ async fn doctor_command(command: DoctorCommand) -> anyhow::Result<()> {
                 data_dir: args.data_dir,
                 workspace_root: args.workspace_root,
                 history_retention_days: None,
+                ..Default::default()
             })
             .context("failed to read configuration")?;
             let report = provider::inspect_providers(&config, &args.provider).await?;
@@ -357,6 +367,9 @@ async fn daemon_command(command: DaemonCommand) -> anyhow::Result<()> {
                         process.listen_addr(),
                         process.started_at.to_rfc3339()
                     );
+                    if let Some(api) = &process.api_listen {
+                        println!("API listening: http://{api}/api/v1");
+                    }
                     print_connect_addresses(&process);
                 }
                 None => println!("Daemon stopped."),

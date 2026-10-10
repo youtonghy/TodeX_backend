@@ -213,6 +213,7 @@ fn authenticated_routes() -> Router<AppState> {
         .route("/v2/providers/image-input", get(provider_image_input))
         .route("/v2/providers/commands", get(provider_commands))
         .merge(agent_providers::routes())
+        .merge(super::api_keys::routes())
         .merge(super::quota::routes())
         .merge(super::ssh::routes())
         .merge(super::agent_desktop::routes())
@@ -4077,6 +4078,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -4334,6 +4336,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -4578,6 +4581,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -4689,6 +4693,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -4849,6 +4854,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -5015,6 +5021,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -5152,6 +5159,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -5292,6 +5300,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -5460,6 +5469,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -5600,6 +5610,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -5822,6 +5833,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -6513,6 +6525,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -6728,6 +6741,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -7061,6 +7075,7 @@ mod tests {
                 enable_auth: false,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -7142,6 +7157,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -7286,6 +7302,7 @@ mod tests {
                 enable_auth: false,
                 enable_tls: false,
             },
+            api: Default::default(),
         };
 
         // Token-less deployments keep the historical local trust model: the
@@ -7459,6 +7476,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         })
         .await
         .unwrap();
@@ -7885,6 +7903,7 @@ mod tests {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: Default::default(),
         }
     }
 
@@ -9962,5 +9981,91 @@ mod tests {
             };
             report(label, started.elapsed(), encodings, bytes);
         }
+    }
+
+    #[tokio::test]
+    async fn api_keys_are_managed_by_signed_devices_and_revocation_applies_at_once() {
+        let root = std::env::temp_dir().join(format!("todex-v2-api-keys-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let app = crate::server::loopback_test_router(state.clone());
+        let device = enroll(&root.join("data"));
+        let call = |request: Request<Body>| {
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+                )
+            }
+        };
+
+        for (method, uri) in [
+            ("GET", "/v2/api-keys"),
+            ("POST", "/v2/api-keys"),
+            ("GET", "/v2/api-keys/listener"),
+            ("DELETE", "/v2/api-keys/0123456789abcdef"),
+        ] {
+            let (status, _) = call(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+
+        let body = json!({"name": "CI", "approval": "reject", "scopes": {"agents": ["codex"]}})
+            .to_string();
+        let (status, created) = call(signed_request(&device, "POST", "/v2/api-keys", &body)).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"].as_str().unwrap().to_owned();
+        let key = created["key"].as_str().unwrap().to_owned();
+        assert!(key.starts_with(&format!("tdx_{id}_")));
+        assert_eq!(created["approval"], "reject");
+        assert!(state.api_keys.authenticate(&key).is_ok());
+
+        // Listing never repeats the key or its hashes.
+        let (status, listed) = call(signed_request(&device, "GET", "/v2/api-keys", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["keys"][0]["id"], id);
+        assert!(!listed.to_string().contains(&key[key.len() - 20..]));
+        assert!(listed["keys"][0].get("secretHash").is_none());
+
+        let uri = format!("/v2/api-keys/{id}");
+        let (status, updated) = call(signed_request(
+            &device,
+            "PATCH",
+            &uri,
+            &json!({"name": "CI 2", "approval": "auto-approve"}).to_string(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["name"], "CI 2");
+        assert_eq!(updated["approval"], "auto-approve");
+
+        let (status, listener) =
+            call(signed_request(&device, "GET", "/v2/api-keys/listener", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listener["enabled"], false);
+        assert_eq!(listener["port"], crate::config::DEFAULT_API_PORT);
+
+        let (status, revoked) = call(signed_request(&device, "DELETE", &uri, "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(revoked["revoked"], true);
+        assert!(state.api_keys.authenticate(&key).is_err());
+        let (status, _) = call(signed_request(
+            &device,
+            "DELETE",
+            "/v2/api-keys/0123456789abcdef",
+            "",
+        ))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = fs::remove_dir_all(&root);
     }
 }

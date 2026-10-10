@@ -11,7 +11,7 @@ use toml_edit::{value, DocumentMut, Item, Table};
 
 use crate::secure_fs;
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 pub struct ServeArgs {
     #[arg(long)]
     pub host: Option<String>,
@@ -23,6 +23,13 @@ pub struct ServeArgs {
     pub workspace_root: Vec<PathBuf>,
     #[arg(long)]
     pub history_retention_days: Option<u64>,
+    /// Serve the external API (API key auth) on its own port.
+    #[arg(long)]
+    pub enable_api: bool,
+    #[arg(long)]
+    pub api_host: Option<String>,
+    #[arg(long)]
+    pub api_port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +42,32 @@ pub struct Config {
     pub history_retention_days: Option<u64>,
     pub agent: AgentConfig,
     pub security: SecurityConfig,
+    pub api: ApiConfig,
+}
+
+/// The external API listener (`[api]`): REST + SSE authenticated with API
+/// keys, on its own port (docs/API.md, "外部 API").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    /// A non-loopback API host sends bearer keys over plaintext HTTP; it is
+    /// refused unless this is set (terminate TLS in front of it).
+    pub allow_plaintext_remote: bool,
+}
+
+pub const DEFAULT_API_PORT: u16 = 7346;
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "127.0.0.1".to_owned(),
+            port: DEFAULT_API_PORT,
+            allow_plaintext_remote: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
@@ -141,6 +174,15 @@ struct FileConfig {
     history_retention_days: Option<u64>,
     agent: Option<PartialAgentConfig>,
     security: Option<PartialSecurityConfig>,
+    api: Option<PartialApiConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialApiConfig {
+    enabled: Option<bool>,
+    host: Option<String>,
+    port: Option<u16>,
+    allow_plaintext_remote: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -234,6 +276,35 @@ impl Config {
 
         let agent_file = file_config.agent.unwrap_or_default();
         let security_file = file_config.security.unwrap_or_default();
+        let api_file = file_config.api.unwrap_or_default();
+        let api = ApiConfig {
+            enabled: coalesce(
+                args.enable_api.then_some(true),
+                env_bool("TODEX_AGENTD_API_ENABLED"),
+                api_file.enabled,
+                defaults.api.enabled,
+            ),
+            host: coalesce(
+                args.api_host,
+                env::var("TODEX_AGENTD_API_HOST").ok(),
+                api_file.host,
+                defaults.api.host,
+            ),
+            port: coalesce(
+                args.api_port,
+                env::var("TODEX_AGENTD_API_PORT")
+                    .ok()
+                    .and_then(|value| value.parse().ok()),
+                api_file.port,
+                defaults.api.port,
+            ),
+            allow_plaintext_remote: coalesce(
+                None,
+                env_bool("TODEX_AGENTD_API_ALLOW_PLAINTEXT_REMOTE"),
+                api_file.allow_plaintext_remote,
+                defaults.api.allow_plaintext_remote,
+            ),
+        };
         let enable_auth = coalesce(
             None,
             env_bool("TODEX_AGENTD_ENABLE_AUTH"),
@@ -359,7 +430,45 @@ impl Config {
                     defaults.security.enable_tls,
                 ),
             },
+            api,
         })
+    }
+
+    /// The API listener must not share the main port, and a non-loopback
+    /// API host needs `api.allow_plaintext_remote`.
+    pub fn ensure_api_listener_is_valid(&self) -> anyhow::Result<()> {
+        if !self.api.enabled {
+            return Ok(());
+        }
+        if self.api.port == self.port && self.api.port != 0 {
+            anyhow::bail!(
+                "api.port {} is the main listener's port; choose another port for the API",
+                self.api.port
+            );
+        }
+        if !crate::listen_addrs::is_loopback_host(&self.api.host)
+            && !self.api.allow_plaintext_remote
+        {
+            anyhow::bail!(
+                "the API listener {} is not a loopback address and would send API keys over \
+                 plaintext HTTP; bind it to 127.0.0.1 or ::1, or set api.allow_plaintext_remote \
+                 = true behind a TLS-terminating proxy",
+                self.api.host
+            );
+        }
+        Ok(())
+    }
+
+    /// Saves the TUI's API listener settings into `[api]`.
+    pub fn save_api_settings(data_dir: PathBuf, enabled: bool, port: u16) -> anyhow::Result<()> {
+        let data_dir = expand_home(data_dir);
+        let mut document = load_config_document(&data_dir)?;
+        if !document.get("api").is_some_and(Item::is_table) {
+            document.insert("api", Item::Table(Table::new()));
+        }
+        document["api"]["enabled"] = value(enabled);
+        document["api"]["port"] = value(i64::from(port));
+        write_config_document(&data_dir, &document)
     }
 
     /// Without device authentication only this machine may reach the daemon,
@@ -497,6 +606,7 @@ impl Default for Config {
                 enable_auth: true,
                 enable_tls: false,
             },
+            api: ApiConfig::default(),
         }
     }
 }
@@ -621,6 +731,16 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
         replace_some!(base_security.enable_auth, overlay_security.enable_auth);
         replace_some!(base_security.enable_tls, overlay_security.enable_tls);
         replace_some!(base_security.auth_token, overlay_security.auth_token);
+    }
+    if let Some(overlay_api) = overlay.api {
+        let base_api = base.api.get_or_insert_with(PartialApiConfig::default);
+        replace_some!(base_api.enabled, overlay_api.enabled);
+        replace_some!(base_api.host, overlay_api.host);
+        replace_some!(base_api.port, overlay_api.port);
+        replace_some!(
+            base_api.allow_plaintext_remote,
+            overlay_api.allow_plaintext_remote
+        );
     }
     base
 }
@@ -933,6 +1053,7 @@ mod tests {
             data_dir: None,
             workspace_root: Vec::new(),
             history_retention_days: None,
+            ..Default::default()
         })
         .expect("load default config");
 
@@ -950,6 +1071,7 @@ mod tests {
             data_dir: Some(root.clone()),
             workspace_root: Vec::new(),
             history_retention_days: None,
+            ..Default::default()
         })
         .expect("load config");
 
@@ -972,6 +1094,7 @@ mod tests {
             data_dir: Some(root.clone()),
             workspace_root: Vec::new(),
             history_retention_days: None,
+            ..Default::default()
         })
         .expect("load config without writes");
 
@@ -1031,6 +1154,7 @@ mod tests {
             data_dir: Some(root.clone()),
             workspace_root: Vec::new(),
             history_retention_days: None,
+            ..Default::default()
         })
         .unwrap();
         if env::var_os("TODEX_AGENTD_PROVIDER_IDLE_TIMEOUT_MINUTES").is_none() {
@@ -1058,6 +1182,57 @@ mod tests {
     }
 
     #[test]
+    fn api_listener_is_off_by_default_and_loads_from_file_and_flags() {
+        let root = env::temp_dir().join(format!("todex-config-api-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let load = |args: ServeArgs| {
+            Config::load(ServeArgs {
+                data_dir: Some(root.clone()),
+                ..args
+            })
+            .unwrap()
+        };
+        let config = load(ServeArgs::default());
+        assert_eq!(config.api, super::ApiConfig::default());
+        assert!(!config.api.enabled);
+        assert_eq!(config.api.port, super::DEFAULT_API_PORT);
+        config.ensure_api_listener_is_valid().unwrap();
+
+        Config::save_api_settings(root.clone(), true, 9001).unwrap();
+        let config = load(ServeArgs::default());
+        assert!(config.api.enabled);
+        assert_eq!(config.api.port, 9001);
+        let config = load(ServeArgs {
+            api_port: Some(9002),
+            api_host: Some("::1".to_owned()),
+            ..ServeArgs::default()
+        });
+        assert_eq!((config.api.host.as_str(), config.api.port), ("::1", 9002));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn api_listener_needs_its_own_port_and_consent_for_remote_plaintext() {
+        let mut config = Config {
+            port: 7345,
+            ..Config::default()
+        };
+        config.api.enabled = true;
+        config.ensure_api_listener_is_valid().unwrap();
+        config.api.port = 7345;
+        assert!(config.ensure_api_listener_is_valid().is_err());
+        config.api.port = 7346;
+        config.api.host = "0.0.0.0".to_owned();
+        assert!(config.ensure_api_listener_is_valid().is_err());
+        config.api.allow_plaintext_remote = true;
+        config.ensure_api_listener_is_valid().unwrap();
+        // A disabled listener is never checked.
+        config.api.enabled = false;
+        config.api.allow_plaintext_remote = false;
+        config.ensure_api_listener_is_valid().unwrap();
+    }
+
+    #[test]
     fn workspace_roots_load_from_array_and_legacy_key() {
         let root = env::temp_dir().join(format!("todex-config-roots-{}", Uuid::new_v4().simple()));
         fs::create_dir_all(&root).unwrap();
@@ -1069,6 +1244,7 @@ mod tests {
             data_dir: Some(root.clone()),
             workspace_root: Vec::new(),
             history_retention_days: None,
+            ..Default::default()
         })
         .expect("load legacy config");
         assert_eq!(config.workspace_roots, vec![PathBuf::from("/srv/one")]);
@@ -1084,6 +1260,7 @@ mod tests {
             data_dir: Some(root.clone()),
             workspace_root: Vec::new(),
             history_retention_days: None,
+            ..Default::default()
         })
         .expect("load multi-root config");
         assert_eq!(
@@ -1102,6 +1279,7 @@ mod tests {
             data_dir: Some(root.clone()),
             workspace_root: vec![PathBuf::from("/cli/only"), PathBuf::from("/cli/other")],
             history_retention_days: None,
+            ..Default::default()
         })
         .expect("load cli config");
         assert_eq!(
