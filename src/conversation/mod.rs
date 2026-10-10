@@ -9,6 +9,7 @@ mod migration;
 mod model;
 mod record;
 mod segment;
+pub(crate) mod server_decrypt;
 mod store;
 mod summary;
 

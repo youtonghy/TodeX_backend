@@ -5,7 +5,7 @@
 ## 1. 目标与威胁模型
 
 - 单个会话没有体积上限；只有数据目录所在磁盘可用空间低于 1 GiB 时新 prompt 返回 `STORAGE_LOW`（HTTP 507）。
-- 历史始终端到端加密（没有 off 模式与开关）：会话内容以密文落盘，后端磁盘上不存在能解密历史的私钥；实时推送与历史回放发送同一份密文，后端不解密、不重加密，原样转发（外层传输加密照常）。
+- 历史始终端到端加密（没有 off 模式与开关）：会话内容以密文落盘，后端磁盘上不存在能解密历史的私钥；实时推送与历史回放发送同一份密文，后端不解密、不重加密，原样转发（外层传输加密照常）。唯一的例外是外部 API 的 API key 会话（§3.5）：后端仅在处理持有该 key 的请求时，用请求带来的 secret 在内存中解密，返回明文。
 - 保护：TodeX 数据目录被盗、被备份或泄露；事后攻破后端时读取已写入的历史。
 - 不保护：后端运行 agent 时看到的明文（它必须处理模型输出）；provider 自身在后端保存的明文 transcript（`~/.claude/projects`、`~/.codex/sessions` 等）；排队中的追加 prompt（daemon 内存中的明文候选消息，投递前不落盘，daemon 重启即丢失；`queue.json` 不再写入，旧版遗留的文件在启动时导入内存并删除）；元数据（sequence、时间、事件类型、大小、下文 §5.2 的信封字段）。
 - 强制加密之前写下的明文历史不迁移、不改写，标记为 `legacyPlaintext` 后只读（§8）。
@@ -73,6 +73,37 @@
 - 被封禁的设备除 `history.encryption.get` 外的所有 `history.*` 命令都返回 `HISTORY_ACCESS_REVOKED`（HTTP 403），包括登记新公钥、申请/履约/列出/驳回授权、`history.keys.list`、任意 `rid` 的 `history.keys.wraps`、设置恢复密钥、吊销与解封。重新配对同一设备身份（`deviceId` 由设备签名公钥决定）不会解除封禁。被封禁设备仍可订阅与回放会话、收到密文，只是取不到新 DEK 的封装：其 `rid` 已吊销，新 DEK 只为未吊销的接收方封装；文件中若出现被封禁设备仍有未吊销接收方的情况，daemon 在下次访问时把该接收方吊销。
 - `history.device.restore {deviceId}` 由任一未被封禁的已配对设备调用，把该设备移出 `revokedDevices`（不改变 `epoch`）。旧公钥仍被拒绝（`CONFLICT`）：设备须生成新密钥对重新登记，之后的新 DEK 才包含它，读取旧历史需要新的授权。设备未被封禁时返回 `NOT_FOUND`。所有设备都被封禁时，只能由新身份（重新安装客户端后配对）的设备解封。
 - `history.encryption.get` 的 `myAccess`：调用方被封禁为 `revoked`，有未吊销的设备接收方为 `active`，否则为 `unregistered`。
+
+### 3.5 API key 接收方（外部 API）
+
+外部 API（`docs/API.md`“外部 API（API Key）”）的调用方不运行客户端解密逻辑，因此每把 API key 自带一个历史接收方，由后端在请求期间代为解密。
+
+**派生：**
+- key 的 secret 为 32 字节随机数。由它派生 X-Wing 种子：`seed = HKDF-SHA256(salt="todex-apikey-v1", ikm=secret, info="todex-apikey-v1/history-recipient")`，再由种子得到公钥。
+- `api-keys.json` 只保存两项：
+  - 公钥（`historyPublicKey`）；
+  - 鉴权哈希 `SHA-256("todex-apikey-v1/auth\0" ‖ secret)`。
+- 鉴权哈希与种子来自不同的派生，无法由一方推出另一方。secret 和种子都不落盘。
+
+**封装范围：**
+- 只有 owner 为 `apikey:<id>` 的会话，其 DEK 会在照常封装给全部未吊销接收方（设备和恢复密钥）之外，再封装给该 key 的接收方。适用范围包括活动 DEK、标题 DEK，以及导入或 fork 草稿的 DEK。
+- 其他会话（设备会话、其他 key 的会话）从不封装给它。
+- 该接收方不写入 `recipients.json`，也不参与 `epoch`。
+- 活动 DEK 会记录它所封装的 owner 接收方。该 key 被吊销或过期后，owner 接收方随之消失，下一次写入时 DEK 轮换，新 DEK 不再包含它。
+- 对于 API key 会话，只要存在 owner 接收方就可以生成 DEK，即使没有任何设备或恢复接收方，也不会返回 `HISTORY_KEY_REQUIRED`。
+
+**解密：**
+1. 请求带着 key 到达时，后端在内存中派生种子。
+2. 从会话的 `keyring.json` 中找到 `rid` 与该 key 匹配的封装，解开 DEK。
+3. 按 §5.3 解密事件、帧引用和 `titleEnc`，以明文返回。
+
+种子和解出的 DEK 只在本次请求或本条 SSE 流期间存在于内存中，结束时清零，不写入日志或磁盘。对没有为该 key 封装的 `kid`（例如外部写入的内容），后端返回 `{"encrypted":true}` 占位。
+
+**威胁模型（§1）：**
+- 数据目录被盗、备份或泄露时依然无法解密 API key 会话：读取需要 key 的 secret，而 secret 不在数据目录中。
+- 某把 key 泄露，只会暴露该 key 自己的会话。
+- 后端在运行时本来就能看到 Agent 的明文，所以请求期间的内存解密没有扩大暴露面。
+- 设备和恢复密钥仍能按 §3.3 读取 API key 会话。
 
 ## 4. 存储格式 v3
 

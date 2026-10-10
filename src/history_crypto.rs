@@ -6,7 +6,10 @@
 //! Devices own X-Wing (ML-KEM-768 + X25519) key pairs. The daemon only sees
 //! their public keys: it seals history content under a random per-segment key
 //! (DEK) that lives in memory, and wraps that DEK for every recipient device.
-//! It can never unwrap a DEK again; only the test helper does.
+//! It cannot unwrap a device's DEK wrap. The one exception is an API key
+//! recipient ([`api_key_recipient_seed`]): its private key derives from the
+//! key's secret, which the daemon only sees for the length of a request
+//! authenticated with it.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chacha20poly1305::{
@@ -127,7 +130,6 @@ impl SegmentKey {
         key
     }
 
-    #[cfg(test)]
     pub(crate) fn from_parts(kid: [u8; KID_LEN], dek: [u8; DEK_LEN]) -> Self {
         Self { kid, dek }
     }
@@ -323,17 +325,40 @@ fn invalid(message: &str) -> AppError {
     AppError::InvalidRequest(message.to_owned())
 }
 
-/// Device-side unwrap. The daemon never holds device private keys, so this
-/// exists only to verify the wrap format in tests.
-#[cfg(test)]
-pub(crate) fn unwrap_for_tests(
-    seed: [u8; 32],
+/// HKDF label deriving an API key's history recipient seed from its secret.
+const API_KEY_RECIPIENT_INFO: &[u8] = b"todex-apikey-v1/history-recipient";
+const API_KEY_SALT: &[u8] = b"todex-apikey-v1";
+
+/// The X-Wing seed of an API key's history recipient (docs/history-encryption.md
+/// §3.5). Only derivable from the key's secret, which is never stored.
+pub(crate) fn api_key_recipient_seed(secret: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(API_KEY_SALT), secret)
+        .expand(API_KEY_RECIPIENT_INFO, seed.as_mut())
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    seed
+}
+
+/// The public key of the recipient whose private key is `seed`.
+pub(crate) fn recipient_from_seed(seed: &[u8; 32]) -> RecipientPublicKey {
+    use x_wing::Decapsulator;
+
+    let key = x_wing::DecapsulationKey::from(*seed);
+    let bytes = key.encapsulation_key().to_bytes();
+    RecipientPublicKey::from_bytes(&bytes).expect("an X-Wing key encodes to a valid public key")
+}
+
+/// Device-side unwrap with the recipient's private seed: what clients do,
+/// and what the daemon does for an API key recipient while serving a
+/// request authenticated with that key.
+pub(crate) fn unwrap_with_seed(
+    seed: &[u8; 32],
     wrapped: &WrappedKey,
     kid: [u8; KID_LEN],
 ) -> Result<SegmentKey> {
     use x_wing::{Decapsulate, Decapsulator};
 
-    let device = x_wing::DecapsulationKey::from(seed);
+    let device = x_wing::DecapsulationKey::from(*seed);
     let rid = recipient_id(&device.encapsulation_key().to_bytes());
     if rid != wrapped.rid {
         return Err(invalid("wrapped history key is for another recipient"));
@@ -357,6 +382,15 @@ pub(crate) fn unwrap_for_tests(
         .try_into()
         .map_err(|_| invalid("invalid wrapped history key"))?;
     Ok(SegmentKey::from_parts(kid, dek))
+}
+
+#[cfg(test)]
+pub(crate) fn unwrap_for_tests(
+    seed: [u8; 32],
+    wrapped: &WrappedKey,
+    kid: [u8; KID_LEN],
+) -> Result<SegmentKey> {
+    unwrap_with_seed(&seed, wrapped, kid)
 }
 
 #[cfg(test)]
@@ -564,5 +598,19 @@ mod tests {
         .is_err());
         let key = SegmentKey::generate();
         assert!(!format!("{key:?}").contains(&format!("{:?}", key.dek)));
+    }
+
+    #[test]
+    fn api_key_recipient_unwraps_only_with_its_own_secret() {
+        let seed = api_key_recipient_seed(b"secret-a");
+        assert_eq!(*seed, *api_key_recipient_seed(b"secret-a"));
+        assert_ne!(*seed, *api_key_recipient_seed(b"secret-b"));
+        let recipient = recipient_from_seed(&seed);
+        let key = SegmentKey::generate();
+        let wrapped = wrap(&key, &recipient).unwrap();
+        let unwrapped = unwrap_with_seed(&seed, &wrapped, key.kid()).unwrap();
+        assert_eq!(unwrapped.dek, key.dek);
+        let other = api_key_recipient_seed(b"secret-b");
+        assert!(unwrap_with_seed(&other, &wrapped, key.kid()).is_err());
     }
 }

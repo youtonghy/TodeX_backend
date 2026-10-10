@@ -24,9 +24,11 @@
 //! [`encode_record`] writes such a payload as `e` + `x` (`x` is exactly the
 //! `$enc` object) and decoding returns the same stored form, so the record
 //! on disk, the event the hub publishes and every replay carry identical
-//! ciphertext. The daemon never decrypts a record it serves; only sealing
-//! a segment (`super::segment`) opens the ciphertext of keys still in
-//! memory, to repack it into frames.
+//! ciphertext. The daemon does not decrypt the records it serves to
+//! devices; sealing a segment (`super::segment`) opens the ciphertext of
+//! keys still in memory to repack it into frames, and the external API
+//! decrypts an API key's own conversations with that key
+//! (`super::server_decrypt`).
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};

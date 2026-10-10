@@ -608,9 +608,20 @@ impl ConversationStore {
     pub async fn ensure_history_writable(&self, conversation_id: &str) -> Result<(), AppError> {
         if let Some(keys) = &self.history {
             self.ensure_not_legacy(conversation_id).await?;
-            keys.deks().current_key(conversation_id).await?;
+            let owner = self.cached_owner(conversation_id);
+            keys.deks()
+                .current_key_for(conversation_id, owner.as_deref())
+                .await?;
         }
         Ok(())
+    }
+
+    /// The owner of a cached manifest: an API key owner adds its own history
+    /// recipient to the conversation's keys (see `history_keys::dek`).
+    fn cached_owner(&self, conversation_id: &str) -> Option<String> {
+        self.manifests
+            .get(conversation_id)
+            .map(|cached| cached.manifest.owner_id.clone())
     }
 
     /// Retire the conversation's current DEK for good (see
@@ -647,7 +658,12 @@ impl ConversationStore {
         let Some(keys) = &self.history else {
             return Ok(None);
         };
-        let (kid, key) = match keys.deks().current_key(conversation_id).await {
+        let owner = self.cached_owner(conversation_id);
+        let (kid, key) = match keys
+            .deks()
+            .current_key_for(conversation_id, owner.as_deref())
+            .await
+        {
             Ok(current) => current,
             Err(error) => match keys.deks().fallback_key(conversation_id).await {
                 Some(previous) => {
@@ -682,7 +698,11 @@ impl ConversationStore {
         let Some(keys) = &self.history else {
             return Ok(None);
         };
-        let (kid, key) = keys.deks().fresh_key(conversation_id).await?;
+        let owner = self.cached_owner(conversation_id);
+        let (kid, key) = keys
+            .deks()
+            .fresh_key(conversation_id, owner.as_deref())
+            .await?;
         let sealed = history_crypto::seal(
             &key,
             conversation_id,
@@ -845,7 +865,11 @@ impl ConversationStore {
         if draft.seal.is_none() {
             let (kid, key) = keys
                 .deks()
-                .draft_key(&event.conversation_id, &draft.temporary)
+                .draft_key(
+                    &event.conversation_id,
+                    &draft.temporary,
+                    Some(&draft.owner_id),
+                )
                 .await?;
             draft.seal = Some(DraftSeal {
                 kid,
@@ -866,7 +890,7 @@ impl ConversationStore {
         manifest: &ConversationManifest,
     ) -> Result<ConversationDraft, AppError> {
         if let Some(keys) = &self.history {
-            keys.deks().ensure_recipients()?;
+            keys.deks().ensure_recipients(Some(&manifest.owner_id))?;
         }
         if tokio::fs::try_exists(self.directory(&manifest.id)?).await? {
             return Err(AppError::Conflict(format!(
@@ -890,6 +914,7 @@ impl ConversationStore {
                 temporary,
                 writer,
                 seal: None,
+                owner_id: manifest.owner_id.clone(),
             }),
             Err(error) => {
                 let _ = tokio::fs::remove_dir_all(&temporary).await;
@@ -3723,6 +3748,8 @@ struct ConversationDraft {
     writer: PlainJournalWriter,
     /// The draft's own key, once a record needed it.
     seal: Option<DraftSeal>,
+    /// The new conversation's owner; see [`ConversationStore::cached_owner`].
+    owner_id: String,
 }
 
 /// See [`ConversationStore::draft_event`].

@@ -9,6 +9,10 @@
 //! persisted).
 //! Rotated keys stay in memory until their segment has been sealed and
 //! repacked ([`DekManager::release_sealed`]); `SegmentKey` zeroizes on drop.
+//!
+//! A conversation owned by an API key (`apikey:<id>`) is also wrapped for
+//! that key's own recipient (spec §3.5), looked up through
+//! [`OwnerRecipients`]; no other conversation is.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -18,8 +22,14 @@ use dashmap::DashMap;
 use super::{encode_id, keyring::KeyEntry, Clock, KeyringStore, RecipientRegistry};
 use crate::{
     error::AppError,
-    history_crypto::{self, SegmentKey},
+    history_crypto::{self, RecipientPublicKey, SegmentKey, RECIPIENT_ID_LEN},
 };
+
+/// The extra history recipient of conversations owned by `owner_id`, if
+/// that owner has one (an active API key).
+pub(crate) trait OwnerRecipients: Send + Sync {
+    fn recipient_for_owner(&self, owner_id: &str) -> Option<RecipientPublicKey>;
+}
 
 type Result<T> = std::result::Result<T, AppError>;
 
@@ -30,6 +40,9 @@ struct ActiveKey {
     kid: String,
     key: Arc<SegmentKey>,
     epoch: u64,
+    /// The owner recipient the key was also wrapped for; a change (the API
+    /// key was revoked) rotates the key like an epoch change.
+    owner_rid: Option<[u8; RECIPIENT_ID_LEN]>,
     created_at: DateTime<Utc>,
 }
 
@@ -58,6 +71,7 @@ pub(crate) struct DekManager {
     keyrings: KeyringStore,
     clock: Clock,
     conversations: Arc<DashMap<String, Arc<tokio::sync::Mutex<ConversationKeys>>>>,
+    owners: Arc<std::sync::RwLock<Option<Arc<dyn OwnerRecipients>>>>,
 }
 
 impl DekManager {
@@ -67,32 +81,67 @@ impl DekManager {
             keyrings,
             clock,
             conversations: Arc::new(DashMap::new()),
+            owners: Arc::default(),
         }
+    }
+
+    /// Installs the owner lookup (the API key store) once it is loaded.
+    pub(crate) fn set_owner_recipients(&self, owners: Arc<dyn OwnerRecipients>) {
+        *self
+            .owners
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(owners);
+    }
+
+    fn owner_recipient(&self, owner_id: Option<&str>) -> Option<RecipientPublicKey> {
+        let owner_id = owner_id?;
+        self.owners
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()?
+            .recipient_for_owner(owner_id)
     }
 
     /// The key to encrypt the next record of `conversation_id` with, as
     /// `(kid, key)`. A new key is durable in the keyring before this returns
     /// it. Fails with `HISTORY_KEY_REQUIRED` when no recipient is active,
     /// since nobody could read the result.
+    #[cfg(test)]
     pub(crate) async fn current_key(
         &self,
         conversation_id: &str,
     ) -> Result<(String, Arc<SegmentKey>)> {
+        self.current_key_for(conversation_id, None).await
+    }
+
+    /// [`Self::current_key`] for a conversation owned by `owner_id`, which
+    /// may add an owner recipient.
+    pub(crate) async fn current_key_for(
+        &self,
+        conversation_id: &str,
+        owner_id: Option<&str>,
+    ) -> Result<(String, Arc<SegmentKey>)> {
         // Validates the id before it becomes a map key.
         self.keyrings.path(conversation_id)?;
         let recipients = self.recipients.active_recipients()?;
+        let owner = self.owner_recipient(owner_id);
+        let owner_rid = owner.as_ref().map(RecipientPublicKey::rid);
         let slot = self.slot(conversation_id);
         let mut keys = slot.lock().await;
         let now = (self.clock)();
         if let Some(active) = &keys.active {
             let age = now.signed_duration_since(active.created_at);
             // A clock that moved backwards also rotates.
-            if active.epoch == recipients.epoch && age >= Duration::zero() && age < MAX_DEK_AGE {
+            if active.epoch == recipients.epoch
+                && active.owner_rid == owner_rid
+                && age >= Duration::zero()
+                && age < MAX_DEK_AGE
+            {
                 return Ok((active.kid.clone(), active.key.clone()));
             }
         }
         keys.retire_active();
-        if recipients.keys.is_empty() {
+        if recipients.keys.is_empty() && owner.is_none() {
             return Err(no_recipients());
         }
         let key = SegmentKey::generate();
@@ -100,6 +149,7 @@ impl DekManager {
         let wraps = recipients
             .keys
             .iter()
+            .chain(owner.as_ref())
             .map(|recipient| history_crypto::wrap(&key, recipient))
             .collect::<Result<Vec<_>>>()?;
         self.keyrings
@@ -119,6 +169,7 @@ impl DekManager {
             kid: kid.clone(),
             key: key.clone(),
             epoch: recipients.epoch,
+            owner_rid,
             created_at: now,
         });
         Ok((kid, key))
@@ -129,9 +180,13 @@ impl DekManager {
     /// [`Self::current_key`] it is wrapped for every active recipient and
     /// durable in the keyring before it is returned, but it is not kept: the
     /// caller drops (and so zeroizes) it.
-    pub(crate) async fn fresh_key(&self, conversation_id: &str) -> Result<(String, SegmentKey)> {
+    pub(crate) async fn fresh_key(
+        &self,
+        conversation_id: &str,
+        owner_id: Option<&str>,
+    ) -> Result<(String, SegmentKey)> {
         let path = self.keyrings.path(conversation_id)?;
-        self.new_key_at(conversation_id, path).await
+        self.new_key_at(conversation_id, path, owner_id).await
     }
 
     /// A one-off key for a conversation still being assembled in the
@@ -143,15 +198,23 @@ impl DekManager {
         &self,
         conversation_id: &str,
         directory: &std::path::Path,
+        owner_id: Option<&str>,
     ) -> Result<(String, SegmentKey)> {
         self.keyrings.path(conversation_id)?;
-        self.new_key_at(conversation_id, directory.join(super::keyring::FILE_NAME))
-            .await
+        self.new_key_at(
+            conversation_id,
+            directory.join(super::keyring::FILE_NAME),
+            owner_id,
+        )
+        .await
     }
 
-    /// `HISTORY_KEY_REQUIRED` unless some recipient could read new history.
-    pub(crate) fn ensure_recipients(&self) -> Result<()> {
-        if self.recipients.active_recipients()?.keys.is_empty() {
+    /// `HISTORY_KEY_REQUIRED` unless some recipient could read new history
+    /// of a conversation owned by `owner_id`.
+    pub(crate) fn ensure_recipients(&self, owner_id: Option<&str>) -> Result<()> {
+        if self.recipients.active_recipients()?.keys.is_empty()
+            && self.owner_recipient(owner_id).is_none()
+        {
             return Err(no_recipients());
         }
         Ok(())
@@ -161,9 +224,11 @@ impl DekManager {
         &self,
         conversation_id: &str,
         path: std::path::PathBuf,
+        owner_id: Option<&str>,
     ) -> Result<(String, SegmentKey)> {
         let recipients = self.recipients.active_recipients()?;
-        if recipients.keys.is_empty() {
+        let owner = self.owner_recipient(owner_id);
+        if recipients.keys.is_empty() && owner.is_none() {
             return Err(no_recipients());
         }
         let key = SegmentKey::generate();
@@ -171,6 +236,7 @@ impl DekManager {
         let wraps = recipients
             .keys
             .iter()
+            .chain(owner.as_ref())
             .map(|recipient| history_crypto::wrap(&key, recipient))
             .collect::<Result<Vec<_>>>()?;
         self.keyrings
@@ -372,6 +438,79 @@ mod tests {
         }
     }
 
+    /// Owner `apikey:1` has recipient `recipient(9)` while `active` is set.
+    struct Owners {
+        active: std::sync::atomic::AtomicBool,
+    }
+
+    impl OwnerRecipients for Owners {
+        fn recipient_for_owner(&self, owner_id: &str) -> Option<RecipientPublicKey> {
+            (owner_id == "apikey:1" && self.active.load(std::sync::atomic::Ordering::SeqCst))
+                .then(|| recipient(9))
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_recipients_wrap_only_their_owners_keys() {
+        let fixture = Fixture::new();
+        let owners = Arc::new(Owners {
+            active: std::sync::atomic::AtomicBool::new(true),
+        });
+        fixture.deks.set_owner_recipients(owners.clone());
+        let rids = |entry: &KeyEntry| entry.wraps.iter().map(|wrap| wrap.rid).collect::<Vec<_>>();
+
+        // Without any device recipient an owner recipient alone suffices.
+        fixture.deks.ensure_recipients(Some("apikey:1")).unwrap();
+        assert!(fixture.deks.ensure_recipients(Some("local")).is_err());
+        let (kid, _) = fixture
+            .deks
+            .current_key_for(&fixture.conversation, Some("apikey:1"))
+            .await
+            .unwrap();
+        let entries = fixture.keyrings.keys(&fixture.conversation).await.unwrap();
+        assert_eq!(rids(&entries[0]), vec![recipient(9).rid()]);
+
+        // Other owners' keys are never wrapped for it.
+        fixture
+            .recipients
+            .register_device("dev_a", &recipient(1))
+            .unwrap();
+        let (other, _) = conversation_dir(&fixture.root);
+        fixture
+            .deks
+            .current_key_for(&other, Some("local"))
+            .await
+            .unwrap();
+        let entries = fixture.keyrings.keys(&other).await.unwrap();
+        assert_eq!(rids(&entries[0]), vec![recipient(1).rid()]);
+
+        // The epoch changed (a device joined): the owner's next key has both.
+        let (next, _) = fixture
+            .deks
+            .current_key_for(&fixture.conversation, Some("apikey:1"))
+            .await
+            .unwrap();
+        assert_ne!(next, kid);
+        let entries = fixture.keyrings.keys(&fixture.conversation).await.unwrap();
+        assert_eq!(
+            rids(&entries[1]),
+            vec![recipient(1).rid(), recipient(9).rid()]
+        );
+
+        // The owner's recipient went away (key revoked): the key rotates.
+        owners
+            .active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (last, _) = fixture
+            .deks
+            .current_key_for(&fixture.conversation, Some("apikey:1"))
+            .await
+            .unwrap();
+        assert_ne!(last, next);
+        let entries = fixture.keyrings.keys(&fixture.conversation).await.unwrap();
+        assert_eq!(rids(&entries[2]), vec![recipient(1).rid()]);
+    }
+
     #[tokio::test]
     async fn no_key_without_a_recipient() {
         let fixture = Fixture::new();
@@ -384,11 +523,11 @@ mod tests {
                 .code(),
             fixture
                 .deks
-                .fresh_key(&fixture.conversation)
+                .fresh_key(&fixture.conversation, None)
                 .await
                 .unwrap_err()
                 .code(),
-            fixture.deks.ensure_recipients().unwrap_err().code(),
+            fixture.deks.ensure_recipients(None).unwrap_err().code(),
         ] {
             assert_eq!(code, "HISTORY_KEY_REQUIRED");
         }
@@ -412,7 +551,7 @@ mod tests {
         std::fs::create_dir_all(&draft).unwrap();
         let (kid, _) = fixture
             .deks
-            .draft_key(&fixture.conversation, &draft)
+            .draft_key(&fixture.conversation, &draft, None)
             .await
             .unwrap();
         let written =
@@ -592,7 +731,11 @@ mod tests {
             .unwrap()
             .value;
         // A fresh key is recorded but never becomes the active one.
-        let (fresh, _) = fixture.deks.fresh_key(&fixture.conversation).await.unwrap();
+        let (fresh, _) = fixture
+            .deks
+            .fresh_key(&fixture.conversation, None)
+            .await
+            .unwrap();
         assert!(fixture
             .deks
             .keys_snapshot(&fixture.conversation)
@@ -620,7 +763,11 @@ mod tests {
             .current_key(&fixture.conversation)
             .await
             .is_err());
-        assert!(fixture.deks.fresh_key(&fixture.conversation).await.is_err());
+        assert!(fixture
+            .deks
+            .fresh_key(&fixture.conversation, None)
+            .await
+            .is_err());
         assert_eq!(
             fixture
                 .deks

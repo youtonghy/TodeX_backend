@@ -30,7 +30,7 @@ use chrono::{DateTime, Utc};
 
 use crate::{devices::DeviceRegistry, error::AppError, secure_fs};
 
-pub(crate) use dek::DekManager;
+pub(crate) use dek::{DekManager, OwnerRecipients};
 pub(crate) use fingerprint::FingerprintKey;
 pub(crate) use keyring::KeyringStore;
 pub(crate) use recipients::{
