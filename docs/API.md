@@ -8,6 +8,7 @@
 - 默认监听地址：`127.0.0.1:7345`
 - 默认 HTTP Base URL：`http://127.0.0.1:7345`
 - 默认 WebSocket URL：`ws://127.0.0.1:7345/v2/ws`
+- 外部 API（API key 鉴权，默认关闭）：`http://127.0.0.1:7346/api/v1`，见 [外部 API（API Key）](#外部-apiapi-key)
 - 传输加密：transport v2（[transport-v2.md](transport-v2.md)），`x25519` 或 `ml-kem-768`，服务端公钥由设备配对交付（验证码认证）；WebSocket 用 `tv=2` 握手，REST 走 `POST /v2/sealed` 隧道
 - 数据格式：JSON
 - 字符编码：UTF-8
@@ -307,6 +308,171 @@ journal 存储格式为 history v3（规格见 `docs/history-encryption.md` §4�
 `events.jsonl` 是规范事件日志，sequence 从 1 连续递增；每次追加以 fsync 后的 journal 行为唯一提交点。manifest 缓存在内存中：创建、状态变化、元数据更新、强制置状态，以及会改变 manifest 的恢复时立即写 `manifest.json` 与 `snapshot.json`（与 journal 一致的 manifest 在启动恢复时不重写）；仅 `lastSequence`、`updatedAt` 变化时最多延迟 2 秒写 `manifest.json`，关闭时刷盘，崩溃后从 journal 重建。journal 修复：末条记录缺少换行时恢复阶段补上；明文文件中间损坏时先把受损文件备份为 `events.corrupt.<ts>.jsonl`，再原子重写这些文件，有效记录原样保留，每个丢失的 sequence 以 `journal.recordLost` 占位（payload `{ "reason": "corrupt", "runStart", "runLength", "backup" }`，同一段丢失共享 `runStart`/`runLength`，客户端可合并显示；普通追加无法伪造该事件类型）；末尾损坏仍隔离到备份文件后截断。`journal.compacted` 标记的 payload 为 `{ "reason": "compacted", "originalType", "runStart", "runLength" }`，同一剥离段共享 `runStart`/`runLength`；旧版本压缩写入的紧凑行 `{"sequence", "compacted": {...}}` 仍按原样读取。客户端把该类型按未知事件处理、不产生时间线条目。daemon 就绪后会在后台复制迁移旧 `$DATA_DIR/codex_gateway/sessions`；旧文件不修改，迁移可重复执行，并会去除 approval response 和常见 secret 字段。迁移失败会记录日志并在下次启动时重试，不阻塞 API 可用性。
 
 Codex 的原生 `thread/tokenUsage/updated` 通知会在 Provider 边界规范化为 `usage.updated`，避免原生字段名与凭证脱敏规则冲突。`payload.usage.last` 是最近一次模型调用，`payload.usage.cumulative` 是当前原生 thread 的累计值；两者都使用 `total`、`input`、`output`、`cacheRead`、`cacheWrite` 和 `reasoningOutput` 数值字段，`payload.contextWindow` 是模型上下文窗口。Pi 的逐回复统计继续位于 assistant `message.completed` 的 `payload.message.usage`。与同一 turn（或运行时作用域）上一条同类型事件 payload 完全相同的 `usage.updated` / `quota.updated` 不再重复写入 journal，`/v2/providers/quota` 的快照仍每次刷新。
+
+## 外部 API（API Key）
+
+除了设备端口 7345，daemon 还可以在另一个端口提供面向脚本、CI 和其他服务的 REST + SSE 接口。这个端口用后端签发的 API key 鉴权，不需要设备配对，也不使用 transport v2，可以调用所有已接入的 Agent。它与设备端口共用同一个会话管理器，但用 key 创建的会话与设备会话互相隔离。
+
+### 开启与配置
+
+外部 API 默认关闭。开启方式有三种：在 `config.toml` 中设置 `[api] enabled = true`，启动时加 `--enable-api`，或设置环境变量 `TODEX_AGENTD_API_ENABLED=true`。TUI 设置页也可以开关它并修改端口，保存后在下次（重新）启动服务时生效。
+
+| 配置 | 命令行参数 | 环境变量 | 默认值 |
+| --- | --- | --- | --- |
+| 开启外部 API | `--enable-api` | `TODEX_AGENTD_API_ENABLED` | `false` |
+| 监听主机 | `--api-host` | `TODEX_AGENTD_API_HOST` | `127.0.0.1` |
+| 监听端口 | `--api-port` | `TODEX_AGENTD_API_PORT` | `7346` |
+| 允许非回环明文监听 | 无 | `TODEX_AGENTD_API_ALLOW_PLAINTEXT_REMOTE` | `false` |
+
+```toml
+[api]
+enabled = true
+host = "127.0.0.1"
+port = 7346
+# allow_plaintext_remote = true   # 仅在可信 TLS 反向代理之后使用
+```
+
+启动时会检查以下几点：
+- API 端口不能与主端口相同。
+- API key 以 bearer 凭据的形式在明文 HTTP 中传输，因此 `api.host` 不是回环地址时必须同时设置 `allow_plaintext_remote = true`，否则 daemon 拒绝启动；设置后每次启动都会记录一条警告。远程访问应在前面放一个终止 TLS 的反向代理。
+- `daemon start` 会预先检查 API 端口是否被占用。
+
+daemon 运行时，`daemon status` 会多输出一行 `API listening: http://<host>:<port>/api/v1`。外部 API 不设 CORS，浏览器跨域调用会失败。
+
+### API key 管理
+
+key 的格式是 `tdx_<16 位十六进制 id>_<43 字符 base64url secret>`，只在创建时完整显示一次。`<data_dir>/api-keys.json`（0600）只保存 secret 的哈希，以及由 secret 派生的历史接收方公钥（见 [history-encryption.md §3.5](history-encryption.md)），文件本身不足以鉴权或解密。
+
+daemon 按文件修改时间重新加载 key，CLI 和 TUI 的修改无需重启就会生效。每把 key 的属性如下：
+
+- `scopes.agents`：允许使用的 Agent 列表，省略表示全部。
+- `scopes.workspaces`：允许使用的 workspace 绝对路径列表（包含子目录），省略表示全部 workspace 根目录。
+- `approval`：审批策略，取值为 `ask`（默认）、`auto-approve` 或 `reject`。
+- `expiresAt`：过期时间，Unix 毫秒，可选。
+
+最多可以有 256 把有效 key。被吊销的 key 仍保留在列表中，状态显示为 `revoked`。吊销或过期后，这把 key 的请求立即返回 401，已打开的 SSE 流在几秒内以 `error` 事件结束，正在运行的 turn 在约 10 秒内被取消。会话历史会保留。
+
+**管理入口：**
+
+- **CLI**（直接读写 `api-keys.json`）：
+
+  ```bash
+  todex-agentd api-key create --name ci --agent codex --workspace ~/projects/app --approval ask [--expires-days 30]
+  todex-agentd api-key list
+  todex-agentd api-key update <id> [--name …] [--agent …|--all-agents] [--workspace …|--all-workspaces] [--approval …] [--expires-days N|--no-expiry]
+  todex-agentd api-key revoke <id>
+  ```
+
+- **TUI**：使用 “API Keys” 面板。
+
+- **设备端 REST**（端口 7345，需要设备签名）：
+  - `GET /v2/api-keys`：返回 `{"keys":[…]}`。每项包含 `id`、`name`、`prefix`、`status`、`scopes`、`approval`、`createdAt`、`expiresAt`、`lastUsedAt`、`revokedAt`，不含任何哈希或密钥。
+  - `POST /v2/api-keys`：请求体为 `{"name","scopes"?,"approval"?,"expiresAt"?}`。返回 201，响应中的 `key` 字段是完整 key，只返回这一次。
+  - `PATCH /v2/api-keys/{id}`：请求体为 `{"name"?,"scopes"?,"approval"?,"expiresAt"?}`，其中 `expiresAt: null` 表示取消过期时间。
+  - `DELETE /v2/api-keys/{id}`：吊销。返回 `{"id","revoked"}`；不存在的 id 返回 404。
+  - `GET /v2/api-keys/listener`：返回 `{"enabled","host","port"}`。
+
+### 鉴权、隔离与 workspace 信任
+
+**鉴权：**
+- 请求头为 `Authorization: Bearer <key>`，也可以用 `X-API-Key: <key>`。
+- 缺少 key、key 错误、已吊销或已过期，一律返回 401 `UNAUTHENTICATED`，不区分具体原因。
+- 同一来源地址 60 秒内鉴权失败 30 次后返回 429 `RATE_LIMITED`，响应带 `Retry-After`。
+
+**隔离：**
+- 每把 key 创建的会话属于 owner `apikey:<id>`。key 之间互相看不到对方的会话，也看不到设备会话；设备端同样看不到 API 会话。访问别人的会话返回 404。
+
+**scope 与信任：**
+- Agent 或 workspace 超出 scope 时返回 403 `UNAUTHORIZED`。
+- workspace 还必须是受信任的：
+  - 在 `scopes.workspaces` 中显式列出的路径，签发 key 即视为授予信任。
+  - 未列出的路径（scope 为全部时也一样）必须已在已配对设备上被信任，否则返回 403 `WORKSPACE_TRUST_REQUIRED`。
+  - 首次使用时，后端会为该 key 的 owner 写入一条信任记录。
+
+**能力限制：**
+- API 会话不注入 TodeX 自带的 agent 工具（SSH、桌面/Computer Use、agent 浏览器），只使用 Agent 的原生能力。
+- turn 请求不接受 `permissionMode`、`sandboxMode`、`approvalPolicy`、`permissionProfile`、`workMode`，统一使用 Agent 的默认值，由 key 的审批策略处理权限请求。带有这些字段的请求返回 422。
+- 首版只支持文本 prompt 和 skills 引用。请求体上限 4 MiB。
+
+### 审批策略
+
+| `approval` | 行为 |
+| --- | --- |
+| `ask` | Agent 请求权限时推送 `permission.requested` 事件，由调用方 `POST …/permissions/{permissionId}` 回答；超时或取消时的处理与设备端相同 |
+| `auto-approve` | 后端立即选择 `allow_once` 选项；没有该选项的请求（例如提问）仍交给调用方回答 |
+| `reject` | 后端立即依次尝试 `reject_once`、`reject_always`、`abort_turn` 选项 |
+
+带 `allowedDeviceIds` 的请求只能由指定设备回答，后端从不代 API key 批准这类请求：`auto-approve` 下按拒绝处理，`ask` 下 API 调用方也无权回答（403）。无论哪种策略，`permission.requested` 和 `permission.resolved` 都会写入历史；由策略自动作答时，记录的作答方为 `apikey-policy:<id>`。
+
+### 接口（Base URL `http://127.0.0.1:7346`）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/v1/health` | 无需鉴权，返回 `{"ok":true,"version"}` |
+| GET | `/api/v1/me` | 当前 key 的摘要，字段与 `/v2/api-keys` 的列表项相同 |
+| GET | `/api/v1/agents` | 按 scope 过滤后的 Agent 快照，返回 `{"agents":[…]}`，每项结构同 `/v2/providers` |
+| GET | `/api/v1/agents/{agent}/models?workspace=` | 实时模型列表，返回 `{"agent","models"}` |
+| GET | `/api/v1/workspaces` | 可用的 workspace，返回 `{"workspaces":[{"path","scope":"root"\|"key"}]}` |
+| POST | `/api/v1/conversations` | 请求体为 `{"agent","workspace","title"?,"profile"?}`，返回 201 和会话 |
+| GET | `/api/v1/conversations` | 返回 `{"conversations":[…]}` |
+| GET / DELETE | `/api/v1/conversations/{id}` | 查看或删除会话 |
+| POST | `/api/v1/conversations/{id}/turns` | 请求体为 `{"text","model"?,"reasoningEffort"?,"skills"?:[{"resourceId","name"?}],"clientRequestId"?}`。默认返回 202 `{"conversationId","turnId"}`；带 `Accept: text/event-stream` 时直接以 SSE 推送本 turn 的事件，终止事件后关闭，响应头带 `X-Todex-Conversation-Id` 和 `X-Todex-Turn-Id`。已有 turn 在运行时返回 409 |
+| GET | `/api/v1/conversations/{id}/events?after=&limit=` | 明文事件分页。`after` 不包含在结果内，默认 0；`limit` 默认 200，最大 1000。返回 `{"conversationId","events","nextSequence","hasMore"}` |
+| GET | `/api/v1/conversations/{id}/events/stream?after=` | SSE：先推送 `after` 之后的历史，再持续推送实时事件；支持 `Last-Event-ID` 续传 |
+| POST | `/api/v1/conversations/{id}/cancel` | 请求体可选，为 `{"turnId"?}`。返回 `{"conversationId","cancelled","turnId","activeTurnId"?}` |
+| POST | `/api/v1/conversations/{id}/permissions/{permissionId}` | 请求体为 `{"outcome","optionId"?,"data"?}`，取值同 v2；返回 `{"conversationId","permissionId","accepted":true}` |
+| POST | `/api/v1/runs` | 一次性调用，见下文 |
+
+**会话对象**与 v2 manifest 的区别：
+- `title` 是解密后的标题。
+- 增加 `agent` 字段（等于 `provider`）。
+- 去掉 `titleEnc` 和 `ownerId`。
+
+**事件对象**与 v2 的 `ConversationEvent` 结构相同（`sequence`、`eventId`、`type`、`payload` 等），但 `payload` 是**明文**：
+- 后端用调用方提供的 key 在内存中解密，见 [history-encryption.md §3.5](history-encryption.md)。
+- 少数无法用这把 key 解开的事件（例如签发 key 之前写入的内容），`payload` 为 `{"encrypted":true}` 加上信封字段。
+- 流式文本片段在写入历史时会合并，所以回放得到的 `message.delta` 可能比实时推送时更长。
+
+**SSE 格式：**
+- 每条事件的格式为 `id: <sequence>`、`event: <事件 type>`、`data: <事件 JSON>`。
+- 每 15 秒发送一行 `: ` 注释作为 keepalive。
+- 流内出错，或 key 被吊销、过期时，会发送 `event: error`（`data` 为 `{"code","message"}`），随后关闭流。
+- 断线后带上 `Last-Event-ID`（或 `?after=`）重连即可续传，不会重复或遗漏事件。
+
+**`POST /api/v1/runs`**：在一次请求中创建会话并发送一个 turn。
+
+请求体为 `{"agent","workspace","text","model"?,"reasoningEffort"?,"title"?,"profile"?,"stream"?:false,"timeoutSecs"?}`。
+- `stream: true` 时，响应与上面带 SSE 的 turn 相同。
+- 否则等待 turn 结束后返回 `{"conversationId","turnId","status","output","error"}`：
+  - `status` 取值为 `completed`、`failed`、`cancelled`、`interrupted`。
+  - `output` 是主 Agent 本 turn 的助手文本拼接，不含 subagent 和思考内容。
+- `timeoutSecs` 默认 600，范围 1–3600。超时后后端会取消该 turn，返回 504 `{"code":"RUN_TIMEOUT","conversationId","turnId","output"}`，其中 `output` 是超时前已收到的文本。
+
+**错误格式**与 v2 相同，为 `{"code","message"}`：
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | 参数错误 |
+| 401 | 鉴权失败 |
+| 403 | 超出 scope，或 workspace 未受信任 |
+| 404 | 会话不存在或不属于该 key |
+| 409 | 已有 turn 在运行 |
+| 422 | 请求体包含不允许的字段 |
+| 429 | 鉴权失败次数过多 |
+| 503 | Agent 不可用 |
+| 504 | `runs` 超时 |
+
+**示例：**
+
+```bash
+KEY=$(todex-agentd api-key create --name demo --workspace ~/projects/app | tail -1)
+curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"agent":"codex","workspace":"'"$HOME"'/projects/app","text":"总结 README"}' \
+  http://127.0.0.1:7346/api/v1/runs
+curl -N -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"agent":"claude-code","workspace":"'"$HOME"'/projects/app","text":"列出 TODO","stream":true}' \
+  http://127.0.0.1:7346/api/v1/runs
+```
 
 ## HTTP 接口
 

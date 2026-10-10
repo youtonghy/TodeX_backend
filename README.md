@@ -235,6 +235,13 @@ args = ["--stdio"]
 [security]
 enable_auth = true
 enable_tls = false
+
+# External API for scripts and services, authenticated with API keys
+# (`todex-agentd api-key create`); off by default. See docs/API.md.
+[api]
+enabled = false
+host = "127.0.0.1"
+port = 7346
 ```
 
 > [!NOTE]
@@ -243,6 +250,10 @@ enable_tls = false
 ---
 
 ## API & WebSocket Reference
+
+### External API (`/api/v1`, API keys)
+
+With `[api] enabled = true` (or `--enable-api`) the daemon also serves REST + SSE on port `7346`, authenticated with `Authorization: Bearer tdx_…` keys issued by `todex-agentd api-key create`, the TUI, or `/v2/api-keys`. Each key reaches only its own conversations, scoped agents and workspaces; `POST /api/v1/runs` runs one prompt end to end. Events come back decrypted for the key while history on disk stays end-to-end encrypted. See the "外部 API（API Key）" chapter of [docs/API.md](docs/API.md).
 
 ### HTTP Endpoints (`/v2`)
 

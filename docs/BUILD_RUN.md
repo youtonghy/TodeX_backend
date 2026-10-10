@@ -133,6 +133,11 @@ args = []
 enable_auth = true
 enable_tls = false
 
+[api]                 # 外部 API（API key 鉴权，REST + SSE），默认关闭；见 docs/API.md
+enabled = false
+host = "127.0.0.1"    # 非回环地址还需 allow_plaintext_remote = true，并在 TLS 反向代理之后使用
+port = 7346
+
 [tui]
 language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
 ```
