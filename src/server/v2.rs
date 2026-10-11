@@ -226,6 +226,10 @@ fn authenticated_routes() -> Router<AppState> {
         .route("/v2/catalog/skills/{resource_id}", get(skill_resource))
         .route("/v2/catalog/mcp", get(mcp))
         .route(
+            "/v2/catalog/mcp/{resource_id}",
+            get(mcp_config).delete(delete_mcp),
+        )
+        .route(
             "/v2/conversations",
             get(list_conversations).post(create_conversation),
         )
@@ -1382,6 +1386,38 @@ async fn mcp(
     require_auth(&state, &headers)?;
     let workspace = validate_catalog_workspace(&state, &query.workspace)?;
     Ok(Json(state.catalog.mcp(query.provider, workspace).await?))
+}
+
+async fn mcp_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(resource_id): AxumPath<String>,
+    Query(query): Query<CatalogQuery>,
+) -> Result<Json<crate::catalog::McpServerConfig>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_catalog_workspace(&state, &query.workspace)?;
+    Ok(Json(
+        state
+            .catalog
+            .mcp_config(query.provider, workspace, &resource_id)
+            .await?,
+    ))
+}
+
+async fn delete_mcp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(resource_id): AxumPath<String>,
+    Query(query): Query<CatalogQuery>,
+) -> Result<Json<crate::catalog::McpServerDeletion>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_catalog_workspace(&state, &query.workspace)?;
+    Ok(Json(
+        state
+            .catalog
+            .delete_mcp(query.provider, workspace, &resource_id)
+            .await?,
+    ))
 }
 
 fn validate_catalog_workspace(state: &AppState, workspace: &str) -> Result<PathBuf, AppError> {

@@ -103,6 +103,51 @@ pub struct McpServerDescriptor {
     url: Option<String>,
     #[serde(skip)]
     headers: BTreeMap<String, String>,
+    #[serde(skip)]
+    origin: McpOrigin,
+}
+
+/// Where a catalog MCP entry was declared, so it can be shown verbatim or
+/// removed from that exact spot.
+#[derive(Clone, Debug, Default)]
+struct McpOrigin {
+    path: PathBuf,
+    format: McpConfigFormat,
+    /// JSON pointer of the `mcpServers` map holding the entry; empty for TOML,
+    /// whose entries always sit under `mcp_servers`.
+    map_pointer: String,
+    /// The entry's key exactly as written, before name cleanup.
+    key: String,
+    /// The entry as declared (TOML converted to JSON).
+    raw: Value,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpConfigFormat {
+    #[default]
+    Json,
+    Toml,
+    /// Reported by the provider's own inspection (Grok Build), not a file
+    /// TodeX parses.
+    Native,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerConfig {
+    pub descriptor: McpServerDescriptor,
+    pub path: String,
+    pub format: McpConfigFormat,
+    pub config: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerDeletion {
+    pub resource_id: String,
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Clone, Debug)]
@@ -281,6 +326,67 @@ impl CatalogService {
         })
     }
 
+    /// One catalog MCP entry with its configuration exactly as declared,
+    /// credentials included.
+    pub async fn mcp_config(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_id: &str,
+    ) -> Result<McpServerConfig, AppError> {
+        let descriptor = self
+            .mcp_descriptor(provider, workspace, resource_id)
+            .await?;
+        Ok(McpServerConfig {
+            path: descriptor.origin.path.to_string_lossy().into_owned(),
+            format: descriptor.origin.format,
+            config: descriptor.origin.raw.clone(),
+            descriptor,
+        })
+    }
+
+    /// Removes one catalog MCP entry from the config file that declares it,
+    /// leaving the rest of the file in place.
+    pub async fn delete_mcp(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_id: &str,
+    ) -> Result<McpServerDeletion, AppError> {
+        if catalog_profile(provider).source == CatalogSource::NativeInspect {
+            return Err(AppError::Unsupported(format!(
+                "{} MCP servers are managed by the provider itself",
+                crate::provider::profile::profile(provider).display_name
+            )));
+        }
+        let descriptor = self
+            .mcp_descriptor(provider, workspace, resource_id)
+            .await?;
+        let origin = descriptor.origin.clone();
+        tokio::task::spawn_blocking(move || remove_mcp_entry(&origin))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
+        Ok(McpServerDeletion {
+            resource_id: descriptor.resource_id,
+            name: descriptor.name,
+            path: descriptor.origin.path.to_string_lossy().into_owned(),
+        })
+    }
+
+    async fn mcp_descriptor(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_id: &str,
+    ) -> Result<McpServerDescriptor, AppError> {
+        self.mcp(provider, workspace)
+            .await?
+            .servers
+            .into_iter()
+            .find(|server| server.resource_id == resource_id)
+            .ok_or_else(|| AppError::NotFound(format!("mcp resource {resource_id}")))
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -308,6 +414,7 @@ impl McpRuntimeTarget {
                 env: BTreeMap::new(),
                 url: None,
                 headers: BTreeMap::new(),
+                origin: McpOrigin::default(),
             },
             command,
             env: BTreeMap::new(),
@@ -337,6 +444,7 @@ impl McpRuntimeTarget {
                 env: BTreeMap::new(),
                 url: Some(url.clone()),
                 headers: BTreeMap::new(),
+                origin: McpOrigin::default(),
             },
             command: Vec::new(),
             env: BTreeMap::new(),
@@ -590,10 +698,14 @@ fn scan_mcp(
                 continue;
             }
         };
-        let parsed = if source.path.extension().and_then(|value| value.to_str()) == Some("toml") {
-            parse_toml_mcp(&raw)
+        let format = if source.path.extension().and_then(|value| value.to_str()) == Some("toml") {
+            McpConfigFormat::Toml
         } else {
-            parse_json_mcp(&raw)
+            McpConfigFormat::Json
+        };
+        let parsed = match format {
+            McpConfigFormat::Toml => parse_toml_mcp(&raw),
+            _ => parse_json_mcp(&raw),
         };
         let entries = match parsed {
             Ok(entries) => entries,
@@ -621,6 +733,13 @@ fn scan_mcp(
                 env: entry.env,
                 url: entry.url,
                 headers: entry.headers,
+                origin: McpOrigin {
+                    path: source.path.clone(),
+                    format,
+                    map_pointer: entry.map_pointer,
+                    key: entry.key,
+                    raw: entry.raw,
+                },
             });
         }
     }
@@ -778,6 +897,13 @@ fn parse_grok_mcp(inspect: &Value, workspace: &Path) -> Vec<McpServerDescriptor>
                     .then(|| target.to_owned())
                     .filter(|value| !value.is_empty()),
                 headers: BTreeMap::new(),
+                origin: McpOrigin {
+                    path: source_path,
+                    format: McpConfigFormat::Native,
+                    map_pointer: String::new(),
+                    key: name.to_owned(),
+                    raw: server.clone(),
+                },
             })
         })
         .collect::<Vec<_>>();
@@ -810,6 +936,9 @@ fn grok_scope(source_type: &str, path: &Path, workspace: &Path) -> CatalogScope 
 
 struct ParsedMcpServer {
     name: String,
+    key: String,
+    map_pointer: String,
+    raw: Value,
     transport: McpTransport,
     enabled: bool,
     command: Vec<String>,
@@ -828,7 +957,10 @@ fn parse_toml_mcp(raw: &str) -> Result<Vec<ParsedMcpServer>, AppError> {
         .iter()
         .filter_map(|(name, value)| {
             let table = value.as_table()?;
-            Some(parsed_mcp_from_toml(clean_name(name.clone()), table))
+            let mut entry = parsed_mcp_from_toml(clean_name(name.clone()), table);
+            entry.key = name.clone();
+            entry.raw = serde_json::to_value(table).unwrap_or(Value::Null);
+            Some(entry)
         })
         .collect())
 }
@@ -881,6 +1013,9 @@ fn parsed_mcp_from_toml(name: String, table: &toml::Table) -> ParsedMcpServer {
         .unwrap_or_default();
     ParsedMcpServer {
         name,
+        key: String::new(),
+        map_pointer: String::new(),
+        raw: Value::Null,
         transport,
         enabled: table
             .get("enabled")
@@ -897,14 +1032,18 @@ fn parse_json_mcp(raw: &str) -> Result<Vec<ParsedMcpServer>, AppError> {
     let value: Value = serde_json::from_str(raw)
         .map_err(|error| AppError::InvalidRequest(format!("invalid MCP JSON config: {error}")))?;
     let mut maps = Vec::new();
-    find_mcp_server_maps(&value, 0, &mut maps);
+    find_mcp_server_maps(&value, String::new(), 0, &mut maps);
     let mut entries = BTreeMap::new();
-    for map in maps {
+    for (map_pointer, map) in maps {
         for (name, value) in map {
             let Some(server) = value.as_object() else {
                 continue;
             };
-            entries.insert(clean_name(name.clone()), parsed_mcp_from_json(server));
+            let mut entry = parsed_mcp_from_json(server);
+            entry.key = name.clone();
+            entry.map_pointer = map_pointer.clone();
+            entry.raw = value.clone();
+            entries.insert(clean_name(name.clone()), entry);
         }
     }
     Ok(entries
@@ -962,6 +1101,9 @@ fn parsed_mcp_from_json(server: &serde_json::Map<String, Value>) -> ParsedMcpSer
         .unwrap_or_default();
     ParsedMcpServer {
         name: String::new(),
+        key: String::new(),
+        map_pointer: String::new(),
+        raw: Value::Null,
         transport,
         enabled: server
             .get("enabled")
@@ -974,10 +1116,12 @@ fn parsed_mcp_from_json(server: &serde_json::Map<String, Value>) -> ParsedMcpSer
     }
 }
 
+/// Collects every `mcpServers` map with its JSON pointer.
 fn find_mcp_server_maps<'a>(
     value: &'a Value,
+    pointer: String,
     depth: usize,
-    output: &mut Vec<&'a serde_json::Map<String, Value>>,
+    output: &mut Vec<(String, &'a serde_json::Map<String, Value>)>,
 ) {
     if depth > 4 {
         return;
@@ -985,19 +1129,85 @@ fn find_mcp_server_maps<'a>(
     match value {
         Value::Object(map) => {
             if let Some(servers) = map.get("mcpServers").and_then(Value::as_object) {
-                output.push(servers);
+                output.push((format!("{pointer}/mcpServers"), servers));
             }
-            for value in map.values() {
-                find_mcp_server_maps(value, depth + 1, output);
+            for (key, value) in map {
+                let token = key.replace('~', "~0").replace('/', "~1");
+                find_mcp_server_maps(value, format!("{pointer}/{token}"), depth + 1, output);
             }
         }
         Value::Array(values) => {
-            for value in values {
-                find_mcp_server_maps(value, depth + 1, output);
+            for (index, value) in values.iter().enumerate() {
+                find_mcp_server_maps(value, format!("{pointer}/{index}"), depth + 1, output);
             }
         }
         _ => {}
     }
+}
+
+/// Deletes the entry `origin` points at and rewrites the file in place of
+/// the old one, keeping its permissions. Fails with `NotFound` when the file
+/// changed and the entry is no longer there.
+fn remove_mcp_entry(origin: &McpOrigin) -> Result<(), AppError> {
+    let path = &origin.path;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(AppError::InvalidRequest(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    let raw = std::fs::read_to_string(path)?;
+    let missing = || AppError::NotFound(format!("mcp server {} in {}", origin.key, path.display()));
+    let updated = match origin.format {
+        McpConfigFormat::Toml => {
+            let mut document = raw.parse::<toml_edit::DocumentMut>().map_err(|error| {
+                AppError::InvalidRequest(format!("invalid MCP TOML config: {error}"))
+            })?;
+            document
+                .get_mut("mcp_servers")
+                .and_then(toml_edit::Item::as_table_like_mut)
+                .and_then(|servers| servers.remove(&origin.key))
+                .ok_or_else(missing)?;
+            document.to_string()
+        }
+        McpConfigFormat::Json => {
+            let mut value: Value = serde_json::from_str(&raw).map_err(|error| {
+                AppError::InvalidRequest(format!("invalid MCP JSON config: {error}"))
+            })?;
+            value
+                .pointer_mut(&origin.map_pointer)
+                .and_then(Value::as_object_mut)
+                .and_then(|servers| servers.remove(&origin.key))
+                .ok_or_else(missing)?;
+            let mut text = serde_json::to_string_pretty(&value)
+                .map_err(|error| AppError::Anyhow(error.into()))?;
+            if raw.ends_with('\n') {
+                text.push('\n');
+            }
+            text
+        }
+        McpConfigFormat::Native => {
+            return Err(AppError::Unsupported(
+                "natively managed MCP servers cannot be removed here".to_owned(),
+            ))
+        }
+    };
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = path.with_file_name(format!(
+        ".{file_name}.todex-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&temp, updated)?;
+    let result = std::fs::set_permissions(&temp, metadata.permissions())
+        .and_then(|()| std::fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(Into::into)
 }
 
 fn apply_mcp_precedence(servers: &mut [McpServerDescriptor]) {
@@ -1159,6 +1369,100 @@ mod tests {
 
         assert_eq!(fs::read(user_skill).unwrap(), before_user);
         assert_eq!(fs::read(project_skill).unwrap(), before_project);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn mcp_entries_are_shown_raw_and_deleted_in_place() {
+        let root = temp_dir("todex-catalog-mcp-edit");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(workspace.join(".codex")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let claude = home.join(".claude.json");
+        fs::write(
+            &claude,
+            r#"{"numStartups":3,"mcpServers":{"keep":{"command":"keep"}},"projects":{"/srv/a/b":{"mcpServers":{"drop":{"type":"http","url":"https://example.test/mcp","headers":{"Authorization":"Bearer t"}}}}}}
+"#,
+        )
+        .unwrap();
+        let codex = workspace.join(".codex/config.toml");
+        fs::write(
+            &codex,
+            "# keep me\nmodel = \"x\"\n\n[mcp_servers.gone]\ncommand = \"npx\"\n\n[mcp_servers.gone.env]\nTOKEN = \"s\"\n\n[mcp_servers.stay]\nurl = \"https://stay.test\"\n",
+        )
+        .unwrap();
+
+        let config = Arc::new(test_config(root.join("data"), workspace_root));
+        let service = CatalogService::with_home(config, Some(home));
+
+        let claude_catalog = service
+            .mcp(ProviderKind::ClaudeCode, workspace.clone())
+            .await
+            .unwrap();
+        let drop = claude_catalog
+            .servers
+            .iter()
+            .find(|server| server.name == "drop")
+            .unwrap();
+        let raw = service
+            .mcp_config(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                &drop.resource_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw.format, McpConfigFormat::Json);
+        assert_eq!(raw.config["headers"]["Authorization"], "Bearer t");
+        service
+            .delete_mcp(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                &drop.resource_id,
+            )
+            .await
+            .unwrap();
+        let rewritten: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+        assert_eq!(rewritten["numStartups"], 3);
+        assert!(rewritten["mcpServers"]["keep"].is_object());
+        assert!(rewritten["projects"]["/srv/a/b"]["mcpServers"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+        assert!(service
+            .delete_mcp(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                &drop.resource_id
+            )
+            .await
+            .is_err());
+
+        let codex_catalog = service
+            .mcp(ProviderKind::Codex, workspace.clone())
+            .await
+            .unwrap();
+        let gone = codex_catalog
+            .servers
+            .iter()
+            .find(|server| server.name == "gone")
+            .unwrap();
+        let raw = service
+            .mcp_config(ProviderKind::Codex, workspace.clone(), &gone.resource_id)
+            .await
+            .unwrap();
+        assert_eq!(raw.format, McpConfigFormat::Toml);
+        assert_eq!(raw.config["env"]["TOKEN"], "s");
+        service
+            .delete_mcp(ProviderKind::Codex, workspace.clone(), &gone.resource_id)
+            .await
+            .unwrap();
+        let toml = fs::read_to_string(&codex).unwrap();
+        assert!(toml.starts_with("# keep me\nmodel = \"x\"\n"));
+        assert!(!toml.contains("gone"));
+        assert!(toml.contains("[mcp_servers.stay]"));
         let _ = fs::remove_dir_all(root);
     }
 
