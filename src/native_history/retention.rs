@@ -3,8 +3,7 @@
 //! on its own start-up, regardless of TodeX references.
 
 use std::{
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -64,19 +63,7 @@ pub(super) fn write(path: &Path, days: Option<u32>) -> Result<Option<Value>, App
     }
     let mut bytes = serde_json::to_vec_pretty(&Value::Object(settings))?;
     bytes.push(b'\n');
-    let target = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
-        _ => path.to_owned(),
-    };
-    let permissions = match fs::metadata(&target) {
-        Ok(metadata) => Some(metadata.permissions()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    replace_atomic(&target, &bytes, permissions)?;
+    crate::secure_fs::replace_keeping_mode(path, &bytes)?;
     Ok(days.map(Value::from))
 }
 
@@ -93,49 +80,6 @@ fn read_settings(path: &Path) -> Result<Option<Map<String, Value>>, AppError> {
             path.display()
         ))),
     }
-}
-
-fn replace_atomic(
-    path: &Path,
-    bytes: &[u8],
-    permissions: Option<fs::Permissions>,
-) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let temporary = parent.join(format!(
-        ".{}.{}.tmp",
-        name.to_string_lossy(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    let result = (|| {
-        let mut options = fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        if let Some(permissions) = permissions {
-            fs::set_permissions(&temporary, permissions)?;
-        }
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
 }
 
 #[cfg(test)]

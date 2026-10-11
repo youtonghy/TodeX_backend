@@ -44,6 +44,48 @@ pub(crate) fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> io::Result<(
     result
 }
 
+/// Atomically replaces a user-owned config file, keeping its permissions: a
+/// symlinked `path` is updated at its target, an existing file keeps its
+/// mode, and a missing one (and its parents) is created owner-only.
+pub(crate) fn replace_keeping_mode(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let target = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
+        _ => path.to_owned(),
+    };
+    let permissions = match fs::metadata(&target) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let parent = target
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        write_new_file(&temporary, bytes)?;
+        if let Some(permissions) = permissions {
+            fs::set_permissions(&temporary, permissions)?;
+        }
+        #[cfg(windows)]
+        if target.exists() {
+            fs::remove_file(&target)?;
+        }
+        fs::rename(&temporary, &target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Writes `bytes` to a new 0600 file and fails with `AlreadyExists` instead of
 /// replacing an existing one. A partially written file is removed.
 pub(crate) fn create_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {

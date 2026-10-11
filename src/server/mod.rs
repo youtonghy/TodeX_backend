@@ -2,6 +2,7 @@ mod agent_desktop;
 mod agent_providers;
 pub(crate) mod api;
 mod api_keys;
+mod cli_settings;
 mod device_pairing;
 mod enforcement;
 mod git;

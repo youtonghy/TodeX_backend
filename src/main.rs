@@ -7,6 +7,7 @@ mod api_keys;
 mod app_state;
 mod autostart;
 mod catalog;
+mod cli_settings;
 mod codex_gateway;
 mod computer;
 mod config;

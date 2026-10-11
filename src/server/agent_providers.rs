@@ -151,7 +151,7 @@ async fn import_agent_providers(
     Ok(Json(block))
 }
 
-fn require_signed_device(
+pub(super) fn require_signed_device(
     state: &AppState,
     headers: &HeaderMap,
     action: &str,
