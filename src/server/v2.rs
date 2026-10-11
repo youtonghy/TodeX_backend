@@ -222,12 +222,15 @@ fn authenticated_routes() -> Router<AppState> {
             "/v2/conversations/{conversation_id}/runtime/stop",
             post(stop_provider_runtime),
         )
-        .route("/v2/catalog/skills", get(skills))
-        .route("/v2/catalog/skills/{resource_id}", get(skill_resource))
-        .route("/v2/catalog/mcp", get(mcp))
+        .route("/v2/catalog/skills", get(skills).post(create_skill))
+        .route(
+            "/v2/catalog/skills/{resource_id}",
+            get(skill_resource).put(update_skill).delete(delete_skill),
+        )
+        .route("/v2/catalog/mcp", get(mcp).post(create_mcp))
         .route(
             "/v2/catalog/mcp/{resource_id}",
-            get(mcp_config).delete(delete_mcp),
+            get(mcp_config).put(update_mcp).delete(delete_mcp),
         )
         .route(
             "/v2/conversations",
@@ -1416,6 +1419,106 @@ async fn delete_mcp(
         state
             .catalog
             .delete_mcp(query.provider, workspace, &resource_id)
+            .await?,
+    ))
+}
+
+async fn create_mcp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CatalogQuery>,
+    Json(request): Json<CreateMcpRequest>,
+) -> Result<Json<crate::catalog::McpServerConfig>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_catalog_workspace(&state, &query.workspace)?;
+    Ok(Json(
+        state
+            .catalog
+            .create_mcp(
+                query.provider,
+                workspace,
+                request.scope,
+                request.name,
+                request.config,
+            )
+            .await?,
+    ))
+}
+
+async fn update_mcp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(resource_id): AxumPath<String>,
+    Query(query): Query<CatalogQuery>,
+    Json(request): Json<UpdateMcpRequest>,
+) -> Result<Json<crate::catalog::McpServerConfig>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_catalog_workspace(&state, &query.workspace)?;
+    Ok(Json(
+        state
+            .catalog
+            .update_mcp(
+                query.provider,
+                workspace,
+                &resource_id,
+                request.name,
+                request.config,
+            )
+            .await?,
+    ))
+}
+
+async fn create_skill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CatalogQuery>,
+    Json(request): Json<CreateSkillRequest>,
+) -> Result<Json<crate::catalog::SkillDescriptor>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_catalog_workspace(&state, &query.workspace)?;
+    Ok(Json(
+        state
+            .catalog
+            .create_skill(
+                query.provider,
+                workspace,
+                &request.source,
+                &request.name,
+                request.content,
+            )
+            .await?,
+    ))
+}
+
+async fn update_skill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(resource_id): AxumPath<String>,
+    Query(query): Query<CatalogQuery>,
+    Json(request): Json<UpdateSkillRequest>,
+) -> Result<Json<crate::catalog::SkillDescriptor>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_catalog_workspace(&state, &query.workspace)?;
+    Ok(Json(
+        state
+            .catalog
+            .update_skill(query.provider, workspace, &resource_id, request.content)
+            .await?,
+    ))
+}
+
+async fn delete_skill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(resource_id): AxumPath<String>,
+    Query(query): Query<CatalogQuery>,
+) -> Result<Json<crate::catalog::SkillDeletion>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_catalog_workspace(&state, &query.workspace)?;
+    Ok(Json(
+        state
+            .catalog
+            .delete_skill(query.provider, workspace, &resource_id)
             .await?,
     ))
 }
@@ -3852,6 +3955,35 @@ struct PromptRequest {
 struct CatalogQuery {
     provider: ProviderKind,
     workspace: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateMcpRequest {
+    scope: crate::catalog::CatalogScope,
+    name: String,
+    config: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateMcpRequest {
+    name: String,
+    config: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSkillRequest {
+    source: String,
+    name: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSkillRequest {
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]

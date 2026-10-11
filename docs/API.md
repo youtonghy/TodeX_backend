@@ -282,17 +282,32 @@ Pi capability 额外声明 `runtimeStop`、`sessionCommands`、`extensionMessage
 
 原生 custom message 以 `extension.message` 交付，包含独立 `messageId` 与完整 `message`（`customType`、`content`、`display`、可选 `details`、`timestamp`）。客户端尊重 `display: false`，并以普通文本安全显示可见内容。原生后台消息与工具不携带旧 `turnId`；usage 保留既有 `scope: "message"` 用于计费去重。`ui.custom` 等依赖终端渲染的自定义界面没有通用 RPC 表示，客户端不能宣称支持或自动回退执行。
 
-### 只读 Skill/MCP Catalog
+### Skill/MCP Catalog
 
 ```http
 GET /v2/catalog/skills?provider=claude-code&workspace=/home/user/projects/demo
+POST /v2/catalog/skills?provider=claude-code&workspace=/home/user/projects/demo
 GET /v2/catalog/skills/{resourceId}?provider=claude-code&workspace=/home/user/projects/demo
+PUT /v2/catalog/skills/{resourceId}?provider=claude-code&workspace=/home/user/projects/demo
+DELETE /v2/catalog/skills/{resourceId}?provider=claude-code&workspace=/home/user/projects/demo
 GET /v2/catalog/mcp?provider=claude-code&workspace=/home/user/projects/demo
+POST /v2/catalog/mcp?provider=claude-code&workspace=/home/user/projects/demo
 GET /v2/catalog/mcp/{resourceId}?provider=claude-code&workspace=/home/user/projects/demo
+PUT /v2/catalog/mcp/{resourceId}?provider=claude-code&workspace=/home/user/projects/demo
 DELETE /v2/catalog/mcp/{resourceId}?provider=claude-code&workspace=/home/user/projects/demo
 ```
 
-Catalog 只读取 Provider 的用户级和项目级原生配置，项目级同名资源优先。Skill 正文只能通过后端生成的 `resourceId` 读取；MCP 列表仅返回名称、来源、scope、transport、active 状态以及可选的 tools/authStatus/error，不返回 command、args、env、URL 或凭据。`GET /v2/catalog/mcp/{resourceId}` 返回单个条目的原始配置 `{ descriptor, path, format: "json" | "toml" | "native", config }`：`config` 是配置文件中该条目的原样内容（TOML 转为 JSON，Grok Build 为其 inspect 输出中的条目），**包含 env、headers 等凭据**，`path` 为声明该条目的文件。`DELETE /v2/catalog/mcp/{resourceId}` 从声明它的文件中删除该条目并返回 `{ resourceId, name, path }`：JSON 文件只删除对应 `mcpServers` 映射中的那一个键（例如 `~/.claude.json` 中某个项目下的条目），按 2 空格缩进重写全文，保留键顺序但不保留原排版；TOML 文件只删除 `[mcp_servers.<name>]` 及其子表，保留其余内容与注释；写入临时文件后原子替换并沿用原文件权限。条目已不存在时返回 `404`，Grok Build 这类由 Provider 自行管理的 MCP 返回 `UNSUPPORTED`。被同名高优先级条目遮蔽的条目也可单独删除。后端不提供安装、启停或改写接口。实际 MCP 调用使用 `mcp.call`，由 daemon 按内部配置执行。`mcp.call` 的结果整体写入 `mcp.completed`/`mcp.failed` 事件，因此序列化后超过 512 KiB（单事件上限的一半）时会被截断：按顺序保留放得下的内容块，第一个放不下的文本块截短，其他放不下的块换成一条说明，顶层字段只保留 `isError` 与 `resultType`（丢弃 `structuredContent`、`_meta` 及其他未知字段），结果带 `truncated: true` 并以一条说明文字结尾。这一上限在结果完整读入后才施加：stdio 服务器的每条 JSON-RPC 消息（一行）另有 16 MiB 的读取上限，超过即断开连接、调用失败（错误说明超过上限）；HTTP 服务器的响应在读入时没有单独的大小上限。`mcp.refresh` 的工具列表每个服务器最多 512 个，描述最多 4096 字（截断处以 `…` 结尾）。
+Skill 与 MCP 列表另带 `editable`（列出的条目能否在此编辑、删除）以及 `creatableSources`（Skill，可新建到的来源，取值同条目的 `source`：`shared-user`、`provider-user`、`shared-project`、`provider-project`，与 Provider 目录重合的来源只保留优先级高的一个）或 `creatableScopes`（MCP，`user` / `project`）。Grok Build 由 Provider 自行管理，`editable: false` 且不可新建；没有 MCP 配置文件的 Provider（OpenCode、ACP）MCP 列表 `editable: false`、`creatableScopes: []`；旧 daemon 不返回这些字段，客户端应视为只读。
+
+- `POST /v2/catalog/skills` 请求体 `{ source, name, content }`：在该来源的 Skill 根目录下新建 `<name>/SKILL.md`。`name` 为 1–100 个字母、数字、`.`、`_`、`-`，不能以 `.` 开头；目录已存在返回 `409`。`content` 必须带可解析的 YAML front matter，且不超过 256 KiB。返回新 Skill 的 descriptor。
+- `PUT /v2/catalog/skills/{resourceId}` 请求体 `{ content }`：校验同上后原子覆盖该 `SKILL.md`（沿用原权限），`resourceId` 不变；格式无效的 Skill 也可借此修复。返回更新后的 descriptor。
+- `DELETE /v2/catalog/skills/{resourceId}`：删除该 Skill 所在目录（含其中脚本等附属文件）；`SKILL.md` 直接位于 Skill 根目录时只删除该文件。返回 `{ resourceId, name, path }`，`path` 为被删除的目录或文件。
+- `POST /v2/catalog/mcp` 请求体 `{ scope, name, config }`：把条目写入该 scope 的第一个 MCP 配置文件（如 Claude Code 的 `~/.claude.json` 顶层 `mcpServers` 或项目 `.mcp.json`，Codex 的 `config.toml` `[mcp_servers]`），文件不存在时创建（权限 0600）。`name` 去除首尾空白后为 1–200 个可打印字符，`config` 必须是 JSON 对象；同一文件中已有同名条目返回 `409`。返回与 `GET /v2/catalog/mcp/{resourceId}` 相同的结构。
+- `PUT /v2/catalog/mcp/{resourceId}` 请求体 `{ name, config }`：在声明它的文件中原位替换该条目，`name` 与原名不同则重命名（新名已存在返回 `409`）。`resourceId` 由名称与文件计算，重命名后会改变，以响应中的 descriptor 为准。
+
+写入规则与删除相同：JSON 按 2 空格缩进重写全文；TOML 只替换 `[mcp_servers.<name>]`，嵌套对象写为内联表，保留其余内容与注释，且 TOML 不接受 `null`；写入临时文件后原子替换。
+
+Catalog 只读取 Provider 的用户级和项目级原生配置，项目级同名资源优先。Skill 正文只能通过后端生成的 `resourceId` 读取；MCP 列表仅返回名称、来源、scope、transport、active 状态以及可选的 tools/authStatus/error，不返回 command、args、env、URL 或凭据。`GET /v2/catalog/mcp/{resourceId}` 返回单个条目的原始配置 `{ descriptor, path, format: "json" | "toml" | "native", config }`：`config` 是配置文件中该条目的原样内容（TOML 转为 JSON，Grok Build 为其 inspect 输出中的条目），**包含 env、headers 等凭据**，`path` 为声明该条目的文件。`DELETE /v2/catalog/mcp/{resourceId}` 从声明它的文件中删除该条目并返回 `{ resourceId, name, path }`：JSON 文件只删除对应 `mcpServers` 映射中的那一个键（例如 `~/.claude.json` 中某个项目下的条目），按 2 空格缩进重写全文，保留键顺序但不保留原排版；TOML 文件只删除 `[mcp_servers.<name>]` 及其子表，保留其余内容与注释；写入临时文件后原子替换并沿用原文件权限。条目已不存在时返回 `404`，Grok Build 这类由 Provider 自行管理的 MCP 返回 `UNSUPPORTED`。被同名高优先级条目遮蔽的条目也可单独删除或编辑。后端不提供安装或启停接口。实际 MCP 调用使用 `mcp.call`，由 daemon 按内部配置执行。`mcp.call` 的结果整体写入 `mcp.completed`/`mcp.failed` 事件，因此序列化后超过 512 KiB（单事件上限的一半）时会被截断：按顺序保留放得下的内容块，第一个放不下的文本块截短，其他放不下的块换成一条说明，顶层字段只保留 `isError` 与 `resultType`（丢弃 `structuredContent`、`_meta` 及其他未知字段），结果带 `truncated: true` 并以一条说明文字结尾。这一上限在结果完整读入后才施加：stdio 服务器的每条 JSON-RPC 消息（一行）另有 16 MiB 的读取上限，超过即断开连接、调用失败（错误说明超过上限）；HTTP 服务器的响应在读入时没有单独的大小上限。`mcp.refresh` 的工具列表每个服务器最多 512 个，描述最多 4096 字（截断处以 `…` 结尾）。
 
 ### Conversation Folder 与旧数据迁移
 

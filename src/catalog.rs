@@ -30,6 +30,11 @@ pub struct CatalogService {
 pub struct SkillCatalog {
     pub provider: ProviderKind,
     pub skills: Vec<SkillDescriptor>,
+    /// Whether the listed skills can be edited and deleted here.
+    pub editable: bool,
+    /// Skill sources (`shared-user`, `provider-project`, …) a new skill can
+    /// be created in.
+    pub creatable_sources: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -64,6 +69,10 @@ pub struct SkillResource {
 pub struct McpCatalog {
     pub provider: ProviderKind,
     pub servers: Vec<McpServerDescriptor>,
+    /// Whether the listed entries can be edited and deleted here.
+    pub editable: bool,
+    /// Scopes a new entry can be added to (the first config file of each).
+    pub creatable_scopes: Vec<CatalogScope>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -150,6 +159,14 @@ pub struct McpServerDeletion {
     pub path: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDeletion {
+    pub resource_id: String,
+    pub name: String,
+    pub path: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct McpRuntimeTarget {
     pub descriptor: McpServerDescriptor,
@@ -160,7 +177,7 @@ pub struct McpRuntimeTarget {
     pub workspace: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CatalogScope {
     User,
@@ -173,6 +190,15 @@ pub enum McpTransport {
     Stdio,
     Http,
     Unknown,
+}
+
+impl CatalogScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Project => "project",
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -230,13 +256,21 @@ impl CatalogService {
             return Ok(SkillCatalog {
                 provider,
                 skills: parse_grok_skills(&inspect, &workspace),
+                editable: false,
+                creatable_sources: Vec::new(),
             });
         }
         let roots = skill_roots(self.home.as_deref(), &workspace, provider);
+        let creatable_sources = roots.iter().map(|root| root.source).collect();
         let skills = tokio::task::spawn_blocking(move || scan_skills(roots))
             .await
             .map_err(|error| AppError::Anyhow(error.into()))??;
-        Ok(SkillCatalog { provider, skills })
+        Ok(SkillCatalog {
+            provider,
+            skills,
+            editable: true,
+            creatable_sources,
+        })
     }
 
     pub async fn skill_resource(
@@ -280,7 +314,16 @@ impl CatalogService {
             return Ok(McpCatalog {
                 provider,
                 servers: parse_grok_mcp(&inspect, &workspace),
+                editable: false,
+                creatable_scopes: Vec::new(),
             });
+        }
+        let sources = mcp_sources(self.home.as_deref(), &workspace, provider);
+        let mut creatable_scopes = Vec::new();
+        for scope in [CatalogScope::User, CatalogScope::Project] {
+            if sources.iter().any(|source| source.scope == scope) {
+                creatable_scopes.push(scope);
+            }
         }
         let home = self.home.clone();
         let workspace_for_scan = workspace.clone();
@@ -289,7 +332,12 @@ impl CatalogService {
         })
         .await
         .map_err(|error| AppError::Anyhow(error.into()))??;
-        Ok(McpCatalog { provider, servers })
+        Ok(McpCatalog {
+            provider,
+            servers,
+            editable: !sources.is_empty(),
+            creatable_scopes,
+        })
     }
 
     pub async fn mcp_target(
@@ -371,6 +419,199 @@ impl CatalogService {
             name: descriptor.name,
             path: descriptor.origin.path.to_string_lossy().into_owned(),
         })
+    }
+
+    /// Adds a new MCP entry to the first config file of `scope`, creating
+    /// the file when it does not exist yet.
+    pub async fn create_mcp(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        scope: CatalogScope,
+        name: String,
+        config: Value,
+    ) -> Result<McpServerConfig, AppError> {
+        let name = validate_mcp_entry(name, &config)?;
+        let source = mcp_sources(self.home.as_deref(), &workspace, provider)
+            .into_iter()
+            .find(|source| source.scope == scope)
+            .ok_or_else(|| {
+                AppError::Unsupported(format!(
+                    "{} has no {} MCP config file TodeX can write",
+                    crate::provider::profile::profile(provider).display_name,
+                    scope.as_str()
+                ))
+            })?;
+        let path = source.path.clone();
+        let entry_name = name.clone();
+        tokio::task::spawn_blocking(move || insert_mcp_entry(&path, &entry_name, config))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
+        let resource_id = resource_id_for_mcp(&name, &source.path);
+        self.mcp_config(provider, workspace, &resource_id).await
+    }
+
+    /// Replaces one MCP entry in the file that declares it, optionally
+    /// renaming it. A rename changes the entry's resource id.
+    pub async fn update_mcp(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_id: &str,
+        name: String,
+        config: Value,
+    ) -> Result<McpServerConfig, AppError> {
+        if catalog_profile(provider).source == CatalogSource::NativeInspect {
+            return Err(AppError::Unsupported(format!(
+                "{} MCP servers are managed by the provider itself",
+                crate::provider::profile::profile(provider).display_name
+            )));
+        }
+        let name = validate_mcp_entry(name, &config)?;
+        let descriptor = self
+            .mcp_descriptor(provider, workspace.clone(), resource_id)
+            .await?;
+        let origin = descriptor.origin.clone();
+        let entry_name = name.clone();
+        tokio::task::spawn_blocking(move || replace_mcp_entry(&origin, &entry_name, config))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
+        let resource_id = resource_id_for_mcp(&name, &descriptor.origin.path);
+        self.mcp_config(provider, workspace, &resource_id).await
+    }
+
+    /// Writes a new `<root>/<name>/SKILL.md` under the skill root of
+    /// `source`.
+    pub async fn create_skill(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        source: &str,
+        name: &str,
+        content: String,
+    ) -> Result<SkillDescriptor, AppError> {
+        if catalog_profile(provider).source == CatalogSource::NativeInspect {
+            return Err(AppError::Unsupported(format!(
+                "{} skills are managed by the provider itself",
+                crate::provider::profile::profile(provider).display_name
+            )));
+        }
+        validate_skill_directory_name(name)?;
+        validate_skill_content(&content)?;
+        let root = skill_roots(self.home.as_deref(), &workspace, provider)
+            .into_iter()
+            .find(|root| root.source == source)
+            .ok_or_else(|| AppError::InvalidRequest(format!("unknown skill source {source}")))?;
+        let path = root.path.join(name).join("SKILL.md");
+        let target = path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            let directory = target.parent().expect("skill file has a parent");
+            if std::fs::symlink_metadata(directory).is_ok() {
+                return Err(AppError::Conflict(format!(
+                    "{} already exists",
+                    directory.display()
+                )));
+            }
+            std::fs::create_dir_all(directory)?;
+            std::fs::write(&target, content)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))??;
+        self.skill_descriptor(provider, workspace, &resource_id("skill", &path))
+            .await
+    }
+
+    /// Overwrites one skill's `SKILL.md`; invalid skills can be fixed this
+    /// way too.
+    pub async fn update_skill(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_id: &str,
+        content: String,
+    ) -> Result<SkillDescriptor, AppError> {
+        let descriptor = self
+            .writable_skill(provider, workspace.clone(), resource_id)
+            .await?;
+        validate_skill_content(&content)?;
+        let path = descriptor.path.clone();
+        tokio::task::spawn_blocking(move || replace_file(&path, content.as_bytes()))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
+        self.skill_descriptor(provider, workspace, resource_id)
+            .await
+    }
+
+    /// Deletes a skill's directory (or just its `SKILL.md` when it sits
+    /// directly in a skill root).
+    pub async fn delete_skill(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_id: &str,
+    ) -> Result<SkillDeletion, AppError> {
+        let descriptor = self
+            .writable_skill(provider, workspace.clone(), resource_id)
+            .await?;
+        let roots = skill_roots(self.home.as_deref(), &workspace, provider);
+        let path = descriptor.path.clone();
+        let removed = tokio::task::spawn_blocking(move || -> Result<PathBuf, AppError> {
+            let directory = path
+                .parent()
+                .expect("skill file has a parent")
+                .to_path_buf();
+            if roots.iter().any(|root| root.path == directory) {
+                std::fs::remove_file(&path)?;
+                return Ok(path);
+            }
+            let metadata = std::fs::symlink_metadata(&directory)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(AppError::InvalidRequest(format!(
+                    "{} is not a regular directory",
+                    directory.display()
+                )));
+            }
+            std::fs::remove_dir_all(&directory)?;
+            Ok(directory)
+        })
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))??;
+        Ok(SkillDeletion {
+            resource_id: descriptor.resource_id,
+            name: descriptor.name,
+            path: removed.to_string_lossy().into_owned(),
+        })
+    }
+
+    async fn skill_descriptor(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_id: &str,
+    ) -> Result<SkillDescriptor, AppError> {
+        self.skills(provider, workspace)
+            .await?
+            .skills
+            .into_iter()
+            .find(|skill| skill.resource_id == resource_id)
+            .ok_or_else(|| AppError::NotFound(format!("skill resource {resource_id}")))
+    }
+
+    async fn writable_skill(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_id: &str,
+    ) -> Result<SkillDescriptor, AppError> {
+        if catalog_profile(provider).source == CatalogSource::NativeInspect {
+            return Err(AppError::Unsupported(format!(
+                "{} skills are managed by the provider itself",
+                crate::provider::profile::profile(provider).display_name
+            )));
+        }
+        self.skill_descriptor(provider, workspace, resource_id)
+            .await
     }
 
     async fn mcp_descriptor(
@@ -716,7 +957,7 @@ fn scan_mcp(
         };
         for entry in entries {
             descriptors.push(McpServerDescriptor {
-                resource_id: resource_id(&format!("mcp:{}", entry.name), &source.path),
+                resource_id: resource_id_for_mcp(&entry.name, &source.path),
                 name: entry.name,
                 provider,
                 scope: source.scope,
@@ -1150,13 +1391,6 @@ fn find_mcp_server_maps<'a>(
 /// changed and the entry is no longer there.
 fn remove_mcp_entry(origin: &McpOrigin) -> Result<(), AppError> {
     let path = &origin.path;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(AppError::InvalidRequest(format!(
-            "{} is not a regular file",
-            path.display()
-        )));
-    }
     let raw = std::fs::read_to_string(path)?;
     let missing = || AppError::NotFound(format!("mcp server {} in {}", origin.key, path.display()));
     let updated = match origin.format {
@@ -1193,6 +1427,27 @@ fn remove_mcp_entry(origin: &McpOrigin) -> Result<(), AppError> {
             ))
         }
     };
+    replace_file(path, updated.as_bytes())
+}
+
+/// Swaps the regular file at `path` for `contents` through a temporary
+/// file, keeping its permissions.
+fn replace_file(path: &Path, contents: &[u8]) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(AppError::InvalidRequest(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    write_through_temp(path, contents, Some(metadata.permissions()))
+}
+
+fn write_through_temp(
+    path: &Path,
+    contents: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<(), AppError> {
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -1201,13 +1456,271 @@ fn remove_mcp_entry(origin: &McpOrigin) -> Result<(), AppError> {
         ".{file_name}.todex-{}",
         uuid::Uuid::new_v4().simple()
     ));
-    std::fs::write(&temp, updated)?;
-    let result = std::fs::set_permissions(&temp, metadata.permissions())
-        .and_then(|()| std::fs::rename(&temp, path));
+    std::fs::write(&temp, contents)?;
+    let result = match permissions {
+        Some(permissions) => std::fs::set_permissions(&temp, permissions),
+        None => restrict_to_owner(&temp),
+    }
+    .and_then(|()| std::fs::rename(&temp, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result.map_err(Into::into)
+}
+
+/// New MCP config files can hold credentials, so only the owner reads them.
+fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Adds `name` to the config file at `path` (top-level `mcpServers` for
+/// JSON, `[mcp_servers]` for TOML), creating the file when missing.
+fn insert_mcp_entry(path: &Path, name: &str, config: Value) -> Result<(), AppError> {
+    let existing = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(AppError::InvalidRequest(format!(
+                "{} is not a regular file",
+                path.display()
+            )))
+        }
+        Ok(metadata) if metadata.len() > MAX_CONFIG_BYTES => {
+            return Err(AppError::InvalidRequest(format!(
+                "{} exceeds {MAX_CONFIG_BYTES} bytes",
+                path.display()
+            )))
+        }
+        Ok(metadata) => Some((std::fs::read_to_string(path)?, metadata.permissions())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let raw = existing.as_ref().map(|(raw, _)| raw.as_str()).unwrap_or("");
+    let conflict = || {
+        AppError::Conflict(format!(
+            "mcp server {name} already exists in {}",
+            path.display()
+        ))
+    };
+    let updated = if path.extension().and_then(|value| value.to_str()) == Some("toml") {
+        let mut document = raw.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            AppError::InvalidRequest(format!("invalid MCP TOML config: {error}"))
+        })?;
+        let servers = document
+            .entry("mcp_servers")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(true);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_like_mut()
+            .ok_or_else(|| AppError::InvalidRequest("mcp_servers is not a table".to_owned()))?;
+        if servers.contains_key(name) {
+            return Err(conflict());
+        }
+        servers.insert(name, toml_edit::Item::Table(json_to_toml_table(&config)?));
+        document.to_string()
+    } else {
+        let mut value: Value = if raw.trim().is_empty() {
+            Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(raw).map_err(|error| {
+                AppError::InvalidRequest(format!("invalid MCP JSON config: {error}"))
+            })?
+        };
+        let root = value.as_object_mut().ok_or_else(|| {
+            AppError::InvalidRequest("MCP JSON config is not an object".to_owned())
+        })?;
+        let servers = root
+            .entry("mcpServers")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| AppError::InvalidRequest("mcpServers is not an object".to_owned()))?;
+        if servers.contains_key(name) {
+            return Err(conflict());
+        }
+        servers.insert(name.to_owned(), config);
+        pretty_json(&value, raw.is_empty() || raw.ends_with('\n'))?
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_through_temp(
+        path,
+        updated.as_bytes(),
+        existing.map(|(_, permissions)| permissions),
+    )
+}
+
+/// Replaces the entry `origin` points at with `config` under `name`.
+fn replace_mcp_entry(origin: &McpOrigin, name: &str, config: Value) -> Result<(), AppError> {
+    let path = &origin.path;
+    let raw = std::fs::read_to_string(path)?;
+    let missing = || AppError::NotFound(format!("mcp server {} in {}", origin.key, path.display()));
+    let conflict = || {
+        AppError::Conflict(format!(
+            "mcp server {name} already exists in {}",
+            path.display()
+        ))
+    };
+    let updated = match origin.format {
+        McpConfigFormat::Toml => {
+            let mut document = raw.parse::<toml_edit::DocumentMut>().map_err(|error| {
+                AppError::InvalidRequest(format!("invalid MCP TOML config: {error}"))
+            })?;
+            let servers = document
+                .get_mut("mcp_servers")
+                .and_then(toml_edit::Item::as_table_like_mut)
+                .ok_or_else(missing)?;
+            if !servers.contains_key(&origin.key) {
+                return Err(missing());
+            }
+            if name != origin.key && servers.contains_key(name) {
+                return Err(conflict());
+            }
+            let table = json_to_toml_table(&config)?;
+            if name == origin.key {
+                servers.insert(name, toml_edit::Item::Table(table));
+            } else {
+                servers.remove(&origin.key);
+                servers.insert(name, toml_edit::Item::Table(table));
+            }
+            document.to_string()
+        }
+        McpConfigFormat::Json => {
+            let mut value: Value = serde_json::from_str(&raw).map_err(|error| {
+                AppError::InvalidRequest(format!("invalid MCP JSON config: {error}"))
+            })?;
+            let servers = value
+                .pointer_mut(&origin.map_pointer)
+                .and_then(Value::as_object_mut)
+                .ok_or_else(missing)?;
+            if !servers.contains_key(&origin.key) {
+                return Err(missing());
+            }
+            if name != origin.key && servers.contains_key(name) {
+                return Err(conflict());
+            }
+            servers.remove(&origin.key);
+            servers.insert(name.to_owned(), config);
+            pretty_json(&value, raw.ends_with('\n'))?
+        }
+        McpConfigFormat::Native => {
+            return Err(AppError::Unsupported(
+                "natively managed MCP servers cannot be edited here".to_owned(),
+            ))
+        }
+    };
+    replace_file(path, updated.as_bytes())
+}
+
+fn pretty_json(value: &Value, trailing_newline: bool) -> Result<String, AppError> {
+    let mut text =
+        serde_json::to_string_pretty(value).map_err(|error| AppError::Anyhow(error.into()))?;
+    if trailing_newline {
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+/// An MCP entry as a TOML table; nested objects become inline tables so
+/// the entry stays one `[mcp_servers.<name>]` block.
+fn json_to_toml_table(config: &Value) -> Result<toml_edit::Table, AppError> {
+    let object = config
+        .as_object()
+        .ok_or_else(|| AppError::InvalidRequest("MCP config must be a JSON object".to_owned()))?;
+    let mut table = toml_edit::Table::new();
+    for (key, value) in object {
+        table.insert(key, toml_edit::Item::Value(json_to_toml_value(value)?));
+    }
+    Ok(table)
+}
+
+fn json_to_toml_value(value: &Value) -> Result<toml_edit::Value, AppError> {
+    Ok(match value {
+        Value::Null => {
+            return Err(AppError::InvalidRequest(
+                "TOML has no null; remove the field instead".to_owned(),
+            ))
+        }
+        Value::Bool(value) => (*value).into(),
+        Value::Number(number) => match (number.as_i64(), number.as_f64()) {
+            (Some(integer), _) => integer.into(),
+            (None, Some(float)) => float.into(),
+            _ => {
+                return Err(AppError::InvalidRequest(format!(
+                    "number {number} does not fit in TOML"
+                )))
+            }
+        },
+        Value::String(value) => value.as_str().into(),
+        Value::Array(values) => {
+            let mut array = toml_edit::Array::new();
+            for value in values {
+                array.push(json_to_toml_value(value)?);
+            }
+            toml_edit::Value::Array(array)
+        }
+        Value::Object(map) => {
+            let mut table = toml_edit::InlineTable::new();
+            for (key, value) in map {
+                table.insert(key, json_to_toml_value(value)?);
+            }
+            toml_edit::Value::InlineTable(table)
+        }
+    })
+}
+
+/// Trims the entry name and checks the config is a JSON object; returns the
+/// name to write.
+fn validate_mcp_entry(name: String, config: &Value) -> Result<String, AppError> {
+    let name = name.trim().to_owned();
+    if name.is_empty() || name.chars().count() > 200 || name.chars().any(char::is_control) {
+        return Err(AppError::InvalidRequest(
+            "MCP server name must be 1-200 printable characters".to_owned(),
+        ));
+    }
+    if !config.is_object() {
+        return Err(AppError::InvalidRequest(
+            "MCP config must be a JSON object".to_owned(),
+        ));
+    }
+    Ok(name)
+}
+
+/// Skill directory names are a single path segment of letters, digits,
+/// `.`, `_` and `-`.
+fn validate_skill_directory_name(name: &str) -> Result<(), AppError> {
+    let valid = !name.is_empty()
+        && name.len() <= 100
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(AppError::InvalidRequest(
+            "skill name must be 1-100 letters, digits, '.', '_' or '-', not starting with '.'"
+                .to_owned(),
+        ))
+    }
+}
+
+fn validate_skill_content(content: &str) -> Result<(), AppError> {
+    if content.len() as u64 > MAX_SKILL_BYTES {
+        return Err(AppError::InvalidRequest(format!(
+            "SKILL.md exceeds {MAX_SKILL_BYTES} bytes"
+        )));
+    }
+    parse_skill_front_matter(content).map(|_| ())
 }
 
 fn apply_mcp_precedence(servers: &mut [McpServerDescriptor]) {
@@ -1228,6 +1741,10 @@ fn apply_mcp_precedence(servers: &mut [McpServerDescriptor]) {
             .filter(|(_, resource_id)| resource_id != &server.resource_id)
             .map(|(_, resource_id)| resource_id.clone());
     }
+}
+
+fn resource_id_for_mcp(name: &str, path: &Path) -> String {
+    resource_id(&format!("mcp:{name}"), path)
 }
 
 fn resource_id(kind: &str, path: &Path) -> String {
@@ -1463,6 +1980,171 @@ mod tests {
         assert!(toml.starts_with("# keep me\nmodel = \"x\"\n"));
         assert!(!toml.contains("gone"));
         assert!(toml.contains("[mcp_servers.stay]"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn mcp_entries_and_skills_are_created_edited_and_deleted() {
+        let root = temp_dir("todex-catalog-write");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let codex = home.join(".codex/config.toml");
+        fs::write(
+            &codex,
+            "# top\nmodel = \"x\"\n\n[profiles.fast]\nmodel = \"y\"\n",
+        )
+        .unwrap();
+        let config = Arc::new(test_config(root.join("data"), workspace_root));
+        let service = CatalogService::with_home(config, Some(home.clone()));
+
+        let catalog = service
+            .mcp(ProviderKind::ClaudeCode, workspace.clone())
+            .await
+            .unwrap();
+        assert!(catalog.editable);
+        assert_eq!(
+            catalog.creatable_scopes,
+            vec![CatalogScope::User, CatalogScope::Project]
+        );
+        let created = service
+            .create_mcp(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                CatalogScope::Project,
+                " docs ".to_owned(),
+                json!({ "command": "npx", "args": ["docs-mcp"] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.descriptor.name, "docs");
+        assert_eq!(created.path, workspace.join(".mcp.json").to_string_lossy());
+        assert!(matches!(
+            service
+                .create_mcp(
+                    ProviderKind::ClaudeCode,
+                    workspace.clone(),
+                    CatalogScope::Project,
+                    "docs".to_owned(),
+                    json!({}),
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let renamed = service
+            .update_mcp(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                &created.descriptor.resource_id,
+                "manual".to_owned(),
+                json!({ "type": "http", "url": "https://example.test/mcp" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.descriptor.transport, McpTransport::Http);
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(workspace.join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            written,
+            json!({ "mcpServers": { "manual": { "type": "http", "url": "https://example.test/mcp" } } })
+        );
+
+        let toml_entry = service
+            .create_mcp(
+                ProviderKind::Codex,
+                workspace.clone(),
+                CatalogScope::User,
+                "files".to_owned(),
+                json!({ "command": "npx", "args": ["-y", "files"], "env": { "TOKEN": "s" } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(toml_entry.config["env"]["TOKEN"], "s");
+        service
+            .update_mcp(
+                ProviderKind::Codex,
+                workspace.clone(),
+                &toml_entry.descriptor.resource_id,
+                "files".to_owned(),
+                json!({ "url": "https://files.test", "enabled": false }),
+            )
+            .await
+            .unwrap();
+        let toml = fs::read_to_string(&codex).unwrap();
+        assert!(
+            toml.starts_with("# top\nmodel = \"x\"\n\n[profiles.fast]\nmodel = \"y\"\n"),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("[mcp_servers.files]\nurl = \"https://files.test\"\nenabled = false\n"),
+            "{toml}"
+        );
+        assert!(!toml.contains("TOKEN"));
+
+        let skills = service
+            .skills(ProviderKind::ClaudeCode, workspace.clone())
+            .await
+            .unwrap();
+        assert!(skills.editable);
+        assert!(skills.creatable_sources.contains(&"provider-project"));
+        let content = "---\nname: review\ndescription: Review code\n---\n\nBody\n";
+        assert!(service
+            .create_skill(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                "provider-project",
+                "../x",
+                content.to_owned()
+            )
+            .await
+            .is_err());
+        assert!(service
+            .create_skill(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                "provider-project",
+                "review",
+                "no front matter".to_owned()
+            )
+            .await
+            .is_err());
+        let skill = service
+            .create_skill(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                "provider-project",
+                "review",
+                content.to_owned(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(skill.description, "Review code");
+        let skill_dir = workspace.join(".claude/skills/review");
+        fs::write(skill_dir.join("helper.sh"), "echo").unwrap();
+        let edited = service
+            .update_skill(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                &skill.resource_id,
+                "---\nname: review\ndescription: Review diffs\n---\n".to_owned(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edited.resource_id, skill.resource_id);
+        assert_eq!(edited.description, "Review diffs");
+        service
+            .delete_skill(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                &skill.resource_id,
+            )
+            .await
+            .unwrap();
+        assert!(!skill_dir.exists());
+        assert!(workspace.join(".claude/skills").exists());
         let _ = fs::remove_dir_all(root);
     }
 
