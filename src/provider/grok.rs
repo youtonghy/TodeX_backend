@@ -406,6 +406,12 @@ fn grok_command_spec(
     Ok(spec)
 }
 
+/// The environment of a one-shot `grok` CLI command (native history
+/// deletion): the same defaults and allowlist as the agent process.
+pub(crate) fn grok_cli_environment(allowlist: &[String]) -> BTreeMap<String, String> {
+    grok_environment(allowlist)
+}
+
 fn grok_environment(allowlist: &[String]) -> BTreeMap<String, String> {
     allowlisted_environment(
         &[("GROK_DISABLE_AUTOUPDATER", "1"), ("NO_COLOR", "1")],

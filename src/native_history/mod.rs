@@ -1,18 +1,26 @@
-//! Native session history of Claude Code and Pi: the agents' own session
-//! files, outside TodeX's conversation store. Lists them with their disk
-//! usage, shows a bounded transcript, deletes chosen sessions, and applies a
-//! TodeX-managed age / capacity policy per provider (saved in
-//! `$data_dir/native-history-cleanup.json`, run by the history cleanup
-//! scheduler in [`crate::history_cleanup`]).
+//! Native session history of Claude Code, Pi, Codex, Grok Build and Devin:
+//! the agents' own sessions, outside TodeX's conversation store. Lists them
+//! (with their disk usage where it is known), shows a bounded transcript,
+//! deletes chosen sessions, and applies a TodeX-managed age / capacity
+//! policy per provider (saved in `$data_dir/native-history-cleanup.json`,
+//! run by the history cleanup scheduler in [`crate::history_cleanup`]).
+//!
+//! Claude Code and Pi sessions are files TodeX removes itself. Codex rollouts
+//! and Grok Build session directories are read from disk but deleted only
+//! through the provider's own CLI; Devin's sessions live in its SQLite
+//! database and are both listed and deleted through its CLI ([`cli`]).
 //!
 //! Safety: a session a TodeX conversation (of any tenant) resumes, a running
 //! session, and a session written in the last two minutes are never
-//! deleted. Ids are validated and resolved through a fresh scan; every
-//! removed path must lie inside the provider's root, and symlinks are never
+//! deleted. Ids are validated and resolved through a fresh scan; every path
+//! TodeX removes must lie inside the provider's root, and symlinks are never
 //! followed or removed.
 
+mod cli;
 mod parse;
 mod retention;
+
+pub use cli::NativeClis;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -51,31 +59,76 @@ const MAX_MARKER_BYTES: u64 = 64 * 1024;
 pub const DEFAULT_TRANSCRIPT_LIMIT: usize = 200;
 pub const MAX_TRANSCRIPT_LIMIT: usize = 1000;
 const MAX_SESSION_ID_CHARS: usize = 128;
+/// Where Codex moves archived rollouts, under `$CODEX_HOME`.
+const CODEX_ARCHIVED_DIR: &str = "archived_sessions";
+/// Codex's append-only thread name index, under `$CODEX_HOME`.
+const CODEX_SESSION_INDEX: &str = "session_index.jsonl";
+/// Largest `session_index.jsonl` read for thread names.
+const MAX_CODEX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest Grok `summary.json` read.
+const MAX_GROK_SUMMARY_BYTES: u64 = 4 * 1024 * 1024;
+/// Devin's session database (with `-wal` / `-shm`) in its data directory.
+const DEVIN_SESSION_DB: &str = "sessions.db";
+const GROK_SUMMARY_FILE: &str = "summary.json";
+const GROK_UPDATES_FILE: &str = "updates.jsonl";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NativeProvider {
     ClaudeCode,
     Pi,
+    Codex,
+    GrokBuild,
+    Devin,
+}
+
+/// What a provider's native history supports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Capabilities {
+    /// The transcript endpoint works.
+    pub view: bool,
+    /// Per-session byte sizes are known.
+    pub sizes: bool,
 }
 
 impl NativeProvider {
-    pub const ALL: [Self; 2] = [Self::ClaudeCode, Self::Pi];
+    pub const ALL: [Self; 5] = [
+        Self::ClaudeCode,
+        Self::Pi,
+        Self::Codex,
+        Self::GrokBuild,
+        Self::Devin,
+    ];
 
-    /// `claude-code` or `pi`; anything else is `INVALID_REQUEST`.
+    /// `claude-code`, `pi`, `codex`, `grok-build` or `devin`; anything else
+    /// is `INVALID_REQUEST`.
     pub fn parse(value: &str) -> Result<Self, AppError> {
-        match value {
-            "claude-code" => Ok(Self::ClaudeCode),
-            "pi" => Ok(Self::Pi),
-            other => Err(AppError::InvalidRequest(format!(
-                "native history supports claude-code and pi, not {other}"
-            ))),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.as_str() == value)
+            .ok_or_else(|| {
+                AppError::InvalidRequest(format!(
+                    "native history supports claude-code, pi, codex, grok-build and devin, not {value}"
+                ))
+            })
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ClaudeCode => "claude-code",
             Self::Pi => "pi",
+            Self::Codex => "codex",
+            Self::GrokBuild => "grok-build",
+            Self::Devin => "devin",
+        }
+    }
+
+    const fn display_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Pi => "Pi",
+            Self::Codex => "Codex",
+            Self::GrokBuild => "Grok Build",
+            Self::Devin => "Devin",
         }
     }
 
@@ -83,7 +136,40 @@ impl NativeProvider {
         match self {
             Self::ClaudeCode => ProviderKind::ClaudeCode,
             Self::Pi => ProviderKind::Pi,
+            Self::Codex => ProviderKind::Codex,
+            Self::GrokBuild => ProviderKind::GrokBuild,
+            Self::Devin => ProviderKind::Devin,
         }
+    }
+
+    pub const fn capabilities(self) -> Capabilities {
+        match self {
+            Self::Devin => Capabilities {
+                view: false,
+                sizes: false,
+            },
+            _ => Capabilities {
+                view: true,
+                sizes: true,
+            },
+        }
+    }
+
+    /// Sessions are deleted through the provider's CLI, not by TodeX.
+    const fn cli_deletes(self) -> bool {
+        matches!(self, Self::Codex | Self::GrokBuild | Self::Devin)
+    }
+
+    /// A policy for this provider is valid: a capacity limit needs
+    /// per-session sizes.
+    pub fn validate_policy(self, policy: &CleanupPolicy) -> Result<(), AppError> {
+        if !self.capabilities().sizes && policy.max_total_bytes.is_some() {
+            return Err(AppError::InvalidRequest(format!(
+                "{} session sizes are unknown, so maxTotalBytes must be null",
+                self.as_str()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -92,22 +178,47 @@ impl NativeProvider {
 pub struct NativeRoots {
     pub claude_dir: PathBuf,
     pub pi_session_dir: PathBuf,
+    /// `$CODEX_HOME` (`~/.codex`).
+    pub codex_home: PathBuf,
+    /// `$GROK_HOME` (`~/.grok`).
+    pub grok_home: PathBuf,
+    /// `$XDG_DATA_HOME/devin/cli` (`~/.local/share/devin/cli`), where Devin
+    /// keeps `sessions.db`.
+    pub devin_dir: PathBuf,
 }
 
 impl NativeRoots {
     pub fn detect() -> Self {
         let dirs = AgentDirs::detect();
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".local")
+                    .join("share")
+            });
         Self {
             claude_dir: dirs.claude_dir().to_owned(),
             pi_session_dir: dirs.pi_session_dir(),
+            codex_home: dirs.codex_home().to_owned(),
+            grok_home: dirs.grok_home().to_owned(),
+            devin_dir: data_home.join("devin").join("cli"),
         }
     }
 
-    /// The directory session files live in (reported as `root`).
+    /// The directory sessions live in (reported as `root`).
     pub fn sessions_root(&self, provider: NativeProvider) -> PathBuf {
         match provider {
             NativeProvider::ClaudeCode => self.claude_dir.join("projects"),
             NativeProvider::Pi => self.pi_session_dir.clone(),
+            NativeProvider::Codex => self.codex_home.join("sessions"),
+            NativeProvider::GrokBuild => self.grok_home.join("sessions"),
+            NativeProvider::Devin => self.devin_dir.clone(),
         }
     }
 
@@ -115,17 +226,32 @@ impl NativeRoots {
     fn side_root(&self, provider: NativeProvider) -> &Path {
         match provider {
             NativeProvider::ClaudeCode => &self.claude_dir,
-            NativeProvider::Pi => &self.pi_session_dir,
+            _ => &self.pi_session_dir,
+        }
+    }
+
+    /// The provider's history store exists. Codex also keeps archived
+    /// rollouts outside `sessions/`.
+    fn store_exists(&self, provider: NativeProvider) -> bool {
+        match provider {
+            NativeProvider::Codex => {
+                self.codex_home.join("sessions").is_dir()
+                    || self.codex_home.join(CODEX_ARCHIVED_DIR).is_dir()
+            }
+            NativeProvider::Devin => self.devin_dir.join(DEVIN_SESSION_DB).is_file(),
+            provider => self.sessions_root(provider).is_dir(),
         }
     }
 }
 
-/// Claude and Pi session ids are UUIDs; anything with characters outside
-/// `[A-Za-z0-9._-]`, a leading dot or `..` is rejected before any lookup.
+/// Session ids are UUIDs (Grok and Devin may take client-chosen ids);
+/// anything with characters outside `[A-Za-z0-9._-]`, a leading dot or
+/// dash (an option to a provider CLI) or `..` is rejected before any lookup.
 pub fn validate_session_id(id: &str) -> Result<(), AppError> {
     let valid = !id.is_empty()
         && id.len() <= MAX_SESSION_ID_CHARS
         && !id.starts_with('.')
+        && !id.starts_with('-')
         && !id.contains("..")
         && id
             .bytes()
@@ -140,15 +266,45 @@ pub fn validate_session_id(id: &str) -> Result<(), AppError> {
 }
 
 /// One native session: its transcript file(s) — Claude may hold the same id
-/// under two project directories — plus Claude's per-session side data.
+/// under two project directories, Codex in `sessions/` and
+/// `archived_sessions/` — plus Claude's per-session side data. Grok's files
+/// are its `summary.json` and `updates.jsonl` inside `dir`; Devin sessions
+/// have no files TodeX knows of.
 #[derive(Clone, Debug)]
 struct NativeSession {
     id: String,
     files: Vec<PathBuf>,
     side: Vec<PathBuf>,
-    bytes: u64,
+    /// Grok's session directory.
+    dir: Option<PathBuf>,
+    /// `None` when the provider does not expose per-session sizes.
+    bytes: Option<u64>,
     modified: SystemTime,
     meta: SessionMeta,
+    /// The provider reports the session open in a live process (Devin).
+    locked: bool,
+}
+
+/// A provider's sessions plus what the store as a whole tells.
+#[derive(Default)]
+struct Listing {
+    sessions: Vec<NativeSession>,
+    available: bool,
+    /// The store's total size for providers without per-session sizes.
+    storage_bytes: u64,
+}
+
+impl Listing {
+    fn total_bytes(&self, provider: NativeProvider) -> u64 {
+        if provider.capabilities().sizes {
+            self.sessions
+                .iter()
+                .filter_map(|session| session.bytes)
+                .fold(0, u64::saturating_add)
+        } else {
+            self.storage_bytes
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -170,6 +326,8 @@ pub struct NativeHistory {
     /// Fixed roots for tests; otherwise detected per call so environment
     /// changes after start still apply.
     pub(crate) roots_override: Option<NativeRoots>,
+    /// The Codex, Grok and Devin CLIs.
+    pub(crate) clis: NativeClis,
 }
 
 #[derive(Serialize)]
@@ -180,7 +338,7 @@ struct SessionView<'a> {
     cwd: Option<&'a str>,
     created_at: Option<DateTime<Utc>>,
     updated_at: DateTime<Utc>,
-    bytes: u64,
+    bytes: Option<u64>,
     referenced_by: Vec<&'a str>,
     running: bool,
 }
@@ -198,7 +356,8 @@ impl Protection {
     }
 
     fn running(&self, session: &NativeSession) -> bool {
-        self.running_native.contains(&session.id)
+        session.locked
+            || self.running_native.contains(&session.id)
             || self
                 .refs
                 .get(&session.id)
@@ -225,12 +384,13 @@ fn recently_written(modified: SystemTime, now: SystemTime) -> bool {
 }
 
 impl NativeHistory {
-    pub fn new(data_dir: &Path, history_cleanup: &HistoryCleanup) -> Self {
+    pub fn new(data_dir: &Path, history_cleanup: &HistoryCleanup, clis: NativeClis) -> Self {
         Self {
             cache: Arc::default(),
             cleanup: history_cleanup.sibling(data_dir.join(NATIVE_HISTORY_CLEANUP_FILE)),
             lock: Arc::default(),
             roots_override: None,
+            clis,
         }
     }
 
@@ -240,17 +400,60 @@ impl NativeHistory {
             .unwrap_or_else(NativeRoots::detect)
     }
 
+    /// The provider's sessions. A missing store (or, for Devin, a missing
+    /// or failing CLI) is an empty, unavailable listing, not an error.
     async fn scan(
         &self,
         roots: &NativeRoots,
         provider: NativeProvider,
-    ) -> Result<Vec<NativeSession>, AppError> {
+    ) -> Result<Listing, AppError> {
+        if provider == NativeProvider::Devin {
+            return Ok(self.scan_devin(roots).await);
+        }
+        let available = roots.store_exists(provider);
         let roots = roots.clone();
         let cache = self.cache.clone();
-        tokio::task::spawn_blocking(move || scan(&roots, provider, &cache))
+        let sessions = tokio::task::spawn_blocking(move || scan(&roots, provider, &cache))
             .await
             .map_err(|error| AppError::Anyhow(error.into()))?
-            .map_err(AppError::from)
+            .map_err(AppError::from)?;
+        Ok(Listing {
+            sessions,
+            available,
+            storage_bytes: 0,
+        })
+    }
+
+    async fn scan_devin(&self, roots: &NativeRoots) -> Listing {
+        let dir = roots.devin_dir.clone();
+        let storage_bytes = [DEVIN_SESSION_DB, "sessions.db-wal", "sessions.db-shm"]
+            .iter()
+            .filter_map(|name| fs::symlink_metadata(dir.join(name)).ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .fold(0, u64::saturating_add);
+        if !roots.store_exists(NativeProvider::Devin)
+            || !crate::provider::process::executable_available(&self.clis.devin)
+        {
+            return Listing {
+                storage_bytes,
+                ..Listing::default()
+            };
+        }
+        match cli::devin_sessions(&self.clis, &dir).await {
+            Ok(items) => Listing {
+                sessions: items.iter().filter_map(devin_session).collect(),
+                available: true,
+                storage_bytes,
+            },
+            Err(error) => {
+                tracing::warn!(%error, "could not list Devin sessions");
+                Listing {
+                    storage_bytes,
+                    ..Listing::default()
+                }
+            }
+        }
     }
 
     async fn protection(
@@ -272,7 +475,7 @@ impl NativeHistory {
                     .await
                     .map_err(|error| AppError::Anyhow(error.into()))?
             }
-            NativeProvider::Pi => HashSet::new(),
+            _ => HashSet::new(),
         };
         Ok(Protection {
             refs,
@@ -287,7 +490,7 @@ impl NativeHistory {
         let mut providers = Vec::new();
         for provider in NativeProvider::ALL {
             let root = roots.sessions_root(provider);
-            let sessions = self.scan(&roots, provider).await?;
+            let listing = self.scan(&roots, provider).await?;
             let native = match provider {
                 NativeProvider::ClaudeCode => {
                     let path = retention::settings_path(&roots.claude_dir);
@@ -296,15 +499,16 @@ impl NativeHistory {
                         "settingsPath": path,
                     })
                 }
-                NativeProvider::Pi => Value::Null,
+                _ => Value::Null,
             };
             providers.push(json!({
                 "provider": provider.as_str(),
-                "available": root.is_dir(),
+                "available": listing.available,
                 "root": root,
-                "sessionCount": sessions.len(),
-                "totalBytes": total_bytes(&sessions),
+                "sessionCount": listing.sessions.len(),
+                "totalBytes": listing.total_bytes(provider),
                 "measuredAt": Utc::now(),
+                "capabilities": provider.capabilities(),
                 "native": native,
             }));
         }
@@ -320,8 +524,10 @@ impl NativeHistory {
         tenant_id: &str,
     ) -> Result<Value, AppError> {
         let roots = self.roots();
-        let mut sessions = self.scan(&roots, provider).await?;
+        let mut listing = self.scan(&roots, provider).await?;
         let protection = self.protection(conversations, &roots, provider).await?;
+        let total_bytes = listing.total_bytes(provider);
+        let sessions = &mut listing.sessions;
         sessions.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.id.cmp(&b.id)));
         let views: Vec<SessionView> = sessions
             .iter()
@@ -346,7 +552,7 @@ impl NativeHistory {
         Ok(json!({
             "provider": provider.as_str(),
             "root": roots.sessions_root(provider),
-            "totalBytes": total_bytes(&sessions),
+            "totalBytes": total_bytes,
             "count": sessions.len(),
             "measuredAt": Utc::now(),
             "sessions": views,
@@ -362,20 +568,32 @@ impl NativeHistory {
         limit: usize,
     ) -> Result<Value, AppError> {
         validate_session_id(id)?;
+        if !provider.capabilities().view {
+            return Err(AppError::Unsupported(format!(
+                "{} sessions have no transcript view",
+                provider.as_str()
+            )));
+        }
         let roots = self.roots();
         let session = self
             .scan(&roots, provider)
             .await?
+            .sessions
             .into_iter()
             .find(|session| session.id == id)
             .ok_or_else(|| AppError::NotFound(format!("native session {id} not found")))?;
-        // The newest file when one id has several.
-        let path = session
-            .files
-            .iter()
-            .max_by_key(|path| modified(path))
-            .cloned()
-            .ok_or_else(|| AppError::NotFound(format!("native session {id} not found")))?;
+        let path = match &session.dir {
+            // Grok: the ACP update log is the conversation.
+            Some(dir) => Some(dir.join(GROK_UPDATES_FILE)).filter(|path| path.is_file()),
+            // The newest file when one id has several.
+            None => session
+                .files
+                .iter()
+                .max_by_key(|path| modified(path))
+                .cloned(),
+        };
+        let path =
+            path.ok_or_else(|| AppError::NotFound(format!("native session {id} not found")))?;
         let (total, messages) =
             tokio::task::spawn_blocking(move || read_transcript(provider, &path, limit))
                 .await
@@ -402,7 +620,7 @@ impl NativeHistory {
     ) -> Result<CleanupReport, AppError> {
         let _guard = self.lock.lock().await;
         let roots = self.roots();
-        let sessions = self.scan(&roots, provider).await?;
+        let sessions = self.scan(&roots, provider).await?.sessions;
         let protection = self.protection(conversations, &roots, provider).await?;
         let mut report = CleanupReport::default();
         for id in ids {
@@ -436,14 +654,19 @@ impl NativeHistory {
     ) -> Result<CleanupReport, AppError> {
         let _guard = self.lock.lock().await;
         let roots = self.roots();
-        let sessions = self.scan(&roots, provider).await?;
+        let sessions = self.scan(&roots, provider).await?.sessions;
         let protection = self.protection(conversations, &roots, provider).await?;
+        let mut thresholds = thresholds;
+        if !provider.capabilities().sizes {
+            // No sizes, no capacity rule (the API refuses to save one).
+            thresholds.max_total_bytes = None;
+        }
         let candidates: Vec<PolicyCandidate> = sessions
             .iter()
             .map(|session| PolicyCandidate {
                 id: session.id.clone(),
                 updated_at: DateTime::<Utc>::from(session.modified),
-                bytes: session.bytes,
+                bytes: session.bytes.unwrap_or(0),
                 protected: protection.skip(session).is_some(),
             })
             .collect();
@@ -459,8 +682,13 @@ impl NativeHistory {
             let Some(session) = sessions.iter().find(|session| session.id == id) else {
                 continue;
             };
-            // The session must not have been written since the scan.
-            let current = session.files.iter().filter_map(|path| modified(path)).max();
+            // The session must not have been written since the scan. Devin
+            // has no files to check; `devin rm` refuses an open session.
+            let current = if session.files.is_empty() {
+                Some(session.modified)
+            } else {
+                session.files.iter().filter_map(|path| modified(path)).max()
+            };
             let unchanged = current.is_some_and(|current| current <= session.modified);
             let still_old = match (rule, age_cutoff) {
                 (PolicyRule::Age, Some(cutoff)) => {
@@ -489,15 +717,23 @@ impl NativeHistory {
         trigger: &'static str,
         report: &mut CleanupReport,
     ) {
-        let sessions_root = roots.sessions_root(provider);
-        let side_root = roots.side_root(provider).to_owned();
-        let target = session.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            remove_session(&sessions_root, &side_root, &target)
-        })
-        .await
-        .map_err(|error| AppError::Anyhow(error.into()))
-        .and_then(|result| result.map_err(AppError::from));
+        let outcome = if provider.cli_deletes() {
+            let spec = match provider {
+                NativeProvider::Codex => self.clis.codex_delete(&roots.codex_home, &session.id),
+                NativeProvider::GrokBuild => self.clis.grok_delete(&roots.grok_home, &session.id),
+                _ => self.clis.devin_delete(&roots.devin_dir, &session.id),
+            };
+            cli::run_delete(provider, &spec).await
+        } else {
+            let sessions_root = roots.sessions_root(provider);
+            let side_root = roots.side_root(provider).to_owned();
+            let target = session.clone();
+            tokio::task::spawn_blocking(move || remove_session(&sessions_root, &side_root, &target))
+                .await
+                .map_err(|error| AppError::Anyhow(error.into()))
+                .and_then(|result| result.map_err(AppError::from))
+        };
+        let freed = session.bytes.unwrap_or(0);
         match outcome {
             Ok(()) => {
                 tracing::info!(
@@ -505,11 +741,11 @@ impl NativeHistory {
                     session_id = %session.id,
                     files = session.files.len(),
                     side_entries = session.side.len(),
-                    freed_bytes = session.bytes,
+                    freed_bytes = freed,
                     trigger,
                     "native history session deleted"
                 );
-                report.freed_bytes = report.freed_bytes.saturating_add(session.bytes);
+                report.freed_bytes = report.freed_bytes.saturating_add(freed);
                 report.deleted.push(session.id.clone());
             }
             Err(error) => {
@@ -563,9 +799,10 @@ impl NativeHistory {
 fn retention_path(roots: &NativeRoots, provider: NativeProvider) -> Result<PathBuf, AppError> {
     match provider {
         NativeProvider::ClaudeCode => Ok(retention::settings_path(&roots.claude_dir)),
-        NativeProvider::Pi => Err(AppError::InvalidRequest(
-            "pi has no native retention setting".to_owned(),
-        )),
+        other => Err(AppError::InvalidRequest(format!(
+            "{} has no native retention setting",
+            other.as_str()
+        ))),
     }
 }
 
@@ -646,13 +883,6 @@ pub(crate) async fn run_enabled(state: &AppState) {
     }
 }
 
-fn total_bytes(sessions: &[NativeSession]) -> u64 {
-    sessions
-        .iter()
-        .map(|session| session.bytes)
-        .fold(0, u64::saturating_add)
-}
-
 fn modified(path: &Path) -> Option<SystemTime> {
     fs::symlink_metadata(path).ok()?.modified().ok()
 }
@@ -676,6 +906,9 @@ fn scan(
     provider: NativeProvider,
     cache: &std::sync::Mutex<MetaCache>,
 ) -> io::Result<Vec<NativeSession>> {
+    if provider == NativeProvider::GrokBuild {
+        return Ok(scan_grok(&roots.sessions_root(provider)));
+    }
     let root = roots.sessions_root(provider);
     // (id from the file name for Claude, path, size, mtime)
     let mut files: Vec<(Option<String>, PathBuf, u64, SystemTime)> = Vec::new();
@@ -725,6 +958,21 @@ fn scan(
                 }
             }
         }
+        NativeProvider::Codex => {
+            // `sessions/YYYY/MM/DD/` and the flat `archived_sessions/`.
+            for dir in [root.clone(), roots.codex_home.join(CODEX_ARCHIVED_DIR)] {
+                for path in codex_rollouts(&dir) {
+                    let id = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(codex_rollout_id);
+                    if id.is_some() {
+                        push_file(id, path);
+                    }
+                }
+            }
+        }
+        NativeProvider::GrokBuild | NativeProvider::Devin => {}
     }
 
     let mut cache = cache
@@ -743,8 +991,9 @@ fn scan(
                     Ok((head, tail)) => parse::session_meta(provider, &head, &tail),
                     Err(error) => {
                         tracing::debug!(path = %path.display(), %error, "could not read native session");
-                        // Claude files are sessions by name; Pi needs a header.
-                        (provider == NativeProvider::ClaudeCode).then(SessionMeta::default)
+                        // Claude and Codex files are sessions by name; Pi
+                        // needs a header.
+                        (provider != NativeProvider::Pi).then(SessionMeta::default)
                     }
                 };
                 cache.insert(
@@ -778,19 +1027,27 @@ fn scan(
             .into_iter()
             .filter_map(|entry| entry.file_name().into_string().ok())
             .collect(),
-        NativeProvider::Pi => Vec::new(),
+        _ => Vec::new(),
+    };
+    let names = if provider == NativeProvider::Codex {
+        codex_thread_names(&roots.codex_home.join(CODEX_SESSION_INDEX))
+    } else {
+        HashMap::new()
     };
     let mut sessions = Vec::with_capacity(groups.len());
     for (id, mut group) in groups {
         group.sort_by_key(|entry| std::cmp::Reverse(entry.2));
         let modified = group[0].2;
-        let meta = group[0].3.clone();
+        let mut meta = group[0].3.clone();
+        if let Some(name) = names.get(&id) {
+            meta.title = Some(name.clone());
+        }
         let files: Vec<PathBuf> = group.iter().map(|(path, ..)| path.clone()).collect();
         let side = match provider {
             NativeProvider::ClaudeCode => {
                 claude_side_entries(&roots.claude_dir, &id, &files, &todos)
             }
-            NativeProvider::Pi => Vec::new(),
+            _ => Vec::new(),
         };
         let bytes = group
             .iter()
@@ -801,12 +1058,183 @@ fn scan(
             id,
             files,
             side,
-            bytes,
+            dir: None,
+            bytes: Some(bytes),
             modified,
             meta,
+            locked: false,
         });
     }
     Ok(sessions)
+}
+
+/// The thread id at the end of a Codex rollout file name,
+/// `rollout-<timestamp>-<uuid>.jsonl`.
+fn codex_rollout_id(name: &str) -> Option<String> {
+    let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let start = stem.len().checked_sub(36)?;
+    let id = stem.get(start..)?;
+    uuid::Uuid::parse_str(id).ok()?;
+    Some(id.to_owned())
+}
+
+/// `rollout-*.jsonl` files up to four directory levels under `dir`
+/// (`YYYY/MM/DD`), never through symlinks.
+fn codex_rollouts(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        for entry in entries(dir) {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() && depth > 0 {
+                walk(&path, depth - 1, out);
+            } else if file_type.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+            {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, 3, &mut out);
+    out
+}
+
+/// Thread names from Codex's append-only `session_index.jsonl`
+/// (`{"id","thread_name","updated_at"}`): the last entry for an id wins,
+/// an empty name clears it.
+fn codex_thread_names(path: &Path) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let Ok(file) = fs::File::open(path) else {
+        return names;
+    };
+    let reader = io::BufReader::new(file.take(MAX_CODEX_INDEX_BYTES));
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = entry
+            .get("thread_name")
+            .and_then(Value::as_str)
+            .map(|name| name.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|name| !name.is_empty());
+        match name {
+            Some(name) => {
+                names.insert(id.to_owned(), parse::cap(&name, parse::TITLE_CHARS));
+            }
+            None => {
+                names.remove(id);
+            }
+        }
+    }
+    names
+}
+
+/// Grok Build sessions: `<root>/<encoded-cwd>/<session-id>/summary.json`,
+/// Grok's own on-disk index. The directory's whole size is the session's.
+fn scan_grok(root: &Path) -> Vec<NativeSession> {
+    let mut sessions = Vec::new();
+    for group in entries(root) {
+        if !is_real_dir(&group.path()) {
+            continue;
+        }
+        for entry in entries(&group.path()) {
+            let dir = entry.path();
+            if !is_real_dir(&dir) {
+                continue;
+            }
+            let summary_path = dir.join(GROK_SUMMARY_FILE);
+            let Some(summary) = read_json_file(&summary_path, MAX_GROK_SUMMARY_BYTES) else {
+                continue;
+            };
+            let Some(meta) = parse::grok_summary(&summary) else {
+                continue;
+            };
+            let Some(id) = meta.id.clone() else { continue };
+            if validate_session_id(&id).is_err() {
+                continue;
+            }
+            let files: Vec<PathBuf> = [summary_path, dir.join(GROK_UPDATES_FILE)]
+                .into_iter()
+                .filter(|path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()))
+                .collect();
+            let modified = files
+                .iter()
+                .filter_map(|path| modified(path))
+                .max()
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            sessions.push(NativeSession {
+                id,
+                files,
+                side: Vec::new(),
+                bytes: Some(tree_bytes(&dir)),
+                dir: Some(dir),
+                modified,
+                meta,
+                locked: false,
+            });
+        }
+    }
+    sessions
+}
+
+fn read_json_file(path: &Path, max_bytes: u64) -> Option<Value> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+/// A Devin `session/list` entry; one without a valid id is dropped, one
+/// without `updatedAt` counts as just written (so it is protected).
+fn devin_session(item: &Value) -> Option<NativeSession> {
+    let id = item.get("sessionId").and_then(Value::as_str)?.to_owned();
+    validate_session_id(&id).ok()?;
+    let text = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    let time = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+            .map(|at| at.with_timezone(&Utc))
+    };
+    let modified = time(item.get("updatedAt"))
+        .map(SystemTime::from)
+        .unwrap_or_else(SystemTime::now);
+    let title = text(item.get("title"))
+        .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+        .map(|title| parse::cap(&title, parse::TITLE_CHARS));
+    Some(NativeSession {
+        meta: SessionMeta {
+            id: Some(id.clone()),
+            title,
+            cwd: text(item.get("cwd")),
+            created_at: time(item.pointer("/_meta/cognition.ai~1createdAt")),
+        },
+        locked: item
+            .pointer("/_meta/cognition.ai~1isLocked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        id,
+        files: Vec::new(),
+        side: Vec::new(),
+        dir: None,
+        bytes: None,
+        modified,
+    })
 }
 
 /// Claude's per-session side data that exists and is strictly keyed by the
@@ -902,6 +1330,16 @@ fn read_transcript(
     let mut total = 0usize;
     let mut line = Vec::new();
     let mut scratch = Vec::new();
+    let mut grok = (provider == NativeProvider::GrokBuild).then(parse::GrokTranscript::default);
+    let mut keep = |scratch: &mut Vec<TranscriptMessage>| {
+        for message in scratch.drain(..) {
+            total += 1;
+            if ring.len() == limit {
+                ring.pop_front();
+            }
+            ring.push_back(message);
+        }
+    };
     loop {
         line.clear();
         if reader.read_until(b'\n', &mut line)? == 0 {
@@ -910,15 +1348,15 @@ fn read_transcript(
         let Ok(record) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
-        scratch.clear();
-        parse::record_messages(provider, &record, &mut scratch);
-        for message in scratch.drain(..) {
-            total += 1;
-            if ring.len() == limit {
-                ring.pop_front();
-            }
-            ring.push_back(message);
+        match grok.as_mut() {
+            Some(grok) => grok.push_record(&record, &mut scratch),
+            None => parse::record_messages(provider, &record, &mut scratch),
         }
+        keep(&mut scratch);
+    }
+    if let Some(grok) = grok.as_mut() {
+        grok.flush(&mut scratch);
+        keep(&mut scratch);
     }
     Ok((total, ring.into()))
 }

@@ -24,8 +24,9 @@ pub(crate) use cli_manager::{
     read_current_version, run_install, run_upgrade, CliManager, CliOperationAction,
     CliUpgradeOperation, CliVersionsResponse, ManagedCli,
 };
+pub(crate) use devin::devin_cli_environment;
 pub(crate) use doctor::inspect_providers;
-pub(crate) use grok::inspect_grok;
+pub(crate) use grok::{grok_cli_environment, inspect_grok};
 pub(crate) use supervisor::{
     plan_policy_deletions, CleanupSkip, NativeSessionRef, PolicyCandidate, PolicyRule,
 };

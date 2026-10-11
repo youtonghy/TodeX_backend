@@ -235,10 +235,13 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
 
 ### Agent 原生历史（`/v2/native-history/*`）
 
-以下接口管理 Claude Code 与 Pi 自己保存的原生会话文件（不属于 TodeX 会话存储），与其他 v2 路由一样需要设备签名。路径中的 `{provider}` 只能是 `claude-code` 或 `pi`，其他值一律返回 `400 INVALID_REQUEST`。原生目录与 Provider 自身的解析方式一致，每次请求重新解析（daemon 启动后修改的环境变量同样生效）：
+以下接口管理 Claude Code、Pi、Codex、Grok Build 与 Devin 自己保存的原生会话（不属于 TodeX 会话存储），与其他 v2 路由一样需要设备签名。路径中的 `{provider}` 只能是 `claude-code`、`pi`、`codex`、`grok-build` 或 `devin`，其他值一律返回 `400 INVALID_REQUEST`。原生目录与 Provider 自身的解析方式一致，每次请求重新解析（daemon 启动后修改的环境变量同样生效）。Claude Code 与 Pi 的会话文件由 TodeX 直接删除；Codex、Grok Build 与 Devin 的会话只通过各自 CLI 的官方删除命令删除（使用 daemon 配置的 `codex_bin` / `grok_bin` / `devin_bin`），TodeX 从不直接删除它们的文件：
 
 - Claude Code：配置目录为 `$CLAUDE_CONFIG_DIR`（默认 `~/.claude`），会话文件为 `<claude_dir>/projects/<编码后的 cwd>/<sessionId>.jsonl`（只认文件名是 UUID 的 `.jsonl`，跳过符号链接目录）。按会话 id 严格关联、随会话一起计量和删除的附属数据（存在才计入）：同目录的 `<sessionId>/`（subagents、tool-results）、`session-env/<sessionId>/`、`file-history/<sessionId>/`、`todos/<sessionId>-*.json`、`debug/<sessionId>.txt`。其他文件（`.credentials.json`、`settings.json`、`history.jsonl`、plugins、skills、memory 等）永不触碰。
 - Pi：会话目录依次取 `$PI_CODING_AGENT_SESSION_DIR`、`<pi_dir>/settings.json` 的 `sessionDir`（支持 `~/`，相对路径基于 `pi_dir`）、`<pi_dir>/sessions`，其中 `pi_dir` 为 `$PI_CODING_AGENT_DIR`（默认 `~/.pi/agent`）。只把首行能解析为 `{"type":"session","id",…}` 头的 `.jsonl` 视为会话（扫描会话目录及其一级子目录），其他文件（如 `permission-forwarding/`）一律忽略；会话 id 取自文件头，删除会话即删除该 `.jsonl`（与 Pi 自身一致）。
+- Codex：主目录为 `$CODEX_HOME`（默认 `~/.codex`），只读扫描 rollout 文件 `sessions/YYYY/MM/DD/rollout-<时间>-<thread id>.jsonl` 与已归档的 `archived_sessions/rollout-*.jsonl`（会话 id 即文件名末尾的 thread UUID，即 TodeX Codex 会话的 `nativeSessionId`）；首行须为 `session_meta`（提供 `cwd`、`createdAt`）。不打开 Codex 的 `state_<N>.sqlite`（运行中的 app-server 可能持有它），也不启动 app-server（其 `thread/list` 默认只返回交互来源且有预览的线程）。线程名（`thread/name/set`、`/rename`）取自追加写入的 `session_index.jsonl`（同一 id 以最后一行为准，空名表示清除）。`bytes` 为 rollout 文件大小（Codex 0.162 起的分页历史还会在 `thread_history_1.sqlite` 中保存索引，不计入）。删除执行 `codex delete --force <id>`（`--force` 跳过确认且要求 UUID），子进程的 `CODEX_HOME` 固定为列表所读的目录；该命令会一并删除 rollout、SQLite 中的线程记录与 `session_index.jsonl` 条目，已用临时 `CODEX_HOME` 实测可离线删除未归档、已归档及未建索引的 rollout。
+- Grok Build：主目录为 `$GROK_HOME`（默认 `~/.grok`），只读扫描 Grok 自己的磁盘索引 `sessions/<URL 编码的 cwd>/<session id>/summary.json`（cwd 过长时目录名为 slug+hash，并另有 `.cwd` 文件，均不影响扫描）；跳过 Grok 自己在列表中隐藏的会话（`hidden: true`，或未显式 `hidden: false` 的 `subagent*` 类会话——`grok sessions delete` 同样找不到它们）。`bytes` 为整个会话目录的大小（`updates.jsonl`、`chat_history.jsonl`、检查点等，不跟随符号链接）。删除执行 `grok --no-auto-update sessions delete <id>`（该命令不提示确认），子进程设置 `GROK_HOME`（及已设置的 `GROK_AUTH_PATH`）与 `grok_env_allowlist` 中的变量。**注意：已登录且非 ZDR 团队时，Grok 会先删除该会话的云端副本，云端删除失败则整个删除中止、本地文件不动**（该项以 `PROVIDER_UNAVAILABLE` 跳过，可重试）。Grok 自带按空闲天数清理会话目录的设置 `config.toml` 的 `[storage] cleanup_ttl_days`（未设置或 0 为关闭）；TodeX 目前不读写该设置，它也不会考虑 TodeX 的引用。
+- Devin：本地会话保存在 SQLite 数据库 `$XDG_DATA_HOME/devin/cli/sessions.db`（默认 `~/.local/share/devin/cli`，含 `-wal` / `-shm`），TodeX 不读取该数据库。列表通过一个短时 `devin acp` 进程完成：`initialize` 后分页调用 ACP `session/list`（无需登录；每页 50 条，按 `nextCursor` 翻页，整个过程 30 秒超时，结束即终止进程）。`devin list --format json` 只列当前目录的会话，因此不使用。会话 id 即 ACP session id（TodeX Devin 会话的 `nativeSessionId`）；`_meta["cognition.ai/isLocked"]` 为 true（另一个 Devin 进程打开着该会话）时视为运行中。删除执行 `devin rm --force <id>`（`--force` 跳过确认；另一个 Devin 实例打开着该会话时 Devin 拒绝删除）。只覆盖本地会话，`devin --cloud` 云端会话不在范围内。
 
 `GET /v2/native-history/providers`：
 
@@ -252,14 +255,23 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
       "sessionCount": 17,
       "totalBytes": 118000000,
       "measuredAt": "2026-10-11T08:00:00Z",
+      "capabilities": { "view": true, "sizes": true },
       "native": { "cleanupPeriodDays": 5, "settingsPath": "/home/u/.claude/settings.json" }
     },
-    { "provider": "pi", "available": false, "root": "/home/u/.pi/agent/sessions", "sessionCount": 0, "totalBytes": 0, "measuredAt": "…", "native": null }
+    { "provider": "pi", "available": false, "root": "/home/u/.pi/agent/sessions", "sessionCount": 0, "totalBytes": 0, "measuredAt": "…", "capabilities": { "view": true, "sizes": true }, "native": null },
+    { "provider": "codex", "available": true, "root": "/home/u/.codex/sessions", "sessionCount": 4, "totalBytes": 2100000, "measuredAt": "…", "capabilities": { "view": true, "sizes": true }, "native": null },
+    { "provider": "grok-build", "available": false, "root": "/home/u/.grok/sessions", "sessionCount": 0, "totalBytes": 0, "measuredAt": "…", "capabilities": { "view": true, "sizes": true }, "native": null },
+    { "provider": "devin", "available": true, "root": "/home/u/.local/share/devin/cli", "sessionCount": 9, "totalBytes": 5300000, "measuredAt": "…", "capabilities": { "view": false, "sizes": false }, "native": null }
   ]
 }
 ```
 
-`available` 表示 `root`（会话所在目录）存在；`totalBytes` 包含会话文件及上述附属数据（不跟随符号链接）。`native` 仅 Claude 有：`cleanupPeriodDays` 为 `settings.json` 中的数值，缺失或文件无法解析时为 `null`。
+`providers` 固定按 `claude-code`、`pi`、`codex`、`grok-build`、`devin` 顺序列出全部五项。
+
+- `available` 表示该 Provider 的历史存储存在：Claude/Pi/Grok 为 `root` 目录存在；Codex 为 `sessions/` 或 `archived_sessions/` 存在；Devin 为 `sessions.db` 存在、`devin_bin` 可执行且 `session/list` 成功（失败只记警告）。不可用时会话列表返回 `count: 0, sessions: []`，不是错误。
+- `capabilities.view`：转录接口可用（Devin 为 `false`）。`capabilities.sizes`：已知每个会话的字节数（Devin 为 `false`）。
+- `totalBytes`：`sizes` 为 `true` 时为各会话 `bytes` 之和（Claude 含上述附属数据，不跟随符号链接）；为 `false` 时为整个历史存储的大小（Devin 为 `sessions.db` 及其 `-wal` / `-shm`，无法测量时为 0）。
+- `native` 仅 Claude 有（其他为 `null`）：`cleanupPeriodDays` 为 `settings.json` 中的数值，缺失或文件无法解析时为 `null`。
 
 `GET /v2/native-history/{provider}/sessions`：
 
@@ -272,10 +284,11 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
 }
 ```
 
-- 按 `updatedAt`（文件 mtime）倒序。`title`：Claude 取最新的 `custom-title` / `ai-title` / `summary` 记录，否则取第一条真实用户消息（跳过 meta、命令/通知包装、tool result 与 sidechain）；Pi 取最新的 `session_info.name`，否则取第一条用户消息；空白折叠为单行，最多 200 字符，没有时为 `null`。`cwd`、`createdAt` 来自 Claude 首条记录或 Pi 文件头，可能为 `null`。
-- 列表只读取每个文件开头和末尾各 256 KiB，并按（路径、大小、mtime）在内存中缓存解析结果，因此超大文件中间的标题可能不会被识别。
-- `referencedBy`：当前 tenant 中 Provider 相同、恢复该原生会话的 TodeX 会话 id（`provider-state.json` 的 `nativeSessionId`，尚未记录时为会话 id 本身——Claude/Pi 驱动首轮即以它作为会话 id）。
-- `running`：Claude 的 `<claude_dir>/sessions/<pid>.json` 标记指向该会话且该 pid 仍存活（Linux 检查 `/proc/<pid>`，其他 Unix 用 `kill(pid, 0)`，无法检查的平台一律视为存活）；或引用它的 TodeX 会话正在运行/等待授权；或文件在最近 2 分钟内被写入。
+- `bytes` 类型为 `number | null`：`capabilities.sizes` 为 `false`（Devin）时恒为 `null`；`totalBytes` 含义同上。
+- 按 `updatedAt` 倒序：Claude/Pi/Codex 为会话文件 mtime，Grok 为 `summary.json` 与 `updates.jsonl` 中较新的 mtime，Devin 为 `session/list` 的 `updatedAt`（缺失时按刚写入处理）。`title`：Claude 取最新的 `custom-title` / `ai-title` / `summary` 记录，否则取第一条真实用户消息（跳过 meta、命令/通知包装、tool result 与 sidechain）；Pi 取最新的 `session_info.name`，否则取第一条用户消息；Codex 取线程名，否则取第一条真实用户消息（跳过 Codex 以用户身份注入的 `<environment_context>` 等 `<…>` 包装与 AGENTS.md 指令）；Grok 取 `generated_title`，否则取 `session_summary`；Devin 取 `session/list` 的 `title`。空白折叠为单行，最多 200 字符，没有时为 `null`。`cwd`、`createdAt` 来自 Claude 首条记录、Pi 文件头、Codex `session_meta`、Grok `summary.json`（`info.cwd`、`created_at`）或 Devin 的 `cwd` / `_meta["cognition.ai/createdAt"]`，可能为 `null`。
+- 列表只读取每个文件开头和末尾各 256 KiB（Codex 只看开头），并按（路径、大小、mtime）在内存中缓存解析结果，因此超大文件中间的标题可能不会被识别。
+- `referencedBy`：当前 tenant 中 Provider 相同（`codex`、`grok-build`、`devin` 分别对应 TodeX 的 Codex、Grok Build、Devin 会话）、恢复该原生会话的 TodeX 会话 id（`provider-state.json` 的 `nativeSessionId`，尚未记录时为会话 id 本身——Claude/Pi 驱动首轮即以它作为会话 id）。
+- `running`：Claude 的 `<claude_dir>/sessions/<pid>.json` 标记指向该会话且该 pid 仍存活（Linux 检查 `/proc/<pid>`，其他 Unix 用 `kill(pid, 0)`，无法检查的平台一律视为存活）；Devin 的 `session/list` 报告该会话被锁定（`cognition.ai/isLocked`）；或引用它的 TodeX 会话正在运行/等待授权；或会话在最近 2 分钟内被写入（同 `updatedAt`）。
 
 `GET /v2/native-history/{provider}/sessions/{id}/transcript?limit=200`：
 
@@ -286,11 +299,13 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
 }
 ```
 
-- `limit` 为 1–1000 的整数（默认 200），否则 `400 INVALID_REQUEST`；id 格式非法为 `400 INVALID_REQUEST`，不存在为 `404 NOT_FOUND`。
+- `limit` 为 1–1000 的整数（默认 200），否则 `400 INVALID_REQUEST`；id 格式非法为 `400 INVALID_REQUEST`，不存在为 `404 NOT_FOUND`；`capabilities.view` 为 `false` 的 Provider（Devin）返回 `501 UNSUPPORTED`。
 - 逐行流式读取文件，只保留最后 `limit` 条可显示消息（按时间正序）；`totalMessages` 为可显示消息总数，`truncated` 表示更早的消息被省略。
 - 映射：用户/助手文本块 → `user`/`assistant`（图片显示为 `[image]`）；工具调用 → `tool`，文本为 `name: <JSON 参数>`（最多 300 字符）；工具结果 → `tool`，最多 500 字符预览；Claude `system` 记录、压缩摘要与 Pi compaction/branch 摘要 → `system`；thinking、Claude sidechain（`isSidechain: true`）与 meta 记录、Pi 系统提示均跳过。每条文本最多 8000 字符，超出部分以 `…` 截断。`at` 为记录时间戳，缺失时为 `null`。
+- Codex 读取 rollout 的 `response_item` 记录：用户消息（同样跳过注入的 `<…>` 上下文与 AGENTS.md 指令）→ `user`；助手消息 → `assistant`；`function_call` / `custom_tool_call` / `local_shell_call` / `web_search_call` → `tool`（`name: <参数>`）；`function_call_output` / `custom_tool_call_output` → `tool` 结果预览；`compacted` 记录 → `system`；developer/system 消息、`reasoning` 以及重复同一内容的 `event_msg` 记录均跳过。
+- Grok 读取 `updates.jsonl`（每行一条持久化的 ACP `session/update` 或 `_x.ai/session/update` 通知，`timestamp` 为 Unix 秒）：连续的 `user_message_chunk` / `agent_message_chunk` 合并为一条 `user` / `assistant` 消息（`at` 取第一块的时间；宿主注入的 `hostTurn` 用户块跳过）；`agent_thought_chunk` 跳过且不打断合并；`tool_call` → `tool`（`title: <rawInput>`）；同一调用第一次 `completed` / `failed` 的 `tool_call_update` → `tool` 结果预览（内容文本，否则 `rawOutput`）。`/rewind` 撤销的轮次仍会出现在转录中。
 
-`POST /v2/native-history/{provider}/cleanup` 删除指定会话，请求体 `{ "sessionIds": ["…"] }`，去重后数量须为 1–500，且每个 id 只能由 `[A-Za-z0-9._-]` 组成、不以 `.` 开头、不含 `..`（最长 128），否则整个请求返回 `400 INVALID_REQUEST`。响应与 `/v2/history/cleanup` 同形（`skipped[].conversationId` 存放的是原生会话 id）：
+`POST /v2/native-history/{provider}/cleanup` 删除指定会话，请求体 `{ "sessionIds": ["…"] }`，去重后数量须为 1–500，且每个 id 只能由 `[A-Za-z0-9._-]` 组成、不以 `.` 或 `-` 开头、不含 `..`（最长 128），否则整个请求返回 `400 INVALID_REQUEST`。响应与 `/v2/history/cleanup` 同形（`skipped[].conversationId` 存放的是原生会话 id）：
 
 ```json
 {
@@ -301,19 +316,21 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
 ```
 
 - 被任意 tenant 的 TodeX 会话引用 → `CONFLICT`（`a TodeX conversation uses this session`）；正在运行（同上 `running` 判定）→ `CONFLICT`（`session is running`）；扫描中找不到 → `NOT_FOUND`。删除 Pi 会话会让引用它的 TodeX 会话永久无法继续，因此引用保护不可绕过。
-- 安全规则：id 先校验再通过一次全新的会话扫描解析为路径；每个待删路径都按其规范化（canonicalize）后的父目录校验必须位于 Provider 根目录内（Claude 会话文件为 `<claude_dir>/projects`，附属数据为 `<claude_dir>`；Pi 为会话目录）；符号链接从不跟随也不删除（扫描用 `symlink_metadata`，符号链接本身被拒绝）。先删会话文件，再尽力删除附属数据（失败只记警告）。每次删除写一条 `native history session deleted` 的 info 日志（provider、session_id、freed_bytes、trigger）。删除与策略运行、设置修改互斥串行。
+- Codex / Grok / Devin 通过 CLI 删除（见上文，单个删除 60 秒超时）：CLI 未安装 → `UNSUPPORTED`（不会退回到直接删除文件）；非零退出时取 stderr（其次 stdout）最后一行 `Error: …`（否则最后一个非空行），脱敏并截断到 300 字符作为 `message`：含 `no session found` / `not found` → `NOT_FOUND`，含 `already open` / `another process`（Devin 拒绝删除被打开的会话）→ `CONFLICT`，其他 → `PROVIDER_UNAVAILABLE`。`grok sessions delete` 找不到会话时也以 0 退出并输出 `No session found…`，按 `NOT_FOUND` 处理。`freedBytes` 计入会话的 `bytes`（Devin 为 0）。
+- 安全规则（Claude/Pi）：id 先校验再通过一次全新的会话扫描解析为路径；每个待删路径都按其规范化（canonicalize）后的父目录校验必须位于 Provider 根目录内（Claude 会话文件为 `<claude_dir>/projects`，附属数据为 `<claude_dir>`；Pi 为会话目录）；符号链接从不跟随也不删除（扫描用 `symlink_metadata`，符号链接本身被拒绝）。先删会话文件，再尽力删除附属数据（失败只记警告）。每次删除写一条 `native history session deleted` 的 info 日志（provider、session_id、freed_bytes、trigger）。删除与策略运行、设置修改互斥串行。
 
 自动清理策略（由 TodeX 管理，按 Provider、全 daemon 共享，不区分 tenant）：`GET`/`PUT /v2/native-history/{provider}/policy` 与 `POST /v2/native-history/{provider}/policy/run` 的请求、响应与校验和 `/v2/history/cleanup-policy`、`/v2/history/cleanup-policy/run` 完全相同（`policy` 为 `{enabled,maxAgeDays,maxTotalBytes}`，响应 `{policy,lastRun,nextRunAt}`；运行响应 `{deleted,skipped,freedBytes,lastRun}`）。
 
 - 策略持久化在 `$DATA_DIR/native-history-cleanup.json`（owner-only 0600，原子替换），文件缺失或损坏按默认值（关闭）处理并记录警告。
-- 语义与 TodeX 策略一致：先按年龄规则删除 `updatedAt` 早于「现在 − `maxAgeDays` 天」的会话，再按容量规则从旧到新删除直到总占用不大于 `maxTotalBytes`。被引用或运行中的会话计入总占用但永不删除；选定后文件又被写入的会话以 `CONFLICT` 跳过。
+- 语义与 TodeX 策略一致：先按年龄规则删除 `updatedAt` 早于「现在 − `maxAgeDays` 天」的会话，再按容量规则从旧到新删除直到总占用不大于 `maxTotalBytes`。被引用或运行中的会话计入总占用但永不删除；选定后文件又被写入的会话以 `CONFLICT` 跳过（Devin 没有可检查的文件，由 `devin rm` 拒绝删除被打开的会话）。
+- `capabilities.sizes` 为 `false` 的 Provider（Devin）没有容量规则：`PUT` 中 `maxTotalBytes` 非 `null` 时返回 `400 INVALID_REQUEST`。
 - 不另起定时器：`/v2/history/*` 的后台任务每次运行在处理各 tenant 策略之后，也会对每个已启用的原生策略运行一次（`trigger: "auto"`），`nextRunAt` 即该任务的下一次运行时间；`PUT` 保存为启用的原生策略同样会唤醒它。
 
 Claude 自身保留期：`GET`/`PUT /v2/native-history/claude-code/native-retention`，请求与响应均为 `{ "cleanupPeriodDays": 30, "settingsPath": "/home/u/.claude/settings.json" }`。
 
 - `PUT` 请求体必须包含 `cleanupPeriodDays`，取值为 `null` 或 1–3650 的整数（否则 `400 INVALID_REQUEST`，`settingsPath` 会被忽略）；`null` 表示删除该键，恢复 Claude 的默认值。
 - 修改 `<claude_dir>/settings.json` 时保留其他所有键（及其顺序）和文件原有权限，原子替换；文件不存在时以 0600 新建；`settings.json` 是符号链接时修改其目标文件。文件存在但不是合法 JSON 对象时 `GET`/`PUT` 都返回 `409 CONFLICT`，且不改动文件。
-- `pi` 没有对应设置，`/v2/native-history/pi/native-retention` 返回 `400 INVALID_REQUEST`。
+- 其他 Provider 没有对应设置，`/v2/native-history/{pi|codex|grok-build|devin}/native-retention` 返回 `400 INVALID_REQUEST`（Grok 的 `[storage] cleanup_ttl_days` 见上文，暂不提供接口）。
 - 注意：Claude Code 按 `cleanupPeriodDays` 在自身启动时清理旧会话，**不会**考虑 TodeX 的引用；被 TodeX 会话引用的 Claude 会话同样会被它删除。TodeX 的原生清理策略和手动删除才会保护被引用的会话。
 
 ### v2 WebSocket

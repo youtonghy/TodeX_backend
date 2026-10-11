@@ -25,6 +25,9 @@ async fn fixture() -> Fixture {
     let roots = NativeRoots {
         claude_dir: root.join("claude"),
         pi_session_dir: root.join("pi").join("sessions"),
+        codex_home: root.join("codex"),
+        grok_home: root.join("grok"),
+        devin_dir: root.join("devin").join("cli"),
     };
     fs::create_dir_all(root.join("workspaces").join("project")).unwrap();
     let mut state = AppState::new_for_tests(Config {
@@ -37,6 +40,14 @@ async fn fixture() -> Fixture {
     .unwrap();
     Arc::make_mut(&mut state.config).security.enable_auth = false;
     state.native_history.roots_override = Some(roots.clone());
+    // No real CLI is ever run: tests that delete install fake ones.
+    let missing = root.join("bin").join("missing").display().to_string();
+    state.native_history.clis = NativeClis {
+        codex: missing.clone(),
+        grok: missing.clone(),
+        devin: missing,
+        ..NativeClis::default()
+    };
     Fixture { root, state, roots }
 }
 
@@ -144,7 +155,16 @@ fn session_ids_reject_traversal() {
     }
     assert!(validate_session_id(&new_id()).is_ok());
     assert!(validate_session_id("01a0c4b6-cdba-76ed-9382-ee5a0d731999").is_ok());
-    assert!(NativeProvider::parse("codex").is_err());
+    assert!(validate_session_id("-rf").is_err());
+    assert_eq!(
+        NativeProvider::parse("codex").unwrap(),
+        NativeProvider::Codex
+    );
+    assert_eq!(
+        NativeProvider::parse("grok-build").unwrap(),
+        NativeProvider::GrokBuild
+    );
+    assert!(NativeProvider::parse("opencode").is_err());
 }
 
 #[tokio::test]
@@ -562,10 +582,554 @@ async fn policy_applies_age_then_capacity_and_keeps_protected_sessions() {
     // The policy file is separate from the TodeX one and survives reloads.
     let data_dir = fixture.root.join("data");
     assert!(data_dir.join(NATIVE_HISTORY_CLEANUP_FILE).exists());
-    let reloaded = NativeHistory::new(&data_dir, &HistoryCleanup::load(&data_dir));
+    let reloaded = NativeHistory::new(
+        &data_dir,
+        &HistoryCleanup::load(&data_dir),
+        NativeClis::default(),
+    );
     assert_eq!(reloaded.cleanup.tenant("pi").await.policy, policy);
     assert_eq!(
         fixture.state.history_cleanup.tenant("pi").await,
         Default::default()
+    );
+}
+
+/// Installs an executable `/bin/sh` script as a fake provider CLI.
+#[cfg(unix)]
+fn fake_cli(fixture: &Fixture, name: &str, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = fixture.root.join("bin").join(name);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path.display().to_string()
+}
+
+fn log_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn skips(report: &CleanupReport) -> HashMap<String, (String, String)> {
+    report
+        .skipped
+        .iter()
+        .map(|skip| {
+            (
+                skip.conversation_id.clone(),
+                (skip.code.clone(), skip.message.clone()),
+            )
+        })
+        .collect()
+}
+
+fn codex_rollout(fixture: &Fixture, dir: &str, id: &str, prompt: &str) -> PathBuf {
+    let path = fixture
+        .roots
+        .codex_home
+        .join(dir)
+        .join(format!("rollout-2026-10-01T08-00-00-{id}.jsonl"));
+    let item = |payload: Value| json!({"timestamp": "2026-10-01T08:00:01.000Z", "type": "response_item", "payload": payload});
+    write_lines(
+        &path,
+        &[
+            json!({"timestamp": "2026-10-01T08:00:00.000Z", "type": "session_meta",
+                   "payload": {"id": id, "timestamp": "2026-10-01T08:00:00.000Z", "cwd": "/work/c", "source": "cli"}}),
+            item(
+                json!({"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<permissions>"}]}),
+            ),
+            item(
+                json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>\n</environment_context>"}]}),
+            ),
+            item(
+                json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "# AGENTS.md instructions for /work/c"}]}),
+            ),
+            item(
+                json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]}),
+            ),
+            json!({"timestamp": "2026-10-01T08:00:01.000Z", "type": "event_msg", "payload": {"type": "user_message", "message": prompt}}),
+            item(
+                json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking"}]}),
+            ),
+            item(
+                json!({"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}", "call_id": "c1"}),
+            ),
+            item(json!({"type": "function_call_output", "call_id": "c1", "output": "a.txt"})),
+            item(
+                json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done."}]}),
+            ),
+        ],
+    );
+    age(&path, DAY);
+    path
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_rollouts_are_listed_viewed_and_deleted_through_the_cli() {
+    let mut fixture = fixture().await;
+    let codex_home = fixture.roots.codex_home.clone();
+    let [plain, archived, referenced, recent, failing] = [(); 5].map(|_| new_id());
+    let plain_path = codex_rollout(&fixture, "sessions/2026/10/01", &plain, "fix the\n build");
+    let archived_path = codex_rollout(&fixture, "archived_sessions", &archived, "old work");
+    codex_rollout(&fixture, "sessions/2026/10/01", &referenced, "r");
+    let recent_path = codex_rollout(&fixture, "sessions/2026/10/02", &recent, "y");
+    age(&recent_path, Duration::ZERO);
+    codex_rollout(&fixture, "sessions/2026/10/02", &failing, "f");
+    // Not rollouts.
+    fs::write(codex_home.join("sessions").join("notes.jsonl"), b"{}\n").unwrap();
+    fs::write(
+        codex_home.join(CODEX_SESSION_INDEX),
+        format!(
+            "{}\n{}\n{}\n",
+            json!({"id": archived, "thread_name": "First name", "updated_at": "x"}),
+            json!({"id": archived, "thread_name": "Named thread", "updated_at": "y"}),
+            json!({"id": plain, "thread_name": "", "updated_at": "z"}),
+        ),
+    )
+    .unwrap();
+    let conversation = reference(&fixture, ProviderKind::Codex, &referenced).await;
+
+    let listing = list(&fixture, NativeProvider::Codex).await;
+    assert_eq!(listing["count"], 5);
+    assert_eq!(listing["root"], json!(codex_home.join("sessions")));
+    let by_id = |id: &str| {
+        listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_id(&plain)["title"], "fix the build");
+    assert_eq!(by_id(&plain)["cwd"], "/work/c");
+    assert_eq!(by_id(&plain)["createdAt"], "2026-10-01T08:00:00Z");
+    assert_eq!(
+        by_id(&plain)["bytes"],
+        fs::metadata(&plain_path).unwrap().len()
+    );
+    assert_eq!(by_id(&archived)["title"], "Named thread");
+    assert_eq!(by_id(&referenced)["referencedBy"], json!([conversation]));
+    assert_eq!(by_id(&recent)["running"], true);
+    assert_eq!(by_id(&plain)["running"], false);
+
+    let providers = fixture.state.native_history.providers().await.unwrap();
+    let codex = &providers["providers"][2];
+    assert_eq!(codex["provider"], "codex");
+    assert_eq!(codex["available"], true);
+    assert_eq!(codex["capabilities"], json!({"view": true, "sizes": true}));
+    assert_eq!(codex["sessionCount"], 5);
+    assert_eq!(codex["native"], Value::Null);
+
+    let transcript = fixture
+        .state
+        .native_history
+        .transcript(NativeProvider::Codex, &plain, 100)
+        .await
+        .unwrap();
+    let messages: Vec<(String, String)> = transcript["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| {
+            (
+                message["role"].as_str().unwrap().to_owned(),
+                message["text"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            ("user", "fix the\n build"),
+            ("tool", r#"exec_command: {"cmd":"ls"}"#),
+            ("tool", "a.txt"),
+            ("assistant", "Done."),
+        ]
+        .map(|(role, text)| (role.to_owned(), text.to_owned()))
+    );
+    assert_eq!(transcript["messages"][0]["at"], "2026-10-01T08:00:01Z");
+
+    // Deletion goes through `codex delete --force <id>` with CODEX_HOME set.
+    let log = fixture.root.join("codex.log");
+    let script = format!(
+        "echo \"$CODEX_HOME|$*\" >> '{log}'\n\
+         if [ \"$3\" = '{failing}' ]; then echo 'WARNING: proceeding' >&2; echo 'Error: failed to delete session' >&2; exit 1; fi\n\
+         find \"$CODEX_HOME\" -name \"*$3.jsonl\" -delete\n\
+         echo \"Deleted session $3.\"\n",
+        log = log.display()
+    );
+    fixture.state.native_history.clis.codex = fake_cli(&fixture, "codex", &script);
+    let expected_freed =
+        by_id(&plain)["bytes"].as_u64().unwrap() + by_id(&archived)["bytes"].as_u64().unwrap();
+    let missing = new_id();
+    let report = fixture
+        .state
+        .native_history
+        .cleanup(
+            &fixture.state.conversations,
+            NativeProvider::Codex,
+            &[
+                plain.clone(),
+                archived.clone(),
+                referenced.clone(),
+                recent.clone(),
+                failing.clone(),
+                missing.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, vec![plain.clone(), archived.clone()]);
+    assert_eq!(report.freed_bytes, expected_freed);
+    let skipped = skips(&report);
+    assert_eq!(skipped[&referenced].0, "CONFLICT");
+    assert_eq!(skipped[&recent].0, "CONFLICT");
+    assert_eq!(skipped[&missing].0, "NOT_FOUND");
+    assert_eq!(skipped[&failing].0, "PROVIDER_UNAVAILABLE");
+    assert!(skipped[&failing].1.ends_with("failed to delete session"));
+    let home = codex_home.display();
+    assert_eq!(
+        log_lines(&log),
+        [&plain, &archived, &failing].map(|id| format!("{home}|delete --force {id}"))
+    );
+    assert!(!plain_path.exists());
+    assert!(!archived_path.exists());
+    assert_eq!(list(&fixture, NativeProvider::Codex).await["count"], 3);
+}
+
+fn grok_session(fixture: &Fixture, id: &str, summary: Value, updates: &[Value]) -> PathBuf {
+    let dir = fixture
+        .roots
+        .grok_home
+        .join("sessions")
+        .join("%2Fwork%2Fg")
+        .join(id);
+    fs::create_dir_all(&dir).unwrap();
+    let mut summary = summary;
+    summary["info"] = json!({"id": id, "cwd": "/work/g"});
+    fs::write(dir.join("summary.json"), summary.to_string()).unwrap();
+    write_lines(&dir.join("updates.jsonl"), updates);
+    for name in ["summary.json", "updates.jsonl"] {
+        age(&dir.join(name), DAY);
+    }
+    dir
+}
+
+fn grok_update(update: Value) -> Value {
+    json!({"timestamp": 1790000000, "method": "session/update", "params": {"sessionId": "s", "update": update}})
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grok_sessions_are_listed_viewed_and_deleted_through_the_cli() {
+    let mut fixture = fixture().await;
+    let base = json!({"session_summary": "", "created_at": "2026-10-01T08:00:00Z",
+                      "updated_at": "2026-10-01T09:00:00Z", "num_messages": 3, "current_model_id": "grok"});
+    let [titled, summarized, gone, hidden] = [(); 4].map(|_| new_id());
+    let mut summary = base.clone();
+    summary["generated_title"] = json!("Fix the parser");
+    summary["session_summary"] = json!("ignored");
+    let titled_dir = grok_session(
+        &fixture,
+        &titled,
+        summary,
+        &[
+            grok_update(
+                json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "hello"}}),
+            ),
+            grok_update(
+                json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "hmm"}}),
+            ),
+            grok_update(
+                json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Hi "}}),
+            ),
+            grok_update(
+                json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "there"}}),
+            ),
+            grok_update(
+                json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Read file", "rawInput": {"path": "/a"}}),
+            ),
+            grok_update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "in_progress"}),
+            ),
+            grok_update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed",
+                               "content": [{"type": "content", "content": {"type": "text", "text": "file body"}}]}),
+            ),
+            grok_update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed"}),
+            ),
+            json!({"timestamp": 1790000001, "method": "_x.ai/session/update", "params": {"sessionId": "s", "update": {"sessionUpdate": "rewind_marker"}}}),
+            grok_update(
+                json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Done."}}),
+            ),
+        ],
+    );
+    let mut summary = base.clone();
+    summary["session_summary"] = json!("Summarized  work");
+    grok_session(&fixture, &summarized, summary, &[]);
+    grok_session(&fixture, &gone, base.clone(), &[]);
+    let mut summary = base.clone();
+    summary["session_kind"] = json!("subagent");
+    grok_session(&fixture, &hidden, summary, &[]);
+    // A group's `.cwd` marker and a directory without summary are ignored.
+    let group = fixture.roots.grok_home.join("sessions").join("%2Fwork%2Fg");
+    fs::write(group.join(".cwd"), b"/work/g").unwrap();
+    fs::create_dir_all(group.join(new_id())).unwrap();
+
+    let listing = list(&fixture, NativeProvider::GrokBuild).await;
+    assert_eq!(listing["count"], 3);
+    let by_id = |id: &str| {
+        listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_id(&titled)["title"], "Fix the parser");
+    assert_eq!(by_id(&titled)["cwd"], "/work/g");
+    assert_eq!(by_id(&titled)["createdAt"], "2026-10-01T08:00:00Z");
+    assert_eq!(by_id(&titled)["bytes"], tree_bytes(&titled_dir));
+    assert_eq!(by_id(&summarized)["title"], "Summarized work");
+    assert_eq!(by_id(&gone)["title"], Value::Null);
+
+    let transcript = fixture
+        .state
+        .native_history
+        .transcript(NativeProvider::GrokBuild, &titled, 100)
+        .await
+        .unwrap();
+    assert_eq!(transcript["title"], "Fix the parser");
+    let texts: Vec<(&str, &str)> = transcript["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| {
+            (
+                message["role"].as_str().unwrap(),
+                message["text"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            ("user", "hello"),
+            ("assistant", "Hi there"),
+            ("tool", r#"Read file: {"path":"/a"}"#),
+            ("tool", "file body"),
+            ("assistant", "Done."),
+        ]
+    );
+    assert_eq!(transcript["messages"][0]["at"], "2026-09-21T14:13:20Z");
+
+    // Without the CLI nothing is deleted.
+    let native = &fixture.state.native_history;
+    let report = native
+        .cleanup(
+            &fixture.state.conversations,
+            NativeProvider::GrokBuild,
+            std::slice::from_ref(&titled),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.skipped[0].code, "UNSUPPORTED");
+    assert!(titled_dir.exists());
+
+    let log = fixture.root.join("grok.log");
+    let script = format!(
+        "echo \"$GROK_HOME|$GROK_DISABLE_AUTOUPDATER|$*\" >> '{log}'\n\
+         if [ \"$4\" = '{gone}' ]; then echo \"No session found with id $4.\"; exit 0; fi\n\
+         find \"$GROK_HOME/sessions\" -mindepth 2 -maxdepth 2 -name \"$4\" -exec rm -rf {{}} +\n\
+         echo \"Deleted session $4\"\n",
+        log = log.display()
+    );
+    let grok = fake_cli(&fixture, "grok", &script);
+    fixture.state.native_history.clis.grok = grok;
+    let native = &fixture.state.native_history;
+    let report = native
+        .cleanup(
+            &fixture.state.conversations,
+            NativeProvider::GrokBuild,
+            &[titled.clone(), gone.clone(), hidden.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, vec![titled.clone()]);
+    assert_eq!(
+        report.freed_bytes,
+        by_id(&titled)["bytes"].as_u64().unwrap()
+    );
+    let skipped = skips(&report);
+    assert_eq!(skipped[&gone].0, "NOT_FOUND");
+    assert_eq!(skipped[&hidden].0, "NOT_FOUND");
+    let home = fixture.roots.grok_home.display();
+    assert_eq!(
+        log_lines(&log),
+        [&titled, &gone].map(|id| format!("{home}|1|--no-auto-update sessions delete {id}"))
+    );
+    assert!(!titled_dir.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_sessions_are_listed_and_deleted_through_the_cli() {
+    let mut fixture = fixture().await;
+    let devin_dir = fixture.roots.devin_dir.clone();
+    fs::create_dir_all(&devin_dir).unwrap();
+    fs::write(devin_dir.join("sessions.db"), vec![0; 4096]).unwrap();
+    fs::write(devin_dir.join("sessions.db-wal"), vec![0; 100]).unwrap();
+    let [old, locked, vanished, recent] = [(); 4].map(|_| new_id());
+    let entry = |id: &str, updated: &str, locked: bool, title: Option<&str>| {
+        let mut entry = json!({"sessionId": id, "cwd": "/work/d", "updatedAt": updated,
+            "_meta": {"cognition.ai/createdAt": "2026-08-01T09:00:00.000Z", "cognition.ai/isLocked": locked}});
+        if let Some(title) = title {
+            entry["title"] = json!(title);
+        }
+        entry
+    };
+    let now = Utc::now().to_rfc3339();
+    let page1 = json!({"jsonrpc": "2.0", "id": 1, "result": {
+        "sessions": [entry(&old, "2026-08-01T10:00:00+00:00", false, Some("Devin  one")),
+                     entry(&locked, "2026-08-01T10:00:00+00:00", true, None)],
+        "nextCursor": "p2"}});
+    let page2 = json!({"jsonrpc": "2.0", "id": 2, "result": {
+        "sessions": [entry(&vanished, "2026-08-02T10:00:00+00:00", false, None),
+                     entry(&recent, &now, false, None),
+                     {"sessionId": "../bad"}]}});
+    let initialize = json!({"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": 1,
+        "agentCapabilities": {"sessionCapabilities": {"list": {}, "delete": {}}}}});
+    let log = fixture.root.join("devin.log");
+    let script = format!(
+        "echo \"$*\" >> '{log}'\n\
+         if [ \"$1\" = acp ]; then\n\
+           while IFS= read -r line; do\n\
+             case \"$line\" in\n\
+               *'\"method\":\"initialize\"'*) echo '{initialize}' ;;\n\
+               *'\"cursor\":\"p2\"'*) echo '{page2}' ;;\n\
+               *'\"method\":\"session/list\"'*) echo 'banner'; echo '{{\"jsonrpc\":\"2.0\",\"method\":\"note\"}}'; echo '{page1}' ;;\n\
+             esac\n\
+           done\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$3\" = '{vanished}' ]; then echo \"Error: no session found matching '$3'\" >&2; exit 1; fi\n\
+         echo \"Session $3 deleted.\"\n",
+        log = log.display()
+    );
+    fixture.state.native_history.clis.devin = fake_cli(&fixture, "devin", &script);
+    let native = &fixture.state.native_history;
+
+    let listing = list(&fixture, NativeProvider::Devin).await;
+    assert_eq!(listing["count"], 4);
+    assert_eq!(listing["totalBytes"], 4196);
+    assert_eq!(listing["root"], json!(devin_dir));
+    let by_id = |id: &str| {
+        listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_id(&old)["title"], "Devin one");
+    assert_eq!(by_id(&old)["cwd"], "/work/d");
+    assert_eq!(by_id(&old)["bytes"], Value::Null);
+    assert_eq!(by_id(&old)["createdAt"], "2026-08-01T09:00:00Z");
+    assert_eq!(by_id(&old)["updatedAt"], "2026-08-01T10:00:00Z");
+    assert_eq!(by_id(&old)["running"], false);
+    assert_eq!(by_id(&locked)["running"], true);
+    assert_eq!(by_id(&recent)["running"], true);
+
+    let providers = native.providers().await.unwrap();
+    let devin = &providers["providers"][4];
+    assert_eq!(devin["provider"], "devin");
+    assert_eq!(devin["available"], true);
+    assert_eq!(
+        devin["capabilities"],
+        json!({"view": false, "sizes": false})
+    );
+    assert_eq!(devin["totalBytes"], 4196);
+    assert!(matches!(
+        native.transcript(NativeProvider::Devin, &old, 10).await,
+        Err(AppError::Unsupported(_))
+    ));
+
+    // Sizes are unknown: a capacity rule is refused, the age rule works.
+    let capacity = CleanupPolicy {
+        enabled: true,
+        max_age_days: None,
+        max_total_bytes: Some(1),
+    };
+    assert!(matches!(
+        NativeProvider::Devin.validate_policy(&capacity),
+        Err(AppError::InvalidRequest(_))
+    ));
+    assert!(NativeProvider::Codex.validate_policy(&capacity).is_ok());
+    let policy = CleanupPolicy {
+        enabled: true,
+        max_age_days: Some(30),
+        max_total_bytes: None,
+    };
+    let (report, _) = run_policy(
+        native,
+        &fixture.state.conversations,
+        NativeProvider::Devin,
+        policy,
+        CleanupTrigger::Manual,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.deleted, vec![old.clone()]);
+    assert_eq!(report.freed_bytes, 0);
+    let skipped = skips(&report);
+    assert_eq!(skipped[&vanished].0, "NOT_FOUND");
+    assert!(skipped[&vanished].1.contains("no session found matching"));
+    assert!(!skipped.contains_key(&locked));
+    let rm: Vec<String> = log_lines(&log)
+        .into_iter()
+        .filter(|line| line.starts_with("rm "))
+        .collect();
+    assert_eq!(rm, [&old, &vanished].map(|id| format!("rm --force {id}")));
+
+    // Without the CLI the store is reported, but nothing is listed.
+    fixture.state.native_history.clis.devin = fixture.root.join("none").display().to_string();
+    let listing = list(&fixture, NativeProvider::Devin).await;
+    assert_eq!(listing["count"], 0);
+    let providers = fixture.state.native_history.providers().await.unwrap();
+    assert_eq!(providers["providers"][4]["available"], false);
+    assert_eq!(providers["providers"][4]["totalBytes"], 4196);
+}
+
+#[test]
+fn cli_failures_are_reduced_to_their_error_line() {
+    assert_eq!(
+        cli::failure_text("WARNING: proceeding\nError: failed to delete session\n", ""),
+        "failed to delete session"
+    );
+    assert_eq!(cli::failure_text("", "\nsomething odd\n"), "something odd");
+    assert_eq!(cli::failure_text("", ""), "exited with an error");
+    assert!(
+        cli::failure_text("Error: key sk-abcdefghijklmnopqrstuvwxyz", "").contains("[REDACTED]")
+    );
+    let long = format!("Error: {}", "x".repeat(1000));
+    assert_eq!(cli::failure_text(&long, "").chars().count(), 301);
+    let clis = NativeClis::default();
+    let spec = clis.grok_delete(Path::new("/g"), "id1");
+    assert_eq!(spec.args, ["--no-auto-update", "sessions", "delete", "id1"]);
+    assert_eq!(spec.env["GROK_HOME"], "/g");
+    let spec = clis.codex_delete(Path::new("/c"), "id2");
+    assert_eq!(spec.args, ["delete", "--force", "id2"]);
+    assert_eq!(spec.env["CODEX_HOME"], "/c");
+    assert_eq!(
+        clis.devin_delete(Path::new("/d"), "id3").args,
+        ["rm", "--force", "id3"]
     );
 }

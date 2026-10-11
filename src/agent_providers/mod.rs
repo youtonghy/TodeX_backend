@@ -169,6 +169,16 @@ impl AgentDirs {
         &self.claude_dir
     }
 
+    /// Codex's home (`$CODEX_HOME` or `~/.codex`).
+    pub(crate) fn codex_home(&self) -> &std::path::Path {
+        &self.codex_home
+    }
+
+    /// Grok Build's home (`$GROK_HOME` or `~/.grok`).
+    pub(crate) fn grok_home(&self) -> &std::path::Path {
+        &self.grok_home
+    }
+
     /// Where Pi keeps its session files, resolved like Pi itself:
     /// `$PI_CODING_AGENT_SESSION_DIR`, else `sessionDir` from
     /// `<pi_dir>/settings.json` (`~/` expanded, relative paths taken from

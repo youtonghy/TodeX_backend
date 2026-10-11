@@ -1,8 +1,8 @@
-//! `/v2/native-history/*` — Claude Code and Pi native sessions: listing,
-//! transcripts, deletion, the per-provider automatic cleanup policy and
-//! Claude's own `cleanupPeriodDays` (see [`crate::native_history`]).
-//! `{provider}` is `claude-code` or `pi`; anything else is
-//! `400 INVALID_REQUEST`.
+//! `/v2/native-history/*` — Claude Code, Pi, Codex, Grok Build and Devin
+//! native sessions: listing, transcripts, deletion, the per-provider
+//! automatic cleanup policy and Claude's own `cleanupPeriodDays` (see
+//! [`crate::native_history`]). `{provider}` is `claude-code`, `pi`, `codex`,
+//! `grok-build` or `devin`; anything else is `400 INVALID_REQUEST`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -154,6 +154,7 @@ async fn update_policy(
     require_auth(&state, &headers)?;
     let provider = NativeProvider::parse(&provider)?;
     let policy = CleanupPolicy::from_request(body)?;
+    provider.validate_policy(&policy)?;
     let cleanup = &state.native_history.cleanup;
     let saved = cleanup.set_policy(provider.as_str(), policy).await?;
     Ok(Json(cleanup.view(&saved)))
@@ -280,6 +281,9 @@ mod tests {
         state.native_history.roots_override = Some(NativeRoots {
             claude_dir: claude_dir.clone(),
             pi_session_dir: pi_dir.clone(),
+            codex_home: root.join("codex"),
+            grok_home: root.join("grok"),
+            devin_dir: root.join("devin").join("cli"),
         });
         let id = uuid::Uuid::new_v4().to_string();
         let transcript = claude_dir
@@ -316,6 +320,83 @@ mod tests {
         assert_eq!(providers["providers"][1]["provider"], "pi");
         assert_eq!(providers["providers"][1]["available"], false);
         assert_eq!(providers["providers"][1]["native"], Value::Null);
+        let ids: Vec<&str> = providers["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|provider| provider["provider"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["claude-code", "pi", "codex", "grok-build", "devin"]);
+        for (index, view, sizes) in [
+            (0, true, true),
+            (2, true, true),
+            (3, true, true),
+            (4, false, false),
+        ] {
+            assert_eq!(
+                providers["providers"][index]["capabilities"],
+                json!({"view": view, "sizes": sizes}),
+                "provider {index}"
+            );
+        }
+        // Missing stores list nothing rather than failing.
+        for provider in ["codex", "grok-build", "devin"] {
+            assert_eq!(
+                providers["providers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["provider"] == provider)
+                    .unwrap()["available"],
+                false
+            );
+            let (status, listing) = call(
+                &app,
+                "GET",
+                &format!("/v2/native-history/{provider}/sessions"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{provider}");
+            assert_eq!(listing["count"], 0);
+            assert_eq!(listing["sessions"], json!([]));
+            assert_eq!(listing["totalBytes"], 0);
+        }
+        let (status, error) = call(
+            &app,
+            "GET",
+            &format!("/v2/native-history/devin/sessions/{id}/transcript"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(error["code"], "UNSUPPORTED");
+        let (status, error) = call(
+            &app,
+            "PUT",
+            "/v2/native-history/devin/policy",
+            Some(json!({"enabled": true, "maxAgeDays": null, "maxTotalBytes": 1000})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["code"], "INVALID_REQUEST");
+        let (status, saved) = call(
+            &app,
+            "PUT",
+            "/v2/native-history/devin/policy",
+            Some(json!({"enabled": true, "maxAgeDays": 30, "maxTotalBytes": null})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["policy"]["maxAgeDays"], 30);
+        let (status, _) = call(
+            &app,
+            "GET",
+            "/v2/native-history/grok-build/native-retention",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
 
         let (status, listing) =
             call(&app, "GET", "/v2/native-history/claude-code/sessions", None).await;
@@ -325,7 +406,7 @@ mod tests {
         assert_eq!(listing["sessions"][0]["id"], id);
         assert_eq!(listing["sessions"][0]["title"], "hello");
         assert!(listing["sessions"][0]["updatedAt"].is_string());
-        let (status, error) = call(&app, "GET", "/v2/native-history/codex/sessions", None).await;
+        let (status, error) = call(&app, "GET", "/v2/native-history/opencode/sessions", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error["code"], "INVALID_REQUEST");
 

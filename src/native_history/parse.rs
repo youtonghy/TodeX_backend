@@ -1,6 +1,7 @@
-//! Reading Claude Code and Pi session records: listing metadata (title, cwd,
-//! creation time) from a bounded head and tail of a file, and the mapping of
-//! records to transcript messages.
+//! Reading Claude Code, Pi and Codex session records — listing metadata
+//! (title, cwd, creation time) from a bounded head and tail of a file — and
+//! Grok Build's `summary.json`; plus the mapping of records (and Grok's ACP
+//! update log) to transcript messages.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -44,6 +45,9 @@ pub(super) fn session_meta(
     match provider {
         NativeProvider::ClaudeCode => Some(claude_meta(head, tail)),
         NativeProvider::Pi => pi_meta(head, tail),
+        NativeProvider::Codex => codex_meta(head),
+        // Grok reads `summary.json`, Devin lists through its CLI.
+        NativeProvider::GrokBuild | NativeProvider::Devin => None,
     }
 }
 
@@ -56,6 +60,9 @@ pub(super) fn record_messages(
     match provider {
         NativeProvider::ClaudeCode => claude_messages(record, out),
         NativeProvider::Pi => pi_messages(record, out),
+        NativeProvider::Codex => codex_messages(record, out),
+        // Grok merges chunks across records: see [`GrokTranscript`].
+        NativeProvider::GrokBuild | NativeProvider::Devin => {}
     }
 }
 
@@ -243,6 +250,350 @@ fn pi_messages(entry: &Value, out: &mut Vec<TranscriptMessage>) {
         }
         // `system` is the system prompt; other roles carry no transcript text.
         _ => {}
+    }
+}
+
+/// The header of a Codex rollout: `{"type":"session_meta","payload":{"id",
+/// "timestamp","cwd",…}}`; the title is the first real user prompt in
+/// `head` (names set with `thread/name/set` live in `session_index.jsonl`
+/// and are applied by the caller).
+fn codex_meta(head: &[String]) -> Option<SessionMeta> {
+    let header = serde_json::from_str::<Value>(head.first()?).ok()?;
+    if header.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = header.get("payload")?;
+    let mut meta = SessionMeta {
+        id: non_empty_str(payload.get("id")),
+        title: None,
+        cwd: non_empty_str(payload.get("cwd")),
+        created_at: timestamp(payload.get("timestamp"))
+            .or_else(|| timestamp(header.get("timestamp"))),
+    };
+    for line in head.iter().skip(1) {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(item) = record.get("payload") else {
+            continue;
+        };
+        if item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("user")
+        {
+            if let Some(text) = codex_user_text(item) {
+                meta.title = title_text(&text);
+                break;
+            }
+        }
+    }
+    Some(meta)
+}
+
+/// The text of a real Codex user message: context Codex injects as user
+/// messages (`<environment_context>`, `<user_instructions>`, AGENTS.md
+/// instructions, …) is left out.
+fn codex_user_text(item: &Value) -> Option<String> {
+    let text = codex_content_text(item.get("content")?);
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('<')
+        || trimmed.starts_with("# AGENTS.md instructions")
+    {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// `input_text` / `output_text` parts joined; images become `[image]`.
+fn codex_content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| match block_type(part) {
+                Some("input_text" | "output_text" | "text") => {
+                    part.get("text").and_then(Value::as_str).map(str::to_owned)
+                }
+                Some("input_image" | "image") => Some("[image]".to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// A Codex rollout record: `response_item` payloads are the conversation
+/// (user and assistant messages, tool calls and their outputs); developer
+/// and system messages, injected context and reasoning are skipped, and so
+/// are the `event_msg` records that repeat the same content for UIs.
+fn codex_messages(record: &Value, out: &mut Vec<TranscriptMessage>) {
+    let at = timestamp(record.get("timestamp"));
+    let Some(item) = record.get("payload") else {
+        return;
+    };
+    match record.get("type").and_then(Value::as_str) {
+        Some("response_item") => {}
+        Some("compacted") => {
+            if let Some(message) = item.get("message").and_then(Value::as_str) {
+                push(out, "system", message, MESSAGE_CHARS, at);
+            }
+            return;
+        }
+        _ => return,
+    }
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => match item.get("role").and_then(Value::as_str) {
+            Some("user") => {
+                if let Some(text) = codex_user_text(item) {
+                    push(out, "user", &text, MESSAGE_CHARS, at);
+                }
+            }
+            Some("assistant") => {
+                if let Some(content) = item.get("content") {
+                    push(
+                        out,
+                        "assistant",
+                        &codex_content_text(content),
+                        MESSAGE_CHARS,
+                        at,
+                    );
+                }
+            }
+            _ => {}
+        },
+        Some(
+            kind @ ("function_call" | "custom_tool_call" | "local_shell_call" | "web_search_call"),
+        ) => {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(match kind {
+                    "local_shell_call" => "shell",
+                    "web_search_call" => "web_search",
+                    _ => "tool",
+                });
+            let args = match item
+                .get("arguments")
+                .or_else(|| item.get("input"))
+                .or_else(|| item.get("action"))
+            {
+                Some(Value::String(text)) => text.clone(),
+                Some(value) => value.to_string(),
+                None => String::new(),
+            };
+            push(out, "tool", &format!("{name}: {args}"), TOOL_CALL_CHARS, at);
+        }
+        Some("function_call_output" | "custom_tool_call_output") => {
+            let preview = match item.get("output") {
+                Some(Value::String(text)) => text.clone(),
+                Some(Value::Array(parts)) => codex_content_text(&Value::Array(parts.clone())),
+                Some(Value::Object(output)) => match output.get("content") {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(content) => codex_content_text(content),
+                    None => String::new(),
+                },
+                _ => String::new(),
+            };
+            push_tool_result(out, &preview, at);
+        }
+        // `reasoning` and anything newer carry no transcript text.
+        _ => {}
+    }
+}
+
+/// The listing fields of a Grok Build `summary.json` (`info.id`,
+/// `info.cwd`, `generated_title` else `session_summary`, `created_at`).
+/// `None` for an unreadable file and for sessions Grok itself hides from
+/// listings (`hidden`, or a `subagent*` session kind without an explicit
+/// `hidden: false`), which `grok sessions delete` cannot find either.
+pub(super) fn grok_summary(summary: &Value) -> Option<SessionMeta> {
+    let hidden = summary
+        .get("hidden")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            summary
+                .get("session_kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("subagent"))
+        });
+    if hidden {
+        return None;
+    }
+    let info = summary.get("info")?;
+    let title = non_empty_str(summary.get("generated_title"))
+        .or_else(|| non_empty_str(summary.get("session_summary")));
+    Some(SessionMeta {
+        id: Some(non_empty_str(info.get("id"))?),
+        title: title.and_then(|title| title_text(&title)),
+        cwd: non_empty_str(info.get("cwd")),
+        created_at: timestamp(summary.get("created_at")),
+    })
+}
+
+/// Grok Build's `updates.jsonl` — one persisted ACP `session/update` (or
+/// `_x.ai/session/update`) notification per line, stamped with
+/// `timestamp` in Unix seconds — mapped to transcript messages. Message
+/// chunks stream across records, so consecutive chunks of one role are
+/// merged; thoughts are skipped; a tool call becomes a `tool` message and
+/// its first completed or failed update a `tool` result preview.
+#[derive(Default)]
+pub(super) struct GrokTranscript {
+    role: Option<&'static str>,
+    text: String,
+    at: Option<DateTime<Utc>>,
+    finished_tools: std::collections::HashSet<String>,
+}
+
+impl GrokTranscript {
+    pub(super) fn push_record(&mut self, record: &Value, out: &mut Vec<TranscriptMessage>) {
+        if !matches!(
+            record.get("method").and_then(Value::as_str),
+            None | Some("session/update" | "_x.ai/session/update")
+        ) {
+            return;
+        }
+        let Some(update) = record.pointer("/params/update") else {
+            return;
+        };
+        let at = record
+            .get("timestamp")
+            .and_then(Value::as_i64)
+            .filter(|seconds| *seconds > 0)
+            .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
+        match update.get("sessionUpdate").and_then(Value::as_str) {
+            Some(kind @ ("user_message_chunk" | "agent_message_chunk")) => {
+                let role = if kind == "user_message_chunk" {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                let Some(content) = update.get("content") else {
+                    return;
+                };
+                // Turns the host injected are not the user's words.
+                if role == "user"
+                    && update.pointer("/_meta/hostTurn").and_then(Value::as_bool) == Some(true)
+                {
+                    return;
+                }
+                let part = grok_chunk_text(content);
+                if part.is_empty() {
+                    return;
+                }
+                if self.role != Some(role) {
+                    self.flush(out);
+                    self.role = Some(role);
+                    self.at = at;
+                } else if role == "user" && !self.text.is_empty() {
+                    // User chunks are whole content blocks, agent chunks
+                    // stream tokens.
+                    self.text.push('\n');
+                }
+                // Bounded: the message is cut to MESSAGE_CHARS anyway.
+                if self.text.len() < 4 * MESSAGE_CHARS {
+                    self.text.push_str(&part);
+                }
+            }
+            Some("tool_call") => {
+                self.flush(out);
+                let title = update
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .or_else(|| update.get("kind").and_then(Value::as_str))
+                    .unwrap_or("tool");
+                let summary = match update.get("rawInput") {
+                    Some(Value::Null) | None => title.to_owned(),
+                    Some(input) => format!("{title}: {input}"),
+                };
+                push(out, "tool", &summary, TOOL_CALL_CHARS, at);
+            }
+            Some("tool_call_update") => {
+                let status = update.get("status").and_then(Value::as_str);
+                if !matches!(status, Some("completed" | "failed")) {
+                    return;
+                }
+                let id = update
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if !self.finished_tools.insert(id) {
+                    return;
+                }
+                self.flush(out);
+                let mut preview = update
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| match block_type(item) {
+                                Some("content") => item.get("content").map(grok_chunk_text),
+                                Some("diff") => Some(format!(
+                                    "diff: {}",
+                                    item.get("path").and_then(Value::as_str).unwrap_or("")
+                                )),
+                                Some("terminal") => Some("[terminal]".to_owned()),
+                                _ => None,
+                            })
+                            .filter(|text| !text.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                if preview.trim().is_empty() {
+                    preview = match update.get("rawOutput") {
+                        Some(Value::String(text)) => text.clone(),
+                        Some(Value::Null) | None => String::new(),
+                        Some(value) => value.to_string(),
+                    };
+                }
+                push_tool_result(out, &preview, at);
+            }
+            // Thoughts, plans, commands, mode changes, rewind markers and
+            // xAI extensions carry no transcript text; they do not break a
+            // run of message chunks either.
+            _ => {}
+        }
+    }
+
+    /// Emits the message being merged, if any.
+    pub(super) fn flush(&mut self, out: &mut Vec<TranscriptMessage>) {
+        if let Some(role) = self.role.take() {
+            push(out, role, &self.text, MESSAGE_CHARS, self.at.take());
+        }
+        self.text.clear();
+    }
+}
+
+/// The text of an ACP content block: text (or the typed `displayText` of
+/// a mid-turn interjection), `[image]`, or a resource's name.
+fn grok_chunk_text(content: &Value) -> String {
+    match block_type(content) {
+        Some("text") => content
+            .pointer("/_meta/displayText")
+            .or_else(|| content.get("displayText"))
+            .or_else(|| content.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        Some("image") => "[image]".to_owned(),
+        Some("resource_link") => content
+            .get("name")
+            .or_else(|| content.get("uri"))
+            .and_then(Value::as_str)
+            .map(|name| format!("[{name}]"))
+            .unwrap_or_default(),
+        Some("resource") => content
+            .pointer("/resource/uri")
+            .and_then(Value::as_str)
+            .map(|uri| format!("[{uri}]"))
+            .unwrap_or_default(),
+        _ => String::new(),
     }
 }
 

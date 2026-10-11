@@ -584,6 +584,12 @@ async fn control_request_updates(
         .await
 }
 
+/// The environment of a one-shot `devin` CLI command or listing process
+/// (native history): the same defaults and allowlist as the agent process.
+pub(crate) fn devin_cli_environment(allowlist: &[String]) -> BTreeMap<String, String> {
+    devin_environment(allowlist)
+}
+
 fn devin_environment(allowlist: &[String]) -> BTreeMap<String, String> {
     allowlisted_environment(&[("NO_COLOR", "1")], allowlist)
 }

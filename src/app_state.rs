@@ -144,8 +144,11 @@ impl AppState {
         )?;
         let api_keys = ApiKeyStore::load(&config.data_dir)?;
         let history_cleanup = crate::history_cleanup::HistoryCleanup::load(&config.data_dir);
-        let native_history =
-            crate::native_history::NativeHistory::new(&config.data_dir, &history_cleanup);
+        let native_history = crate::native_history::NativeHistory::new(
+            &config.data_dir,
+            &history_cleanup,
+            crate::native_history::NativeClis::from_config(&config.agent),
+        );
         // Before the store opens: recovery may journal into API key
         // conversations, whose keys are also wrapped for the key's recipient.
         history_keys
