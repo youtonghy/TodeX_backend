@@ -283,6 +283,9 @@ impl ManagedServer {
     }
 
     pub async fn wait(mut self) -> Result<()> {
+        let result = self.handle.await.context("server task join failed");
+        // The periodic tasks run for as long as the server does; aborting
+        // them before the await stopped them at startup in `serve` mode.
         if let Some(task) = self.retention_task.take() {
             task.abort();
         }
@@ -292,7 +295,6 @@ impl ManagedServer {
         if let Some(task) = self.kanban_schedule_task.take() {
             task.abort();
         }
-        let result = self.handle.await.context("server task join failed");
         if let Some(api) = self.api.take() {
             api.stop().await;
         }
