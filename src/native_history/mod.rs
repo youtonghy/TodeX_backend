@@ -321,8 +321,10 @@ pub struct NativeHistory {
     cache: Arc<std::sync::Mutex<MetaCache>>,
     /// Per-provider policies and last runs, keyed by provider id.
     pub(crate) cleanup: HistoryCleanup,
-    /// Serializes deletions (manual and policy) and settings edits.
-    lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes deletions (manual and policy) and settings edits, one
+    /// lock per provider so a slow CLI (Devin's `rm` can take seconds per
+    /// session) never holds up another agent's cleanup.
+    locks: Arc<[tokio::sync::Mutex<()>; 5]>,
     /// Fixed roots for tests; otherwise detected per call so environment
     /// changes after start still apply.
     pub(crate) roots_override: Option<NativeRoots>,
@@ -388,10 +390,21 @@ impl NativeHistory {
         Self {
             cache: Arc::default(),
             cleanup: history_cleanup.sibling(data_dir.join(NATIVE_HISTORY_CLEANUP_FILE)),
-            lock: Arc::default(),
+            locks: Arc::default(),
             roots_override: None,
             clis,
         }
+    }
+
+    fn provider_lock(&self, provider: NativeProvider) -> &tokio::sync::Mutex<()> {
+        let index = match provider {
+            NativeProvider::ClaudeCode => 0,
+            NativeProvider::Pi => 1,
+            NativeProvider::Codex => 2,
+            NativeProvider::GrokBuild => 3,
+            NativeProvider::Devin => 4,
+        };
+        &self.locks[index]
     }
 
     pub fn roots(&self) -> NativeRoots {
@@ -618,7 +631,7 @@ impl NativeHistory {
         provider: NativeProvider,
         ids: &[String],
     ) -> Result<CleanupReport, AppError> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.provider_lock(provider).lock().await;
         let roots = self.roots();
         let sessions = self.scan(&roots, provider).await?.sessions;
         let protection = self.protection(conversations, &roots, provider).await?;
@@ -652,7 +665,7 @@ impl NativeHistory {
         now: DateTime<Utc>,
         trigger: CleanupTrigger,
     ) -> Result<CleanupReport, AppError> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.provider_lock(provider).lock().await;
         let roots = self.roots();
         let sessions = self.scan(&roots, provider).await?.sessions;
         let protection = self.protection(conversations, &roots, provider).await?;
@@ -780,7 +793,7 @@ impl NativeHistory {
     ) -> Result<Value, AppError> {
         let path = retention_path(&self.roots(), provider)?;
         let days = retention::parse_request(body)?;
-        let _guard = self.lock.lock().await;
+        let _guard = self.provider_lock(provider).lock().await;
         let saved = {
             let path = path.clone();
             tokio::task::spawn_blocking(move || retention::write(&path, days))
