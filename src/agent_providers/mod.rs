@@ -14,7 +14,7 @@ pub(crate) mod files;
 mod grok;
 mod model_fetch;
 mod opencode;
-mod pi;
+pub(crate) mod pi;
 mod store;
 
 pub(crate) use model_fetch::http_client;

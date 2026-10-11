@@ -1643,7 +1643,7 @@ fn json_to_toml_table(config: &Value) -> Result<toml_edit::Table, AppError> {
     Ok(table)
 }
 
-fn json_to_toml_value(value: &Value) -> Result<toml_edit::Value, AppError> {
+pub(crate) fn json_to_toml_value(value: &Value) -> Result<toml_edit::Value, AppError> {
     Ok(match value {
         Value::Null => {
             return Err(AppError::InvalidRequest(
