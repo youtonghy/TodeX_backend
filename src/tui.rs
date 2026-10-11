@@ -2308,9 +2308,21 @@ impl TuiApp {
             self.autostart_enabled = registration.enabled;
         }
         let previous_pid = self.daemon.as_ref().map(|process| process.pid);
+        let previously_outdated = self.daemon.as_ref().is_some_and(|process| process.outdated);
         match daemon::status(&self.config) {
             Ok(next) => {
                 let next_pid = next.as_ref().map(|process| process.pid);
+                if next.as_ref().is_some_and(|process| process.outdated)
+                    && (previous_pid != next_pid || !previously_outdated)
+                {
+                    let line = self
+                        .text(
+                            "The daemon executable changed since it started; restart recommended.",
+                            "daemon 启动后程序文件已更新，建议重启。",
+                        )
+                        .to_owned();
+                    self.push_log(line);
+                }
                 if previous_pid != next_pid && self.daemon_op.is_none() {
                     match next.as_ref() {
                         Some(process) => self.push_log(match self.language {
@@ -3107,6 +3119,14 @@ impl TuiApp {
                 },
                 Style::default().fg(Color::Cyan),
             )
+        } else if process.is_some_and(|process| process.outdated) {
+            Span::styled(
+                self.text(
+                    "Running (outdated, restart recommended)",
+                    "运行中（程序已更新，建议重启）",
+                ),
+                Style::default().fg(Color::Yellow),
+            )
         } else if process.is_some() {
             Span::styled(
                 self.text("Running", "运行中"),
@@ -3353,9 +3373,15 @@ impl TuiApp {
         } else {
             self.text("API listener: off", "API 监听：关")
         };
+        let restart_recommended = self.daemon.as_ref().is_some_and(|process| process.outdated);
+        let restart = if restart_recommended {
+            self.text("Restart daemon (recommended)", "重启 daemon（建议重启）")
+        } else {
+            self.text("Restart daemon", "重启 daemon")
+        };
         let actions = [
             start_stop,
-            self.text("Restart daemon", "重启 daemon"),
+            restart,
             autostart,
             self.text("Edit listen IP", "编辑监听 IP"),
             self.text("Edit listen port", "编辑监听端口"),
@@ -3388,6 +3414,8 @@ impl TuiApp {
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
+                } else if idx == 1 && restart_recommended {
+                    Style::default().fg(Color::Yellow)
                 } else {
                     Style::default()
                 };

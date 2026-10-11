@@ -39,6 +39,10 @@ pub struct DaemonProcess {
     /// The external API listener (`host:port`), when enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_listen: Option<String>,
+    /// Set by [`status`] when the executable on disk was replaced or removed
+    /// after this daemon started, so it should be restarted to run it.
+    #[serde(skip)]
+    pub outdated: bool,
 }
 
 impl DaemonProcess {
@@ -48,7 +52,7 @@ impl DaemonProcess {
 }
 
 pub async fn start(config: Config) -> Result<DaemonProcess> {
-    if let Some(process) = status(&config)? {
+    if let Some(process) = recover(&config)? {
         return Ok(process);
     }
     // The child would refuse the same configuration; fail here with the
@@ -203,6 +207,9 @@ async fn terminate_spawned_child(child: &mut Child) {
 }
 
 pub async fn stop(config: &Config) -> Result<Option<DaemonProcess>> {
+    if read_pid_file(&config.data_dir)?.is_none() {
+        recover(config)?;
+    }
     let Some(process) = read_pid_file(&config.data_dir)? else {
         return Ok(None);
     };
@@ -266,10 +273,43 @@ pub fn status(config: &Config) -> Result<Option<DaemonProcess>> {
     if process_matches_record(&process)
         && (process_liveness(process.pid).is_running() || daemon_health_check(&process))
     {
-        return Ok(Some(process));
+        let outdated = executable_is_outdated(&process);
+        return Ok(Some(DaemonProcess {
+            outdated,
+            ..process
+        }));
     }
 
     Ok(None)
+}
+
+/// Like [`status`], but when the pid file is missing it also looks for a
+/// running daemon on the same data directory and records it again. Older
+/// builds deleted the pid file of a daemon whose executable had been
+/// replaced, leaving it running unmanaged and holding its port.
+pub fn recover(config: &Config) -> Result<Option<DaemonProcess>> {
+    if let Some(process) = status(config)? {
+        return Ok(Some(process));
+    }
+    if read_pid_file(&config.data_dir)?.is_some() {
+        return Ok(None);
+    }
+    let Some(process) = find_unrecorded_daemon(config) else {
+        return Ok(None);
+    };
+    match write_pid_record(&process) {
+        Ok(()) => {
+            tracing::info!(
+                pid = process.pid,
+                listen = %process.listen_addr(),
+                "recovered running daemon without a pid file"
+            );
+        }
+        // Another caller recorded a daemon first; report whatever it wrote.
+        Err(error) if read_pid_file(&config.data_dir)?.is_none() => return Err(error),
+        Err(_) => {}
+    }
+    status(config)
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -417,8 +457,26 @@ fn write_pid_file(config: &Config, port: u16, api_listen: Option<String>) -> Res
         started_at: Utc::now(),
         executable: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("todex-agentd")),
         api_listen,
+        outdated: false,
     };
-    let raw = serde_json::to_string_pretty(&process)?;
+    match write_pid_record(&process) {
+        // `recover` may have recorded this daemon between its listener
+        // coming up and this write; take the record over.
+        Err(_)
+            if read_pid_file(&config.data_dir)?
+                .is_some_and(|recorded| recorded.pid == process.pid) =>
+        {
+            fs::write(&path, serde_json::to_string_pretty(&process)?)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            Ok(process)
+        }
+        result => result.map(|()| process),
+    }
+}
+
+fn write_pid_record(process: &DaemonProcess) -> Result<()> {
+    let path = pid_file_path(&process.data_dir);
+    let raw = serde_json::to_string_pretty(process)?;
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -428,8 +486,7 @@ fn write_pid_file(config: &Config, port: u16, api_listen: Option<String>) -> Res
         .with_context(|| format!("failed to write {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("failed to sync {}", path.display()))?;
-    set_owner_only_file(&path)?;
-    Ok(process)
+    set_owner_only_file(&path)
 }
 
 fn remove_stale_pid_file(data_dir: &Path) -> Result<()> {
@@ -668,9 +725,161 @@ fn canonical_or_original(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Whether the daemon's executable path no longer holds the binary it runs:
+/// it was rebuilt, updated in place, or deleted.
+fn executable_is_outdated(process: &DaemonProcess) -> bool {
+    let Ok(on_disk) = fs::metadata(&process.executable) else {
+        return true;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // `/proc/<pid>/exe` opens the inode the process runs, even unlinked.
+        if let Ok(running) = fs::metadata(proc_path(process.pid).join("exe")) {
+            return running.dev() != on_disk.dev() || running.ino() != on_disk.ino();
+        }
+    }
+    on_disk
+        .modified()
+        .is_ok_and(|modified| DateTime::<Utc>::from(modified) > process.started_at)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_path(pid: u32) -> PathBuf {
+    Path::new("/proc").join(pid.to_string())
+}
+
 #[cfg(target_os = "linux")]
 fn process_executable(pid: u32) -> Option<PathBuf> {
-    fs::read_link(Path::new("/proc").join(pid.to_string()).join("exe")).ok()
+    let path = fs::read_link(proc_path(pid).join("exe")).ok()?;
+    // A replaced or deleted executable reads back as "<path> (deleted)".
+    Some(
+        path.to_str()
+            .and_then(|raw| raw.strip_suffix(" (deleted)"))
+            .map(PathBuf::from)
+            .unwrap_or(path),
+    )
+}
+
+/// Finds a healthy `daemon-run` process of this executable family serving
+/// `config.data_dir` and rebuilds its pid file record from its arguments.
+#[cfg(target_os = "linux")]
+fn find_unrecorded_daemon(config: &Config) -> Option<DaemonProcess> {
+    let data_dir = canonical_or_original(&config.data_dir);
+    let own_pid = std::process::id();
+    fs::read_dir("/proc")
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != own_pid)
+        .find_map(|pid| {
+            let executable = process_executable(pid)?;
+            if !executable
+                .file_name()?
+                .to_str()?
+                .starts_with("todex-agentd")
+            {
+                return None;
+            }
+            let cmdline = fs::read(proc_path(pid).join("cmdline")).ok()?;
+            let args = cmdline
+                .split(|byte| *byte == 0)
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect::<Vec<_>>();
+            let process = daemon_record_from_args(pid, executable, &args, config)?;
+            // A busy daemon may miss one short health timeout; it is only
+            // checked once per recovery, so allow a few attempts.
+            if canonical_or_original(&process.data_dir) != data_dir
+                || !(0..3).any(|_| daemon_health_check(&process))
+            {
+                return None;
+            }
+            Some(DaemonProcess {
+                started_at: process_started_at(pid).unwrap_or(process.started_at),
+                ..process
+            })
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn find_unrecorded_daemon(_config: &Config) -> Option<DaemonProcess> {
+    // Elsewhere a replaced executable keeps matching its pid file record, so
+    // the record is not lost in the first place.
+    None
+}
+
+/// Parses `daemon-run` arguments as written by [`daemon_run_args`].
+fn daemon_record_from_args(
+    pid: u32,
+    executable: PathBuf,
+    args: &[String],
+    config: &Config,
+) -> Option<DaemonProcess> {
+    if !args.iter().any(|arg| arg == "daemon-run") {
+        return None;
+    }
+    let value = |flag: &str| {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].clone())
+    };
+    let port = match value("--port") {
+        Some(port) => port.parse::<u16>().ok()?,
+        None => config.port,
+    };
+    if port == 0 {
+        return None;
+    }
+    let workspace_roots = args
+        .windows(2)
+        .filter(|pair| pair[0] == "--workspace-root")
+        .map(|pair| PathBuf::from(&pair[1]))
+        .collect();
+    let api_listen = value("--api-port").map(|api_port| {
+        format!(
+            "{}:{api_port}",
+            value("--api-host").unwrap_or_else(|| config.api.host.clone())
+        )
+    });
+    Some(DaemonProcess {
+        pid,
+        host: value("--host").unwrap_or_else(|| config.host.clone()),
+        port,
+        data_dir: value("--data-dir")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config.data_dir.clone()),
+        workspace_roots,
+        started_at: Utc::now(),
+        executable,
+        api_listen,
+        outdated: false,
+    })
+}
+
+/// Reads a process start time from `/proc/<pid>/stat` and the boot time.
+#[cfg(target_os = "linux")]
+fn process_started_at(pid: u32) -> Option<DateTime<Utc>> {
+    let stat = fs::read_to_string(proc_path(pid).join("stat")).ok()?;
+    // Field 22 (starttime); the fields after the parenthesized name start at 3.
+    let start_ticks = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()?;
+    let boot_time = fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    let millis = (start_ticks as i64).checked_mul(1000)? / ticks_per_second as i64;
+    DateTime::from_timestamp_millis(boot_time.checked_mul(1000)?.checked_add(millis)?)
 }
 
 #[cfg(target_os = "macos")]
@@ -883,12 +1092,13 @@ mod tests {
     #[cfg(unix)]
     use std::{process::Command, thread};
 
-    #[cfg(target_os = "linux")]
-    use super::process_has_exited;
     use super::{
-        pid_file_path, port_is_listening, process_is_running, process_matches_record, status,
-        DaemonProcess, IdleTimer, UPDATE_RESTART_IDLE_AFTER,
+        daemon_record_from_args, daemon_run_args, pid_file_path, port_is_listening,
+        process_is_running, process_matches_record, status, DaemonProcess, IdleTimer,
+        UPDATE_RESTART_IDLE_AFTER,
     };
+    #[cfg(target_os = "linux")]
+    use super::{executable_is_outdated, process_has_exited, process_started_at};
     #[cfg(unix)]
     use super::{process_liveness, ProcessLiveness};
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
@@ -940,6 +1150,7 @@ mod tests {
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
             api_listen: None,
+            outdated: false,
         };
         fs::write(
             pid_file_path(&config.data_dir),
@@ -968,6 +1179,7 @@ mod tests {
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
             api_listen: None,
+            outdated: false,
         };
         fs::write(
             pid_file_path(&config.data_dir),
@@ -991,8 +1203,88 @@ mod tests {
             started_at: Utc::now(),
             executable: std::env::temp_dir().join("definitely-not-todex-agentd"),
             api_listen: None,
+            outdated: false,
         };
         assert!(!process_matches_record(&process));
+    }
+
+    #[test]
+    fn daemon_record_round_trips_daemon_run_args() {
+        let root = unique_tmp_dir("todex-daemon-run-args");
+        let mut config = test_config(root.clone());
+        config.api.enabled = true;
+        let mut args = vec!["todex-agentd".to_owned(), "daemon-run".to_owned()];
+        args.extend(
+            daemon_run_args(&config)
+                .into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned()),
+        );
+
+        let record =
+            daemon_record_from_args(42, env::current_exe().unwrap(), &args, &config).unwrap();
+
+        assert_eq!(record.pid, 42);
+        assert_eq!(record.listen_addr(), "127.0.0.1:7345");
+        assert_eq!(record.data_dir, config.data_dir);
+        assert_eq!(record.workspace_roots, config.workspace_roots);
+        assert_eq!(
+            record.api_listen,
+            Some(format!("{}:{}", config.api.host, config.api.port))
+        );
+        assert!(
+            daemon_record_from_args(42, env::current_exe().unwrap(), &args[2..], &config).is_none()
+        );
+    }
+
+    /// Rebuilding or updating the daemon binary must not make the running
+    /// daemon look stopped (which used to delete its pid file); it should be
+    /// reported as running and outdated instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replaced_executable_still_matches_and_is_outdated() {
+        let root = unique_tmp_dir("todex-daemon-replaced-exe");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let executable = root.join("todex-agentd");
+        fs::copy("/bin/sleep", &executable).expect("copy sleep");
+        // Concurrent tests forking while the copy was open can briefly keep
+        // a write handle alive, which fails exec with ETXTBSY.
+        let mut child = (0..50)
+            .find_map(|_| match Command::new(&executable).arg("30").spawn() {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    thread::sleep(Duration::from_millis(20));
+                    None
+                }
+                result => Some(result),
+            })
+            .expect("executable stayed busy")
+            .expect("spawn copied executable");
+        let process = DaemonProcess {
+            pid: child.id(),
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            data_dir: root.clone(),
+            workspace_roots: Vec::new(),
+            started_at: Utc::now(),
+            executable: executable.clone(),
+            api_listen: None,
+            outdated: false,
+        };
+        assert!(process_matches_record(&process));
+        assert!(!executable_is_outdated(&process));
+
+        fs::remove_file(&executable).expect("remove executable");
+        assert!(process_matches_record(&process));
+        assert!(executable_is_outdated(&process));
+
+        fs::copy("/bin/sleep", &executable).expect("replace executable");
+        assert!(process_matches_record(&process));
+        assert!(executable_is_outdated(&process));
+        assert!(process_started_at(process.pid)
+            .is_some_and(|started| (Utc::now() - started).num_seconds().abs() < 60));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -1025,6 +1317,7 @@ mod tests {
             started_at: Utc::now(),
             executable: env::current_exe().unwrap(),
             api_listen: None,
+            outdated: false,
         };
         fs::write(
             pid_file_path(&config.data_dir),

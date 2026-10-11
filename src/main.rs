@@ -198,7 +198,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     match &cli.command {
         Command::Serve(args) | Command::Tui(args) => {
             let config = Config::load_read_only(args.clone())?;
-            if daemon::status(&config)?.is_none() {
+            if daemon::recover(&config)?.is_none() {
                 update::before_start().await?;
             }
         }
@@ -236,7 +236,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Update { check, args } => {
             if !check && update::enabled() {
                 let config = Config::load_read_only(args)?;
-                if daemon::status(&config)?.is_some() {
+                if daemon::recover(&config)?.is_some() {
                     anyhow::bail!(
                         "stop the daemon before installing an update (or use daemon restart)"
                     );
@@ -326,7 +326,7 @@ async fn daemon_command(command: DaemonCommand) -> anyhow::Result<()> {
     match command {
         DaemonCommand::Start(args) => {
             let config = Config::load(args).context("failed to load configuration")?;
-            if daemon::status(&config)?.is_none() {
+            if daemon::recover(&config)?.is_none() {
                 update::before_start().await?;
             }
             let process = daemon::start(config).await?;
@@ -360,7 +360,7 @@ async fn daemon_command(command: DaemonCommand) -> anyhow::Result<()> {
         }
         DaemonCommand::Status(args) => {
             let config = Config::load(args).context("failed to load configuration")?;
-            match daemon::status(&config)? {
+            match daemon::recover(&config)? {
                 Some(process) => {
                     println!(
                         "Daemon running: pid={} listen={} started_at={}",
@@ -368,6 +368,12 @@ async fn daemon_command(command: DaemonCommand) -> anyhow::Result<()> {
                         process.listen_addr(),
                         process.started_at.to_rfc3339()
                     );
+                    if process.outdated {
+                        println!(
+                            "Restart recommended: {} changed since the daemon started (daemon restart)",
+                            process.executable.display()
+                        );
+                    }
                     if let Some(api) = &process.api_listen {
                         println!("API listening: http://{api}/api/v1");
                     }
