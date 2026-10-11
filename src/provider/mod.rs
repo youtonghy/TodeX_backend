@@ -26,6 +26,9 @@ pub(crate) use cli_manager::{
 };
 pub(crate) use doctor::inspect_providers;
 pub(crate) use grok::inspect_grok;
+pub(crate) use supervisor::{
+    plan_policy_deletions, CleanupSkip, NativeSessionRef, PolicyCandidate, PolicyRule,
+};
 pub use supervisor::{
     CancelOutcome, CleanupReport, CleanupThresholds, ConversationPrompt, ConversationSupervisor,
     FollowUpAddOutcome, PromptContentRef, PromptSkillRef,

@@ -163,6 +163,49 @@ impl AgentDirs {
             opencode_dir: env_dir("XDG_CONFIG_HOME", home.join(".config")).join("opencode"),
         }
     }
+
+    /// Claude Code's config directory (`$CLAUDE_CONFIG_DIR` or `~/.claude`).
+    pub(crate) fn claude_dir(&self) -> &std::path::Path {
+        &self.claude_dir
+    }
+
+    /// Where Pi keeps its session files, resolved like Pi itself:
+    /// `$PI_CODING_AGENT_SESSION_DIR`, else `sessionDir` from
+    /// `<pi_dir>/settings.json` (`~/` expanded, relative paths taken from
+    /// the agent directory), else `<pi_dir>/sessions`.
+    pub(crate) fn pi_session_dir(&self) -> PathBuf {
+        if let Some(dir) =
+            std::env::var_os("PI_CODING_AGENT_SESSION_DIR").filter(|value| !value.is_empty())
+        {
+            return PathBuf::from(dir);
+        }
+        let configured = std::fs::read_to_string(pi::settings_path(self))
+            .ok()
+            .and_then(|text| json5::from_str::<Value>(&text).ok())
+            .and_then(|settings| {
+                settings
+                    .get("sessionDir")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|dir| !dir.is_empty())
+                    .map(str::to_owned)
+            });
+        let Some(dir) = configured else {
+            return self.pi_dir.join("sessions");
+        };
+        let expanded = match dir.strip_prefix("~/") {
+            Some(rest) => std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(rest))
+                .unwrap_or_else(|| PathBuf::from(&dir)),
+            None => PathBuf::from(&dir),
+        };
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.pi_dir.join(expanded)
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

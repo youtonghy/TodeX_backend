@@ -59,6 +59,8 @@ pub struct AppState {
     pub(crate) api_keys: ApiKeyStore,
     /// Saved history cleanup policies; see [`crate::history_cleanup`].
     pub(crate) history_cleanup: crate::history_cleanup::HistoryCleanup,
+    /// Claude Code and Pi native sessions; see [`crate::native_history`].
+    pub(crate) native_history: crate::native_history::NativeHistory,
     pub(crate) api_auth_failures: crate::server::api::AuthFailures,
     pub workspaces: WorkspaceStore,
     pub kanban_tasks: KanbanTaskStore,
@@ -142,6 +144,8 @@ impl AppState {
         )?;
         let api_keys = ApiKeyStore::load(&config.data_dir)?;
         let history_cleanup = crate::history_cleanup::HistoryCleanup::load(&config.data_dir);
+        let native_history =
+            crate::native_history::NativeHistory::new(&config.data_dir, &history_cleanup);
         // Before the store opens: recovery may journal into API key
         // conversations, whose keys are also wrapped for the key's recipient.
         history_keys
@@ -201,6 +205,7 @@ impl AppState {
             history_keys,
             api_keys,
             history_cleanup,
+            native_history,
             api_auth_failures: Default::default(),
             workspaces,
             kanban_tasks,

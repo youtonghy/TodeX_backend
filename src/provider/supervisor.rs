@@ -49,6 +49,9 @@ use super::types::{
 mod follow_ups;
 mod history_cleanup;
 pub use follow_ups::FollowUpAddOutcome;
+pub(crate) use history_cleanup::{
+    plan_policy_deletions, CleanupSkip, NativeSessionRef, PolicyCandidate, PolicyRule,
+};
 pub use history_cleanup::{CleanupReport, CleanupThresholds};
 
 fn prompt_fingerprint(prompt: &ConversationPrompt) -> Result<String, AppError> {

@@ -167,7 +167,31 @@ impl HistoryCleanup {
     /// treated the same, so it never blocks the daemon from starting.
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join(HISTORY_CLEANUP_FILE);
-        let file = match std::fs::read(&path) {
+        let file = Self::read_file(&path);
+        Self {
+            path: Arc::new(path),
+            file: Arc::new(tokio::sync::Mutex::new(file)),
+            wake: Arc::new(Notify::new()),
+            next_pass: Arc::default(),
+        }
+    }
+
+    /// A second policy file (keyed by its own ids, for example the
+    /// native-history providers) driven by the same scheduler: enabling one
+    /// of its policies wakes this store's scheduler, and its `nextRunAt` is
+    /// that scheduler's next pass.
+    pub fn sibling(&self, path: PathBuf) -> Self {
+        let file = Self::read_file(&path);
+        Self {
+            path: Arc::new(path),
+            file: Arc::new(tokio::sync::Mutex::new(file)),
+            wake: self.wake.clone(),
+            next_pass: self.next_pass.clone(),
+        }
+    }
+
+    fn read_file(path: &Path) -> CleanupFile {
+        match std::fs::read(path) {
             Ok(bytes) => match serde_json::from_slice::<CleanupFile>(&bytes) {
                 Ok(file) => file,
                 Err(error) => {
@@ -188,12 +212,6 @@ impl HistoryCleanup {
                 );
                 CleanupFile::default()
             }
-        };
-        Self {
-            path: Arc::new(path),
-            file: Arc::new(tokio::sync::Mutex::new(file)),
-            wake: Arc::new(Notify::new()),
-            next_pass: Arc::default(),
         }
     }
 
@@ -254,7 +272,7 @@ impl HistoryCleanup {
         Ok(tenant)
     }
 
-    async fn enabled_policies(&self) -> Vec<(String, CleanupPolicy)> {
+    pub(crate) async fn enabled_policies(&self) -> Vec<(String, CleanupPolicy)> {
         self.file
             .lock()
             .await
@@ -375,6 +393,11 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
 }
 
 async fn run_enabled(state: &AppState) {
+    run_enabled_tenants(state).await;
+    crate::native_history::run_enabled(state).await;
+}
+
+async fn run_enabled_tenants(state: &AppState) {
     for (tenant_id, policy) in state.history_cleanup.enabled_policies().await {
         match run_policy(
             &state.conversations,

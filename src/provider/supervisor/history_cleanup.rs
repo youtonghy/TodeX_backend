@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::ConversationSupervisor;
-use crate::conversation::{ConversationManifest, ConversationStatus};
+use crate::conversation::{ConversationManifest, ConversationStatus, ProviderKind};
 use crate::error::AppError;
 
 /// Shutdown reason the provider driver sees for policy and batch removals.
@@ -34,7 +34,7 @@ pub struct CleanupSkip {
 }
 
 impl CleanupSkip {
-    fn new(conversation_id: &str, error: &AppError) -> Self {
+    pub(crate) fn new(conversation_id: &str, error: &AppError) -> Self {
         Self {
             conversation_id: conversation_id.to_owned(),
             code: error.code().to_owned(),
@@ -118,6 +118,16 @@ pub(crate) fn plan_policy_deletions(
     plan
 }
 
+/// A TodeX conversation that resumes a provider's native session.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeSessionRef {
+    pub owner_id: String,
+    pub conversation_id: String,
+    pub native_session_id: String,
+    /// Running, waiting for a permission, or holding an active turn.
+    pub active: bool,
+}
+
 fn is_running(manifest: &ConversationManifest) -> bool {
     matches!(
         manifest.status,
@@ -126,6 +136,46 @@ fn is_running(manifest: &ConversationManifest) -> bool {
 }
 
 impl ConversationSupervisor {
+    /// Every conversation (of any owner) of `provider` with the native
+    /// session it resumes: the recorded `nativeSessionId`, or — before one is
+    /// recorded — the conversation id, which the Claude and Pi drivers pass
+    /// as the session id of a first turn.
+    pub(crate) async fn native_session_refs(
+        &self,
+        provider: ProviderKind,
+    ) -> Result<Vec<NativeSessionRef>, AppError> {
+        let active: HashSet<String> = self
+            .active
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        let mut refs = Vec::new();
+        for manifest in self.store.list().await? {
+            if manifest.provider != provider {
+                continue;
+            }
+            let native_session_id = match self.store.provider_state(&manifest.id).await {
+                Ok(state) => state.native_session_id,
+                Err(error) => {
+                    tracing::debug!(
+                        conversation_id = %manifest.id,
+                        error = %error,
+                        "could not read provider state for native history references"
+                    );
+                    None
+                }
+            }
+            .unwrap_or_else(|| manifest.id.clone());
+            refs.push(NativeSessionRef {
+                active: active.contains(&manifest.id) || is_running(&manifest),
+                owner_id: manifest.owner_id,
+                conversation_id: manifest.id,
+                native_session_id,
+            });
+        }
+        Ok(refs)
+    }
+
     /// Disk usage of a conversation, `0` (with a warning) when it cannot be
     /// measured.
     async fn measured_bytes(&self, conversation_id: &str) -> u64 {

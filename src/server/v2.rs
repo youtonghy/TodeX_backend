@@ -216,6 +216,7 @@ fn authenticated_routes() -> Router<AppState> {
         .merge(super::api_keys::routes())
         .merge(super::quota::routes())
         .merge(super::history_cleanup::routes())
+        .merge(super::native_history::routes())
         .merge(super::ssh::routes())
         .merge(super::agent_desktop::routes())
         .merge(super::remote::routes())

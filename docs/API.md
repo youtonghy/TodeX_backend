@@ -233,6 +233,89 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
 
 后台任务随服务启动，首次在启动约 5 分钟后运行，此后每小时运行一次，对每个已启用策略的 tenant 执行上述清理并以 `trigger: "auto"` 记录 `lastRun`（失败写入 `lastRun.error` 并记入日志）。`PUT` 保存为启用的策略会唤醒后台任务尽快运行一次，但 `PUT` 响应不等待清理完成。服务停止时后台任务随之终止。该策略与配置项 `history_retention_days`（`--history-retention-days`，按天对全部 tenant 的每日保留清理）相互独立，可以同时生效。
 
+### Agent 原生历史（`/v2/native-history/*`）
+
+以下接口管理 Claude Code 与 Pi 自己保存的原生会话文件（不属于 TodeX 会话存储），与其他 v2 路由一样需要设备签名。路径中的 `{provider}` 只能是 `claude-code` 或 `pi`，其他值一律返回 `400 INVALID_REQUEST`。原生目录与 Provider 自身的解析方式一致，每次请求重新解析（daemon 启动后修改的环境变量同样生效）：
+
+- Claude Code：配置目录为 `$CLAUDE_CONFIG_DIR`（默认 `~/.claude`），会话文件为 `<claude_dir>/projects/<编码后的 cwd>/<sessionId>.jsonl`（只认文件名是 UUID 的 `.jsonl`，跳过符号链接目录）。按会话 id 严格关联、随会话一起计量和删除的附属数据（存在才计入）：同目录的 `<sessionId>/`（subagents、tool-results）、`session-env/<sessionId>/`、`file-history/<sessionId>/`、`todos/<sessionId>-*.json`、`debug/<sessionId>.txt`。其他文件（`.credentials.json`、`settings.json`、`history.jsonl`、plugins、skills、memory 等）永不触碰。
+- Pi：会话目录依次取 `$PI_CODING_AGENT_SESSION_DIR`、`<pi_dir>/settings.json` 的 `sessionDir`（支持 `~/`，相对路径基于 `pi_dir`）、`<pi_dir>/sessions`，其中 `pi_dir` 为 `$PI_CODING_AGENT_DIR`（默认 `~/.pi/agent`）。只把首行能解析为 `{"type":"session","id",…}` 头的 `.jsonl` 视为会话（扫描会话目录及其一级子目录），其他文件（如 `permission-forwarding/`）一律忽略；会话 id 取自文件头，删除会话即删除该 `.jsonl`（与 Pi 自身一致）。
+
+`GET /v2/native-history/providers`：
+
+```json
+{
+  "providers": [
+    {
+      "provider": "claude-code",
+      "available": true,
+      "root": "/home/u/.claude/projects",
+      "sessionCount": 17,
+      "totalBytes": 118000000,
+      "measuredAt": "2026-10-11T08:00:00Z",
+      "native": { "cleanupPeriodDays": 5, "settingsPath": "/home/u/.claude/settings.json" }
+    },
+    { "provider": "pi", "available": false, "root": "/home/u/.pi/agent/sessions", "sessionCount": 0, "totalBytes": 0, "measuredAt": "…", "native": null }
+  ]
+}
+```
+
+`available` 表示 `root`（会话所在目录）存在；`totalBytes` 包含会话文件及上述附属数据（不跟随符号链接）。`native` 仅 Claude 有：`cleanupPeriodDays` 为 `settings.json` 中的数值，缺失或文件无法解析时为 `null`。
+
+`GET /v2/native-history/{provider}/sessions`：
+
+```json
+{
+  "provider": "pi", "root": "…", "totalBytes": 0, "count": 0, "measuredAt": "…",
+  "sessions": [
+    { "id": "uuid", "title": "…", "cwd": "/work", "createdAt": "…", "updatedAt": "…", "bytes": 1234, "referencedBy": ["todex-conversation-id"], "running": false }
+  ]
+}
+```
+
+- 按 `updatedAt`（文件 mtime）倒序。`title`：Claude 取最新的 `custom-title` / `ai-title` / `summary` 记录，否则取第一条真实用户消息（跳过 meta、命令/通知包装、tool result 与 sidechain）；Pi 取最新的 `session_info.name`，否则取第一条用户消息；空白折叠为单行，最多 200 字符，没有时为 `null`。`cwd`、`createdAt` 来自 Claude 首条记录或 Pi 文件头，可能为 `null`。
+- 列表只读取每个文件开头和末尾各 256 KiB，并按（路径、大小、mtime）在内存中缓存解析结果，因此超大文件中间的标题可能不会被识别。
+- `referencedBy`：当前 tenant 中 Provider 相同、恢复该原生会话的 TodeX 会话 id（`provider-state.json` 的 `nativeSessionId`，尚未记录时为会话 id 本身——Claude/Pi 驱动首轮即以它作为会话 id）。
+- `running`：Claude 的 `<claude_dir>/sessions/<pid>.json` 标记指向该会话且该 pid 仍存活（Linux 检查 `/proc/<pid>`，其他 Unix 用 `kill(pid, 0)`，无法检查的平台一律视为存活）；或引用它的 TodeX 会话正在运行/等待授权；或文件在最近 2 分钟内被写入。
+
+`GET /v2/native-history/{provider}/sessions/{id}/transcript?limit=200`：
+
+```json
+{
+  "provider": "pi", "id": "uuid", "title": "…", "cwd": "…", "totalMessages": 523, "truncated": true,
+  "messages": [ { "role": "user", "text": "…", "at": "2026-10-11T08:00:00Z" } ]
+}
+```
+
+- `limit` 为 1–1000 的整数（默认 200），否则 `400 INVALID_REQUEST`；id 格式非法为 `400 INVALID_REQUEST`，不存在为 `404 NOT_FOUND`。
+- 逐行流式读取文件，只保留最后 `limit` 条可显示消息（按时间正序）；`totalMessages` 为可显示消息总数，`truncated` 表示更早的消息被省略。
+- 映射：用户/助手文本块 → `user`/`assistant`（图片显示为 `[image]`）；工具调用 → `tool`，文本为 `name: <JSON 参数>`（最多 300 字符）；工具结果 → `tool`，最多 500 字符预览；Claude `system` 记录、压缩摘要与 Pi compaction/branch 摘要 → `system`；thinking、Claude sidechain（`isSidechain: true`）与 meta 记录、Pi 系统提示均跳过。每条文本最多 8000 字符，超出部分以 `…` 截断。`at` 为记录时间戳，缺失时为 `null`。
+
+`POST /v2/native-history/{provider}/cleanup` 删除指定会话，请求体 `{ "sessionIds": ["…"] }`，去重后数量须为 1–500，且每个 id 只能由 `[A-Za-z0-9._-]` 组成、不以 `.` 开头、不含 `..`（最长 128），否则整个请求返回 `400 INVALID_REQUEST`。响应与 `/v2/history/cleanup` 同形（`skipped[].conversationId` 存放的是原生会话 id）：
+
+```json
+{
+  "deleted": ["id"],
+  "skipped": [ { "conversationId": "id", "code": "CONFLICT", "message": "resource is busy: session is running" } ],
+  "freedBytes": 123
+}
+```
+
+- 被任意 tenant 的 TodeX 会话引用 → `CONFLICT`（`a TodeX conversation uses this session`）；正在运行（同上 `running` 判定）→ `CONFLICT`（`session is running`）；扫描中找不到 → `NOT_FOUND`。删除 Pi 会话会让引用它的 TodeX 会话永久无法继续，因此引用保护不可绕过。
+- 安全规则：id 先校验再通过一次全新的会话扫描解析为路径；每个待删路径都按其规范化（canonicalize）后的父目录校验必须位于 Provider 根目录内（Claude 会话文件为 `<claude_dir>/projects`，附属数据为 `<claude_dir>`；Pi 为会话目录）；符号链接从不跟随也不删除（扫描用 `symlink_metadata`，符号链接本身被拒绝）。先删会话文件，再尽力删除附属数据（失败只记警告）。每次删除写一条 `native history session deleted` 的 info 日志（provider、session_id、freed_bytes、trigger）。删除与策略运行、设置修改互斥串行。
+
+自动清理策略（由 TodeX 管理，按 Provider、全 daemon 共享，不区分 tenant）：`GET`/`PUT /v2/native-history/{provider}/policy` 与 `POST /v2/native-history/{provider}/policy/run` 的请求、响应与校验和 `/v2/history/cleanup-policy`、`/v2/history/cleanup-policy/run` 完全相同（`policy` 为 `{enabled,maxAgeDays,maxTotalBytes}`，响应 `{policy,lastRun,nextRunAt}`；运行响应 `{deleted,skipped,freedBytes,lastRun}`）。
+
+- 策略持久化在 `$DATA_DIR/native-history-cleanup.json`（owner-only 0600，原子替换），文件缺失或损坏按默认值（关闭）处理并记录警告。
+- 语义与 TodeX 策略一致：先按年龄规则删除 `updatedAt` 早于「现在 − `maxAgeDays` 天」的会话，再按容量规则从旧到新删除直到总占用不大于 `maxTotalBytes`。被引用或运行中的会话计入总占用但永不删除；选定后文件又被写入的会话以 `CONFLICT` 跳过。
+- 不另起定时器：`/v2/history/*` 的后台任务每次运行在处理各 tenant 策略之后，也会对每个已启用的原生策略运行一次（`trigger: "auto"`），`nextRunAt` 即该任务的下一次运行时间；`PUT` 保存为启用的原生策略同样会唤醒它。
+
+Claude 自身保留期：`GET`/`PUT /v2/native-history/claude-code/native-retention`，请求与响应均为 `{ "cleanupPeriodDays": 30, "settingsPath": "/home/u/.claude/settings.json" }`。
+
+- `PUT` 请求体必须包含 `cleanupPeriodDays`，取值为 `null` 或 1–3650 的整数（否则 `400 INVALID_REQUEST`，`settingsPath` 会被忽略）；`null` 表示删除该键，恢复 Claude 的默认值。
+- 修改 `<claude_dir>/settings.json` 时保留其他所有键（及其顺序）和文件原有权限，原子替换；文件不存在时以 0600 新建；`settings.json` 是符号链接时修改其目标文件。文件存在但不是合法 JSON 对象时 `GET`/`PUT` 都返回 `409 CONFLICT`，且不改动文件。
+- `pi` 没有对应设置，`/v2/native-history/pi/native-retention` 返回 `400 INVALID_REQUEST`。
+- 注意：Claude Code 按 `cleanupPeriodDays` 在自身启动时清理旧会话，**不会**考虑 TodeX 的引用；被 TodeX 会话引用的 Claude 会话同样会被它删除。TodeX 的原生清理策略和手动删除才会保护被引用的会话。
+
 ### v2 WebSocket
 
 客户端命令 envelope：

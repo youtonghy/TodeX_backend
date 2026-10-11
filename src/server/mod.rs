@@ -7,6 +7,7 @@ mod enforcement;
 mod git;
 mod history_cleanup;
 mod history_keys;
+mod native_history;
 pub mod protocol;
 mod quota;
 mod remote;
