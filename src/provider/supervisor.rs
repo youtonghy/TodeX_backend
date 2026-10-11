@@ -47,7 +47,9 @@ use super::types::{
 };
 
 mod follow_ups;
+mod history_cleanup;
 pub use follow_ups::FollowUpAddOutcome;
+pub use history_cleanup::{CleanupReport, CleanupThresholds};
 
 fn prompt_fingerprint(prompt: &ConversationPrompt) -> Result<String, AppError> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(prompt)?)))
@@ -1167,17 +1169,45 @@ impl ConversationSupervisor {
                 "active conversation cannot be deleted".to_owned(),
             ));
         }
-        self.registry
-            .driver(manifest.provider)?
+        let driver = self.registry.driver(manifest.provider)?;
+        driver
             .shutdown_session_with_reason(&manifest.id, "conversation_deleted")
             .await;
         self.store.delete(&manifest.id).await?;
+        self.release_removed(&manifest, None).await;
+        Ok(manifest)
+    }
+
+    /// Releases what a removed conversation still holds outside its
+    /// directory: the provider session (when `shutdown_reason` is set; a
+    /// caller may have shut it down before removing), the follow-up queue,
+    /// the agent MCP grant and the event hub channel. Shared by every
+    /// deletion path so none of them leaks a resident process or a live
+    /// subscription.
+    pub(super) async fn release_removed(
+        &self,
+        manifest: &ConversationManifest,
+        shutdown_reason: Option<&str>,
+    ) {
+        if let Some(reason) = shutdown_reason {
+            match self.registry.driver(manifest.provider) {
+                Ok(driver) => {
+                    driver
+                        .shutdown_session_with_reason(&manifest.id, reason)
+                        .await
+                }
+                Err(error) => tracing::warn!(
+                    conversation_id = %manifest.id,
+                    error = %error,
+                    "no driver to shut down the session of a removed conversation"
+                ),
+            }
+        }
         self.follow_up_queues.remove(&manifest.id);
         self.revoke_agent_mcp(&manifest.id).await;
         // Close the broadcast channel so live websocket subscriptions exit
         // instead of holding their per-connection slot forever.
         self.hub.remove(&manifest.id);
-        Ok(manifest)
     }
 
     pub async fn cleanup_expired(
@@ -1193,13 +1223,8 @@ impl ConversationSupervisor {
             .collect();
         let removed = self.store.cleanup_before(cutoff, &protected).await?;
         for manifest in &removed {
-            self.registry
-                .driver(manifest.provider)?
-                .shutdown_session_with_reason(&manifest.id, "conversation_expired")
+            self.release_removed(manifest, Some("conversation_expired"))
                 .await;
-            self.follow_up_queues.remove(&manifest.id);
-            self.revoke_agent_mcp(&manifest.id).await;
-            self.hub.remove(&manifest.id);
         }
         Ok(removed)
     }
@@ -3061,6 +3086,7 @@ fn normalize_profile(
 #[cfg(all(test, unix))]
 mod tests {
     mod follow_up_queue;
+    mod history_cleanup;
     mod profile_golden;
 
     use std::collections::BTreeMap;

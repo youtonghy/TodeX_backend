@@ -5,6 +5,7 @@ mod api_keys;
 mod device_pairing;
 mod enforcement;
 mod git;
+mod history_cleanup;
 mod history_keys;
 pub mod protocol;
 mod quota;

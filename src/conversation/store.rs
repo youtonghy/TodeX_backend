@@ -1110,6 +1110,45 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Bytes on disk of one conversation directory: the sum of the regular
+    /// files under it. Symbolic links are neither followed nor counted, and
+    /// entries that vanish during the walk (a concurrent rewrite) are
+    /// skipped. Runs on the blocking pool.
+    pub async fn disk_usage(&self, conversation_id: &str) -> Result<u64, AppError> {
+        let directory = self.directory(conversation_id)?;
+        Ok(
+            tokio::task::spawn_blocking(move || directory_bytes(&directory))
+                .await
+                .map_err(blocking_error)??,
+        )
+    }
+
+    /// Removes a conversation if `still_eligible` accepts its current
+    /// manifest and no turn is running in it, checked under the conversation
+    /// lock. `Ok(None)` when it no longer exists or was refused.
+    pub async fn delete_if(
+        &self,
+        conversation_id: &str,
+        still_eligible: impl FnOnce(&ConversationManifest) -> bool,
+    ) -> Result<Option<ConversationManifest>, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let current = match self.get_unlocked(conversation_id).await {
+            Ok(value) => value,
+            Err(AppError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if matches!(
+            current.status,
+            super::ConversationStatus::Running | super::ConversationStatus::WaitingPermission
+        ) || !still_eligible(&current)
+        {
+            return Ok(None);
+        }
+        tokio::fs::remove_dir_all(self.directory(conversation_id)?).await?;
+        self.forget_locked(conversation_id);
+        Ok(Some(current))
+    }
+
     /// Drop every cache entry of a removed conversation, its DEKs included
     /// (its keyring went with its directory). Callers hold the
     /// conversation lock.
@@ -4784,6 +4823,42 @@ async fn set_owner_only(path: &Path, directory: bool) -> Result<(), AppError> {
     #[cfg(not(unix))]
     let _ = (path, directory);
     Ok(())
+}
+
+/// Sum of the regular file sizes under `root`, without following symbolic
+/// links. Entries removed while the walk runs are skipped; a missing `root`
+/// is an error.
+fn directory_bytes(root: &Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let mut pending = vec![root.to_path_buf()];
+    let mut first = true;
+    while let Some(directory) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if !first && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        first = false;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            // `DirEntry::metadata` does not traverse symbolic links.
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]

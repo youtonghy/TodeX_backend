@@ -18,6 +18,7 @@ mod devices;
 mod error;
 mod event;
 mod external_command;
+mod history_cleanup;
 mod history_crypto;
 mod history_keys;
 mod kanban_scheduler;

@@ -57,6 +57,8 @@ pub struct AppState {
     pub(crate) history_keys: HistoryKeys,
     /// Keys of the external API listener; see [`crate::api_keys`].
     pub(crate) api_keys: ApiKeyStore,
+    /// Saved history cleanup policies; see [`crate::history_cleanup`].
+    pub(crate) history_cleanup: crate::history_cleanup::HistoryCleanup,
     pub(crate) api_auth_failures: crate::server::api::AuthFailures,
     pub workspaces: WorkspaceStore,
     pub kanban_tasks: KanbanTaskStore,
@@ -139,6 +141,7 @@ impl AppState {
             config.security.enable_auth.then(|| devices.clone()),
         )?;
         let api_keys = ApiKeyStore::load(&config.data_dir)?;
+        let history_cleanup = crate::history_cleanup::HistoryCleanup::load(&config.data_dir);
         // Before the store opens: recovery may journal into API key
         // conversations, whose keys are also wrapped for the key's recipient.
         history_keys
@@ -197,6 +200,7 @@ impl AppState {
             device_pairing,
             history_keys,
             api_keys,
+            history_cleanup,
             api_auth_failures: Default::default(),
             workspaces,
             kanban_tasks,

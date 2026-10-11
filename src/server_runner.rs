@@ -19,6 +19,8 @@ pub struct ManagedServer {
     shutdown: Option<oneshot::Sender<()>>,
     handle: JoinHandle<Result<()>>,
     retention_task: Option<JoinHandle<()>>,
+    /// Applies the tenants' saved history cleanup policies.
+    history_cleanup_task: Option<JoinHandle<()>>,
     /// Runs due kanban task schedules.
     kanban_schedule_task: Option<JoinHandle<()>>,
     migration_task: Option<JoinHandle<()>>,
@@ -119,6 +121,7 @@ impl ManagedServer {
                 }
             })
         });
+        let history_cleanup_task = Some(crate::history_cleanup::spawn(state.clone()));
         let app = server::router(state.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -209,6 +212,7 @@ impl ManagedServer {
             shutdown: Some(shutdown_tx),
             handle,
             retention_task,
+            history_cleanup_task,
             kanban_schedule_task,
             migration_task,
             maintenance_task,
@@ -261,6 +265,9 @@ impl ManagedServer {
         if let Some(task) = self.retention_task.take() {
             task.abort();
         }
+        if let Some(task) = self.history_cleanup_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.kanban_schedule_task.take() {
             task.abort();
         }
@@ -277,6 +284,9 @@ impl ManagedServer {
 
     pub async fn wait(mut self) -> Result<()> {
         if let Some(task) = self.retention_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.history_cleanup_task.take() {
             task.abort();
         }
         if let Some(task) = self.kanban_schedule_task.take() {

@@ -103,6 +103,11 @@ POST /v2/conversations
 GET /v2/conversations/{conversationId}
 PATCH /v2/conversations/{conversationId}
 DELETE /v2/conversations/{conversationId}
+GET /v2/history/storage
+POST /v2/history/cleanup
+GET /v2/history/cleanup-policy
+PUT /v2/history/cleanup-policy
+POST /v2/history/cleanup-policy/run
 GET /v2/conversations/{conversationId}/events?afterSequence=0&limit=200&detail=full
 GET /v2/conversations/{conversationId}/events?beforeSequence=500&limit=200&detail=summary
 POST /v2/conversations/{conversationId}/prompt
@@ -177,6 +182,56 @@ HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB �
 `beforeSequence=N` 提供反向翻页（与 `afterSequence` 互斥，优先生效）：返回 `sequence <= N` 的最后 `limit` 条（升序），`hasMore` 表示是否还有更早的事件，下一页游标为本页首条 `sequence - 1`。用于长对话自下向上懒加载：首屏用 manifest 的 `lastSequence` 拉取尾页，滚动到顶部再继续向前翻页。
 
 两个方向的回放页（以及 WebSocket 订阅补放的每一页）都同时受 `limit`（上限 1000）与约 8 MiB journal 字节限制，先到先止，但每页至少返回一条事件；因此一页可能少于 `limit` 条，客户端应在 `hasMore` 为 `true` 时继续翻页，而不是按条数判断是否结束。
+
+### 历史存储与清理（`/v2/history/*`）
+
+以下接口与其他 v2 路由一样需要设备签名，并且只作用于当前 tenant（`ownerId` 与调用方 `tenant_id` 相同）的会话；其他 tenant 的会话既不计入、也不能被删除。
+
+`GET /v2/history/storage` 统计每个会话目录（`$DATA_DIR/conversations/<id>/`）的磁盘占用：递归累加普通文件大小，不跟随也不计入符号链接，遍历在阻塞线程池中进行。`conversations` 的每一项是与 `GET /v2/conversations` 完全相同的 manifest 字段再加 `bytes`，按 `updatedAt` 倒序；无法测量的会话记为 `bytes: 0` 并照常列出（daemon 记录警告）。
+
+```json
+{
+  "totalBytes": 123456,
+  "count": 42,
+  "measuredAt": "2026-10-11T08:00:00Z",
+  "conversations": [ { "id": "…", "ownerId": "local", "updatedAt": "…", "bytes": 2048 } ]
+}
+```
+
+`POST /v2/history/cleanup` 批量删除指定会话，请求体 `{ "conversationIds": ["…"] }`，数量须为 1–500（重复 id 去重），否则返回 `400 INVALID_REQUEST`。每个会话都走与 `DELETE /v2/conversations/{id}` 相同的路径（关闭 Provider 会话、清除追加队列、撤销 Agent MCP 授权、关闭事件 hub 通道）；不能删除的会话不会让整批失败，而是进入 `skipped`，`code`/`message` 与单独删除时 API 返回的错误一致（运行中或等待授权为 `CONFLICT`，不存在或属于其他 tenant 为 `NOT_FOUND`）。`freedBytes` 是删除前测得的已删除会话占用之和。
+
+```json
+{
+  "deleted": ["id1"],
+  "skipped": [ { "conversationId": "id2", "code": "CONFLICT", "message": "resource is busy: active conversation cannot be deleted" } ],
+  "freedBytes": 4096
+}
+```
+
+`GET /v2/history/cleanup-policy` 读取、`PUT /v2/history/cleanup-policy` 保存（请求体即 `policy` 对象）当前 tenant 的自动清理策略，两者都返回：
+
+```json
+{
+  "policy": { "enabled": false, "maxAgeDays": null, "maxTotalBytes": null },
+  "lastRun": { "at": "2026-10-11T08:00:00Z", "trigger": "auto", "deleted": 3, "freedBytes": 1024, "error": null },
+  "nextRunAt": "2026-10-11T09:00:00Z"
+}
+```
+
+- 校验（失败为 `400 INVALID_REQUEST`）：`maxAgeDays` 为 `null` 或 1–3650 的整数；`maxTotalBytes` 为 `null` 或 1048576（1 MiB）到 2^53 的整数；`enabled: true` 时两者至少一个非 `null`。关闭的策略可以保留阈值。
+- `lastRun` 从未运行时为 `null`；`trigger` 为 `auto`（后台任务）或 `manual`（手动运行）；整次运行失败时 `error` 为错误文本，否则为 `null`。`nextRunAt` 是后台任务下一次计划运行时间，策略关闭时为 `null`。
+- 策略按 tenant 持久化在 `$DATA_DIR/history-cleanup.json`（owner-only 0600，原子替换）。文件缺失视为默认值（关闭、两个阈值均为 `null`）；文件损坏时记录警告并按默认值处理，不影响 daemon 启动。
+
+`POST /v2/history/cleanup-policy/run` 立即按已保存策略的阈值清理一次（不论 `enabled`），两个阈值都为 `null` 时返回 `400 INVALID_REQUEST`；结果以 `trigger: "manual"` 记为 `lastRun`。响应为 `{ "deleted": [...], "skipped": [...], "freedBytes": N, "lastRun": {...} }`，`skipped` 形状同上（选中后会话已变化或开始运行时记为 `CONFLICT`）。
+
+策略语义（手动运行与后台任务相同）：
+
+- 运行期间持有 CLI 执行闸门的写锁（与 `history_retention_days` 清理相同），选定与删除之间不会有新 turn 或 fork 预留开始；运行中、等待授权或已预留的会话永不删除。
+- 年龄规则：删除 `updatedAt` 早于「现在 − `maxAgeDays` 天」的会话。
+- 容量规则：执行年龄规则后，若该 tenant 剩余总占用仍大于 `maxTotalBytes`，按 `updatedAt` 从旧到新继续删除可删除的会话，直到总占用不大于 `maxTotalBytes`；活动会话计入总占用但不会被删除，因此总占用可能仍高于上限。
+- 每次删除都执行与单独删除相同的清理（Provider 会话以 `conversation_cleanup` 原因关闭、移除追加队列、撤销 MCP 授权、关闭 hub 通道）。
+
+后台任务随服务启动，首次在启动约 5 分钟后运行，此后每小时运行一次，对每个已启用策略的 tenant 执行上述清理并以 `trigger: "auto"` 记录 `lastRun`（失败写入 `lastRun.error` 并记入日志）。`PUT` 保存为启用的策略会唤醒后台任务尽快运行一次，但 `PUT` 响应不等待清理完成。服务停止时后台任务随之终止。该策略与配置项 `history_retention_days`（`--history-retention-days`，按天对全部 tenant 的每日保留清理）相互独立，可以同时生效。
 
 ### v2 WebSocket
 
