@@ -600,6 +600,8 @@ PUT /v2/kanban/tasks
       "conversationId": "conv_abc",
       "conversationIds": ["conv_abc", "conv_def"],
       "sortOrder": 0,
+      "parentId": "task-m9k1a0-ef56gh",
+      "priority": "high",
       "schedule": {
         "id": "sched-m9k3a0-x1y2z3",
         "at": "2026-10-10T09:30",
@@ -626,6 +628,8 @@ PUT /v2/kanban/tasks
 
 `conversationIds` 是任务名下新建的对话（顺序即显示顺序），`conversationId` 镜像第一项供只认单字段的旧客户端使用；推送时字段缺失表示客户端不认识它，后端保留已存的列表，显式的空数组才表示清空。`sortOrder` 缺失时同样保留原值。
 
+`parentId` 指向同一 owner 下的父任务（子任务行，后端不做级联或存在性校验，每个子任务独立拥有状态、定时和对话）；`priority` 取 `none`、`low`、`medium`、`high`、`urgent`，`none` 表示显式清除。两个字段缺失时保留已存值（旧客户端）。
+
 ### 任务定时
 
 `schedule` 由后端调度器执行，客户端无需在线。`at` 是**后端本地时区**的墙上时间 `YYYY-MM-DDTHH:MM`，响应中的 `timeZone` 给出该时区（`name` 为 IANA 名称，平台未报告时省略；`offsetMinutes` 为当前 UTC 偏移）。DST 跳过的时刻顺延一小时，重复的时刻取第一次。
@@ -639,7 +643,7 @@ PUT /v2/kanban/tasks
 
 删除以墓碑同步：客户端把记录标记为非空的 `deletedAt`（Unix 毫秒）后再推送，`GET`/`PUT` 响应会继续携带墓碑直到其超过 30 天保留期被清理。其他端拉取到墓碑后同样隐藏该任务；比墓碑更旧的写入无法复活任务。接口不提供单独的 `DELETE`，避免抹掉墓碑后被旧端重新上传。
 
-后端校验与前端一致：`title` 非空且不超过 200 字符，`description` 不超过 2000 字符，`status` 为 `planned`、`in-progress` 或 `done`，`dueDate` 为 `YYYY-MM-DD`；每个 owner 最多 500 条未删除任务，超出时整批拒绝（`INVALID_REQUEST`）。
+后端校验与前端一致：`title` 非空且不超过 200 字符，`description` 不超过 2000 字符，`status` 为 `planned`、`in-progress` 或 `done`，`dueDate` 为 `YYYY-MM-DD`，`parentId` 不超过 128 字节且不等于任务自身 `id`，`priority` 为 `none`、`low`、`medium`、`high` 或 `urgent`；每个 owner 最多 500 条未删除任务，超出时整批拒绝（`INVALID_REQUEST`）。
 
 ### Workspace 目录浏览
 

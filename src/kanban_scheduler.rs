@@ -374,6 +374,8 @@ mod tests {
             conversation_id: None,
             conversation_ids: None,
             sort_order: None,
+            parent_id: None,
+            priority: None,
             schedule: Some(KanbanTaskSchedule {
                 id: format!("{id}-schedule"),
                 at: at

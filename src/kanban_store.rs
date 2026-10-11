@@ -56,6 +56,14 @@ pub struct KanbanTaskRecord {
     /// Manual order within the workspace status group; opaque to the backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<serde_json::Number>,
+    /// Parent task row (same tenant) when this row is a subtask. The backend
+    /// stores it as-is: no cascade and no existence check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// One of [`VALID_PRIORITIES`]; `"none"` is kept so a client can clear a
+    /// priority explicitly, while an absent field means a client predating it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
     /// Timed start/send run by the backend scheduler (`kanban_scheduler`).
     /// Clients cancel it through `status` rather than dropping the field, so
     /// an absent schedule always means a client that predates it.
@@ -316,7 +324,7 @@ pub fn schedule_instant(at: &str) -> Option<DateTime<Utc>> {
 
 /// Merges a client write that won on `updatedAt` into the stored record.
 /// Fields an older client does not know (absent conversation list, sort
-/// order, schedule) keep their stored value, and scheduler-owned schedule
+/// order, parent, priority, schedule) keep their stored value, and scheduler-owned schedule
 /// state is never rolled back by a client copy made before the run.
 fn merge_incoming(existing: &KanbanTaskRecord, mut task: KanbanTaskRecord) -> KanbanTaskRecord {
     if task.conversation_ids.is_none() {
@@ -332,6 +340,12 @@ fn merge_incoming(existing: &KanbanTaskRecord, mut task: KanbanTaskRecord) -> Ka
     }
     if task.sort_order.is_none() {
         task.sort_order = existing.sort_order.clone();
+    }
+    if task.parent_id.is_none() {
+        task.parent_id = existing.parent_id.clone();
+    }
+    if task.priority.is_none() {
+        task.priority = existing.priority.clone();
     }
     match (&existing.schedule, &task.schedule) {
         (Some(stored), None) => task.schedule = Some(stored.clone()),
@@ -431,6 +445,7 @@ async fn set_owner_only(path: &Path) -> Result<(), AppError> {
 }
 
 const VALID_STATUSES: [&str; 3] = ["planned", "in-progress", "done"];
+const VALID_PRIORITIES: [&str; 5] = ["none", "low", "medium", "high", "urgent"];
 
 fn normalize_tasks(
     tasks: Vec<KanbanTaskRecord>,
@@ -502,6 +517,24 @@ fn normalize_tasks(
             // An explicit empty list clears the conversations.
             task.conversation_id = unique.first().cloned();
             task.conversation_ids = Some(unique);
+        }
+        task.parent_id = task
+            .parent_id
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if let Some(parent_id) = &task.parent_id {
+            if parent_id.len() > KANBAN_ID_LIMIT || *parent_id == task.id {
+                return Err(AppError::InvalidRequest(format!(
+                    "kanban task parentId must be at most {KANBAN_ID_LIMIT} bytes and differ from the task id"
+                )));
+            }
+        }
+        if let Some(priority) = &task.priority {
+            if !VALID_PRIORITIES.contains(&priority.as_str()) {
+                return Err(AppError::InvalidRequest(format!(
+                    "kanban task priority must be one of {VALID_PRIORITIES:?}"
+                )));
+            }
         }
         if let Some(schedule) = task.schedule.as_mut() {
             normalize_schedule(schedule)?;
@@ -630,6 +663,8 @@ mod tests {
             conversation_id: None,
             conversation_ids: None,
             sort_order: None,
+            parent_id: None,
+            priority: None,
             schedule: None,
             created_at: updated_at,
             updated_at,
@@ -824,6 +859,45 @@ mod tests {
         let snapshot = store.merge_owned("local", vec![cleared]).await.unwrap();
         assert_eq!(snapshot.tasks[0].conversation_ids, Some(Vec::new()));
         assert_eq!(snapshot.tasks[0].conversation_id, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn kanban_store_keeps_parent_and_priority_older_clients_omit() {
+        let root = make_temp_dir("todex-kanban-subtask");
+        let store = KanbanTaskStore::new(root.clone()).await.unwrap();
+        let mut subtask = task("task-2", "sub", 10);
+        subtask.parent_id = Some(" task-1 ".to_owned());
+        subtask.priority = Some("high".to_owned());
+        let snapshot = store.merge_owned("local", vec![subtask]).await.unwrap();
+        assert_eq!(snapshot.tasks[0].parent_id.as_deref(), Some("task-1"));
+
+        // A client that predates both fields renames the subtask.
+        let snapshot = store
+            .merge_owned("local", vec![task("task-2", "renamed", 20)])
+            .await
+            .unwrap();
+        let merged = &snapshot.tasks[0];
+        assert_eq!(merged.title, "renamed");
+        assert_eq!(merged.parent_id.as_deref(), Some("task-1"));
+        assert_eq!(merged.priority.as_deref(), Some("high"));
+
+        // An explicit "none" clears the priority and is stored as sent.
+        let mut cleared = merged.clone();
+        cleared.updated_at = 30;
+        cleared.priority = Some("none".to_owned());
+        let snapshot = store.merge_owned("local", vec![cleared]).await.unwrap();
+        assert_eq!(snapshot.tasks[0].priority.as_deref(), Some("none"));
+
+        let mut bad_priority = task("task-3", "t", 10);
+        bad_priority.priority = Some("critical".to_owned());
+        assert!(store
+            .merge_owned("local", vec![bad_priority])
+            .await
+            .is_err());
+        let mut own_parent = task("task-3", "t", 10);
+        own_parent.parent_id = Some("task-3".to_owned());
+        assert!(store.merge_owned("local", vec![own_parent]).await.is_err());
         let _ = fs::remove_dir_all(root);
     }
 
