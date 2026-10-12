@@ -12,7 +12,10 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    workspace_paths::{expand_home, validate_workspace_directory_text},
+    workspace_paths::{
+        canonical_workspace_root, expand_home, scratch_workspace_root,
+        validate_workspace_directory_text,
+    },
 };
 
 const WORKSPACE_TRUST_FILE: &str = "workspace-trust.json";
@@ -49,6 +52,7 @@ pub struct WorkspaceTrustStatus {
 pub struct WorkspaceTrustStore {
     path: Arc<PathBuf>,
     workspace_roots: Arc<Vec<PathBuf>>,
+    scratch_root: Arc<PathBuf>,
     inner: Arc<RwLock<WorkspaceTrustSnapshot>>,
 }
 
@@ -57,13 +61,20 @@ pub(crate) struct WorkspaceTrustPermit {
 }
 
 impl WorkspaceTrustStore {
+    /// `workspace_roots` are the configured roots; the scratch root under
+    /// `data_dir` is added here. Folders inside it are created by the daemon
+    /// for conversations without a workspace and are always trusted.
     pub async fn new(data_dir: PathBuf, workspace_roots: Vec<PathBuf>) -> Result<Self, AppError> {
         tokio::fs::create_dir_all(&data_dir).await?;
         let path = data_dir.join(WORKSPACE_TRUST_FILE);
+        let scratch_root = scratch_workspace_root(&data_dir);
+        let mut workspace_roots = workspace_roots;
+        workspace_roots.push(scratch_root.clone());
         let snapshot = load_snapshot(&path, &workspace_roots).await?;
         Ok(Self {
             path: Arc::new(path),
             workspace_roots: Arc::new(workspace_roots),
+            scratch_root: Arc::new(scratch_root),
             inner: Arc::new(RwLock::new(snapshot)),
         })
     }
@@ -75,6 +86,13 @@ impl WorkspaceTrustStore {
     ) -> Result<WorkspaceTrustStatus, AppError> {
         let workspace = self.validate(workspace)?;
         let workspace_path = workspace.display().to_string();
+        if self.is_scratch(&workspace) {
+            return Ok(WorkspaceTrustStatus {
+                workspace_path,
+                trusted: true,
+                trusted_at: None,
+            });
+        }
         let snapshot = self.inner.read().await;
         let decision = snapshot
             .entries
@@ -223,15 +241,24 @@ impl WorkspaceTrustStore {
         let workspace = self.validate(workspace)?;
         let workspace_path = workspace.display().to_string();
         let snapshot = self.inner.clone().read_owned().await;
-        if snapshot.entries.iter().any(|entry| {
-            entry.owner_id == owner_id && entry.workspace_path == workspace_path && entry.trusted
-        }) {
+        if self.is_scratch(&workspace)
+            || snapshot.entries.iter().any(|entry| {
+                entry.owner_id == owner_id
+                    && entry.workspace_path == workspace_path
+                    && entry.trusted
+            })
+        {
             Ok(WorkspaceTrustPermit {
                 _snapshot: snapshot,
             })
         } else {
             Err(AppError::WorkspaceTrustRequired(workspace_path))
         }
+    }
+
+    /// `workspace` must already be canonical.
+    fn is_scratch(&self, workspace: &Path) -> bool {
+        canonical_workspace_root(&self.scratch_root).is_ok_and(|root| workspace.starts_with(root))
     }
 
     fn validate(&self, workspace: &Path) -> Result<PathBuf, AppError> {

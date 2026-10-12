@@ -1055,13 +1055,41 @@ impl ConversationSupervisor {
         title: Option<String>,
         provider_profile: Option<String>,
     ) -> Result<ConversationManifest, AppError> {
+        self.create_inner(owner_id, provider, Some(workspace), title, provider_profile)
+            .await
+    }
+
+    /// Creates a conversation without a user workspace: the daemon makes
+    /// `<data_dir>/workspace/<conversation id>` and uses it as the workspace.
+    pub async fn create_scratch_owned(
+        &self,
+        owner_id: &str,
+        provider: ProviderKind,
+        title: Option<String>,
+        provider_profile: Option<String>,
+    ) -> Result<ConversationManifest, AppError> {
+        self.create_inner(owner_id, provider, None, title, provider_profile)
+            .await
+    }
+
+    async fn create_inner(
+        &self,
+        owner_id: &str,
+        provider: ProviderKind,
+        workspace: Option<PathBuf>,
+        title: Option<String>,
+        provider_profile: Option<String>,
+    ) -> Result<ConversationManifest, AppError> {
         validate_owner_id(owner_id)?;
-        let workspace = validate_workspace_directory_text(
-            &self.config.workspace_roots,
-            workspace.to_str().ok_or_else(|| {
-                AppError::InvalidRequest("workspace path is not UTF-8".to_owned())
-            })?,
-        )?;
+        let validate = |workspace: &Path| {
+            validate_workspace_directory_text(
+                &self.config.workspace_access_roots(),
+                workspace.to_str().ok_or_else(|| {
+                    AppError::InvalidRequest("workspace path is not UTF-8".to_owned())
+                })?,
+            )
+        };
+        let validated = workspace.as_deref().map(validate).transpose()?;
         let descriptor = self.registry.driver(provider)?.descriptor();
         if !descriptor.available {
             return Err(AppError::ProviderUnavailable(
@@ -1074,11 +1102,33 @@ impl ConversationSupervisor {
         let title = title
             .map(|title| title.trim().chars().take(200).collect::<String>())
             .filter(|title| !title.is_empty());
-        let manifest = ConversationManifest::new(provider, workspace, title, provider_profile);
-        let mut manifest = manifest;
+        let mut manifest = ConversationManifest::new(
+            provider,
+            validated.unwrap_or_default(),
+            title,
+            provider_profile,
+        );
+        if workspace.is_none() {
+            let folder = self.config.scratch_workspace_root().join(&manifest.id);
+            tokio::fs::create_dir_all(&folder).await?;
+            manifest.workspace = validate(&folder)?;
+            manifest.scratch_workspace = true;
+        }
         manifest.owner_id = owner_id.to_owned();
         manifest.workspace_id = Some(stable_workspace_id(&manifest.workspace));
-        let manifest = self.store.create(manifest).await?;
+        let scratch_folder = manifest
+            .scratch_workspace
+            .then(|| manifest.workspace.clone());
+        let manifest = match self.store.create(manifest).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                // The folder is still empty; do not leave it orphaned.
+                if let Some(folder) = scratch_folder {
+                    let _ = tokio::fs::remove_dir(folder).await;
+                }
+                return Err(error);
+            }
+        };
         self.emit(
             &manifest.id,
             "conversation.created",

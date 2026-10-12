@@ -91,6 +91,11 @@ pub struct ConversationManifest {
     pub workspace: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// `workspace` is a folder the daemon created for this conversation under
+    /// `<data_dir>/workspace` because it was started without a workspace.
+    /// Omitted while `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scratch_workspace: bool,
     /// Plaintext title. Absent while the title is encrypted (`titleEnc`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -146,6 +151,7 @@ impl ConversationManifest {
             owner_id: default_owner_id(),
             workspace,
             workspace_id: None,
+            scratch_workspace: false,
             title,
             title_enc: None,
             provider_profile,

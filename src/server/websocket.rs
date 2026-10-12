@@ -545,7 +545,7 @@ async fn dispatch(
                 .await?
                 .last_cursor;
             let cwd = match validate_workspace_directory_text(
-                &state.config.workspace_roots,
+                &state.config.workspace_access_roots(),
                 &payload.cwd,
             ) {
                 Ok(cwd) => cwd,
@@ -1033,7 +1033,7 @@ async fn dispatch(
                 }
                 None => {
                     let cwd = validate_workspace_directory_text(
-                        &state.config.workspace_roots,
+                        &state.config.workspace_access_roots(),
                         &payload.cwd,
                     )?;
                     state

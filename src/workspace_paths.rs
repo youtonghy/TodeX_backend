@@ -5,6 +5,14 @@ use std::{
 
 use crate::error::AppError;
 
+/// Folder under the data dir holding one auto-created workspace per
+/// conversation started without a workspace ("None" in the clients).
+pub const SCRATCH_WORKSPACE_DIR: &str = "workspace";
+
+pub fn scratch_workspace_root(data_dir: &Path) -> PathBuf {
+    data_dir.join(SCRATCH_WORKSPACE_DIR)
+}
+
 pub fn canonical_workspace_root(root: &Path) -> Result<PathBuf, AppError> {
     let root = expand_home(root);
     let metadata = fs::metadata(&root).map_err(workspace_path_error)?;

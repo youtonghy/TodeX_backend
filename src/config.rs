@@ -485,6 +485,21 @@ impl Config {
         .map_err(anyhow::Error::msg)
     }
 
+    /// `<data_dir>/workspace`, parent of the per-conversation folders created
+    /// for conversations started without a workspace.
+    pub fn scratch_workspace_root(&self) -> PathBuf {
+        crate::workspace_paths::scratch_workspace_root(&self.data_dir)
+    }
+
+    /// Roots a conversation may work in: the configured workspace roots plus
+    /// the scratch root. Directory browsing and the workspace registry keep
+    /// using `workspace_roots` alone.
+    pub fn workspace_access_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.workspace_roots.clone();
+        roots.push(self.scratch_workspace_root());
+        roots
+    }
+
     /// The first configured root; `workspace_roots` is never empty after load.
     pub fn primary_workspace_root(&self) -> &Path {
         self.workspace_roots

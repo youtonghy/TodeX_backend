@@ -150,6 +150,8 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 }
 ```
 
+不指定工作区（客户端的「None」选项）时省略 `workspace`，改传 `"scratchWorkspace": true`：后端为该对话创建 `$TODEX_AGENTD_DATA_DIR/workspace/<conversationId>` 并把它作为 workspace，返回的 manifest 带 `"scratchWorkspace": true`（为 `false` 时省略），`workspace` 是新目录的规范路径，`workspaceId` 照常按路径生成，因此每个对话各不相同，不会出现在 `/v2/workspaces` 中。`scratchWorkspace` 与 `workspace` 同时提供或都不提供时返回 `400 INVALID_REQUEST`。删除对话不会删除该目录。
+
 发送 prompt：
 
 ```json
@@ -700,6 +702,7 @@ GET /v2/version
 | `data_dir` | string | 当前数据目录（仅鉴权后） |
 | `workspace_root` | string | 主 workspace 根目录（根列表第一项，仅鉴权后） |
 | `workspace_roots` | string[] | 全部已配置的 workspace 根目录（仅鉴权后） |
+| `scratch_workspace_root` | string | 无工作区对话目录的父目录 `$DATA_DIR/workspace`（仅鉴权后）；不在 `workspace_roots` 中，客户端可在首次创建这类对话前用它做模型/命令发现 |
 | `historyEncryption` | number | 后端支持的历史加密版本（当前 `1`），见「历史加密密钥」 |
 
 ## Workspace 缓存同步与信任
@@ -707,6 +710,8 @@ GET /v2/version
 工作区清单由后端持久化到 `$TODEX_AGENTD_DATA_DIR/workspaces.json`。手机和桌面端的本地存储只作为离线缓存；连接成功后会拉取当前身份的后端快照。工作区 ID 由后端根据规范化路径稳定生成，并与对话 manifest 的 `workspaceId` 共用，从而让不同设备恢复同一工作区内的对话。
 
 后端会把 `workspace_roots` 作为移动端可用工作区的权限边界。`PUT /v2/workspaces`、`/v2/workspace/entries`、本地 Codex 启动和本地终端启动都会拒绝所有根目录之外的目录；目录必须存在且是目录。
+
+`$DATA_DIR/workspace`（`scratch_workspace_root`）是额外的访问根：创建对话、Provider 发现、文件、Git 和终端等按路径访问的接口都接受它及其子目录，且该目录树对所有 owner 视为已信任，无需信任决定。它不出现在 `workspace_roots`、`/v2/workspace/directories` 的浏览根列表中，也不能注册为 `/v2/workspaces` 记录。
 
 ```http
 GET /v2/workspaces

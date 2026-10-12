@@ -100,6 +100,7 @@ impl AppState {
                 );
             }
         }
+        tokio::fs::create_dir_all(config.scratch_workspace_root()).await?;
         set_owner_only_directory(&config.data_dir).await?;
         set_owner_only_directory(&config.data_dir.join("logs")).await?;
         set_owner_only_directory(&config.data_dir.join("audit")).await?;

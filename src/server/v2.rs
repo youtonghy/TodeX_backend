@@ -307,6 +307,7 @@ pub(super) async fn version(
             .iter()
             .map(|root| root.display().to_string())
             .collect(),
+        scratch_workspace_root: state.config.scratch_workspace_root().display().to_string(),
     });
     Json(VersionResponse {
         name: env!("CARGO_PKG_NAME"),
@@ -557,7 +558,8 @@ pub(super) async fn workspace_entries(
 ) -> Result<Json<WorkspaceEntriesResponse>, AppError> {
     require_auth(&state, &headers)?;
 
-    let cwd = validate_workspace_directory_text(&state.config.workspace_roots, &query.cwd)?;
+    let cwd =
+        validate_workspace_directory_text(&state.config.workspace_access_roots(), &query.cwd)?;
 
     let raw_query = query.query.as_deref().unwrap_or("");
     let relative_query = normalize_relative_query(raw_query)?;
@@ -620,7 +622,7 @@ pub(super) async fn workspace_file(
     Query(query): Query<WorkspaceFileQuery>,
 ) -> Result<Json<WorkspaceFileResponse>, AppError> {
     require_auth(&state, &headers)?;
-    let path = validate_workspace_file_text(&state.config.workspace_roots, &query.path)?;
+    let path = validate_workspace_file_text(&state.config.workspace_access_roots(), &query.path)?;
     let metadata = tokio::fs::metadata(&path).await?;
     if !metadata.is_file() {
         return Err(AppError::InvalidRequest("path must be a file".to_owned()));
@@ -688,7 +690,7 @@ pub(super) async fn save_workspace_file(
             "file is too large to edit".to_owned(),
         ));
     }
-    let roots = state.config.workspace_roots.clone();
+    let roots = state.config.workspace_access_roots();
     tokio::task::spawn_blocking(move || save_workspace_text(&roots, request))
         .await
         .map_err(|error| AppError::Anyhow(error.into()))??;
@@ -767,9 +769,11 @@ pub(super) async fn git_scan(
     Query(query): Query<super::protocol::GitScanQuery>,
 ) -> Result<Json<super::protocol::GitScanResponse>, AppError> {
     require_auth(&state, &headers)?;
-    let workspace =
-        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
-    git::scan(&state.config.workspace_roots, &workspace)
+    let workspace = validate_workspace_directory_text(
+        &state.config.workspace_access_roots(),
+        &query.workspace_path,
+    )?;
+    git::scan(&state.config.workspace_access_roots(), &workspace)
         .await
         .map(Json)
 }
@@ -787,14 +791,16 @@ pub(super) async fn git_run(
                 truncate_git_error(error.to_string(), 256)
             ))
         })?;
-    let workspace =
-        validate_workspace_directory_text(&state.config.workspace_roots, &request.workspace_path)?;
+    let workspace = validate_workspace_directory_text(
+        &state.config.workspace_access_roots(),
+        &request.workspace_path,
+    )?;
     state
         .workspace_trust
         .ensure_trusted(&auth.tenant_id, &workspace)
         .await?;
     let result = git::run(
-        &state.config.workspace_roots,
+        &state.config.workspace_access_roots(),
         &state.config.data_dir,
         &workspace,
         &request,
@@ -835,9 +841,11 @@ pub(super) async fn git_status(
     Query(query): Query<super::protocol::GitScanQuery>,
 ) -> Result<Json<super::protocol::GitStatusResponse>, AppError> {
     require_auth(&state, &headers)?;
-    let workspace =
-        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
-    git::status::read(&state.config.workspace_roots, &workspace)
+    let workspace = validate_workspace_directory_text(
+        &state.config.workspace_access_roots(),
+        &query.workspace_path,
+    )?;
+    git::status::read(&state.config.workspace_access_roots(), &workspace)
         .await
         .map(Json)
 }
@@ -848,10 +856,12 @@ pub(super) async fn git_log(
     Query(query): Query<super::protocol::GitLogQuery>,
 ) -> Result<Json<super::protocol::GitLogResponse>, AppError> {
     require_auth(&state, &headers)?;
-    let workspace =
-        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
+    let workspace = validate_workspace_directory_text(
+        &state.config.workspace_access_roots(),
+        &query.workspace_path,
+    )?;
     git::log::read(
-        &state.config.workspace_roots,
+        &state.config.workspace_access_roots(),
         &workspace,
         query.skip,
         query.limit,
@@ -866,9 +876,11 @@ pub(super) async fn git_workspace(
     Query(query): Query<super::protocol::GitScanQuery>,
 ) -> Result<Json<super::protocol::GitWorkspaceResponse>, AppError> {
     require_auth(&state, &headers)?;
-    let workspace =
-        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
-    git::workspace::snapshot(&state.config.workspace_roots, &workspace)
+    let workspace = validate_workspace_directory_text(
+        &state.config.workspace_access_roots(),
+        &query.workspace_path,
+    )?;
+    git::workspace::snapshot(&state.config.workspace_access_roots(), &workspace)
         .await
         .map(Json)
 }
@@ -879,11 +891,17 @@ pub(super) async fn git_diff(
     Query(query): Query<super::protocol::GitDiffQuery>,
 ) -> Result<Json<super::protocol::GitDiffResponse>, AppError> {
     require_auth(&state, &headers)?;
-    let workspace =
-        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
-    git::diff::file(&state.config.workspace_roots, &workspace, &query.path)
-        .await
-        .map(Json)
+    let workspace = validate_workspace_directory_text(
+        &state.config.workspace_access_roots(),
+        &query.workspace_path,
+    )?;
+    git::diff::file(
+        &state.config.workspace_access_roots(),
+        &workspace,
+        &query.path,
+    )
+    .await
+    .map(Json)
 }
 
 pub(super) async fn git_pull_request(
@@ -892,9 +910,11 @@ pub(super) async fn git_pull_request(
     Query(query): Query<super::protocol::GitScanQuery>,
 ) -> Result<Json<super::protocol::GitPullRequestResponse>, AppError> {
     require_auth(&state, &headers)?;
-    let workspace =
-        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace_path)?;
-    git::pull_request::summary(&state.config.workspace_roots, &workspace)
+    let workspace = validate_workspace_directory_text(
+        &state.config.workspace_access_roots(),
+        &query.workspace_path,
+    )?;
+    git::pull_request::summary(&state.config.workspace_access_roots(), &workspace)
         .await
         .map(Json)
 }
@@ -912,8 +932,10 @@ pub(super) async fn git_operation(
                 truncate_git_error(error.to_string(), 256)
             ))
         })?;
-    let workspace =
-        validate_workspace_directory_text(&state.config.workspace_roots, &request.workspace_path)?;
+    let workspace = validate_workspace_directory_text(
+        &state.config.workspace_access_roots(),
+        &request.workspace_path,
+    )?;
     let _trust = state
         .workspace_trust
         .acquire_owned(&auth.tenant_id, &workspace)
@@ -922,7 +944,7 @@ pub(super) async fn git_operation(
     // beneath it. This is a preflight guard, not a lock against external Git tools.
     let target = match &request.operation {
         super::protocol::GitOperation::RemoveWorktree { path } => Some(
-            validate_workspace_directory_text(&state.config.workspace_roots, path)?,
+            validate_workspace_directory_text(&state.config.workspace_access_roots(), path)?,
         ),
         _ => None,
     };
@@ -946,7 +968,7 @@ pub(super) async fn git_operation(
         }
     }
     let result = git::workspace::operate(
-        &state.config.workspace_roots,
+        &state.config.workspace_access_roots(),
         &state.config.data_dir,
         &workspace,
         &request.operation,
@@ -1527,7 +1549,7 @@ async fn delete_skill(
 }
 
 fn validate_catalog_workspace(state: &AppState, workspace: &str) -> Result<PathBuf, AppError> {
-    validate_workspace_directory_text(&state.catalog.config().workspace_roots, workspace)
+    validate_workspace_directory_text(&state.catalog.config().workspace_access_roots(), workspace)
 }
 
 async fn providers(
@@ -1836,8 +1858,10 @@ async fn provider_image_input(
     Query(query): Query<ProviderImageInputQuery>,
 ) -> Result<Json<crate::provider::types::ProviderImageInputCapability>, AppError> {
     let auth = require_auth(&state, &headers)?;
-    let workspace =
-        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace)?;
+    let workspace = validate_workspace_directory_text(
+        &state.config.workspace_access_roots(),
+        &query.workspace,
+    )?;
     Ok(Json(
         state
             .conversations
@@ -1858,8 +1882,10 @@ async fn provider_models(
     Query(query): Query<ProviderModelsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
-    let workspace =
-        validate_workspace_directory_text(&state.config.workspace_roots, &query.workspace)?;
+    let workspace = validate_workspace_directory_text(
+        &state.config.workspace_access_roots(),
+        &query.workspace,
+    )?;
     let models = state
         .conversations
         .models_live(&auth.tenant_id, query.provider, &workspace)
@@ -1890,7 +1916,7 @@ async fn provider_commands(
         AppError::InvalidRequest("workspace is required without conversationId".to_owned())
     })?;
     let workspace =
-        validate_workspace_directory_text(&state.config.workspace_roots, &workspace_text)?;
+        validate_workspace_directory_text(&state.config.workspace_access_roots(), &workspace_text)?;
     let commands = state
         .conversations
         .commands_live(&auth.tenant_id, provider, &workspace)
@@ -1934,25 +1960,7 @@ async fn create_conversation(
     Json(request): Json<CreateConversationRequest>,
 ) -> Result<Json<ConversationManifest>, AppError> {
     let auth = require_auth(&state, &headers)?;
-    let provider = match request.provider {
-        Some(provider) => provider,
-        None => state
-            .config
-            .agent
-            .default_agent
-            .parse()
-            .map_err(AppError::InvalidRequest)?,
-    };
-    let manifest = state
-        .conversations
-        .create_owned(
-            &auth.tenant_id,
-            provider,
-            request.workspace,
-            request.title,
-            request.provider_profile,
-        )
-        .await?;
+    let manifest = create_requested_conversation(&state, &auth.tenant_id, request).await?;
     Ok(Json(manifest))
 }
 
@@ -3276,26 +3284,8 @@ async fn dispatch_command_inner(
         }
         "conversation.create" => {
             let request: CreateConversationRequest = Deserialize::deserialize(&command.payload)?;
-            let provider = match request.provider {
-                Some(provider) => provider,
-                None => state
-                    .config
-                    .agent
-                    .default_agent
-                    .parse()
-                    .map_err(AppError::InvalidRequest)?,
-            };
             Ok(serde_json::to_value(
-                state
-                    .conversations
-                    .create_owned(
-                        owner_id,
-                        provider,
-                        request.workspace,
-                        request.title,
-                        request.provider_profile,
-                    )
-                    .await?,
+                create_requested_conversation(state, owner_id, request).await?,
             )?)
         }
         "conversation.prompt" | "conversation.followUp" => {
@@ -3744,6 +3734,9 @@ pub(super) struct VersionPaths {
     data_dir: String,
     workspace_root: String,
     workspace_roots: Vec<String>,
+    /// Parent of the per-conversation folders of conversations started
+    /// without a workspace; trusted, usable for discovery before the first one.
+    scratch_workspace_root: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3881,11 +3874,58 @@ struct WorkspaceDirectory {
 struct CreateConversationRequest {
     #[serde(default)]
     provider: Option<ProviderKind>,
-    workspace: PathBuf,
+    #[serde(default)]
+    workspace: Option<PathBuf>,
+    /// Start without a workspace: the daemon creates a folder for the
+    /// conversation under `<data_dir>/workspace`. Excludes `workspace`.
+    #[serde(default)]
+    scratch_workspace: bool,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     provider_profile: Option<String>,
+}
+
+async fn create_requested_conversation(
+    state: &AppState,
+    owner_id: &str,
+    request: CreateConversationRequest,
+) -> Result<ConversationManifest, AppError> {
+    let provider = match request.provider {
+        Some(provider) => provider,
+        None => state
+            .config
+            .agent
+            .default_agent
+            .parse()
+            .map_err(AppError::InvalidRequest)?,
+    };
+    match (request.scratch_workspace, request.workspace) {
+        (true, None) => {
+            state
+                .conversations
+                .create_scratch_owned(owner_id, provider, request.title, request.provider_profile)
+                .await
+        }
+        (true, Some(_)) => Err(AppError::InvalidRequest(
+            "scratchWorkspace cannot be combined with workspace".to_owned(),
+        )),
+        (false, Some(workspace)) => {
+            state
+                .conversations
+                .create_owned(
+                    owner_id,
+                    provider,
+                    workspace,
+                    request.title,
+                    request.provider_profile,
+                )
+                .await
+        }
+        (false, None) => Err(AppError::InvalidRequest(
+            "workspace path is required".to_owned(),
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -5730,6 +5770,137 @@ mod tests {
             entry_paths(&hidden),
             vec![".config/", ".config/settings.json"]
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn scratch_workspace_conversations_get_their_own_trusted_folder() {
+        let root = std::env::temp_dir().join(format!("todex-v2-scratch-{}", Uuid::new_v4()));
+        let workspace_root = root.join("projects");
+        let project = workspace_root.join("app");
+        fs::create_dir_all(&project).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let state = AppState::new_for_tests(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            pairing_encryption: PairingEncryption::None,
+            data_dir: root.join("data"),
+            workspace_roots: vec![workspace_root.clone()],
+            history_retention_days: None,
+            agent: AgentConfig {
+                default_agent: "codex".to_owned(),
+                codex_bin: executable.clone(),
+                claude_bin: executable.clone(),
+                pi_bin: executable.clone(),
+                grok_bin: executable,
+                grok_auth_method: None,
+                grok_env_allowlist: Vec::new(),
+                devin_bin: "devin".to_owned(),
+                devin_auth_method: None,
+                devin_api_key_env: None,
+                devin_env_allowlist: Vec::new(),
+                opencode_bin: "opencode".to_owned(),
+                opencode_env_allowlist: Vec::new(),
+                antigravity_bin: "agy".to_owned(),
+                antigravity_env_allowlist: Vec::new(),
+                acp_profiles: BTreeMap::new(),
+                ssh_bin: "ssh".to_owned(),
+                provider_idle_timeout_minutes: 0,
+            },
+            security: SecurityConfig {
+                enable_auth: true,
+                enable_tls: false,
+            },
+            api: Default::default(),
+        })
+        .await
+        .unwrap();
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state.clone());
+        let scratch_root = fs::canonicalize(root.join("data").join("workspace")).unwrap();
+
+        let version = app
+            .clone()
+            .oneshot(signed_request(&device, "GET", "/v2/version", ""))
+            .await
+            .unwrap();
+        let version_json: Value =
+            serde_json::from_slice(&to_bytes(version.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            version_json["workspace_roots"],
+            json!([workspace_root.display().to_string()])
+        );
+        assert_eq!(
+            version_json["scratch_workspace_root"],
+            root.join("data").join("workspace").display().to_string()
+        );
+
+        let mut folders = Vec::new();
+        for _ in 0..2 {
+            let create = app
+                .clone()
+                .oneshot(signed_request(
+                    &device,
+                    "POST",
+                    "/v2/conversations",
+                    &json!({ "provider": "codex", "scratchWorkspace": true }).to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(create.status(), StatusCode::OK);
+            let created: ConversationManifest =
+                serde_json::from_slice(&to_bytes(create.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert!(created.scratch_workspace);
+            assert_eq!(created.workspace, scratch_root.join(&created.id));
+            assert!(created.workspace.is_dir());
+            state
+                .workspace_trust
+                .ensure_trusted("local", &created.workspace)
+                .await
+                .unwrap();
+            folders.push(created.workspace);
+        }
+        assert_ne!(folders[0], folders[1]);
+        state
+            .workspace_trust
+            .ensure_trusted("local", &scratch_root)
+            .await
+            .unwrap();
+
+        for body in [
+            json!({ "provider": "codex", "scratchWorkspace": true, "workspace": project }),
+            json!({ "provider": "codex" }),
+        ] {
+            let rejected = app
+                .clone()
+                .oneshot(signed_request(
+                    &device,
+                    "POST",
+                    "/v2/conversations",
+                    &body.to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let regular = state
+            .conversations
+            .create_owned("local", ProviderKind::Codex, project.clone(), None, None)
+            .await
+            .unwrap();
+        assert!(!regular.scratch_workspace);
+        assert!(state
+            .workspace_trust
+            .ensure_trusted("local", &project)
+            .await
+            .is_err());
 
         let _ = fs::remove_dir_all(root);
     }
