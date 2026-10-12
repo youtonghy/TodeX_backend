@@ -368,7 +368,7 @@ Claude 自身保留期：`GET`/`PUT /v2/native-history/claude-code/native-retent
 
 `conversation.subscribe` 的 `limit` 只是 replay 分页大小。可选 `detail`（`full` 默认 | `summary`）按 HTTP `detail=summary` 同样的规则折叠首次 replay 的过程事件；实时事件与缺口/滞后补放始终完整。可选 `backfillLimit` 限制首次 replay 的事件数：从 `afterSequence` 之后按 sequence 升序最多发送 `backfillLimit` 条，不跳过也不只发最新事件。结果为 `{ "conversationId", "subscribed": true, "nextSequence", "hasMore", "lastSequence" }`：`nextSequence` 是最后一条已 replay 的 sequence（未截断时等于高水位），`hasMore` 表示 `nextSequence` 与 `lastSequence`（订阅时的 journal 高水位）之间仍有未发送事件，实时推送从 `lastSequence` 之后继续。`hasMore: true` 时客户端用 HTTP `afterSequence=nextSequence` 翻页补齐 `(nextSequence, lastSequence]`，服务端不会把这段当作序号缺口补放。两个字段都省略时行为与之前完全一致（`hasMore` 恒为 `false`）。
 
-支持 `conversation.subscribe`、`conversation.unsubscribe`、`conversation.create`、`conversation.prompt`、`conversation.queue.add` / `remove` / `clear` / `resume` / `list`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call`、`server.ping` 和 `history.*`（见下文「历史加密密钥」）。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
+支持 `conversation.subscribe`、`conversation.unsubscribe`、`conversation.create`、`conversation.prompt`、`conversation.queue.add` / `remove` / `clear` / `resume` / `list`、`conversation.schedule`、`conversation.cancel`、`conversation.stop`、`conversation.runtime.stop`、`conversation.permission.respond`、`mcp.list`、`mcp.refresh`、`mcp.call`、`server.ping` 和 `history.*`（见下文「历史加密密钥」）。服务端返回 `server.result`、`server.error` 与按 conversation 隔离的 `conversation.event`。订阅会先 replay，再接续实时 sequence；实时广播滞后时会从最后已交付 sequence 自动补放到当前高水位，补放失败则发送错误并移除该订阅，避免静默缺事件。 `conversation.event` 外层新增 `delivery: "live" | "replay"`：首次订阅、序号缺口和广播滞后的补放均为 `replay`，事件日志 payload 不变。客户端只对明确为 `live` 且未处理的事件执行 toast 或编辑器填充等瞬时操作。
 
 每条 socket 最多同时持有 128 个会话订阅，超出后 `conversation.subscribe` 返回 `INVALID_REQUEST`。`conversation.unsubscribe` 的 payload 为 `{ "conversationId": "..." }`，释放该订阅槽位并停止转发任务，幂等且返回 `{ "conversationId", "unsubscribed" }`；订阅任务因补放失败终止时发出的 `server.error` 在 `payload.conversationId` 中携带会话 ID，客户端可据此清理本地订阅记录并重订阅。删除会话（含过期清理）会关闭其广播通道，等同于终止该会话的全部订阅。
 
@@ -383,7 +383,7 @@ MCP 真实调用只走 Backend：客户端只发送 `resourceId`、`toolName` �
 Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追加消息（所有 Provider 都支持；`followUpQueue` 仍只表示 Provider 原生队列）。队列只保存在 daemon 内存中，不写入磁盘（明文由 daemon 持有至投递，见 [history-encryption.md](history-encryption.md) §1），保存完整请求（含附件与 Skill），fork 不复制，删除会话一并丢弃；daemon 重启或崩溃会丢失全部未投递的追加消息。旧版 daemon 留下的 `queue.json` 在启动时一次性导入内存（按 `daemon_restarted` 暂停）并删除。能力 `backendQueueControl: true`（恒为 true）表示还支持 `conversation.queue.pause`、`conversation.queue.take` 与 `add` 的 `paused`。每个会话最多 32 条、序列化后合计 32 MiB，超出返回 `RESOURCE_EXHAUSTED`。
 
 - `conversation.queue.add`：payload 与 `conversation.prompt` 相同，另加 `itemId`（1–200 字节，省略时用命令 `id`）、可选 `front: true`（插到队首）与可选 `paused: true`（入队并以 `user` 暂停，即使会话空闲、队列为空也不开始；队列已被用户持有的暂停占用时保持原因不变）。入队前按 prompt 的规则校验内容、路径与 Skill，不合法立即拒绝。会话空闲且队列为空时直接开始，结果为 `{ "conversationId", "itemId", "status": "started", "turnId" }`；否则入队，结果为 `{ ..., "status": "queued" }`。同一 `itemId` 已在队列中或已投递时幂等返回其状态，不会重复执行。
-- `conversation.queue.remove`（`itemId` 必填，不存在返回 `NOT_FOUND`）、`conversation.queue.pause`、`conversation.queue.clear`、`conversation.queue.resume`、`conversation.queue.list`：payload 为 `{ "conversationId", "itemId"? }`，结果为 `{ "conversationId", "queue": <快照> }`。`resume` 解除暂停，会话空闲时立即开始队首。`pause` 以 `user` 暂停：队列为空时不产生暂停（快照 `paused` 仍为 false），已处于 `turn_cancelled` / `start_failed` / `daemon_restarted` / `user` 暂停时不改原因。
+- `conversation.queue.remove`（`itemId` 必填，不存在返回 `NOT_FOUND`）、`conversation.queue.pause`、`conversation.queue.clear`、`conversation.queue.resume`、`conversation.queue.list`：payload 为 `{ "conversationId", "itemId"? }`，结果为 `{ "conversationId", "queue": <快照> }`。`resume` 解除暂停，会话空闲时立即开始队首。`pause` 以 `user` 暂停：队列为空时不产生暂停（快照 `paused` 仍为 false），已处于 `turn_cancelled` / `start_failed` / `daemon_restarted` / `user` / `scheduled` 暂停时不改原因。
 - `conversation.queue.take`（`itemId` 必填，不存在返回 `NOT_FOUND`；旧版明文会话同 `remove` 可用）：原子移出该项并返回 `{ "conversationId", "itemId", "item": { "id", "text", "content": [<提示内容引用，与入队时一致：text / localImage / image{data,mimeType} / file>], "skills": [{ "resourceId", "name" }] }, "queue": <快照> }`，并追加 `followups.updated`。移出后队列为空则解除暂停（同 `remove`）。
 
 快照为 `{ "items": [{ "id", "text", "status": "queued", "queuedAt", "contentCount", "skills" }], "paused", "pauseReason", "pauseMessage", "resumeAt" }`，不含内联图片数据。每次变化都会追加 `followups.updated` 事件（payload 即快照）；懒加载窗口可能不含最近一次该事件，客户端打开会话或重连后应调用 `conversation.queue.list` 取当前快照。
@@ -397,7 +397,18 @@ Provider 能力中的 `backendQueue: true` 表示 daemon 为该会话保存追�
 - 用尽判定：快照带 `status` 时只有 `status: "rejected"` 算用尽（`allowed` / `allowed_warning` 即使某窗口达到 100 % 也不算）；不带 `status` 时需某窗口 `usedPercent` ≥ 100 且 `isUsingOverage` 不为 `true`。
 - 等待下限：`resumeAt` = max(窗口重置时间, 现在 + 60 秒)，重置时间已过去时也至少等 60 秒。Claude 只在错误文本中给出重置时刻（如 "resets 5:30pm (UTC)"）时，解析出的时刻早于现在但不超过 10 分钟按"现在"处理（再套 60 秒下限），不再顺延到次日或下周。
 - 退避与上限：续写项本身再次因用尽失败时，第 n 次（n 从 1 起）等待 max(重置时间, 现在 + 60 秒 × 2^(n−1))。连续 3 个续写项都因用尽失败后不再插入续写项，队列以 `turn_failed` 暂停（队列为空时也暂停），`pauseMessage` 说明已停止自动续写；任一 turn 以 `turn.completed` 结束时清零，这一暂停也随之解除（窗口已恢复，此前排在其后的项照常开始）。
-- 用户持有的暂停：队列已因 `turn_cancelled` / `start_failed` / `daemon_restarted` / `user` 暂停时（例如暂停期间手动发送的 prompt 遇到额度用尽），续写项照常插到队首，但 `pauseReason` 不变、不设定时器，`resumeAt` 照常下发仅供显示；用户 `resume` 后从续写项开始。
+- 用户持有的暂停：队列已因 `turn_cancelled` / `start_failed` / `daemon_restarted` / `user` / `scheduled` 暂停时（例如暂停期间手动发送的 prompt 遇到额度用尽），续写项照常插到队首，但 `pauseReason` 不变、不设定时器，`resumeAt` 照常下发仅供显示；用户 `resume` 后从续写项开始。
+
+### 定时会话（`conversation.schedule`）
+
+能力 `scheduledConversations: true`（与 `backendQueueControl` 一起恒为 true）表示 daemon 可把会话的追加队列扣留到指定时刻再发送。客户端通常新建会话后调用 `conversation.schedule`，定时期间所有消息都经 `conversation.queue.add` 入队（被扣留）；到点后与普通队列一样派发：开始队首，每个 turn 以 `turn.completed` 结束后开始下一项。扣留的消息与普通队列一样只在 daemon 内存中（见 [history-encryption.md](history-encryption.md) §1），重启即丢失。
+
+- 命令：payload 为 `{ "conversationId", "at": <RFC 3339 时刻> | null }`，结果为 `{ "conversationId", "queue": <快照>, "schedule": { "at", "interrupted"? } | null }`。
+- 设定（`at` 非空）：会话须可写（旧版明文会话返回 `HISTORY_READ_ONLY`）且没有运行中的 turn（否则 `CONFLICT`）；`at` 须晚于现在且不超过 366 天后（否则 `INVALID_REQUEST`）。manifest 记 `schedule: { "at" }`，队列以 `scheduled` 暂停、`resumeAt` 为 `at`（队列为空时也保持暂停）；原有的 `user` 等暂停被取代。对已定时的会话再次调用只改时间。到点（按墙钟时间每 30 秒复核，机器休眠后也会补上）后清除 manifest 的 `schedule`、解除暂停并开始队首；队列为空时只是回到空闲。
+- 取消（`at` 为 `null`）：清除 `schedule`（包括已中断的）。队列为 `scheduled` 暂停时：有消息则改为 `user` 暂停，不发送任何内容；没有消息则解除暂停。归档会话同样取消其定时。删除会话一并丢弃队列，计时器到点后不做任何事。
+- 定时期间：`conversation.queue.add` 即使会话空闲、队列为空也只入队不开始；`conversation.queue.resume` 即「立即发送」，清除 `schedule` 并开始队首；`conversation.queue.clear`（以及 `remove` / `take` 移空队列）只移除消息，保留 `scheduled` 暂停与 `schedule`；`conversation.queue.pause` 不改原因；额度续写也不会解除该暂停。直接的 `conversation.prompt`（以及 `conversation.retry`）返回 `INVALID_REQUEST`：`conversation is scheduled; queue the prompt instead`，旧客户端因此无法绕过扣留。
+- manifest 字段 `schedule: { "at": <RFC 3339>, "interrupted"?: true }`（未定时时省略，`interrupted` 为 `false` 时省略）出现在会话列表、详情、创建/更新结果中，客户端据此在侧栏显示倒计时；它与标题、归档一样随会话列表刷新获得，不产生单独的事件。队列的变化（含到点发送）照常以 `followups.updated` 推送给订阅者。
+- 重启：daemon 启动时把所有仍生效的 `schedule` 标记为 `interrupted: true` 并写回（队列已随重启丢失）。中断的定时不扣留任何消息、没有计时器、不拒绝直接 prompt；客户端显示后由用户重新设定（`conversation.schedule` 给出新的 `at`，同时清除 `interrupted`）或取消。
 
 ### 历史加密密钥（`history.*`）
 

@@ -129,6 +129,28 @@ pub struct ConversationManifest {
     /// `HISTORY_READ_ONLY`. Omitted while `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub legacy_plaintext: bool,
+    /// Scheduled conversation (`conversation.schedule`): its follow-up queue
+    /// is held until `at`. Omitted while unscheduled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ConversationSchedule>,
+}
+
+/// `manifest.schedule`. The held prompts live in daemon memory only, so a
+/// restart marks the schedule `interrupted`: it then holds nothing and has
+/// no timer until the client re-arms or cancels it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSchedule {
+    pub at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
+}
+
+impl ConversationSchedule {
+    /// Holding the queue now: set and not interrupted by a restart.
+    pub fn is_active(&self) -> bool {
+        !self.interrupted
+    }
 }
 
 /// `manifest.titleEnc`: the UTF-8 title sealed under `kid` with history
@@ -167,6 +189,7 @@ impl ConversationManifest {
             storage_version: None,
             history_encrypted_at: None,
             legacy_plaintext: false,
+            schedule: None,
         }
     }
 }

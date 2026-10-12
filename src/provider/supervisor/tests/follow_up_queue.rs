@@ -1381,3 +1381,265 @@ async fn prompt_path_futures_stay_small() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+fn in_ms(ms: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() + chrono::Duration::milliseconds(ms)
+}
+
+async fn schedule_of(
+    supervisor: &ConversationSupervisor,
+    id: &str,
+) -> Option<crate::conversation::ConversationSchedule> {
+    supervisor.get(id).await.unwrap().schedule
+}
+
+#[tokio::test]
+async fn a_scheduled_queue_is_held_until_its_time_then_sent_in_order() {
+    let (root, _store, supervisor, workspace, gate) = gated_fixture("todex-schedule-fire").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    let at = in_ms(400);
+    let (snapshot, schedule) = supervisor
+        .schedule_owned("local", &manifest.id, Some(at))
+        .await
+        .unwrap();
+    assert_eq!(
+        schedule.as_ref().map(|s| (s.at, s.interrupted)),
+        Some((at, false))
+    );
+    assert_eq!(snapshot["paused"], true);
+    assert_eq!(snapshot["pauseReason"], "scheduled");
+    assert_eq!(snapshot["items"], json!([]));
+    assert_eq!(schedule_of(&supervisor, &manifest.id).await, schedule);
+
+    // An idle conversation with an empty scheduled queue holds the add.
+    for (item, text) in [("item-1", "first"), ("item-2", "second")] {
+        assert_eq!(
+            add(&supervisor, &manifest.id, item, queued_prompt(text)).await,
+            FollowUpAddOutcome::Queued
+        );
+    }
+    let error = supervisor
+        .prompt(&manifest.id, "direct".to_owned(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::InvalidRequest(ref message) if message == "conversation is scheduled; queue the prompt instead")
+    );
+    assert!(gate.prompts().is_empty());
+
+    gate.wait_for_prompts(1).await;
+    assert_eq!(gate.prompts(), ["first"]);
+    assert_eq!(schedule_of(&supervisor, &manifest.id).await, None);
+    let (ids, snapshot) = queue_ids(&supervisor, &manifest.id).await;
+    assert_eq!(ids, ["item-2"]);
+    assert_eq!(snapshot["paused"], false);
+    gate.release();
+    gate.wait_for_prompts(2).await;
+    assert_eq!(gate.prompts(), ["first", "second"]);
+    gate.release();
+    wait_until_idle(&supervisor).await;
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_schedule_can_be_moved_and_cancelled() {
+    let (root, _store, supervisor, workspace, gate) = gated_fixture("todex-schedule-move").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    // Moving the time leaves the earlier timer with nothing to do.
+    supervisor
+        .schedule_owned("local", &manifest.id, Some(in_ms(200)))
+        .await
+        .unwrap();
+    add(&supervisor, &manifest.id, "item-1", queued_prompt("first")).await;
+    let later = in_ms(3_600_000);
+    let (snapshot, _) = supervisor
+        .schedule_owned("local", &manifest.id, Some(later))
+        .await
+        .unwrap();
+    assert_eq!(snapshot["pauseReason"], "scheduled");
+    assert_eq!(snapshot["resumeAt"], json!(later));
+    sleep(Duration::from_millis(500)).await;
+    assert!(gate.prompts().is_empty());
+    assert_eq!(
+        schedule_of(&supervisor, &manifest.id).await.unwrap().at,
+        later
+    );
+
+    // Cancelling with items keeps them under a user pause; nothing is sent.
+    let (snapshot, schedule) = supervisor
+        .schedule_owned("local", &manifest.id, None)
+        .await
+        .unwrap();
+    assert_eq!(schedule, None);
+    assert_eq!(snapshot["pauseReason"], "user");
+    assert_eq!(queue_ids(&supervisor, &manifest.id).await.0, ["item-1"]);
+    assert_eq!(schedule_of(&supervisor, &manifest.id).await, None);
+    // Scheduling replaces that user pause.
+    let (snapshot, _) = supervisor
+        .schedule_owned("local", &manifest.id, Some(later))
+        .await
+        .unwrap();
+    assert_eq!(snapshot["pauseReason"], "scheduled");
+    supervisor
+        .queue_remove_owned("local", &manifest.id, "item-1")
+        .await
+        .unwrap();
+    // Cancelling an empty schedule leaves an idle queue.
+    let (snapshot, _) = supervisor
+        .schedule_owned("local", &manifest.id, None)
+        .await
+        .unwrap();
+    assert_eq!(snapshot["paused"], false);
+    assert!(matches!(
+        add(&supervisor, &manifest.id, "item-2", queued_prompt("now")).await,
+        FollowUpAddOutcome::Started(_)
+    ));
+    gate.wait_for_prompts(1).await;
+    // A running conversation cannot be scheduled; a past time is refused.
+    assert!(matches!(
+        supervisor
+            .schedule_owned("local", &manifest.id, Some(later))
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    gate.release();
+    wait_until_idle(&supervisor).await;
+    for at in [in_ms(-1000), in_ms(367 * 24 * 3_600_000)] {
+        assert!(matches!(
+            supervisor
+                .schedule_owned("local", &manifest.id, Some(at))
+                .await,
+            Err(AppError::InvalidRequest(_))
+        ));
+    }
+    assert_eq!(schedule_of(&supervisor, &manifest.id).await, None);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn resume_sends_a_scheduled_queue_now_and_clear_keeps_the_schedule() {
+    let (root, _store, supervisor, workspace, gate) = gated_fixture("todex-schedule-resume").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    supervisor
+        .schedule_owned("local", &manifest.id, Some(in_ms(3_600_000)))
+        .await
+        .unwrap();
+    for item in ["a", "b"] {
+        add(&supervisor, &manifest.id, item, queued_prompt(item)).await;
+    }
+    let snapshot = supervisor
+        .queue_clear_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    assert_eq!(snapshot["items"], json!([]));
+    assert_eq!(snapshot["pauseReason"], "scheduled");
+    assert!(schedule_of(&supervisor, &manifest.id).await.is_some());
+    add(&supervisor, &manifest.id, "c", queued_prompt("c")).await;
+    // A user pause does not displace the schedule.
+    let snapshot = supervisor
+        .queue_pause_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    assert_eq!(snapshot["pauseReason"], "scheduled");
+    assert!(gate.prompts().is_empty());
+
+    supervisor
+        .queue_resume_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    gate.wait_for_prompts(1).await;
+    assert_eq!(gate.prompts(), ["c"]);
+    assert_eq!(schedule_of(&supervisor, &manifest.id).await, None);
+    gate.release();
+    wait_until_idle(&supervisor).await;
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn archiving_or_deleting_ends_a_schedule() {
+    let (root, store, supervisor, workspace, gate) = gated_fixture("todex-schedule-archive").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace.clone(), None, None)
+        .await
+        .unwrap();
+    supervisor
+        .schedule_owned("local", &manifest.id, Some(in_ms(300)))
+        .await
+        .unwrap();
+    add(&supervisor, &manifest.id, "a", queued_prompt("a")).await;
+    let archived = supervisor
+        .update_metadata_owned("local", &manifest.id, None, Some(true))
+        .await
+        .unwrap();
+    assert!(archived.schedule.is_none());
+    let (ids, snapshot) = queue_ids(&supervisor, &manifest.id).await;
+    assert_eq!(ids, ["a"]);
+    assert_eq!(snapshot["pauseReason"], "user");
+
+    let deleted = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    supervisor
+        .schedule_owned("local", &deleted.id, Some(in_ms(300)))
+        .await
+        .unwrap();
+    add(&supervisor, &deleted.id, "b", queued_prompt("b")).await;
+    supervisor.delete_owned("local", &deleted.id).await.unwrap();
+    sleep(Duration::from_millis(600)).await;
+    assert!(gate.prompts().is_empty());
+    assert!(store.get(&deleted.id).await.is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_restart_marks_an_active_schedule_interrupted() {
+    let (root, store, supervisor, workspace, gate) = gated_fixture("todex-schedule-restart").await;
+    let manifest = supervisor
+        .create(ProviderKind::ClaudeCode, workspace, None, None)
+        .await
+        .unwrap();
+    let at = in_ms(3_600_000);
+    supervisor
+        .schedule_owned("local", &manifest.id, Some(at))
+        .await
+        .unwrap();
+    add(&supervisor, &manifest.id, "a", queued_prompt("a")).await;
+
+    let restarted = restarted(&supervisor, &store);
+    restarted.recover_all().await.unwrap();
+    let schedule = schedule_of(&restarted, &manifest.id).await.unwrap();
+    assert_eq!((schedule.at, schedule.interrupted), (at, true));
+    let value = serde_json::to_value(restarted.get(&manifest.id).await.unwrap()).unwrap();
+    assert_eq!(value["schedule"]["interrupted"], true);
+    let snapshot = restarted
+        .queue_list_owned("local", &manifest.id)
+        .await
+        .unwrap();
+    assert_eq!(snapshot["items"], json!([]));
+    assert_eq!(snapshot["paused"], false);
+    // An interrupted schedule holds nothing: direct prompts pass the check.
+    restarted.ensure_not_scheduled(&manifest.id).await.unwrap();
+    // Scheduling again re-arms it.
+    let (_, schedule) = restarted
+        .schedule_owned("local", &manifest.id, Some(at))
+        .await
+        .unwrap();
+    assert!(!schedule.unwrap().interrupted);
+    restarted
+        .schedule_owned("local", &manifest.id, None)
+        .await
+        .unwrap();
+    assert_eq!(schedule_of(&restarted, &manifest.id).await, None);
+    assert!(gate.prompts().is_empty());
+    fs::remove_dir_all(root).unwrap();
+}

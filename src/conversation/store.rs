@@ -1097,6 +1097,23 @@ impl ConversationStore {
         Ok(manifest)
     }
 
+    /// Replaces `manifest.schedule`. `updatedAt` stays: a schedule is not
+    /// conversation activity and must not reorder the list.
+    pub async fn set_schedule(
+        &self,
+        conversation_id: &str,
+        schedule: Option<super::ConversationSchedule>,
+    ) -> Result<ConversationManifest, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        let mut manifest = self.get_unlocked(conversation_id).await?;
+        if manifest.schedule == schedule {
+            return Ok(manifest);
+        }
+        manifest.schedule = schedule;
+        self.persist_manifest_locked(&manifest).await?;
+        Ok(manifest)
+    }
+
     pub async fn delete(&self, conversation_id: &str) -> Result<(), AppError> {
         let _guard = self.lock(conversation_id).await;
         let directory = self.directory(conversation_id)?;

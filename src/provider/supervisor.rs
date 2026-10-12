@@ -719,6 +719,7 @@ impl ConversationSupervisor {
                 );
             }
             self.import_legacy_follow_ups(&manifest.id).await;
+            self.interrupt_schedule(&manifest.id).await;
             if (index + 1) % 25 == 0 || index + 1 == total {
                 tracing::info!(
                     recovered = index + 1,
@@ -1209,6 +1210,12 @@ impl ConversationSupervisor {
             .store
             .update_metadata(&manifest.id, title, archived)
             .await?;
+        // An archived conversation is not sent later; its held items stay
+        // queued under a user pause.
+        if archived == Some(true) && updated.schedule.is_some() {
+            self.cancel_schedule(&manifest.id).await?;
+            return self.store.get(&manifest.id).await;
+        }
         Ok(updated)
     }
 
@@ -1347,6 +1354,7 @@ impl ConversationSupervisor {
     ) -> Result<String, AppError> {
         self.writable_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        self.ensure_not_scheduled(conversation_id).await?;
         let latest = match self
             .store
             .digest(conversation_id, |digest| digest.last_user_message())
@@ -1799,6 +1807,8 @@ impl ConversationSupervisor {
     ) -> Result<String, AppError> {
         self.writable_owned(owner_id, conversation_id).await?;
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        // Queue delivery goes through `prompt_inner` and is not refused.
+        self.ensure_not_scheduled(conversation_id).await?;
         self.prompt_inner(owner_id, conversation_id, prompt).await
     }
 

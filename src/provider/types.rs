@@ -184,6 +184,8 @@ pub struct ProviderCapabilitySnapshot {
     /// The queue also takes `conversation.queue.pause` and `.take`, and
     /// `add` accepts `paused`.
     pub backend_queue_control: bool,
+    /// The queue can be held until a set time (`conversation.schedule`).
+    pub scheduled_conversations: bool,
     #[serde(flatten)]
     pub resident_runtime: Option<ResidentRuntimeCapabilities>,
 }
@@ -249,6 +251,7 @@ impl ProviderSnapshot {
                 follow_up_queue: native_queue,
                 backend_queue: true,
                 backend_queue_control: true,
+                scheduled_conversations: true,
                 resident_runtime: driver.supports_runtime_stop().then_some(
                     ResidentRuntimeCapabilities {
                         runtime_stop: true,

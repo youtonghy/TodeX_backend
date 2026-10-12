@@ -88,6 +88,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.queue.clear"
             | "conversation.queue.resume"
             | "conversation.queue.list"
+            | "conversation.schedule"
             | "conversation.retry"
             | "conversation.resume"
             | "conversation.fork"
@@ -3412,6 +3413,16 @@ async fn dispatch_command_inner(
             };
             Ok(json!({ "conversationId": request.conversation_id, "queue": snapshot }))
         }
+        "conversation.schedule" => {
+            let request: ScheduleRequest = Deserialize::deserialize(&command.payload)?;
+            let (queue, schedule) = state
+                .conversations
+                .schedule_owned(owner_id, &request.conversation_id, request.at)
+                .await?;
+            Ok(json!({
+                "conversationId": request.conversation_id, "queue": queue, "schedule": schedule,
+            }))
+        }
         "conversation.retry" => {
             let request: WsConversationRequest = Deserialize::deserialize(&command.payload)?;
             let turn_id = state
@@ -4062,6 +4073,14 @@ struct SubscribeRequest {
 #[serde(rename_all = "camelCase")]
 struct UnsubscribeRequest {
     conversation_id: String,
+}
+
+/// `conversation.schedule`: `at` is an RFC 3339 instant, or `null` to cancel.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScheduleRequest {
+    conversation_id: String,
+    at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5653,6 +5672,51 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(taken_again.code(), "NOT_FOUND");
+
+        let at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let scheduled = run!(
+            "schedule",
+            "conversation.schedule",
+            json!({ "conversationId": manifest.id, "at": at }),
+        )
+        .unwrap();
+        assert_eq!(scheduled["conversationId"], manifest.id);
+        assert_eq!(scheduled["queue"]["paused"], true);
+        assert_eq!(scheduled["queue"]["pauseReason"], "scheduled");
+        assert!(scheduled["schedule"]["at"].is_string());
+        assert!(scheduled["schedule"].get("interrupted").is_none());
+        let stored = state.conversations.get(&manifest.id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap()["schedule"],
+            scheduled["schedule"]
+        );
+        let refused = run!(
+            "prompt-scheduled",
+            "conversation.prompt",
+            json!({ "conversationId": manifest.id, "text": "now" }),
+        )
+        .unwrap_err();
+        assert_eq!(refused.code(), "INVALID_REQUEST");
+        let past = run!(
+            "schedule-past",
+            "conversation.schedule",
+            json!({ "conversationId": manifest.id, "at": "2020-01-01T00:00:00Z" }),
+        )
+        .unwrap_err();
+        assert_eq!(past.code(), "INVALID_REQUEST");
+        let cancelled = run!(
+            "unschedule",
+            "conversation.schedule",
+            json!({ "conversationId": manifest.id, "at": null }),
+        )
+        .unwrap();
+        assert_eq!(cancelled["schedule"], Value::Null);
+        assert_eq!(cancelled["queue"]["paused"], false);
+        let stored = state.conversations.get(&manifest.id).await.unwrap();
+        assert!(serde_json::to_value(&stored)
+            .unwrap()
+            .get("schedule")
+            .is_none());
         let _ = fs::remove_dir_all(root);
     }
 

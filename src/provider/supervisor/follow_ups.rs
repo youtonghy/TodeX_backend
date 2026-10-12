@@ -13,6 +13,11 @@
 //! queue through `followups.updated` events and the list command; events
 //! never carry inline image data, `take` returns an item with it.
 //!
+//! A scheduled conversation (`conversation.schedule`) holds its queue under
+//! the `scheduled` pause until the set instant, then sends it like any other
+//! queue; its prompts are just as memory-only, so a restart loses them and
+//! marks the manifest's schedule `interrupted`.
+//!
 //! A `queue.json` left by an older daemon is imported once at startup as a
 //! paused queue and deleted, so queued text is never dropped silently.
 
@@ -22,6 +27,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use super::{prepare_prompt_content, ConversationPrompt, ConversationSupervisor};
+use crate::conversation::ConversationSchedule;
 use crate::error::AppError;
 
 /// Items one conversation may hold, matching the clients' former local cap.
@@ -33,6 +39,12 @@ pub(super) const FOLLOW_UP_QUEUE_EVENT: &str = "followups.updated";
 const RATE_LIMITED: &str = "rate_limited";
 /// Pause reason of a queue the user paused.
 const USER_PAUSE: &str = "user";
+/// Pause reason of a scheduled conversation's queue, held until `resume_at`.
+const SCHEDULED: &str = "scheduled";
+/// Farthest ahead a conversation may be scheduled.
+const MAX_SCHEDULE_AHEAD_DAYS: i64 = 366;
+/// A turn started outside the queue would bypass the hold.
+const SCHEDULED_PROMPT_ERROR: &str = "conversation is scheduled; queue the prompt instead";
 /// Item id prefix of the prompt that continues a rate-limited turn.
 const RATE_LIMIT_CONTINUE_PREFIX: &str = "rate-limit-continue-";
 /// Model-facing, so it stays English whatever the client locale: the
@@ -54,6 +66,7 @@ const MAX_RATE_LIMIT_CONTINUATIONS: u32 = 3;
 /// user, so the continuation joins the queue without lifting them.
 const USER_HELD_PAUSES: &[&str] = &[
     USER_PAUSE,
+    SCHEDULED,
     "turn_cancelled",
     "start_failed",
     "daemon_restarted",
@@ -70,8 +83,9 @@ pub(super) struct FollowUpQueue {
     pause_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pause_message: Option<String>,
-    /// When a `rate_limited` pause lifts by itself. Also kept, for display
-    /// only, when a continuation was queued under a pause the user holds.
+    /// When a `rate_limited` or `scheduled` pause lifts by itself. Also kept,
+    /// for display only, when a continuation was queued under a pause the
+    /// user holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_at: Option<DateTime<Utc>>,
     /// Consecutive continuation turns that failed on an exhausted plan
@@ -145,6 +159,18 @@ impl FollowUpQueue {
 
     fn rate_limited(&self) -> bool {
         self.paused && self.pause_reason.as_deref() == Some(RATE_LIMITED)
+    }
+
+    fn scheduled(&self) -> bool {
+        self.paused && self.pause_reason.as_deref() == Some(SCHEDULED)
+    }
+
+    /// Lifts the pause of a queue left empty; a scheduled one keeps waiting
+    /// for its time.
+    fn unpause_if_empty(&mut self) {
+        if self.items.is_empty() && !self.scheduled() {
+            self.unpause();
+        }
     }
 
     fn held_by_user(&self) -> bool {
@@ -264,7 +290,8 @@ impl ConversationSupervisor {
     }
 
     /// Queues `prompt` behind the running turn, or starts it when the
-    /// conversation is idle and nothing waits ahead of it. With `paused` the
+    /// conversation is idle, not scheduled, and nothing waits ahead of it.
+    /// With `paused` the
     /// item is always queued and the queue is paused by the user, so nothing
     /// starts. Re-adding an id that is queued or already delivered is a no-op
     /// reporting its state.
@@ -291,7 +318,7 @@ impl ConversationSupervisor {
             return Ok(FollowUpAddOutcome::Started(turn_id));
         }
         let busy = self.active.contains_key(conversation_id);
-        if !busy && !paused && queue.items.is_empty() {
+        if !busy && !paused && queue.items.is_empty() && !queue.scheduled() {
             return self
                 .prompt_inner(owner_id, conversation_id, prompt)
                 .await
@@ -361,9 +388,7 @@ impl ConversationSupervisor {
         if queue.items.len() == before {
             return Err(AppError::NotFound(format!("follow-up {item_id}")));
         }
-        if queue.items.is_empty() {
-            queue.unpause();
-        }
+        queue.unpause_if_empty();
         self.save_follow_ups(conversation_id, &queue).await?;
         Ok(queue.snapshot())
     }
@@ -384,9 +409,7 @@ impl ConversationSupervisor {
             return Err(AppError::NotFound(format!("follow-up {item_id}")));
         };
         let item = queue.items.remove(index);
-        if queue.items.is_empty() {
-            queue.unpause();
-        }
+        queue.unpause_if_empty();
         let content = serde_json::to_value(&item.request.content)?;
         self.commit_follow_ups(conversation_id, &queue).await?;
         // The item left the queue; failing to announce that must not lose it.
@@ -437,12 +460,13 @@ impl ConversationSupervisor {
         let _request_guard = self.request_gate(conversation_id).lock_owned().await;
         let mut queue = self.load_follow_ups(conversation_id);
         queue.items.clear();
-        queue.unpause();
+        queue.unpause_if_empty();
         self.save_follow_ups(conversation_id, &queue).await?;
         Ok(queue.snapshot())
     }
 
     /// Lifts a pause; an idle conversation starts its head item right away.
+    /// A scheduled queue is sent now, ending the schedule.
     pub async fn queue_resume_owned(
         &self,
         owner_id: &str,
@@ -453,6 +477,9 @@ impl ConversationSupervisor {
             let _request_guard = self.request_gate(conversation_id).lock_owned().await;
             let mut queue = self.load_follow_ups(conversation_id);
             if queue.paused {
+                if queue.scheduled() {
+                    self.store.set_schedule(conversation_id, None).await?;
+                }
                 queue.unpause();
                 self.save_follow_ups(conversation_id, &queue).await?;
             }
@@ -460,6 +487,116 @@ impl ConversationSupervisor {
         };
         self.drain_follow_ups(conversation_id).await;
         Ok(snapshot)
+    }
+
+    /// `conversation.schedule`. With `at` the queue is held under the
+    /// `scheduled` pause until then (replacing a user pause; scheduling again
+    /// just moves the time) and the manifest records the schedule; a
+    /// conversation running a turn cannot be scheduled. Without `at` the
+    /// schedule ends, an interrupted one included: held items stay queued
+    /// under a user pause, so nothing is sent. Returns the queue snapshot
+    /// and the schedule now in effect.
+    pub async fn schedule_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        at: Option<DateTime<Utc>>,
+    ) -> Result<(Value, Option<ConversationSchedule>), AppError> {
+        let Some(at) = at else {
+            self.get_owned(owner_id, conversation_id).await?;
+            let snapshot = self.cancel_schedule(conversation_id).await?;
+            return Ok((snapshot, None));
+        };
+        self.writable_owned(owner_id, conversation_id).await?;
+        let now = Utc::now();
+        if at <= now {
+            return Err(AppError::InvalidRequest(
+                "at must be in the future".to_owned(),
+            ));
+        }
+        if at > now + chrono::Duration::days(MAX_SCHEDULE_AHEAD_DAYS) {
+            return Err(AppError::InvalidRequest(format!(
+                "at must be at most {MAX_SCHEDULE_AHEAD_DAYS} days ahead"
+            )));
+        }
+        let schedule = ConversationSchedule {
+            at,
+            interrupted: false,
+        };
+        let snapshot = {
+            let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+            if self.active.contains_key(conversation_id) {
+                return Err(AppError::Conflict(
+                    "a running conversation cannot be scheduled".to_owned(),
+                ));
+            }
+            let mut queue = self.load_follow_ups(conversation_id);
+            self.store
+                .set_schedule(conversation_id, Some(schedule.clone()))
+                .await?;
+            queue.pause(SCHEDULED, None);
+            queue.resume_at = Some(at);
+            self.save_follow_ups(conversation_id, &queue).await?;
+            queue.snapshot()
+        };
+        self.spawn_schedule_timer(conversation_id, at);
+        Ok((snapshot, Some(schedule)))
+    }
+
+    /// Ends the conversation's schedule. Archiving a conversation does too,
+    /// so its queue is not sent later.
+    pub(super) async fn cancel_schedule(&self, conversation_id: &str) -> Result<Value, AppError> {
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        self.store.set_schedule(conversation_id, None).await?;
+        let mut queue = self.load_follow_ups(conversation_id);
+        if queue.scheduled() {
+            queue.unpause();
+            if queue.holds_items() {
+                queue.pause(USER_PAUSE, None);
+            }
+            self.save_follow_ups(conversation_id, &queue).await?;
+        }
+        Ok(queue.snapshot())
+    }
+
+    /// Refuses a turn started outside the queue while the conversation is
+    /// scheduled. Callers hold the conversation's request gate.
+    pub(super) async fn ensure_not_scheduled(&self, conversation_id: &str) -> Result<(), AppError> {
+        let manifest = self.store.get(conversation_id).await?;
+        if manifest
+            .schedule
+            .as_ref()
+            .is_some_and(ConversationSchedule::is_active)
+        {
+            return Err(AppError::InvalidRequest(SCHEDULED_PROMPT_ERROR.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// The queue lives in memory, so a schedule found at startup lost what it
+    /// held: it is marked interrupted, with no timer, until the client
+    /// schedules again or cancels.
+    pub(super) async fn interrupt_schedule(&self, conversation_id: &str) {
+        let result = async {
+            let manifest = self.store.get(conversation_id).await?;
+            let Some(schedule) = manifest.schedule.filter(ConversationSchedule::is_active) else {
+                return Ok(());
+            };
+            self.store
+                .set_schedule(
+                    conversation_id,
+                    Some(ConversationSchedule {
+                        interrupted: true,
+                        ..schedule
+                    }),
+                )
+                .await
+                .map(drop)
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::error!(conversation_id, error = %error, "failed to mark the schedule interrupted");
+        }
     }
 
     pub async fn queue_list_owned(
@@ -720,13 +857,7 @@ impl ConversationSupervisor {
         let supervisor = self.clone();
         let conversation_id = conversation_id.to_owned();
         tokio::spawn(async move {
-            // `to_std` fails once the reset is in the past.
-            while let Ok(remaining) = (until - Utc::now()).to_std() {
-                if remaining.is_zero() {
-                    break;
-                }
-                tokio::time::sleep(remaining.min(RATE_LIMIT_RECHECK)).await;
-            }
+            sleep_until_wall_clock(until).await;
             supervisor
                 .resume_after_rate_limit(&conversation_id, until)
                 .await;
@@ -756,6 +887,43 @@ impl ConversationSupervisor {
             Ok(false) => {}
             Err(error) => {
                 tracing::error!(conversation_id, error = %error, "failed to resume the follow-up queue after a rate limit");
+            }
+        }
+    }
+
+    fn spawn_schedule_timer(&self, conversation_id: &str, at: DateTime<Utc>) {
+        let supervisor = self.clone();
+        let conversation_id = conversation_id.to_owned();
+        tokio::spawn(async move {
+            sleep_until_wall_clock(at).await;
+            supervisor.send_scheduled(&conversation_id, at).await;
+        });
+    }
+
+    /// The schedule for `at` is due: it ends and the queue is sent. A queue
+    /// that was rescheduled, cancelled, sent early or deleted in the meantime
+    /// is left alone.
+    async fn send_scheduled(&self, conversation_id: &str, at: DateTime<Utc>) {
+        if self.is_shutting_down() {
+            return;
+        }
+        let result = async {
+            let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+            let mut queue = self.load_follow_ups(conversation_id);
+            if !queue.scheduled() || queue.resume_at != Some(at) {
+                return Ok(false);
+            }
+            self.store.set_schedule(conversation_id, None).await?;
+            queue.unpause();
+            self.save_follow_ups(conversation_id, &queue).await?;
+            Ok::<_, AppError>(true)
+        }
+        .await;
+        match result {
+            Ok(true) => self.drain_follow_ups(conversation_id).await,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(conversation_id, error = %error, "failed to send the scheduled queue");
             }
         }
     }
@@ -792,6 +960,19 @@ impl ConversationSupervisor {
         if let Err(error) = result {
             tracing::error!(conversation_id, error = %error, "failed to settle the rate-limit wait");
         }
+    }
+}
+
+/// Sleeps until the wall clock reaches `until`, re-reading it at least every
+/// [`RATE_LIMIT_RECHECK`] because monotonic timers stop while the machine
+/// sleeps.
+async fn sleep_until_wall_clock(until: DateTime<Utc>) {
+    // `to_std` fails once `until` is in the past.
+    while let Ok(remaining) = (until - Utc::now()).to_std() {
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(remaining.min(RATE_LIMIT_RECHECK)).await;
     }
 }
 

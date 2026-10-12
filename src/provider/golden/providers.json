@@ -42,7 +42,8 @@
       "liveConfiguration": false,
       "followUpQueue": false,
       "backendQueue": true,
-      "backendQueueControl": true
+      "backendQueueControl": true,
+      "scheduledConversations": true
     },
     "models": []
   },
@@ -108,7 +109,8 @@
       "liveConfiguration": false,
       "followUpQueue": false,
       "backendQueue": true,
-      "backendQueueControl": true
+      "backendQueueControl": true,
+      "scheduledConversations": true
     },
     "models": []
   },
@@ -158,6 +160,7 @@
       "followUpQueue": true,
       "backendQueue": true,
       "backendQueueControl": true,
+      "scheduledConversations": true,
       "runtimeStop": true,
       "sessionCommands": true,
       "extensionMessages": true,
@@ -230,7 +233,8 @@
       "liveConfiguration": false,
       "followUpQueue": false,
       "backendQueue": true,
-      "backendQueueControl": true
+      "backendQueueControl": true,
+      "scheduledConversations": true
     },
     "models": [
       {
@@ -616,7 +620,8 @@
       "liveConfiguration": true,
       "followUpQueue": false,
       "backendQueue": true,
-      "backendQueueControl": true
+      "backendQueueControl": true,
+      "scheduledConversations": true
     },
     "models": []
   },
@@ -664,6 +669,7 @@
       "followUpQueue": false,
       "backendQueue": true,
       "backendQueueControl": true,
+      "scheduledConversations": true,
       "runtimeStop": true,
       "sessionCommands": true,
       "extensionMessages": true,
@@ -727,6 +733,7 @@
       "followUpQueue": false,
       "backendQueue": true,
       "backendQueueControl": true,
+      "scheduledConversations": true,
       "runtimeStop": true,
       "sessionCommands": true,
       "extensionMessages": true,
@@ -786,7 +793,8 @@
       "liveConfiguration": false,
       "followUpQueue": false,
       "backendQueue": true,
-      "backendQueueControl": true
+      "backendQueueControl": true,
+      "scheduledConversations": true
     },
     "models": []
   },
@@ -835,6 +843,7 @@
       "followUpQueue": false,
       "backendQueue": true,
       "backendQueueControl": true,
+      "scheduledConversations": true,
       "runtimeStop": true,
       "sessionCommands": true,
       "extensionMessages": true,
