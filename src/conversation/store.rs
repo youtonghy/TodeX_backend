@@ -7081,6 +7081,10 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Shut down like the server does: a still-dirty manifest leaves the
+        // flush timer to rewrite it after callers drop the store, racing a
+        // restarted store's recovery (Windows denies the replace).
+        store.flush_pending_deltas().await;
         let directory = root.join("conversations").join(&manifest.id);
         (root, store, manifest.id, directory)
     }
