@@ -342,6 +342,7 @@ partial replay approvals, legacy gaps, usage snapshots and status rendering.
 | Claude Code | default / auto / bypassPermissions; runtime eligibility may restrict auto | Native plan permission mode; not an OS sandbox |
 | Pi | Fixed full-access; RPC has no built-in tool approval or sandbox | Unsupported |
 | Grok | Fixed ask through ACP metadata and permission callbacks | Unsupported |
+| DeepSeek Harness | ask: each ACP permission request is forwarded; auto / full-access: approved client-side (dsh offers one-shot options only) | Unsupported (no ACP modes) |
 | Generic ACP | Fixed ask; native permission requests are forwarded | Unsupported until a profile advertises an integrated mode |
 
 Prompt requests accept optional `permissionMode` (`ask`, `auto`, `full-access`) and
