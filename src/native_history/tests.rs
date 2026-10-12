@@ -605,6 +605,7 @@ fn fake_cli(fixture: &Fixture, name: &str, body: &str) -> String {
     path.display().to_string()
 }
 
+#[cfg(unix)]
 fn log_lines(path: &Path) -> Vec<String> {
     fs::read_to_string(path)
         .unwrap_or_default()
@@ -613,6 +614,7 @@ fn log_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 fn skips(report: &CleanupReport) -> HashMap<String, (String, String)> {
     report
         .skipped
@@ -626,6 +628,7 @@ fn skips(report: &CleanupReport) -> HashMap<String, (String, String)> {
         .collect()
 }
 
+#[cfg(unix)]
 fn codex_rollout(fixture: &Fixture, dir: &str, id: &str, prompt: &str) -> PathBuf {
     let path = fixture
         .roots
@@ -802,6 +805,7 @@ async fn codex_rollouts_are_listed_viewed_and_deleted_through_the_cli() {
     assert_eq!(list(&fixture, NativeProvider::Codex).await["count"], 3);
 }
 
+#[cfg(unix)]
 fn grok_session(fixture: &Fixture, id: &str, summary: Value, updates: &[Value]) -> PathBuf {
     let dir = fixture
         .roots
@@ -820,6 +824,7 @@ fn grok_session(fixture: &Fixture, id: &str, summary: Value, updates: &[Value]) 
     dir
 }
 
+#[cfg(unix)]
 fn grok_update(update: Value) -> Value {
     json!({"timestamp": 1790000000, "method": "session/update", "params": {"sessionId": "s", "update": update}})
 }

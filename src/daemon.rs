@@ -808,6 +808,7 @@ fn find_unrecorded_daemon(_config: &Config) -> Option<DaemonProcess> {
 }
 
 /// Parses `daemon-run` arguments as written by [`daemon_run_args`].
+#[cfg(any(target_os = "linux", test))]
 fn daemon_record_from_args(
     pid: u32,
     executable: PathBuf,

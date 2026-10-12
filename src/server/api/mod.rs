@@ -296,5 +296,6 @@ impl PermissionPolicy for ApiKeyPermissionPolicy {
     }
 }
 
-#[cfg(test)]
+// The fixture runs a Python script as the provider executable.
+#[cfg(all(test, unix))]
 mod tests;
