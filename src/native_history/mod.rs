@@ -1423,7 +1423,30 @@ fn pid_alive(pid: i64) -> bool {
         let result = unsafe { libc::kill(pid, 0) };
         result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows::core::HRESULT;
+        use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: the handle is closed before return and the exit code
+        // points to a writable u32.
+        unsafe {
+            match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid as u32) {
+                Ok(process) => {
+                    let mut code = 0u32;
+                    let result = GetExitCodeProcess(process, &mut code);
+                    let _ = CloseHandle(process);
+                    // An unreadable exit code keeps the session protected.
+                    result.is_err() || code == STILL_ACTIVE.0 as u32
+                }
+                // The process exists but belongs to someone else.
+                Err(error) => error.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0),
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         // No portable check: treat the session as running to be safe.
         true
