@@ -336,6 +336,13 @@ impl DriverRegistry {
                 Arc::new(super::antigravity::AntigravityDriver::new(&config.agent))
                     as Arc<dyn ProviderDriver>,
             ),
+            (
+                ProviderKind::DeepseekHarness,
+                Arc::new(super::deepseek_harness::DeepseekHarnessDriver::new(
+                    &config.agent,
+                    &config.data_dir,
+                )) as Arc<dyn ProviderDriver>,
+            ),
         ]);
         Self {
             drivers: Arc::new(drivers),
@@ -3263,6 +3270,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                dsh_bin: "dsh".to_owned(),
+                dsh_env_allowlist: Vec::new(),
                 antigravity_bin: "agy".to_owned(),
                 antigravity_env_allowlist: Vec::new(),
                 acp_profiles,
@@ -4071,6 +4080,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                dsh_bin: "dsh".to_owned(),
+                dsh_env_allowlist: Vec::new(),
                 antigravity_bin: "agy".to_owned(),
                 antigravity_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
@@ -4121,6 +4132,7 @@ mod tests {
             ManagedCli::Devin,
             ManagedCli::Opencode,
             ManagedCli::Antigravity,
+            ManagedCli::DeepseekHarness,
         ] {
             assert!(!supervisor.has_active_turns_for_cli(cli));
         }
@@ -5121,6 +5133,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: fixture_text.clone(),
                 opencode_env_allowlist: Vec::new(),
+                dsh_bin: fixture_text.clone(),
+                dsh_env_allowlist: Vec::new(),
                 antigravity_bin: fixture_text,
                 antigravity_env_allowlist: Vec::new(),
                 acp_profiles: profiles,
@@ -5391,6 +5405,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                dsh_bin: "dsh".to_owned(),
+                dsh_env_allowlist: Vec::new(),
                 antigravity_bin: "agy".to_owned(),
                 antigravity_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
@@ -5616,6 +5632,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                dsh_bin: "dsh".to_owned(),
+                dsh_env_allowlist: Vec::new(),
                 antigravity_bin: "agy".to_owned(),
                 antigravity_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
@@ -5679,6 +5697,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                dsh_bin: "dsh".to_owned(),
+                dsh_env_allowlist: Vec::new(),
                 antigravity_bin: "agy".to_owned(),
                 antigravity_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),
@@ -5768,7 +5788,7 @@ if [ "$mode" = "--no-auto-update" ]; then
         ;;
     esac
   done
-elif [ "$mode" = "acp" ]; then
+elif [ "$mode" = "acp" ] || [ "$mode" = "--profile" ]; then
   while IFS= read -r line; do
     case "$line" in
       *'"method":"initialize"'*)
@@ -6154,6 +6174,8 @@ done
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                dsh_bin: "dsh".to_owned(),
+                dsh_env_allowlist: Vec::new(),
                 antigravity_bin: "agy".to_owned(),
                 antigravity_env_allowlist: Vec::new(),
                 acp_profiles: BTreeMap::new(),

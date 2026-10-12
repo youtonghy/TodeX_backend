@@ -188,6 +188,7 @@ fn quirks(provider: ProviderKind) -> &'static AcpQuirks {
         ProviderKind::GrokBuild => &super::grok::ACP_QUIRKS,
         ProviderKind::Devin => &super::devin::ACP_QUIRKS,
         ProviderKind::Opencode => &super::opencode::ACP_QUIRKS,
+        ProviderKind::DeepseekHarness => &super::deepseek_harness::ACP_QUIRKS,
         ProviderKind::Acp
         | ProviderKind::Codex
         | ProviderKind::Pi
@@ -915,7 +916,12 @@ async fn run_acp_turn_steps(
 
     let mut state = context.provider_state;
     state.native_session_id = Some(native_session_id.clone());
-    state.recoverable = initialize.agent_capabilities.load_session;
+    // A session is recoverable when a later process can reattach to it.
+    state.recoverable = initialize.agent_capabilities.load_session
+        || (quirks(provider).prefer_resume
+            && initialize_value
+                .pointer("/agentCapabilities/sessionCapabilities/resume")
+                .is_some());
     state.last_error = None;
     sink.save_provider_state(state).await?;
 
@@ -1263,6 +1269,43 @@ fn opencode_control_requests(
         )),
         _ => Err(AppError::Unsupported(
             "OpenCode does not expose native prompt queue controls".to_owned(),
+        )),
+    }
+}
+
+/// DeepSeek Harness: `model` before `reasoning_effort`, because the effort
+/// choices belong to the selected model. dsh has no steering or queue.
+pub(super) fn dsh_control_commands(
+    request: &PendingProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
+    dsh_control_requests(&request.control, session_id)
+}
+
+fn dsh_control_requests(
+    control: &ProviderControl,
+    session_id: &str,
+) -> Result<Vec<(String, Value)>, AppError> {
+    match control {
+        ProviderControl::Configure {
+            model,
+            reasoning_effort,
+        } => Ok([("model", model), ("reasoning_effort", reasoning_effort)]
+            .into_iter()
+            .filter_map(|(id, value)| {
+                value.as_ref().map(|value| {
+                    (
+                        "session/set_config_option".to_owned(),
+                        json!({"sessionId":session_id,"configId":id,"value":value}),
+                    )
+                })
+            })
+            .collect()),
+        ProviderControl::Steer { .. } => Err(AppError::Unsupported(
+            "DeepSeek Harness does not expose mid-turn steering over ACP".to_owned(),
+        )),
+        _ => Err(AppError::Unsupported(
+            "DeepSeek Harness does not expose native prompt queue controls".to_owned(),
         )),
     }
 }
@@ -3273,6 +3316,42 @@ mod tests {
         assert_eq!(usage["input"], 12422);
         assert_eq!(usage["total"], 12466);
         assert!(usage["contextWindow"].is_null());
+    }
+
+    #[test]
+    fn dsh_controls_set_model_before_reasoning_effort() {
+        let commands = dsh_control_requests(
+            &ProviderControl::Configure {
+                model: Some(r#"["deepseek-official","deepseek-v4-pro"]"#.to_owned()),
+                reasoning_effort: Some("max".to_owned()),
+            },
+            "dsh-native",
+        )
+        .unwrap();
+        let configs: Vec<_> = commands
+            .iter()
+            .map(|(method, params)| {
+                assert_eq!(method, "session/set_config_option");
+                assert_eq!(params["sessionId"], "dsh-native");
+                params["configId"].as_str().unwrap()
+            })
+            .collect();
+        assert_eq!(configs, ["model", "reasoning_effort"]);
+        assert_eq!(
+            commands[0].1["value"],
+            r#"["deepseek-official","deepseek-v4-pro"]"#
+        );
+        for control in [
+            ProviderControl::Steer {
+                text: "redirect".to_owned(),
+            },
+            ProviderControl::QueueList,
+        ] {
+            assert!(matches!(
+                dsh_control_requests(&control, "dsh-native"),
+                Err(AppError::Unsupported(_))
+            ));
+        }
     }
 
     #[test]

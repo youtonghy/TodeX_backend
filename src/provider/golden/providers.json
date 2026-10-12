@@ -789,5 +789,67 @@
       "backendQueueControl": true
     },
     "models": []
+  },
+  {
+    "id": "deepseek-harness",
+    "displayName": "DeepSeek Harness",
+    "available": false,
+    "unavailableReason": "executable '/nonexistent/todex-golden/dsh' was not found; install it with `npm install -g @deepseek-ai/dsh` (requires Node.js)",
+    "profiles": [],
+    "capabilities": {
+      "permissionConfig": {
+        "modes": [
+          "ask",
+          "auto",
+          "full-access"
+        ],
+        "defaultMode": "ask",
+        "supportsPlan": false,
+        "sandboxModes": [],
+        "approvalPolicies": [],
+        "permissionProfiles": [],
+        "enforcement": "agent-policy",
+        "description": "dsh asks for each gated tool over ACP; ask mediates every request, auto/full-access approve client-side"
+      },
+      "nativeFork": false,
+      "nativeCompact": false,
+      "nativeResume": true,
+      "cancel": true,
+      "permissions": true,
+      "toolEvents": true,
+      "nativeSkills": false,
+      "nativeMcp": true,
+      "managedMcp": true,
+      "modelSelection": true,
+      "imageInput": false,
+      "imageInputMode": "profile",
+      "controlActions": [
+        "steer",
+        "cancel",
+        "interrupt",
+        "followUp",
+        "retry"
+      ],
+      "steering": true,
+      "liveConfiguration": true,
+      "followUpQueue": false,
+      "backendQueue": true,
+      "backendQueueControl": true,
+      "runtimeStop": true,
+      "sessionCommands": true,
+      "extensionMessages": true,
+      "extensionUi": [
+        "select",
+        "confirm",
+        "input",
+        "editor",
+        "notify",
+        "setStatus",
+        "setWidget",
+        "setTitle",
+        "set_editor_text"
+      ]
+    },
+    "models": []
   }
 ]

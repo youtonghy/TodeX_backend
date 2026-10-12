@@ -1298,5 +1298,151 @@
     "mode=bogus work=plan profile=- sandbox=danger-full-access approval=on-request": {
       "error": "unsupported capability: antigravity does not support permission mode bogus"
     }
+  },
+  "deepseek-harness": {
+    "mode=- work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=- work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=- work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=- work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=- work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=- work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=- work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=ask work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "ask",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=ask work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=ask work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=ask work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=ask work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=ask work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=auto work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "auto",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=auto work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=auto work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=auto work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=auto work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=auto work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=full-access work=- profile=- sandbox=- approval=-": {
+      "permissionMode": "full-access",
+      "workMode": "implement",
+      "approvalsReviewer": null,
+      "sandboxMode": null,
+      "approvalPolicy": null,
+      "providerMode": null,
+      "source": "provider-default"
+    },
+    "mode=full-access work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not expose sandbox or approval overrides"
+    },
+    "mode=full-access work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=full-access work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=bogus work=- profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not support permission mode bogus"
+    },
+    "mode=bogus work=- profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not support permission mode bogus"
+    },
+    "mode=bogus work=plan profile=- sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=read-only sandbox=- approval=-": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=- sandbox=workspace-write approval=never": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    },
+    "mode=bogus work=plan profile=- sandbox=danger-full-access approval=on-request": {
+      "error": "unsupported capability: deepseek-harness does not support Plan mode"
+    }
   }
 }

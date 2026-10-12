@@ -32,6 +32,7 @@ pub enum ManagedCli {
     Devin,
     Opencode,
     Antigravity,
+    DeepseekHarness,
 }
 
 impl ManagedCli {
@@ -44,6 +45,7 @@ impl ManagedCli {
             Self::Devin => "devin",
             Self::Opencode => "opencode",
             Self::Antigravity => "antigravity",
+            Self::DeepseekHarness => "deepseek-harness",
         }
     }
 
@@ -56,6 +58,7 @@ impl ManagedCli {
             Self::Devin => "Devin",
             Self::Opencode => "OpenCode",
             Self::Antigravity => "Antigravity CLI",
+            Self::DeepseekHarness => "DeepSeek Harness",
         }
     }
 
@@ -68,6 +71,7 @@ impl ManagedCli {
             Self::Devin => ProviderKind::Devin,
             Self::Opencode => ProviderKind::Opencode,
             Self::Antigravity => ProviderKind::Antigravity,
+            Self::DeepseekHarness => ProviderKind::DeepseekHarness,
         }
     }
 
@@ -80,6 +84,7 @@ impl ManagedCli {
             Self::Devin => &config.agent.devin_bin,
             Self::Opencode => &config.agent.opencode_bin,
             Self::Antigravity => &config.agent.antigravity_bin,
+            Self::DeepseekHarness => &config.agent.dsh_bin,
         }
     }
 
@@ -92,7 +97,27 @@ impl ManagedCli {
             Self::Devin => &["update"],
             Self::Opencode => &["upgrade"],
             Self::Antigravity => &["update"],
+            // No self-update command; `npm_package` reinstalls instead.
+            Self::DeepseekHarness => &[],
         }
+    }
+
+    /// The npm package for CLIs distributed only through npm. Both install
+    /// and upgrade run `npm install -g <package>@latest`.
+    fn npm_package(self) -> Option<&'static str> {
+        match self {
+            Self::DeepseekHarness => Some("@deepseek-ai/dsh"),
+            _ => None,
+        }
+    }
+
+    /// Whether TodeX can install this CLI here: a vendor script on Unix, or
+    /// npm on PATH for npm-distributed CLIs.
+    fn install_available(self) -> bool {
+        if self.npm_package().is_some() {
+            return cfg!(unix) && executable_available("npm");
+        }
+        self.install_script().is_some()
     }
 
     /// The vendor's documented `curl | bash` installer. Each script installs
@@ -140,6 +165,7 @@ impl ManagedCli {
                 shell: "bash",
                 env: &[],
             },
+            Self::DeepseekHarness => return None,
         })
     }
 }
@@ -236,7 +262,7 @@ impl CliManager {
         if let Some(cached) = self.cached_versions().await {
             return self.with_active_operation(cached).await;
         }
-        let (codex, pi, claude, grok, devin, opencode, antigravity) = tokio::join!(
+        let (codex, pi, claude, grok, devin, opencode, antigravity, dsh) = tokio::join!(
             inspect_cli(config, ManagedCli::Codex),
             inspect_cli(config, ManagedCli::Pi),
             inspect_cli(config, ManagedCli::ClaudeCode),
@@ -244,8 +270,9 @@ impl CliManager {
             inspect_cli(config, ManagedCli::Devin),
             inspect_cli(config, ManagedCli::Opencode),
             inspect_cli(config, ManagedCli::Antigravity),
+            inspect_cli(config, ManagedCli::DeepseekHarness),
         );
-        let mut clis = vec![codex, pi, claude, grok, devin, opencode, antigravity];
+        let mut clis = vec![codex, pi, claude, grok, devin, opencode, antigravity, dsh];
         clis.extend(config.agent.acp_profiles.keys().map(|name| CliVersionInfo {
             id: format!("acp:{name}"),
             name: name.clone(),
@@ -392,6 +419,10 @@ pub async fn run_upgrade(
     config: &Config,
     provider: ManagedCli,
 ) -> Result<Option<String>, AppError> {
+    if provider.npm_package().is_some() {
+        run_npm_install(config, provider).await?;
+        return current_version(config, provider).await;
+    }
     let binary = provider.binary(config);
     let cwd = &config.data_dir;
     let help = run_command(binary, &["--help"], cwd, VERSION_TIMEOUT).await?;
@@ -413,6 +444,14 @@ pub async fn run_install(
     config: &Config,
     provider: ManagedCli,
 ) -> Result<Option<String>, AppError> {
+    if provider.npm_package().is_some() {
+        run_npm_install(config, provider).await?;
+        return current_version(config, provider).await.and_then(|version| {
+            version
+                .map(Some)
+                .ok_or_else(|| not_found_after_install(config, provider))
+        });
+    }
     let script = provider.install_script().ok_or_else(|| {
         AppError::Unsupported(format!(
             "{} cannot be installed from TodeX on this platform",
@@ -446,12 +485,52 @@ pub async fn run_install(
             Ok(version)
         }
         (Err(_), Some(error)) => Err(error),
-        (Err(_), None) => Err(AppError::ProviderUnavailable(format!(
-            "{} was installed but '{}' is still not found; set its path in the TodeX config",
-            provider.name(),
-            provider.binary(config)
-        ))),
+        (Err(_), None) => Err(not_found_after_install(config, provider)),
     }
+}
+
+fn not_found_after_install(config: &Config, provider: ManagedCli) -> AppError {
+    AppError::ProviderUnavailable(format!(
+        "{} was installed but '{}' is still not found; set its path in the TodeX config",
+        provider.name(),
+        provider.binary(config)
+    ))
+}
+
+/// `npm install -g <package>@latest`. The package name is a constant, so no
+/// request input reaches npm.
+async fn run_npm_install(config: &Config, provider: ManagedCli) -> Result<(), AppError> {
+    let package = provider.npm_package().ok_or_else(|| {
+        AppError::Unsupported(format!(
+            "{} is not distributed through npm",
+            provider.name()
+        ))
+    })?;
+    if !provider.install_available() {
+        return Err(AppError::Unsupported(format!(
+            "{} needs npm on PATH to install or upgrade from TodeX",
+            provider.name()
+        )));
+    }
+    let mut spec = CommandSpec::new("npm", &config.data_dir);
+    spec.args = npm_install_args(package);
+    spec.detach_terminal = true;
+    let output = run_bounded_command(&spec, MAX_OUTPUT_BYTES, INSTALL_TIMEOUT).await?;
+    if output.success {
+        Ok(())
+    } else {
+        Err(install_failure(provider, &output.stderr, &output.stdout))
+    }
+}
+
+fn npm_install_args(package: &str) -> Vec<String> {
+    vec![
+        "install".to_owned(),
+        "--global".to_owned(),
+        "--no-fund".to_owned(),
+        "--no-audit".to_owned(),
+        format!("{package}@latest"),
+    ]
 }
 
 /// The installer's last non-empty output line, which is where these scripts
@@ -513,7 +592,7 @@ async fn inspect_cli(config: &Config, provider: ManagedCli) -> CliVersionInfo {
             latest_version,
             status: "notInstalled".to_owned(),
             upgrade_supported: false,
-            install_supported: config.security.enable_auth && provider.install_script().is_some(),
+            install_supported: config.security.enable_auth && provider.install_available(),
             error: None,
         };
     }
@@ -543,7 +622,9 @@ async fn inspect_cli(config: &Config, provider: ManagedCli) -> CliVersionInfo {
         current_version,
         latest_version,
         status: status.to_owned(),
-        upgrade_supported: installed && config.security.enable_auth,
+        upgrade_supported: installed
+            && config.security.enable_auth
+            && (provider.npm_package().is_none() || provider.install_available()),
         install_supported: false,
         error,
     }
@@ -609,6 +690,10 @@ async fn latest_version(config: &Config, provider: ManagedCli) -> Result<Option<
             "version",
         ),
         ManagedCli::Opencode => ("https://registry.npmjs.org/opencode-ai/latest", "version"),
+        ManagedCli::DeepseekHarness => (
+            "https://registry.npmjs.org/@deepseek-ai%2fdsh/latest",
+            "version",
+        ),
         // The per-platform manifest the official installer and `agy update` read.
         ManagedCli::Antigravity => {
             antigravity_manifest = antigravity_manifest_url();
@@ -776,7 +861,8 @@ fn user_facing_error(error: &AppError) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_versions, extract_version, strip_ansi, CliManager, CliOperationAction, ManagedCli,
+        compare_versions, extract_version, npm_install_args, strip_ansi, CliManager,
+        CliOperationAction, ManagedCli, ProviderKind,
     };
 
     #[test]
@@ -789,6 +875,25 @@ mod tests {
             extract_version("v2.1.259 (Claude Code)"),
             Some("2.1.259".to_owned())
         );
+    }
+
+    #[test]
+    fn deepseek_harness_installs_and_upgrades_through_fixed_npm_command() {
+        let cli = ManagedCli::DeepseekHarness;
+        assert_eq!(cli.provider_kind(), ProviderKind::DeepseekHarness);
+        assert!(cli.install_script().is_none());
+        assert!(cli.upgrade_args().is_empty());
+        assert_eq!(
+            npm_install_args(cli.npm_package().unwrap()),
+            [
+                "install",
+                "--global",
+                "--no-fund",
+                "--no-audit",
+                "@deepseek-ai/dsh@latest"
+            ]
+        );
+        assert!(ManagedCli::Opencode.npm_package().is_none());
     }
 
     #[test]

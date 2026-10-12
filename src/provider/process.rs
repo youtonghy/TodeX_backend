@@ -718,6 +718,8 @@ fn user_install_dirs() -> Vec<PathBuf> {
             home.join(".grok").join("bin"),
             home.join(".opencode").join("bin"),
             home.join(".pi").join("agent").join("bin"),
+            // npm's documented user prefix for `npm install -g` without root.
+            home.join(".npm-global").join("bin"),
         ]
     }
     #[cfg(not(unix))]

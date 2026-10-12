@@ -5,6 +5,7 @@ pub(crate) mod antigravity;
 mod claude;
 mod cli_manager;
 pub(crate) mod codex;
+mod deepseek_harness;
 mod devin;
 mod discovery;
 mod doctor;

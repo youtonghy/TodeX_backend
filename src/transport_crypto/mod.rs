@@ -757,6 +757,8 @@ mod tests {
                 devin_env_allowlist: Vec::new(),
                 opencode_bin: "opencode".to_owned(),
                 opencode_env_allowlist: Vec::new(),
+                dsh_bin: "dsh".to_owned(),
+                dsh_env_allowlist: Vec::new(),
                 antigravity_bin: "agy".to_owned(),
                 antigravity_env_allowlist: Vec::new(),
                 acp_profiles: Default::default(),

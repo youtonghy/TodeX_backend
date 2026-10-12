@@ -130,6 +130,8 @@ pub struct AgentConfig {
     pub opencode_env_allowlist: Vec<String>,
     pub antigravity_bin: String,
     pub antigravity_env_allowlist: Vec<String>,
+    pub dsh_bin: String,
+    pub dsh_env_allowlist: Vec<String>,
     pub acp_profiles: BTreeMap<String, AcpProfileConfig>,
     /// OpenSSH client used for remote hosts; `ssh-add` is looked up next to it.
     pub ssh_bin: String,
@@ -202,6 +204,8 @@ struct PartialAgentConfig {
     opencode_env_allowlist: Option<Vec<String>>,
     antigravity_bin: Option<String>,
     antigravity_env_allowlist: Option<Vec<String>>,
+    dsh_bin: Option<String>,
+    dsh_env_allowlist: Option<Vec<String>>,
     acp_profiles: Option<BTreeMap<String, AcpProfileConfig>>,
     ssh_bin: Option<String>,
     provider_idle_timeout_minutes: Option<u64>,
@@ -409,6 +413,15 @@ impl Config {
                 antigravity_env_allowlist: env_list("TODEX_AGENTD_ANTIGRAVITY_ENV_ALLOWLIST")
                     .or(agent_file.antigravity_env_allowlist)
                     .unwrap_or(defaults.agent.antigravity_env_allowlist),
+                dsh_bin: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_DSH_BIN").ok(),
+                    agent_file.dsh_bin,
+                    defaults.agent.dsh_bin,
+                ),
+                dsh_env_allowlist: env_list("TODEX_AGENTD_DSH_ENV_ALLOWLIST")
+                    .or(agent_file.dsh_env_allowlist)
+                    .unwrap_or(defaults.agent.dsh_env_allowlist),
                 acp_profiles: agent_file
                     .acp_profiles
                     .unwrap_or(defaults.agent.acp_profiles),
@@ -614,6 +627,8 @@ impl Default for Config {
                 opencode_env_allowlist: default_opencode_env_allowlist(),
                 antigravity_bin: "agy".to_owned(),
                 antigravity_env_allowlist: default_antigravity_env_allowlist(),
+                dsh_bin: "dsh".to_owned(),
+                dsh_env_allowlist: default_dsh_env_allowlist(),
                 acp_profiles: BTreeMap::new(),
                 provider_idle_timeout_minutes: DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
             },
@@ -732,6 +747,11 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
         replace_some!(
             base_agent.antigravity_env_allowlist,
             overlay_agent.antigravity_env_allowlist
+        );
+        replace_some!(base_agent.dsh_bin, overlay_agent.dsh_bin);
+        replace_some!(
+            base_agent.dsh_env_allowlist,
+            overlay_agent.dsh_env_allowlist
         );
         replace_some!(base_agent.acp_profiles, overlay_agent.acp_profiles);
         replace_some!(
@@ -853,6 +873,18 @@ fn default_opencode_env_allowlist() -> Vec<String> {
         "OPENCODE_DISABLE_PROJECT_CONFIG",
         "OPENCODE_EXPERIMENTAL",
         "OPENCODE_PERMISSION",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn default_dsh_env_allowlist() -> Vec<String> {
+    [
+        "DSH_HOME",
+        "DEEPSEEK_API_KEY",
+        "DEEPSEEK_BASE_URL",
+        "DEEPSEEK_SEARCH_BASE_URL",
     ]
     .into_iter()
     .map(str::to_owned)
