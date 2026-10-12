@@ -6,13 +6,14 @@ Reference: [Official model guidance — prompting best practices](https://develo
 
 - Complete the requested outcome within scope. Infer routine details from the repository and conversation; preserve unrelated behavior. Define success by the requested behavior, constraints, and verification evidence.
 - Treat action requests (for example, “can you…”, “I want to…”, or “help me…”) as instructions to do the work. Continue through implementation, appropriate verification, and delivery; a plan or capability acknowledgement is not completion.
+- Before starting a task that spans modules or repositories, changes product behavior, public interfaces/APIs (including `docs/API.md`), or data schemas/migrations, touches security, authentication, or permissions, or carries compatibility or deployment risk, invoke the `plan-gate` skill: investigate read-only, present its full plan, and wait for the user to approve or amend it before implementing. For these gated tasks, the approved plan is the reviewable result and authorization covers investigation and planning until approval. Simple, localized, low-risk changes proceed directly without the gate.
 - Proceed with routine, reversible work already authorized by the task. Ask only for missing decisions that materially change the outcome and cannot be inferred, or for authorization not already provided. Prepare a concrete, reviewable result before requesting final approval; continue independent work while waiting. Silence is not approval.
 - Carry forward prior authorization, constraints, and completed work. Apply follow-up corrections to the active task; answer side questions and then resume unless the user cancels or replaces it.
 
 ## Instruction handling
 
 - Follow system and developer instructions first, then explicit user instructions, then applicable repository and skill guidance. Read instructions governing the changed paths and load relevant skills; resolve stale or conflicting guidance against that priority.
-- Do not turn routine choices or hypothetical risks into approval gates. If a file or skill causes a pause or departure from the user's intent, link the exact file, quote the rule, and explain its applicability. Distinguish the requirement from your interpretation.
+- Apart from the `plan-gate` rule above, do not turn routine choices or hypothetical risks into approval gates. If a file or skill causes a pause or departure from the user's intent, link the exact file, quote the rule, and explain its applicability. Distinguish the requirement from your interpretation.
 - When editing prompts or guidance, remove redundant or conflicting rules. Define outcomes, constraints, evidence, and completion criteria; prescribe a sequence only when order matters.
 
 ## Communication
