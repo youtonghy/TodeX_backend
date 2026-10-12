@@ -164,6 +164,11 @@ impl AgentDirs {
         }
     }
 
+    /// Pi's agent directory (`$PI_CODING_AGENT_DIR` or `~/.pi/agent`).
+    pub(crate) fn pi_dir(&self) -> &std::path::Path {
+        &self.pi_dir
+    }
+
     /// Claude Code's config directory (`$CLAUDE_CONFIG_DIR` or `~/.claude`).
     pub(crate) fn claude_dir(&self) -> &std::path::Path {
         &self.claude_dir
