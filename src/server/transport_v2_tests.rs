@@ -2,6 +2,7 @@
 //! real socket, and the `/v2/sealed` tunnel through the real router.
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body, Bytes};
@@ -1229,6 +1230,18 @@ fn first_record(sealed: &SealedRequest) -> Vec<u8> {
     sealed.body[..4 + length].to_vec()
 }
 
+/// Waits until stalled requests hold every permit of `pool`, so a fixed
+/// sleep does not race them on slow runners.
+async fn exhausted(pool: &tokio::sync::Semaphore) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pool.available_permits() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("stalled requests never took every permit");
+}
+
 #[tokio::test]
 async fn tunnel_admission_bounds_time_and_keeps_public_and_signed_pools_apart() {
     let server = TestServer::start(PairingEncryption::X25519).await;
@@ -1246,7 +1259,15 @@ async fn tunnel_admission_bounds_time_and_keeps_public_and_signed_pools_apart() 
         idle_timeout: Duration::from_millis(800),
         permit_wait: Duration::from_millis(200),
     };
-    let app = super::sealed::routes_with_limits(api, server.state.clone(), limits, 1);
+    let signed_pool = Arc::new(tokio::sync::Semaphore::new(1));
+    let public_pool = Arc::new(tokio::sync::Semaphore::new(super::sealed::PUBLIC_PERMITS));
+    let app = super::sealed::routes_with_limits(
+        api,
+        server.state.clone(),
+        limits,
+        signed_pool.clone(),
+        public_pool.clone(),
+    );
     let peer: SocketAddr = "192.0.2.21:7001".parse().unwrap();
     let send = |sealed: &SealedRequest, body: Body| {
         let mut request = Request::builder()
@@ -1314,7 +1335,7 @@ async fn tunnel_admission_bounds_time_and_keeps_public_and_signed_pools_apart() 
         &signed_inner(&device, "PUT", "/probe", &large),
     );
     let held = tokio::spawn(send(&holder, stalled_body(&first_record(&holder))));
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    exhausted(&signed_pool).await;
     let inner = signed_inner(&device, "POST", "/probe", b"once");
     let busy = seal_request(&keys, protocol, &inner);
     let opened = open(
@@ -1369,7 +1390,7 @@ async fn tunnel_admission_bounds_time_and_keeps_public_and_signed_pools_apart() 
         let body = stalled_body(&first_record(&sealed));
         stalled.push(tokio::spawn(send(&sealed, body)));
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    exhausted(&public_pool).await;
     let fifth = seal_request(&keys, protocol, &version);
     let opened = open(
         send(&fifth, Body::from(fifth.body.clone())).await.unwrap(),

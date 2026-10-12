@@ -545,7 +545,10 @@ mod tests {
         let mut config = crate::config::Config::default().agent;
         config.dsh_bin = "dsh-test".to_owned();
         let driver = DeepseekHarnessDriver::new(&config, &root);
-        let patch = root.join("providers/deepseek-harness/todex.patch.yml");
+        let patch = root
+            .join("providers")
+            .join("deepseek-harness")
+            .join("todex.patch.yml");
         std::fs::create_dir_all(patch.parent().unwrap()).unwrap();
         std::fs::write(&patch, "- id: session-log-deepseek\n  disabled: false\n").unwrap();
         let spec = driver.command_spec(&root).unwrap();

@@ -62,7 +62,7 @@ const PUBLIC_INNER_BODY_MAX: usize = 64 * 1024;
 const AUTHENTICATED_PERMITS: usize = 32;
 /// The same for public inner routes (no credential): a separate, small pool,
 /// so anonymous peers cannot take slots from paired devices.
-const PUBLIC_PERMITS: usize = 4;
+pub(super) const PUBLIC_PERMITS: usize = 4;
 
 /// Time limits that keep a tunnel request from holding the daemon.
 #[derive(Clone, Copy, Debug)]
@@ -129,15 +129,22 @@ struct SealedState {
 }
 
 pub(super) fn routes(api: Router, state: AppState) -> Router {
-    routes_with_limits(api, state, TunnelLimits::default(), AUTHENTICATED_PERMITS)
+    routes_with_limits(
+        api,
+        state,
+        TunnelLimits::default(),
+        Arc::new(Semaphore::new(AUTHENTICATED_PERMITS)),
+        Arc::new(Semaphore::new(PUBLIC_PERMITS)),
+    )
 }
 
-/// [`routes`] with explicit limits and authenticated pool size (tests).
+/// [`routes`] with explicit limits and permit pools (tests).
 pub(super) fn routes_with_limits(
     api: Router,
     state: AppState,
     limits: TunnelLimits,
-    authenticated_permits: usize,
+    authenticated_permits: Arc<Semaphore>,
+    public_permits: Arc<Semaphore>,
 ) -> Router {
     Router::new()
         .route(SEALED_PATH, post(sealed))
@@ -145,8 +152,8 @@ pub(super) fn routes_with_limits(
             api,
             state,
             limits,
-            authenticated_permits: Arc::new(Semaphore::new(authenticated_permits)),
-            public_permits: Arc::new(Semaphore::new(PUBLIC_PERMITS)),
+            authenticated_permits,
+            public_permits,
         })
 }
 
