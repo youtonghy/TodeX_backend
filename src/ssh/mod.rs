@@ -228,10 +228,17 @@ impl SshService {
         let dir = data_dir.join("ssh");
         let control_dir = dir.join(CONTROL_DIR);
         {
+            // The parent holds the managed config, host store and control
+            // sockets, so it is owner-only too (also tightening older data
+            // directories created with the default umask).
+            let dir = dir.clone();
             let control_dir = control_dir.clone();
-            tokio::task::spawn_blocking(move || secure_fs::ensure_owner_only_dir(&control_dir))
-                .await
-                .map_err(|error| AppError::Anyhow(error.into()))??;
+            tokio::task::spawn_blocking(move || {
+                secure_fs::ensure_owner_only_dir(&dir)?;
+                secure_fs::ensure_owner_only_dir(&control_dir)
+            })
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
         }
         let store = match tokio::fs::read(dir.join(STORE_FILE)).await {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
@@ -917,6 +924,23 @@ exit 0
             host_name: "10.0.0.5".into(),
             ..ManagedHost::default()
         }
+    }
+
+    #[tokio::test]
+    async fn ssh_data_dir_is_owner_only() {
+        let root = std::env::temp_dir().join(format!("todex-ssh-{}", Uuid::new_v4().simple()));
+        let data = root.join("data");
+        // An older daemon created the directory with the default umask.
+        std::fs::create_dir_all(data.join("ssh")).unwrap();
+        std::fs::set_permissions(data.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _service = SshService::with_home(&data, "ssh".to_owned(), Some(root.join("home")))
+            .await
+            .unwrap();
+        for dir in [data.join("ssh"), data.join("ssh").join(CONTROL_DIR)] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

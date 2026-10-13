@@ -3846,8 +3846,39 @@ pub struct CodexGatewayStore {
 }
 
 impl CodexGatewayStore {
+    /// Opens the store, restricting any existing `codex_gateway` tree (which
+    /// holds session transcripts) to the owner.
     pub fn new(data_dir: PathBuf) -> Self {
+        let root = data_dir.join("codex_gateway");
+        if let Err(error) = restrict_tree_to_owner(&root) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %root.display(),
+                    error = %error,
+                    "failed to restrict CodeX gateway data to the owner"
+                );
+            }
+        }
         Self { data_dir }
+    }
+
+    /// Creates the session directory and its `codex_gateway/sessions`
+    /// parents owner-only (0700).
+    async fn ensure_session_dir(&self, dir: &Path) -> Result<()> {
+        if fs::try_exists(dir).await? {
+            return Ok(());
+        }
+        let root = self.data_dir.join("codex_gateway");
+        let dirs = [root.clone(), root.join("sessions"), dir.to_path_buf()];
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            for dir in dirs {
+                crate::secure_fs::ensure_owner_only_dir(&dir)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))??;
+        Ok(())
     }
 
     pub async fn append_event(
@@ -3860,8 +3891,8 @@ impl CodexGatewayStore {
         let mut state = self.recover_session_locked(session_id).await?;
         let record = CodexGatewayEventRecord::new(session_id, state.last_cursor + 1, event);
         let dir = self.session_dir(session_id);
-        fs::create_dir_all(&dir).await?;
-        let mut file = OpenOptions::new()
+        self.ensure_session_dir(&dir).await?;
+        let mut file = owner_only_options()
             .create(true)
             .append(true)
             .open(dir.join("events.jsonl"))
@@ -3928,8 +3959,15 @@ impl CodexGatewayStore {
 
     async fn save_session_state(&self, state: &CodexGatewaySessionState) -> Result<()> {
         let dir = self.session_dir(&state.session_id);
-        fs::create_dir_all(&dir).await?;
-        fs::write(dir.join("state.json"), serde_json::to_vec_pretty(state)?).await?;
+        self.ensure_session_dir(&dir).await?;
+        let mut file = owner_only_options()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(dir.join("state.json"))
+            .await?;
+        file.write_all(&serde_json::to_vec_pretty(state)?).await?;
+        file.flush().await?;
         Ok(())
     }
 
@@ -3984,6 +4022,30 @@ impl CodexGatewayStore {
             .join("sessions")
             .join(component)
     }
+}
+
+/// Open options that create files owner-only (0600 on Unix).
+fn owner_only_options() -> OpenOptions {
+    #[allow(unused_mut)]
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+}
+
+/// Restricts `root` and everything below it to the owner: directories 0700,
+/// files 0600. Symlinks are neither followed nor changed.
+fn restrict_tree_to_owner(root: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(root)?;
+    if metadata.is_dir() {
+        crate::secure_fs::set_owner_only(root, true)?;
+        for entry in std::fs::read_dir(root)? {
+            restrict_tree_to_owner(&entry?.path())?;
+        }
+    } else if metadata.is_file() {
+        crate::secure_fs::set_owner_only(root, false)?;
+    }
+    Ok(())
 }
 
 fn legacy_session_component(session_id: &str) -> String {
@@ -4401,6 +4463,44 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gateway_store_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let data_dir = std::env::temp_dir().join(format!("todex-gateway-perms-{}", Uuid::new_v4()));
+        let store = CodexGatewayStore::new(data_dir.clone());
+        store
+            .append_event(
+                "session-perms",
+                CodexGatewayEvent::new("codex.test", json!({"text": "secret"})),
+            )
+            .await
+            .unwrap();
+        let root = data_dir.join("codex_gateway");
+        let session = store.session_dir("session-perms");
+        for dir in [root.clone(), root.join("sessions"), session.clone()] {
+            assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+        }
+        for file in [session.join("events.jsonl"), session.join("state.json")] {
+            assert_eq!(mode(&file), 0o600, "{}", file.display());
+        }
+
+        // An existing tree from an older daemon is tightened on startup.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            session.join("events.jsonl"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let _store = CodexGatewayStore::new(data_dir.clone());
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&session), 0o700);
+        assert_eq!(mode(&session.join("events.jsonl")), 0o600);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
 
     #[derive(Default)]
     struct RecordingTransport {

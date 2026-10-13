@@ -834,7 +834,6 @@ async fn fork_claude_transcript(
     workspace: &Path,
     forked_id: &str,
 ) -> Result<(), AppError> {
-    let metadata = tokio::fs::metadata(source_path).await?;
     let raw = tokio::fs::read(source_path).await?;
     let text = String::from_utf8(raw)
         .map_err(|_| AppError::InvalidRequest("Claude transcript is not UTF-8".to_owned()))?;
@@ -859,9 +858,20 @@ async fn fork_claude_transcript(
             "Claude fork destination already exists".to_owned(),
         ));
     }
-    tokio::fs::write(&destination, format!("{}\n", lines.join("\n"))).await?;
-    tokio::fs::set_permissions(&destination, metadata.permissions()).await?;
-    Ok(())
+    // Created new and owner-only from the start: the transcript holds the
+    // conversation, and an existing file is never replaced.
+    let bytes = format!("{}\n", lines.join("\n")).into_bytes();
+    let written = destination.clone();
+    match tokio::task::spawn_blocking(move || crate::secure_fs::create_owner_only(&written, &bytes))
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))?
+    {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(AppError::Conflict(
+            "Claude fork destination already exists".to_owned(),
+        )),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The per-project directory name Claude Code derives from its cwd:
@@ -1349,6 +1359,16 @@ mod tests {
             .unwrap();
 
         let forked_path = super::claude_session_path_at(&root, &workspace, forked).await;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&forked_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the forked transcript is owner-only");
+        }
         let copied = std::fs::read_to_string(&forked_path).unwrap();
         let lines: Vec<&str> = copied.lines().collect();
         assert_eq!(lines.len(), 4);
