@@ -218,6 +218,8 @@ claude_bin = "claude"
 pi_bin = "pi"
 # Provider 连续无输出超过该分钟数时停止当前 turn（0 关闭）
 provider_idle_timeout_minutes = 60
+# 常驻 Provider 进程无 turn 超过该秒数后停止（最小 30）
+provider_keepalive_seconds = 300
 
 [agent.acp_profiles.default]
 command = "mcp-server"

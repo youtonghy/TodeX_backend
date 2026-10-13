@@ -111,7 +111,8 @@ impl OpencodeDriver {
         Self {
             binary: config.opencode_bin.clone(),
             env_allowlist: config.opencode_env_allowlist.clone(),
-            sessions: ResidentSessions::new(&PROFILE, "OpenCode"),
+            sessions: ResidentSessions::new(&PROFILE, "OpenCode")
+                .with_idle_timeout(config.provider_keepalive()),
             discovery: DiscoveryCache::new(),
         }
     }

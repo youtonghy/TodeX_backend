@@ -110,7 +110,8 @@ impl GrokBuildDriver {
             binary: config.grok_bin.clone(),
             auth_method: config.grok_auth_method.clone(),
             env_allowlist: config.grok_env_allowlist.clone(),
-            sessions: ResidentSessions::new(&PROFILE, "Grok"),
+            sessions: ResidentSessions::new(&PROFILE, "Grok")
+                .with_idle_timeout(config.provider_keepalive()),
             models: CatalogCache::new(PROFILE.discovery_cache_ttl),
             commands: CatalogCache::new(PROFILE.discovery_cache_ttl),
         }

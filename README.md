@@ -227,6 +227,8 @@ claude_bin = "claude"
 pi_bin = "pi"
 # Stop a turn whose provider produces no output for this many minutes (0 disables).
 provider_idle_timeout_minutes = 60
+# Stop a resident provider process after this many seconds without a turn (minimum 30).
+provider_keepalive_seconds = 300
 
 [agent.acp_profiles.default]
 command = "mcp-server"

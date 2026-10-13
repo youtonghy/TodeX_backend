@@ -3555,6 +3555,7 @@ mod tests {
             env: BTreeMap::from([("TODEX_TEST_ACP_KEY_3f9b1c".to_owned(), "secret".to_owned())]),
             auth_method: None,
             api_key_env: Some("TODEX_TEST_ACP_KEY_3f9b1c".to_owned()),
+            resident: true,
         };
         let options = profile_runtime_options(&profile).unwrap();
         assert!(options.authenticate);
@@ -3569,6 +3570,7 @@ mod tests {
             env: BTreeMap::new(),
             auth_method: None,
             api_key_env: Some("TODEX_TEST_ACP_MISSING_7c2d4e".to_owned()),
+            resident: true,
         };
         assert!(matches!(
             profile_runtime_options(&profile),
@@ -3591,6 +3593,7 @@ mod tests {
             env: BTreeMap::new(),
             auth_method: Some("devin-browser".to_owned()),
             api_key_env: None,
+            resident: true,
         };
         let options = profile_runtime_options(&profile).unwrap();
         assert_eq!(options.auth_timeout, Some(INTERACTIVE_AUTH_TIMEOUT));

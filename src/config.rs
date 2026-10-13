@@ -3,6 +3,8 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Args;
@@ -138,9 +140,40 @@ pub struct AgentConfig {
     /// A running turn whose provider produces no output for this long is
     /// stopped and failed. 0 disables the watchdog.
     pub provider_idle_timeout_minutes: u64,
+    /// How long a resident provider process (Codex, Pi, OpenCode, Grok,
+    /// Devin, DeepSeek Harness, resident ACP profiles) is kept without a
+    /// turn before it is stopped. Read it through
+    /// [`AgentConfig::provider_keepalive`], which applies the minimum.
+    pub provider_keepalive_seconds: u64,
 }
 
 pub const DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES: u64 = 60;
+pub const DEFAULT_PROVIDER_KEEPALIVE_SECONDS: u64 = 300;
+/// Shorter keepalives are raised to this; a process that stops between
+/// quick follow-up turns would pay its whole startup again.
+pub const MIN_PROVIDER_KEEPALIVE_SECONDS: u64 = 30;
+
+/// The keepalive of [`Config::load`], for runtimes built without the config.
+static PROVIDER_KEEPALIVE_SECONDS: AtomicU64 = AtomicU64::new(DEFAULT_PROVIDER_KEEPALIVE_SECONDS);
+
+impl AgentConfig {
+    /// The idle keepalive of resident provider processes, at least
+    /// [`MIN_PROVIDER_KEEPALIVE_SECONDS`].
+    pub fn provider_keepalive(&self) -> Duration {
+        keepalive_duration(self.provider_keepalive_seconds)
+    }
+}
+
+/// The provider keepalive of the configuration the daemon loaded (the
+/// default before [`Config::load`]); for runtimes constructed without an
+/// [`AgentConfig`].
+pub fn provider_keepalive() -> Duration {
+    keepalive_duration(PROVIDER_KEEPALIVE_SECONDS.load(Ordering::Relaxed))
+}
+
+fn keepalive_duration(seconds: u64) -> Duration {
+    Duration::from_secs(seconds.max(MIN_PROVIDER_KEEPALIVE_SECONDS))
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AcpProfileConfig {
@@ -153,6 +186,14 @@ pub struct AcpProfileConfig {
     pub auth_method: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Keep one agent process per conversation between turns (the default);
+    /// `false` starts a process for every turn.
+    #[serde(default = "default_true")]
+    pub resident: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -209,6 +250,7 @@ struct PartialAgentConfig {
     acp_profiles: Option<BTreeMap<String, AcpProfileConfig>>,
     ssh_bin: Option<String>,
     provider_idle_timeout_minutes: Option<u64>,
+    provider_keepalive_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -221,8 +263,13 @@ struct PartialSecurityConfig {
 }
 
 impl Config {
+    /// Loads the configuration a daemon runs with; it also becomes the
+    /// process-wide [`provider_keepalive`].
     pub fn load(args: ServeArgs) -> anyhow::Result<Self> {
-        Self::load_internal(args)
+        let config = Self::load_internal(args)?;
+        PROVIDER_KEEPALIVE_SECONDS
+            .store(config.agent.provider_keepalive_seconds, Ordering::Relaxed);
+        Ok(config)
     }
 
     pub fn load_read_only(args: ServeArgs) -> anyhow::Result<Self> {
@@ -433,6 +480,14 @@ impl Config {
                     agent_file.provider_idle_timeout_minutes,
                     defaults.agent.provider_idle_timeout_minutes,
                 ),
+                provider_keepalive_seconds: coalesce(
+                    None,
+                    env::var("TODEX_AGENTD_PROVIDER_KEEPALIVE_SECONDS")
+                        .ok()
+                        .and_then(|value| value.trim().parse().ok()),
+                    agent_file.provider_keepalive_seconds,
+                    defaults.agent.provider_keepalive_seconds,
+                ),
             },
             security: SecurityConfig {
                 enable_auth,
@@ -631,6 +686,7 @@ impl Default for Config {
                 dsh_env_allowlist: default_dsh_env_allowlist(),
                 acp_profiles: BTreeMap::new(),
                 provider_idle_timeout_minutes: DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
+                provider_keepalive_seconds: DEFAULT_PROVIDER_KEEPALIVE_SECONDS,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -757,6 +813,10 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
         replace_some!(
             base_agent.provider_idle_timeout_minutes,
             overlay_agent.provider_idle_timeout_minutes
+        );
+        replace_some!(
+            base_agent.provider_keepalive_seconds,
+            overlay_agent.provider_keepalive_seconds
         );
     }
     if let Some(overlay_security) = overlay.security {
@@ -1016,12 +1076,14 @@ mod tests {
         ffi::OsString,
         fs,
         path::{Path, PathBuf},
+        time::Duration,
     };
 
     use super::{
         expand_home_with_home, load_file_config, optional_non_empty,
-        warn_retired_history_encryption, Config, PairingEncryption, ServeArgs,
-        DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
+        warn_retired_history_encryption, AgentConfig, Config, PairingEncryption, ServeArgs,
+        DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES, DEFAULT_PROVIDER_KEEPALIVE_SECONDS,
+        MIN_PROVIDER_KEEPALIVE_SECONDS,
     };
     use uuid::Uuid;
 
@@ -1207,6 +1269,48 @@ mod tests {
         if env::var_os("TODEX_AGENTD_PROVIDER_IDLE_TIMEOUT_MINUTES").is_none() {
             assert_eq!(config.agent.provider_idle_timeout_minutes, 0);
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_keepalive_and_acp_resident_parse_with_defaults() {
+        let defaults = Config::default();
+        assert_eq!(
+            defaults.agent.provider_keepalive(),
+            Duration::from_secs(DEFAULT_PROVIDER_KEEPALIVE_SECONDS)
+        );
+        let root = env::temp_dir().join(format!(
+            "todex-config-keepalive-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("config.toml"),
+            "[agent]\nprovider_keepalive_seconds = 900\n\n\
+             [agent.acp_profiles.kept]\ncommand = \"agent\"\n\n\
+             [agent.acp_profiles.per_turn]\ncommand = \"agent\"\nresident = false\n",
+        )
+        .unwrap();
+        let config = Config::load_read_only(ServeArgs {
+            data_dir: Some(root.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        if env::var_os("TODEX_AGENTD_PROVIDER_KEEPALIVE_SECONDS").is_none() {
+            assert_eq!(config.agent.provider_keepalive_seconds, 900);
+            assert_eq!(config.agent.provider_keepalive(), Duration::from_secs(900));
+        }
+        assert!(config.agent.acp_profiles["kept"].resident);
+        assert!(!config.agent.acp_profiles["per_turn"].resident);
+        // Too short a keepalive is raised to the minimum.
+        let agent = AgentConfig {
+            provider_keepalive_seconds: 1,
+            ..config.agent
+        };
+        assert_eq!(
+            agent.provider_keepalive(),
+            Duration::from_secs(MIN_PROVIDER_KEEPALIVE_SECONDS)
+        );
         let _ = fs::remove_dir_all(root);
     }
 

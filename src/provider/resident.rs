@@ -93,6 +93,12 @@ impl ResidentSessions {
         }
     }
 
+    /// Replaces the profile's idle timeout (the configured keepalive).
+    pub(super) fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
     /// Runs a turn on the conversation's session, starting it with `launch`
     /// when none is running. A turn that raced the session's own stop (idle
     /// timeout, discarded process) never reached the agent and is retried

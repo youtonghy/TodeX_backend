@@ -144,7 +144,8 @@ impl DevinDriver {
             api_key_env: config.devin_api_key_env.clone(),
             cli_credentials: cli_credentials_enabled(),
             env_allowlist: config.devin_env_allowlist.clone(),
-            sessions: ResidentSessions::new(&PROFILE, "Devin"),
+            sessions: ResidentSessions::new(&PROFILE, "Devin")
+                .with_idle_timeout(config.provider_keepalive()),
             discovery: DiscoveryCache::new(),
             fork_probe: DiscoveryCache::new(),
         }

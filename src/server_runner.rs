@@ -423,6 +423,7 @@ mod tests {
                 acp_profiles: Default::default(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
+                provider_keepalive_seconds: 300,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -492,6 +493,7 @@ mod tests {
                 acp_profiles: Default::default(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
+                provider_keepalive_seconds: 300,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -568,6 +570,7 @@ mod tests {
                 acp_profiles: Default::default(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
+                provider_keepalive_seconds: 300,
             },
             security: SecurityConfig {
                 enable_auth: true,

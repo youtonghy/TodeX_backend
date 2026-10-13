@@ -52,10 +52,12 @@ fn golden_config(root: &Path, executable: Option<&str>) -> Config {
                     env: BTreeMap::new(),
                     auth_method: None,
                     api_key_env: None,
+                    resident: true,
                 },
             )]),
             ssh_bin: "ssh".to_owned(),
             provider_idle_timeout_minutes: 0,
+            provider_keepalive_seconds: 300,
         },
         security: SecurityConfig {
             enable_auth: true,

@@ -7,7 +7,6 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-const IDLE_TIMEOUT: Duration = super::PROFILE.process_model.idle_timeout().unwrap();
 const MAX_WORKERS: usize = super::PROFILE.process_model.max_sessions().unwrap();
 
 pub(super) struct Sessions {
@@ -152,6 +151,8 @@ fn spawn_worker(binary: String) -> mpsc::Sender<Command> {
 }
 
 async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
+    // `[agent].provider_keepalive_seconds` of the loaded configuration.
+    let idle_timeout = crate::config::provider_keepalive();
     let mut process: Option<JsonLineProcess> = None;
     let mut native_thread = None;
     let mut native_model: Option<String> = None;
@@ -175,7 +176,7 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                         _ => break,
                     }
                 }
-                _ = tokio::time::sleep(IDLE_TIMEOUT) => break,
+                _ = tokio::time::sleep(idle_timeout) => break,
             }
         } else {
             commands.recv().await

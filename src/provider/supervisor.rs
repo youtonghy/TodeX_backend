@@ -3290,6 +3290,7 @@ mod tests {
                     env: BTreeMap::new(),
                     auth_method: None,
                     api_key_env: None,
+                    resident: true,
                 },
             );
         }
@@ -3325,6 +3326,7 @@ mod tests {
                 acp_profiles,
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
+                provider_keepalive_seconds: 300,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -4141,6 +4143,7 @@ mod tests {
                     env: BTreeMap::new(),
                     auth_method: None,
                     api_key_env: None,
+                    resident: true,
                 },
             );
         }
@@ -4172,6 +4175,7 @@ mod tests {
                 acp_profiles: profiles,
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
+                provider_keepalive_seconds: 300,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5195,6 +5199,7 @@ mod tests {
                 env: BTreeMap::new(),
                 auth_method: None,
                 api_key_env: None,
+                resident: true,
             },
         );
         let config = Arc::new(Config {
@@ -5225,6 +5230,7 @@ mod tests {
                 acp_profiles: profiles,
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
+                provider_keepalive_seconds: 300,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5497,6 +5503,7 @@ mod tests {
                 acp_profiles: BTreeMap::new(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
+                provider_keepalive_seconds: 300,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5724,6 +5731,7 @@ mod tests {
                 acp_profiles: BTreeMap::new(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
+                provider_keepalive_seconds: 300,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5789,6 +5797,7 @@ mod tests {
                 acp_profiles: BTreeMap::new(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
+                provider_keepalive_seconds: 300,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -6266,6 +6275,7 @@ done
                 acp_profiles: BTreeMap::new(),
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
+                provider_keepalive_seconds: 300,
             },
             security: SecurityConfig {
                 enable_auth: true,

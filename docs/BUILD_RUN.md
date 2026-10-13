@@ -92,6 +92,7 @@ dsh --version
 | `TODEX_AGENTD_DSH_BIN` | `dsh`（DeepSeek Harness）命令路径 |
 | `TODEX_AGENTD_DSH_ENV_ALLOWLIST` | 允许传给 DeepSeek Harness 的逗号分隔环境变量名 |
 | `TODEX_AGENTD_PROVIDER_IDLE_TIMEOUT_MINUTES` | Provider 空闲超时分钟数（默认 60，`0` 关闭） |
+| `TODEX_AGENTD_PROVIDER_KEEPALIVE_SECONDS` | 常驻 Provider 进程无 turn 时的保活秒数（默认 300，最小 30） |
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
@@ -127,12 +128,14 @@ antigravity_env_allowlist = ["GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL"]
 dsh_bin = "dsh"
 dsh_env_allowlist = ["DSH_HOME", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_SEARCH_BASE_URL"]
 provider_idle_timeout_minutes = 60   # Provider 连续无输出超过该分钟数时停止当前 turn（PROVIDER_IDLE_TIMEOUT）；0 关闭
+provider_keepalive_seconds = 300     # 常驻 Provider 进程（Codex/Pi/OpenCode/Grok/Devin/dsh/ACP profile）无 turn 多久后停止；最小 30
 
 [agent.acp_profiles.example]
 command = "example-acp-agent"
 args = []
 # auth_method = "some-auth-id"         # 需要认证的 ACP profile：initialize 声明的方法 ID
 # api_key_env = "EXAMPLE_API_KEY"      # 保存 API key 的环境变量名，经 ACP _meta.api_key 发送
+# resident = false                     # 每个 turn 启动一个进程（默认 true：每个对话一个常驻进程）
 
 [security]
 enable_auth = true
@@ -157,7 +160,7 @@ Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径
 
 Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。`devin acp` 自身有意不读取本地 `devin auth login` 登录态（官方理由是避免用量归属到错误账号），daemon 会在每个 ACP 进程启动时执行 `authenticate`，按以下顺序解析 API key 并以 `_meta.api_key` 无头发送（不写入日志）：先读 `devin_api_key_env`（例如 `"DEVIN_API_KEY"`）指向的 daemon 环境变量，再默认回退读取 `devin auth login` 写入的 `~/.local/share/devin/credentials.toml` 中的 `windsurf_api_key`——因此已登录的 CLI 开箱即用；将 `TODEX_AGENTD_DEVIN_CLI_CREDENTIALS` 设为 `false` 可禁用该回退。两者都不可用时按上游声明的 `devin-browser` 方法执行一次浏览器授权，daemon 最多等待 5 分钟供用户完成批准。会话分叉能力按已安装 CLI 动态探测：daemon 在 `devin acp` 的 `initialize` 响应中检查 `sessionCapabilities.fork`（结果缓存约 5 分钟），声明后自动开放；当前版本未声明时 fork 保持不可用。
 
-OpenCode 通过 `opencode acp` 接入，每个对话对应一个常驻 ACP 进程（空闲 300 秒回收，上限 32 个）。与 Devin 不同，`opencode acp` 直接读取 `opencode auth login` 保存的本地凭据，其 `opencode-login` authMethod 仅是指向该终端命令的说明，daemon 不发送 ACP `authenticate`；首次使用前用 daemon 用户执行一次 `opencode auth login` 即可。权限模式支持 `ask`/`auto`/`full-access`：`ask` 把每个 `session/request_permission` 转交用户逐条决定；`auto` 自动选 `allow_once`，`full-access` 优先 `allow_always`，自动批准写入 `permission.resolved`（`autoApproved: true`）事件留痕。OpenCode 原生 `permission` 配置（`opencode.json` 或白名单转发的 `OPENCODE_PERMISSION`）仍先生效。plan 工作模式经 `configOptions.mode` 映射为 `plan`/`build`。模型目录与 slash 命令来自真实 ACP 会话探测（探测会话随后 `session/close`）；模型以 `provider/model` 形式选择并支持会话内切换；reasoning effort 经 `configOptions.effort` 下发，仅当所选模型有 variant 时可用，模型探测会逐个读取各模型的 `supportedReasoningEfforts`。恢复对话优先用 `session/resume`（不回放历史），会话分叉走 `session/fork`。默认环境白名单转发 `OPENCODE_CONFIG*`、`OPENCODE_AUTH_CONTENT`、`OPENCODE_API_KEY` 等 `OPENCODE_*` 变量；进程固定注入 `OPENCODE_DISABLE_AUTOUPDATE=1`，自升级走 `POST /v2/providers/opencode/upgrade`（`opencode upgrade`）。
+OpenCode 通过 `opencode acp` 接入，每个对话对应一个常驻 ACP 进程（空闲超过 `[agent].provider_keepalive_seconds`（默认 300 秒，最小 30 秒）后回收，上限 32 个）。与 Devin 不同，`opencode acp` 直接读取 `opencode auth login` 保存的本地凭据，其 `opencode-login` authMethod 仅是指向该终端命令的说明，daemon 不发送 ACP `authenticate`；首次使用前用 daemon 用户执行一次 `opencode auth login` 即可。权限模式支持 `ask`/`auto`/`full-access`：`ask` 把每个 `session/request_permission` 转交用户逐条决定；`auto` 自动选 `allow_once`，`full-access` 优先 `allow_always`，自动批准写入 `permission.resolved`（`autoApproved: true`）事件留痕。OpenCode 原生 `permission` 配置（`opencode.json` 或白名单转发的 `OPENCODE_PERMISSION`）仍先生效。plan 工作模式经 `configOptions.mode` 映射为 `plan`/`build`。模型目录与 slash 命令来自真实 ACP 会话探测（探测会话随后 `session/close`）；模型以 `provider/model` 形式选择并支持会话内切换；reasoning effort 经 `configOptions.effort` 下发，仅当所选模型有 variant 时可用，模型探测会逐个读取各模型的 `supportedReasoningEfforts`。恢复对话优先用 `session/resume`（不回放历史），会话分叉走 `session/fork`。默认环境白名单转发 `OPENCODE_CONFIG*`、`OPENCODE_AUTH_CONTENT`、`OPENCODE_API_KEY` 等 `OPENCODE_*` 变量；进程固定注入 `OPENCODE_DISABLE_AUTOUPDATE=1`，自升级走 `POST /v2/providers/opencode/upgrade`（`opencode upgrade`）。
 
 DeepSeek Harness 通过 `dsh --profile acp` 接入（`npm install -g @deepseek-ai/dsh`，daemon 的 PATH 中需要有 Node.js），每个对话对应一个常驻 ACP 进程。首次使用前为 daemon 用户配置 DeepSeek API key：设置 `DEEPSEEK_API_KEY`（已在默认白名单中），或在 `dsh web` 的 Settings → Models 中保存到 `$DSH_HOME/.credentials.yaml`。daemon 启动 dsh 时叠加 `$TODEX_AGENTD_DATA_DIR/providers/deepseek-harness/todex.patch.yml`，禁用 dsh 默认开启的会话日志上传（`session-log-deepseek`）。其他 provider 路由（Anthropic、OpenAI、自定义网关等）在 `$DSH_HOME/profiles/acp/cordis.patch.yml` 中配置，所需的 API key 环境变量需加入 `TODEX_AGENTD_DSH_ENV_ALLOWLIST`。行为细节见 [API 文档](API.md)。
 

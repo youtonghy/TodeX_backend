@@ -130,7 +130,8 @@ impl DeepseekHarnessDriver {
                 .join("providers")
                 .join(ProviderKind::DeepseekHarness.as_str())
                 .join(PATCH_FILE),
-            sessions: ResidentSessions::new(&PROFILE, "DeepSeek Harness"),
+            sessions: ResidentSessions::new(&PROFILE, "DeepSeek Harness")
+                .with_idle_timeout(config.provider_keepalive()),
             discovery: DiscoveryCache::new(),
         }
     }
