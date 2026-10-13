@@ -15,6 +15,7 @@ effort = "low"
 session = "ses_fixture"
 active = None
 late_id = None
+switch_on_cancel = False
 
 
 def write(value):
@@ -117,8 +118,9 @@ for line in sys.stdin:
     elif method == "session/prompt":
         active = request_id
         text = params["prompt"][0]["text"]
+        switch_on_cancel = text == "cancel-switch"
         update("agent_message_chunk", messageId="msg_fixture", content={"type": "text", "text": "ok"})
-        if text not in ("hold", "cancel", "permission"):
+        if text not in ("hold", "cancel", "cancel-switch", "permission"):
             finish()
         elif text == "permission":
             write({"jsonrpc": "2.0", "id": 17, "method": "session/request_permission",
@@ -133,6 +135,10 @@ for line in sys.stdin:
                 unexpected = json.loads(sys.stdin.readline())
                 assert unexpected.get("id") != late_id, "client responded to an RPC response"
         time.sleep(0.05)
+        if active and switch_on_cancel:
+            # The agent changes its own config while the cancel drains.
+            model = "opencode/other-model"
+            update("config_option_update", configOptions=options())
         if active:
             finish("cancelled")
     elif method == "session/close":

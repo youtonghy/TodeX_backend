@@ -1875,6 +1875,7 @@ async fn drain_cancelled_turn(
                 provider,
                 auto_approve,
                 client_requests,
+                &mut *connection,
             )
             .await?
             .ok_or(AppError::StreamClosed)?,
@@ -1903,7 +1904,9 @@ async fn drain_cancelled_turn(
 }
 
 /// Reads until the `session/prompt` response, rejecting reverse requests;
-/// `None` when the agent closed its output first.
+/// `None` when the agent closed its output first. Config and mode updates
+/// still reach `connection`'s cache: a clean cancel keeps the process for
+/// the next turn, which skips config the cache says is applied.
 async fn drain_until_prompt_response(
     process: &mut JsonLineProcess,
     prompt_request_id: &str,
@@ -1911,6 +1914,7 @@ async fn drain_until_prompt_response(
     provider: ProviderKind,
     auto_approve: AutoApprove,
     client_requests: &mut tokio::task::JoinSet<(Vec<Value>, Result<(), AppError>)>,
+    connection: &mut AcpConnectionState,
 ) -> Result<Option<Value>, AppError> {
     let (_cancel_tx, mut cancelled) = watch::channel(true);
     loop {
@@ -1945,6 +1949,7 @@ async fn drain_until_prompt_response(
                 process.send(&json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32800,"message":"turn cancelled"}})).await?;
             }
         } else {
+            observe_config_options(connection, &message);
             handle_acp_message(
                 process,
                 message,
@@ -1953,7 +1958,7 @@ async fn drain_until_prompt_response(
                 provider,
                 true,
                 auto_approve,
-                &mut AcpConnectionState::default(),
+                connection,
             )
             .await?;
         }
@@ -4724,6 +4729,30 @@ mod tests {
         );
         assert_eq!(fixture.processes(), 1);
         assert_eq!(fixture.count("initialize"), 1);
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_the_agent_changes_while_a_cancel_drains_reaches_the_cache() {
+        let fixture = GenericFixture::new(true).await;
+        let (cancel, task) = fixture.start("turn-cancel", "cancel-switch", None).await;
+        fixture.wait_for_method("session/prompt").await;
+        cancel.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.cancelled);
+        let writes = fixture.count("session/set_config_option");
+        // The agent switched to another model during the drain; the kept
+        // process must be asked for the session's original one again.
+        fixture
+            .run("turn-next", "normal", Some("opencode/fixture-model"))
+            .await;
+        assert_eq!(fixture.processes(), 1);
+        assert_eq!(fixture.count("session/set_config_option"), writes + 1);
         fixture.finish().await;
     }
 
