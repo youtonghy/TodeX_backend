@@ -14,8 +14,8 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 type Result<T> = std::result::Result<T, AppError>;
@@ -25,7 +25,7 @@ const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_DEVICES: usize = 256;
 /// `lastSeenAt` updates are batched; auth verifies should not rewrite the file
 /// on every request.
-const SEEN_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const SEEN_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -72,8 +72,12 @@ struct Inner {
     path: PathBuf,
     devices: BTreeMap<String, DeviceRecord>,
     mtime: Option<SystemTime>,
+    /// `last_seen_at` changed in memory but is not on disk yet.
     dirty: bool,
     last_flush: Instant,
+    flush_interval: Duration,
+    /// A background flush is waiting for `flush_interval` to pass.
+    flush_scheduled: bool,
 }
 
 /// Daemon-side registry handle. Reads reload the file when another process
@@ -85,6 +89,10 @@ pub(crate) struct DeviceRegistry {
 
 impl DeviceRegistry {
     pub(crate) fn load(data_dir: &Path) -> Result<Self> {
+        Self::load_with_flush_interval(data_dir, SEEN_FLUSH_INTERVAL)
+    }
+
+    fn load_with_flush_interval(data_dir: &Path, flush_interval: Duration) -> Result<Self> {
         let path = data_dir.join(FILE_NAME);
         let (devices, mtime) = read_records(&path)?.unwrap_or_default();
         Ok(Self {
@@ -94,6 +102,8 @@ impl DeviceRegistry {
                 mtime,
                 dirty: false,
                 last_flush: Instant::now(),
+                flush_interval,
+                flush_scheduled: false,
             })),
         })
     }
@@ -129,17 +139,33 @@ impl DeviceRegistry {
     }
 
     /// Record request activity. The timestamp is kept in memory and flushed at
-    /// most once per SEEN_FLUSH_INTERVAL to avoid a disk write per request.
+    /// most once per SEEN_FLUSH_INTERVAL to avoid a disk write per request:
+    /// inside a Tokio runtime by a background blocking task, otherwise inline
+    /// once the interval has passed.
     pub(crate) fn touch(&self, device_id: &str) {
-        if let Ok(mut inner) = self.inner.lock() {
-            if let Some(record) = inner.devices.get_mut(device_id) {
-                record.last_seen_at = Some(unix_ms());
-                inner.dirty = true;
-                if inner.last_flush.elapsed() >= SEEN_FLUSH_INTERVAL {
-                    let _ = inner.write();
-                }
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let Some(record) = inner.devices.get_mut(device_id) else {
+            return;
+        };
+        record.last_seen_at = Some(unix_ms());
+        inner.dirty = true;
+        if !schedule_flush(&Arc::downgrade(&self.inner), &mut inner) {
+            if let Err(error) = inner.flush_if_due() {
+                tracing::warn!(error = %error, "failed to record device activity");
             }
         }
+    }
+
+    /// Writes pending `lastSeenAt` updates now (daemon shutdown). An external
+    /// change to the file still wins over them.
+    pub(crate) fn flush(&self) -> Result<()> {
+        let mut inner = self.lock()?;
+        if inner.reload_if_changed()? || !inner.dirty {
+            return Ok(());
+        }
+        inner.write()
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>> {
@@ -149,24 +175,69 @@ impl DeviceRegistry {
     }
 }
 
+/// Schedules one background flush of pending `lastSeenAt` updates for when
+/// the flush interval has passed. Returns false outside a Tokio runtime.
+fn schedule_flush(registry: &Weak<Mutex<Inner>>, inner: &mut Inner) -> bool {
+    if inner.flush_scheduled {
+        return true;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    inner.flush_scheduled = true;
+    let delay = inner
+        .flush_interval
+        .saturating_sub(inner.last_flush.elapsed());
+    let registry = registry.clone();
+    runtime.spawn(async move {
+        tokio::time::sleep(delay).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            let Some(shared) = registry.upgrade() else {
+                return;
+            };
+            let Ok(mut inner) = shared.lock() else {
+                return;
+            };
+            inner.flush_scheduled = false;
+            if let Err(error) = inner.flush_if_due() {
+                tracing::warn!(error = %error, "failed to record device activity");
+            }
+            if inner.dirty {
+                schedule_flush(&registry, &mut inner);
+            }
+        })
+        .await;
+    });
+    true
+}
+
 impl Inner {
-    fn reload_if_changed(&mut self) -> Result<()> {
+    /// Reloads the file when another process changed it. Returns whether it
+    /// did; an external writer (TUI revocation) wins over unflushed
+    /// last_seen updates, which are best-effort anyway.
+    fn reload_if_changed(&mut self) -> Result<bool> {
         let mtime = fs::metadata(&self.path)
             .and_then(|metadata| metadata.modified())
             .ok();
-        if mtime != self.mtime {
-            // An external writer (TUI revocation) wins over unflushed
-            // last_seen updates; those timestamps are best-effort anyway.
-            let (devices, mtime) = read_records(&self.path)?.unwrap_or_default();
-            self.devices = devices;
-            self.mtime = mtime;
-            self.dirty = false;
+        if mtime == self.mtime {
+            return Ok(false);
+        }
+        let (devices, mtime) = read_records(&self.path)?.unwrap_or_default();
+        self.devices = devices;
+        self.mtime = mtime;
+        self.dirty = false;
+        Ok(true)
+    }
+
+    /// Writes pending `lastSeenAt` updates once the flush interval passed.
+    fn flush_if_due(&mut self) -> Result<()> {
+        if !self.dirty || self.last_flush.elapsed() < self.flush_interval {
             return Ok(());
         }
-        if self.dirty {
-            self.write()?;
+        if self.reload_if_changed()? {
+            return Ok(());
         }
-        Ok(())
+        self.write()
     }
 
     fn write(&mut self) -> Result<()> {
@@ -360,6 +431,82 @@ mod tests {
         assert!(revoke_device(&root, &record.device_id).unwrap());
         assert!(registry.get(&record.device_id).unwrap().is_none());
         assert!(!revoke_device(&root, &record.device_id).unwrap());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn registry_file(root: &Path) -> (String, Option<u64>) {
+        let path = root.join(FILE_NAME);
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            Some(fs::metadata(&path).unwrap().ino())
+        };
+        #[cfg(not(unix))]
+        let inode = None;
+        (fs::read_to_string(path).unwrap(), inode)
+    }
+
+    #[test]
+    fn activity_within_the_flush_interval_does_not_rewrite_the_file() {
+        let (root, registry) = fixture();
+        let record = registry.register("Phone", &key(7)).unwrap();
+        let before = registry_file(&root);
+        for _ in 0..20 {
+            assert!(registry.get(&record.device_id).unwrap().is_some());
+            registry.touch(&record.device_id);
+        }
+        assert_eq!(registry_file(&root), before);
+        assert!(!before.0.contains("lastSeenAt"));
+
+        // Shutdown writes the pending timestamp.
+        registry.flush().unwrap();
+        assert!(registry_file(&root).0.contains("lastSeenAt"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn activity_flushes_inline_once_the_interval_passed_outside_a_runtime() {
+        let (root, _) = fixture();
+        let registry =
+            DeviceRegistry::load_with_flush_interval(&root, Duration::from_millis(20)).unwrap();
+        let record = registry.register("Phone", &key(7)).unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        registry.touch(&record.device_id);
+        assert!(registry_file(&root).0.contains("lastSeenAt"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn pending_activity_is_flushed_in_the_background_without_requests() {
+        let (root, _) = fixture();
+        let registry =
+            DeviceRegistry::load_with_flush_interval(&root, Duration::from_millis(100)).unwrap();
+        let record = registry.register("Phone", &key(7)).unwrap();
+        registry.touch(&record.device_id);
+        registry.touch(&record.device_id);
+        assert!(!registry_file(&root).0.contains("lastSeenAt"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !registry_file(&root).0.contains("lastSeenAt") {
+            assert!(Instant::now() < deadline, "activity was never flushed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_external_change_wins_over_pending_activity() {
+        let (root, registry) = fixture();
+        let phone = registry.register("Phone", &key(7)).unwrap();
+        let laptop = registry.register("Laptop", &key(8)).unwrap();
+        registry.touch(&phone.device_id);
+        assert!(revoke_device(&root, &phone.device_id).unwrap());
+
+        registry.flush().unwrap();
+        let (raw, _) = registry_file(&root);
+        assert!(!raw.contains(&phone.device_id));
+        assert!(raw.contains(&laptop.device_id));
+        assert!(registry.get(&phone.device_id).unwrap().is_none());
+        assert!(registry.get(&laptop.device_id).unwrap().is_some());
         let _ = fs::remove_dir_all(&root);
     }
 

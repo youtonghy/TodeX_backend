@@ -147,6 +147,13 @@ impl DeviceAuthenticator {
         }
     }
 
+    /// Writes pending device `lastSeenAt` updates (daemon shutdown).
+    pub(crate) fn flush_activity(&self) {
+        if let Err(error) = self.registry.flush() {
+            tracing::warn!(error = %error, "failed to record device activity at shutdown");
+        }
+    }
+
     /// Full verification for a request whose body is already known.
     pub(crate) fn authenticate(
         &self,

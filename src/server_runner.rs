@@ -287,7 +287,9 @@ impl ManagedServer {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        self.handle.await.context("server task join failed")?
+        let result = self.handle.await.context("server task join failed");
+        self.state.device_auth.flush_activity();
+        result?
     }
 
     pub async fn wait(mut self) -> Result<()> {
@@ -320,6 +322,7 @@ impl ManagedServer {
         }
         self.state.conversations.shutdown_all().await;
         self.state.codex_local_adapters.shutdown_all().await;
+        self.state.device_auth.flush_activity();
         result?
     }
 }
