@@ -249,7 +249,8 @@ mod tests {
     }
 
     /// Feeds `fragments` through merge windows the way the store does and
-    /// returns the events it would journal.
+    /// returns the events it would journal. Windows never expire here, so
+    /// the split depends only on keys and sizes, not on how fast this runs.
     fn merged(fragments: &[(DeltaFragment, Value)]) -> Vec<Value> {
         let mut out = Vec::new();
         let mut pending: Option<PendingDelta<()>> = None;
@@ -265,12 +266,9 @@ mod tests {
             if let Some(window) = pending.take() {
                 out.push(window.into_parts().2);
             }
-            pending = Some(PendingDelta::new(
-                (),
-                "message.delta",
-                fragment.clone(),
-                payload,
-            ));
+            let mut window = PendingDelta::new((), "message.delta", fragment.clone(), payload);
+            window.started += Duration::from_secs(3600);
+            pending = Some(window);
         }
         out.extend(pending.map(|window| window.into_parts().2));
         out
