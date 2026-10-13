@@ -312,7 +312,7 @@ cargo run -- daemon status
 cargo run -- daemon stop
 ```
 
-daemon 启动后会写入 `~/.todex-agent/daemon.json`，日志写入 `~/.todex-agent/logs/todex-agentd-daemon.log`。`daemon start`、`restart` 和 `status` 会在监听地址下方逐行列出客户端可用的连接地址（`connect: ws://<IP>:<端口>/v2/ws (<网卡>)`）。
+daemon 启动后会写入 `~/.todex-agent/daemon.json`，日志写入 `~/.todex-agent/logs/todex-agentd-daemon.log`（不含 ANSI 颜色码；超过 10 MiB 时在启动时及运行中（Unix）每分钟检查并轮转为 `.1`…`.3`，最多保留 3 份旧日志）。TUI 退出时把本次日志自动保存到 `~/.todex-agent/tui-logs/`（目录 0700、文件 0600；没有事件时不生成 `.jsonl`，只保留最近 20 次）。`daemon start`、`restart` 和 `status` 会在监听地址下方逐行列出客户端可用的连接地址（`connect: ws://<IP>:<端口>/v2/ws (<网卡>)`）。
 
 登录时自动启动 daemon（开机自启）：
 
