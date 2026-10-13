@@ -405,7 +405,7 @@ impl Sessions {
         self.table.lock().await.closing = false;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn worker_count(&self) -> usize {
         let mut table = self.table.lock().await;
         table.prune();
@@ -413,7 +413,7 @@ impl Sessions {
     }
 
     /// Whether the conversation has a worker that takes turns.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn holds(&self, id: &str) -> bool {
         let mut table = self.table.lock().await;
         table.prune();

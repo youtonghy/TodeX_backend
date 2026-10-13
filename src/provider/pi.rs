@@ -32,7 +32,7 @@ const MAX_PI_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
 /// A resident Pi process with no turn, query, background event or open
 /// dialog for this long is stopped; the next turn resumes its session file.
 /// The default of `[agent].provider_keepalive_seconds`.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwrap();
 /// How long a turn waits for a stopping resident process (flush, dialog
 /// closure and graceful termination) before reopening the session.

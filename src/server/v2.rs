@@ -8863,11 +8863,13 @@ mod tests {
             "server.error"
         );
 
-        // The workspace is not trusted: skipped with a reason.
+        // The workspace is not trusted: skipped with a reason. Claude Code
+        // resolves to the test binary, so the driver is available even
+        // where no provider CLI is installed.
         let workspace = std::fs::canonicalize(root.join("workspaces/project")).unwrap();
         let manifest = state
             .conversations
-            .create_for_tests(ProviderKind::Codex, workspace.clone())
+            .create_for_tests(ProviderKind::ClaudeCode, workspace.clone())
             .await
             .unwrap();
         ws.send(send(json!({ "id": "w2", "type": "conversation.warm", "payload": { "conversationId": manifest.id } })))
@@ -9370,7 +9372,8 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("todex-{name}-{nonce}"));
         fs::create_dir_all(&root).unwrap();
-        root
+        // Listings compare canonical paths; macOS's temp dir is a symlink.
+        fs::canonicalize(root).unwrap()
     }
 
     #[test]

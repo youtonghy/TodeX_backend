@@ -849,6 +849,7 @@ mod tests {
 
             // Outside paths (directly, through `..`, or through a symlink),
             // and reads without a recognizable path, ask like an edit.
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut outside_reads = vec![
                 json!({ "AbsolutePath": outside.join("secret.txt").display().to_string() }),
                 json!({ "AbsolutePath": format!("{workspace}/../../outside/secret.txt") }),

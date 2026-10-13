@@ -5909,6 +5909,9 @@ mod tests {
         config.data_dir =
             std::env::temp_dir().join(format!("todex-qr-test-{}", uuid::Uuid::new_v4()));
         let mut app = super::TuiApp::new(config);
+        // A CJK title's wide-glyph continuation cells carry no style, so pin
+        // the language instead of following the host locale.
+        app.language = super::TuiLanguage::English;
         app.pairing_qr = Some(super::PairingQr {
             payload: payload.to_owned(),
         });
