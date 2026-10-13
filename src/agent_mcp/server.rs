@@ -210,7 +210,7 @@ fn prepare_exec(arguments: Value) -> Result<Prepared<SshCall>, String> {
     // The approver sees what the command reads: the start of standard input
     // (secret-looking values redacted, as it is journaled with the prompt).
     if let Some(stdin) = &request.stdin {
-        let mut preview = redact_sensitive_text(&bounded_text(
+        let mut preview = redact_stdin_preview(&bounded_text(
             stdin.as_bytes(),
             APPROVAL_STDIN_PREVIEW_BYTES,
         ));
@@ -227,21 +227,105 @@ fn prepare_exec(arguments: Value) -> Result<Prepared<SshCall>, String> {
     })
 }
 
+/// Standard input as shown to the approver and journaled with the prompt:
+/// PEM blocks, `KEY=value` / `key: value` lines with a secret-looking key,
+/// and known token formats are redacted.
+fn redact_stdin_preview(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut in_pem = false;
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        let ending = &line[content.len()..];
+        if in_pem {
+            // A block cut by the preview limit stays redacted to the end.
+            if content.contains("-----END ") {
+                in_pem = false;
+                output.push_str("[REDACTED PEM BLOCK]");
+                output.push_str(ending);
+            }
+            continue;
+        }
+        if let Some(start) = content.find("-----BEGIN ") {
+            output.push_str(&content[..start]);
+            if content[start..].contains("-----END ") {
+                output.push_str("[REDACTED PEM BLOCK]");
+                output.push_str(ending);
+            } else {
+                in_pem = true;
+            }
+            continue;
+        }
+        output.push_str(&redact_secret_assignment(content));
+        output.push_str(ending);
+    }
+    if in_pem {
+        output.push_str("[REDACTED PEM BLOCK]");
+    }
+    redact_sensitive_text(&output)
+}
+
+/// Replaces the value of a `KEY=value` / `key: value` line (optionally
+/// indented, `export`ed or with a quoted key) whose key names a secret.
+fn redact_secret_assignment(line: &str) -> std::borrow::Cow<'_, str> {
+    const SECRET_KEY_PARTS: &[&str] = &[
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "apikey",
+        "privatekey",
+        "credential",
+        "auth",
+    ];
+    let body = line.trim_start();
+    let body = body.strip_prefix("export ").unwrap_or(body);
+    let key_len = body
+        .find(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '"' | '\''))
+        })
+        .unwrap_or(body.len());
+    let rest = body[key_len..].trim_start();
+    let Some(separator) = rest.chars().next().filter(|ch| matches!(ch, '=' | ':')) else {
+        return line.into();
+    };
+    let value = rest[separator.len_utf8()..].trim();
+    let key: String = body[..key_len]
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    if value.is_empty() || !SECRET_KEY_PARTS.iter().any(|part| key.contains(part)) {
+        return line.into();
+    }
+    let value_start = line.len() - rest.len() + separator.len_utf8();
+    format!("{} [REDACTED]", &line[..value_start]).into()
+}
+
 /// Why `ssh_exec` is refused before asking: in ask mode the user approves
-/// the whole command, and the prompt and journal keep only
-/// [`EVENT_COMMAND_LIMIT`] bytes of it, so a longer command could hide what
-/// it does past the cut.
+/// the whole call, and the prompt and journal keep only
+/// [`EVENT_COMMAND_LIMIT`] bytes of the command and
+/// [`APPROVAL_STDIN_PREVIEW_BYTES`] of standard input, so a longer one could
+/// hide what it does past the cut.
 fn ask_mode_exec_refusal(arguments: Option<&rmcp::model::JsonObject>) -> Option<String> {
-    let command = arguments?.get("command")?.as_str()?;
-    (command.len() > EVENT_COMMAND_LIMIT).then(|| {
-        format!(
-            "ssh_exec commands are limited to {EVENT_COMMAND_LIMIT} bytes while the user \
-             approves each call (this one is {} bytes). Upload the script to the host first \
-             (for example with a short command that reads it from stdin into a file), then \
-             run it with a short command.",
-            command.len()
-        )
-    })
+    let arguments = arguments?;
+    let length = |field: &str| {
+        arguments
+            .get(field)
+            .and_then(Value::as_str)
+            .map_or(0, str::len)
+    };
+    let (field, limit, bytes) = if length("command") > EVENT_COMMAND_LIMIT {
+        ("command", EVENT_COMMAND_LIMIT, length("command"))
+    } else if length("stdin") > APPROVAL_STDIN_PREVIEW_BYTES {
+        ("stdin", APPROVAL_STDIN_PREVIEW_BYTES, length("stdin"))
+    } else {
+        return None;
+    };
+    Some(format!(
+        "ssh_exec {field} is limited to {limit} bytes while the user approves each call \
+         (this one is {bytes} bytes). Upload the script to the host as a file first (for \
+         example ask the user to copy it there), then run it with a short command."
+    ))
 }
 
 fn run<'a>(
@@ -276,8 +360,8 @@ fn registry_of_tools() -> ToolRegistry<SshTools, SshCall> {
                 "Run a shell command on an allowed SSH host (non-interactive, no TTY, no password prompts). \
                  Returns stdout, stderr and the exit code; a non-zero exit code is a normal result. \
                  stdout and stderr are each capped at 256 KiB (truncated=true when cut). Unavailable \
-                 in Plan mode; in ask mode the user approves each call and commands are limited to \
-                 4096 bytes (upload a longer script first, then run it).",
+                 in Plan mode; in ask mode the user approves each call and command and stdin are each limited \
+                 to 4096 bytes (upload a longer script to the host as a file first, then run it).",
                 schema(json!({
                     "type": "object",
                     "properties": {
@@ -1350,6 +1434,23 @@ exit 3
         assert_eq!(refused.is_error, Some(true));
         let text = serde_json::to_string(&refused.content).unwrap();
         assert!(text.contains("Upload the script"), "{text}");
+        // Standard input is shown in the prompt only up to the same limit.
+        let refused = call(
+            &client,
+            "ssh_exec",
+            json!({
+                "host": "web",
+                "command": "cat > run.sh",
+                "stdin": "x".repeat(APPROVAL_STDIN_PREVIEW_BYTES + 1),
+            }),
+        )
+        .await;
+        assert_eq!(refused.is_error, Some(true));
+        let text = serde_json::to_string(&refused.content).unwrap();
+        assert!(
+            text.contains("stdin is limited") && text.contains("Upload the script"),
+            "{text}"
+        );
         let history = harness
             .state
             .conversations
@@ -1397,6 +1498,57 @@ exit 3
             !preview.contains("sk-ant-abcdefghijklmnop0123"),
             "{preview}"
         );
+    }
+
+    #[test]
+    fn stdin_preview_redacts_pem_blocks_and_secret_assignments() {
+        let stdin = "#!/bin/sh\n\
+            export DB_PASSWORD=hunter2\n\
+            api-key: abc123\n\
+            \"client_secret\": \"s3cr3t\",\n\
+            Private_Key = xyz\n\
+            USER=alice\n\
+            cat <<'EOF' > id\n\
+            -----BEGIN OPENSSH PRIVATE KEY-----\n\
+            b3BlbnNzaC1rZXktdjEAAAAA\n\
+            -----END OPENSSH PRIVATE KEY-----\n\
+            EOF\n\
+            echo done\n\
+            -----BEGIN RSA PRIVATE KEY-----\n\
+            MIIEowIBAAKCAQEA";
+        let preview = redact_stdin_preview(stdin);
+        for secret in [
+            "hunter2",
+            "abc123",
+            "s3cr3t",
+            "xyz",
+            "b3BlbnNzaC1",
+            "MIIEow",
+        ] {
+            assert!(!preview.contains(secret), "{secret} leaked: {preview}");
+        }
+        assert!(
+            preview.contains("export DB_PASSWORD= [REDACTED]"),
+            "{preview}"
+        );
+        assert!(preview.contains("USER=alice"), "{preview}");
+        assert!(
+            preview.contains("echo done\nEOF") || preview.contains("EOF\necho done"),
+            "{preview}"
+        );
+        assert_eq!(
+            preview.matches("[REDACTED PEM BLOCK]").count(),
+            2,
+            "{preview}"
+        );
+
+        let prepared = prepare_exec(json!({
+            "host": "web",
+            "command": "cat > .env",
+            "stdin": "TOKEN=plain-value\n",
+        }))
+        .unwrap();
+        assert_eq!(prepared.input["stdinPreview"], json!("TOKEN= [REDACTED]\n"));
     }
 
     async fn open_session(harness: &Harness) -> String {
