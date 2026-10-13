@@ -597,10 +597,11 @@ fn validate_executable_config_entries(output: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// A push runs with submodule recursion off (see [`PUSH_ARGS`]). Repository
-/// config that asks for submodule pushes or configures submodules is refused
-/// as well, so a push never reaches into, or publishes commits from, another
-/// repository that the user did not choose to push.
+/// A push runs with submodule recursion off (see [`PUSH_ARGS`]), which
+/// overrides repository config. Config that asks for recursion is refused as
+/// well, so a repository never silently expects a submodule push; ordinary
+/// submodule entries (`git submodule init` writes `submodule.<name>.*`) are
+/// left alone because nothing reads them without recursion.
 fn validate_push_config_entries(output: &[u8]) -> Result<()> {
     for entry in output.split(|byte| *byte == 0) {
         if entry.is_empty() {
@@ -611,7 +612,7 @@ fn validate_push_config_entries(output: &[u8]) -> Result<()> {
             .position(|byte| matches!(*byte, b'\n' | b'='))
             .unwrap_or(entry.len());
         let key = String::from_utf8_lossy(&entry[..key_end]).to_ascii_lowercase();
-        if key == "push.recursesubmodules" || key.starts_with("submodule.") {
+        if key == "push.recursesubmodules" || key == "submodule.recurse" {
             return Err(AppError::InvalidRequest(format!(
                 "repository-local submodule Git config is not supported for push: {key}; \
                  TodeX pushes only the current repository, so remove the setting or push \
@@ -1400,10 +1401,14 @@ mod tests {
         assert!(
             validate_push_config_entries(b"remote.origin.url\nhttps://example.com/r.git\0").is_ok()
         );
+        // An initialized submodule does not block a push of this repository.
+        assert!(
+            validate_push_config_entries(b"submodule.lib.url\nhttps://example.com/lib.git\0")
+                .is_ok()
+        );
         for listing in [
             &b"push.recurseSubmodules\non-demand\0"[..],
             b"submodule.recurse\ntrue\0",
-            b"submodule.lib.url\nhttps://example.com/lib.git\0",
         ] {
             let error = validate_push_config_entries(listing)
                 .unwrap_err()
@@ -1434,6 +1439,8 @@ mod tests {
         git(&["init"]);
         assert!(validate_push_execution_config(&repository).await.is_ok());
         git(&["config", "submodule.lib.url", "https://example.com/lib.git"]);
+        assert!(validate_push_execution_config(&repository).await.is_ok());
+        git(&["config", "submodule.recurse", "true"]);
         assert!(matches!(
             validate_push_execution_config(&repository).await,
             Err(AppError::InvalidRequest(_))

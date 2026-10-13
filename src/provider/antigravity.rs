@@ -64,7 +64,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         approval_policies: &[],
         permission_profiles: &[],
         enforcement: "agent-policy",
-        description: "agy runs with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network and non-TodeX MCP tools; full-access allows everything. agy has no auto-review tier, so auto is not offered. Plan uses agy --mode plan and only reads. Not an operating-system sandbox.",
+        description: "agy runs with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network, non-TodeX MCP tools and reads outside the workspace; full-access allows everything. agy has no auto-review tier, so auto is not offered. Plan uses agy --mode plan and only reads. Not an operating-system sandbox.",
     },
     native_fork: false,
     native_compact: false,

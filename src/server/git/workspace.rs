@@ -1101,7 +1101,7 @@ mod tests {
     async fn push_refuses_repository_submodule_config() {
         for (key, value) in [
             ("push.recurseSubmodules", "on-demand"),
-            ("submodule.lib.url", "https://example.invalid/lib.git"),
+            ("submodule.recurse", "true"),
         ] {
             let fixture = Fixture::new();
             fixture.seed().await;
