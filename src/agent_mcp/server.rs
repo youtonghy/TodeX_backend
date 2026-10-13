@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, Semaphore};
 use uuid::Uuid;
 
 use super::{
+    authorizer::ToolMode,
     registry::{
         self, parse, schema, tool_error, BoxFuture, Caller, Invocation, Prepared, ToolEntry,
         ToolHost, ToolRegistry,
@@ -46,7 +47,7 @@ use crate::{
         OutputStream,
     },
     local_terminal::decode_terminal_output,
-    provider::ConversationSupervisor,
+    provider::{process::redact_sensitive_text, ConversationSupervisor},
     ssh::{classify_failure, SshFailureKind, SshMode},
 };
 
@@ -73,6 +74,8 @@ const OUTPUT_FLUSH_BYTES: usize = 16 * 1024;
 const ERROR_DETAIL_LIMIT: usize = 4096;
 /// Command text in an approval prompt.
 const SUMMARY_COMMAND_CHARS: usize = 200;
+/// Standard input shown in an approval prompt.
+const APPROVAL_STDIN_PREVIEW_BYTES: usize = 4096;
 
 pub(crate) fn routes(state: &AppState) -> Router<AppState> {
     let tools = SshTools {
@@ -187,11 +190,15 @@ fn prepare_list_hosts(arguments: Value) -> Result<Prepared<SshCall>, String> {
 
 fn prepare_exec(arguments: Value) -> Result<Prepared<SshCall>, String> {
     let request = validate(parse("ssh_exec", arguments)?)?;
-    let command: String = request
+    let total_chars = request.command.chars().count();
+    let mut command: String = request
         .command
         .chars()
         .take(SUMMARY_COMMAND_CHARS)
         .collect();
+    if total_chars > SUMMARY_COMMAND_CHARS {
+        command.push_str(&format!("… (truncated, {total_chars} chars)"));
+    }
     let mut input = json!({
         "host": request.host,
         "command": bounded_text(request.command.as_bytes(), EVENT_COMMAND_LIMIT),
@@ -200,14 +207,40 @@ fn prepare_exec(arguments: Value) -> Result<Prepared<SshCall>, String> {
     if let Some(cwd) = &request.cwd {
         input["cwd"] = json!(cwd);
     }
-    // Standard input may carry secrets: only its size is shown.
+    // The approver sees what the command reads: the start of standard input
+    // (secret-looking values redacted, as it is journaled with the prompt).
     if let Some(stdin) = &request.stdin {
+        let mut preview = redact_sensitive_text(&bounded_text(
+            stdin.as_bytes(),
+            APPROVAL_STDIN_PREVIEW_BYTES,
+        ));
+        if stdin.len() > APPROVAL_STDIN_PREVIEW_BYTES {
+            preview.push_str(&format!("… (truncated, {} bytes)", stdin.len()));
+        }
         input["stdinBytes"] = json!(stdin.len());
+        input["stdinPreview"] = json!(preview);
     }
     Ok(Prepared {
         summary: format!("run `{command}` on {}", request.host),
         input,
         call: SshCall::Exec(request),
+    })
+}
+
+/// Why `ssh_exec` is refused before asking: in ask mode the user approves
+/// the whole command, and the prompt and journal keep only
+/// [`EVENT_COMMAND_LIMIT`] bytes of it, so a longer command could hide what
+/// it does past the cut.
+fn ask_mode_exec_refusal(arguments: Option<&rmcp::model::JsonObject>) -> Option<String> {
+    let command = arguments?.get("command")?.as_str()?;
+    (command.len() > EVENT_COMMAND_LIMIT).then(|| {
+        format!(
+            "ssh_exec commands are limited to {EVENT_COMMAND_LIMIT} bytes while the user \
+             approves each call (this one is {} bytes). Upload the script to the host first \
+             (for example with a short command that reads it from stdin into a file), then \
+             run it with a short command.",
+            command.len()
+        )
     })
 }
 
@@ -243,7 +276,8 @@ fn registry_of_tools() -> ToolRegistry<SshTools, SshCall> {
                 "Run a shell command on an allowed SSH host (non-interactive, no TTY, no password prompts). \
                  Returns stdout, stderr and the exit code; a non-zero exit code is a normal result. \
                  stdout and stderr are each capped at 256 KiB (truncated=true when cut). Unavailable \
-                 in Plan mode; in ask mode the user approves each call.",
+                 in Plan mode; in ask mode the user approves each call and commands are limited to \
+                 4096 bytes (upload a longer script first, then run it).",
                 schema(json!({
                     "type": "object",
                     "properties": {
@@ -309,6 +343,15 @@ impl ServerHandler for SshTools {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if request.name == "ssh_exec" {
+            let caller = registry::caller(&context)?;
+            let mode = self.mcp.inner.authorizer.tool_mode(&caller.conversation_id);
+            if mode == ToolMode::Ask {
+                if let Some(message) = ask_mode_exec_refusal(request.arguments.as_ref()) {
+                    return Ok(tool_error(message).into());
+                }
+            }
+        }
         self.registry().call(self, request, &context).await
     }
 
@@ -1278,6 +1321,82 @@ exit 3
             .iter()
             .any(|event| event.event_type == "ssh.exec.started"));
         client.cancel().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ask_mode_refuses_commands_too_long_to_review() {
+        let harness = harness().await;
+        let client = bridged_client(&harness).await;
+        let long = format!("echo {}", "x".repeat(EVENT_COMMAND_LIMIT));
+        // Without approval the full command runs.
+        let ran = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "web", "command": long }),
+        )
+        .await;
+        assert_eq!(ran.is_error, Some(false));
+
+        harness
+            .state
+            .agent_mcp
+            .record_turn_mode(&harness.conversation_id, "ask", "implement");
+        let refused = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "web", "command": long }),
+        )
+        .await;
+        assert_eq!(refused.is_error, Some(true));
+        let text = serde_json::to_string(&refused.content).unwrap();
+        assert!(text.contains("Upload the script"), "{text}");
+        let history = harness
+            .state
+            .conversations
+            .history_for_tests(&harness.conversation_id)
+            .await;
+        assert!(!history
+            .iter()
+            .any(|event| event.event_type == "permission.requested"));
+        client.cancel().await.unwrap();
+    }
+
+    #[test]
+    fn approval_shows_truncation_and_a_stdin_preview() {
+        let command = format!("echo {}", "y".repeat(300));
+        let stdin = format!("{}tail", "z".repeat(APPROVAL_STDIN_PREVIEW_BYTES));
+        let prepared = prepare_exec(json!({
+            "host": "web",
+            "command": command,
+            "stdin": stdin,
+        }))
+        .unwrap();
+        assert!(
+            prepared
+                .summary
+                .contains(&format!("… (truncated, {} chars)", command.chars().count())),
+            "{}",
+            prepared.summary
+        );
+        assert_eq!(prepared.input["stdinBytes"], json!(stdin.len()));
+        let preview = prepared.input["stdinPreview"].as_str().unwrap();
+        assert!(preview.starts_with("zzz"));
+        assert!(!preview.contains("tail"));
+        assert!(preview.ends_with(&format!("… (truncated, {} bytes)", stdin.len())));
+
+        let short = prepare_exec(json!({
+            "host": "web",
+            "command": "cat > run.sh",
+            "stdin": "#!/bin/sh\nTOKEN=sk-ant-abcdefghijklmnop0123\necho hi\n",
+        }))
+        .unwrap();
+        assert_eq!(short.summary, "run `cat > run.sh` on web");
+        let preview = short.input["stdinPreview"].as_str().unwrap();
+        assert!(preview.contains("echo hi") && !preview.contains("truncated"));
+        assert!(
+            !preview.contains("sk-ant-abcdefghijklmnop0123"),
+            "{preview}"
+        );
     }
 
     async fn open_session(harness: &Harness) -> String {
