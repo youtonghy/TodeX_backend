@@ -84,21 +84,103 @@ pub(super) fn run_with_main_loop(body: impl FnOnce()) -> ! {
     unreachable!("the body exits the process");
 }
 
-/// Dispatches notification signals on a background thread.
+/// The bus driver's name, the sender of `NameOwnerChanged`.
+const BUS_DRIVER: &str = "org.freedesktop.DBus";
+
+/// The unique bus name that currently owns [`SERVICE`], `None` while it is
+/// unknown or unowned. Only signals from this connection are trusted: any
+/// process of the same user can emit an `ActionInvoked` signal (or send one
+/// straight to us), and an answer forged that way would approve a
+/// confirmation.
+static OWNER: Mutex<Option<String>> = Mutex::new(None);
+
+fn set_owner(owner: Option<String>) {
+    *OWNER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = owner;
+}
+
+/// Whether a notification signal from `sender` comes from the current
+/// notification server. Signals are dropped while the owner is unknown.
+fn trusted_sender(owner: Option<&str>, sender: Option<&str>) -> bool {
+    matches!((owner, sender), (Some(owner), Some(sender)) if owner == sender)
+}
+
+/// The new owner of [`SERVICE`] announced by a `NameOwnerChanged` signal,
+/// `None` when the signal is not a bus-driver announcement about it. An
+/// empty new owner means the name was released.
+fn announced_owner(sender: Option<&str>, name: &str, new_owner: &str) -> Option<Option<String>> {
+    if sender != Some(BUS_DRIVER) || name != SERVICE {
+        return None;
+    }
+    Some((!new_owner.is_empty()).then(|| new_owner.to_owned()))
+}
+
+/// Dispatches notification signals on a background thread, accepting only
+/// those sent by the current owner of [`SERVICE`].
 fn listen(bus: Bus) -> Result<(), String> {
+    // Follow ownership changes before reading the current owner, so a
+    // change between the two is not missed.
+    let owner_rule = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender(BUS_DRIVER)
+        .and_then(|rule| rule.interface(BUS_DRIVER))
+        .and_then(|rule| rule.member("NameOwnerChanged"))
+        .and_then(|rule| rule.arg(0, SERVICE))
+        .map_err(|error| error.to_string())?
+        .build();
+    let owner_changes = MessageIterator::for_match_rule(owner_rule, &bus, None)
+        .map_err(|error| error.to_string())?;
+    // The bus resolves a well-known sender to its current owner, so this
+    // rule follows the notification server across restarts; the sender is
+    // still checked per message, since signals addressed to us directly
+    // bypass match rules.
     let rule = MatchRule::builder()
         .msg_type(MessageType::Signal)
-        .interface(SERVICE)
+        .sender(SERVICE)
+        .and_then(|rule| rule.interface(SERVICE))
         .and_then(|rule| rule.path(PATH))
         .map_err(|error| error.to_string())?
         .build();
     let messages =
         MessageIterator::for_match_rule(rule, &bus, None).map_err(|error| error.to_string())?;
+    let owner = plain_proxy(&bus, BUS_DRIVER, "/org/freedesktop/DBus", BUS_DRIVER)
+        .and_then(|proxy| proxy.call::<_, _, String>("GetNameOwner", &(SERVICE,)).ok());
+    set_owner(owner);
+    std::thread::Builder::new()
+        .name("todex-notification-owner".to_owned())
+        .spawn(move || {
+            for message in owner_changes.flatten() {
+                let header = message.header();
+                let sender = header.sender().map(|sender| sender.as_str());
+                let Ok((name, _old, new_owner)) =
+                    message.body().deserialize::<(String, String, String)>()
+                else {
+                    continue;
+                };
+                if let Some(owner) = announced_owner(sender, &name, &new_owner) {
+                    set_owner(owner);
+                }
+            }
+            // Without ownership updates, stop trusting any sender.
+            set_owner(None);
+        })
+        .map_err(|error| error.to_string())?;
     std::thread::Builder::new()
         .name("todex-notifications".to_owned())
         .spawn(move || {
             for message in messages.flatten() {
                 let header = message.header();
+                let sender = header.sender().map(|sender| sender.as_str());
+                let trusted = {
+                    let owner = OWNER
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    trusted_sender(owner.as_deref(), sender)
+                };
+                if !trusted {
+                    continue;
+                }
                 let Some(member) = header.member().map(|member| member.as_str().to_owned()) else {
                     continue;
                 };
@@ -490,5 +572,36 @@ mod kglobalaccel {
         .body()
         .deserialize::<R>()
         .map_err(|error| format!("{method} replied unexpectedly: {error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_signals_need_the_current_owner_as_sender() {
+        assert!(trusted_sender(Some(":1.42"), Some(":1.42")));
+        // A forged signal from another connection of the same user.
+        assert!(!trusted_sender(Some(":1.42"), Some(":1.99")));
+        assert!(!trusted_sender(Some(":1.42"), None));
+        // While the owner is unknown, nothing is trusted.
+        assert!(!trusted_sender(None, Some(":1.42")));
+        assert!(!trusted_sender(None, None));
+    }
+
+    #[test]
+    fn owner_changes_only_come_from_the_bus_driver_about_the_service() {
+        assert_eq!(
+            announced_owner(Some(BUS_DRIVER), SERVICE, ":1.7"),
+            Some(Some(":1.7".to_owned()))
+        );
+        assert_eq!(announced_owner(Some(BUS_DRIVER), SERVICE, ""), Some(None));
+        // A forged NameOwnerChanged from a regular connection.
+        assert_eq!(announced_owner(Some(":1.99"), SERVICE, ":1.99"), None);
+        assert_eq!(
+            announced_owner(Some(BUS_DRIVER), "org.example.Other", ":1.7"),
+            None
+        );
     }
 }
