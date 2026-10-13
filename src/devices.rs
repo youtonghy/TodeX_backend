@@ -78,6 +78,9 @@ struct Inner {
     flush_interval: Duration,
     /// A background flush is waiting for `flush_interval` to pass.
     flush_scheduled: bool,
+    /// Flushes `flush_if_due` attempted, for tests.
+    #[cfg(test)]
+    flush_attempts: usize,
 }
 
 /// Daemon-side registry handle. Reads reload the file when another process
@@ -104,6 +107,8 @@ impl DeviceRegistry {
                 last_flush: Instant::now(),
                 flush_interval,
                 flush_scheduled: false,
+                #[cfg(test)]
+                flush_attempts: 0,
             })),
         })
     }
@@ -230,14 +235,26 @@ impl Inner {
     }
 
     /// Writes pending `lastSeenAt` updates once the flush interval passed.
+    /// A failed attempt (unwritable directory, corrupt file) also restarts
+    /// the interval, so the next retry, and its warning, waits a full
+    /// interval instead of spinning.
     fn flush_if_due(&mut self) -> Result<()> {
         if !self.dirty || self.last_flush.elapsed() < self.flush_interval {
             return Ok(());
         }
-        if self.reload_if_changed()? {
-            return Ok(());
+        #[cfg(test)]
+        {
+            self.flush_attempts += 1;
         }
-        self.write()
+        let result = match self.reload_if_changed() {
+            Ok(true) => Ok(()),
+            Ok(false) => self.write(),
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            self.last_flush = Instant::now();
+        }
+        result
     }
 
     fn write(&mut self) -> Result<()> {
@@ -490,6 +507,25 @@ mod tests {
             assert!(Instant::now() < deadline, "activity was never flushed");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_failed_background_flush_waits_a_full_interval_before_retrying() {
+        let (root, _) = fixture();
+        let registry =
+            DeviceRegistry::load_with_flush_interval(&root, Duration::from_millis(100)).unwrap();
+        let record = registry.register("Phone", &key(7)).unwrap();
+        registry.touch(&record.device_id);
+        // A corrupt file makes every reload, and so every flush, fail.
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(root.join(FILE_NAME), b"not json").unwrap();
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let attempts = registry.inner.lock().unwrap().flush_attempts;
+        assert!(
+            (1..=5).contains(&attempts),
+            "expected about one attempt per interval, got {attempts}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
