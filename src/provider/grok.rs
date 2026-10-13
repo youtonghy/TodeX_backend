@@ -343,7 +343,8 @@ async fn control_request(
 }
 
 /// `grok inspect` reports skills and MCP servers together and clients load
-/// both catalogs at once; one spawn serves them for a short while.
+/// both catalogs at once; one spawn serves them for a short while, after
+/// which the last report is served while a background spawn refreshes it.
 const INSPECT_CACHE_TTL: Duration = Duration::from_secs(15);
 static INSPECT_CACHE: std::sync::LazyLock<CatalogCache<Value>> =
     std::sync::LazyLock::new(|| CatalogCache::new(Some(INSPECT_CACHE_TTL)));
@@ -353,16 +354,6 @@ pub(crate) async fn inspect_grok(
     config: &AgentConfig,
     workspace: &Path,
 ) -> Result<Value, AppError> {
-    INSPECT_CACHE
-        .fetch(
-            &config.grok_bin,
-            workspace,
-            inspect_grok_uncached(config, workspace),
-        )
-        .await
-}
-
-async fn inspect_grok_uncached(config: &AgentConfig, workspace: &Path) -> Result<Value, AppError> {
     let mut spec = CommandSpec::new(&config.grok_bin, workspace);
     spec.args = vec![
         "--no-auto-update".to_owned(),
@@ -370,6 +361,12 @@ async fn inspect_grok_uncached(config: &AgentConfig, workspace: &Path) -> Result
         "--json".to_owned(),
     ];
     spec.env = grok_environment(&config.grok_env_allowlist);
+    INSPECT_CACHE
+        .fetch_or_stale(&config.grok_bin, workspace, inspect_grok_uncached(spec))
+        .await
+}
+
+async fn inspect_grok_uncached(spec: CommandSpec) -> Result<Value, AppError> {
     let output = run_bounded_command(&spec, INSPECT_MAX_BYTES, DIAGNOSTIC_TIMEOUT).await?;
     if !output.success {
         let stderr = redact_sensitive_text(&String::from_utf8_lossy(&output.stderr));

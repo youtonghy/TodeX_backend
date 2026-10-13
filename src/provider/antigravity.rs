@@ -102,6 +102,9 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
 /// (`gemini-3.8-flash-high`), lowest first.
 const EFFORT_SUFFIXES: [&str; 3] = ["low", "medium", "high"];
 const MODELS_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a turn waits for the model catalog to pick a variant before
+/// passing the selected model id unchanged.
+const LAUNCH_CATALOG_TIMEOUT: Duration = Duration::from_secs(2);
 const USAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 /// How long a finished turn's process may take to flush its history and
@@ -133,7 +136,17 @@ impl AntigravityDriver {
     /// variants of one model, so the selected effort picks the variant.
     async fn launch_model(&self, workspace: &Path, prompt: &DriverPrompt) -> Option<String> {
         let model = prompt.model.as_deref()?;
-        let efforts = match self.discover_models(workspace).await {
+        // A cold or slow catalog must not hold up the turn; the lookup keeps
+        // running in the background and serves the next turn.
+        let catalog = tokio::time::timeout(LAUNCH_CATALOG_TIMEOUT, self.discover_models(workspace))
+            .await
+            .unwrap_or_else(|_| {
+                Err(AppError::ProviderUnavailable(format!(
+                    "agy models took longer than {}s",
+                    LAUNCH_CATALOG_TIMEOUT.as_secs()
+                )))
+            });
+        let efforts = match catalog {
             Ok(models) => models
                 .into_iter()
                 .find(|entry| entry.id == model)
@@ -179,8 +192,8 @@ impl ProviderDriver for AntigravityDriver {
         &self,
         workspace: &Path,
     ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
-        let fetch = async {
-            let spec = self.command_spec(workspace, &["models"]);
+        let spec = self.command_spec(workspace, &["models"]);
+        let fetch = async move {
             let output =
                 run_bounded_command(&spec, MAX_COMMAND_OUTPUT_BYTES, MODELS_TIMEOUT).await?;
             if !output.success {
@@ -191,7 +204,9 @@ impl ProviderDriver for AntigravityDriver {
             }
             Ok(parse_models(&String::from_utf8_lossy(&output.stdout)))
         };
-        self.models.fetch(&self.binary, workspace, fetch).await
+        self.models
+            .fetch_or_stale(&self.binary, workspace, fetch)
+            .await
     }
 
     fn discovery_timeout(&self) -> Duration {

@@ -7,7 +7,9 @@
 //! one fetch per key at a time (single-flight): concurrent callers for the
 //! same key wait for the running fetch, other keys proceed in parallel.
 //! A failure is handed to the callers that waited for it but not cached
-//! for later ones.
+//! for later ones. [`DiscoveryCache::get_or_refresh`] additionally serves
+//! an expired value at once and refreshes it in the background
+//! (stale-while-revalidate), for lookups on a turn's critical path.
 //!
 //! Keys carry what invalidates a result besides time: the workspace, the
 //! managed provider configuration revision
@@ -55,8 +57,9 @@ impl<V> Default for Stored<V> {
 struct SlotState<V> {
     /// Read without waiting, so a running fetch never hides the last value.
     stored: Mutex<Stored<V>>,
-    /// Held by the running fetch: one fetch per key at a time.
-    flight: tokio::sync::Mutex<()>,
+    /// Held by the running fetch: one fetch per key at a time. Shared so a
+    /// background refresh can hold it past its caller.
+    flight: Arc<tokio::sync::Mutex<()>>,
 }
 
 type Slot<V> = Arc<SlotState<V>>;
@@ -127,7 +130,7 @@ impl<K: Clone + Eq + Hash, V: Clone> DiscoveryCache<K, V> {
             .or_insert_with(|| {
                 Arc::new(SlotState {
                     stored: Mutex::new(Stored::default()),
-                    flight: tokio::sync::Mutex::new(()),
+                    flight: Arc::new(tokio::sync::Mutex::new(())),
                 })
             })
             .clone()
@@ -165,21 +168,71 @@ impl<K: Clone + Eq + Hash, V: Clone> DiscoveryCache<K, V> {
                 return Err(shared_error(error));
             }
         }
-        match fetch().await {
-            Ok((value, ttl)) => {
-                let mut stored = slot.stored();
-                stored.entry = Some(Entry {
-                    value: value.clone(),
-                    expires: Instant::now() + ttl,
-                });
-                stored.failure = None;
-                Ok(value)
+        store_fetched(&slot, fetch()).await
+    }
+
+    /// Like [`Self::get_or_fetch`], but an expired value is returned at once
+    /// while one background task refreshes it, and a fetch always runs on
+    /// its own task: a caller that stops waiting (a timeout) does not cancel
+    /// it, so the next lookup finds its result.
+    pub(super) async fn get_or_refresh<F, Fut>(&self, key: &K, fetch: F) -> Result<V, AppError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(V, Duration), AppError>> + Send + 'static,
+        V: Send + 'static,
+    {
+        let slot = self.slot(key);
+        let waiting_since = Instant::now();
+        let stale = slot
+            .stored()
+            .entry
+            .as_ref()
+            .map(|entry| (entry.value.clone(), entry.expires > waiting_since));
+        if let Some((value, fresh)) = stale {
+            if !fresh {
+                // Already refreshing when the flight is taken.
+                if let Ok(flight) = slot.flight.clone().try_lock_owned() {
+                    let refresh = fetch();
+                    let slot = slot.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = store_fetched(&slot, refresh).await {
+                            tracing::warn!(%error, "background catalog refresh failed; keeping the previous catalog");
+                        }
+                        drop(flight);
+                    });
+                }
             }
-            Err(error) => {
-                slot.stored().failure = Some((Instant::now(), shared_error(&error)));
-                Err(error)
+            return Ok(value);
+        }
+        let flight = slot.flight.clone().lock_owned().await;
+        {
+            let stored = slot.stored();
+            // Whatever the fetch this caller waited for stored, even if it
+            // already expired: the next lookup refreshes it.
+            if let Some(entry) = stored.entry.as_ref() {
+                return Ok(entry.value.clone());
+            }
+            if let Some((_, error)) = stored
+                .failure
+                .as_ref()
+                .filter(|(failed_at, _)| *failed_at >= waiting_since)
+            {
+                return Err(shared_error(error));
             }
         }
+        let fetching = fetch();
+        let task_slot = slot.clone();
+        tokio::spawn(async move {
+            let result = store_fetched(&task_slot, fetching).await;
+            drop(flight);
+            result
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(AppError::ProviderUnavailable(format!(
+                "catalog fetch failed: {error}"
+            )))
+        })
     }
 
     /// The last value stored for `key`, even if it expired or a fetch for it
@@ -204,6 +257,29 @@ impl<K: Clone + Eq + Hash, V: Clone> DiscoveryCache<K, V> {
             value,
             expires: Instant::now() + ttl,
         });
+    }
+}
+
+/// Runs `fetch` and records its value or failure in `slot`; the caller
+/// holds the slot's flight.
+async fn store_fetched<V: Clone>(
+    slot: &SlotState<V>,
+    fetch: impl Future<Output = Result<(V, Duration), AppError>>,
+) -> Result<V, AppError> {
+    match fetch.await {
+        Ok((value, ttl)) => {
+            let mut stored = slot.stored();
+            stored.entry = Some(Entry {
+                value: value.clone(),
+                expires: Instant::now() + ttl,
+            });
+            stored.failure = None;
+            Ok(value)
+        }
+        Err(error) => {
+            slot.stored().failure = Some((Instant::now(), shared_error(&error)));
+            Err(error)
+        }
     }
 }
 
@@ -310,6 +386,28 @@ impl<V: Clone> CatalogCache<V> {
         };
         self.cache
             .get_or_fetch(&DiscoveryKey::new(binary, workspace).await, || async move {
+                Ok((fetch.await?, ttl))
+            })
+            .await
+    }
+
+    /// [`Self::fetch`] with stale-while-revalidate
+    /// ([`DiscoveryCache::get_or_refresh`]): an expired catalog is returned
+    /// at once and refreshed in the background.
+    pub(super) async fn fetch_or_stale(
+        &self,
+        binary: &str,
+        workspace: &Path,
+        fetch: impl Future<Output = Result<V, AppError>> + Send + 'static,
+    ) -> Result<V, AppError>
+    where
+        V: Send + 'static,
+    {
+        let Some(ttl) = self.ttl else {
+            return fetch.await;
+        };
+        self.cache
+            .get_or_refresh(&DiscoveryKey::new(binary, workspace).await, || async move {
                 Ok((fetch.await?, ttl))
             })
             .await
@@ -485,6 +583,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(value, 9);
+    }
+
+    #[tokio::test]
+    async fn expired_values_are_served_while_one_background_refresh_runs() {
+        let cache = Arc::new(DiscoveryCache::<&'static str, usize>::new());
+        cache.insert(&"k", 1, Duration::ZERO);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let held = Arc::new(tokio::sync::Mutex::new(Some(held)));
+        let refresh = |calls: Arc<AtomicUsize>, held: Arc<tokio::sync::Mutex<Option<_>>>| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(held) = held.lock().await.take() {
+                let _: Result<(), _> = held.await;
+            }
+            Ok((2, Duration::from_secs(60)))
+        };
+        // Both callers get the stale value without waiting; one refresh runs.
+        for _ in 0..2 {
+            let value = tokio::time::timeout(
+                Duration::from_secs(1),
+                cache.get_or_refresh(&"k", || refresh(calls.clone(), held.clone())),
+            )
+            .await
+            .expect("a stale value is returned without waiting");
+            assert_eq!(value.unwrap(), 1);
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cache.is_fresh(&"k") {
+            assert!(Instant::now() < deadline, "refresh never stored");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            cache
+                .get_or_refresh(&"k", || async { Ok((3, Duration::from_secs(60))) })
+                .await
+                .unwrap(),
+            2
+        );
+
+        // A failed refresh keeps the stale value.
+        cache.insert(&"k", 4, Duration::ZERO);
+        cache
+            .get_or_refresh(&"k", || async {
+                Err::<(usize, Duration), _>(AppError::ProviderUnavailable("down".to_owned()))
+            })
+            .await
+            .unwrap();
+        let _ = cache.existing(&"k").unwrap().flight.lock().await;
+        assert_eq!(cache.peek(&"k"), Some(4));
+    }
+
+    #[tokio::test]
+    async fn a_first_fetch_outlives_a_caller_that_stops_waiting() {
+        let cache = Arc::new(DiscoveryCache::<&'static str, usize>::new());
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(10),
+            cache.get_or_refresh(&"k", || async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok((5, Duration::from_secs(60)))
+            }),
+        )
+        .await;
+        assert!(abandoned.is_err());
+        // The next caller waits for that fetch instead of starting its own.
+        assert_eq!(
+            cache
+                .get_or_refresh(&"k", || async { Ok((6, Duration::from_secs(60))) })
+                .await
+                .unwrap(),
+            5
+        );
     }
 
     #[tokio::test]
