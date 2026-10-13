@@ -537,13 +537,27 @@ const CODEX_RPC: RpcPeer = RpcPeer {
     classify_error: None,
 };
 
+/// A thread [`prepare_codex_thread`] started or resumed.
+struct PreparedThread {
+    thread: String,
+    model: Option<String>,
+    /// The provider state to save with the turn, unless already current.
+    state: Option<ProviderState>,
+    /// The `thread/start|resume` response: the configuration Codex applied
+    /// (see [`codex_configuration_event`]).
+    response: Value,
+}
+
+/// Initializes the app-server and starts or resumes the conversation's
+/// thread with `prompt`'s settings. Nothing is journalled: the turn that
+/// uses the thread emits its `turn.configuration`.
 async fn prepare_codex_thread(
     process: &mut JsonLineProcess,
     context: DriverContext,
     prompt: &DriverPrompt,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
-) -> Result<(String, Option<String>, Option<ProviderState>), AppError> {
+) -> Result<PreparedThread, AppError> {
     process
         .send(&json!({
             "id": "initialize",
@@ -573,7 +587,7 @@ async fn prepare_codex_thread(
         prompt.approval_policy.as_deref(),
     )?;
     let mut effective_model = prompt.model.clone();
-    let native_session_id = match context.provider_state.native_session_id.as_deref() {
+    let (native_session_id, response) = match context.provider_state.native_session_id.as_deref() {
         Some(thread_id) => {
             let mut resume_params = json!({
                 "threadId": thread_id,
@@ -602,10 +616,7 @@ async fn prepare_codex_thread(
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .or(effective_model);
-            if let Some(configuration) = codex_configuration_event(&response, &prompt) {
-                sink.emit("turn.configuration", configuration).await?;
-            }
-            thread_id.to_owned()
+            (thread_id.to_owned(), response)
         }
         None => {
             let mut params = json!({
@@ -634,10 +645,7 @@ async fn prepare_codex_thread(
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .or(effective_model);
-            if let Some(configuration) = codex_configuration_event(&response, &prompt) {
-                sink.emit("turn.configuration", configuration).await?;
-            }
-            response
+            let thread = response
                 .pointer("/thread/id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
@@ -645,7 +653,8 @@ async fn prepare_codex_thread(
                         "Codex thread/start response did not include a thread id".to_owned(),
                     )
                 })?
-                .to_owned()
+                .to_owned();
+            (thread, response)
         }
     };
 
@@ -663,7 +672,12 @@ async fn prepare_codex_thread(
         provider_state
     });
 
-    Ok((native_session_id, effective_model, state_to_save))
+    Ok(PreparedThread {
+        thread: native_session_id,
+        model: effective_model,
+        state: state_to_save,
+        response,
+    })
 }
 
 /// Adds TodeX's MCP servers to a `thread/start|resume` `config` override.
@@ -679,7 +693,30 @@ fn add_agent_mcp_config(params: &mut Value, context: &DriverContext) {
     }
 }
 
-fn codex_configuration_event(response: &Value, prompt: &DriverPrompt) -> Option<Value> {
+/// The settings a `thread/start|resume` applies; a thread prepared with
+/// other ones (by a prewarm) reports them, not the turn's.
+fn codex_thread_settings(prompt: &DriverPrompt) -> [Option<&str>; 7] {
+    [
+        prompt.model.as_deref(),
+        prompt.reasoning_effort.as_deref(),
+        prompt.permission_mode.as_deref(),
+        prompt.work_mode.as_deref(),
+        prompt.permission_profile.as_deref(),
+        prompt.sandbox_mode.as_deref(),
+        prompt.approval_policy.as_deref(),
+    ]
+}
+
+/// `turn.configuration` for the first turn on a thread prepared with
+/// `prepared_with`'s settings, from the `thread/start|resume` `response`.
+/// When a prewarm prepared the thread with other settings, the response is
+/// stale: the values this turn's `turn/start` overrides are reported
+/// instead, as requested rather than provider-confirmed.
+fn codex_configuration_event(
+    response: &Value,
+    prompt: &DriverPrompt,
+    prepared_with: &DriverPrompt,
+) -> Option<Value> {
     let mut effective = serde_json::Map::new();
     for key in [
         "model",
@@ -701,10 +738,38 @@ fn codex_configuration_event(response: &Value, prompt: &DriverPrompt) -> Option<
         };
         effective.insert("sandboxMode".to_owned(), json!(mode));
     }
+    let mut source = "provider-confirmed";
+    if codex_thread_settings(prompt) != codex_thread_settings(prepared_with) {
+        source = "requested";
+        if let Some(model) = &prompt.model {
+            effective.insert("model".to_owned(), json!(model));
+        }
+        if let Some(effort) = &prompt.reasoning_effort {
+            effective.insert("reasoningEffort".to_owned(), json!(effort));
+        }
+        if let Ok(controls) = resolve_execution_config(
+            ProviderKind::Codex,
+            prompt.permission_mode.as_deref(),
+            prompt.work_mode.as_deref(),
+            prompt.permission_profile.as_deref(),
+            prompt.sandbox_mode.as_deref(),
+            prompt.approval_policy.as_deref(),
+        ) {
+            for (key, value) in [
+                ("approvalPolicy", controls.approval_policy),
+                ("approvalsReviewer", controls.approvals_reviewer),
+                ("sandboxMode", controls.sandbox_mode),
+            ] {
+                if let Some(value) = value {
+                    effective.insert(key.to_owned(), json!(value));
+                }
+            }
+        }
+    }
     if effective.is_empty() {
         return None;
     }
-    effective.insert("source".to_owned(), json!("provider-confirmed"));
+    effective.insert("source".to_owned(), json!(source));
     Some(json!({
         "provider": "codex", "turnId": prompt.turn_id,
         "requested": { "permissionMode": prompt.permission_mode, "workMode": prompt.work_mode, "model": prompt.model, "reasoningEffort": prompt.reasoning_effort, "permissionProfile": prompt.permission_profile, "sandboxMode": prompt.sandbox_mode, "approvalPolicy": prompt.approval_policy },

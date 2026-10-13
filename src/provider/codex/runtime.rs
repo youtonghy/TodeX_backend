@@ -195,6 +195,9 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
     let mut known_queue = VecDeque::<Value>::new();
     // A new thread a prewarm started, saved with the next turn.
     let mut warm_state: Option<ProviderState> = None;
+    // The prewarm's thread response and settings: the next turn journals
+    // its `turn.configuration` (a muted warm journals nothing).
+    let mut warm_configuration: Option<(Value, DriverPrompt)> = None;
     loop {
         let command = if let Some(process) = process.as_mut() {
             tokio::select! {
@@ -245,8 +248,9 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                 let child = process.as_mut().expect("spawned process");
                 let result = async {
                     let mut state_to_save = warm_state.take();
+                    let mut configuration = warm_configuration.take();
                     if native_thread.is_none() {
-                        let (thread, model, state) = super::prepare_codex_thread(
+                        let prepared = super::prepare_codex_thread(
                             child,
                             context,
                             &prompt,
@@ -254,9 +258,15 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                             &mut cancel,
                         )
                         .await?;
-                        native_thread = Some(thread);
-                        native_model = model;
-                        state_to_save = state;
+                        native_thread = Some(prepared.thread);
+                        native_model = prepared.model;
+                        state_to_save = prepared.state;
+                        configuration = Some((prepared.response, prompt.clone()));
+                    }
+                    if let Some(event) = configuration.and_then(|(response, prepared_with)| {
+                        super::codex_configuration_event(&response, &prompt, &prepared_with)
+                    }) {
+                        sink.emit("turn.configuration", event).await?;
                     }
                     active_turn(
                         child,
@@ -310,10 +320,11 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                 match super::prepare_codex_thread(child, context, &settings, &sink, &mut cancel)
                     .await
                 {
-                    Ok((thread, model, state)) => {
-                        native_thread = Some(thread);
-                        native_model = model;
-                        warm_state = state;
+                    Ok(prepared) => {
+                        native_thread = Some(prepared.thread);
+                        native_model = prepared.model;
+                        warm_state = prepared.state;
+                        warm_configuration = Some((prepared.response, settings));
                         let _ = respond.send(Ok(()));
                     }
                     Err(error) => {
@@ -781,7 +792,8 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::conversation::{
-        ConversationEventHub, ConversationManifest, ConversationStore, ProviderState,
+        ConversationEvent, ConversationEventHub, ConversationManifest, ConversationStore,
+        ProviderState,
     };
     #[cfg(unix)]
     use crate::provider::types::PermissionBroker;
@@ -814,9 +826,10 @@ mod tests {
         assert!(sessions.workers.lock().await.is_empty());
     }
 
+    /// Prewarms a thread with the default settings, then runs its first
+    /// turn with `turn_model`; returns the conversation's journal.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn a_prewarm_prepares_the_thread_the_first_turn_uses() {
+    async fn prewarm_then_turn(turn_model: Option<&str>) -> Vec<ConversationEvent> {
         use std::os::unix::fs::PermissionsExt;
         let root =
             std::env::temp_dir().join(format!("todex-codex-prewarm-{}", uuid::Uuid::new_v4()));
@@ -916,7 +929,10 @@ done
                 &binary,
                 Run {
                     context: context(),
-                    prompt: prompt("turn-1", "hello"),
+                    prompt: DriverPrompt {
+                        model: turn_model.map(str::to_owned),
+                        ..prompt("turn-1", "hello")
+                    },
                     sink: sink("turn-1"),
                     cancel,
                     permit: trust.acquire_owned("local", &root).await.unwrap(),
@@ -943,7 +959,45 @@ done
             Some("native")
         );
         sessions.stop_all().await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
         let _ = std::fs::remove_dir_all(root);
+        history
+    }
+
+    /// The `turn.configuration` events of `history`.
+    #[cfg(unix)]
+    fn configurations(history: &[ConversationEvent]) -> Vec<Value> {
+        history
+            .iter()
+            .filter(|event| event.event_type == "turn.configuration")
+            .map(|event| event.payload.clone())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_prewarm_prepares_the_thread_the_first_turn_uses() {
+        // Same settings: the warm's provider-confirmed configuration is
+        // journalled once, by the turn.
+        let configurations = configurations(&prewarm_then_turn(None).await);
+        assert_eq!(configurations.len(), 1);
+        assert_eq!(configurations[0]["turnId"], "turn-1");
+        assert_eq!(configurations[0]["effective"]["model"], "fixture-model");
+        assert_eq!(
+            configurations[0]["effective"]["source"],
+            "provider-confirmed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_first_turn_with_other_settings_than_its_prewarm_reports_its_own() {
+        let configurations = configurations(&prewarm_then_turn(Some("other-model")).await);
+        assert_eq!(configurations.len(), 1);
+        assert_eq!(configurations[0]["turnId"], "turn-1");
+        assert_eq!(configurations[0]["requested"]["model"], "other-model");
+        assert_eq!(configurations[0]["effective"]["model"], "other-model");
+        assert_eq!(configurations[0]["effective"]["source"], "requested");
     }
 
     #[test]
