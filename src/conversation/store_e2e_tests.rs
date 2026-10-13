@@ -1666,3 +1666,53 @@ async fn an_expiring_key_is_sealed_out_with_its_records() {
     assert_eq!(fs::metadata(directory.join(EVENTS_FILE)).unwrap().len(), 0);
     e2e.cleanup();
 }
+
+/// `save_request` holds the conversation lock while it checks the key: an
+/// expired key is sealed out under that lock instead of waiting on it.
+#[tokio::test]
+async fn saving_a_request_seals_an_expired_key_without_deadlocking() {
+    let root = temp_dir("todex-e2e-key-age-request");
+    let now = Arc::new(std::sync::Mutex::new(Utc::now()));
+    let clock_now = now.clone();
+    let keys =
+        HistoryKeys::load_with_clock(&root, None, Arc::new(move || *clock_now.lock().unwrap()))
+            .unwrap();
+    keys.recipients()
+        .register_device("dev_a", &recipient(1))
+        .unwrap();
+    let store = ConversationStore::new(root.clone())
+        .await
+        .unwrap()
+        .with_history_keys(keys.clone())
+        .with_seal_min_bytes(4 * 1024);
+    let e2e = E2e {
+        root: root.clone(),
+        keys: keys.clone(),
+        store: store.clone(),
+    };
+    let id = e2e.create(None).await.id;
+    for index in 0..40 {
+        let (event_type, payload) = mixed_payload(index);
+        store.append(&id, event_type, payload).await.unwrap();
+    }
+    let old_kid = keys.deks().current_key(&id).await.unwrap().0;
+    *now.lock().unwrap() += chrono::Duration::hours(24);
+    assert!(keys.deks().active_key_expired(&id).await);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        store.save_request(&id, &json!({"turnId": "turn_1", "files": []})),
+    )
+    .await
+    .expect("save_request deadlocked on the conversation lock")
+    .unwrap();
+    let directory = store.directory(&id).unwrap();
+    let sealed = journal_records(&directory.join("events.000001.jsonl"));
+    assert_eq!(sealed.len(), 40);
+    assert!(sealed
+        .iter()
+        .all(|record| record["x"]["kid"] == old_kid.as_str()));
+    assert_eq!(fs::metadata(directory.join(EVENTS_FILE)).unwrap().len(), 0);
+    assert_ne!(keys.deks().current_key(&id).await.unwrap().0, old_kid);
+    e2e.cleanup();
+}

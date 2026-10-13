@@ -402,7 +402,7 @@ impl DekManager {
 
 /// `HISTORY_KEY_REQUIRED`: nobody could read what would be encrypted. New
 /// prompts and conversations are refused with it; see
-/// `ConversationStore::ensure_history_writable`.
+/// `ConversationStore::ensure_history_key_locked`.
 fn no_recipients() -> AppError {
     AppError::HistoryKeyRequired
 }

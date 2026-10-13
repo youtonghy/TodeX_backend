@@ -641,28 +641,41 @@ impl ConversationStore {
             .transpose()
     }
 
-    /// New work must be able to encrypt what it writes: this refuses a
-    /// legacy plaintext conversation (`HISTORY_READ_ONLY`, see
-    /// [`Self::ensure_not_legacy`]), then creates (or confirms) the
-    /// conversation's current DEK and fails with `HISTORY_KEY_REQUIRED` when
-    /// no recipient is left to wrap it for, so a prompt is refused before its
-    /// turn starts (§3.2). Turns already running keep their key; see
-    /// [`Self::record_key`].
+    /// The checks [`Self::save_request`] runs before a prompt's turn, for
+    /// tests: [`Self::ensure_not_legacy`], then
+    /// [`Self::ensure_history_key_locked`] under the conversation lock.
+    #[cfg(test)]
     pub async fn ensure_history_writable(&self, conversation_id: &str) -> Result<(), AppError> {
-        if let Some(keys) = &self.history {
-            self.ensure_not_legacy(conversation_id).await?;
-            // The key below would replace one that expired by age: seal the
-            // expiring key's records first (see `append_batch_locked`).
-            if let Some(min_bytes) = self.proactive_seal_min_bytes() {
-                if keys.deks().active_key_expired(conversation_id).await {
-                    self.seal_active_if(conversation_id, min_bytes).await?;
-                }
+        self.ensure_not_legacy(conversation_id).await?;
+        let _guard = self.lock(conversation_id).await;
+        self.ensure_history_key_locked(conversation_id).await
+    }
+
+    /// New work must be able to encrypt what it writes: this creates (or
+    /// confirms) the conversation's current DEK and fails with
+    /// `HISTORY_KEY_REQUIRED` when no recipient is left to wrap it for, so a
+    /// prompt is refused before its turn starts (§3.2). Turns already
+    /// running keep their key; see [`Self::record_key`]. The caller holds
+    /// the conversation lock (it is not reentrant: an expiring key's file is
+    /// sealed with [`Self::seal_active_if_locked`]) and has already refused
+    /// legacy plaintext history with [`Self::ensure_not_legacy`], which
+    /// takes the lock itself.
+    async fn ensure_history_key_locked(&self, conversation_id: &str) -> Result<(), AppError> {
+        let Some(keys) = &self.history else {
+            return Ok(());
+        };
+        // The key below would replace one that expired by age: seal the
+        // expiring key's records first (see `append_batch_locked`).
+        if let Some(min_bytes) = self.proactive_seal_min_bytes() {
+            if keys.deks().active_key_expired(conversation_id).await {
+                self.seal_active_if_locked(conversation_id, min_bytes)
+                    .await?;
             }
-            let owner = self.cached_owner(conversation_id);
-            keys.deks()
-                .current_key_for(conversation_id, owner.as_deref())
-                .await?;
         }
+        let owner = self.cached_owner(conversation_id);
+        keys.deks()
+            .current_key_for(conversation_id, owner.as_deref())
+            .await?;
         Ok(())
     }
 
@@ -1826,6 +1839,9 @@ impl ConversationStore {
         conversation_id: &str,
         request: &Value,
     ) -> Result<(), AppError> {
+        // Legacy plaintext history is refused before the lock: classifying
+        // it takes the lock itself, and the answer never flips back.
+        self.ensure_not_legacy(conversation_id).await?;
         let _guard = self.lock(conversation_id).await;
         let directory = self.directory(conversation_id)?;
         self.get_unlocked(conversation_id).await?;
@@ -1834,7 +1850,7 @@ impl ConversationStore {
         // unaffected — appends never refuse on size. Likewise a turn whose
         // history could not be encrypted (no recipient left) never starts.
         self.ensure_free_space(&directory).await?;
-        self.ensure_history_writable(conversation_id).await?;
+        self.ensure_history_key_locked(conversation_id).await?;
         write_atomic_json(&directory.join(LAST_REQUEST_FILE), request).await
     }
 
