@@ -57,6 +57,8 @@ const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Where Devin deviates from plain ACP.
 pub(super) const ACP_QUIRKS: AcpQuirks = AcpQuirks {
     subagents: true,
+    // Reattach without replaying history when the CLI advertises resume.
+    prefer_resume: true,
     recreate_unloadable_session: true,
     control_commands: Some(super::acp::devin_control_commands),
     prompt_usage: PromptUsage::ResultUsage,

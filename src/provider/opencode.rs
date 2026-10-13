@@ -732,13 +732,9 @@ mod tests {
                 .count(),
             0
         );
-        // Every turn restates build mode so a previous plan turn cannot stick.
-        assert_eq!(fixture.config_writes().len(), 2);
-        assert!(fixture
-            .config_writes()
-            .iter()
-            .all(|request| request["params"]["configId"] == "mode"
-                && request["params"]["value"] == "build"));
+        // Every turn requests build mode, but the session already reports it,
+        // so nothing is re-sent.
+        assert!(fixture.config_writes().is_empty());
         let events = fixture
             .store
             .complete_history(&fixture.manifest.id)
@@ -884,16 +880,30 @@ mod tests {
         fixture.wait_for_method("session/prompt").await;
         cancel.send(true).unwrap();
         assert!(task.await.unwrap().unwrap().cancelled);
-        // A cancelled process is not reusable; the next turn loads the native session.
-        let (_cancel, task) = fixture.start("turn-resume", "normal").await;
+        // The agent acknowledged the cancel: the process serves the next turn.
+        for turn in ["turn-kept", "turn-resume"] {
+            if turn == "turn-resume" {
+                // A new process reattaches to the native session.
+                fixture.driver.shutdown_session(&fixture.manifest.id).await;
+            }
+            let (_cancel, task) = fixture.start(turn, "normal").await;
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .stop_reason,
+                "end_turn"
+            );
+        }
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
-                .stop_reason,
-            "end_turn"
+            fixture
+                .requests()
+                .iter()
+                .filter(|request| request["method"] == "initialize")
+                .count(),
+            2
         );
         // OpenCode advertises sessionCapabilities.resume; resuming attaches
         // without replaying history instead of session/load.

@@ -30,6 +30,7 @@ use super::profile::{
     CatalogProfile, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel, ProviderProfile,
     SkillInjection,
 };
+use super::resident::{ResidentLaunch, ResidentSessions};
 use super::rpc::{safe_error_text, FailureWording, RpcClient, RpcPeer};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
@@ -68,7 +69,11 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     file_attachments: FileAttachmentStyle::AtMention,
     profile_required: true,
     recovery_full_scan: false,
-    process_model: ProcessModel::PerTurn,
+    // Profiles with `resident = false` start a process per turn instead.
+    process_model: ProcessModel::Resident {
+        idle: Some(Duration::from_secs(300)),
+        max_sessions: 32,
+    },
     discovery_cache_ttl: None,
     catalog: CatalogProfile::skills_only(
         ConfigHome {
@@ -81,10 +86,41 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
 
 pub struct AcpDriver {
     profiles: BTreeMap<String, AcpProfileConfig>,
-    /// Per-profile `sessionCapabilities.fork` probe results: profile name →
-    /// declared fork support. Populated by `refresh_control_capabilities`
-    /// and `fork_session`.
-    fork_probe: DiscoveryCache<String, bool>,
+    /// Per-profile capability probe results (fork support and image
+    /// prompts from one `initialize`), keyed by profile name. Populated by
+    /// `refresh_control_capabilities`, `discover_image_input` and
+    /// `fork_session`.
+    probes: DiscoveryCache<String, ProfileProbe>,
+    /// Conversations of `resident` profiles keep their agent process
+    /// between turns.
+    sessions: ResidentSessions,
+}
+
+/// What one profile's `initialize` response declares.
+#[derive(Clone, Copy, Debug)]
+struct ProfileProbe {
+    fork: bool,
+    /// `None` when the probe failed; image capability is then asked again
+    /// so the caller sees the failure.
+    image: Option<bool>,
+}
+
+impl ProfileProbe {
+    const FAILED: Self = Self {
+        fork: false,
+        image: None,
+    };
+
+    fn from_initialize(initialize: &Value) -> Result<Self, AppError> {
+        let response: InitializeResponse =
+            serde_json::from_value(initialize.clone()).map_err(|error| {
+                AppError::InvalidRequest(format!("invalid ACP initialize response: {error}"))
+            })?;
+        Ok(Self {
+            fork: declares_session_fork(initialize),
+            image: Some(response.agent_capabilities.prompt_capabilities.image),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -103,7 +139,7 @@ pub(super) struct AcpRuntimeOptions {
 }
 
 /// How one ACP agent deviates from plain ACP. Each ACP-based driver declares
-/// its own (`ACP_QUIRKS`); configured ACP profiles use [`PLAIN_ACP`].
+/// its own (`ACP_QUIRKS`); configured ACP profiles use [`GENERIC_ACP`].
 #[derive(Clone, Copy)]
 pub(super) struct AcpQuirks {
     /// Opts into `cognition.ai/subagent_*` markers on initialize and maps
@@ -183,14 +219,21 @@ pub(super) const PLAIN_ACP: AcpQuirks = AcpQuirks {
     session_mode: None,
 };
 
+/// Configured ACP profiles: plain ACP, reattaching with `session/resume`
+/// when the agent advertises it.
+const GENERIC_ACP: AcpQuirks = AcpQuirks {
+    prefer_resume: true,
+    ..PLAIN_ACP
+};
+
 fn quirks(provider: ProviderKind) -> &'static AcpQuirks {
     match provider {
         ProviderKind::GrokBuild => &super::grok::ACP_QUIRKS,
         ProviderKind::Devin => &super::devin::ACP_QUIRKS,
         ProviderKind::Opencode => &super::opencode::ACP_QUIRKS,
         ProviderKind::DeepseekHarness => &super::deepseek_harness::ACP_QUIRKS,
-        ProviderKind::Acp
-        | ProviderKind::Codex
+        ProviderKind::Acp => &GENERIC_ACP,
+        ProviderKind::Codex
         | ProviderKind::Pi
         | ProviderKind::ClaudeCode
         | ProviderKind::Antigravity => &PLAIN_ACP,
@@ -201,7 +244,9 @@ impl AcpDriver {
     pub fn new(config: &AgentConfig) -> Self {
         Self {
             profiles: config.acp_profiles.clone(),
-            fork_probe: DiscoveryCache::new(),
+            probes: DiscoveryCache::new(),
+            sessions: ResidentSessions::new(&PROFILE, "ACP")
+                .with_idle_timeout(config.provider_keepalive()),
         }
     }
 
@@ -264,11 +309,11 @@ impl ProviderDriver for AcpDriver {
             .profiles
             .iter()
             .filter(|(name, profile)| {
-                !self.fork_probe.is_fresh(*name) && executable_available(&profile.command)
+                !self.probes.is_fresh(*name) && executable_available(&profile.command)
             })
             .map(|(name, profile)| {
-                self.fork_probe.get_or_fetch(name, || async {
-                    Ok((probe_fork_capability(profile).await, FORK_PROBE_TTL))
+                self.probes.get_or_fetch(name, || async {
+                    Ok((probe_profile(profile).await, FORK_PROBE_TTL))
                 })
             });
         futures_util::future::join_all(probes).await;
@@ -277,7 +322,7 @@ impl ProviderDriver for AcpDriver {
     fn supports_native_fork(&self) -> bool {
         self.profiles
             .keys()
-            .any(|name| self.fork_probe.peek(name).unwrap_or(false))
+            .any(|name| self.probes.peek(name).is_some_and(|probe| probe.fork))
     }
 
     async fn fork_session(
@@ -308,8 +353,11 @@ impl ProviderDriver for AcpDriver {
             .await?;
             let initialize = acp_control_response(&mut process, &request_id).await?;
             let capable = declares_session_fork(&initialize);
-            self.fork_probe
-                .insert(&profile_name, capable, FORK_PROBE_TTL);
+            let probe = ProfileProbe::from_initialize(&initialize).unwrap_or(ProfileProbe {
+                fork: capable,
+                image: None,
+            });
+            self.probes.insert(&profile_name, probe, FORK_PROBE_TTL);
             if !capable {
                 return Err(AppError::Unsupported(
                     "ACP agent does not declare sessionCapabilities.fork".to_owned(),
@@ -364,37 +412,42 @@ impl ProviderDriver for AcpDriver {
         result
     }
 
+    /// Answered from the cached capability probe (one `initialize` per
+    /// profile per [`FORK_PROBE_TTL`], shared with the fork probe); probes
+    /// run outside any workspace, so `workspace` is not used.
     async fn discover_image_input(
         &self,
-        workspace: &std::path::Path,
+        _workspace: &std::path::Path,
         profile: Option<&str>,
     ) -> Result<bool, AppError> {
-        let profile = self.named_profile(profile)?;
-        let spec = acp_command_spec(profile, workspace);
-        let mut process = JsonLineProcess::spawn(&spec).await?;
-        let result = async {
-            let request_id = send_request(
-                &mut process,
-                "initialize",
-                initialize_request(ProviderKind::Acp),
-            )
+        let config = self.named_profile(profile)?;
+        let name = profile.map(str::trim).unwrap_or_default().to_owned();
+        let probe = self
+            .probes
+            .get_or_fetch(&name, || async {
+                let initialize = initialize_profile(config).await?;
+                Ok((ProfileProbe::from_initialize(&initialize)?, FORK_PROBE_TTL))
+            })
             .await?;
-            let peer = RpcPeer {
-                failure: FailureWording::Method,
-                closed: "ACP agent closed during initialize",
-                ..ACP_RPC
-            };
-            let result = RpcClient::new(&mut process, peer)
-                .response(&request_id, "initialize", None, None)
-                .await?;
-            let response: InitializeResponse = serde_json::from_value(result).map_err(|error| {
-                AppError::InvalidRequest(format!("invalid ACP initialize response: {error}"))
-            })?;
-            Ok(response.agent_capabilities.prompt_capabilities.image)
+        if let Some(image) = probe.image {
+            return Ok(image);
         }
-        .await;
-        process.terminate().await;
-        result
+        // The cached fork probe failed; probe again and report why.
+        let probe = ProfileProbe::from_initialize(&initialize_profile(config).await?)?;
+        self.probes.insert(&name, probe, FORK_PROBE_TTL);
+        Ok(probe.image.unwrap_or(false))
+    }
+
+    async fn shutdown_session(&self, conversation_id: &str) {
+        self.sessions.stop(conversation_id).await;
+    }
+
+    async fn shutdown_session_with_reason(&self, conversation_id: &str, _reason: &str) {
+        self.shutdown_session(conversation_id).await;
+    }
+
+    async fn shutdown(&self) {
+        self.sessions.stop_all().await;
     }
 
     async fn run_turn(
@@ -406,6 +459,27 @@ impl ProviderDriver for AcpDriver {
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         let profile = self.profile(&context)?;
+        if profile.resident {
+            // Validate the profile (api_key_env) before reserving a session.
+            profile_runtime_options(profile)?;
+            return self
+                .sessions
+                .run_turn(
+                    context,
+                    prompt,
+                    sink,
+                    cancel,
+                    launch_permit,
+                    |context, _prompt| {
+                        let profile = self.profile(context)?;
+                        Ok(ResidentLaunch {
+                            spec: acp_command_spec(profile, &context.manifest.workspace),
+                            runtime: profile_runtime_options(profile)?,
+                        })
+                    },
+                )
+                .await;
+        }
         let spec = acp_command_spec(profile, &context.manifest.workspace);
         let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
         let result = run_acp_turn(
@@ -472,36 +546,39 @@ pub(super) fn declares_session_fork(initialize: &Value) -> bool {
         .is_some()
 }
 
-/// Probe one profile's fork capability by completing `initialize` in a
-/// throwaway process. Failures map to `false` — the fork control stays hidden
-/// rather than offering an action that cannot succeed.
-async fn probe_fork_capability(profile: &AcpProfileConfig) -> bool {
-    let run = async {
-        let spec = acp_command_spec(profile, &std::env::temp_dir());
-        let mut process = JsonLineProcess::spawn(&spec).await?;
-        let result = async {
-            let request_id = send_request(
-                &mut process,
-                "initialize",
-                initialize_request(ProviderKind::Acp),
-            )
-            .await?;
-            let initialize = acp_control_response(&mut process, &request_id).await?;
-            Ok::<_, AppError>(declares_session_fork(&initialize))
-        }
-        .await;
-        process.terminate().await;
-        result
-    };
+/// Completes `initialize` with one profile in a throwaway process outside
+/// any workspace.
+async fn initialize_profile(profile: &AcpProfileConfig) -> Result<Value, AppError> {
+    let spec = acp_command_spec(profile, &std::env::temp_dir());
+    let mut process = JsonLineProcess::spawn(&spec).await?;
+    let result = async {
+        let request_id = send_request(
+            &mut process,
+            "initialize",
+            initialize_request(ProviderKind::Acp),
+        )
+        .await?;
+        acp_control_response(&mut process, &request_id).await
+    }
+    .await;
+    process.terminate().await;
+    result
+}
+
+/// Probe one profile's capabilities for the cache. Failures map to
+/// [`ProfileProbe::FAILED`] — the fork control stays hidden rather than
+/// offering an action that cannot succeed.
+async fn probe_profile(profile: &AcpProfileConfig) -> ProfileProbe {
+    let run = async { ProfileProbe::from_initialize(&initialize_profile(profile).await?) };
     match tokio::time::timeout(FORK_PROBE_TIMEOUT, run).await {
-        Ok(Ok(capable)) => capable,
+        Ok(Ok(probe)) => probe,
         Ok(Err(error)) => {
-            tracing::debug!(error = %error, "ACP fork capability probe failed");
-            false
+            tracing::debug!(error = %error, "ACP capability probe failed");
+            ProfileProbe::FAILED
         }
         Err(_) => {
-            tracing::debug!("ACP fork capability probe timed out");
-            false
+            tracing::debug!("ACP capability probe timed out");
+            ProfileProbe::FAILED
         }
     }
 }
@@ -583,6 +660,9 @@ pub(super) struct AcpConnectionState {
     /// and `subagent_completed` `_meta` markers map to `subagent.updated`
     /// instead of tool progress.
     subagents: BTreeSet<String>,
+    /// Set when the last turn's cancel completed cleanly; see
+    /// [`AcpConnectionState::take_clean_cancel`].
+    clean_cancel: bool,
 }
 
 /// Minimum spacing between in-progress snapshots of one tool call. Streaming
@@ -592,6 +672,14 @@ const ACP_TOOL_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 const ACP_CHUNK_TEXT: &[&str] = &["/content/text"];
 
 impl AcpConnectionState {
+    /// Whether the turn that just ended was cancelled cleanly: the agent
+    /// answered `session/prompt` with stop reason `cancelled` within the
+    /// drain bound and nothing it asked for is still open, so the process
+    /// may serve the next turn. Resets the flag.
+    pub(super) fn take_clean_cancel(&mut self) -> bool {
+        std::mem::take(&mut self.clean_cancel)
+    }
+
     fn tool_flush_deadline(&self) -> Option<tokio::time::Instant> {
         self.tool_pending
             .keys()
@@ -710,6 +798,7 @@ async fn run_acp_turn_steps(
     connection: &mut AcpConnectionState,
     mut controls: Option<&mut mpsc::Receiver<PendingProviderControl>>,
 ) -> Result<DriverTurnResult, AppError> {
+    connection.clean_cancel = false;
     let provider = context.manifest.provider;
     super::types::resolve_execution_config(
         provider,
@@ -1009,7 +1098,7 @@ async fn run_acp_turn_steps(
                     "session/cancel",
                     CancelNotification::new(native_session_id.clone()),
                 ).await?;
-                return drain_cancelled_turn(process, &native_session_id, &prompt_request_id, sink, provider, auto_approve, &mut client_requests, terminal_response.is_some()).await;
+                return drain_cancelled_turn(process, &native_session_id, &prompt_request_id, sink, provider, auto_approve, &mut client_requests, terminal_response.as_ref(), pending.is_empty(), connection).await;
             }
         };
         let Some(message) = message else {
@@ -1082,7 +1171,9 @@ async fn run_acp_turn_steps(
                     provider,
                     auto_approve,
                     &mut client_requests,
-                    terminal_response.is_some(),
+                    terminal_response.as_ref(),
+                    pending.is_empty(),
+                    connection,
                 )
                 .await;
             }
@@ -1433,17 +1524,25 @@ async fn complete_live_control(
     Ok(())
 }
 
+/// Keeps the cached session config current with what the agent reports
+/// on its own: `config_option_update` replaces the options and
+/// `current_mode_update` moves the `mode` option. Unchanged values are not
+/// re-sent on the next turn, so the cache must not go stale.
 pub(super) fn observe_config_options(connection: &mut AcpConnectionState, message: &Value) {
-    if message.get("method").and_then(Value::as_str) != Some("session/update")
-        || message
-            .pointer("/params/update/sessionUpdate")
-            .and_then(Value::as_str)
-            != Some("config_option_update")
-    {
+    if message.get("method").and_then(Value::as_str) != Some("session/update") {
         return;
     }
-    if let Some((id, response)) = &mut connection.session {
-        if message.pointer("/params/sessionId").and_then(Value::as_str) == Some(id.as_str()) {
+    let Some((id, response)) = &mut connection.session else {
+        return;
+    };
+    if message.pointer("/params/sessionId").and_then(Value::as_str) != Some(id.as_str()) {
+        return;
+    }
+    match message
+        .pointer("/params/update/sessionUpdate")
+        .and_then(Value::as_str)
+    {
+        Some("config_option_update") => {
             if let Some(options) = message
                 .pointer("/params/update/configOptions")
                 .filter(|value| value.is_array())
@@ -1451,6 +1550,26 @@ pub(super) fn observe_config_options(connection: &mut AcpConnectionState, messag
                 response["configOptions"] = options.clone();
             }
         }
+        Some("current_mode_update") => {
+            let Some(mode) = message
+                .pointer("/params/update/currentModeId")
+                .and_then(Value::as_str)
+            else {
+                return;
+            };
+            if let Some(option) = response
+                .get_mut("configOptions")
+                .and_then(Value::as_array_mut)
+                .and_then(|options| {
+                    options
+                        .iter_mut()
+                        .find(|option| option.get("id").and_then(Value::as_str) == Some("mode"))
+                })
+            {
+                option["currentValue"] = json!(mode);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1622,8 +1741,16 @@ async fn emit_prompt_metadata(
     Ok(())
 }
 
+/// How long a cancelled turn waits for the agent to settle the prompt.
+const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Give cancellation a bounded protocol drain before the caller terminates the process.
 /// Reverse requests during this window are rejected without waiting for another user action.
+///
+/// The cancel is clean — the process may serve the next turn — when the
+/// `session/prompt` response arrives within the bound with stop reason
+/// `cancelled`, every in-flight client request is answered and no live
+/// control is still awaiting its acknowledgement (`controls_settled`).
 #[allow(clippy::too_many_arguments)]
 async fn drain_cancelled_turn(
     process: &mut JsonLineProcess,
@@ -1633,71 +1760,103 @@ async fn drain_cancelled_turn(
     provider: ProviderKind,
     auto_approve: AutoApprove,
     client_requests: &mut tokio::task::JoinSet<(Vec<Value>, Result<(), AppError>)>,
-    terminal_seen: bool,
+    terminal_response: Option<&Value>,
+    controls_settled: bool,
+    connection: &mut AcpConnectionState,
 ) -> Result<DriverTurnResult, AppError> {
     let drain = async {
-        if terminal_seen {
-            return Ok(true);
-        }
-        let (_cancel_tx, mut cancelled) = watch::channel(true);
-        loop {
-            let message = tokio::select! {
-                message = process.read_frame() => sink.provider_frame(message?).await?,
-                response = client_requests.join_next(), if !client_requests.is_empty() => {
-                    if let Some(Ok((responses, _))) = response { for response in responses { process.send(&response).await?; } }
-                    continue;
+        let response = match terminal_response {
+            Some(response) => response.clone(),
+            None => drain_until_prompt_response(
+                process,
+                prompt_request_id,
+                sink,
+                provider,
+                auto_approve,
+                client_requests,
+            )
+            .await?
+            .ok_or(AppError::StreamClosed)?,
+        };
+        // Answers to requests the cancel interrupted still go out, so the
+        // agent holds no open request when the next turn starts.
+        while let Some(joined) = client_requests.join_next().await {
+            if let Ok((responses, _)) = joined {
+                for response in responses {
+                    process.send(&response).await?;
                 }
-            };
-            let Some(message) = message else {
-                return Ok::<bool, AppError>(false);
-            };
-            if jsonrpc_id(&message) == Some(prompt_request_id) {
-                emit_prompt_metadata(&message, sink, provider).await?;
-                return Ok(true);
-            }
-            if let Some(id) = message
-                .get("id")
-                .filter(|_| message.get("method").is_some())
-            {
-                if message.get("method").and_then(Value::as_str)
-                    == Some("session/request_permission")
-                {
-                    send_result(
-                        process,
-                        id,
-                        serde_json::to_value(RequestPermissionResponse::new(
-                            RequestPermissionOutcome::Cancelled,
-                        ))?,
-                    )
-                    .await?;
-                } else {
-                    process.send(&json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32800,"message":"turn cancelled"}})).await?;
-                }
-            } else {
-                handle_acp_message(
-                    process,
-                    message,
-                    sink,
-                    &mut cancelled,
-                    provider,
-                    true,
-                    auto_approve,
-                    &mut AcpConnectionState::default(),
-                )
-                .await?;
             }
         }
+        Ok::<Value, AppError>(response)
     };
-    let graceful = matches!(
-        tokio::time::timeout(Duration::from_secs(3), drain).await,
-        Ok(Ok(true))
-    );
+    let response = tokio::time::timeout(CANCEL_DRAIN_TIMEOUT, drain).await;
+    let graceful = matches!(response, Ok(Ok(_)));
+    connection.clean_cancel = controls_settled
+        && matches!(&response, Ok(Ok(response)) if response.pointer("/result/stopReason").and_then(Value::as_str) == Some("cancelled"));
     sink.emit("provider.event", json!({"provider":provider.as_str(), "providerMethod":"session/cancel/result", "metadata":{"graceful":graceful}})).await?;
     Ok(DriverTurnResult {
         native_session_id: Some(session_id.to_owned()),
         stop_reason: "cancelled".to_owned(),
         cancelled: true,
     })
+}
+
+/// Reads until the `session/prompt` response, rejecting reverse requests;
+/// `None` when the agent closed its output first.
+async fn drain_until_prompt_response(
+    process: &mut JsonLineProcess,
+    prompt_request_id: &str,
+    sink: &DriverEventSink,
+    provider: ProviderKind,
+    auto_approve: AutoApprove,
+    client_requests: &mut tokio::task::JoinSet<(Vec<Value>, Result<(), AppError>)>,
+) -> Result<Option<Value>, AppError> {
+    let (_cancel_tx, mut cancelled) = watch::channel(true);
+    loop {
+        let message = tokio::select! {
+            message = process.read_frame() => sink.provider_frame(message?).await?,
+            response = client_requests.join_next(), if !client_requests.is_empty() => {
+                if let Some(Ok((responses, _))) = response { for response in responses { process.send(&response).await?; } }
+                continue;
+            }
+        };
+        let Some(message) = message else {
+            return Ok(None);
+        };
+        if jsonrpc_id(&message) == Some(prompt_request_id) {
+            emit_prompt_metadata(&message, sink, provider).await?;
+            return Ok(Some(message));
+        }
+        if let Some(id) = message
+            .get("id")
+            .filter(|_| message.get("method").is_some())
+        {
+            if message.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+                send_result(
+                    process,
+                    id,
+                    serde_json::to_value(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Cancelled,
+                    ))?,
+                )
+                .await?;
+            } else {
+                process.send(&json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32800,"message":"turn cancelled"}})).await?;
+            }
+        } else {
+            handle_acp_message(
+                process,
+                message,
+                sink,
+                &mut cancelled,
+                provider,
+                true,
+                auto_approve,
+                &mut AcpConnectionState::default(),
+            )
+            .await?;
+        }
+    }
 }
 
 fn ensure_acp_images_supported(
@@ -2979,6 +3138,14 @@ async fn apply_requested_config(
                 context.provider.as_str()
             )));
         }
+        // The session already reports this value (a resident session keeps
+        // it from the last turn, a new one from session/new|load|resume).
+        if current_options
+            .as_deref()
+            .is_some_and(|options| config_current_value(options, config_id) == Some(requested))
+        {
+            continue;
+        }
         let request_id = send_request(
             process,
             "session/set_config_option",
@@ -3007,6 +3174,11 @@ async fn apply_requested_config(
                 ))
             })?;
         current_options = Some(response.config_options);
+        // Cache each acknowledged value at once: a later failure in this turn
+        // must not leave the session believing an older value.
+        if let (Some((_, session)), Some(options)) = (&mut connection.session, &current_options) {
+            session["configOptions"] = serde_json::to_value(options)?;
+        }
     }
     if let Some(options) = &current_options {
         if let Some(effective) = config_effective(&serde_json::to_value(options)?) {
@@ -3014,6 +3186,21 @@ async fn apply_requested_config(
         }
     }
     Ok(current_options)
+}
+
+/// The `currentValue` of the select option `config_id`.
+fn config_current_value<'a>(
+    options: &'a [SessionConfigOption],
+    config_id: &str,
+) -> Option<&'a str> {
+    use agent_client_protocol::schema::v1::SessionConfigKind;
+    options
+        .iter()
+        .find(|option| option.id.0.as_ref() == config_id)
+        .and_then(|option| match &option.kind {
+            SessionConfigKind::Select(select) => Some(select.current_value.0.as_ref()),
+            _ => None,
+        })
 }
 
 /// Devin session modes map the product permission modes onto its native
@@ -4103,5 +4290,263 @@ mod tests {
             commands_fingerprint(&first),
             commands_fingerprint(&first[..1])
         );
+    }
+
+    /// A configured ACP profile driving the plain-ACP OpenCode wire fixture.
+    #[cfg(unix)]
+    struct GenericFixture {
+        root: std::path::PathBuf,
+        driver: std::sync::Arc<AcpDriver>,
+        store: crate::conversation::ConversationStore,
+        manifest: crate::conversation::ConversationManifest,
+        trust: crate::workspace_trust::WorkspaceTrustStore,
+    }
+
+    #[cfg(unix)]
+    impl GenericFixture {
+        async fn new(resident: bool) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let root =
+                std::env::temp_dir().join(format!("todex-acp-generic-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
+            let binary = root.join("acp-fixture");
+            std::fs::write(
+                &binary,
+                include_str!("../../tests/fixtures/opencode_acp_fixture.py"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut config = crate::config::Config::default().agent;
+            config.acp_profiles.insert(
+                "fixture".to_owned(),
+                AcpProfileConfig {
+                    command: binary.to_string_lossy().to_string(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    auth_method: None,
+                    api_key_env: None,
+                    resident,
+                },
+            );
+            let driver = std::sync::Arc::new(AcpDriver::new(&config));
+            let store = crate::conversation::ConversationStore::new(root.join("data"))
+                .await
+                .unwrap();
+            let manifest = store
+                .create(crate::conversation::ConversationManifest::new(
+                    ProviderKind::Acp,
+                    root.clone(),
+                    None,
+                    Some("fixture".to_owned()),
+                ))
+                .await
+                .unwrap();
+            let trust = crate::workspace_trust::WorkspaceTrustStore::new(
+                root.join("data"),
+                vec![root.clone()],
+            )
+            .await
+            .unwrap();
+            trust.set_owned("local", &root, true).await.unwrap();
+            Self {
+                root,
+                driver,
+                store,
+                manifest,
+                trust,
+            }
+        }
+
+        async fn start(
+            &self,
+            turn_id: &str,
+            text: &str,
+            model: Option<&str>,
+        ) -> (
+            watch::Sender<bool>,
+            tokio::task::JoinHandle<Result<DriverTurnResult, AppError>>,
+        ) {
+            let context = DriverContext {
+                manifest: self.manifest.clone(),
+                provider_state: self.store.provider_state(&self.manifest.id).await.unwrap(),
+                agent_mcp: None,
+            };
+            let prompt = DriverPrompt {
+                turn_id: turn_id.to_owned(),
+                text: text.to_owned(),
+                content: vec![],
+                skills: vec![],
+                model: model.map(ToOwned::to_owned),
+                reasoning_effort: None,
+                permission_mode: None,
+                work_mode: None,
+                permission_profile: None,
+                sandbox_mode: None,
+                approval_policy: None,
+            };
+            let sink = DriverEventSink::new(
+                self.store.clone(),
+                crate::conversation::ConversationEventHub::default(),
+                super::super::types::PermissionBroker::default(),
+                &self.manifest.id,
+            )
+            .with_turn_id(turn_id);
+            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
+            let driver = self.driver.clone();
+            let (cancel, receiver) = watch::channel(false);
+            let task = tokio::spawn(async move {
+                driver
+                    .run_turn(context, prompt, sink, receiver, permit)
+                    .await
+            });
+            (cancel, task)
+        }
+
+        async fn run(&self, turn_id: &str, text: &str, model: Option<&str>) -> DriverTurnResult {
+            let (_cancel, task) = self.start(turn_id, text, model).await;
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        }
+
+        fn requests(&self) -> Vec<Value> {
+            std::fs::read_to_string(self.root.join("opencode-requests.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        }
+
+        fn count(&self, method: &str) -> usize {
+            self.requests()
+                .iter()
+                .filter(|request| request["method"] == method)
+                .count()
+        }
+
+        fn processes(&self) -> usize {
+            self.requests()
+                .iter()
+                .map(|request| request["fixturePid"].as_u64())
+                .collect::<BTreeSet<_>>()
+                .len()
+        }
+
+        async fn wait_for_method(&self, method: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.count(method) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fixture request deadline");
+        }
+
+        async fn finish(self) {
+            self.driver.shutdown().await;
+            std::fs::remove_dir_all(self.root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resident_profile_runs_turns_on_one_process() {
+        let fixture = GenericFixture::new(true).await;
+        for turn in ["turn-first", "turn-second"] {
+            assert_eq!(
+                fixture.run(turn, "normal", None).await.stop_reason,
+                "end_turn"
+            );
+        }
+        assert_eq!(fixture.processes(), 1);
+        assert_eq!(fixture.count("initialize"), 1);
+        assert_eq!(fixture.count("session/new"), 1);
+        assert_eq!(fixture.count("session/prompt"), 2);
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_resident_profile_starts_a_process_per_turn_and_resumes() {
+        let fixture = GenericFixture::new(false).await;
+        for turn in ["turn-first", "turn-second"] {
+            assert_eq!(
+                fixture.run(turn, "normal", None).await.stop_reason,
+                "end_turn"
+            );
+        }
+        assert_eq!(fixture.processes(), 2);
+        assert_eq!(fixture.count("initialize"), 2);
+        assert_eq!(fixture.count("session/new"), 1);
+        // The agent advertises `sessionCapabilities.resume`: no history replay.
+        assert_eq!(fixture.count("session/resume"), 1);
+        assert_eq!(fixture.count("session/load"), 0);
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_cancel_keeps_the_resident_process() {
+        let fixture = GenericFixture::new(true).await;
+        let (cancel, task) = fixture.start("turn-cancel", "cancel", None).await;
+        fixture.wait_for_method("session/prompt").await;
+        cancel.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.cancelled);
+        assert_eq!(fixture.count("session/cancel"), 1);
+        assert_eq!(
+            fixture.run("turn-next", "normal", None).await.stop_reason,
+            "end_turn"
+        );
+        assert_eq!(fixture.processes(), 1);
+        assert_eq!(fixture.count("initialize"), 1);
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unchanged_session_config_is_not_sent_again() {
+        let fixture = GenericFixture::new(true).await;
+        let config_writes = |fixture: &GenericFixture| fixture.count("session/set_config_option");
+        // session/new already reports the requested model.
+        fixture
+            .run("turn-current", "normal", Some("opencode/fixture-model"))
+            .await;
+        assert_eq!(config_writes(&fixture), 0);
+        fixture
+            .run("turn-switch", "normal", Some("opencode/other-model"))
+            .await;
+        assert_eq!(config_writes(&fixture), 1);
+        // The acknowledged value is cached for the next turn.
+        fixture
+            .run("turn-same", "normal", Some("opencode/other-model"))
+            .await;
+        assert_eq!(config_writes(&fixture), 1);
+        fixture.finish().await;
+    }
+
+    #[test]
+    fn agent_reported_mode_updates_the_cached_config() {
+        let mut connection = AcpConnectionState {
+            session: Some((
+                "s".to_owned(),
+                json!({"configOptions":[{"id":"mode","name":"Mode","type":"select","currentValue":"plan","options":[]}]}),
+            )),
+            ..Default::default()
+        };
+        observe_config_options(
+            &mut connection,
+            &json!({"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"current_mode_update","currentModeId":"build"}}}),
+        );
+        let options: Vec<SessionConfigOption> =
+            serde_json::from_value(connection.session.unwrap().1["configOptions"].clone()).unwrap();
+        assert_eq!(config_current_value(&options, "mode"), Some("build"));
     }
 }

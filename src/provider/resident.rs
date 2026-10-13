@@ -1,10 +1,12 @@
 //! One resident ACP agent process per conversation, kept between turns
-//! (Grok Build, Devin, OpenCode).
+//! (Grok Build, Devin, OpenCode, DeepSeek Harness, configured ACP profiles).
 //!
 //! Each conversation gets an actor owning the process: it runs turns one at
 //! a time, forwards live controls into the running turn, keeps serving
-//! notifications between turns and stops after the profile's idle timeout.
-//! The provider supplies how to launch it; everything else is shared.
+//! notifications between turns and stops after the idle keepalive
+//! (`[agent].provider_keepalive_seconds`). A turn that ends in a clean
+//! cancel keeps the process; any other failure discards it. The provider
+//! supplies how to launch it; everything else is shared.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -396,7 +398,12 @@ impl SessionActor {
                 result = run_acp_turn_controlled(running, context, prompt, &sink, &mut cancel, options, &mut connection, Some(&mut controls)) => result,
                 _ = shutdown.changed() => { let _ = respond_to.send(ResidentReply::Finished(Err(AppError::TurnCancelled))); break; }
             };
-            let reusable = result.as_ref().is_ok_and(|result| !result.cancelled);
+            // A cancel the agent acknowledged in time left the session idle;
+            // anything else may leave work running in the process.
+            let clean_cancel = connection.take_clean_cancel();
+            let reusable = result
+                .as_ref()
+                .is_ok_and(|result| !result.cancelled || clean_cancel);
             last_sink = Some(sink);
             while let Ok(control) = controls.try_recv() {
                 let _ = control

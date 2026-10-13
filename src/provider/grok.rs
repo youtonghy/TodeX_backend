@@ -42,6 +42,8 @@ const GROK_RPC: RpcPeer = RpcPeer {
 
 /// Where Grok Build deviates from plain ACP.
 pub(super) const ACP_QUIRKS: AcpQuirks = AcpQuirks {
+    // Reattach without replaying history when the CLI advertises resume.
+    prefer_resume: true,
     control_commands: Some(super::acp::grok_control_commands),
     prompt_usage: PromptUsage::GrokMetadata,
     extension_updates: Some(ExtensionUpdates {
@@ -899,6 +901,19 @@ mod tests {
         fixture.wait_for_method("session/prompt").await;
         cancel.send(true).unwrap();
         assert!(task.await.unwrap().unwrap().cancelled);
+        // The cancel was acknowledged, so the process is kept; a reopened
+        // session reloads without replay.
+        let (_cancel, task) = fixture.start("turn-kept", "normal").await;
+        assert_eq!(task.await.unwrap().unwrap().stop_reason, "end_turn");
+        assert_eq!(
+            fixture
+                .requests()
+                .iter()
+                .filter(|request| request["method"] == "initialize")
+                .count(),
+            1
+        );
+        fixture.driver.shutdown_session(&fixture.manifest.id).await;
         let (_cancel, task) = fixture.start("turn-resume", "normal").await;
         assert_eq!(task.await.unwrap().unwrap().stop_reason, "end_turn");
         let load = fixture
@@ -918,12 +933,13 @@ mod tests {
         assert!(events.iter().any(|event| event.payload["providerMethod"]
             == "session/cancel/result"
             && event.payload["metadata"]["graceful"] == true));
+        // One usage ledger per turn: cancelled, kept and reloaded.
         assert_eq!(
             events
                 .iter()
                 .filter(|event| event.event_type == "usage.updated")
                 .count(),
-            2
+            3
         );
         fixture.finish().await;
     }
@@ -947,9 +963,26 @@ mod tests {
         })
         .await
         .expect("second turn was never queued");
-        // A cancelled turn discards the process; the queued turn must not be
-        // dropped with it.
+        // A cancel with an unacknowledged live control discards the process;
+        // the queued turn must not be dropped with it.
+        let driver = fixture.driver.clone();
+        let conversation_id = fixture.manifest.id.clone();
+        let control = tokio::spawn(async move {
+            driver
+                .control(
+                    &conversation_id,
+                    "turn-cancel",
+                    "config-hang",
+                    ProviderControl::Configure {
+                        model: Some("hang".to_owned()),
+                        reasoning_effort: None,
+                    },
+                )
+                .await
+        });
+        fixture.wait_for_method("session/set_config_option").await;
         cancel.send(true).unwrap();
+        assert!(control.await.unwrap().is_err());
         assert!(first.await.unwrap().unwrap().cancelled);
         let queued = tokio::time::timeout(Duration::from_secs(15), queued)
             .await

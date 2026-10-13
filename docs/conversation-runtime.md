@@ -116,6 +116,15 @@ optional and canonical aliases are recomputed when old journals are replayed.
   permission request of the conversation is pending. The turn is cancelled
   normally, the driver is aborted if it has not finished 30 s later, and the
   turn ends with `turn.failed` code `PROVIDER_IDLE_TIMEOUT`.
+- `[agent].provider_keepalive_seconds` (default 300, minimum 30; env
+  `TODEX_AGENTD_PROVIDER_KEEPALIVE_SECONDS`) is how long a resident provider
+  process (Codex, Pi, OpenCode, Grok Build, Devin, DeepSeek Harness and ACP
+  profiles unless `resident = false`) is kept with no turn before it is
+  stopped; the next turn reattaches to the native session. It is distinct
+  from the stall watchdog above, which only measures silence inside a
+  running turn. A resident ACP process also survives a cancelled turn when
+  the agent answers `session/prompt` with `stopReason: "cancelled"` within
+  3 s and nothing it asked for is still open; otherwise it is discarded.
 - WebSocket delivery never waits on a stuck peer: a socket send over 20 s or an
   outgoing queue full for over 10 s closes the connection. Subscribe backfill
   runs beside the read loop, so replies to later commands may interleave with
