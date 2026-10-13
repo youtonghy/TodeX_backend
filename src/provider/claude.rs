@@ -4,6 +4,7 @@ use chrono_tz::Tz;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -55,7 +56,11 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     file_attachments: FileAttachmentStyle::AtMention,
     profile_required: false,
     recovery_full_scan: false,
-    process_model: ProcessModel::PerTurn,
+    // One resident process per conversation; see `claude/runtime.rs`.
+    process_model: ProcessModel::Resident {
+        idle: Some(Duration::from_secs(300)),
+        max_sessions: 16,
+    },
     discovery_cache_ttl: Some(Duration::from_secs(60)),
     catalog: CatalogProfile {
         source: CatalogSource::Filesystem,
@@ -74,13 +79,17 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     },
 };
 
+mod runtime;
+
+/// Slash-command catalogs captured from each process's `initialize` control
+/// response, keyed by conversation id. Kept apart from the resident process
+/// so the catalog survives its idle exit.
+type Catalogs = Arc<Mutex<HashMap<String, ProviderSessionCommands>>>;
+
 pub struct ClaudeDriver {
     binary: String,
-    /// Slash-command catalogs captured from each session's `initialize`
-    /// control response, keyed by conversation id. Claude has no resident
-    /// runtime, so this is the only place the live catalog survives between
-    /// the per-turn process exits.
-    catalogs: Mutex<HashMap<String, ProviderSessionCommands>>,
+    catalogs: Catalogs,
+    sessions: runtime::Sessions,
     models: CatalogCache<Vec<super::types::ProviderModelDescriptor>>,
 }
 
@@ -408,7 +417,17 @@ impl ClaudeDriver {
     pub fn new(config: &AgentConfig) -> Self {
         Self {
             binary: config.claude_bin.clone(),
-            catalogs: Mutex::new(HashMap::new()),
+            catalogs: Catalogs::default(),
+            sessions: runtime::Sessions::new(
+                PROFILE
+                    .process_model
+                    .idle_timeout()
+                    .expect("Claude declares an idle timeout"),
+                PROFILE
+                    .process_model
+                    .max_sessions()
+                    .expect("Claude declares a session limit"),
+            ),
             models: CatalogCache::new(PROFILE.discovery_cache_ttl),
         }
     }
@@ -591,109 +610,165 @@ impl ProviderDriver for ClaudeDriver {
         context: DriverContext,
         prompt: DriverPrompt,
         sink: DriverEventSink,
-        mut cancel: watch::Receiver<bool>,
+        cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
-        let controls = super::types::resolve_execution_config(
-            context.manifest.provider,
-            prompt.permission_mode.as_deref(),
-            prompt.work_mode.as_deref(),
-            prompt.permission_profile.as_deref(),
-            prompt.sandbox_mode.as_deref(),
-            prompt.approval_policy.as_deref(),
-        )?;
-        let requested_session_id = context
-            .provider_state
-            .native_session_id
-            .clone()
-            .unwrap_or_else(|| context.manifest.id.clone());
-        let mut spec = CommandSpec::new(&self.binary, &context.manifest.workspace);
-        spec.args = vec![
-            "-p".to_owned(),
-            "--input-format".to_owned(),
-            "stream-json".to_owned(),
-            "--output-format".to_owned(),
-            "stream-json".to_owned(),
-            "--verbose".to_owned(),
-            "--include-partial-messages".to_owned(),
-            "--replay-user-messages".to_owned(),
-            "--permission-prompts".to_owned(),
-            "host".to_owned(),
-            // Match the official Agent SDK transport: host alone does not
-            // connect can_use_tool requests to the stream-json control channel.
-            "--permission-prompt-tool".to_owned(),
-            "stdio".to_owned(),
-            "--permission-mode".to_owned(),
-            controls
-                .provider_mode
-                .expect("Claude permission mode validated"),
-        ];
-        // `session_state_changed: idle` marks the real end of a turn; see
-        // `run_claude_turn`.
-        spec.env.insert(
-            "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".to_owned(),
-            "1".to_owned(),
-        );
-        // `--resume` replays a transcript Claude already wrote; it fails
-        // initialization outright ("No conversation found") when the file is
-        // missing or unloadable — transcript cleanup, manual deletion, or a
-        // `CLAUDE_CONFIG_DIR` change all orphan a recorded `native_session_id`
-        // this way, and retrying the same `--resume` can never recover. Only a
-        // transcript that exists and parses justifies `--resume`.
-        let session_path = claude_session_path_at(
-            &crate::agent_providers::claude_config_dir(),
-            &context.manifest.workspace,
-            &requested_session_id,
-        )
-        .await;
-        if claude_transcript_loadable(&session_path).await {
-            // A turn that dies after Claude creates its transcript but before
-            // the id reaches provider state (rate limit, crash, cancel) leaves
-            // no recorded session: `--session-id` would then deadlock on
-            // "Session ID is already in use", so resume the file instead.
-            spec.args.push("--resume".to_owned());
-        } else {
-            // A transcript file that fails to load still blocks `--session-id`
-            // ("already in use"), so move it aside rather than deleting it and
-            // start a fresh transcript under the same id.
-            if tokio::fs::try_exists(&session_path).await.unwrap_or(false) {
-                let stale = session_path.with_extension("jsonl.todex-stale");
-                if let Err(error) = tokio::fs::rename(&session_path, &stale).await {
-                    tracing::warn!(
-                        path = %session_path.display(),
-                        %error,
-                        "could not move aside unloadable Claude transcript"
-                    );
-                }
-            }
-            spec.args.push("--session-id".to_owned());
-        }
-        spec.args.push(requested_session_id.clone());
-        if let Some(model) = &prompt.model {
-            spec.push_flag_value("--model", model)?;
-        }
-        if let Some(effort) = &prompt.reasoning_effort {
-            spec.push_flag_value("--effort", effort)?;
-        }
-        if let Some(launch) = &context.agent_mcp {
-            spec.args
-                .extend(super::mcp_injection::claude_args(launch).await?);
-        }
-
-        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
-        let result = run_claude_turn(
-            &mut process,
-            context,
-            prompt,
-            requested_session_id,
-            &sink,
-            &self.catalogs,
-            &mut cancel,
-        )
-        .await;
-        process.terminate().await;
-        result
+        self.sessions
+            .run(
+                runtime::Launcher {
+                    binary: self.binary.clone(),
+                    catalogs: self.catalogs.clone(),
+                },
+                runtime::Run {
+                    context,
+                    prompt,
+                    sink,
+                    cancel,
+                    permit: launch_permit,
+                },
+            )
+            .await
     }
+
+    async fn shutdown_session(&self, conversation_id: &str) {
+        self.sessions.stop(conversation_id).await;
+    }
+
+    async fn shutdown(&self) {
+        self.sessions.stop_all().await;
+    }
+}
+
+/// The native session a turn runs on: the recorded one, else the
+/// conversation id (`--session-id` creates it under that id).
+fn claude_session_id(context: &DriverContext) -> String {
+    context
+        .provider_state
+        .native_session_id
+        .clone()
+        .unwrap_or_else(|| context.manifest.id.clone())
+}
+
+/// The command line of a Claude process serving `context` with `prompt`'s
+/// launch settings. Called once per spawn: it moves an unloadable
+/// transcript aside and writes the agent MCP config.
+async fn claude_launch_spec(
+    binary: &str,
+    context: &DriverContext,
+    prompt: &DriverPrompt,
+) -> Result<(CommandSpec, String), AppError> {
+    let controls = super::types::resolve_execution_config(
+        context.manifest.provider,
+        prompt.permission_mode.as_deref(),
+        prompt.work_mode.as_deref(),
+        prompt.permission_profile.as_deref(),
+        prompt.sandbox_mode.as_deref(),
+        prompt.approval_policy.as_deref(),
+    )?;
+    let requested_session_id = claude_session_id(context);
+    let mut spec = CommandSpec::new(binary, &context.manifest.workspace);
+    spec.args = vec![
+        "-p".to_owned(),
+        "--input-format".to_owned(),
+        "stream-json".to_owned(),
+        "--output-format".to_owned(),
+        "stream-json".to_owned(),
+        "--verbose".to_owned(),
+        "--include-partial-messages".to_owned(),
+        "--replay-user-messages".to_owned(),
+        "--permission-prompts".to_owned(),
+        "host".to_owned(),
+        // Match the official Agent SDK transport: host alone does not
+        // connect can_use_tool requests to the stream-json control channel.
+        "--permission-prompt-tool".to_owned(),
+        "stdio".to_owned(),
+        "--permission-mode".to_owned(),
+        controls
+            .provider_mode
+            .expect("Claude permission mode validated"),
+    ];
+    // `session_state_changed: idle` marks the real end of a turn; see
+    // `run_claude_turn`.
+    spec.env.insert(
+        "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".to_owned(),
+        "1".to_owned(),
+    );
+    // `--resume` replays a transcript Claude already wrote; it fails
+    // initialization outright ("No conversation found") when the file is
+    // missing or unloadable — transcript cleanup, manual deletion, or a
+    // `CLAUDE_CONFIG_DIR` change all orphan a recorded `native_session_id`
+    // this way, and retrying the same `--resume` can never recover. Only a
+    // transcript that exists and parses justifies `--resume`.
+    let session_path = claude_session_path_at(
+        &crate::agent_providers::claude_config_dir(),
+        &context.manifest.workspace,
+        &requested_session_id,
+    )
+    .await;
+    if claude_transcript_loadable(&session_path).await {
+        // A turn that dies after Claude creates its transcript but before
+        // the id reaches provider state (rate limit, crash, cancel) leaves
+        // no recorded session: `--session-id` would then deadlock on
+        // "Session ID is already in use", so resume the file instead.
+        spec.args.push("--resume".to_owned());
+    } else {
+        // A transcript file that fails to load still blocks `--session-id`
+        // ("already in use"), so move it aside rather than deleting it and
+        // start a fresh transcript under the same id.
+        if tokio::fs::try_exists(&session_path).await.unwrap_or(false) {
+            let stale = session_path.with_extension("jsonl.todex-stale");
+            if let Err(error) = tokio::fs::rename(&session_path, &stale).await {
+                tracing::warn!(
+                    path = %session_path.display(),
+                    %error,
+                    "could not move aside unloadable Claude transcript"
+                );
+            }
+        }
+        spec.args.push("--session-id".to_owned());
+    }
+    spec.args.push(requested_session_id.clone());
+    if let Some(model) = &prompt.model {
+        spec.push_flag_value("--model", model)?;
+    }
+    if let Some(effort) = &prompt.reasoning_effort {
+        spec.push_flag_value("--effort", effort)?;
+    }
+    if let Some(launch) = &context.agent_mcp {
+        spec.args
+            .extend(super::mcp_injection::claude_args(launch).await?);
+    }
+    Ok((spec, requested_session_id))
+}
+
+/// Spawns Claude for `context` and completes the `initialize` handshake,
+/// recording the session's slash-command catalog.
+async fn start_claude(
+    binary: &str,
+    catalogs: &Catalogs,
+    context: &DriverContext,
+    prompt: &DriverPrompt,
+    permit: WorkspaceTrustPermit,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<JsonLineProcess, AppError> {
+    let (spec, session_id) = claude_launch_spec(binary, context, prompt).await?;
+    let mut process = JsonLineProcess::spawn_trusted(&spec, permit).await?;
+    let commands = match initialize_claude(&mut process, cancel).await {
+        Ok(commands) => commands,
+        Err(error) => {
+            // Never on the caller's path: the failed process exits on its own.
+            tokio::spawn(async move { process.terminate().await });
+            return Err(error);
+        }
+    };
+    catalogs.lock().await.insert(
+        context.manifest.id.clone(),
+        ProviderSessionCommands {
+            commands,
+            runtime_id: session_id,
+        },
+    );
+    Ok(process)
 }
 
 /// Whether the transcript at `path` can back a `--resume`: the file must
@@ -2044,32 +2119,18 @@ fn claude_command_catalog(initialize_response: &Value) -> Vec<ProviderCommandDes
         .collect()
 }
 
+/// One turn on an initialized Claude process: sends the prompt and reads
+/// until the turn ends. A cancelled turn returns at once with the process
+/// still mid-turn; the caller interrupts or stops it.
 async fn run_claude_turn(
     process: &mut JsonLineProcess,
     context: DriverContext,
     prompt: DriverPrompt,
     requested_session_id: String,
     sink: &DriverEventSink,
-    catalogs: &Mutex<HashMap<String, ProviderSessionCommands>>,
+    catalogs: &Catalogs,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<DriverTurnResult, AppError> {
-    let commands = initialize_claude(process, cancel).await?;
-    catalogs.lock().await.insert(
-        context.manifest.id.clone(),
-        ProviderSessionCommands {
-            commands,
-            runtime_id: requested_session_id.clone(),
-        },
-    );
-    // The transcript exists once initialize succeeds; persist its id right
-    // away so a failed or cancelled turn still resumes instead of hitting
-    // "Session ID is already in use" on the next launch.
-    if context.provider_state.native_session_id.as_deref() != Some(requested_session_id.as_str()) {
-        let mut provider_state = context.provider_state.clone();
-        provider_state.native_session_id = Some(requested_session_id.clone());
-        provider_state.recoverable = true;
-        sink.save_provider_state(provider_state).await?;
-    }
     let expected_mode = super::types::resolve_execution_config(
         context.manifest.provider,
         prompt.permission_mode.as_deref(),
@@ -2089,6 +2150,16 @@ async fn run_claude_turn(
         }
     });
     process.send(&user_message).await?;
+    // The transcript exists once initialize succeeds; persist its id right
+    // away so a failed or cancelled turn still resumes instead of hitting
+    // "Session ID is already in use" on the next launch. Written after the
+    // prompt so the journal fsync overlaps the model call.
+    let mut provider_state = context.provider_state;
+    if provider_state.native_session_id.as_deref() != Some(requested_session_id.as_str()) {
+        provider_state.native_session_id = Some(requested_session_id.clone());
+        provider_state.recoverable = true;
+        sink.save_provider_state(provider_state.clone()).await?;
+    }
 
     let mut saw_output = false;
     let mut tools = ClaudeToolCalls::default();
@@ -2381,11 +2452,17 @@ async fn run_claude_turn(
         .and_then(Value::as_str)
         .unwrap_or(&requested_session_id)
         .to_owned();
-    let mut provider_state = context.provider_state;
-    provider_state.native_session_id = Some(native_session_id.clone());
-    provider_state.recoverable = true;
-    provider_state.last_error = None;
-    sink.save_provider_state(provider_state).await?;
+    // Only a changed state is written: a resident session usually ends each
+    // turn on the id, recoverability and clean error it started with.
+    if provider_state.native_session_id.as_deref() != Some(native_session_id.as_str())
+        || !provider_state.recoverable
+        || provider_state.last_error.is_some()
+    {
+        provider_state.native_session_id = Some(native_session_id.clone());
+        provider_state.recoverable = true;
+        provider_state.last_error = None;
+        sink.save_provider_state(provider_state).await?;
+    }
     Ok(DriverTurnResult {
         native_session_id: Some(native_session_id),
         stop_reason: result
