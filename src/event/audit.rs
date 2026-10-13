@@ -54,6 +54,9 @@ pub struct AuditLog {
 struct PendingBatch {
     lines: Vec<(PathBuf, Vec<u8>)>,
     flush_scheduled: bool,
+    /// A background flush failed: the next batched record is refused, so
+    /// audited operations stay fail-closed (at most one flush interval late).
+    failed: bool,
 }
 
 impl Default for AuditLog {
@@ -100,8 +103,10 @@ impl AuditLog {
 
     /// Queues `event` for the background flush, which writes and syncs
     /// queued records together at most once per `BATCH_FLUSH_INTERVAL`.
-    /// Write failures are logged, not returned. Outside a Tokio runtime the
-    /// record is written and synced inline.
+    /// A failed flush is logged and makes the next call return an error
+    /// (then batching resumes), so a broken trail still refuses the audited
+    /// operation. Outside a Tokio runtime the record is written and synced
+    /// inline.
     pub fn append_batched(&self, data_dir: &Path, event: &EventRecord) -> Result<(), AppError> {
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
@@ -112,6 +117,11 @@ impl AuditLog {
                 .map_err(AppError::from);
         };
         let mut batch = self.lock_batch();
+        if std::mem::take(&mut batch.failed) {
+            return Err(AppError::from(io::Error::other(
+                "the terminal audit trail could not be written",
+            )));
+        }
         batch.lines.push((directory, line));
         if !batch.flush_scheduled {
             batch.flush_scheduled = true;
@@ -121,6 +131,7 @@ impl AuditLog {
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Err(error) = log.write_pending(None) {
                         warn!(file = log.file_name, error = %error, "failed to write batched audit records");
+                        log.lock_batch().failed = true;
                     }
                 })
                 .await;
@@ -480,6 +491,26 @@ mod tests {
             assert!(Instant::now() < deadline, "batch was never flushed");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_batch_flush_refuses_the_next_batched_record() {
+        let temp = temp_dir();
+        // The audit directory is a file, so every write fails.
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("audit"), b"").unwrap();
+        let log = AuditLog::terminal();
+        log.append_batched(&temp, &record(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !log.lock_batch().failed {
+            assert!(Instant::now() < deadline, "the flush never failed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(log.append_batched(&temp, &record(2)).is_err());
+        // Batching resumes; the trail keeps refusing while it stays broken.
+        log.append_batched(&temp, &record(3)).unwrap();
         let _ = fs::remove_dir_all(&temp);
     }
 
