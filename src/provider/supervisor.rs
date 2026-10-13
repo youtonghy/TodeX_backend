@@ -404,8 +404,10 @@ pub struct ConversationSupervisor {
     rate_limit_retry_floor: Duration,
     /// Prewarms in flight across conversations; see [`MAX_PREWARMS`].
     prewarms: Arc<tokio::sync::Semaphore>,
-    /// The muted sink of each warmed conversation; its next turn journals
-    /// the events the provider sent while no turn ran.
+    /// The muted sink of each conversation's latest prewarm, registered
+    /// before the provider is awaited. Its next turn takes it over (see
+    /// [`DriverEventSink::hand_over`]): the events the provider sent while no
+    /// turn ran are journalled with that turn, and later ones go to it.
     prewarm_sinks: Arc<dashmap::DashMap<String, DriverEventSink>>,
 }
 
@@ -1712,9 +1714,14 @@ impl ConversationSupervisor {
             return Ok(Some("busy"));
         };
         // A CLI upgrade holds the gate exclusively; never wait for it.
-        let Ok(_cli_permit) = self.cli_execution_gate.try_read() else {
+        // An admission check only: the guard is dropped before the provider
+        // is awaited. Tokio's RwLock is write-preferring, so a queued writer
+        // (`cleanup_expired`, a CLI upgrade) would otherwise block every
+        // prompt's read behind a slow warm for up to PREWARM_TIMEOUT. The
+        // re-check after the warm covers a conversation removed meanwhile.
+        if self.cli_execution_gate.try_read().is_err() {
             return Ok(Some("busy"));
-        };
+        }
         let launch_permit = match self
             .workspace_trust
             .try_acquire_owned(owner_id, &manifest.workspace)
@@ -1744,19 +1751,47 @@ impl ConversationSupervisor {
             provider_state,
             agent_mcp,
         };
+        // Registered before the provider is awaited, so a turn submitted
+        // during the warm (or after a timeout) still takes its events over.
+        // An older prewarm's sink, which a resident process may still use,
+        // is handed over to this one.
+        if let Some(previous) = self
+            .prewarm_sinks
+            .insert(conversation_id.to_owned(), sink.clone())
+        {
+            previous.hand_over(&sink).await;
+        }
         let warmed = tokio::time::timeout(
             PREWARM_TIMEOUT,
             driver.prewarm(context, settings, sink.clone(), launch_permit),
         )
         .await;
+        // The conversation may have been deleted or expired, or the daemon
+        // may have started shutting down, while the provider started: stop
+        // what the warm revived instead of leaving it resident.
+        let shutting_down = self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire);
+        let deleted = matches!(
+            self.store.get(conversation_id).await,
+            Err(AppError::NotFound(_))
+        );
+        if shutting_down || deleted {
+            driver
+                .shutdown_session_with_reason(conversation_id, "conversation_deleted")
+                .await;
+            self.revoke_agent_mcp(conversation_id).await;
+            self.prewarm_sinks.remove(conversation_id);
+            return if deleted {
+                Err(AppError::NotFound(format!(
+                    "conversation {conversation_id}"
+                )))
+            } else {
+                Ok(Some("busy"))
+            };
+        }
         Ok(match warmed {
-            Ok(Ok(outcome)) => {
-                let reason = outcome.reason();
-                if reason.is_none() {
-                    self.prewarm_sinks.insert(conversation_id.to_owned(), sink);
-                }
-                reason
-            }
+            Ok(Ok(outcome)) => outcome.reason(),
             Ok(Err(error)) => {
                 tracing::warn!(conversation_id, error = %error, "provider prewarm failed");
                 Some("failed")
@@ -2332,11 +2367,7 @@ impl ConversationSupervisor {
             .with_activity(activity.clone())
             .with_quota(supervisor.quota.clone());
             if let Some((_, warm)) = supervisor.prewarm_sinks.remove(&conversation_id) {
-                for (event_type, payload) in warm.take_deferred() {
-                    if let Err(error) = sink.emit(event_type, payload).await {
-                        tracing::warn!(conversation_id, error = %error, "could not journal an event from the prewarm");
-                    }
-                }
+                warm.hand_over(&sink).await;
             }
             let driver_context = DriverContext {
                 manifest,
@@ -4804,6 +4835,240 @@ mod tests {
                 .unwrap()
         };
         assert!(position("turn.started") < position("provider.commands.updated"));
+        supervisor.shutdown_all().await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Announces its command catalog while warming, then holds the warm
+    /// until `release`, and reports something more once released.
+    struct SlowWarmDriver {
+        real: Arc<dyn ProviderDriver>,
+        announced: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderDriver for SlowWarmDriver {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.real.descriptor()
+        }
+
+        async fn prewarm(
+            &self,
+            _context: DriverContext,
+            _settings: DriverPrompt,
+            sink: DriverEventSink,
+            _launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
+        ) -> Result<super::super::types::ProviderPrewarm, AppError> {
+            sink.emit(
+                "provider.commands.updated",
+                json!({ "provider": "acp", "commands": [{ "name": "review" }] }),
+            )
+            .await?;
+            self.announced.notify_one();
+            self.release.notified().await;
+            // As a resident actor reports between turns through its last sink.
+            sink.emit("provider.event", json!({ "kind": "late" }))
+                .await?;
+            Ok(super::super::types::ProviderPrewarm::Warmed)
+        }
+
+        async fn run_turn(
+            &self,
+            context: DriverContext,
+            prompt: DriverPrompt,
+            sink: DriverEventSink,
+            cancel: watch::Receiver<bool>,
+            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
+        ) -> Result<DriverTurnResult, AppError> {
+            self.real
+                .run_turn(context, prompt, sink, cancel, launch_permit)
+                .await
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_turn_during_a_warm_takes_its_events_over_and_later_ones_follow_it() {
+        let (root, store, mut supervisor, workspace) =
+            control_fixture_with("todex-warm-handover", true, false).await;
+        let announced = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        replace_driver(&mut supervisor, ProviderKind::Acp, |real| {
+            Arc::new(SlowWarmDriver {
+                real,
+                announced: announced.clone(),
+                release: release.clone(),
+            })
+        });
+        let manifest = supervisor
+            .create_owned(
+                "local",
+                ProviderKind::Acp,
+                workspace,
+                None,
+                Some("fixture".to_owned()),
+            )
+            .await
+            .unwrap();
+        let warm = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let id = manifest.id.clone();
+            async move { supervisor.warm_owned("local", &id).await }
+        });
+        announced.notified().await;
+        // The warm is still running when the turn starts.
+        let turn_id = supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let count = |history: &[ConversationEvent], event_type: &str| {
+            history
+                .iter()
+                .filter(|event| event.event_type == event_type)
+                .count()
+        };
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert_eq!(count(&history, "provider.commands.updated"), 1);
+        let position = |event_type: &str| {
+            history
+                .iter()
+                .position(|event| event.event_type == event_type)
+                .unwrap()
+        };
+        assert!(position("turn.started") < position("provider.commands.updated"));
+
+        // What the warm reports after the turn took it over is journalled
+        // right away, with that turn, not held for a later one.
+        release.notify_one();
+        assert_eq!(warm.await.unwrap().unwrap(), None);
+        let late = |history: &[ConversationEvent]| {
+            history
+                .iter()
+                .filter(|event| event.payload["kind"] == "late")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let reported = late(&history);
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].payload["turnId"], json!(turn_id));
+        assert!(!supervisor.prewarm_sinks.contains_key(&manifest.id));
+
+        supervisor
+            .prompt(&manifest.id, "again".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert_eq!(late(&history).len(), 1);
+        assert_eq!(count(&history, "provider.commands.updated"), 1);
+        supervisor.shutdown_all().await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Holds the warm until `release`, then prepares the real session;
+    /// records the warm and every session shutdown in order.
+    struct GatedWarmDriver {
+        real: Arc<dyn ProviderDriver>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderDriver for GatedWarmDriver {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.real.descriptor()
+        }
+
+        async fn prewarm(
+            &self,
+            context: DriverContext,
+            settings: DriverPrompt,
+            sink: DriverEventSink,
+            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
+        ) -> Result<super::super::types::ProviderPrewarm, AppError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            let outcome = self
+                .real
+                .prewarm(context, settings, sink, launch_permit)
+                .await;
+            self.log.lock().unwrap().push("prewarmed".to_owned());
+            outcome
+        }
+
+        async fn shutdown_session_with_reason(&self, conversation_id: &str, reason: &str) {
+            self.log.lock().unwrap().push(format!("shutdown:{reason}"));
+            self.real
+                .shutdown_session_with_reason(conversation_id, reason)
+                .await;
+        }
+
+        async fn run_turn(
+            &self,
+            context: DriverContext,
+            prompt: DriverPrompt,
+            sink: DriverEventSink,
+            cancel: watch::Receiver<bool>,
+            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
+        ) -> Result<DriverTurnResult, AppError> {
+            self.real
+                .run_turn(context, prompt, sink, cancel, launch_permit)
+                .await
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_warm_never_revives_a_conversation_deleted_meanwhile() {
+        let (root, _store, mut supervisor, workspace) =
+            control_fixture_with("todex-warm-deleted", true, false).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        replace_driver(&mut supervisor, ProviderKind::Acp, |real| {
+            Arc::new(GatedWarmDriver {
+                real,
+                started: started.clone(),
+                release: release.clone(),
+                log: log.clone(),
+            })
+        });
+        let manifest = supervisor
+            .create_owned(
+                "local",
+                ProviderKind::Acp,
+                workspace,
+                None,
+                Some("fixture".to_owned()),
+            )
+            .await
+            .unwrap();
+        let warm = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let id = manifest.id.clone();
+            async move { supervisor.warm_owned("local", &id).await }
+        });
+        started.notified().await;
+        supervisor
+            .delete_owned("local", &manifest.id)
+            .await
+            .unwrap();
+        release.notify_one();
+        assert!(matches!(warm.await.unwrap(), Err(AppError::NotFound(_))));
+        // The session the warm started after the deletion is stopped again.
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "shutdown:conversation_deleted",
+                "prewarmed",
+                "shutdown:conversation_deleted"
+            ]
+        );
+        assert!(!supervisor.prewarm_sinks.contains_key(&manifest.id));
         supervisor.shutdown_all().await;
         let _ = fs::remove_dir_all(root);
     }

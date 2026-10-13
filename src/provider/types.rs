@@ -647,12 +647,27 @@ pub struct DriverEventSink {
     /// Last journalled payload (after attribution) and event per
     /// [`REPEATABLE_SNAPSHOT_EVENTS`] type, shared like `unparsed_lines`.
     snapshots: Arc<Mutex<HashMap<String, (Value, ConversationEvent)>>>,
-    /// Set for a provider prewarm: nothing is journalled or published, the
-    /// provider state is not saved and permission requests are refused.
-    muted: bool,
-    /// Events a muted sink held back, shared by its clones, for the first
-    /// turn to journal (see [`Self::take_deferred`]).
-    deferred: Arc<Mutex<Vec<(String, Value)>>>,
+    /// Set for a provider prewarm (see [`Self::muted`]); shared by clones.
+    muted: Option<Arc<tokio::sync::Mutex<MutedState>>>,
+}
+
+/// What a prewarm's muted sink holds, shared by all of its clones.
+#[derive(Default)]
+struct MutedState {
+    /// Events held back until a turn takes the sink over, oldest first.
+    deferred: Vec<(String, Value)>,
+    /// The sink of the turn that took it over; everything goes there since.
+    redirect: Option<DriverEventSink>,
+}
+
+/// Where a call through a muted sink goes.
+enum MutedRoute {
+    /// Not a prewarm sink: handle it here.
+    Unmuted,
+    /// No turn took the prewarm over yet.
+    Held,
+    /// A turn took the prewarm over: delegate to its sink.
+    To(Box<DriverEventSink>),
 }
 
 impl DriverEventSink {
@@ -674,43 +689,69 @@ impl DriverEventSink {
             activity: None,
             quota: crate::quota_store::QuotaStore::default(),
             snapshots: Arc::default(),
-            muted: false,
-            deferred: Arc::default(),
+            muted: None,
         }
     }
 
-    /// A sink for [`ProviderDriver::prewarm`]: events are held back for
-    /// [`Self::take_deferred`], the provider state is not saved and
-    /// permission requests fail.
+    /// A sink for [`ProviderDriver::prewarm`]. Until a turn takes it over
+    /// ([`Self::hand_over`]) events are held back, the provider state is not
+    /// saved, streamed deltas are dropped and permission requests fail.
     pub fn muted(mut self) -> Self {
-        self.muted = true;
+        self.muted = Some(Arc::default());
         self
     }
 
+    /// Whether this sink was created by [`Self::muted`] for a prewarm.
     pub fn is_muted(&self) -> bool {
-        self.muted
+        self.muted.is_some()
     }
 
-    /// The events a muted sink held back so far, oldest first. A provider
-    /// announces some state only once per session (its command catalog, a
-    /// recreated native session), so the turn that follows a prewarm
-    /// journals them instead of losing them.
-    pub fn take_deferred(&self) -> Vec<(String, Value)> {
-        std::mem::take(
-            &mut *self
-                .deferred
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
-    }
-
-    fn refuse_muted_permission(&self) -> Result<(), AppError> {
-        if self.muted {
-            return Err(AppError::Conflict(
-                "a provider prewarm cannot ask for permission".to_owned(),
-            ));
+    /// Hands a prewarm's muted sink over to the sink of the turn that
+    /// follows it: the events it held back are journalled there (a provider
+    /// announces some state only once per session, such as its command
+    /// catalog or a recreated native session), and from then on every clone
+    /// of this sink delegates to `turn`, as a resident process's sink of its
+    /// last turn does between turns. Both happen under the buffer lock, so a
+    /// concurrent emit lands after the held-back events, never in between or
+    /// in a later buffer. A muted `turn` (a newer prewarm) holds them in turn.
+    pub async fn hand_over(&self, turn: &DriverEventSink) {
+        let Some(muted) = &self.muted else {
+            return;
+        };
+        let mut state = muted.lock().await;
+        for (event_type, payload) in std::mem::take(&mut state.deferred) {
+            if let Err(error) = Box::pin(turn.emit(event_type, payload)).await {
+                tracing::warn!(
+                    conversation_id = %self.conversation_id,
+                    error = %error,
+                    "could not journal an event from the prewarm"
+                );
+            }
         }
-        Ok(())
+        state.redirect = Some(turn.clone());
+    }
+
+    /// Where a call through this sink goes; see [`MutedRoute`].
+    async fn muted_route(&self) -> MutedRoute {
+        let Some(muted) = &self.muted else {
+            return MutedRoute::Unmuted;
+        };
+        match &muted.lock().await.redirect {
+            Some(target) => MutedRoute::To(Box::new(self.redirected(target))),
+            None => MutedRoute::Held,
+        }
+    }
+
+    /// `target` with this clone's runtime attribution, if it has one.
+    fn redirected(&self, target: &DriverEventSink) -> DriverEventSink {
+        match &self.runtime_id {
+            Some(runtime_id) => target.clone().for_runtime(runtime_id.clone()),
+            None => target.clone(),
+        }
+    }
+
+    fn muted_permission_refused() -> AppError {
+        AppError::Conflict("a provider prewarm cannot ask for permission".to_owned())
     }
 
     /// Every event and stdout frame routed through this sink (and its clones,
@@ -768,11 +809,14 @@ impl DriverEventSink {
         mut payload: Value,
     ) -> Result<ConversationEvent, AppError> {
         let event_type = event_type.into();
-        if self.muted {
-            self.deferred
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push((event_type.clone(), payload.clone()));
+        if let Some(muted) = &self.muted {
+            let mut state = muted.lock().await;
+            if let Some(target) = &state.redirect {
+                let target = self.redirected(target);
+                drop(state);
+                return Box::pin(target.emit(event_type, payload)).await;
+            }
+            state.deferred.push((event_type.clone(), payload.clone()));
             return Ok(ConversationEvent::new(
                 &self.conversation_id,
                 0,
@@ -834,8 +878,12 @@ impl DriverEventSink {
         text_pointers: &'static [&'static str],
         extra: Option<&str>,
     ) -> Result<(), AppError> {
-        if self.muted {
-            return Ok(());
+        match self.muted_route().await {
+            MutedRoute::Unmuted => {}
+            MutedRoute::Held => return Ok(()),
+            MutedRoute::To(target) => {
+                return Box::pin(target.emit_delta(event_type, payload, text_pointers, extra)).await
+            }
         }
         self.touch();
         self.decorate(event_type, &mut payload);
@@ -926,8 +974,10 @@ impl DriverEventSink {
     }
 
     pub async fn save_provider_state(&self, state: ProviderState) -> Result<(), AppError> {
-        if self.muted {
-            return Ok(());
+        match self.muted_route().await {
+            MutedRoute::Unmuted => {}
+            MutedRoute::Held => return Ok(()),
+            MutedRoute::To(target) => return Box::pin(target.save_provider_state(state)).await,
         }
         self.store
             .save_provider_state(&self.conversation_id, state)
@@ -943,7 +993,21 @@ impl DriverEventSink {
         options: Value,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<PermissionDecision, AppError> {
-        self.refuse_muted_permission()?;
+        match self.muted_route().await {
+            MutedRoute::Unmuted => {}
+            MutedRoute::Held => return Err(Self::muted_permission_refused()),
+            MutedRoute::To(target) => {
+                return Box::pin(target.request_permission(
+                    provider_request_id,
+                    kind,
+                    title,
+                    details,
+                    options,
+                    cancel,
+                ))
+                .await
+            }
+        }
         self.permissions
             .request(
                 self.clone(),
@@ -970,7 +1034,21 @@ impl DriverEventSink {
         options: Value,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<(PermissionDecision, String), AppError> {
-        self.refuse_muted_permission()?;
+        match self.muted_route().await {
+            MutedRoute::Unmuted => {}
+            MutedRoute::Held => return Err(Self::muted_permission_refused()),
+            MutedRoute::To(target) => {
+                return Box::pin(target.request_permission_answered(
+                    provider_request_id,
+                    kind,
+                    title,
+                    details,
+                    options,
+                    cancel,
+                ))
+                .await
+            }
+        }
         self.permissions
             .request(
                 self.clone(),
@@ -999,7 +1077,22 @@ impl DriverEventSink {
         allowed_devices: Vec<String>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<(PermissionDecision, String), AppError> {
-        self.refuse_muted_permission()?;
+        match self.muted_route().await {
+            MutedRoute::Unmuted => {}
+            MutedRoute::Held => return Err(Self::muted_permission_refused()),
+            MutedRoute::To(target) => {
+                return Box::pin(target.request_permission_on_devices(
+                    provider_request_id,
+                    kind,
+                    title,
+                    details,
+                    options,
+                    allowed_devices,
+                    cancel,
+                ))
+                .await
+            }
+        }
         self.permissions
             .request(
                 self.clone(),
