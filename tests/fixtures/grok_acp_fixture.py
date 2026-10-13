@@ -56,18 +56,23 @@ for line in sys.stdin:
         journal.write(json.dumps({**request, "fixturePid": os.getpid()}) + "\n")
     method, params, request_id = request.get("method"), request.get("params", {}), request.get("id")
     if method == "initialize":
+        capabilities = {"loadSession": True}
+        # A test opts into `session/resume` with a marker in the workspace.
+        if os.path.exists("advertise-resume"):
+            capabilities["sessionCapabilities"] = {"resume": {}}
         result(request_id, {"protocolVersion": 1,
-                            "agentCapabilities": {"loadSession": True},
+                            "agentCapabilities": capabilities,
                             "authMethods": [{"id": "cached_token", "name": "Cached"}],
                             "_meta": {"defaultAuthMethodId": "cached_token"}})
     elif method == "authenticate":
         assert params["methodId"] == "cached_token"
         result(request_id, {})
-    elif method in ("session/new", "session/load"):
+    elif method in ("session/new", "session/load", "session/resume"):
         assert params["_meta"]["yoloMode"] is False
         assert params["_meta"]["autoMode"] is False
         if method == "session/load":
             assert params["_meta"]["noReplay"] is True
+        if method in ("session/load", "session/resume"):
             session = params["sessionId"]
         result(request_id, {"sessionId": session, "configOptions": options()})
     elif method == "session/set_config_option":

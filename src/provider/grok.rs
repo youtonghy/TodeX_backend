@@ -967,6 +967,31 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn wire_resume_keeps_ask_policy() {
+        let fixture = Fixture::new().await;
+        std::fs::write(fixture.root.join("advertise-resume"), "").unwrap();
+        let (_cancel, task) = fixture.start("turn-first", "normal").await;
+        assert_eq!(task.await.unwrap().unwrap().stop_reason, "end_turn");
+        fixture.driver.shutdown_session(&fixture.manifest.id).await;
+        let (_cancel, task) = fixture.start("turn-resume", "normal").await;
+        assert_eq!(task.await.unwrap().unwrap().stop_reason, "end_turn");
+        let requests = fixture.requests();
+        let resume = requests
+            .iter()
+            .find(|request| request["method"] == "session/resume")
+            .expect("an advertised resume is preferred over load");
+        assert_eq!(
+            resume["params"]["_meta"],
+            json!({"yoloMode":false,"autoMode":false})
+        );
+        assert!(!requests
+            .iter()
+            .any(|request| request["method"] == "session/load"));
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn wire_turn_queued_behind_a_discarded_session_runs_on_a_new_one() {
         let fixture = Fixture::new().await;
         let (cancel, first) = fixture.start("turn-cancel", "cancel").await;
