@@ -12,11 +12,18 @@ fn invalid(message: &str) -> AppError {
     AppError::InvalidRequest(message.to_owned())
 }
 
+/// A remote name safe to interpolate into `-c remote.<name>.mirror=false`:
+/// `[A-Za-z0-9._/-]` only (no `=`, whitespace or newline), not starting with
+/// `-`, and `/`-separated components (`upstream/fork`) that are non-empty
+/// and do not start with `.` (so no `.` or `..`, which Git rejects too).
 fn is_plain_remote_name(remote: &str) -> bool {
-    !remote.is_empty()
+    !remote.starts_with('-')
         && remote
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+        && remote
+            .split('/')
+            .all(|component| !component.is_empty() && !component.starts_with('.'))
 }
 
 async fn text_command(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -468,7 +475,7 @@ async fn operate_locked(
             // The name is interpolated into a config key below.
             if !is_plain_remote_name(remote) {
                 return Err(invalid(
-                    "Upstream remote name must use only letters, digits, '.', '_' and '-'",
+                    "Upstream remote name must use only letters, digits, '.', '_', '-' and '/'",
                 ));
             }
             validate_push_execution_config(workspace).await?;
@@ -1082,7 +1089,7 @@ mod tests {
 
     #[test]
     fn push_remote_names_are_restricted_before_config_interpolation() {
-        for remote in ["origin", "up-stream_2.mirror"] {
+        for remote in ["origin", "up-stream_2.mirror", "upstream/fork", "a/b-c/d.e"] {
             assert!(is_plain_remote_name(remote), "{remote}");
         }
         for remote in [
@@ -1090,7 +1097,16 @@ mod tests {
             "a=b",
             "a.mirror=true -c core.x",
             "evil\nname",
-            "a/b",
+            "a/b=c",
+            "a/b c",
+            "a/b\n",
+            "-origin",
+            "/origin",
+            "origin/",
+            "a//b",
+            "a/../b",
+            "..",
+            "a/./b",
             "é",
         ] {
             assert!(!is_plain_remote_name(remote), "{remote:?}");
