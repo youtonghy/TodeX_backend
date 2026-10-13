@@ -147,6 +147,9 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        // Another test thread may have registered these callsites while no
+        // subscriber wanted them; recompute so this one sees its spans.
+        tracing::callsite::rebuild_interest_cache();
         let app = Router::new()
             .route("/v2/events", get(|| async { "ok" }))
             .layer(TraceLayer::new_for_http().make_span_with(request_span::<Body>));
