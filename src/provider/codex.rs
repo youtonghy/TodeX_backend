@@ -1023,11 +1023,13 @@ async fn handle_codex_message(
     payload["nativeSessionId"] = params.get("threadId").cloned().unwrap_or(Value::Null);
     match event_type {
         "message.delta" => {
-            sink.emit_delta(event_type, payload, CODEX_MESSAGE_TEXT, None)
+            let key = codex_delta_key(&payload);
+            sink.emit_delta_keyed(event_type, payload, key, CODEX_MESSAGE_TEXT)
                 .await?
         }
         "thought.delta" => {
-            sink.emit_delta(event_type, payload, CODEX_THOUGHT_TEXT, None)
+            let key = codex_delta_key(&payload);
+            sink.emit_delta_keyed(event_type, payload, key, CODEX_THOUGHT_TEXT)
                 .await?
         }
         _ => {
@@ -1040,6 +1042,18 @@ async fn handle_codex_message(
 /// Text fields of streamed Codex fragments; the rest of the payload (item
 /// block, native turn) identifies the stream they merge within.
 pub(super) const CODEX_MESSAGE_TEXT: &[&str] = &["/delta"];
+
+/// Merge identity of a streamed Codex fragment: every field besides its
+/// text (`provider` is constant).
+pub(super) fn codex_delta_key(payload: &Value) -> String {
+    serde_json::to_string(&(
+        payload.get("role"),
+        payload.get("block"),
+        payload.get("nativeTurnId"),
+        payload.get("nativeSessionId"),
+    ))
+    .unwrap_or_default()
+}
 const CODEX_THOUGHT_TEXT: &[&str] = &["/delta", "/thought"];
 
 fn codex_usage_event(params: &Value) -> Option<Value> {

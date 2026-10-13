@@ -108,7 +108,8 @@ impl<T> PendingDelta<T> {
         {
             return Err(payload);
         }
-        let mut merged = Vec::with_capacity(self.fragment.text_pointers.len());
+        // Check every field before touching either payload, so a refused
+        // fragment leaves the window as it was.
         for pointer in self.fragment.text_pointers {
             let (Some(text), Some(next)) = (
                 self.payload.pointer(pointer).and_then(Value::as_str),
@@ -119,11 +120,17 @@ impl<T> PendingDelta<T> {
             if text.len() + next.len() > DELTA_COALESCE_MAX_BYTES {
                 return Err(payload);
             }
-            merged.push(format!("{text}{next}"));
         }
-        for (pointer, text) in self.fragment.text_pointers.iter().zip(merged) {
-            if let Some(slot) = payload.pointer_mut(pointer) {
-                *slot = Value::String(text);
+        // The merged text grows in place: the window's buffer moves into the
+        // newest payload instead of being copied into a new string.
+        for pointer in self.fragment.text_pointers {
+            if let (Some(Value::String(text)), Some(Value::String(next))) = (
+                self.payload.pointer_mut(pointer),
+                payload.pointer_mut(pointer),
+            ) {
+                let mut merged = std::mem::take(text);
+                merged.push_str(next);
+                *next = merged;
             }
         }
         self.payload = payload;
@@ -239,6 +246,99 @@ mod tests {
         }
         let (_, _, payload) = pending.into_parts();
         assert_eq!(payload["delta"].as_str().unwrap().len(), 16 * 1024);
+    }
+
+    /// Feeds `fragments` through merge windows the way the store does and
+    /// returns the events it would journal.
+    fn merged(fragments: &[(DeltaFragment, Value)]) -> Vec<Value> {
+        let mut out = Vec::new();
+        let mut pending: Option<PendingDelta<()>> = None;
+        for (fragment, payload) in fragments {
+            let payload = match pending.as_mut() {
+                Some(window) => match window.try_append("message.delta", fragment, payload.clone())
+                {
+                    Ok(()) => continue,
+                    Err(payload) => payload,
+                },
+                None => payload.clone(),
+            };
+            if let Some(window) = pending.take() {
+                out.push(window.into_parts().2);
+            }
+            pending = Some(PendingDelta::new(
+                (),
+                "message.delta",
+                fragment.clone(),
+                payload,
+            ));
+        }
+        out.extend(pending.map(|window| window.into_parts().2));
+        out
+    }
+
+    #[tokio::test]
+    async fn precomputed_keys_merge_a_thousand_fragments_like_payload_keys() {
+        let fragments: Vec<Value> = (0..1000)
+            .map(|index| {
+                json!({"role": "assistant", "delta": format!("{index:04}é…{}", "x".repeat(40)),
+                       "block": {"id": if index < 600 { "item-1" } else { "item-2" }}, "turnId": "t1"})
+            })
+            .collect();
+        let by_payload: Vec<_> = fragments
+            .iter()
+            .map(|payload| (fragment(payload), payload.clone()))
+            .collect();
+        let by_key: Vec<_> = fragments
+            .iter()
+            .map(|payload| {
+                let key = payload["block"]["id"].as_str().unwrap().to_owned();
+                (DeltaFragment::keyed(key, DELTA), payload.clone())
+            })
+            .collect();
+        let expected = merged(&by_payload);
+        let actual = merged(&by_key);
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        // Windows fill to the size limit and never cross a block.
+        let text: String = fragments
+            .iter()
+            .map(|payload| payload["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|payload| payload["delta"].as_str().unwrap())
+                .collect::<String>(),
+            text
+        );
+        assert!(actual.iter().all(|payload| {
+            payload["delta"].as_str().unwrap().len() <= DELTA_COALESCE_MAX_BYTES
+        }));
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|payload| payload["block"]["id"] == "item-1")
+                .count(),
+            2
+        );
+        assert_eq!(actual.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_refused_fragment_leaves_the_window_untouched() {
+        const BOTH: &[&str] = &["/delta", "/thought"];
+        let first = json!({"delta": "a", "thought": "b"});
+        let key = DeltaFragment::from_payload(&first, BOTH, None).unwrap();
+        let mut pending = PendingDelta::new((), "thought.delta", key.clone(), first.clone());
+        // The second field is missing: nothing of the first may move.
+        let partial = json!({"delta": "c"});
+        assert_eq!(
+            pending.try_append("thought.delta", &key, partial.clone()),
+            Err(partial)
+        );
+        assert_eq!(pending.into_parts().2, first);
     }
 
     #[tokio::test]

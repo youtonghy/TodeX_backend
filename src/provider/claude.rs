@@ -3399,9 +3399,15 @@ async fn handle_stream_event(
             match text {
                 Some(text) => {
                     // The payload omits the content-block index; keep blocks
-                    // (and subagent streams) apart anyway.
-                    let block = json!([event.get("index"), message.get("parent_tool_use_id")]);
-                    sink.emit_delta(event_type, payload, text, Some(&block.to_string()))
+                    // (and subagent streams) apart anyway. The rest of the
+                    // payload is the delta type and the subagent id.
+                    let key = serde_json::to_string(&(
+                        delta_type,
+                        event.get("index"),
+                        message.get("parent_tool_use_id"),
+                    ))
+                    .unwrap_or_default();
+                    sink.emit_delta_keyed(event_type, payload, key, text)
                         .await?;
                 }
                 None => {

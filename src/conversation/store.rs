@@ -124,6 +124,9 @@ const TAIL_CACHE_ENTRIES: usize = 256;
 /// Whole-journal digests kept; a miss rebuilds from the segment `.idx`
 /// files and the plaintext files.
 const DIGEST_CACHE_ENTRIES: usize = 256;
+/// Journal file listings kept (see [`ConversationStore::files_locked`]); a
+/// miss lists the conversation directory again.
+const FILE_LIST_CACHE_ENTRIES: usize = 256;
 /// Payloads at least this large are sealed and encoded on the blocking
 /// pool (still under the conversation lock) instead of an async worker.
 const BLOCKING_ENCODE_BYTES: usize = 64 * 1024;
@@ -175,6 +178,11 @@ pub struct ConversationStore {
     /// lock and never held across an await.
     indexes: Arc<std::sync::Mutex<LruCache<String, JournalIndex>>>,
     tails: Arc<LruMap<JournalTail>>,
+    /// Journal file listings, so appends need one `stat` of the active file
+    /// instead of a directory listing. Only touched under the conversation
+    /// lock; every rewrite of the journal files drops the entry (through
+    /// [`Self::index_remove`]) or replaces it.
+    file_lists: Arc<LruMap<Vec<JournalFile>>>,
     /// Test hook: journal writes wait on this lock (see
     /// [`Self::hold_journal_writes`]).
     #[cfg(test)]
@@ -185,9 +193,11 @@ pub struct ConversationStore {
     /// and then fails (see [`Self::fail_next_journal_write`]).
     #[cfg(test)]
     journal_write_fault: Arc<std::sync::Mutex<Option<usize>>>,
-    /// Open streaming-text merge window per conversation. Only touched while
-    /// the conversation lock is held, so any other write flushes it first and
-    /// journal order matches emission order.
+    /// Open streaming-text merge window per conversation. Opened, replaced
+    /// and flushed only while the conversation lock is held, so any other
+    /// write flushes it first and journal order matches emission order;
+    /// fragments join an open window under the map entry's lock alone (see
+    /// [`Self::append_delta_and_publish`]).
     pending_deltas: Arc<DashMap<String, StoreDelta>>,
     delta_generation: Arc<AtomicU64>,
     /// Authoritative in-memory manifests. Every writer holds the
@@ -524,6 +534,7 @@ impl ConversationStore {
                 std::num::NonZeroUsize::new(INDEX_CACHE_ENTRIES).expect("index cache is not empty"),
             ))),
             tails: Arc::new(LruMap::new(TAIL_CACHE_ENTRIES)),
+            file_lists: Arc::new(LruMap::new(FILE_LIST_CACHE_ENTRIES)),
             pending_deltas: Arc::new(DashMap::new()),
             delta_generation: Arc::new(AtomicU64::new(0)),
             manifests: Arc::new(DashMap::new()),
@@ -571,8 +582,11 @@ impl ConversationStore {
         self.index_cache().put(conversation_id.to_owned(), index);
     }
 
+    /// Drops the replay index and, with it, the cached file listing: every
+    /// path that rewrites journal files forgets the index.
     fn index_remove(&self, conversation_id: &str) {
         self.index_cache().pop(conversation_id);
+        self.file_lists.remove(conversation_id);
     }
 
     /// Give a keyless test store history keys (what [`Self::open`] does).
@@ -1250,6 +1264,18 @@ impl ConversationStore {
         validate_event_type(&event_type)?;
         // Reject an unknown conversation now instead of from the flush timer.
         self.directory(conversation_id)?;
+        // Fast path: a fragment that joins the open window touches neither
+        // the journal nor the conversation lock. The map entry's own lock
+        // orders it against flushes, which take the window out of the map
+        // under the conversation lock: the fragment either joins the window
+        // before it is flushed or finds none and takes the locked path.
+        let payload = match self.pending_deltas.get_mut(conversation_id) {
+            Some(mut pending) => match pending.delta.try_append(&event_type, &fragment, payload) {
+                Ok(()) => return Ok(()),
+                Err(payload) => payload,
+            },
+            None => payload,
+        };
         let store = self.clone();
         let conversation_id = conversation_id.to_owned();
         let hub = hub.clone();
@@ -1501,15 +1527,18 @@ impl ConversationStore {
         // empty) it is terminated in place so the records never glue across
         // the file boundary. Sealed `.seg` files are always complete.
         if !terminated {
-            if let Some(file) = files.iter().rev().find(|file| file.bytes > 0) {
-                if file.name == EVENTS_FILE || file.is_sealed_segment() {
+            match files.iter().rev().find(|file| file.bytes > 0) {
+                Some(file) if file.name == EVENTS_FILE || file.is_sealed_segment() => {
                     // Handled by the separator prepended to `line` below.
-                } else {
+                }
+                Some(file) => {
                     terminate_journal(&directory.join(&file.name)).await?;
+                    // The sealed file grew by its newline; list it again.
+                    self.file_lists.remove(conversation_id);
+                    files = self.files_locked(conversation_id, &directory).await?;
                     terminated = true;
                 }
-            } else {
-                terminated = true;
+                None => terminated = true,
             }
         }
         // Nothing may change on disk for a record that cannot be encrypted
@@ -1667,6 +1696,7 @@ impl ConversationStore {
         let last = files.last_mut().expect("active segment is present");
         last.bytes = metadata.len();
         last.modified = metadata.modified().ok();
+        self.file_lists.insert(conversation_id, files.clone());
         self.index_update(conversation_id, |index| {
             if index.files == pre_write_files {
                 for &(sequence, start, end) in &ranges {
@@ -2162,7 +2192,18 @@ impl ConversationStore {
             }
             self.reconciled.insert(conversation_id.to_owned(), ());
         }
-        journal_files(directory).await
+        if let Some(cached) = self.file_lists.with(conversation_id, |files| files.clone()) {
+            if active_file_matches(directory, &cached).await {
+                return Ok(cached);
+            }
+        }
+        let files = journal_files(directory).await?;
+        // An empty listing is not kept: a conversation published later may
+        // start with sealed files only.
+        if !files.is_empty() {
+            self.file_lists.insert(conversation_id, files.clone());
+        }
+        Ok(files)
     }
 
     /// Shared replay prelude: the manifest must exist and the index — a
@@ -3316,6 +3357,7 @@ impl ConversationStore {
                 Some(first) => (group, first),
                 // An empty sealed file holds nothing to convert.
                 None => {
+                    self.file_lists.remove(conversation_id);
                     for file in &group {
                         if file.bytes == 0 {
                             remove_if_exists(&directory.join(&file.name)).await?;
@@ -3428,7 +3470,7 @@ impl ConversationStore {
             prepared.number,
         );
         let body = prepared.body.clone();
-        tokio::task::spawn_blocking(move || {
+        let committed = tokio::task::spawn_blocking(move || {
             let prepared = PreparedSegment {
                 number,
                 temp_seg,
@@ -3439,8 +3481,10 @@ impl ConversationStore {
             segment::commit_prepared(&path, &prepared, stop)
         })
         .await
-        .map_err(blocking_error)?
-        .map_err(|error| segment_error(conversation_id, number, error))?;
+        .map_err(blocking_error)?;
+        // Committed or not, the sources may be gone: list the files again.
+        self.file_lists.remove(conversation_id);
+        committed.map_err(|error| segment_error(conversation_id, number, error))?;
         if stop.is_some() {
             // A simulated crash: leave the directory as it is and forget
             // everything, like a restarted process would.
@@ -3628,7 +3672,10 @@ impl ConversationStore {
         let terminated = self.read_last_event(conversation_id).await?.1;
         let previous = files.clone();
         let mut files = files;
-        let (sealed, fresh) = rotate_journal(&directory, &files, terminated).await?;
+        let rotated = rotate_journal(&directory, &files, terminated).await;
+        // Even a failed rotation may have terminated the active file.
+        self.file_lists.remove(conversation_id);
+        let (sealed, fresh) = rotated?;
         *files.last_mut().expect("active segment is present") = sealed;
         files.extend(fresh);
         self.index_update(conversation_id, |index| {
@@ -3769,6 +3816,23 @@ pub(super) async fn journal_files(directory: &Path) -> Result<Vec<JournalFile>, 
     let mut files: Vec<JournalFile> = sealed.into_iter().map(|(_, file)| file).collect();
     files.extend(active);
     Ok(files)
+}
+
+/// Whether `files` (a cached [`journal_files`] listing) still describes the
+/// active file: one `stat` instead of a directory listing. Sealed files
+/// only change through this store, which drops or replaces the cached
+/// listing whenever it touches them.
+async fn active_file_matches(directory: &Path, files: &[JournalFile]) -> bool {
+    let cached = files.last().filter(|file| file.name == EVENTS_FILE);
+    match tokio::fs::metadata(directory.join(EVENTS_FILE)).await {
+        Ok(metadata) => cached.is_some_and(|file| {
+            metadata.is_file()
+                && file.bytes == metadata.len()
+                && file.modified == metadata.modified().ok()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => cached.is_none(),
+        Err(_) => false,
+    }
 }
 
 /// Seal the active `events.jsonl` under the next segment number and create
@@ -7039,6 +7103,133 @@ mod tests {
             assert_eq!(journalled.payload["delta"], *text);
             assert_eq!(published.sequence, journalled.sequence);
             assert_eq!(published.payload, journalled.payload);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_cached_file_listing_follows_appends_rotations_seals_and_outside_writes() {
+        let root = temp_dir("todex-file-list-cache");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let id = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap()
+            .id;
+        let directory = store.directory(&id).unwrap();
+        let cached = || store.file_lists.with(&id, |files| files.clone());
+        let listed = || async { journal_files(&directory).await.unwrap() };
+        store
+            .append(&id, "turn.started", json!({"turnId": "t1"}))
+            .await
+            .unwrap();
+        // The append left the listing it wrote behind, matching the disk.
+        assert_eq!(cached(), Some(listed().await));
+        store.seal_active_for_tests(&id).await.unwrap();
+        assert_eq!(cached(), None);
+        store
+            .append(&id, "turn.completed", json!({"turnId": "t1"}))
+            .await
+            .unwrap();
+        assert_eq!(cached(), Some(listed().await));
+        assert_eq!(listed().await.len(), 2);
+        assert_eq!(store.seal_all_for_tests(&id).await.unwrap(), 1);
+        store
+            .append(&id, "turn.started", json!({"turnId": "t2"}))
+            .await
+            .unwrap();
+        assert_eq!(cached(), Some(listed().await));
+        assert!(listed().await[0].is_sealed_segment());
+        // A write behind the store's back changes the active file's size:
+        // the next use lists the directory again.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join(EVENTS_FILE))
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"\n").unwrap();
+        drop(file);
+        let _guard = store.lock(&id).await;
+        assert_eq!(
+            store.files_locked(&id, &directory).await.unwrap(),
+            listed().await
+        );
+        drop(_guard);
+        assert_eq!(store.complete_history(&id).await.unwrap().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_thousand_keyed_deltas_journal_and_publish_their_exact_text() {
+        let root = temp_dir("todex-delta-thousand");
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let conversation = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let id = conversation.id.as_str();
+        let hub = ConversationEventHub::default();
+        let mut live = hub.subscribe(id);
+        let template = json!({"role": "assistant", "turnId": "t1",
+                              "block": {"category": "assistant_final", "id": "item-1"}});
+        let fragments: Vec<String> = (0..1000)
+            .map(|index| format!("<{index:04}>{}", "é".repeat(20)))
+            .collect();
+        for text in &fragments {
+            let mut payload = template.clone();
+            payload["delta"] = json!(text);
+            store
+                .append_delta_and_publish(
+                    id,
+                    "message.delta",
+                    payload,
+                    DeltaFragment::keyed("item-1", &["/delta"]),
+                    &hub,
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .append_and_publish(id, "turn.completed", json!({"turnId": "t1"}), &hub)
+            .await
+            .unwrap();
+        let journalled = store.complete_history(id).await.unwrap();
+        let (deltas, last) = journalled.split_at(journalled.len() - 1);
+        assert_eq!(last[0].event_type, "turn.completed");
+        // Every merged event is the template carrying a run of consecutive
+        // fragments, in order, within the size limit.
+        let mut next = 0;
+        for event in deltas {
+            assert_eq!(event.event_type, "message.delta");
+            let text = event.payload["delta"].as_str().unwrap();
+            assert!(text.len() <= super::super::coalesce::DELTA_COALESCE_MAX_BYTES);
+            let mut rest = text;
+            while !rest.is_empty() {
+                rest = rest.strip_prefix(fragments[next].as_str()).unwrap();
+                next += 1;
+            }
+            let mut expected = template.clone();
+            expected["delta"] = json!(text);
+            assert_eq!(event.payload, expected);
+        }
+        assert_eq!(next, fragments.len());
+        assert!(deltas.len() < 100, "{} merged events", deltas.len());
+        // Live receivers got exactly what was journalled.
+        for event in &journalled {
+            let published = live.recv().await.unwrap();
+            assert_eq!(
+                serde_json::to_vec(&**published).unwrap(),
+                serde_json::to_vec(event).unwrap()
+            );
         }
         fs::remove_dir_all(root).unwrap();
     }

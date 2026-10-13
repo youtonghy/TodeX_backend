@@ -909,6 +909,59 @@ impl DriverEventSink {
         result
     }
 
+    /// [`Self::emit_delta`] with the merge identity computed by the provider
+    /// instead of by cloning and serializing every fragment. `key` must
+    /// cover every field of `payload` outside `text_pointers` that can
+    /// differ between fragments (a merged event keeps the newest
+    /// fragment's other fields); the sink adds the fields it decorates
+    /// payloads with (runtime, scope, turn).
+    pub async fn emit_delta_keyed(
+        &self,
+        event_type: &str,
+        mut payload: Value,
+        key: String,
+        text_pointers: &'static [&'static str],
+    ) -> Result<(), AppError> {
+        match self.muted_route().await {
+            MutedRoute::Unmuted => {}
+            MutedRoute::Held => return Ok(()),
+            MutedRoute::To(target) => {
+                return Box::pin(target.emit_delta_keyed(event_type, payload, key, text_pointers))
+                    .await
+            }
+        }
+        self.touch();
+        self.decorate(event_type, &mut payload);
+        let mergeable = text_pointers
+            .iter()
+            .all(|pointer| payload.pointer(pointer).is_some_and(Value::is_string));
+        let result = if mergeable {
+            let mut key = key;
+            for field in ["runtimeId", "scope", "turnId", "nativeTurnId"] {
+                key.push('\0');
+                if let Some(value) = payload.get(field) {
+                    key.push_str(&value.to_string());
+                }
+            }
+            self.store
+                .append_delta_and_publish(
+                    &self.conversation_id,
+                    event_type,
+                    payload,
+                    DeltaFragment::keyed(key, text_pointers),
+                    &self.hub,
+                )
+                .await
+        } else {
+            self.store
+                .append_and_publish(&self.conversation_id, event_type, payload, &self.hub)
+                .await
+                .map(|_| ())
+        };
+        self.touch();
+        result
+    }
+
     /// The frame of a provider read. An unparseable line becomes
     /// `Value::Null`, which readers skip like a blank line, after the first
     /// MAX_REPORTED_UNPARSED_LINES per turn are journalled as `provider.event`.

@@ -706,6 +706,26 @@ const ACP_TOOL_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 /// Text field of a streamed `agent_message_chunk` / `agent_thought_chunk`.
 const ACP_CHUNK_TEXT: &[&str] = &["/content/text"];
 
+/// Merge identity of a streamed ACP chunk: the message id and every
+/// payload field besides the chunk text (annotations and `_meta` included).
+fn acp_chunk_key(payload: &Value, message_id: Option<&str>) -> String {
+    let content: Vec<(&String, &Value)> = payload
+        .get("content")
+        .and_then(Value::as_object)
+        .map(|content| content.iter().filter(|(key, _)| *key != "text").collect())
+        .unwrap_or_default();
+    let rest: Vec<(&String, &Value)> = payload
+        .as_object()
+        .map(|payload| {
+            payload
+                .iter()
+                .filter(|(key, _)| *key != "content")
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::to_string(&(message_id, rest, content)).unwrap_or_default()
+}
+
 impl AcpConnectionState {
     /// Whether the turn that just ended was cancelled cleanly: the agent
     /// answered `session/prompt` with stop reason `cancelled` within the
@@ -2426,7 +2446,8 @@ pub(super) async fn handle_acp_message(
             // Chunks of one agent message/thought merge; image or resource
             // chunks stay separate events.
             let message_id = update.get("messageId").and_then(Value::as_str);
-            sink.emit_delta(event_type, payload, ACP_CHUNK_TEXT, message_id)
+            let key = acp_chunk_key(&payload, message_id);
+            sink.emit_delta_keyed(event_type, payload, key, ACP_CHUNK_TEXT)
                 .await?;
         } else {
             sink.emit(event_type, payload).await?;
