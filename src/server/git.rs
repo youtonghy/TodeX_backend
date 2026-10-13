@@ -357,9 +357,10 @@ async fn run_locked(
             )
             .await?;
             if request.action.is_push() {
+                validate_push_execution_config(&repository).await?;
                 if let Err(error) = run_step(
                     &repository,
-                    mutation_git_args(&hooks_path, &["push"]),
+                    mutation_git_args(&hooks_path, PUSH_ARGS),
                     "git push",
                     &mut output,
                 )
@@ -374,9 +375,10 @@ async fn run_locked(
             }
         }
         GitAction::Push => {
+            validate_push_execution_config(&repository).await?;
             run_step(
                 &repository,
-                mutation_git_args(&hooks_path, &["push"]),
+                mutation_git_args(&hooks_path, PUSH_ARGS),
                 "git push",
                 &mut output,
             )
@@ -468,13 +470,31 @@ async fn prepare_disabled_hooks_directory(data_dir: &Path) -> Result<PathBuf> {
 }
 
 async fn validate_mutation_execution_config(repository: &Path) -> Result<()> {
+    for listing in repository_config_listings(repository).await? {
+        validate_executable_config_entries(&listing)?;
+    }
+    Ok(())
+}
+
+/// Checks the repository's own config before a push; see
+/// [`validate_push_config_entries`].
+async fn validate_push_execution_config(repository: &Path) -> Result<()> {
+    for listing in repository_config_listings(repository).await? {
+        validate_push_config_entries(&listing)?;
+    }
+    Ok(())
+}
+
+/// The repository-scoped config (`--local`, plus `--worktree` when enabled
+/// and present) as `git config --null --list` output, includes resolved.
+async fn repository_config_listings(repository: &Path) -> Result<Vec<Vec<u8>>> {
     let local = run_checked(
         repository,
         &git_args(&["config", "--local", "--includes", "--null", "--list"]),
         "git config --local --includes --list",
     )
     .await?;
-    validate_executable_config_entries(&local.stdout)?;
+    let mut listings = vec![local.stdout];
     // Git refuses --worktree once linked worktrees exist unless the extension
     // is enabled. Without it, local config is already the effective repo scope.
     let extension = run_git_command(
@@ -499,13 +519,13 @@ async fn validate_mutation_execution_config(repository: &Path) -> Result<()> {
             "git config --worktree --includes --list",
         )
         .await?;
-        validate_executable_config_entries(&worktree.stdout)?;
+        listings.push(worktree.stdout);
     } else if !extension.status.success() && extension.status.code() != Some(1) {
         return Err(AppError::GitProcess(
             "Cannot inspect worktree configuration".to_owned(),
         ));
     }
-    Ok(())
+    Ok(listings)
 }
 
 /// `extensions.worktreeConfig` only enables the per-worktree config file; Git
@@ -577,6 +597,31 @@ fn validate_executable_config_entries(output: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// A push runs with submodule recursion off (see [`PUSH_ARGS`]). Repository
+/// config that asks for submodule pushes or configures submodules is refused
+/// as well, so a push never reaches into, or publishes commits from, another
+/// repository that the user did not choose to push.
+fn validate_push_config_entries(output: &[u8]) -> Result<()> {
+    for entry in output.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let key_end = entry
+            .iter()
+            .position(|byte| matches!(*byte, b'\n' | b'='))
+            .unwrap_or(entry.len());
+        let key = String::from_utf8_lossy(&entry[..key_end]).to_ascii_lowercase();
+        if key == "push.recursesubmodules" || key.starts_with("submodule.") {
+            return Err(AppError::InvalidRequest(format!(
+                "repository-local submodule Git config is not supported for push: {key}; \
+                 TodeX pushes only the current repository, so remove the setting or push \
+                 from a terminal"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn is_supported_remote_url(value: &str) -> bool {
     let value = value.trim();
     let lower = value.to_ascii_lowercase();
@@ -599,6 +644,14 @@ fn is_supported_remote_url(value: &str) -> bool {
     };
     !host.is_empty() && !path.is_empty() && !host.contains(['/', '\\'])
 }
+
+/// `git push` without submodule recursion, whatever the config says.
+const PUSH_ARGS: &[&str] = &[
+    "-c",
+    "submodule.recurse=false",
+    "push",
+    "--recurse-submodules=no",
+];
 
 fn mutation_git_args(hooks_path: &Path, values: &[&str]) -> Vec<String> {
     mutation_git_args_owned(hooks_path, git_args(values))
@@ -1330,6 +1383,65 @@ mod tests {
             validate_executable_config_entries(b"url.custom::.insteadof\nhttps://example.com/\0"),
             Err(AppError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn push_disables_submodule_recursion() {
+        let args = mutation_git_args(Path::new("/hooks"), PUSH_ARGS);
+        let push = args.iter().position(|arg| arg == "push").expect("push");
+        assert!(args[..push]
+            .windows(2)
+            .any(|pair| pair[0] == "-c" && pair[1] == "submodule.recurse=false"));
+        assert_eq!(args[push + 1], "--recurse-submodules=no");
+    }
+
+    #[test]
+    fn push_rejects_submodule_config_entries() {
+        assert!(
+            validate_push_config_entries(b"remote.origin.url\nhttps://example.com/r.git\0").is_ok()
+        );
+        for listing in [
+            &b"push.recurseSubmodules\non-demand\0"[..],
+            b"submodule.recurse\ntrue\0",
+            b"submodule.lib.url\nhttps://example.com/lib.git\0",
+        ] {
+            let error = validate_push_config_entries(listing)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not supported for push"), "{error}");
+        }
+        // Submodule config does not block other mutations such as commit.
+        assert!(validate_executable_config_entries(
+            b"submodule.lib.url\nhttps://example.com/lib.git\0"
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn push_config_check_reads_repository_config() {
+        let root = temp_dir("todex-git-push-submodule");
+        let repository = root.join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(args)
+                .status()
+                .expect("git");
+            assert!(status.success());
+        };
+        git(&["init"]);
+        assert!(validate_push_execution_config(&repository).await.is_ok());
+        git(&["config", "submodule.lib.url", "https://example.com/lib.git"]);
+        assert!(matches!(
+            validate_push_execution_config(&repository).await,
+            Err(AppError::InvalidRequest(_))
+        ));
+        assert!(validate_mutation_execution_config(&repository)
+            .await
+            .is_ok());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

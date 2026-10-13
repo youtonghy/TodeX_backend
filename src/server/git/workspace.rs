@@ -12,6 +12,13 @@ fn invalid(message: &str) -> AppError {
     AppError::InvalidRequest(message.to_owned())
 }
 
+fn is_plain_remote_name(remote: &str) -> bool {
+    !remote.is_empty()
+        && remote
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 async fn text_command(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = run_checked(cwd, &git_args(args), "Git workspace inspection").await?;
     String::from_utf8(output.stdout).map_err(|_| invalid("Git returned non-UTF-8 data"))
@@ -458,12 +465,20 @@ async fn operate_locked(
                     "Current branch needs a branch upstream before pushing",
                 ));
             }
+            // The name is interpolated into a config key below.
+            if !is_plain_remote_name(remote) {
+                return Err(invalid(
+                    "Upstream remote name must use only letters, digits, '.', '_' and '-'",
+                ));
+            }
+            validate_push_execution_config(workspace).await?;
             // Explicit refspec bypasses push.default and remote.*.push (including
             // force refspecs). No force, tags, mirror, upstream setup, or hooks.
             git_args(&[
                 "-c",
                 &format!("remote.{remote}.mirror=false"),
                 "push",
+                "--recurse-submodules=no",
                 "--no-force",
                 "--no-follow-tags",
                 "--",
@@ -1063,6 +1078,65 @@ mod tests {
                 .unwrap(),
             remote_head
         );
+    }
+
+    #[test]
+    fn push_remote_names_are_restricted_before_config_interpolation() {
+        for remote in ["origin", "up-stream_2.mirror"] {
+            assert!(is_plain_remote_name(remote), "{remote}");
+        }
+        for remote in [
+            "",
+            "a=b",
+            "a.mirror=true -c core.x",
+            "evil\nname",
+            "a/b",
+            "é",
+        ] {
+            assert!(!is_plain_remote_name(remote), "{remote:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn push_refuses_repository_submodule_config() {
+        for (key, value) in [
+            ("push.recurseSubmodules", "on-demand"),
+            ("submodule.lib.url", "https://example.invalid/lib.git"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.seed().await;
+            let branch = text_command(&fixture.repo, &["branch", "--show-current"])
+                .await
+                .unwrap();
+            for (config_key, config_value) in [
+                (
+                    "remote.origin.url".to_owned(),
+                    "https://example.invalid/repo.git",
+                ),
+                (
+                    "remote.origin.fetch".to_owned(),
+                    "+refs/heads/*:refs/remotes/origin/*",
+                ),
+                (format!("branch.{}.remote", branch.trim()), "origin"),
+                (format!("branch.{}.merge", branch.trim()), "refs/heads/main"),
+                (key.to_owned(), value),
+            ] {
+                text_command(&fixture.repo, &["config", &config_key, config_value])
+                    .await
+                    .unwrap();
+            }
+            let error = fixture
+                .action(GitOperation::Push {})
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&key.to_ascii_lowercase())
+                    && error.contains("not supported for push"),
+                "{error}"
+            );
+            let _ = fs::remove_dir_all(&fixture.root);
+        }
     }
 
     #[test]
