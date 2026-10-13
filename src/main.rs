@@ -317,9 +317,11 @@ fn default_env_filter() -> tracing_subscriber::EnvFilter {
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let config = Config::load(args).context("failed to load configuration")?;
+    // Ctrl-C / SIGTERM stop the server like the daemon, so batched audit
+    // records and pending device activity are written before exiting.
     ManagedServer::start(config, ProviderProcessTracking::Enabled)
         .await?
-        .wait()
+        .run_until(daemon::shutdown_signal())
         .await
 }
 

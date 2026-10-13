@@ -698,7 +698,7 @@ async fn wait_for_shutdown_or_server_exit(
     }
 }
 
-async fn shutdown_signal() -> Result<()> {
+pub(crate) async fn shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};

@@ -257,6 +257,22 @@ impl ManagedServer {
             && !self.state.codex_local_adapters.has_active_adapters()
     }
 
+    /// Serves until `shutdown` resolves, then stops like the daemon does
+    /// (flushing batched audit records and pending device activity), or
+    /// until the server ends on its own.
+    pub async fn run_until(
+        self,
+        shutdown: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
+        tokio::select! {
+            signal = shutdown => {
+                let stopped = self.stop().await;
+                signal.and(stopped)
+            }
+            () = self.finished() => self.wait().await,
+        }
+    }
+
     pub async fn stop(mut self) -> Result<()> {
         if let Some(task) = self.migration_task.take() {
             task.abort();
@@ -421,6 +437,39 @@ mod tests {
         assert!(reqwest::get(format!("http://{api}/api/v1/health"))
             .await
             .is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_signal_stops_the_server_and_flushes_batched_audit_records() {
+        let root = env::temp_dir().join(format!("todex-server-signal-{}", uuid::Uuid::new_v4()));
+        let config = Config {
+            port: 0,
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..Config::default()
+        };
+        let server = ManagedServer::start(config.clone(), ProviderProcessTracking::Disabled)
+            .await
+            .unwrap();
+        let addr = server.addr();
+        let record = crate::event::EventRecord::new(
+            "terminal.audit",
+            None,
+            None,
+            None,
+            serde_json::json!({ "marker": "flushed-on-signal" }),
+        );
+        server
+            .state
+            .terminal_audit_log
+            .append_batched(&config.data_dir, &record)
+            .unwrap();
+        // The signal arrives before the batch interval passes.
+        server.run_until(async { Ok(()) }).await.unwrap();
+        let audit = fs::read_to_string(config.data_dir.join("audit/audit-terminal.jsonl")).unwrap();
+        assert!(audit.contains("flushed-on-signal"), "{audit}");
+        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
         let _ = fs::remove_dir_all(&root);
     }
 
