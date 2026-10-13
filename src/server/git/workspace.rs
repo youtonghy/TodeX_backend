@@ -922,10 +922,16 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
+        // `git daemon` runs `git-daemon` as a child of the `git` wrapper, so
+        // killing the wrapper would orphan the daemon; run it directly.
+        let exec_path = std::process::Command::new("git")
+            .arg("--exec-path")
+            .output()
+            .unwrap();
+        let exec_path = String::from_utf8(exec_path.stdout).unwrap();
         let _daemon = Daemon(
-            std::process::Command::new("git")
+            std::process::Command::new(PathBuf::from(exec_path.trim()).join("git-daemon"))
                 .args([
-                    "daemon",
                     "--listen=127.0.0.1",
                     &format!("--port={port}"),
                     "--reuseaddr",
