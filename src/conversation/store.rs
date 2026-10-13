@@ -4240,6 +4240,21 @@ const TOOL_OUTPUT_KEYS: &[&str] = &[
 /// Subtrees never searched for output: tool input (a file write's
 /// `arguments.content`) and the block descriptor.
 const TOOL_INPUT_KEYS: &[&str] = &["arguments", "input", "rawInput", "block"];
+/// Keys whose subtree is encoded media, never text output: Codex
+/// `contentItems[].imageUrl`, Claude `source.data`, MCP `data` / `blob`.
+/// Cutting inside them would corrupt the image or file, so the output cap
+/// neither cuts nor counts them (only [`bound_event_payload`] applies).
+const TOOL_BINARY_KEYS: &[&str] = &["data", "imageUrl", "image_url", "blob"];
+/// Content-item `type`s whose whole object is encoded media; see
+/// [`TOOL_BINARY_KEYS`].
+const TOOL_BINARY_TYPES: &[&str] = &[
+    "image",
+    "inputImage",
+    "input_image",
+    "audio",
+    "resource",
+    "blob",
+];
 
 /// Cap the output of a `tool.completed` payload: when its output strings
 /// (see [`TOOL_OUTPUT_KEYS`]) hold more than [`TOOL_OUTPUT_CAP_BYTES`],
@@ -4251,7 +4266,9 @@ const TOOL_INPUT_KEYS: &[&str] = &["arguments", "input", "rawInput", "block"];
 /// (`_truncated` when `truncated` is taken). Returns that size when the
 /// payload changed; smaller outputs are left untouched. Runs before the
 /// payload is sealed, so the summary, the full ciphertext and the live
-/// push all carry the same capped output.
+/// push all carry the same capped output. Encoded media (`data:` URLs,
+/// [`TOOL_BINARY_KEYS`], [`TOOL_BINARY_TYPES`] items) is kept whole and
+/// left out of the count.
 fn cap_tool_output(event_type: &str, payload: &mut Value) -> Option<usize> {
     if event_type != "tool.completed" {
         return None;
@@ -4319,7 +4336,11 @@ fn collect_output_leaves(
 ) {
     let parent = pointer.len();
     match value {
-        Value::String(text) if in_output && text.len() >= TOOL_OUTPUT_MIN_LEAF_BYTES => {
+        Value::String(text)
+            if in_output
+                && text.len() >= TOOL_OUTPUT_MIN_LEAF_BYTES
+                && !text.starts_with("data:") =>
+        {
             leaves.push((pointer.clone(), text.len()));
         }
         Value::Array(items) => {
@@ -4331,8 +4352,19 @@ fn collect_output_leaves(
             }
         }
         Value::Object(map) => {
+            if in_output
+                && map
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| TOOL_BINARY_TYPES.contains(&kind))
+            {
+                return;
+            }
             for (key, item) in map {
                 if !in_output && TOOL_INPUT_KEYS.contains(&key.as_str()) {
+                    continue;
+                }
+                if in_output && TOOL_BINARY_KEYS.contains(&key.as_str()) {
                     continue;
                 }
                 pointer.push('/');
@@ -6422,6 +6454,93 @@ mod tests {
         for (index, text) in texts.iter().enumerate().skip(37) {
             assert_eq!(*text, format!("{index:02}").repeat(5 * 1024));
         }
+    }
+
+    #[test]
+    fn tool_output_cap_keeps_encoded_media_whole_and_uncounted() {
+        let text = "t".repeat(300 * 1024);
+        let base64 = "QUJD".repeat(64 * 1024);
+        let data_url = format!("data:image/png;base64,{base64}");
+        let payloads = [
+            // Codex `contentItems`, plus a bare `data:` URL string.
+            json!({
+                "item": { "contentItems": [
+                    { "type": "inputText", "text": text },
+                    { "type": "inputImage", "imageUrl": data_url },
+                    { "type": "input_image", "image_url": data_url },
+                    data_url,
+                ] },
+            }),
+            // Claude Code `result` blocks.
+            json!({
+                "result": [
+                    { "type": "text", "text": text },
+                    { "type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": base64,
+                    } },
+                ],
+            }),
+            // MCP `content` items.
+            json!({
+                "result": { "content": [
+                    { "type": "text", "text": text },
+                    { "type": "image", "mimeType": "image/png", "data": base64 },
+                    { "type": "audio", "mimeType": "audio/wav", "data": base64 },
+                    { "type": "resource", "resource": {
+                        "uri": "file:///a.bin", "mimeType": "application/octet-stream",
+                        "blob": base64,
+                    } },
+                ] },
+            }),
+        ];
+        for mut payload in payloads {
+            let before = payload.clone();
+            // Only the text counts toward the cap.
+            assert_eq!(
+                cap_tool_output("tool.completed", &mut payload),
+                Some(text.len())
+            );
+            assert_eq!(payload["truncated"], json!({ "originalBytes": text.len() }));
+            let mut capped = 0;
+            let mut media = 0;
+            let mut stack = vec![(before.clone(), payload.clone())];
+            while let Some((original, kept)) = stack.pop() {
+                match (original, kept) {
+                    (Value::String(original), Value::String(kept)) => {
+                        if original == text {
+                            assert!(kept.contains("bytes of tool output truncated"));
+                            assert!(kept.len() < original.len());
+                            capped += 1;
+                        } else {
+                            assert_eq!(kept, original);
+                            if original.len() >= base64.len() {
+                                media += 1;
+                            }
+                        }
+                    }
+                    (Value::Array(original), Value::Array(kept)) => {
+                        stack.extend(original.into_iter().zip(kept));
+                    }
+                    (Value::Object(original), Value::Object(mut kept)) => {
+                        kept.remove("truncated");
+                        for (key, value) in original {
+                            stack.push((value, kept.remove(&key).unwrap()));
+                        }
+                        assert!(kept.is_empty());
+                    }
+                    (original, kept) => assert_eq!(kept, original),
+                }
+            }
+            assert_eq!(capped, 1);
+            assert!(media >= 1, "{before}");
+        }
+        // Media alone never triggers the cap.
+        let mut images = json!({ "result": { "content": [
+            { "type": "image", "mimeType": "image/png", "data": "A".repeat(TOOL_OUTPUT_CAP_BYTES * 2) },
+        ] } });
+        let before = images.clone();
+        assert_eq!(cap_tool_output("tool.completed", &mut images), None);
+        assert_eq!(images, before);
     }
 
     #[test]
