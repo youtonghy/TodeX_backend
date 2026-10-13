@@ -540,8 +540,18 @@ impl Drop for BrowserWatch {
     }
 }
 
+/// Makes an agent tool's state directory owner-only (0700), creating it or
+/// tightening one an older daemon created world-readable. It holds browser
+/// profiles (cookies, storage) and desktop screenshots.
+pub(crate) fn protect_state_dir(dir: &Path) {
+    if let Err(error) = secure_fs::ensure_owner_only_dir(dir) {
+        tracing::warn!(%error, dir = %dir.display(), "cannot make the agent tool state directory private");
+    }
+}
+
 impl AgentBrowser {
     pub(crate) fn load(data_dir: &Path) -> Result<Self, AppError> {
+        protect_state_dir(&data_dir.join("agent-browser"));
         let profiles =
             Profiles::load(data_dir).map_err(|error| AppError::InvalidRequest(error.message))?;
         let browser = Self {

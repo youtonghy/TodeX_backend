@@ -125,6 +125,69 @@ struct Display {
     xvfb: Supervised,
 }
 
+/// Chromium flags every agent browser starts with, after `--user-data-dir`.
+/// Component updates, Safe Browsing list downloads, crash reporting and
+/// metrics uploads are off: an agent profile has no use for them, and their
+/// caches would otherwise grow every profile by tens of megabytes.
+const BROWSER_ARGS: &[&str] = &[
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--no-startup-window",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
+    "--disable-sync",
+    "--disable-component-update",
+    "--safebrowsing-disable-auto-update",
+    "--disable-breakpad",
+    "--metrics-recording-only",
+    // Chromium reads only one `--disable-features`; keep every feature here.
+    "--disable-features=Translate,MediaRouter,OptimizationHints,SafeBrowsing",
+    "--window-size=1280,800",
+];
+
+/// Profile entries the disabled components left behind (by browsers started
+/// before these flags, or before an update). Names ending in `*` match by
+/// prefix.
+const STALE_PROFILE_ENTRIES: &[&str] = &["Safe Browsing", "component_crx_cache", "BrowserMetrics*"];
+
+/// Removes [`STALE_PROFILE_ENTRIES`] from a profile that no browser is
+/// using; `SingletonLock` marks one in use (or left by a crash, in which
+/// case cleaning waits for a clean exit).
+fn remove_stale_profile_entries(profile_dir: &Path) {
+    if std::fs::symlink_metadata(profile_dir.join("SingletonLock")).is_ok() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(profile_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let stale = STALE_PROFILE_ENTRIES
+            .iter()
+            .any(|pattern| match pattern.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => name == *pattern,
+            });
+        if !stale {
+            continue;
+        }
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        if let Err(error) = removed {
+            tracing::warn!(%error, path = %path.display(), "agent browser: cannot remove a stale profile cache");
+        }
+    }
+}
+
 pub(crate) async fn launch(executable: &Path, profile_dir: &Path) -> Result<Process, BrowserError> {
     launch_in(executable, profile_dir, true).await
 }
@@ -138,30 +201,18 @@ async fn launch_in(
 ) -> Result<Process, BrowserError> {
     // Cookies and storage of the agent's sessions: owner-only (0700).
     let dir = profile_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || crate::secure_fs::ensure_owner_only_dir(&dir))
-        .await
-        .map_err(|error| {
-            BrowserError::failed(format!("cannot create the browser profile: {error}"))
-        })?
-        .map_err(|error| {
-            BrowserError::failed(format!("cannot create the browser profile: {error}"))
-        })?;
+    tokio::task::spawn_blocking(move || {
+        crate::secure_fs::ensure_owner_only_dir(&dir)?;
+        remove_stale_profile_entries(&dir);
+        std::io::Result::Ok(())
+    })
+    .await
+    .map_err(|error| BrowserError::failed(format!("cannot create the browser profile: {error}")))?
+    .map_err(|error| BrowserError::failed(format!("cannot create the browser profile: {error}")))?;
     let mut command = Command::new(executable);
     command
         .arg(format!("--user-data-dir={}", profile_dir.display()))
-        .args([
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--no-startup-window",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-background-timer-throttling",
-            "--disable-session-crashed-bubble",
-            "--hide-crash-restore-bubble",
-            "--disable-sync",
-            "--disable-features=Translate,MediaRouter,OptimizationHints",
-            "--window-size=1280,800",
-        ])
+        .args(BROWSER_ARGS)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -809,6 +860,62 @@ mod tests {
             std::env::temp_dir().join(format!("todex-launch-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn browser_args_disable_background_components_in_one_feature_list() {
+        for flag in [
+            "--disable-component-update",
+            "--safebrowsing-disable-auto-update",
+            "--disable-breakpad",
+            "--metrics-recording-only",
+        ] {
+            assert!(BROWSER_ARGS.contains(&flag), "{flag}");
+        }
+        let feature_lists = BROWSER_ARGS
+            .iter()
+            .filter_map(|arg| arg.strip_prefix("--disable-features="))
+            .collect::<Vec<_>>();
+        assert_eq!(feature_lists.len(), 1);
+        let features = feature_lists[0].split(',').collect::<Vec<_>>();
+        for feature in [
+            "Translate",
+            "MediaRouter",
+            "OptimizationHints",
+            "SafeBrowsing",
+        ] {
+            assert!(features.contains(&feature), "{feature}");
+        }
+    }
+
+    #[test]
+    fn stale_component_caches_are_removed_from_an_idle_profile() {
+        let dir = temp_dir("stale");
+        for name in [
+            "Safe Browsing",
+            "component_crx_cache",
+            "BrowserMetrics",
+            "Default",
+        ] {
+            std::fs::create_dir_all(dir.join(name).join("inner")).unwrap();
+        }
+        std::fs::write(dir.join("BrowserMetrics-spare.pma"), b"x").unwrap();
+        std::fs::write(dir.join("Local State"), b"{}").unwrap();
+
+        remove_stale_profile_entries(&dir);
+        let mut left = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        left.sort();
+        assert_eq!(left, ["Default", "Local State"]);
+
+        // A profile in use is left alone.
+        std::fs::create_dir_all(dir.join("Safe Browsing")).unwrap();
+        std::fs::write(dir.join("SingletonLock"), b"").unwrap();
+        remove_stale_profile_entries(&dir);
+        assert!(dir.join("Safe Browsing").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An executable "browser" script that ignores every Chromium flag.

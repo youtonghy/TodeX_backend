@@ -182,6 +182,7 @@ struct Inner {
 
 impl AgentDesktop {
     pub async fn load(data_dir: &Path) -> Result<Self, AppError> {
+        crate::agent_browser::protect_state_dir(&data_dir.join(STATE_DIR));
         let settings_path = data_dir.join(SETTINGS_FILE);
         let settings = match tokio::fs::read(&settings_path).await {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
