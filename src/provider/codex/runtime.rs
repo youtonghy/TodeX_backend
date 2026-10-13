@@ -208,8 +208,9 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                 }
                 let child = process.as_mut().expect("spawned process");
                 let result = async {
+                    let mut state_to_save = None;
                     if native_thread.is_none() {
-                        let (thread, model) = super::prepare_codex_thread(
+                        let (thread, model, state) = super::prepare_codex_thread(
                             child,
                             context,
                             &prompt,
@@ -219,10 +220,12 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                         .await?;
                         native_thread = Some(thread);
                         native_model = model;
+                        state_to_save = state;
                     }
                     active_turn(
                         child,
                         native_thread.as_deref().unwrap(),
+                        state_to_save,
                         &prompt,
                         &mut native_model,
                         &sink,
@@ -286,6 +289,7 @@ struct Pending {
 async fn active_turn(
     process: &mut JsonLineProcess,
     thread: &str,
+    state_to_save: Option<ProviderState>,
     prompt: &DriverPrompt,
     native_model: &mut Option<String>,
     sink: &DriverEventSink,
@@ -322,9 +326,16 @@ async fn active_turn(
     if let Some(model) = &prompt.model {
         *native_model = Some(model.clone());
     }
-    process
-        .send(&json!({"id": start_id, "method": "turn/start", "params": params}))
-        .await?;
+    let start = json!({"id": start_id, "method": "turn/start", "params": params});
+    match state_to_save {
+        // A new native thread is saved while the provider gets the turn.
+        Some(state) => {
+            let (sent, saved) = tokio::join!(process.send(&start), sink.save_provider_state(state));
+            saved?;
+            sent?;
+        }
+        None => process.send(&start).await?,
+    }
     let mut start_request = Some(start_id);
     let mut queued_start: Option<Value> = None;
     let mut start_deadline =

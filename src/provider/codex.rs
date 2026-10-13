@@ -4,7 +4,7 @@ use std::path::Path;
 use tokio::sync::watch;
 
 use crate::config::AgentConfig;
-use crate::conversation::ProviderKind;
+use crate::conversation::{ProviderKind, ProviderState};
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
@@ -281,7 +281,7 @@ impl ProviderDriver for CodexDriver {
             let response = read_rpc_response(&mut process, "fork").await?;
             let native = response.pointer("/thread/id").and_then(Value::as_str).filter(|id| !id.is_empty() && *id != original)
                 .ok_or_else(|| AppError::ProviderUnavailable("Codex fork did not return a new thread id".to_owned()))?;
-            let mut state = crate::conversation::ProviderState::new(ProviderKind::Codex);
+            let mut state = ProviderState::new(ProviderKind::Codex);
             state.native_session_id = Some(native.to_owned());
             state.recoverable = true;
             Ok(state)
@@ -523,7 +523,7 @@ async fn prepare_codex_thread(
     prompt: &DriverPrompt,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
-) -> Result<(String, Option<String>), AppError> {
+) -> Result<(String, Option<String>, Option<ProviderState>), AppError> {
     process
         .send(&json!({
             "id": "initialize",
@@ -629,13 +629,21 @@ async fn prepare_codex_thread(
         }
     };
 
-    let mut provider_state = context.provider_state;
-    provider_state.native_session_id = Some(native_session_id.clone());
-    provider_state.recoverable = true;
-    provider_state.last_error = None;
-    sink.save_provider_state(provider_state).await?;
+    // A resumed thread whose saved state is already current needs no write;
+    // otherwise the caller saves it while `turn/start` is being sent.
+    let saved = &context.provider_state;
+    let state_to_save = (saved.native_session_id.as_deref() != Some(native_session_id.as_str())
+        || !saved.recoverable
+        || saved.last_error.is_some())
+    .then(|| {
+        let mut provider_state = context.provider_state;
+        provider_state.native_session_id = Some(native_session_id.clone());
+        provider_state.recoverable = true;
+        provider_state.last_error = None;
+        provider_state
+    });
 
-    Ok((native_session_id, effective_model))
+    Ok((native_session_id, effective_model, state_to_save))
 }
 
 /// Adds TodeX's MCP servers to a `thread/start|resume` `config` override.
