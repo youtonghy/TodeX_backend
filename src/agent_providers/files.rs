@@ -56,8 +56,13 @@ pub fn read_text(path: &Path, label: &str) -> Result<Option<String>, AppError> {
 }
 
 /// Parse a config file that may contain comments/trailing commas. JSON5 is a
-/// strict superset of JSON, so plain JSON files parse identically.
+/// strict superset of JSON, so plain JSON files parse identically. A file
+/// that is empty or whitespace-only reads as an empty object, so a config
+/// another tool created but never filled does not block installation.
 pub fn parse_json5(text: &str, path: &Path, label: &str) -> Result<Value, AppError> {
+    if text.trim().is_empty() {
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
     json5::from_str(text).map_err(|error| {
         AppError::InvalidRequest(format!(
             "{label} file is not valid JSON/JSONC ({}): {error}",
@@ -252,5 +257,21 @@ mod tests {
         .unwrap();
         assert_eq!(value["a"], 1);
         assert!(parse_json5("[1,2]", Path::new("x.json"), "test").is_ok());
+    }
+
+    #[test]
+    fn empty_or_whitespace_json5_reads_as_empty_object() {
+        for text in ["", "  \n\t\r\n"] {
+            let value = parse_json5(text, Path::new("x.json"), "test").unwrap();
+            assert_eq!(value, serde_json::json!({}));
+        }
+        let root = test_dir();
+        let path = root.join("mcp_config.json");
+        fs::write(&path, "\n").unwrap();
+        assert_eq!(
+            read_json5(&path, "test").unwrap(),
+            Some(serde_json::json!({}))
+        );
+        assert!(parse_json5("{", Path::new("x.json"), "test").is_err());
     }
 }
