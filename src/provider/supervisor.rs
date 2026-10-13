@@ -2066,50 +2066,39 @@ impl ConversationSupervisor {
             self.active.remove(conversation_id);
             return Err(error);
         }
-        if let Err(error) = self
-            .emit(
-                conversation_id,
-                "message.created",
-                user_message_payload(
-                    &turn_id,
-                    client_request_id.as_deref(),
-                    &request_fingerprint,
-                    &user_text,
-                    request_sealed.then_some(&request_snapshot),
-                ),
-            )
-            .await
-        {
-            self.active.remove(conversation_id);
-            return Err(error);
-        }
+        // The user message, the injected skills and the turn start are
+        // journalled with one write and one sync.
+        let mut opening = vec![(
+            "message.created".to_owned(),
+            user_message_payload(
+                &turn_id,
+                client_request_id.as_deref(),
+                &request_fingerprint,
+                &user_text,
+                request_sealed.then_some(&request_snapshot),
+            ),
+        )];
         if !injected.is_empty() {
-            if let Err(error) = self
-                .emit(
-                    conversation_id,
-                    "skill.injected",
-                    json!({
-                        "turnId": turn_id,
-                        "skills": injected.iter().map(|(name, content)| json!({
-                            "name": name,
-                            "bytes": content.len(),
-                        })).collect::<Vec<_>>(),
-                    }),
-                )
-                .await
-            {
-                self.active.remove(conversation_id);
-                return Err(error);
-            }
+            opening.push((
+                "skill.injected".to_owned(),
+                json!({
+                    "turnId": turn_id,
+                    "skills": injected.iter().map(|(name, content)| json!({
+                        "name": name,
+                        "bytes": content.len(),
+                    })).collect::<Vec<_>>(),
+                }),
+            ));
         }
+        opening.push((
+            "turn.started".to_owned(),
+            json!({ "turnId": turn_id, "clientRequestId": client_request_id, "provider": manifest.provider,
+                "requestedPermissions": { "permissionMode": permission_mode, "workMode": work_mode, "profile": permission_profile, "sandboxMode": sandbox_mode, "approvalPolicy": approval_policy },
+                "effectivePermissions": effective_permissions, "configurationStatus": "validated" }),
+        ));
         if let Err(error) = self
-            .emit(
-                conversation_id,
-                "turn.started",
-                json!({ "turnId": turn_id, "clientRequestId": client_request_id, "provider": manifest.provider,
-                    "requestedPermissions": { "permissionMode": permission_mode, "workMode": work_mode, "profile": permission_profile, "sandboxMode": sandbox_mode, "approvalPolicy": approval_policy },
-                    "effectivePermissions": effective_permissions, "configurationStatus": "validated" }),
-            )
+            .store
+            .append_many_and_publish(conversation_id, opening, &self.hub)
             .await
         {
             self.active.remove(conversation_id);

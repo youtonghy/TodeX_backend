@@ -1243,6 +1243,36 @@ impl ConversationStore {
             .await
     }
 
+    /// [`Self::append_and_publish`] for consecutive events that belong
+    /// together: they get consecutive sequences, are written with one journal
+    /// write and one sync, and are published in order. Only the last event
+    /// may change the conversation status (crash recovery replays just the
+    /// newest record onto a stale manifest status).
+    pub async fn append_many_and_publish(
+        &self,
+        conversation_id: &str,
+        events: Vec<(String, Value)>,
+        hub: &ConversationEventHub,
+    ) -> Result<Vec<ConversationEvent>, AppError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        for (event_type, _) in &events {
+            validate_event_type(event_type)?;
+        }
+        let store = self.clone();
+        let conversation_id = conversation_id.to_owned();
+        let hub = hub.clone();
+        Self::detached(async move {
+            let _guard = store.lock(&conversation_id).await;
+            store.flush_pending_delta_locked(&conversation_id).await?;
+            store
+                .append_batch_locked(&conversation_id, events, Some(&hub))
+                .await
+        })
+        .await
+    }
+
     /// Streaming text fragment: merged with the open window of the same stream
     /// (see [`super::coalesce`]) and journalled when the window expires, fills,
     /// or any other event of this conversation is written or read. The merged
@@ -1398,27 +1428,48 @@ impl ConversationStore {
         &self,
         conversation_id: &str,
         event_type: String,
-        mut payload: Value,
+        payload: Value,
         hub: Option<&ConversationEventHub>,
     ) -> Result<ConversationEvent, AppError> {
-        redact_secrets(&mut payload);
-        rename_reserved_encrypted_field(conversation_id, &event_type, &mut payload);
-        let bounded = bound_event_payload(&mut payload)?;
-        if let Some(original_bytes) = bounded.original_bytes {
-            tracing::warn!(
-                conversation_id,
-                event_type,
-                original_bytes,
-                bounded_bytes = bounded.bytes,
-                "oversized conversation event payload truncated"
-            );
-        }
-        // Safety net: bounding always lands under the budget, so this only
-        // trips if that invariant is ever broken.
-        if bounded.bytes > MAX_EVENT_PAYLOAD_BYTES {
-            return Err(AppError::InvalidRequest(format!(
-                "conversation event payload exceeds {MAX_EVENT_PAYLOAD_BYTES} bytes"
-            )));
+        let mut events = self
+            .append_batch_locked(conversation_id, vec![(event_type, payload)], hub)
+            .await?;
+        Ok(events.pop().expect("one event was appended"))
+    }
+
+    /// Appends `entries` as consecutive records in one journal write and
+    /// sync. Callers hold the conversation lock and pass at least one entry.
+    async fn append_batch_locked(
+        &self,
+        conversation_id: &str,
+        entries: Vec<(String, Value)>,
+        hub: Option<&ConversationEventHub>,
+    ) -> Result<Vec<ConversationEvent>, AppError> {
+        debug_assert!(!entries.is_empty());
+        let mut prepared = Vec::with_capacity(entries.len());
+        let mut encode_blocking = false;
+        for (event_type, mut payload) in entries {
+            redact_secrets(&mut payload);
+            rename_reserved_encrypted_field(conversation_id, &event_type, &mut payload);
+            let bounded = bound_event_payload(&mut payload)?;
+            if let Some(original_bytes) = bounded.original_bytes {
+                tracing::warn!(
+                    conversation_id,
+                    event_type,
+                    original_bytes,
+                    bounded_bytes = bounded.bytes,
+                    "oversized conversation event payload truncated"
+                );
+            }
+            // Safety net: bounding always lands under the budget, so this only
+            // trips if that invariant is ever broken.
+            if bounded.bytes > MAX_EVENT_PAYLOAD_BYTES {
+                return Err(AppError::InvalidRequest(format!(
+                    "conversation event payload exceeds {MAX_EVENT_PAYLOAD_BYTES} bytes"
+                )));
+            }
+            encode_blocking |= bounded.bytes >= BLOCKING_ENCODE_BYTES;
+            prepared.push((event_type, payload));
         }
         let directory = self.directory(conversation_id)?;
         let mut manifest = self.get_unlocked(conversation_id).await?;
@@ -1465,16 +1516,23 @@ impl ConversationStore {
             }
             manifest.last_sequence = journal_sequence;
         }
-        let mut event = ConversationEvent::new(
-            conversation_id,
-            manifest.last_sequence.saturating_add(1),
-            event_type,
-            payload,
-        );
-        event.provider = Some(manifest.provider);
-        // v3 records store microseconds; the published event matches what a
-        // later replay decodes.
-        event.time = truncate_to_micros(event.time);
+        let events = prepared
+            .into_iter()
+            .zip(1_u64..)
+            .map(|((event_type, payload), offset)| {
+                let mut event = ConversationEvent::new(
+                    conversation_id,
+                    manifest.last_sequence.saturating_add(offset),
+                    event_type,
+                    payload,
+                );
+                event.provider = Some(manifest.provider);
+                // v3 records store microseconds; the published event matches
+                // what a later replay decodes.
+                event.time = truncate_to_micros(event.time);
+                event
+            })
+            .collect::<Vec<_>>();
         let event_path = directory.join(EVENTS_FILE);
         // A torn final record (a write interrupted before its newline) must
         // be closed before anything else is appended. When it is the active
@@ -1561,12 +1619,18 @@ impl ConversationStore {
         // folded into the digest.
         // Large payloads are sealed and encoded on the blocking pool; the
         // conversation lock is still held, so journal order is unchanged.
-        let (event, record) = if bounded.bytes >= BLOCKING_ENCODE_BYTES {
-            tokio::task::spawn_blocking(move || stored_record(event, key))
+        let encode = move || {
+            events
+                .into_iter()
+                .map(|event| stored_record(event, key.clone()))
+                .collect::<Result<Vec<_>, AppError>>()
+        };
+        let stored = if encode_blocking {
+            tokio::task::spawn_blocking(encode)
                 .await
                 .map_err(blocking_error)??
         } else {
-            stored_record(event, key)?
+            encode()?
         };
         // `create` normally made the journal and rotation always creates the
         // fresh active file; only here does a missing one get created, and
@@ -1584,12 +1648,26 @@ impl ConversationStore {
         // A torn sealed `.seg` cannot exist, and an unterminated active
         // file gets the separator.
         let separator = u64::from(!terminated && active_bytes > 0);
-        let mut line = Vec::with_capacity(record.len() + 2);
+        let mut line = Vec::with_capacity(
+            stored
+                .iter()
+                .map(|(_, record)| record.len() + 1)
+                .sum::<usize>()
+                + 1,
+        );
         if separator == 1 {
             line.push(b'\n');
         }
-        line.extend_from_slice(&record);
-        line.push(b'\n');
+        // Each record's byte range in the active file, newline excluded.
+        let mut ranges = Vec::with_capacity(stored.len());
+        let mut events = Vec::with_capacity(stored.len());
+        for (event, record) in stored {
+            let start = active_bytes + line.len() as u64;
+            line.extend_from_slice(&record);
+            ranges.push((event.sequence, start, active_bytes + line.len() as u64));
+            line.push(b'\n');
+            events.push(event);
+        }
         let pre_write_files = files.clone();
         let write_directory = directory.clone();
         #[cfg(test)]
@@ -1615,12 +1693,11 @@ impl ConversationStore {
             #[cfg(not(test))]
             let fault = None;
             append_journal_line(&write_directory, &event_path, created, &line, fault)
-                .map(|metadata| (line, metadata))
         })
         .await
         .map_err(blocking_error)
         .and_then(|written| written.map_err(AppError::from));
-        let (line, metadata) = match written {
+        let metadata = match written {
             Ok(written) => written,
             Err(error) => {
                 self.abandon_failed_append(conversation_id).await;
@@ -1632,12 +1709,9 @@ impl ConversationStore {
         last.modified = metadata.modified().ok();
         self.index_update(conversation_id, |index| {
             if index.files == pre_write_files {
-                index.push_active(
-                    active_index,
-                    event.sequence,
-                    active_bytes + separator,
-                    active_bytes + line.len() as u64 - 1,
-                );
+                for &(sequence, start, end) in &ranges {
+                    index.push_active(active_index, sequence, start, end);
+                }
                 index.files = files.clone();
             }
         });
@@ -1650,7 +1724,10 @@ impl ConversationStore {
                 if cached.files != pre_write_files {
                     return false;
                 }
-                Arc::make_mut(&mut cached.digest).apply(&event);
+                let digest = Arc::make_mut(&mut cached.digest);
+                for event in &events {
+                    digest.apply(event);
+                }
                 cached.files = files;
                 true
             })
@@ -1658,31 +1735,36 @@ impl ConversationStore {
         if !digest_current {
             self.digests.remove(conversation_id);
         }
+        let last_event = events.last().expect("a batch holds at least one event");
         self.tails.insert(
             conversation_id,
             JournalTail {
                 name: EVENTS_FILE.to_owned(),
                 bytes: metadata.len(),
                 modified: metadata.modified().ok(),
-                event: Arc::new(event.clone()),
+                event: Arc::new(last_event.clone()),
             },
         );
 
         // The synced journal line above is the commit point. The manifest only
         // mirrors it: status changes are written now (recovery and clients
         // key off them), everything else is flushed by the debounce timer.
-        manifest.last_sequence = event.sequence;
-        manifest.status = status_after_conversation_event(manifest.status, &event);
-        manifest.updated_at = event.time;
+        manifest.last_sequence = last_event.sequence;
+        for event in &events {
+            manifest.status = status_after_conversation_event(manifest.status, event);
+        }
+        manifest.updated_at = last_event.time;
         if manifest.status == persisted_status {
             self.mark_manifest_dirty_locked(manifest);
         } else {
             self.persist_manifest_locked(&manifest).await?;
         }
         if let Some(hub) = hub {
-            hub.publish(event.clone());
+            for event in &events {
+                hub.publish(event.clone());
+            }
         }
-        Ok(event)
+        Ok(events)
     }
 
     pub async fn save_request(

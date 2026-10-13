@@ -1149,3 +1149,107 @@ async fn recovery_that_cuts_the_journal_retires_the_key() {
     assert_eq!(journal_records(&journal).len(), 3);
     e2e.cleanup();
 }
+
+#[tokio::test]
+async fn a_batched_append_journals_and_publishes_like_single_appends() {
+    let e2e = E2e::new("todex-e2e-batch", true).await;
+    let store = &e2e.store;
+    let single = e2e.create(None).await.id;
+    let batched = e2e.create(None).await.id;
+    let hub = ConversationEventHub::default();
+    let mut single_live = hub.subscribe(&single);
+    let mut batched_live = hub.subscribe(&batched);
+    let opening = vec![
+        (
+            "message.created".to_owned(),
+            json!({"turnId": "t1", "clientRequestId": "r1", "requestFingerprint": "abc123",
+                   "role": "user", "content": SECRETS[0]}),
+        ),
+        (
+            "skill.injected".to_owned(),
+            json!({"turnId": "t1", "skills": [{"name": "s", "bytes": 3}]}),
+        ),
+        (
+            "turn.started".to_owned(),
+            json!({"turnId": "t1", "provider": "codex"}),
+        ),
+    ];
+    for id in [&single, &batched] {
+        store
+            .append_and_publish(id, "message.created", json!({"turnId": "t0"}), &hub)
+            .await
+            .unwrap();
+    }
+    for (event_type, payload) in &opening {
+        store
+            .append_and_publish(&single, event_type.as_str(), payload.clone(), &hub)
+            .await
+            .unwrap();
+    }
+    let appended = store
+        .append_many_and_publish(&batched, opening.clone(), &hub)
+        .await
+        .unwrap();
+    assert_eq!(
+        appended
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        [2, 3, 4]
+    );
+
+    // Same records, sequences and plaintext; nothing readable on disk.
+    let keys = e2e.client_keys(&single).await;
+    let batched_keys = e2e.client_keys(&batched).await;
+    let (single_history, frames) = history(store, &single, ReplayDetail::Full).await;
+    let single_view = client_view(&keys, &single_history, &frames, false);
+    let (batched_history, frames) = history(store, &batched, ReplayDetail::Full).await;
+    let batched_view = client_view(&batched_keys, &batched_history, &frames, false);
+    assert_eq!(batched_view.len(), 4);
+    for (single, batched) in single_view.iter().zip(&batched_view) {
+        assert_eq!(single.sequence, batched.sequence);
+        assert_eq!(single.event_type, batched.event_type);
+        assert_eq!(single.payload, batched.payload);
+    }
+    assert!(!contains(
+        &all_bytes(&store.directory(&batched).unwrap()),
+        SECRETS[0]
+    ));
+
+    // Published in journal order, carrying the stored ciphertext.
+    for (index, journalled) in batched_history.iter().enumerate() {
+        let event = batched_live.recv().await.unwrap();
+        assert_eq!(event.sequence, journalled.sequence);
+        assert_eq!(event.payload, journalled.payload);
+        assert_eq!(
+            single_live.recv().await.unwrap().event_type,
+            journalled.event_type,
+            "event {index}"
+        );
+    }
+
+    // The batch's status change and tail survive a restart.
+    let manifest = store.get(&batched).await.unwrap();
+    assert_eq!(manifest.last_sequence, 4);
+    assert_eq!(
+        manifest.status,
+        crate::conversation::ConversationStatus::Running
+    );
+    let warm = store.digest(&batched, Clone::clone).await.unwrap();
+    let restarted = e2e.restart().await;
+    assert_eq!(
+        restarted
+            .store
+            .digest(&batched, Clone::clone)
+            .await
+            .unwrap(),
+        warm
+    );
+    let next = restarted
+        .store
+        .append(&batched, "turn.completed", json!({"turnId": "t1"}))
+        .await
+        .unwrap();
+    assert_eq!(next.sequence, 5);
+    e2e.cleanup();
+}
