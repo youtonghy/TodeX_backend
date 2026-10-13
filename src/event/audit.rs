@@ -13,7 +13,11 @@
 //! is logged and retried later; meanwhile records keep going to the live
 //! file, so a stuck rotation neither fails writes nor deletes old files.
 //! Every record is synced before `append` returns, on the blocking pool so
-//! async workers never wait on the disk.
+//! async workers never wait on the disk. High-frequency records (terminal
+//! keystrokes and resizes) go through [`AuditLog::append_batched`] instead:
+//! they are queued and written by a background flush that syncs at most once
+//! per [`BATCH_FLUSH_INTERVAL`]. `append` writes any queued records first, so
+//! the file keeps the order records were submitted in.
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -34,11 +38,22 @@ const RETAINED_AUDIT_FILES: usize = 3;
 /// After a failed rotation, appends go to the live file for this long
 /// before rotation is tried again.
 const ROTATION_RETRY_DELAY: Duration = Duration::from_secs(60);
+/// Batched records wait at most this long for their write and sync.
+const BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct AuditLog {
     file_name: &'static str,
     open: Arc<Mutex<Option<OpenAuditFile>>>,
+    batch: Arc<Mutex<PendingBatch>>,
+}
+
+/// Records queued by `append_batched`, oldest first, with their audit
+/// directory.
+#[derive(Default)]
+struct PendingBatch {
+    lines: Vec<(PathBuf, Vec<u8>)>,
+    flush_scheduled: bool,
 }
 
 impl Default for AuditLog {
@@ -66,37 +81,107 @@ impl AuditLog {
         Self {
             file_name,
             open: Arc::default(),
+            batch: Arc::default(),
         }
     }
 
-    /// Appends `event` as one JSON line under `data_dir/audit` and syncs it.
+    /// Appends `event` as one JSON line under `data_dir/audit` and syncs it,
+    /// after any records queued by `append_batched`.
     pub async fn append(&self, data_dir: &Path, event: &EventRecord) -> Result<(), AppError> {
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
         let directory = data_dir.join("audit");
-        let open = self.open.clone();
-        let file_name = self.file_name;
-        tokio::task::spawn_blocking(move || {
-            // A panic while holding the lock leaves at worst a stale handle,
-            // which the path/len checks below tolerate.
-            let mut open = open.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let result = append_line(
-                &mut open,
-                &directory,
-                file_name,
-                &line,
-                MAX_AUDIT_FILE_BYTES,
-            );
-            if result.is_err() {
-                // Reopen on the next write instead of reusing a handle in an
-                // unknown state.
-                *open = None;
-            }
-            result
-        })
-        .await
-        .map_err(|error| AppError::Anyhow(error.into()))?
-        .map_err(AppError::from)
+        let log = self.clone();
+        tokio::task::spawn_blocking(move || log.write_pending(Some((directory, line))))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))?
+            .map_err(AppError::from)
+    }
+
+    /// Queues `event` for the background flush, which writes and syncs
+    /// queued records together at most once per `BATCH_FLUSH_INTERVAL`.
+    /// Write failures are logged, not returned. Outside a Tokio runtime the
+    /// record is written and synced inline.
+    pub fn append_batched(&self, data_dir: &Path, event: &EventRecord) -> Result<(), AppError> {
+        let mut line = serde_json::to_vec(event)?;
+        line.push(b'\n');
+        let directory = data_dir.join("audit");
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return self
+                .write_pending(Some((directory, line)))
+                .map_err(AppError::from);
+        };
+        let mut batch = self.lock_batch();
+        batch.lines.push((directory, line));
+        if !batch.flush_scheduled {
+            batch.flush_scheduled = true;
+            let log = self.clone();
+            runtime.spawn(async move {
+                tokio::time::sleep(BATCH_FLUSH_INTERVAL).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(error) = log.write_pending(None) {
+                        warn!(file = log.file_name, error = %error, "failed to write batched audit records");
+                    }
+                })
+                .await;
+            });
+        }
+        Ok(())
+    }
+
+    /// Writes and syncs queued records now (daemon shutdown).
+    pub fn flush(&self) {
+        if let Err(error) = self.write_pending(None) {
+            warn!(file = self.file_name, error = %error, "failed to write batched audit records");
+        }
+    }
+
+    fn lock_batch(&self) -> std::sync::MutexGuard<'_, PendingBatch> {
+        self.batch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Writes the queued records, then `line`, and syncs once. Holding the
+    /// file lock while taking the queue keeps records in submission order.
+    fn write_pending(&self, line: Option<(PathBuf, Vec<u8>)>) -> io::Result<()> {
+        // A panic while holding the lock leaves at worst a stale handle,
+        // which the path/len checks below tolerate.
+        let mut open = self
+            .open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lines = {
+            let mut batch = self.lock_batch();
+            batch.flush_scheduled = false;
+            std::mem::take(&mut batch.lines)
+        };
+        if lines.is_empty() && line.is_none() {
+            return Ok(());
+        }
+        let result = lines
+            .iter()
+            .chain(&line)
+            .try_for_each(|(directory, line)| {
+                append_line(
+                    &mut open,
+                    directory,
+                    self.file_name,
+                    line,
+                    MAX_AUDIT_FILE_BYTES,
+                    false,
+                )
+            })
+            .and_then(|()| match open.as_ref() {
+                Some(current) => current.file.sync_data(),
+                None => Ok(()),
+            });
+        if result.is_err() {
+            // Reopen on the next write instead of reusing a handle in an
+            // unknown state.
+            *open = None;
+        }
+        result
     }
 }
 
@@ -106,9 +191,11 @@ fn append_line(
     file_name: &str,
     line: &[u8],
     max_bytes: u64,
+    sync: bool,
 ) -> io::Result<()> {
     let path = directory.join(file_name);
     if open.as_ref().is_none_or(|current| current.path != path) {
+        close_synced(open)?;
         *open = Some(open_audit_file(directory, path.clone())?);
     }
     let current = open.as_mut().expect("audit file was just opened");
@@ -119,7 +206,7 @@ fn append_line(
             .is_none_or(|retry_at| Instant::now() >= retry_at);
     if rotation_due {
         // Close the handle first: Windows cannot rename an open file.
-        *open = None;
+        close_synced(open)?;
         let rotated = rotate(directory, file_name);
         let mut reopened = open_audit_file(directory, path)?;
         if let Err(error) = rotated {
@@ -134,8 +221,19 @@ fn append_line(
     }
     let current = open.as_mut().expect("audit file is open");
     current.file.write_all(line)?;
-    current.file.sync_data()?;
+    if sync {
+        current.file.sync_data()?;
+    }
     current.len += line.len() as u64;
+    Ok(())
+}
+
+/// Syncs and closes the open handle, so unsynced batched lines are durable
+/// before the file is rotated or switched.
+fn close_synced(open: &mut Option<OpenAuditFile>) -> io::Result<()> {
+    if let Some(current) = open.take() {
+        current.file.sync_data()?;
+    }
     Ok(())
 }
 
@@ -247,7 +345,7 @@ mod tests {
         let line: &[u8] = b"0123456789\n";
         // Two lines per file: 12 lines leave the live file plus 3 rotations.
         for _ in 0..12 {
-            append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
+            append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22, true).unwrap();
         }
         assert_eq!(
             fs::read(directory.join("audit.jsonl")).unwrap().len(),
@@ -268,9 +366,17 @@ mod tests {
         let temp = temp_dir();
         let directory = temp.join("audit");
         let mut open = None;
-        append_line(&mut open, &directory, AUDIT_FILE_NAME, b"first\n", 1024).unwrap();
+        append_line(
+            &mut open,
+            &directory,
+            AUDIT_FILE_NAME,
+            b"first\n",
+            1024,
+            true,
+        )
+        .unwrap();
         let other = temp.join("other");
-        append_line(&mut open, &other, AUDIT_FILE_NAME, b"second\n", 1024).unwrap();
+        append_line(&mut open, &other, AUDIT_FILE_NAME, b"second\n", 1024, true).unwrap();
         assert_eq!(
             fs::read_to_string(other.join("audit.jsonl")).unwrap(),
             "second\n"
@@ -296,9 +402,9 @@ mod tests {
         fs::create_dir_all(directory.join("audit.jsonl.3/inside")).unwrap();
 
         let mut open = None;
-        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
+        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22, true).unwrap();
         // The retry delay keeps the next write from rotating again.
-        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
+        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22, true).unwrap();
         assert_eq!(
             fs::read(directory.join("audit.jsonl")).unwrap(),
             [line, line, line, line].concat()
@@ -312,7 +418,7 @@ mod tests {
         // Once the obstacle is gone, the next due rotation succeeds.
         fs::remove_dir_all(directory.join("audit.jsonl.3")).unwrap();
         open.as_mut().unwrap().rotation_retry_at = Some(Instant::now());
-        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
+        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22, true).unwrap();
         assert_eq!(fs::read(directory.join("audit.jsonl")).unwrap(), line);
         assert_eq!(
             fs::read(directory.join("audit.jsonl.1")).unwrap(),
@@ -334,7 +440,7 @@ mod tests {
         // A leftover staged file blocks the first step.
         fs::create_dir_all(directory.join("audit.jsonl.rotating")).unwrap();
         let mut open = None;
-        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22).unwrap();
+        append_line(&mut open, &directory, AUDIT_FILE_NAME, line, 22, true).unwrap();
         assert_eq!(
             fs::read(directory.join("audit.jsonl")).unwrap(),
             [line, line, line].concat()
@@ -343,6 +449,48 @@ mod tests {
             fs::read(directory.join("audit.jsonl.3")).unwrap(),
             b"three\n"
         );
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn batched_records_keep_order_and_content_with_synchronous_ones() {
+        let temp = temp_dir();
+        let log = AuditLog::terminal();
+        let path = temp.join("audit/audit-terminal.jsonl");
+        let records = (1..=4).map(record).collect::<Vec<_>>();
+        let expected = |count: usize| {
+            records[..count]
+                .iter()
+                .map(|record| format!("{}\n", serde_json::to_string(record).unwrap()))
+                .collect::<String>()
+        };
+
+        log.append_batched(&temp, &records[0]).unwrap();
+        log.append_batched(&temp, &records[1]).unwrap();
+        assert!(!path.exists(), "batched records wait for the flush");
+        // A synchronous record (terminal start/stop/deny) writes the queue
+        // first.
+        log.append(&temp, &records[2]).await.unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected(3));
+
+        log.append_batched(&temp, &records[3]).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected(3));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::read_to_string(&path).unwrap() != expected(4) {
+            assert!(Instant::now() < deadline, "batch was never flushed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn flush_writes_queued_records_immediately() {
+        let temp = temp_dir();
+        let log = AuditLog::terminal();
+        log.append_batched(&temp, &record(1)).unwrap();
+        log.flush();
+        let text = fs::read_to_string(temp.join("audit/audit-terminal.jsonl")).unwrap();
+        assert!(text.contains("\"index\":1"));
         let _ = fs::remove_dir_all(&temp);
     }
 

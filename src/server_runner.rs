@@ -289,6 +289,7 @@ impl ManagedServer {
         }
         let result = self.handle.await.context("server task join failed");
         self.state.device_auth.flush_activity();
+        self.state.terminal_audit_log.flush();
         result?
     }
 
@@ -323,6 +324,7 @@ impl ManagedServer {
         self.state.conversations.shutdown_all().await;
         self.state.codex_local_adapters.shutdown_all().await;
         self.state.device_auth.flush_activity();
+        self.state.terminal_audit_log.flush();
         result?
     }
 }

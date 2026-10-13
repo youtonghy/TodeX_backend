@@ -1603,6 +1603,9 @@ async fn authorize_terminal_request(
     auth: Option<&AuthContext>,
     state: &AppState,
 ) -> Result<(), AppError> {
+    // Keystrokes and resizes are audited per message: their allow records
+    // are batched; every other record is synced before the request goes on.
+    let batched = matches!(operation, "terminal.input" | "terminal.resize");
     let Some(auth) = auth else {
         if state.config.security.enable_auth {
             return Err(AppError::Unauthenticated);
@@ -1622,7 +1625,7 @@ async fn authorize_terminal_request(
                 "protocol": "todex-terminal.v1",
             }),
         );
-        append_terminal_audit_event(state, &event).await?;
+        append_terminal_audit_event(state, &event, batched).await?;
         return Ok(());
     };
 
@@ -1645,7 +1648,7 @@ async fn authorize_terminal_request(
                 "protocol": "todex-terminal.v1",
             }),
         );
-        append_terminal_audit_event(state, &event).await?;
+        append_terminal_audit_event(state, &event, false).await?;
         return Err(AppError::Unauthorized("tenant mismatch".to_owned()));
     }
 
@@ -1667,7 +1670,7 @@ async fn authorize_terminal_request(
             "protocol": "todex-terminal.v1",
         }),
     );
-    append_terminal_audit_event(state, &event).await?;
+    append_terminal_audit_event(state, &event, batched).await?;
     Ok(())
 }
 
@@ -1819,14 +1822,19 @@ pub(crate) async fn append_audit_event(
 
 /// Appends a `terminal.audit` record to `$DATA_DIR/audit/audit-terminal.jsonl`,
 /// which rotates on its own budget (see [`crate::event::AuditLog::terminal`]).
+/// A `batched` record is queued for the background flush instead of being
+/// synced before this returns; the next synchronous record writes it first.
 async fn append_terminal_audit_event(
     state: &AppState,
     event: &EventRecord,
+    batched: bool,
 ) -> Result<(), AppError> {
-    state
-        .terminal_audit_log
-        .append(&state.config.data_dir, event)
-        .await
+    let log = &state.terminal_audit_log;
+    if batched {
+        log.append_batched(&state.config.data_dir, event)
+    } else {
+        log.append(&state.config.data_dir, event).await
+    }
 }
 
 fn truncate_snapshot_text(text: String, max_bytes: usize) -> String {
