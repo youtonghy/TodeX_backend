@@ -130,7 +130,8 @@ optional and canonical aliases are recomputed when old journals are replayed.
   `POST /v2/conversations/{id}/warm` start a conversation's resident provider
   process before its next prompt, prepared with the settings of its last
   request: spawn, `initialize` and the native session setup run, nothing is
-  journalled. At most 4 prewarms run at once; one never evicts another
+  journalled meanwhile; events the provider sends during the prewarm are
+  held and journalled after the next turn's `turn.started`. At most 4 prewarms run at once; one never evicts another
   conversation's process. `false` makes every warm request answer
   `warmed: false` with `reason: "disabled"`. See docs/API.md for the skip
   reasons.

@@ -404,6 +404,9 @@ pub struct ConversationSupervisor {
     rate_limit_retry_floor: Duration,
     /// Prewarms in flight across conversations; see [`MAX_PREWARMS`].
     prewarms: Arc<tokio::sync::Semaphore>,
+    /// The muted sink of each warmed conversation; its next turn journals
+    /// the events the provider sent while no turn ran.
+    prewarm_sinks: Arc<dashmap::DashMap<String, DriverEventSink>>,
 }
 
 /// Completed control results kept for retried requests.
@@ -519,6 +522,7 @@ impl ConversationSupervisor {
             follow_up_queues: Arc::default(),
             rate_limit_retry_floor: follow_ups::RATE_LIMIT_RETRY_FLOOR,
             prewarms: Arc::new(tokio::sync::Semaphore::new(MAX_PREWARMS)),
+            prewarm_sinks: Arc::default(),
         }
     }
 
@@ -1290,6 +1294,7 @@ impl ConversationSupervisor {
             }
         }
         self.follow_up_queues.remove(&manifest.id);
+        self.prewarm_sinks.remove(&manifest.id);
         self.revoke_agent_mcp(&manifest.id).await;
         // Close the broadcast channel so live websocket subscriptions exit
         // instead of holding their per-connection slot forever.
@@ -1741,11 +1746,17 @@ impl ConversationSupervisor {
         };
         let warmed = tokio::time::timeout(
             PREWARM_TIMEOUT,
-            driver.prewarm(context, settings, sink, launch_permit),
+            driver.prewarm(context, settings, sink.clone(), launch_permit),
         )
         .await;
         Ok(match warmed {
-            Ok(Ok(outcome)) => outcome.reason(),
+            Ok(Ok(outcome)) => {
+                let reason = outcome.reason();
+                if reason.is_none() {
+                    self.prewarm_sinks.insert(conversation_id.to_owned(), sink);
+                }
+                reason
+            }
             Ok(Err(error)) => {
                 tracing::warn!(conversation_id, error = %error, "provider prewarm failed");
                 Some("failed")
@@ -2320,6 +2331,13 @@ impl ConversationSupervisor {
             .with_turn_id(spawned_turn_id.clone())
             .with_activity(activity.clone())
             .with_quota(supervisor.quota.clone());
+            if let Some((_, warm)) = supervisor.prewarm_sinks.remove(&conversation_id) {
+                for (event_type, payload) in warm.take_deferred() {
+                    if let Err(error) = sink.emit(event_type, payload).await {
+                        tracing::warn!(conversation_id, error = %error, "could not journal an event from the prewarm");
+                    }
+                }
+            }
             let driver_context = DriverContext {
                 manifest,
                 provider_state: provider_state.clone(),
@@ -4680,6 +4698,112 @@ mod tests {
             disabled.warm_owned("local", &other.id).await.unwrap(),
             Some("disabled")
         );
+        supervisor.shutdown_all().await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Announces its command catalog while warming, as an ACP agent does
+    /// once after `session/new`.
+    struct AnnouncingDriver(Arc<dyn ProviderDriver>);
+
+    #[async_trait::async_trait]
+    impl ProviderDriver for AnnouncingDriver {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.0.descriptor()
+        }
+
+        async fn prewarm(
+            &self,
+            context: DriverContext,
+            settings: DriverPrompt,
+            sink: DriverEventSink,
+            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
+        ) -> Result<super::super::types::ProviderPrewarm, AppError> {
+            sink.emit(
+                "provider.commands.updated",
+                json!({ "provider": "acp", "commands": [{ "name": "review" }] }),
+            )
+            .await?;
+            self.0.prewarm(context, settings, sink, launch_permit).await
+        }
+
+        async fn run_turn(
+            &self,
+            context: DriverContext,
+            prompt: DriverPrompt,
+            sink: DriverEventSink,
+            cancel: watch::Receiver<bool>,
+            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
+        ) -> Result<DriverTurnResult, AppError> {
+            self.0
+                .run_turn(context, prompt, sink, cancel, launch_permit)
+                .await
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn events_a_prewarm_held_back_are_journalled_by_the_next_turn() {
+        let (root, store, mut supervisor, workspace) =
+            control_fixture_with("todex-warm-deferred", true, false).await;
+        replace_driver(&mut supervisor, ProviderKind::Acp, |real| {
+            Arc::new(AnnouncingDriver(real))
+        });
+        let manifest = supervisor
+            .create_owned(
+                "local",
+                ProviderKind::Acp,
+                workspace,
+                None,
+                Some("fixture".to_owned()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            supervisor.warm_owned("local", &manifest.id).await.unwrap(),
+            None
+        );
+        let commands = |history: &[ConversationEvent]| {
+            history
+                .iter()
+                .filter(|event| event.event_type == "provider.commands.updated")
+                .count()
+        };
+        assert_eq!(
+            commands(&store.complete_history(&manifest.id).await.unwrap()),
+            0
+        );
+
+        supervisor
+            .prompt_owned(
+                "local",
+                &manifest.id,
+                ConversationPrompt {
+                    client_request_id: None,
+                    text: "hello".to_owned(),
+                    model: None,
+                    reasoning_effort: None,
+                    skills: Vec::new(),
+                    content: Vec::new(),
+                    permission_mode: None,
+                    work_mode: None,
+                    permission_profile: None,
+                    sandbox_mode: None,
+                    approval_policy: None,
+                },
+            )
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert_eq!(commands(&history), 1);
+        let position = |event_type: &str| {
+            history
+                .iter()
+                .position(|event| event.event_type == event_type)
+                .unwrap()
+        };
+        assert!(position("turn.started") < position("provider.commands.updated"));
         supervisor.shutdown_all().await;
         let _ = fs::remove_dir_all(root);
     }

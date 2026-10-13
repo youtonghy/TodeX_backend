@@ -650,6 +650,9 @@ pub struct DriverEventSink {
     /// Set for a provider prewarm: nothing is journalled or published, the
     /// provider state is not saved and permission requests are refused.
     muted: bool,
+    /// Events a muted sink held back, shared by its clones, for the first
+    /// turn to journal (see [`Self::take_deferred`]).
+    deferred: Arc<Mutex<Vec<(String, Value)>>>,
 }
 
 impl DriverEventSink {
@@ -672,11 +675,13 @@ impl DriverEventSink {
             quota: crate::quota_store::QuotaStore::default(),
             snapshots: Arc::default(),
             muted: false,
+            deferred: Arc::default(),
         }
     }
 
-    /// A sink for [`ProviderDriver::prewarm`]: events are dropped, the
-    /// provider state is not saved and permission requests fail.
+    /// A sink for [`ProviderDriver::prewarm`]: events are held back for
+    /// [`Self::take_deferred`], the provider state is not saved and
+    /// permission requests fail.
     pub fn muted(mut self) -> Self {
         self.muted = true;
         self
@@ -684,6 +689,19 @@ impl DriverEventSink {
 
     pub fn is_muted(&self) -> bool {
         self.muted
+    }
+
+    /// The events a muted sink held back so far, oldest first. A provider
+    /// announces some state only once per session (its command catalog, a
+    /// recreated native session), so the turn that follows a prewarm
+    /// journals them instead of losing them.
+    pub fn take_deferred(&self) -> Vec<(String, Value)> {
+        std::mem::take(
+            &mut *self
+                .deferred
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 
     fn refuse_muted_permission(&self) -> Result<(), AppError> {
@@ -751,6 +769,10 @@ impl DriverEventSink {
     ) -> Result<ConversationEvent, AppError> {
         let event_type = event_type.into();
         if self.muted {
+            self.deferred
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((event_type.clone(), payload.clone()));
             return Ok(ConversationEvent::new(
                 &self.conversation_id,
                 0,
