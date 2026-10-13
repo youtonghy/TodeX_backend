@@ -295,8 +295,11 @@ async fn doctor_command(command: DoctorCommand) -> anyhow::Result<()> {
 }
 
 fn init_serve_logging() {
+    use std::io::IsTerminal;
+    // A detached daemon writes into its log file; keep escape codes out.
     tracing_subscriber::fmt()
         .with_env_filter(default_env_filter())
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 }
 

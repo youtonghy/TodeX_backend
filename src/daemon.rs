@@ -20,6 +20,13 @@ const LOG_FILE_NAME: &str = "todex-agentd-daemon.log";
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 const STOP_FORCE_AFTER: Duration = Duration::from_secs(8);
+/// The daemon log rotates to `.1` once it outgrows this size.
+const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+/// Rotated daemon logs kept (`.1` newest through `.3` oldest).
+const LOG_ROTATE_KEEP: usize = 3;
+/// How often a running daemon checks its log size.
+#[cfg(unix)]
+const LOG_ROTATE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(200);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -152,6 +159,9 @@ pub fn daemon_run_args(config: &Config) -> Vec<std::ffi::OsString> {
 /// the child in its own process group so it outlives its parent.
 fn detach_with_config(command: &mut Command, config: &Config) -> Result<()> {
     let log_path = log_file_path(&config.data_dir);
+    if let Err(error) = rotate_log_if_larger(&log_path, LOG_ROTATE_BYTES, LOG_ROTATE_KEEP) {
+        tracing::warn!(log = %log_path.display(), %error, "failed to rotate the daemon log");
+    }
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -171,6 +181,101 @@ fn detach_with_config(command: &mut Command, config: &Config) -> Result<()> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    Ok(())
+}
+
+/// Shifts `path` to `path.1`, `path.1` to `path.2`, … keeping `keep` rotated
+/// files, once `path` is larger than `limit` bytes. Returns whether it rotated.
+fn rotate_log_if_larger(path: &Path, limit: u64, keep: usize) -> std::io::Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.len() > limit => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    let rotated = |index: usize| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".{index}"));
+        PathBuf::from(name)
+    };
+    for index in (1..keep).rev() {
+        match fs::rename(rotated(index), rotated(index + 1)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    if keep == 0 {
+        fs::remove_file(path)?;
+    } else {
+        fs::rename(path, rotated(1))?;
+    }
+    Ok(true)
+}
+
+/// Rotates the log a detached daemon writes through stdout/stderr: the
+/// parent redirected both to the log file, so after renaming it the fresh
+/// file is installed over descriptors 1 and 2. Does nothing when stdout is
+/// not that file (a foreground `daemon-run`).
+#[cfg(unix)]
+fn spawn_log_rotation(path: PathBuf) -> Option<tokio::task::JoinHandle<()>> {
+    if !stdout_is_file(&path) {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut checks = tokio::time::interval(LOG_ROTATE_CHECK_INTERVAL);
+        checks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            checks.tick().await;
+            let log = path.clone();
+            match tokio::task::spawn_blocking(move || rotate_redirected_log(&log)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(log = %path.display(), %error, "failed to rotate the daemon log");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "daemon log rotation task failed");
+                }
+            }
+        }
+    }))
+}
+
+#[cfg(unix)]
+fn stdout_is_file(path: &Path) -> bool {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(stdout) = std::io::stdout().as_fd().try_clone_to_owned() else {
+        return false;
+    };
+    let (Ok(stdout), Ok(file)) = (fs::File::from(stdout).metadata(), fs::metadata(path)) else {
+        return false;
+    };
+    stdout.dev() == file.dev() && stdout.ino() == file.ino()
+}
+
+#[cfg(unix)]
+fn rotate_redirected_log(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Another process (a later `daemon start`) may have rotated it already.
+    if !stdout_is_file(path) || !rotate_log_if_larger(path, LOG_ROTATE_BYTES, LOG_ROTATE_KEEP)? {
+        return Ok(());
+    }
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    for target in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: dup2 atomically replaces a descriptor this process owns
+        // with a duplicate of an open file; no Rust object owns 1 or 2.
+        if unsafe { libc::dup2(log.as_raw_fd(), target) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    tracing::info!(log = %path.display(), "rotated the daemon log");
     Ok(())
 }
 
@@ -336,11 +441,17 @@ pub async fn run(config: Config) -> Result<()> {
         "todex-agentd daemon ready"
     );
 
+    #[cfg(unix)]
+    let log_rotation = spawn_log_rotation(log_file_path(&process.data_dir));
     let (update_tx, update_rx) = watch::channel(None);
     let update_checks = update::enabled().then(|| tokio::spawn(watch_for_updates(update_tx)));
     let result = wait_for_shutdown_or_server_exit(server, update_rx).await;
     if let Some(checks) = update_checks {
         checks.abort();
+    }
+    #[cfg(unix)]
+    if let Some(rotation) = log_rotation {
+        rotation.abort();
     }
     let Some(version) = result? else {
         return Ok(());
@@ -1095,8 +1206,8 @@ mod tests {
 
     use super::{
         daemon_record_from_args, daemon_run_args, pid_file_path, port_is_listening,
-        process_is_running, process_matches_record, status, DaemonProcess, IdleTimer,
-        UPDATE_RESTART_IDLE_AFTER,
+        process_is_running, process_matches_record, rotate_log_if_larger, status, DaemonProcess,
+        IdleTimer, UPDATE_RESTART_IDLE_AFTER,
     };
     #[cfg(target_os = "linux")]
     use super::{executable_is_outdated, process_has_exited, process_started_at};
@@ -1125,6 +1236,30 @@ mod tests {
             idle.observe(true, resumed + Duration::from_secs(60)),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn daemon_log_rotates_past_the_limit_and_keeps_three() {
+        let dir = unique_tmp_dir("todex-daemon-log-rotation");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("daemon.log");
+        let rotated = |index: usize| dir.join(format!("daemon.log.{index}"));
+
+        assert!(!rotate_log_if_larger(&log, 8, 3).unwrap(), "missing log");
+        fs::write(&log, "12345678").unwrap();
+        assert!(!rotate_log_if_larger(&log, 8, 3).unwrap(), "at the limit");
+
+        for generation in 0..5 {
+            fs::write(&log, format!("generation {generation}")).unwrap();
+            assert!(rotate_log_if_larger(&log, 8, 3).unwrap());
+            assert!(!log.exists());
+        }
+        assert_eq!(fs::read_to_string(rotated(1)).unwrap(), "generation 4");
+        assert_eq!(fs::read_to_string(rotated(2)).unwrap(), "generation 3");
+        assert_eq!(fs::read_to_string(rotated(3)).unwrap(), "generation 2");
+        assert!(!rotated(4).exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
