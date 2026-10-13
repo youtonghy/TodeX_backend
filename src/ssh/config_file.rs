@@ -8,6 +8,8 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    sync::Mutex,
+    time::SystemTime,
 };
 
 use serde::{Deserialize, Serialize};
@@ -67,19 +69,90 @@ pub(crate) struct SshOption {
     pub value: String,
 }
 
-/// Lists concrete aliases (no wildcards or negations) from `config`, following
-/// `Include` the way OpenSSH does for a user configuration file: relative
-/// paths resolve against `~/.ssh`, globs expand in sorted order.
-pub(crate) fn discover_aliases(config: &Path, home: &Path) -> Vec<DiscoveredAlias> {
+/// [`AliasCache::discover`] without the cache.
+#[cfg(test)]
+fn discover_aliases(config: &Path, home: &Path) -> Vec<DiscoveredAlias> {
+    discover_with_inputs(config, home).0
+}
+
+/// A path's modification time and length (`None` when it cannot be read),
+/// compared to tell whether a discovery input changed.
+type Stamp = Option<(Option<SystemTime>, u64)>;
+
+fn stamp(path: &Path) -> Stamp {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.modified().ok(), metadata.len()))
+}
+
+/// The aliases, and every input they were read from: each config file
+/// opened (or tried) and each directory an `Include` glob listed, stamped
+/// before it was read.
+fn discover_with_inputs(
+    config: &Path,
+    home: &Path,
+) -> (Vec<DiscoveredAlias>, Vec<(PathBuf, Stamp)>) {
     let mut walker = Walker {
         ssh_dir: home.join(".ssh"),
         home: home.to_path_buf(),
         seen_aliases: HashSet::new(),
         files_read: 0,
         aliases: Vec::new(),
+        inputs: Vec::new(),
     };
     walker.walk(config, 0);
-    walker.aliases
+    (walker.aliases, walker.inputs)
+}
+
+/// [`discover_aliases`] for repeated calls (every agent turn checks the
+/// hosts): the last result is reused while none of its inputs changed, which
+/// costs a `stat` per input instead of re-reading the whole `Include` tree.
+#[derive(Default)]
+pub(crate) struct AliasCache {
+    last: Mutex<Option<CachedAliases>>,
+}
+
+struct CachedAliases {
+    config: PathBuf,
+    home: PathBuf,
+    inputs: Vec<(PathBuf, Stamp)>,
+    aliases: Vec<DiscoveredAlias>,
+}
+
+impl AliasCache {
+    /// Lists concrete aliases (no wildcards or negations) from `config`,
+    /// following `Include` the way OpenSSH does for a user configuration
+    /// file: relative paths resolve against `~/.ssh`, globs expand in sorted
+    /// order. Blocking: call from the blocking pool.
+    pub(crate) fn discover(&self, config: &Path, home: &Path) -> Vec<DiscoveredAlias> {
+        {
+            let last = self
+                .last
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = last.as_ref().filter(|cached| {
+                cached.config == config
+                    && cached.home == home
+                    && cached
+                        .inputs
+                        .iter()
+                        .all(|(path, recorded)| stamp(path) == *recorded)
+            }) {
+                return cached.aliases.clone();
+            }
+        }
+        let (aliases, inputs) = discover_with_inputs(config, home);
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedAliases {
+            config: config.to_path_buf(),
+            home: home.to_path_buf(),
+            inputs,
+            aliases: aliases.clone(),
+        });
+        aliases
+    }
 }
 
 struct Walker {
@@ -88,6 +161,7 @@ struct Walker {
     seen_aliases: HashSet<String>,
     files_read: usize,
     aliases: Vec<DiscoveredAlias>,
+    inputs: Vec<(PathBuf, Stamp)>,
 }
 
 impl Walker {
@@ -95,6 +169,7 @@ impl Walker {
         if depth > MAX_INCLUDE_DEPTH || self.files_read >= MAX_CONFIG_FILES {
             return;
         }
+        self.inputs.push((path.to_path_buf(), stamp(path)));
         let Some(text) = read_bounded(path) else {
             return;
         };
@@ -127,7 +202,7 @@ impl Walker {
         }
     }
 
-    fn expand_include(&self, argument: &str) -> Vec<PathBuf> {
+    fn expand_include(&mut self, argument: &str) -> Vec<PathBuf> {
         let expanded = if argument == "~" {
             self.home.clone()
         } else if let Some(rest) = argument.strip_prefix("~/") {
@@ -140,7 +215,7 @@ impl Walker {
                 self.ssh_dir.join(path)
             }
         };
-        expand_glob(&expanded)
+        expand_glob(&expanded, &mut self.inputs)
     }
 }
 
@@ -153,7 +228,9 @@ fn read_bounded(path: &Path) -> Option<String> {
 }
 
 /// Expands `*`/`?` per path component; matches are sorted like glob(3).
-fn expand_glob(path: &Path) -> Vec<PathBuf> {
+/// Expands `*` and `?` components; every directory listed is recorded in
+/// `listed`, since a file appearing there can change the expansion.
+fn expand_glob(path: &Path, listed: &mut Vec<(PathBuf, Stamp)>) -> Vec<PathBuf> {
     let mut candidates = vec![PathBuf::new()];
     for component in path.components() {
         let part = component.as_os_str().to_string_lossy();
@@ -165,6 +242,7 @@ fn expand_glob(path: &Path) -> Vec<PathBuf> {
         }
         let mut next = Vec::new();
         for candidate in &candidates {
+            listed.push((candidate.clone(), stamp(candidate)));
             let Ok(entries) = fs::read_dir(candidate) else {
                 continue;
             };
@@ -537,6 +615,35 @@ mod tests {
             .map(|alias| alias.alias)
             .collect();
         assert_eq!(aliases, ["web", "db", "alpha", "beta", "quoted"]);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn cached_aliases_follow_changes_to_any_included_file() {
+        let home = temp_home();
+        let ssh = home.join(".ssh");
+        fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        let cache = AliasCache::default();
+        let config = ssh.join("config");
+        let aliases = |cache: &AliasCache| -> Vec<String> {
+            cache
+                .discover(&config, &home)
+                .into_iter()
+                .map(|alias| alias.alias)
+                .collect()
+        };
+        // A config that does not exist yet is an input too.
+        assert!(aliases(&cache).is_empty());
+        fs::write(&config, "Host web\nInclude conf.d/*.conf\n").unwrap();
+        assert_eq!(aliases(&cache), ["web"]);
+        assert_eq!(aliases(&cache), ["web"]);
+        // A new file matching the glob, then a changed included file.
+        fs::write(ssh.join("conf.d/a.conf"), "Host alpha\n").unwrap();
+        assert_eq!(aliases(&cache), ["web", "alpha"]);
+        fs::write(ssh.join("conf.d/a.conf"), "Host alpha beta\n").unwrap();
+        assert_eq!(aliases(&cache), ["web", "alpha", "beta"]);
+        fs::remove_file(ssh.join("conf.d/a.conf")).unwrap();
+        assert_eq!(aliases(&cache), ["web"]);
         fs::remove_dir_all(home).unwrap();
     }
 

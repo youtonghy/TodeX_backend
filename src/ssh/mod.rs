@@ -210,6 +210,9 @@ struct Inner {
     multiplex: bool,
     store: RwLock<SshStore>,
     resolve_cache: Mutex<HashMap<String, CachedResolution>>,
+    /// Aliases from the user's `~/.ssh/config`, re-read only when it or a
+    /// file it includes changed.
+    user_aliases: Arc<config_file::AliasCache>,
 }
 
 impl SshService {
@@ -244,6 +247,7 @@ impl SshService {
                 multiplex,
                 store: RwLock::new(store),
                 resolve_cache: Mutex::new(HashMap::new()),
+                user_aliases: Arc::default(),
             }),
         };
         {
@@ -406,10 +410,10 @@ impl SshService {
             })
             .collect();
         if let (Some(config), Some(home)) = (self.user_config(), self.inner.home.clone()) {
-            let discovered =
-                tokio::task::spawn_blocking(move || config_file::discover_aliases(&config, &home))
-                    .await
-                    .map_err(|error| AppError::Anyhow(error.into()))?;
+            let cache = self.inner.user_aliases.clone();
+            let discovered = tokio::task::spawn_blocking(move || cache.discover(&config, &home))
+                .await
+                .map_err(|error| AppError::Anyhow(error.into()))?;
             for alias in discovered {
                 // Managed hosts come first in the wrapper, so they win.
                 if views.iter().any(|view| view.alias == alias.alias) {
@@ -585,10 +589,10 @@ impl SshService {
         let (Some(config), Some(home)) = (self.user_config(), self.inner.home.clone()) else {
             return Ok(());
         };
-        let discovered =
-            tokio::task::spawn_blocking(move || config_file::discover_aliases(&config, &home))
-                .await
-                .map_err(|error| AppError::Anyhow(error.into()))?;
+        let cache = self.inner.user_aliases.clone();
+        let discovered = tokio::task::spawn_blocking(move || cache.discover(&config, &home))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))?;
         if renaming != Some(alias) && discovered.iter().any(|found| found.alias == alias) {
             return Err(AppError::Conflict(format!(
                 "{alias} is already defined in ~/.ssh/config"
