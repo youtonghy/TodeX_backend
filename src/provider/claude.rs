@@ -419,10 +419,7 @@ impl ClaudeDriver {
             binary: config.claude_bin.clone(),
             catalogs: Catalogs::default(),
             sessions: runtime::Sessions::new(
-                PROFILE
-                    .process_model
-                    .idle_timeout()
-                    .expect("Claude declares an idle timeout"),
+                config.provider_keepalive(),
                 PROFILE
                     .process_model
                     .max_sessions()

@@ -21,7 +21,7 @@ optional and canonical aliases are recomputed when old journals are replayed.
 - Usage belongs to a turn/message and updates a stable snapshot. Unknown usage
   is not zero. TPS is omitted without a reliable generation interval. Automatic
   compaction updates its own state without ending the parent turn.
-- Claude Code keeps one stream-json process per conversation (idle 300 s,
+- Claude Code keeps one stream-json process per conversation (idle `provider_keepalive_seconds`,
   at most 16; busy slots fall back to a one-turn process). Each turn writes a
   `user` frame to it; a changed launch setting (model, effort, permission
   mode, MCP config, settings) or a dead process restarts it with `--resume`.
@@ -118,7 +118,7 @@ optional and canonical aliases are recomputed when old journals are replayed.
   turn ends with `turn.failed` code `PROVIDER_IDLE_TIMEOUT`.
 - `[agent].provider_keepalive_seconds` (default 300, minimum 30; env
   `TODEX_AGENTD_PROVIDER_KEEPALIVE_SECONDS`) is how long a resident provider
-  process (Codex, Pi, OpenCode, Grok Build, Devin, DeepSeek Harness and ACP
+  process (Codex, Claude Code, Pi, OpenCode, Grok Build, Devin, DeepSeek Harness and ACP
   profiles unless `resident = false`) is kept with no turn before it is
   stopped; the next turn reattaches to the native session. It is distinct
   from the stall watchdog above, which only measures silence inside a
