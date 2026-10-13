@@ -117,6 +117,38 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+const TUI_LOG_PREFIX: &str = "todex-tui-";
+/// Auto-saved TUI runs (a `.log` plus an optional `.jsonl`) kept on disk.
+const TUI_LOG_RUNS_KEPT: usize = 20;
+
+/// Deletes all but the newest `keep` saved runs in `dir`. Run names embed a
+/// sortable timestamp, so the newest runs sort last.
+fn prune_tui_logs(dir: &Path, keep: usize) -> io::Result<()> {
+    let mut runs = std::collections::BTreeMap::<String, Vec<PathBuf>>::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(run) = name
+            .strip_suffix(".log")
+            .or_else(|| name.strip_suffix(".jsonl"))
+            .filter(|run| run.starts_with(TUI_LOG_PREFIX))
+        else {
+            continue;
+        };
+        runs.entry(run.to_owned()).or_default().push(path);
+    }
+    let excess = runs.len().saturating_sub(keep);
+    for path in runs.into_values().take(excess).flatten() {
+        match fs::remove_file(&path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn init_terminal() -> Result<Terminal<PositionedBackend<io::BufWriter<io::Stdout>>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2852,11 +2884,11 @@ impl TuiApp {
 
     fn save_logs(&mut self) -> Result<()> {
         let dir = self.config.data_dir.join("tui-logs");
-        fs::create_dir_all(&dir)
+        crate::secure_fs::ensure_owner_only_dir(&dir)
             .with_context(|| format!("failed to create log directory {}", dir.display()))?;
         let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
-        let text_path = dir.join(format!("todex-tui-{timestamp}.log"));
-        let jsonl_path = dir.join(format!("todex-tui-{timestamp}.jsonl"));
+        let text_path = dir.join(format!("{TUI_LOG_PREFIX}{timestamp}.log"));
+        let jsonl_path = dir.join(format!("{TUI_LOG_PREFIX}{timestamp}.jsonl"));
 
         let listen_host = self.listen_host();
         let listen_port = self
@@ -2912,22 +2944,37 @@ impl TuiApp {
             jsonl.push('\n');
         }
 
-        fs::write(&text_path, text)
+        crate::secure_fs::write_owner_only_atomic(&text_path, text.as_bytes())
             .with_context(|| format!("failed to write {}", text_path.display()))?;
-        fs::write(&jsonl_path, jsonl)
-            .with_context(|| format!("failed to write {}", jsonl_path.display()))?;
+        // A run without live events leaves no empty event file behind.
+        let jsonl_path = if jsonl.is_empty() {
+            None
+        } else {
+            crate::secure_fs::write_owner_only_atomic(&jsonl_path, jsonl.as_bytes())
+                .with_context(|| format!("failed to write {}", jsonl_path.display()))?;
+            Some(jsonl_path)
+        };
+        if let Err(error) = prune_tui_logs(&dir, TUI_LOG_RUNS_KEPT) {
+            tracing::warn!(dir = %dir.display(), %error, "failed to remove old TUI logs");
+        }
 
-        self.notice = match self.language {
-            TuiLanguage::English => format!(
+        self.notice = match (self.language, &jsonl_path) {
+            (TuiLanguage::English, Some(jsonl_path)) => format!(
                 "Auto-saved logs to {} and {}.",
                 text_path.display(),
                 jsonl_path.display()
             ),
-            TuiLanguage::Chinese => format!(
+            (TuiLanguage::English, None) => {
+                format!("Auto-saved logs to {}.", text_path.display())
+            }
+            (TuiLanguage::Chinese, Some(jsonl_path)) => format!(
                 "日志已自动保存到 {} 和 {}。",
                 text_path.display(),
                 jsonl_path.display()
             ),
+            (TuiLanguage::Chinese, None) => {
+                format!("日志已自动保存到 {}。", text_path.display())
+            }
         };
         self.last_error = None;
         self.push_log(self.notice.clone());
@@ -5529,6 +5576,53 @@ mod tests {
         });
         app.language = TuiLanguage::English;
         (app, data_dir)
+    }
+
+    #[tokio::test]
+    async fn saved_logs_are_private_skip_empty_events_and_keep_twenty_runs() {
+        let (mut app, data_dir) = api_keys_app("saved-logs");
+        let dir = data_dir.join("tui-logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        for run in 0..25 {
+            let stem = format!("todex-tui-20000101-0000{run:02}");
+            std::fs::write(dir.join(format!("{stem}.log")), "old").unwrap();
+            if run % 2 == 0 {
+                std::fs::write(dir.join(format!("{stem}.jsonl")), "{}\n").unwrap();
+            }
+        }
+        std::fs::write(dir.join("notes.txt"), "keep").unwrap();
+
+        app.save_logs().unwrap();
+
+        let mut names = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        let runs = names
+            .iter()
+            .filter_map(|name| name.strip_suffix(".log"))
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 20);
+        // The six oldest fixtures went, with their event files.
+        assert_eq!(runs[0], "todex-tui-20000101-000006");
+        assert!(!dir.join("todex-tui-20000101-000004.jsonl").exists());
+        assert!(dir.join("todex-tui-20000101-000006.jsonl").exists());
+        assert!(names.contains(&"notes.txt".to_owned()));
+        // No live events: the new run has no `.jsonl`.
+        let newest = runs.last().unwrap();
+        assert!(!newest.starts_with("todex-tui-2000"));
+        assert!(!dir.join(format!("{newest}.jsonl")).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &std::path::Path| {
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+            };
+            assert_eq!(mode(&dir), 0o700);
+            assert_eq!(mode(&dir.join(format!("{newest}.log"))), 0o600);
+        }
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     fn stored_api_keys(data_dir: &std::path::Path) -> Vec<crate::api_keys::ApiKeyRecord> {
