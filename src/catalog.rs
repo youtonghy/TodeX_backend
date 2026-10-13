@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -18,11 +19,135 @@ const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SCAN_ENTRIES: usize = 2000;
 const MAX_SCAN_VISITED_ENTRIES: usize = 20_000;
 const MAX_SCAN_DEPTH: usize = 4;
+/// Most (provider, workspace) scan results kept; the cache is emptied when
+/// a new key would exceed it.
+const MAX_CACHED_SCANS: usize = 256;
+/// A scan that saw a file or directory modified this recently is not
+/// cached: a further change within the same timestamp tick would leave its
+/// stamp unchanged.
+const RACY_STAMP_WINDOW: Duration = Duration::from_secs(2);
+/// Most (path, mtime) pairs remembered for warn-once MCP config warnings.
+const MAX_WARNED_CONFIGS: usize = 256;
 
 #[derive(Clone)]
 pub struct CatalogService {
     config: Arc<Config>,
     home: Option<PathBuf>,
+    cache: Arc<ScanCache>,
+}
+
+type ScanKey = (ProviderKind, PathBuf);
+type Validator = Vec<(PathBuf, Option<Stamp>)>;
+
+/// Filesystem catalog scans per (provider, workspace), reused while every
+/// file and directory the scan looked at is unchanged.
+#[derive(Default)]
+struct ScanCache {
+    skills: Mutex<HashMap<ScanKey, Arc<CachedScan<Vec<SkillDescriptor>>>>>,
+    mcp: Mutex<HashMap<ScanKey, Arc<CachedScan<Vec<McpServerDescriptor>>>>>,
+    #[cfg(test)]
+    builds: std::sync::atomic::AtomicUsize,
+}
+
+struct CachedScan<T> {
+    /// Every path the scan read or listed, with what it looked like then
+    /// (`None`: missing or unreadable).
+    validator: Validator,
+    value: T,
+}
+
+/// What a path looked like when a scan read it; any difference means the
+/// scan has to run again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Stamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    directory: bool,
+    symlink: bool,
+}
+
+impl Stamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+            directory: metadata.is_dir(),
+            symlink: metadata.file_type().is_symlink(),
+        }
+    }
+
+    fn read(path: &Path) -> Option<Self> {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| Self::of(&metadata))
+    }
+}
+
+impl ScanCache {
+    /// The cached result for `key` when every validator path still looks
+    /// the same, else the result of `build` (cached unless it saw a racy
+    /// stamp). Blocking: stats every validator path.
+    fn get_or_build<T: Clone>(
+        &self,
+        map: &Mutex<HashMap<ScanKey, Arc<CachedScan<T>>>>,
+        key: ScanKey,
+        build: impl FnOnce(&mut Validator) -> Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        let cached = map
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .cloned();
+        if let Some(cached) = cached {
+            if cached
+                .validator
+                .iter()
+                .all(|(path, stamp)| Stamp::read(path) == *stamp)
+            {
+                return Ok(cached.value.clone());
+            }
+        }
+        #[cfg(test)]
+        self.builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut validator = Vec::new();
+        let value = build(&mut validator)?;
+        let horizon = SystemTime::now()
+            .checked_sub(RACY_STAMP_WINDOW)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let settled = validator.iter().all(|(_, stamp)| {
+            stamp.is_none_or(|stamp| stamp.modified.is_some_and(|modified| modified < horizon))
+        });
+        let mut map = map.lock().unwrap_or_else(PoisonError::into_inner);
+        if settled {
+            if map.len() >= MAX_CACHED_SCANS && !map.contains_key(&key) {
+                map.clear();
+            }
+            map.insert(
+                key,
+                Arc::new(CachedScan {
+                    validator,
+                    value: value.clone(),
+                }),
+            );
+        } else {
+            map.remove(&key);
+        }
+        Ok(value)
+    }
+
+    /// Drops every cached scan; called after TodeX itself writes a skill or
+    /// MCP config, which can be shared by several providers and workspaces.
+    fn invalidate(&self) {
+        self.skills
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.mcp
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -220,12 +345,17 @@ impl CatalogService {
         Self {
             config,
             home: std::env::var_os("HOME").map(PathBuf::from),
+            cache: Arc::default(),
         }
     }
 
     #[cfg(test)]
     pub fn with_home(config: Arc<Config>, home: Option<PathBuf>) -> Self {
-        Self { config, home }
+        Self {
+            config,
+            home,
+            cache: Arc::default(),
+        }
     }
 
     /// The catalog a [`CatalogSource::NativeInspect`] CLI reports about
@@ -262,9 +392,14 @@ impl CatalogService {
         }
         let roots = skill_roots(self.home.as_deref(), &workspace, provider);
         let creatable_sources = roots.iter().map(|root| root.source).collect();
-        let skills = tokio::task::spawn_blocking(move || scan_skills(roots))
-            .await
-            .map_err(|error| AppError::Anyhow(error.into()))??;
+        let cache = self.cache.clone();
+        let skills = tokio::task::spawn_blocking(move || {
+            cache.get_or_build(&cache.skills, (provider, workspace), |validator| {
+                scan_skills(roots, validator)
+            })
+        })
+        .await
+        .map_err(|error| AppError::Anyhow(error.into()))??;
         Ok(SkillCatalog {
             provider,
             skills,
@@ -348,9 +483,11 @@ impl CatalogService {
             }
         }
         let home = self.home.clone();
-        let workspace_for_scan = workspace.clone();
+        let cache = self.cache.clone();
         let servers = tokio::task::spawn_blocking(move || {
-            scan_mcp(home.as_deref(), &workspace_for_scan, provider)
+            cache.get_or_build(&cache.mcp, (provider, workspace.clone()), |validator| {
+                scan_mcp(home.as_deref(), &workspace, provider, validator)
+            })
         })
         .await
         .map_err(|error| AppError::Anyhow(error.into()))??;
@@ -433,9 +570,9 @@ impl CatalogService {
             .mcp_descriptor(provider, workspace, resource_id)
             .await?;
         let origin = descriptor.origin.clone();
-        tokio::task::spawn_blocking(move || remove_mcp_entry(&origin))
-            .await
-            .map_err(|error| AppError::Anyhow(error.into()))??;
+        let removed = tokio::task::spawn_blocking(move || remove_mcp_entry(&origin)).await;
+        self.cache.invalidate();
+        removed.map_err(|error| AppError::Anyhow(error.into()))??;
         Ok(McpServerDeletion {
             resource_id: descriptor.resource_id,
             name: descriptor.name,
@@ -466,9 +603,10 @@ impl CatalogService {
             })?;
         let path = source.path.clone();
         let entry_name = name.clone();
-        tokio::task::spawn_blocking(move || insert_mcp_entry(&path, &entry_name, config))
-            .await
-            .map_err(|error| AppError::Anyhow(error.into()))??;
+        let inserted =
+            tokio::task::spawn_blocking(move || insert_mcp_entry(&path, &entry_name, config)).await;
+        self.cache.invalidate();
+        inserted.map_err(|error| AppError::Anyhow(error.into()))??;
         let resource_id = resource_id_for_mcp(&name, &source.path);
         self.mcp_config(provider, workspace, &resource_id).await
     }
@@ -495,9 +633,11 @@ impl CatalogService {
             .await?;
         let origin = descriptor.origin.clone();
         let entry_name = name.clone();
-        tokio::task::spawn_blocking(move || replace_mcp_entry(&origin, &entry_name, config))
-            .await
-            .map_err(|error| AppError::Anyhow(error.into()))??;
+        let replaced =
+            tokio::task::spawn_blocking(move || replace_mcp_entry(&origin, &entry_name, config))
+                .await;
+        self.cache.invalidate();
+        replaced.map_err(|error| AppError::Anyhow(error.into()))??;
         let resource_id = resource_id_for_mcp(&name, &descriptor.origin.path);
         self.mcp_config(provider, workspace, &resource_id).await
     }
@@ -525,8 +665,9 @@ impl CatalogService {
             .find(|root| root.source == source)
             .ok_or_else(|| AppError::InvalidRequest(format!("unknown skill source {source}")))?;
         let path = root.path.join(name).join("SKILL.md");
+        let base = skill_write_base(&root, &workspace);
         let target = path.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let created = tokio::task::spawn_blocking(move || -> Result<(), AppError> {
             let directory = target.parent().expect("skill file has a parent");
             if std::fs::symlink_metadata(directory).is_ok() {
                 return Err(AppError::Conflict(format!(
@@ -534,12 +675,14 @@ impl CatalogService {
                     directory.display()
                 )));
             }
+            ensure_confined(directory, &base)?;
             std::fs::create_dir_all(directory)?;
             std::fs::write(&target, content)?;
             Ok(())
         })
-        .await
-        .map_err(|error| AppError::Anyhow(error.into()))??;
+        .await;
+        self.cache.invalidate();
+        created.map_err(|error| AppError::Anyhow(error.into()))??;
         self.skill_descriptor(provider, workspace, &resource_id("skill", &path))
             .await
     }
@@ -557,10 +700,15 @@ impl CatalogService {
             .writable_skill(provider, workspace.clone(), resource_id)
             .await?;
         validate_skill_content(&content)?;
+        let base = self.skill_write_base(provider, &workspace, &descriptor)?;
         let path = descriptor.path.clone();
-        tokio::task::spawn_blocking(move || replace_file(&path, content.as_bytes()))
-            .await
-            .map_err(|error| AppError::Anyhow(error.into()))??;
+        let replaced = tokio::task::spawn_blocking(move || {
+            ensure_confined(&path, &base)?;
+            replace_file(&path, content.as_bytes())
+        })
+        .await;
+        self.cache.invalidate();
+        replaced.map_err(|error| AppError::Anyhow(error.into()))??;
         self.skill_descriptor(provider, workspace, resource_id)
             .await
     }
@@ -577,6 +725,7 @@ impl CatalogService {
             .writable_skill(provider, workspace.clone(), resource_id)
             .await?;
         let roots = skill_roots(self.home.as_deref(), &workspace, provider);
+        let base = self.skill_write_base(provider, &workspace, &descriptor)?;
         let path = descriptor.path.clone();
         let removed = tokio::task::spawn_blocking(move || -> Result<PathBuf, AppError> {
             let directory = path
@@ -584,6 +733,7 @@ impl CatalogService {
                 .expect("skill file has a parent")
                 .to_path_buf();
             if roots.iter().any(|root| root.path == directory) {
+                ensure_confined(&path, &base)?;
                 std::fs::remove_file(&path)?;
                 return Ok(path);
             }
@@ -594,16 +744,40 @@ impl CatalogService {
                     directory.display()
                 )));
             }
+            ensure_confined(&directory, &base)?;
             std::fs::remove_dir_all(&directory)?;
             Ok(directory)
         })
-        .await
-        .map_err(|error| AppError::Anyhow(error.into()))??;
+        .await;
+        self.cache.invalidate();
+        let removed = removed.map_err(|error| AppError::Anyhow(error.into()))??;
         Ok(SkillDeletion {
             resource_id: descriptor.resource_id,
             name: descriptor.name,
             path: removed.to_string_lossy().into_owned(),
         })
+    }
+
+    /// The directory a write to `descriptor`'s skill must stay inside once
+    /// symlinks are resolved; see [`skill_write_base`].
+    fn skill_write_base(
+        &self,
+        provider: ProviderKind,
+        workspace: &Path,
+        descriptor: &SkillDescriptor,
+    ) -> Result<PathBuf, AppError> {
+        skill_roots(self.home.as_deref(), workspace, provider)
+            .into_iter()
+            .find(|root| {
+                root.source == descriptor.source && descriptor.path.starts_with(&root.path)
+            })
+            .map(|root| skill_write_base(&root, workspace))
+            .ok_or_else(|| {
+                AppError::InvalidRequest(format!(
+                    "{} is not in a writable skill root",
+                    descriptor.path.display()
+                ))
+            })
     }
 
     async fn skill_descriptor(
@@ -749,6 +923,59 @@ fn skill_roots(home: Option<&Path>, workspace: &Path, provider: ProviderKind) ->
     deduplicate_roots(roots)
 }
 
+/// Project skills must stay inside the workspace and user skills inside
+/// their skill root once symlinks are resolved, so a repository shipping
+/// e.g. `.claude -> /elsewhere` cannot redirect skill writes or deletions.
+/// The user's own skill root may itself be a symlink.
+fn skill_write_base(root: &SourceRoot, workspace: &Path) -> PathBuf {
+    match root.scope {
+        CatalogScope::Project => workspace.to_path_buf(),
+        CatalogScope::User => root.path.clone(),
+    }
+}
+
+/// Fails unless `path` resolves (through every symlink in its existing
+/// part) to somewhere inside `base`, compared component-wise.
+fn ensure_confined(path: &Path, base: &Path) -> Result<(), AppError> {
+    let resolved = resolve_existing_prefix(path)?;
+    let base = resolve_existing_prefix(base)?;
+    if resolved.starts_with(&base) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidRequest(format!(
+            "{} resolves outside {}",
+            path.display(),
+            base.display()
+        )))
+    }
+}
+
+/// Canonicalizes the longest existing ancestor of `path` and appends the
+/// components that do not exist yet.
+fn resolve_existing_prefix(path: &Path) -> Result<PathBuf, AppError> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
+                    return Err(AppError::InvalidRequest(format!(
+                        "{} cannot be resolved",
+                        path.display()
+                    )));
+                };
+                missing.push(name);
+                existing = parent;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut resolved = std::fs::canonicalize(existing)?;
+    resolved.extend(missing.into_iter().rev());
+    Ok(resolved)
+}
+
 fn catalog_profile(provider: ProviderKind) -> &'static CatalogProfile {
     &crate::provider::profile::profile(provider).catalog
 }
@@ -777,14 +1004,26 @@ fn deduplicate_roots(roots: Vec<SourceRoot>) -> Vec<SourceRoot> {
     selected.into_values().collect()
 }
 
-fn scan_skills(mut roots: Vec<SourceRoot>) -> Result<Vec<SkillDescriptor>, AppError> {
+/// Lists the skills under `roots`, recording in `validator` every directory
+/// it listed and every `SKILL.md` it read (stamped before reading).
+fn scan_skills(
+    mut roots: Vec<SourceRoot>,
+    validator: &mut Validator,
+) -> Result<Vec<SkillDescriptor>, AppError> {
     roots.sort_by_key(|root| std::cmp::Reverse(root.priority));
     let mut skills = Vec::new();
     let mut seen_paths = HashSet::new();
     let mut visited_entries = 0;
     for root in roots {
         let mut files = Vec::new();
-        collect_named_files(&root.path, "SKILL.md", 0, &mut files, &mut visited_entries)?;
+        collect_named_files(
+            &root.path,
+            "SKILL.md",
+            0,
+            &mut files,
+            &mut visited_entries,
+            validator,
+        )?;
         files.sort();
         for path in files {
             if !seen_paths.insert(path.clone()) {
@@ -852,6 +1091,7 @@ fn collect_named_files(
     depth: usize,
     output: &mut Vec<PathBuf>,
     visited_entries: &mut usize,
+    validator: &mut Validator,
 ) -> Result<(), AppError> {
     if depth > MAX_SCAN_DEPTH
         || output.len() >= MAX_SCAN_ENTRIES
@@ -861,10 +1101,18 @@ fn collect_named_files(
     }
     let metadata = match std::fs::symlink_metadata(directory) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            validator.push((directory.to_path_buf(), None));
+            return Ok(());
+        }
         Err(error) => return Err(error.into()),
     };
+    validator.push((directory.to_path_buf(), Some(Stamp::of(&metadata))));
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Ok(());
     }
@@ -879,9 +1127,18 @@ fn collect_named_files(
             continue;
         }
         if file_type.is_dir() {
-            collect_named_files(&entry.path(), name, depth + 1, output, visited_entries)?;
+            collect_named_files(
+                &entry.path(),
+                name,
+                depth + 1,
+                output,
+                visited_entries,
+                validator,
+            )?;
         } else if file_type.is_file() && entry.file_name() == name {
-            output.push(entry.path());
+            let path = entry.path();
+            validator.push((path.clone(), Stamp::read(&path)));
+            output.push(path);
         }
     }
     Ok(())
@@ -935,19 +1192,31 @@ fn apply_skill_precedence(skills: &mut [SkillDescriptor]) {
     }
 }
 
+/// Lists the MCP servers declared in `provider`'s config files, recording
+/// in `validator` each file it looked at (stamped before reading).
 fn scan_mcp(
     home: Option<&Path>,
     workspace: &Path,
     provider: ProviderKind,
+    validator: &mut Validator,
 ) -> Result<Vec<McpServerDescriptor>, AppError> {
     let mut descriptors = Vec::new();
     for source in mcp_sources(home, workspace, provider) {
         let metadata = match std::fs::symlink_metadata(&source.path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                validator.push((source.path.clone(), None));
+                continue;
+            }
             Err(error) => return Err(error.into()),
         };
+        validator.push((source.path.clone(), Some(Stamp::of(&metadata))));
+        let modified = metadata.modified().ok();
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || metadata.len() > MAX_CONFIG_BYTES
@@ -957,7 +1226,9 @@ fn scan_mcp(
         let raw = match std::fs::read_to_string(&source.path) {
             Ok(raw) => raw,
             Err(error) => {
-                tracing::warn!(path = %source.path.display(), error = %error, "skipping unreadable MCP config");
+                if first_config_warning(&source.path, modified) {
+                    tracing::warn!(path = %source.path.display(), error = %error, "skipping unreadable MCP config");
+                }
                 continue;
             }
         };
@@ -973,7 +1244,9 @@ fn scan_mcp(
         let entries = match parsed {
             Ok(entries) => entries,
             Err(error) => {
-                tracing::warn!(path = %source.path.display(), error = %error, "skipping invalid MCP config");
+                if first_config_warning(&source.path, modified) {
+                    tracing::warn!(path = %source.path.display(), error = %error, "skipping invalid MCP config");
+                }
                 continue;
             }
         };
@@ -1015,6 +1288,23 @@ fn scan_mcp(
             .then_with(|| left.resource_id.cmp(&right.resource_id))
     });
     Ok(descriptors)
+}
+
+/// Whether a broken MCP config at `path` with this mtime has not been
+/// warned about yet, so each version of a broken file is logged once rather
+/// than on every scan.
+fn first_config_warning(path: &Path, modified: Option<SystemTime>) -> bool {
+    type Warned = HashSet<(PathBuf, Option<SystemTime>)>;
+    static WARNED: LazyLock<Mutex<Warned>> = LazyLock::new(Mutex::default);
+    let mut warned = WARNED.lock().unwrap_or_else(PoisonError::into_inner);
+    let key = (path.to_path_buf(), modified);
+    if warned.contains(&key) {
+        return false;
+    }
+    if warned.len() >= MAX_WARNED_CONFIGS {
+        warned.clear();
+    }
+    warned.insert(key)
 }
 
 /// The MCP config files TodeX lists for `provider`; none for providers that
@@ -1210,7 +1500,11 @@ struct ParsedMcpServer {
     headers: BTreeMap<String, String>,
 }
 
+/// An empty or whitespace-only file declares no servers.
 fn parse_toml_mcp(raw: &str) -> Result<Vec<ParsedMcpServer>, AppError> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     let value: toml::Value = toml::from_str(raw)
         .map_err(|error| AppError::InvalidRequest(format!("invalid MCP TOML config: {error}")))?;
     let Some(servers) = value.get("mcp_servers").and_then(toml::Value::as_table) else {
@@ -1291,7 +1585,11 @@ fn parsed_mcp_from_toml(name: String, table: &toml::Table) -> ParsedMcpServer {
     }
 }
 
+/// An empty or whitespace-only file declares no servers.
 fn parse_json_mcp(raw: &str) -> Result<Vec<ParsedMcpServer>, AppError> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     let value: Value = serde_json::from_str(raw)
         .map_err(|error| AppError::InvalidRequest(format!("invalid MCP JSON config: {error}")))?;
     let mut maps = Vec::new();
@@ -1478,30 +1776,18 @@ fn write_through_temp(
         ".{file_name}.todex-{}",
         uuid::Uuid::new_v4().simple()
     ));
-    std::fs::write(&temp, contents)?;
+    // Config files can hold credentials: the temp file is created 0600
+    // before any byte is written and only then given the target's mode.
+    crate::secure_fs::create_owner_only(&temp, contents)?;
     let result = match permissions {
         Some(permissions) => std::fs::set_permissions(&temp, permissions),
-        None => restrict_to_owner(&temp),
+        None => Ok(()),
     }
     .and_then(|()| std::fs::rename(&temp, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result.map_err(Into::into)
-}
-
-/// New MCP config files can hold credentials, so only the owner reads them.
-fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
 }
 
 /// Adds `name` to the config file at `path` (top-level `mcpServers` for
@@ -2310,6 +2596,360 @@ mod tests {
             );
         }
         crate::provider::golden_support::assert_golden("catalog_sources", &Value::Object(snapshot));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn empty_mcp_configs_declare_nothing_and_broken_ones_warn_once() {
+        for raw in ["", "  \n\t\n"] {
+            assert!(parse_json_mcp(raw).unwrap().is_empty());
+            assert!(parse_toml_mcp(raw).unwrap().is_empty());
+        }
+        assert!(parse_json_mcp("{ malformed").is_err());
+        assert!(parse_toml_mcp("[mcp_servers").is_err());
+
+        let path = temp_dir("todex-catalog-warn").join(".mcp.json");
+        let first = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        let second = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        assert!(first_config_warning(&path, first));
+        assert!(!first_config_warning(&path, first));
+        assert!(first_config_warning(&path, second));
+        assert!(!first_config_warning(&path, second));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_writes_cannot_escape_through_workspace_symlinks() {
+        let root = temp_dir("todex-catalog-escape");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        let outside = root.join("outside");
+        let victim = outside.join("skills/victim");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&victim).unwrap();
+        let victim_content = "---\nname: victim\ndescription: outside\n---\n";
+        fs::write(victim.join("SKILL.md"), victim_content).unwrap();
+        // The repository ships `.claude` pointing outside the workspace.
+        std::os::unix::fs::symlink(&outside, workspace.join(".claude")).unwrap();
+        let config = Arc::new(test_config(root.join("data"), workspace_root));
+        let service = CatalogService::with_home(config, Some(home));
+
+        let content = "---\nname: planted\ndescription: x\n---\n";
+        assert!(matches!(
+            service
+                .create_skill(
+                    ProviderKind::ClaudeCode,
+                    workspace.clone(),
+                    "provider-project",
+                    "planted",
+                    content.to_owned(),
+                )
+                .await,
+            Err(AppError::InvalidRequest(_))
+        ));
+        assert!(!outside.join("skills/planted").exists());
+
+        let listed = service
+            .skills(ProviderKind::ClaudeCode, workspace.clone())
+            .await
+            .unwrap()
+            .skills
+            .into_iter()
+            .find(|skill| skill.name == "victim")
+            .expect("the scan reads through the symlinked directory");
+        assert!(matches!(
+            service
+                .update_skill(
+                    ProviderKind::ClaudeCode,
+                    workspace.clone(),
+                    &listed.resource_id,
+                    content.to_owned(),
+                )
+                .await,
+            Err(AppError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            service
+                .delete_skill(
+                    ProviderKind::ClaudeCode,
+                    workspace.clone(),
+                    &listed.resource_id
+                )
+                .await,
+            Err(AppError::InvalidRequest(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(victim.join("SKILL.md")).unwrap(),
+            victim_content
+        );
+
+        // A skill root inside the workspace still works.
+        let created = service
+            .create_skill(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                "shared-project",
+                "inside",
+                content.to_owned(),
+            )
+            .await
+            .unwrap();
+        service
+            .delete_skill(
+                ProviderKind::ClaudeCode,
+                workspace.clone(),
+                &created.resource_id,
+            )
+            .await
+            .unwrap();
+        assert!(!workspace.join(".agents/skills/inside").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_writes_use_owner_only_temp_files_and_keep_existing_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = temp_dir("todex-catalog-temp");
+        fs::create_dir_all(&root).unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let created = root.join("config.toml");
+        insert_mcp_entry(&created, "tools", json!({ "command": "x" })).unwrap();
+        assert_eq!(mode(&created), 0o600);
+
+        let existing = root.join(".claude.json");
+        fs::write(&existing, "{}\n").unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o640)).unwrap();
+        insert_mcp_entry(&existing, "tools", json!({ "command": "x" })).unwrap();
+        assert_eq!(mode(&existing), 0o640);
+        assert!(fs::read_to_string(&existing).unwrap().contains("tools"));
+
+        // No temp file is left behind.
+        let names = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2, "no temp files left: {names:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Moves every mtime under `root` into the past, so the next scan is not
+    /// racy and gets cached.
+    fn settle(root: &Path) {
+        let past = SystemTime::now() - Duration::from_secs(60);
+        let metadata = fs::symlink_metadata(root).unwrap();
+        if metadata.file_type().is_symlink() {
+            return;
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(root).unwrap() {
+                settle(&entry.unwrap().path());
+            }
+        }
+        fs::File::open(root).unwrap().set_modified(past).unwrap();
+    }
+
+    fn builds(service: &CatalogService) -> usize {
+        service
+            .cache
+            .builds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn catalog_scans_are_cached_until_a_source_changes() {
+        let root = temp_dir("todex-catalog-cache");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        let skill = |name: &str, description: &str| {
+            let path = workspace.join(format!(".claude/skills/{name}/SKILL.md"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                format!("---\nname: {name}\ndescription: {description}\n---\n"),
+            )
+            .unwrap();
+        };
+        fs::create_dir_all(&home).unwrap();
+        skill("alpha", "first");
+        let mcp = workspace.join(".mcp.json");
+        fs::write(&mcp, r#"{"mcpServers":{"one":{"command":"x"}}}"#).unwrap();
+        settle(&root);
+        let config = Arc::new(test_config(root.join("data"), workspace_root));
+        let service = CatalogService::with_home(config, Some(home));
+        let provider = ProviderKind::ClaudeCode;
+        let skill_names = |catalog: SkillCatalog| {
+            catalog
+                .skills
+                .into_iter()
+                .map(|skill| format!("{}:{}", skill.name, skill.description))
+                .collect::<Vec<_>>()
+        };
+        let server_names = |catalog: McpCatalog| {
+            catalog
+                .servers
+                .into_iter()
+                .map(|server| server.name)
+                .collect::<Vec<_>>()
+        };
+
+        // Hit: the second call reuses the first scan.
+        let first = service.skills(provider, workspace.clone()).await.unwrap();
+        assert_eq!(skill_names(first), ["alpha:first"]);
+        assert_eq!(builds(&service), 1);
+        let again = service.skills(provider, workspace.clone()).await.unwrap();
+        assert_eq!(skill_names(again), ["alpha:first"]);
+        assert_eq!(builds(&service), 1);
+
+        // Modify a SKILL.md.
+        skill("alpha", "second version");
+        let modified = service.skills(provider, workspace.clone()).await.unwrap();
+        assert_eq!(skill_names(modified), ["alpha:second version"]);
+        settle(&root);
+        service.skills(provider, workspace.clone()).await.unwrap();
+        let built = builds(&service);
+        service.skills(provider, workspace.clone()).await.unwrap();
+        assert_eq!(builds(&service), built, "settled scan is cached again");
+
+        // Add a skill directory.
+        skill("beta", "added");
+        let added = service.skills(provider, workspace.clone()).await.unwrap();
+        assert_eq!(skill_names(added), ["alpha:second version", "beta:added"]);
+        settle(&root);
+        service.skills(provider, workspace.clone()).await.unwrap();
+
+        // Delete a skill directory.
+        fs::remove_dir_all(workspace.join(".claude/skills/alpha")).unwrap();
+        let deleted = service.skills(provider, workspace.clone()).await.unwrap();
+        assert_eq!(skill_names(deleted), ["beta:added"]);
+
+        // MCP: hit, modify, delete and re-add the config file.
+        let built = builds(&service);
+        assert_eq!(
+            server_names(service.mcp(provider, workspace.clone()).await.unwrap()),
+            ["one"]
+        );
+        service.mcp(provider, workspace.clone()).await.unwrap();
+        assert_eq!(builds(&service), built + 1);
+        fs::write(&mcp, r#"{"mcpServers":{"two":{"command":"xy"}}}"#).unwrap();
+        assert_eq!(
+            server_names(service.mcp(provider, workspace.clone()).await.unwrap()),
+            ["two"]
+        );
+        fs::remove_file(&mcp).unwrap();
+        assert!(server_names(service.mcp(provider, workspace.clone()).await.unwrap()).is_empty());
+        fs::write(&mcp, r#"{"mcpServers":{"three":{"command":"x"}}}"#).unwrap();
+        assert_eq!(
+            server_names(service.mcp(provider, workspace.clone()).await.unwrap()),
+            ["three"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn catalog_cache_is_per_workspace_and_cleared_by_writes() {
+        let root = temp_dir("todex-catalog-cache-scope");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let first = workspace_root.join("first");
+        let second = workspace_root.join("second");
+        fs::create_dir_all(&home).unwrap();
+        for (workspace, name) in [(&first, "one"), (&second, "two")] {
+            fs::create_dir_all(workspace).unwrap();
+            fs::write(
+                workspace.join(".mcp.json"),
+                format!(r#"{{"mcpServers":{{"{name}":{{"command":"x"}}}}}}"#),
+            )
+            .unwrap();
+        }
+        settle(&root);
+        let config = Arc::new(test_config(root.join("data"), workspace_root));
+        let service = CatalogService::with_home(config, Some(home));
+        let provider = ProviderKind::ClaudeCode;
+        let names = |catalog: McpCatalog| {
+            catalog
+                .servers
+                .into_iter()
+                .map(|server| server.name)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            names(service.mcp(provider, first.clone()).await.unwrap()),
+            ["one"]
+        );
+        assert_eq!(
+            names(service.mcp(provider, second.clone()).await.unwrap()),
+            ["two"]
+        );
+        assert_eq!(
+            names(service.mcp(provider, first.clone()).await.unwrap()),
+            ["one"]
+        );
+        assert_eq!(
+            names(service.mcp(provider, second.clone()).await.unwrap()),
+            ["two"]
+        );
+        assert_eq!(builds(&service), 2, "each workspace is scanned once");
+
+        // A write through the service drops cached scans right away.
+        service
+            .create_mcp(
+                provider,
+                first.clone(),
+                CatalogScope::Project,
+                "added".to_owned(),
+                json!({ "command": "y" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            names(service.mcp(provider, first.clone()).await.unwrap()),
+            ["added", "one"]
+        );
+        let skills = service.skills(provider, first.clone()).await.unwrap();
+        assert!(skills.skills.is_empty());
+        let created = service
+            .create_skill(
+                provider,
+                first.clone(),
+                "provider-project",
+                "fresh",
+                "---\nname: fresh\ndescription: new\n---\n".to_owned(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.name, "fresh");
+        settle(&root);
+        let before = builds(&service);
+        let skills = service.skills(provider, first.clone()).await.unwrap();
+        assert_eq!(skills.skills.len(), 1);
+        service.skills(provider, first.clone()).await.unwrap();
+        assert_eq!(builds(&service), before + 1);
+        service
+            .delete_skill(provider, first.clone(), &created.resource_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            builds(&service),
+            before + 1,
+            "deletion only looked the skill up"
+        );
+        assert!(service
+            .skills(provider, first.clone())
+            .await
+            .unwrap()
+            .skills
+            .is_empty());
+        assert_eq!(
+            builds(&service),
+            before + 2,
+            "deletion invalidated the cache"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
