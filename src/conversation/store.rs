@@ -59,9 +59,12 @@ const JOURNAL_SCAN_BUFFER_BYTES: usize = 256 * 1024;
 /// `events.jsonl`, the only file appends touch. Once the active file passes
 /// this size it is sealed under the next number, a fresh active file takes
 /// over and the background maintenance task converts the sealed file into a
-/// compressed segment (see [`super::segment`]).
+/// compressed segment (see [`super::segment`]). Smaller active files are
+/// also sealed proactively, once they reach the configured
+/// `history_seal_min_bytes`, after a turn or when the conversation goes
+/// idle (see [`ConversationStore::seal_active_if`]).
 #[cfg(not(test))]
-const DEFAULT_JOURNAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_JOURNAL_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
 /// Tests rotate the active segment well below the production size so a
 /// multi-segment journal does not need hundreds of MiB of fixture writes.
 #[cfg(test)]
@@ -127,6 +130,9 @@ const DIGEST_CACHE_ENTRIES: usize = 256;
 /// Journal file listings kept (see [`ConversationStore::files_locked`]); a
 /// miss lists the conversation directory again.
 const FILE_LIST_CACHE_ENTRIES: usize = 256;
+/// A conversation without appends for this long has its active file sealed
+/// by the maintenance task once it holds `history_seal_min_bytes`.
+pub(super) const IDLE_SEAL_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// Payloads at least this large are sealed and encoded on the blocking
 /// pool (still under the conversation lock) instead of an async worker.
 const BLOCKING_ENCODE_BYTES: usize = 64 * 1024;
@@ -183,6 +189,12 @@ pub struct ConversationStore {
     /// lock; every rewrite of the journal files drops the entry (through
     /// [`Self::index_remove`]) or replaces it.
     file_lists: Arc<LruMap<Vec<JournalFile>>>,
+    /// Active files smaller than this are never sealed early (`0`: no
+    /// proactive sealing); see [`Self::seal_active_if`].
+    seal_min_bytes: Arc<AtomicU64>,
+    /// When each conversation was last appended to in this process, for
+    /// the idle seal pass; an entry is dropped once the pass handled it.
+    last_appends: Arc<DashMap<String, tokio::time::Instant>>,
     /// Test hook: journal writes wait on this lock (see
     /// [`Self::hold_journal_writes`]).
     #[cfg(test)]
@@ -535,6 +547,10 @@ impl ConversationStore {
             ))),
             tails: Arc::new(LruMap::new(TAIL_CACHE_ENTRIES)),
             file_lists: Arc::new(LruMap::new(FILE_LIST_CACHE_ENTRIES)),
+            seal_min_bytes: Arc::new(AtomicU64::new(
+                crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
+            )),
+            last_appends: Arc::new(DashMap::new()),
             pending_deltas: Arc::new(DashMap::new()),
             delta_generation: Arc::new(AtomicU64::new(0)),
             manifests: Arc::new(DashMap::new()),
@@ -589,6 +605,19 @@ impl ConversationStore {
         self.file_lists.remove(conversation_id);
     }
 
+    /// Active files below `bytes` are not sealed before they reach the
+    /// rotation size; `0` turns proactive sealing off
+    /// (`history_seal_min_bytes`, `docs/history-encryption.md` §4.1).
+    pub fn with_seal_min_bytes(self, bytes: u64) -> Self {
+        self.seal_min_bytes.store(bytes, Ordering::Relaxed);
+        self
+    }
+
+    /// The proactive seal threshold, `None` when proactive sealing is off.
+    fn proactive_seal_min_bytes(&self) -> Option<u64> {
+        Some(self.seal_min_bytes.load(Ordering::Relaxed)).filter(|bytes| *bytes > 0)
+    }
+
     /// Give a keyless test store history keys (what [`Self::open`] does).
     #[cfg(test)]
     pub fn with_history_keys(mut self, keys: HistoryKeys) -> Self {
@@ -622,6 +651,13 @@ impl ConversationStore {
     pub async fn ensure_history_writable(&self, conversation_id: &str) -> Result<(), AppError> {
         if let Some(keys) = &self.history {
             self.ensure_not_legacy(conversation_id).await?;
+            // The key below would replace one that expired by age: seal the
+            // expiring key's records first (see `append_batch_locked`).
+            if let Some(min_bytes) = self.proactive_seal_min_bytes() {
+                if keys.deks().active_key_expired(conversation_id).await {
+                    self.seal_active_if(conversation_id, min_bytes).await?;
+                }
+            }
             let owner = self.cached_owner(conversation_id);
             keys.deks()
                 .current_key_for(conversation_id, owner.as_deref())
@@ -1189,6 +1225,7 @@ impl ConversationStore {
         }
         self.index_remove(conversation_id);
         self.tails.remove(conversation_id);
+        self.last_appends.remove(conversation_id);
         self.pending_deltas.remove(conversation_id);
         self.manifests.remove(conversation_id);
         self.digests.remove(conversation_id);
@@ -1541,8 +1578,24 @@ impl ConversationStore {
                 None => terminated = true,
             }
         }
+        // A DEK about to be replaced for its age is sealed out together with
+        // its records (when the active file is worth a segment): the
+        // segment is built while the key is still in memory, instead of
+        // ending up passthrough if the daemon restarts first.
+        let key_expiring = match (&self.history, self.proactive_seal_min_bytes()) {
+            (Some(keys), Some(min_bytes))
+                if files
+                    .last()
+                    .is_some_and(|file| file.name == EVENTS_FILE && file.bytes >= min_bytes) =>
+            {
+                keys.deks().active_key_expired(conversation_id).await
+            }
+            _ => false,
+        };
         // Nothing may change on disk for a record that cannot be encrypted
         // (no recipient and no key left in memory): check before rotating.
+        // An expiring key is replaced here, so the key below is already the
+        // fresh file's.
         let mut key = self.record_key(conversation_id).await?;
         // Seal the active file once it passed its target size and start a
         // fresh `events.jsonl`. Sealing only renames the active file, so a
@@ -1550,9 +1603,10 @@ impl ConversationStore {
         // sealed file holds exactly the bytes the active file held and the
         // fresh file starts empty. Conversion to a compressed segment runs
         // in the background.
-        if files
-            .last()
-            .is_some_and(|file| file.name == EVENTS_FILE && file.bytes >= journal_segment_bytes())
+        if key_expiring
+            || files.last().is_some_and(|file| {
+                file.name == EVENTS_FILE && file.bytes >= journal_segment_bytes()
+            })
         {
             let previous = files.clone();
             match rotate_journal(&directory, &files, terminated).await {
@@ -1574,8 +1628,9 @@ impl ConversationStore {
                     self.maintenance.request(conversation_id);
                     // Each DEK's records stay inside one sealed file, which
                     // is what lets the seal converter repack them and then
-                    // drop the key.
-                    if let Some(keys) = &self.history {
+                    // drop the key. A key that expired was just replaced by
+                    // one that has sealed nothing yet.
+                    if let Some(keys) = self.history.as_ref().filter(|_| !key_expiring) {
                         keys.deks().rotate(conversation_id).await;
                         key = self.record_key(conversation_id).await?;
                     }
@@ -1697,6 +1752,8 @@ impl ConversationStore {
         last.bytes = metadata.len();
         last.modified = metadata.modified().ok();
         self.file_lists.insert(conversation_id, files.clone());
+        self.last_appends
+            .insert(conversation_id.to_owned(), tokio::time::Instant::now());
         self.index_update(conversation_id, |index| {
             if index.files == pre_write_files {
                 for &(sequence, start, end) in &ranges {
@@ -3670,9 +3727,78 @@ impl ConversationStore {
             return Ok(());
         }
         let terminated = self.read_last_event(conversation_id).await?.1;
+        self.rotate_active_locked(conversation_id, &directory, files, terminated)
+            .await
+    }
+
+    /// Seal the active file of `conversation_id` early — before it reaches
+    /// the rotation size — when it holds at least `min_bytes` and ends on a
+    /// complete record, then let the maintenance task convert it while its
+    /// DEK is still in memory (`docs/history-encryption.md` §4.1). Returns
+    /// whether it was sealed. Takes the conversation lock like an append,
+    /// so it never races one; the conversion builds outside the lock and
+    /// commits under it ([`Self::seal_next`]).
+    pub async fn seal_active_if(
+        &self,
+        conversation_id: &str,
+        min_bytes: u64,
+    ) -> Result<bool, AppError> {
+        let _guard = self.lock(conversation_id).await;
+        self.seal_active_if_locked(conversation_id, min_bytes).await
+    }
+
+    /// [`Self::seal_active_if`] for a caller holding the conversation lock.
+    async fn seal_active_if_locked(
+        &self,
+        conversation_id: &str,
+        min_bytes: u64,
+    ) -> Result<bool, AppError> {
+        let directory = self.directory(conversation_id)?;
+        if !tokio::fs::try_exists(directory.join(MANIFEST_FILE)).await? {
+            return Ok(false);
+        }
+        // Legacy plaintext history is never rewritten (§8).
+        if self.get_unlocked(conversation_id).await?.legacy_plaintext {
+            return Ok(false);
+        }
+        // Buffered stream text belongs before the boundary.
+        self.flush_pending_delta_locked(conversation_id).await?;
+        let files = self.files_locked(conversation_id, &directory).await?;
+        if !files
+            .last()
+            .is_some_and(|file| file.name == EVENTS_FILE && file.bytes >= min_bytes.max(1))
+        {
+            return Ok(false);
+        }
+        // A torn final record is left for the next append to close.
+        let (_, terminated) = self
+            .read_last_event_in(conversation_id, &directory, &files)
+            .await?;
+        if !terminated {
+            return Ok(false);
+        }
+        self.rotate_active_locked(conversation_id, &directory, files, true)
+            .await?;
+        tracing::info!(
+            conversation_id,
+            "sealed the active conversation journal early"
+        );
+        Ok(true)
+    }
+
+    /// Rename the active file to the next sealed number (see
+    /// [`rotate_journal`]), retag the caches that described it, retire the
+    /// active DEK and queue the conversion. Callers hold the lock.
+    async fn rotate_active_locked(
+        &self,
+        conversation_id: &str,
+        directory: &Path,
+        files: Vec<JournalFile>,
+        terminated: bool,
+    ) -> Result<(), AppError> {
         let previous = files.clone();
         let mut files = files;
-        let rotated = rotate_journal(&directory, &files, terminated).await;
+        let rotated = rotate_journal(directory, &files, terminated).await;
         // Even a failed rotation may have terminated the active file.
         self.file_lists.remove(conversation_id);
         let (sealed, fresh) = rotated?;
@@ -3692,7 +3818,63 @@ impl ConversationStore {
         if let Some(keys) = &self.history {
             keys.deks().rotate(conversation_id).await;
         }
+        self.maintenance.request(conversation_id);
         Ok(())
+    }
+
+    /// The proactive seal after a turn ended: the active file is sealed when
+    /// it holds `history_seal_min_bytes`, and converted in the background.
+    /// Failures are logged; the next trigger tries again.
+    pub async fn seal_after_turn(&self, conversation_id: &str) {
+        let Some(min_bytes) = self.proactive_seal_min_bytes() else {
+            return;
+        };
+        if let Err(error) = self.seal_active_if(conversation_id, min_bytes).await {
+            tracing::warn!(conversation_id, error = %error, "failed to seal the conversation journal after a turn");
+        }
+    }
+
+    /// The idle pass of the maintenance task: every conversation appended
+    /// to in this process but not for `idle` has its active file sealed
+    /// when it holds `history_seal_min_bytes`. Returns the conversations
+    /// sealed.
+    pub(super) async fn seal_idle_conversations(&self, idle: std::time::Duration) -> Vec<String> {
+        let Some(min_bytes) = self.proactive_seal_min_bytes() else {
+            self.last_appends.clear();
+            return Vec::new();
+        };
+        let now = tokio::time::Instant::now();
+        let idle_ids: Vec<String> = self
+            .last_appends
+            .iter()
+            .filter(|entry| now.saturating_duration_since(*entry.value()) >= idle)
+            .map(|entry| entry.key().clone())
+            .collect();
+        let mut sealed = Vec::new();
+        for conversation_id in idle_ids {
+            let _guard = self.lock(&conversation_id).await;
+            // An append that landed meanwhile restarts the idle clock.
+            let still_idle = self
+                .last_appends
+                .remove_if(&conversation_id, |_, last| {
+                    now.saturating_duration_since(*last) >= idle
+                })
+                .is_some();
+            if !still_idle {
+                continue;
+            }
+            match self
+                .seal_active_if_locked(&conversation_id, min_bytes)
+                .await
+            {
+                Ok(true) => sealed.push(conversation_id),
+                Ok(false) | Err(AppError::NotFound(_)) => {}
+                Err(error) => {
+                    tracing::warn!(conversation_id, error = %error, "failed to seal an idle conversation journal");
+                }
+            }
+        }
+        sealed
     }
 
     pub(super) fn directory(&self, conversation_id: &str) -> Result<PathBuf, AppError> {

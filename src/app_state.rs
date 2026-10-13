@@ -156,7 +156,9 @@ impl AppState {
             .deks()
             .set_owner_recipients(std::sync::Arc::new(api_keys.clone()));
         let conversation_store =
-            ConversationStore::open(config.data_dir.clone(), history_keys.clone()).await?;
+            ConversationStore::open(config.data_dir.clone(), history_keys.clone())
+                .await?
+                .with_seal_min_bytes(config.history_seal_min_bytes);
         let conversation_hub = ConversationEventHub::default();
         let quota = QuotaStore::default();
         let conversations = ConversationSupervisor::new_with_execution_gate(

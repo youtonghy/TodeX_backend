@@ -42,6 +42,11 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub workspace_roots: Vec<PathBuf>,
     pub history_retention_days: Option<u64>,
+    /// Active journal files at least this large are sealed early — after a
+    /// turn, when the conversation goes idle, or before their DEK expires —
+    /// so they are compressed while the DEK is still in memory; `0` turns
+    /// that off (docs/history-encryption.md §4.1).
+    pub history_seal_min_bytes: u64,
     pub agent: AgentConfig,
     pub security: SecurityConfig,
     pub api: ApiConfig,
@@ -152,6 +157,9 @@ pub struct AgentConfig {
 
 pub const DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES: u64 = 60;
 pub const DEFAULT_PROVIDER_KEEPALIVE_SECONDS: u64 = 300;
+
+/// Default of `history_seal_min_bytes` / `TODEX_AGENTD_HISTORY_SEAL_MIN_BYTES`.
+pub const DEFAULT_HISTORY_SEAL_MIN_BYTES: u64 = 2 * 1024 * 1024;
 /// Shorter keepalives are raised to this; a process that stops between
 /// quick follow-up turns would pay its whole startup again.
 pub const MIN_PROVIDER_KEEPALIVE_SECONDS: u64 = 30;
@@ -224,6 +232,7 @@ struct FileConfig {
     workspace_root: Option<PathBuf>,
     workspace_roots: Option<Vec<PathBuf>>,
     history_retention_days: Option<u64>,
+    history_seal_min_bytes: Option<u64>,
     agent: Option<PartialAgentConfig>,
     security: Option<PartialSecurityConfig>,
     api: Option<PartialApiConfig>,
@@ -312,6 +321,14 @@ impl Config {
             })
             .or(file_config.history_retention_days)
             .or(defaults.history_retention_days);
+        let history_seal_min_bytes = coalesce(
+            None,
+            env::var("TODEX_AGENTD_HISTORY_SEAL_MIN_BYTES")
+                .ok()
+                .and_then(|value| value.trim().parse().ok()),
+            file_config.history_seal_min_bytes,
+            defaults.history_seal_min_bytes,
+        );
         let host = coalesce(
             args.host,
             env::var("TODEX_AGENTD_HOST").ok(),
@@ -388,6 +405,7 @@ impl Config {
             data_dir,
             workspace_roots,
             history_retention_days,
+            history_seal_min_bytes,
             agent: AgentConfig {
                 default_agent: coalesce(
                     None,
@@ -681,6 +699,7 @@ impl Default for Config {
             data_dir,
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
+            history_seal_min_bytes: DEFAULT_HISTORY_SEAL_MIN_BYTES,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),
@@ -784,6 +803,7 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
     replace_some!(base.workspace_root, overlay.workspace_root);
     replace_some!(base.workspace_roots, overlay.workspace_roots);
     replace_some!(base.history_retention_days, overlay.history_retention_days);
+    replace_some!(base.history_seal_min_bytes, overlay.history_seal_min_bytes);
 
     if let Some(overlay_agent) = overlay.agent {
         let base_agent = base.agent.get_or_insert_with(PartialAgentConfig::default);
@@ -1286,6 +1306,36 @@ mod tests {
         .unwrap();
         if env::var_os("TODEX_AGENTD_PROVIDER_IDLE_TIMEOUT_MINUTES").is_none() {
             assert_eq!(config.agent.provider_idle_timeout_minutes, 0);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_seal_min_bytes_defaults_and_parses() {
+        assert_eq!(
+            Config::default().history_seal_min_bytes,
+            super::DEFAULT_HISTORY_SEAL_MIN_BYTES
+        );
+        let root =
+            env::temp_dir().join(format!("todex-config-seal-min-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let load = || {
+            Config::load_read_only(ServeArgs {
+                data_dir: Some(root.clone()),
+                ..Default::default()
+            })
+            .unwrap()
+            .history_seal_min_bytes
+        };
+        if env::var_os("TODEX_AGENTD_HISTORY_SEAL_MIN_BYTES").is_none() {
+            fs::write(root.join("config.toml"), "port = 7400\n").unwrap();
+            assert_eq!(load(), 2 * 1024 * 1024);
+            fs::write(
+                root.join("config.toml"),
+                "history_seal_min_bytes = 0\n[agent]\nprovider_prewarm = true\n",
+            )
+            .unwrap();
+            assert_eq!(load(), 0);
         }
         let _ = fs::remove_dir_all(root);
     }

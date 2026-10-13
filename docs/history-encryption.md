@@ -54,7 +54,7 @@
 ### 3.2 分片密钥生命周期
 
 - 每个会话至多一个活动 DEK，首次加密写入时惰性生成：对所有未吊销接收方（设备 + 恢复）各封装一次，写入 `keyring.json`（fsync）后才能用于加密。
-- 轮换条件：活动分片封存、`epoch` 变化、DEK 使用超过 24 小时、daemon 重启（内存丢失即轮换）。
+- 轮换条件：活动分片封存、`epoch` 变化、DEK 使用超过 24 小时、daemon 重启（内存丢失即轮换）。因超过 24 小时轮换时，若活动分片已达 `history_seal_min_bytes`，先封存活动分片（§4.1），新 DEK 从新的活动分片开始。
 - 已轮换但所在分片尚未封存的 DEK 仍留在内存，供封存时重打包；分片封存完成后清零。daemon 崩溃后丢失的 DEK 只影响该分片不能重打包压缩，内容仍可被客户端读取。活动文件改名封存的同时轮换 DEK，所以一个 DEK 的记录只落在一个分片里。改名失败（例如 Windows 上文件被安全软件占用）不影响追加：本条记录照常写入原活动文件、沿用原 DEK（没有改名就不轮换），下一次追加再尝试封存。
 - nonce 不复用：同一 sequence 只在同一 DEK 下加密一次。追加写入或 fsync 失败（`ENOSPC`、`EIO`）时，后端尽力把活动文件截回写入前的长度，无论截断是否成功都弃用当前 DEK 后才返回错误；尾部恢复截掉记录（损坏尾部隔离到 `events.corrupt.*`）或追加时发现 manifest 领先 journal，同样先弃用 DEK。被弃用的 DEK 不再作为下文无接收方时的回退密钥，此时若无法生成新 DEK，追加直接失败而不是用旧 DEK 重新加密同一 sequence。
 - 会话标题：`manifest.titleEnc = {"kid","ct"}`，以该 `kid` 的 stream 2、counter 0 加密，`kid` 同样登记在 `keyring.json`；省略 `manifest.title`（客户端视同空串）。每次设置标题都用一个只为它生成的新 `kid`（不进入活动 DEK、用后即弃），所以 counter 0 永不在同一 `kid` 下复用。
@@ -118,7 +118,7 @@ keyring.json            e2e 才有
 manifest.json  snapshot.json  provider-state.json  last-request.json
 ```
 
-活动分片原始大小超过 64 MiB 时封存（改名为 `events.NNNNNN.jsonl`），后台任务转为 `.seg + .idx`：写临时文件 → fsync → rename `.idx` → rename `.seg` → fsync 目录 → 删除明文分片 → fsync 目录。恢复规则：同号 `.jsonl` 与 `.seg` 并存且 `.idx` 校验通过时删除 `.jsonl`，否则删除 `.seg/.idx` 重做。
+活动分片原始大小超过 16 MiB 时封存（改名为 `events.NNNNNN.jsonl`），后台任务转为 `.seg + .idx`。为了在 DEK 仍在内存时完成封存（否则只能按 passthrough 打包，几乎不压缩），活动分片达到 `history_seal_min_bytes`（顶层配置，默认 2 MiB，环境变量 `TODEX_AGENTD_HISTORY_SEAL_MIN_BYTES`，`0` 关闭）时还会提前封存：turn 结束（终态事件写入后）、会话 15 分钟没有追加（后台维护任务每分钟检查，只看本进程内追加过的会话）、活动 DEK 因超过 24 小时即将轮换前（追加或新 prompt 换新 DEK 之前先封存，被换下的 DEK 只覆盖这一个分片）。提前封存与追加持有同一把会话锁，只在活动分片以完整记录结尾时进行（撕裂的尾部留给下一次追加处理），旧版明文会话不封存；daemon 关闭时不封存。转换过程同下：写临时文件 → fsync → rename `.idx` → rename `.seg` → fsync 目录 → 删除明文分片 → fsync 目录。恢复规则：同号 `.jsonl` 与 `.seg` 并存且 `.idx` 校验通过时删除 `.jsonl`，否则删除 `.seg/.idx` 重做。
 
 ### 4.2 v3 行
 
@@ -144,10 +144,10 @@ manifest.json  snapshot.json  provider-state.json  last-request.json
 
 - v3 行另有两个可选字段：`n` 仅在原 `normalizedType` 与按 `y` 重算的值不同时写入（`""` 表示原值缺失）；`tn` 保存旧事件微秒以下的纳秒余数。迁移后的事件与原事件逐字段相同。新追加的事件时间截到微秒。信封 `e` 为空时省略。
 - `.seg` 文件头为 `TDXSEG1\n` 加 16 字节分片 id；每帧有 36 字节帧头（流、`kid` 长度、首 sequence、条数、原始与存储长度、帧序号、原始数据 CRC-32），因此丢失或损坏的 `.idx` 可由帧头重建。raw DEFLATE 自身无校验，读取每帧都核对 CRC-32；`.idx` 的 SHA-256 覆盖其 body，另记 `.seg` 全文 SHA-256（只在崩溃恢复判定时计算）。信封流编号 0，内容帧沿用 3/4。
-- `.idx` 记录 `sources`（被替换的明文文件）。v2 迁移把相邻明文段合并为至多 64 MiB 的一个分片、以首个来源的段号命名，恢复时 `.idx` 通过且 `.seg` 全文校验通过才删除残留来源，否则删除 `.seg/.idx` 重做。单个超过 64 MiB 的旧文件整体成为一个分片。
+- `.idx` 记录 `sources`（被替换的明文文件）。v2 迁移把相邻明文段合并为至多一个封存阈值（16 MiB）的一个分片、以首个来源的段号命名，恢复时 `.idx` 通过且 `.seg` 全文校验通过才删除残留来源，否则删除 `.seg/.idx` 重做。单个超过阈值的旧文件整体成为一个分片。
 - 帧表与分片表一起从 `.idx` 读入（约每 MiB 原始数据 0.1 KB），不另行懒加载。
 - 封存精简的匹配规则：`message.delta` 需同 turn 内同 `block.id` 的后续 `message.completed`（或列在 `block.supersedes` 中）；没有 block id 的 delta（Claude Code、ACP）一律保留，因为终态记录无法按 id 对应；`tool.updated` 需同 turn 同 `toolCallId`/`block.id` 的后续 `tool.completed`/`tool.failed`，或 ACP 的 `status` 为 `completed`/`failed` 的后续 `tool.updated`（终态 update 本身保留）；`subagent.updated` 需同 `subagentId` 的后续 `subagent.completed`/`failed`/`cancelled`。终态必须在同一分片内。
-- 帧压缩级别 9：真实 64 MiB 会话封存为 4.0–5.9 MiB。
+- 帧压缩级别 9：真实 64 MiB 会话封存为 4.0–5.9 MiB（11–16 倍）。
 - 调试构建（不含 release 与 `cargo test`）读取 `TODEX_AGENTD_DEBUG_JOURNAL_SEGMENT_BYTES`（≥ 4096）作为封存阈值，供隔离后端的端到端测试在几轮对话后就产生封存帧与 passthrough 帧；未设置时行为不变。
 
 ### 4.5 实现补充（密钥轨，e2e）

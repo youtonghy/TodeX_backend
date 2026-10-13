@@ -2526,6 +2526,12 @@ impl ConversationSupervisor {
         };
         self.emit_terminal(conversation_id, turn_id, event_type, payload)
             .await;
+        // Seal a large active journal file at the turn boundary while its DEK
+        // is in memory (docs/history-encryption.md §4.1); never on shutdown,
+        // where the conversion could not finish anyway.
+        if !self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            self.store.seal_after_turn(conversation_id).await;
+        }
         event_type
     }
 
@@ -3499,6 +3505,7 @@ mod tests {
             data_dir: root.join("data"),
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
+            history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),
@@ -3700,6 +3707,61 @@ mod tests {
         supervisor.delete_owned("local", &id).await.unwrap();
         supervisor.shutdown_all().await;
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_seals_its_journal_once_it_reaches_the_seal_threshold() {
+        let (root, store, supervisor, workspace, _keys) =
+            encrypted_control_fixture("todex-turn-end-seal").await;
+        let manifest = supervisor
+            .create_owned("local", ProviderKind::Codex, workspace, None, None)
+            .await
+            .unwrap();
+        let directory = root.join("data/conversations").join(&manifest.id);
+        let prompt = |text: &str| ConversationPrompt {
+            client_request_id: Some(text.to_owned()),
+            text: text.to_owned(),
+            model: Some("fixture-model".to_owned()),
+            reasoning_effort: None,
+            skills: Vec::new(),
+            content: Vec::new(),
+            permission_mode: None,
+            work_mode: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
+        };
+        // Below the default threshold a turn leaves the active file alone.
+        supervisor
+            .prompt_owned("local", &manifest.id, prompt("first"))
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        assert!(!directory.join("events.000001.jsonl").exists());
+        let before = store.complete_history(&manifest.id).await.unwrap();
+        assert_eq!(before.last().unwrap().event_type, "turn.completed");
+
+        // At the threshold the turn's end seals it for conversion.
+        let store = store.with_seal_min_bytes(1);
+        supervisor
+            .prompt_owned("local", &manifest.id, prompt("second"))
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        assert!(directory.join("events.000001.jsonl").exists());
+        assert_eq!(
+            fs::metadata(directory.join("events.jsonl")).unwrap().len(),
+            0
+        );
+        assert_eq!(store.seal_all_for_tests(&manifest.id).await.unwrap(), 1);
+        assert!(directory.join("events.000001.seg").exists());
+        let after = store.complete_history(&manifest.id).await.unwrap();
+        assert_eq!(after.last().unwrap().event_type, "turn.completed");
+        assert_eq!(
+            after.last().unwrap().sequence,
+            store.get(&manifest.id).await.unwrap().last_sequence
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -4358,6 +4420,7 @@ mod tests {
             data_dir: root.join("data"),
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
+            history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: managed_binary,
@@ -5945,6 +6008,7 @@ mod tests {
             data_dir: root.join("data"),
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
+            history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: fixture_text.clone(),
@@ -6219,6 +6283,7 @@ mod tests {
             data_dir,
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
+            history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
             agent: AgentConfig {
                 default_agent: "pi".to_owned(),
                 codex_bin: fixture_text.clone(),
@@ -6448,6 +6513,7 @@ mod tests {
             data_dir: root.join("data"),
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
+            history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: fixture.to_string_lossy().to_string(),
@@ -6515,6 +6581,7 @@ mod tests {
             data_dir: data_dir.clone(),
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
+            history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: fixture.to_string_lossy().to_string(),
@@ -6994,6 +7061,7 @@ done
             data_dir: root.join("data"),
             workspace_roots: vec![workspace_root],
             history_retention_days: None,
+            history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: executable.clone(),

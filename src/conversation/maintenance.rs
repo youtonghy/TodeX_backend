@@ -1,8 +1,8 @@
 //! Background journal maintenance: converting sealed journal files into
-//! compressed segments and deleting the v2 migration backups older versions
-//! made, a week after they were made. One task does all of it, one
-//! conversation and one segment at a time, so it never competes with turns
-//! for more than a core.
+//! compressed segments, sealing the active file of conversations that went
+//! idle, and deleting the v2 migration backups older versions made, a week
+//! after they were made. One task does all of it, one conversation and one
+//! segment at a time, so it never competes with turns for more than a core.
 //!
 //! Legacy history is never rewritten: plaintext conversations stay as they
 //! are (read-only, `docs/history-encryption.md` §8), so neither v2 → v3
@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::AppError;
 
-use super::store::ConversationStore;
+use super::store::{ConversationStore, IDLE_SEAL_AFTER};
 
 /// Directory inside a conversation holding hard links to its v2 journal
 /// files from before migration.
@@ -71,7 +71,7 @@ impl MaintenanceQueue {
             .extend(failed);
     }
 
-    fn take(&self) -> Vec<String> {
+    pub(super) fn take(&self) -> Vec<String> {
         std::mem::take(
             &mut *self
                 .pending
@@ -128,9 +128,10 @@ pub(super) fn available_space(path: &Path) -> std::io::Result<u64> {
 
 impl ConversationStore {
     /// Start the maintenance task. It converts files sealed by appends as
-    /// soon as they are sealed (retrying failures every minute) and deletes
-    /// week-old migration backups. Every step is committed atomically, so
-    /// aborting the task at any point is safe.
+    /// soon as they are sealed (retrying failures every minute), seals the
+    /// active file of conversations idle for [`IDLE_SEAL_AFTER`] (checked
+    /// every minute) and deletes week-old migration backups. Every step is
+    /// committed atomically, so aborting the task at any point is safe.
     pub fn spawn_maintenance(&self) -> JoinHandle<()> {
         let store = self.clone();
         tokio::spawn(async move {
@@ -143,6 +144,8 @@ impl ConversationStore {
                 let now = tokio::time::Instant::now();
                 if now >= next_retry {
                     store.maintenance.retry_failed();
+                    // Sealed idle files are queued and converted next loop.
+                    store.seal_idle_conversations(IDLE_SEAL_AFTER).await;
                     next_retry = now + IDLE_TICK;
                 }
                 if now >= next_cleanup {

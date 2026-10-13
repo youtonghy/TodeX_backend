@@ -46,6 +46,14 @@ struct ActiveKey {
     created_at: DateTime<Utc>,
 }
 
+impl ActiveKey {
+    /// Due for replacement by age; a clock that moved backwards counts too.
+    fn expired(&self, now: DateTime<Utc>) -> bool {
+        let age = now.signed_duration_since(self.created_at);
+        age < Duration::zero() || age >= MAX_DEK_AGE
+    }
+}
+
 #[derive(Default)]
 struct ConversationKeys {
     active: Option<ActiveKey>,
@@ -130,12 +138,9 @@ impl DekManager {
         let mut keys = slot.lock().await;
         let now = (self.clock)();
         if let Some(active) = &keys.active {
-            let age = now.signed_duration_since(active.created_at);
-            // A clock that moved backwards also rotates.
             if active.epoch == recipients.epoch
                 && active.owner_rid == owner_rid
-                && age >= Duration::zero()
-                && age < MAX_DEK_AGE
+                && !active.expired(now)
             {
                 return Ok((active.kid.clone(), active.key.clone()));
             }
@@ -287,6 +292,21 @@ impl DekManager {
             snapshot.insert(active.kid.clone(), active.key.clone());
         }
         snapshot
+    }
+
+    /// Whether the next [`Self::current_key_for`] replaces the active key of
+    /// `conversation_id` because of its age ([`MAX_DEK_AGE`]). The store
+    /// seals the active file first, so the expiring key's records form a
+    /// segment while the key is still in memory.
+    pub(crate) async fn active_key_expired(&self, conversation_id: &str) -> bool {
+        let Some(slot) = self.existing_slot(conversation_id) else {
+            return false;
+        };
+        let now = (self.clock)();
+        let keys = slot.lock().await;
+        keys.active
+            .as_ref()
+            .is_some_and(|active| active.expired(now))
     }
 
     /// Ends the active key (the active segment was sealed); the next write

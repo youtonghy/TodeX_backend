@@ -104,6 +104,12 @@ optional and canonical aliases are recomputed when old journals are replayed.
   original string bytes. If cutting strings cannot fit, the payload becomes
   `{"truncated": true, "originalBytes": N}` plus its short top-level scalars.
   The 1 MiB limit remains a final check.
+- `history_seal_min_bytes` (top level, default 2097152 = 2 MiB, `0` disables;
+  env `TODEX_AGENTD_HISTORY_SEAL_MIN_BYTES`) is the smallest active journal file
+  sealed early (see the storage paragraph below and
+  `docs/history-encryption.md` §4.1). Sealing early lets the background task
+  compress and repack the file while its DEK is still in memory; after a
+  restart it could only frame the ciphertext as passthrough.
 - Every started turn gets one terminal event. A panicking driver ends it with
   `turn.failed` code `PROVIDER_PANIC` (other task join errors:
   `PROVIDER_TASK_CANCELLED`). A failed terminal append is retried after
@@ -157,10 +163,14 @@ active `events.jsonl`, the only file appends touch. Every new line is a
 short-key v3 record (`s`, `i`, `t` in µs, `y`, `r`, `p`, envelope `e`, content
 `c`); v2 full-event lines and v2 compaction markers still decode, and every
 read returns the same `ConversationEvent` as before, so the wire format is
-unchanged. Once the active file passes 64 MiB the next append renames it to
+unchanged. Once the active file passes 16 MiB the next append renames it to
 the next segment number and starts a fresh `events.jsonl` (a crash between the
 two leaves the journal ending in a sealed file, which the next append
-recreates the active file for). The background maintenance task then
+recreates the active file for). Smaller active files are sealed the same way
+once they hold `history_seal_min_bytes` (below): when a turn ends, when the
+conversation had no append for 15 minutes, and before its DEK is replaced
+for age — so conversion runs while the DEK is still in memory; never at
+shutdown. The background maintenance task then
 converts the sealed file into a `.seg`: three streams (envelope lines, summary
 payloads, full payloads) cut into ~1 MiB raw-DEFLATE frames with CRC-32, and a
 checksummed `.idx` holding the frame table, the segment's journal digest and
@@ -180,7 +190,7 @@ time (payload `{"reason": "compacted", "originalType", "runStart",
 
 The replay index of a conversation holds each sealed segment's range and frame
 table plus per-record offsets of the plaintext files (the active file stays
-under 64 MiB); indexes are LRU-bounded to 64 conversations and decompressed
+under 16 MiB); indexes are LRU-bounded to 64 conversations and decompressed
 frames share one 32 MiB LRU. Replay pages read plaintext spans and decode
 sealed frames transparently, with the same limits (1000 records or about
 8 MiB of journal, a sealed record counting the length of its v3 line). A cold

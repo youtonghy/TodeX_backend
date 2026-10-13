@@ -1253,3 +1253,368 @@ async fn a_batched_append_journals_and_publishes_like_single_appends() {
     assert_eq!(next.sequence, 5);
     e2e.cleanup();
 }
+
+/// What a client sees of the whole history: HTTP pages in both details,
+/// and WebSocket replay, where every message carries only the frames of
+/// its own event (a one-event page).
+async fn client_views(
+    e2e: &E2e,
+    keyring_owner: &str,
+    id: &str,
+) -> (
+    Vec<ConversationEvent>,
+    Vec<ConversationEvent>,
+    Vec<ConversationEvent>,
+) {
+    let store = &e2e.store;
+    let keys = e2e.client_keys(keyring_owner).await;
+    let (full, frames) = history(store, id, ReplayDetail::Full).await;
+    let full = client_view(&keys, &full, &frames, false);
+    let (summary, frames) = history(store, id, ReplayDetail::Summary).await;
+    let summary = client_view(&keys, &summary, &frames, true);
+    let mut socket = Vec::new();
+    let mut after = 0;
+    loop {
+        let page = store
+            .replay_detail(id, after, 1, ReplayDetail::Full)
+            .await
+            .unwrap();
+        after = page.next_sequence;
+        socket.extend(client_view(&keys, &page.events, &page.frames, false));
+        if !page.has_more {
+            break;
+        }
+    }
+    (full, summary, socket)
+}
+
+fn sealed_segments(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".seg"))
+        .collect();
+    names.sort();
+    names
+}
+
+fn file_bytes(directory: &Path, suffixes: &[&str]) -> u64 {
+    fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with("events.") && suffixes.iter().any(|suffix| name.ends_with(suffix))
+        })
+        .map(|entry| entry.metadata().unwrap().len())
+        .sum()
+}
+
+#[tokio::test]
+async fn a_proactive_seal_after_a_turn_keeps_every_view_of_the_history() {
+    let e2e = E2e::new("todex-e2e-proactive-seal", true).await;
+    let store = e2e.store.clone().with_seal_min_bytes(16 * 1024);
+    let id = e2e.create(None).await.id;
+    // Two turns, well below the rotation size.
+    for index in 0..80 {
+        let (event_type, payload) = mixed_payload(index);
+        store.append(&id, event_type, payload).await.unwrap();
+    }
+    let directory = store.directory(&id).unwrap();
+    let active = fs::metadata(directory.join(EVENTS_FILE)).unwrap().len();
+    assert!(active >= 16 * 1024 && active < journal_segment_bytes());
+    let (full, summary, socket) = client_views(&e2e, &id, &id).await;
+    assert_eq!(full.len(), 80);
+    let kids: BTreeSet<String> = journal_records(&directory.join(EVENTS_FILE))
+        .iter()
+        .map(|record| record["x"]["kid"].as_str().unwrap().to_owned())
+        .collect();
+
+    // Below the threshold nothing happens; at it the turn end seals.
+    assert!(!store.seal_active_if(&id, active + 1).await.unwrap());
+    store.seal_after_turn(&id).await;
+    assert!(directory.join("events.000001.jsonl").exists());
+    assert_eq!(fs::metadata(directory.join(EVENTS_FILE)).unwrap().len(), 0);
+    // The rotation queued the conversion for the maintenance task.
+    assert_eq!(store.maintenance.take(), vec![id.clone()]);
+    assert_eq!(store.seal_all_for_tests(&id).await.unwrap(), 1);
+    assert_eq!(sealed_segments(&directory), vec!["events.000001.seg"]);
+    let sealed = file_bytes(&directory, &[".seg", ".idx"]);
+    eprintln!(
+        "proactive seal: {active} bytes of active journal -> {sealed} bytes of segment + index ({:.1}x)",
+        active as f64 / sealed as f64
+    );
+    assert!(sealed * 3 < active, "{sealed} sealed bytes from {active}");
+    // Repacked under the DEK while it was in memory, then released.
+    let loaded = segment::load_index(&directory, 1).unwrap();
+    assert!(loaded.body.frames.iter().any(|frame| frame.kid.is_some()));
+    for kid in &kids {
+        assert!(e2e.keys.deks().key_for(&id, kid).await.is_none());
+    }
+
+    // HTTP pages in both details and WebSocket replay are unchanged.
+    let (sealed_full, sealed_summary, sealed_socket) = client_views(&e2e, &id, &id).await;
+    assert_payloads(&sealed_full, &full);
+    assert_payloads(&sealed_summary, &summary);
+    assert_payloads(&sealed_socket, &socket);
+    assert_payloads(&socket, &full);
+
+    // A fork copies the sealed frames and reads the same.
+    let fork = ConversationManifest::new(ProviderKind::Codex, e2e.root.clone(), None, None);
+    let fork_id = fork.id.clone();
+    let copy_id = fork_id.clone();
+    store
+        .create_from_journal(
+            &id,
+            fork,
+            None,
+            None,
+            move |event, sequence| {
+                let mut next =
+                    ConversationEvent::new(&copy_id, sequence, event.event_type, event.payload);
+                next.time = event.time;
+                next
+            },
+            |_| Vec::new(),
+        )
+        .await
+        .unwrap();
+    let (fork_full, _, _) = client_views(&e2e, &fork_id, &fork_id).await;
+    for (copy, original) in fork_full.iter().zip(&sealed_full) {
+        assert_eq!(copy.event_type, original.event_type);
+        assert_eq!(copy.payload, original.payload);
+    }
+
+    // Appends continue under a new key; a restart recovers everything.
+    let next = store
+        .append(&id, "turn.started", json!({"turnId": "turn_2"}))
+        .await
+        .unwrap();
+    assert_eq!(next.sequence, 81);
+    let restarted = e2e.restart().await;
+    let manifest = restarted.store.recover(&id).await.unwrap();
+    assert_eq!(manifest.last_sequence, 81);
+    let (cold_full, cold_summary, _) = client_views(&restarted, &id, &id).await;
+    assert_payloads(&cold_full[..80], &full);
+    assert_payloads(&cold_summary[..80], &summary);
+    assert_eq!(cold_full[80].event_type, "turn.started");
+    e2e.cleanup();
+}
+
+#[tokio::test]
+async fn proactive_seals_never_race_concurrent_appends() {
+    let e2e = E2e::new("todex-e2e-seal-race", true).await;
+    let store = e2e.store.clone();
+    let id = e2e.create(None).await.id;
+    let writers: Vec<_> = (0..4u64)
+        .map(|writer| {
+            let (store, id) = (store.clone(), id.clone());
+            tokio::spawn(async move {
+                for index in 0..60u64 {
+                    let (event_type, mut payload) = mixed_payload(index);
+                    payload["writer"] = json!(writer);
+                    payload["index"] = json!(index);
+                    store.append(&id, event_type, payload).await.unwrap();
+                }
+            })
+        })
+        .collect();
+    let sealer = {
+        let (store, id) = (store.clone(), id.clone());
+        tokio::spawn(async move {
+            let mut sealed = 0;
+            for _ in 0..30 {
+                if store.seal_active_if(&id, 1).await.unwrap() {
+                    sealed += 1;
+                }
+                // Conversion builds outside the lock while appends go on.
+                while store.seal_next(&id).await.unwrap() {}
+                tokio::task::yield_now().await;
+            }
+            sealed
+        })
+    };
+    for writer in writers {
+        writer.await.unwrap();
+    }
+    assert!(sealer.await.unwrap() > 0);
+    store.seal_active_if(&id, 1).await.unwrap();
+    while store.seal_next(&id).await.unwrap() {}
+
+    let check = |events: &[ConversationEvent]| {
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=240).collect::<Vec<u64>>()
+        );
+        let mut seen = BTreeSet::new();
+        for event in events {
+            if event.event_type == JOURNAL_COMPACTED_EVENT {
+                // Only superseded stream fragments are slimmed.
+                assert!(matches!(
+                    event.payload["originalType"].as_str(),
+                    Some("message.delta" | "tool.updated")
+                ));
+                continue;
+            }
+            let payload = &event.payload;
+            assert!(seen.insert((
+                payload["writer"].as_u64().unwrap(),
+                payload["index"].as_u64().unwrap()
+            )));
+        }
+        // Every other record of every writer is there exactly once.
+        for writer in 0..4 {
+            for index in 0..60 {
+                if !matches!(mixed_payload(index).0, "message.delta" | "tool.updated") {
+                    assert!(seen.contains(&(writer, index)), "{writer}/{index}");
+                }
+            }
+        }
+    };
+    let (full, summary, socket) = client_views(&e2e, &id, &id).await;
+    check(&full);
+    check(&socket);
+    assert_eq!(summary.len(), 240);
+    let directory = store.directory(&id).unwrap();
+    assert!(!sealed_segments(&directory).is_empty());
+    let restarted = e2e.restart().await;
+    assert_eq!(
+        restarted.store.recover(&id).await.unwrap().last_sequence,
+        240
+    );
+    let (cold_full, _, _) = client_views(&restarted, &id, &id).await;
+    assert_eq!(
+        serde_json::to_value(&cold_full).unwrap(),
+        serde_json::to_value(&full).unwrap()
+    );
+    e2e.cleanup();
+}
+
+#[tokio::test]
+async fn idle_conversations_are_sealed_once_and_small_ones_never() {
+    let e2e = E2e::new("todex-e2e-idle-seal", true).await;
+    let store = e2e.store.clone().with_seal_min_bytes(8 * 1024);
+    let large = e2e.create(None).await.id;
+    let small = e2e.create(None).await.id;
+    for index in 0..60 {
+        let (event_type, payload) = mixed_payload(index);
+        store.append(&large, event_type, payload).await.unwrap();
+    }
+    store
+        .append(&small, "turn.started", json!({"turnId": "t1"}))
+        .await
+        .unwrap();
+    // Not idle long enough yet.
+    assert!(store
+        .seal_idle_conversations(IDLE_SEAL_AFTER)
+        .await
+        .is_empty());
+    assert_eq!(
+        store
+            .seal_idle_conversations(std::time::Duration::ZERO)
+            .await,
+        vec![large.clone()]
+    );
+    assert!(store
+        .directory(&large)
+        .unwrap()
+        .join("events.000001.jsonl")
+        .exists());
+    // Handled: no second seal until the next append.
+    assert!(store
+        .seal_idle_conversations(std::time::Duration::ZERO)
+        .await
+        .is_empty());
+    assert_eq!(store.seal_all_for_tests(&large).await.unwrap(), 1);
+    // Proactive sealing off: nothing is sealed.
+    let off = store.clone().with_seal_min_bytes(0);
+    for index in 60..120 {
+        let (event_type, payload) = mixed_payload(index);
+        off.append(&large, event_type, payload).await.unwrap();
+    }
+    assert!(off
+        .seal_idle_conversations(std::time::Duration::ZERO)
+        .await
+        .is_empty());
+    off.seal_after_turn(&large).await;
+    assert!(!store
+        .directory(&large)
+        .unwrap()
+        .join("events.000002.jsonl")
+        .exists());
+    e2e.cleanup();
+}
+
+#[tokio::test]
+async fn an_expiring_key_is_sealed_out_with_its_records() {
+    let root = temp_dir("todex-e2e-key-age");
+    let now = Arc::new(std::sync::Mutex::new(Utc::now()));
+    let clock_now = now.clone();
+    let keys =
+        HistoryKeys::load_with_clock(&root, None, Arc::new(move || *clock_now.lock().unwrap()))
+            .unwrap();
+    keys.recipients()
+        .register_device("dev_a", &recipient(1))
+        .unwrap();
+    let store = ConversationStore::new(root.clone())
+        .await
+        .unwrap()
+        .with_history_keys(keys.clone())
+        .with_seal_min_bytes(4 * 1024);
+    let e2e = E2e {
+        root: root.clone(),
+        keys: keys.clone(),
+        store: store.clone(),
+    };
+    let first = e2e.create(None).await.id;
+    let second = e2e.create(None).await.id;
+    for id in [&first, &second] {
+        for index in 0..40 {
+            let (event_type, payload) = mixed_payload(index);
+            store.append(id, event_type, payload).await.unwrap();
+        }
+    }
+    let first_kid = keys.deks().current_key(&first).await.unwrap().0;
+    *now.lock().unwrap() += chrono::Duration::hours(24);
+    assert!(keys.deks().active_key_expired(&first).await);
+
+    // Inside an append: the expiring key's file is sealed before the record
+    // is written under the new key.
+    let event = store
+        .append(&first, "turn.started", json!({"turnId": "turn_1"}))
+        .await
+        .unwrap();
+    let directory = store.directory(&first).unwrap();
+    let sealed = journal_records(&directory.join("events.000001.jsonl"));
+    assert_eq!(sealed.len(), 40);
+    assert!(sealed
+        .iter()
+        .all(|record| record["x"]["kid"] == first_kid.as_str()));
+    let active = journal_records(&directory.join(EVENTS_FILE));
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0]["s"], event.sequence);
+    assert_ne!(active[0]["x"]["kid"], first_kid.as_str());
+    // One new key, not two: the rotation reused the age replacement.
+    assert_eq!(keys.keyrings().keys(&first).await.unwrap().len(), 2);
+    store.seal_all_for_tests(&first).await.unwrap();
+    assert!(keys.deks().key_for(&first, &first_kid).await.is_none());
+    let loaded = segment::load_index(&directory, 1).unwrap();
+    assert!(loaded
+        .body
+        .frames
+        .iter()
+        .all(|frame| frame.kid.as_deref().is_none_or(|kid| kid == first_kid)));
+
+    // Before a prompt: the new key is taken only after sealing.
+    store.ensure_history_writable(&second).await.unwrap();
+    let directory = store.directory(&second).unwrap();
+    assert_eq!(
+        journal_records(&directory.join("events.000001.jsonl")).len(),
+        40
+    );
+    assert_eq!(fs::metadata(directory.join(EVENTS_FILE)).unwrap().len(), 0);
+    e2e.cleanup();
+}

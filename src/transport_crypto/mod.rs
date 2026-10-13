@@ -743,6 +743,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/todex-test"),
             workspace_roots: vec![PathBuf::from("/tmp/todex-test/workspace")],
             history_retention_days: None,
+            history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
             agent: AgentConfig {
                 default_agent: "codex".to_owned(),
                 codex_bin: "codex".to_owned(),

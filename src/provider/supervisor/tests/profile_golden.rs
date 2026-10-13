@@ -26,6 +26,7 @@ fn golden_config(root: &Path, executable: Option<&str>) -> Config {
         data_dir: root.join("data"),
         workspace_roots: vec![root.join("workspaces")],
         history_retention_days: None,
+        history_seal_min_bytes: crate::config::DEFAULT_HISTORY_SEAL_MIN_BYTES,
         agent: AgentConfig {
             default_agent: "codex".to_owned(),
             codex_bin: bin("codex"),
