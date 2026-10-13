@@ -104,6 +104,15 @@ optional and canonical aliases are recomputed when old journals are replayed.
   original string bytes. If cutting strings cannot fit, the payload becomes
   `{"truncated": true, "originalBytes": N}` plus its short top-level scalars.
   The 1 MiB limit remains a final check.
+- `tool.completed` output (the strings under `aggregatedOutput`, `output`,
+  `result`, `partialResult`, `content`, `contentItems`, `structuredContent`,
+  `rawOutput`, `stdout`, `stderr`, `formattedOutput`; never `arguments` or
+  `input`) is capped before that: above 256 KiB of UTF-8, read in document
+  order as one text, only the first 192 KiB and the last 32 KiB stay, cut on
+  character boundaries, with a `…[N bytes of tool output truncated]…` line
+  where the head ends and a top-level `truncated: {"originalBytes": N}`
+  (`_truncated` if taken). Strings under 256 bytes are kept whole. The summary,
+  the full ciphertext and the live push all carry the capped payload.
 - `history_seal_min_bytes` (top level, default 2097152 = 2 MiB, `0` disables;
   env `TODEX_AGENTD_HISTORY_SEAL_MIN_BYTES`) is the smallest active journal file
   sealed early (see the storage paragraph below and

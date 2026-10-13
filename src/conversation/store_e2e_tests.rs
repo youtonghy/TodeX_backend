@@ -1254,6 +1254,54 @@ async fn a_batched_append_journals_and_publishes_like_single_appends() {
     e2e.cleanup();
 }
 
+#[tokio::test]
+async fn capped_tool_output_is_journalled_published_and_summarized_alike() {
+    let e2e = E2e::new("todex-e2e-tool-cap", true).await;
+    let store = &e2e.store;
+    let id = e2e.create(None).await.id;
+    let hub = ConversationEventHub::default();
+    let mut live = hub.subscribe(&id);
+    let output = format!("{}\n", SECRETS[2]).repeat(20_000);
+    let appended = store
+        .append_and_publish(
+            &id,
+            "tool.completed",
+            json!({"turnId": "t1", "toolCallId": "call_1", "result": output, "isError": false}),
+            &hub,
+        )
+        .await
+        .unwrap();
+    // The live push is the journalled record, byte for byte.
+    let published = live.recv().await.unwrap();
+    assert_eq!(
+        serde_json::to_vec(&**published).unwrap(),
+        serde_json::to_vec(&appended).unwrap()
+    );
+    let line = &journal_records(&store.directory(&id).unwrap().join(EVENTS_FILE))[0];
+    assert_eq!(published.payload["$enc"], line["x"]);
+    assert!(!contains(
+        &all_bytes(&store.directory(&id).unwrap()),
+        SECRETS[2]
+    ));
+
+    // Summary and full ciphertext open to the same capped payload.
+    let keys = e2e.client_keys(&id).await;
+    let (full, frames) = history(store, &id, ReplayDetail::Full).await;
+    let full = client_view(&keys, &full, &frames, false).remove(0).payload;
+    assert_eq!(full["truncated"], json!({"originalBytes": output.len()}));
+    assert_eq!(full["toolCallId"], "call_1");
+    let kept = full["result"].as_str().unwrap();
+    assert!(kept.len() < TOOL_OUTPUT_HEAD_BYTES + TOOL_OUTPUT_TAIL_BYTES + 64);
+    assert!(output.starts_with(kept.split_once("\n…[").unwrap().0));
+    assert!(output.ends_with(kept.rsplit_once("]…\n").unwrap().1));
+    let (summary, frames) = history(store, &id, ReplayDetail::Summary).await;
+    let summary = client_view(&keys, &summary, &frames, true).remove(0);
+    let mut expected = ConversationEvent::new(&id, 1, "tool.completed", full);
+    expected.provider = Some(ProviderKind::Codex);
+    assert_eq!(summary.payload, summarized(&expected).payload);
+    e2e.cleanup();
+}
+
 /// What a client sees of the whole history: HTTP pages in both details,
 /// and WebSocket replay, where every message carries only the frames of
 /// its own event (a one-event page).

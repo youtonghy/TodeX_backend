@@ -1474,6 +1474,13 @@ impl ConversationStore {
         for (event_type, mut payload) in entries {
             redact_secrets(&mut payload);
             rename_reserved_encrypted_field(conversation_id, &event_type, &mut payload);
+            if let Some(original_bytes) = cap_tool_output(&event_type, &mut payload) {
+                tracing::debug!(
+                    conversation_id,
+                    original_bytes,
+                    "tool output truncated to its head and tail"
+                );
+            }
             let bounded = bound_event_payload(&mut payload)?;
             if let Some(original_bytes) = bounded.original_bytes {
                 tracing::warn!(
@@ -4189,6 +4196,140 @@ impl PlainJournalWriter {
     }
 }
 
+/// `tool.completed` output longer than this (UTF-8 bytes, summed over the
+/// output strings) keeps only its head and tail; see [`cap_tool_output`].
+const TOOL_OUTPUT_CAP_BYTES: usize = 256 * 1024;
+const TOOL_OUTPUT_HEAD_BYTES: usize = 192 * 1024;
+const TOOL_OUTPUT_TAIL_BYTES: usize = 32 * 1024;
+/// Output strings shorter than this (content-item types, MIME types, ids)
+/// are kept whole and not counted.
+const TOOL_OUTPUT_MIN_LEAF_BYTES: usize = 256;
+/// Payload keys whose subtree is tool output, across providers: Codex
+/// `item.aggregatedOutput` / `item.result` / `item.contentItems` /
+/// `item.output`, Claude Code, Pi and Antigravity `result` (Pi also
+/// `partialResult`), MCP `content` / `structuredContent`, ACP `rawOutput`.
+const TOOL_OUTPUT_KEYS: &[&str] = &[
+    "aggregatedOutput",
+    "output",
+    "formattedOutput",
+    "stdout",
+    "stderr",
+    "result",
+    "partialResult",
+    "content",
+    "contentItems",
+    "structuredContent",
+    "rawOutput",
+];
+/// Subtrees never searched for output: tool input (a file write's
+/// `arguments.content`) and the block descriptor.
+const TOOL_INPUT_KEYS: &[&str] = &["arguments", "input", "rawInput", "block"];
+
+/// Cap the output of a `tool.completed` payload: when its output strings
+/// (see [`TOOL_OUTPUT_KEYS`]) hold more than [`TOOL_OUTPUT_CAP_BYTES`],
+/// read in document order as one text, only the first
+/// [`TOOL_OUTPUT_HEAD_BYTES`] and the last [`TOOL_OUTPUT_TAIL_BYTES`] stay
+/// (cut on character boundaries; strings wholly in between become empty)
+/// with an elision line where the head ends, and the payload records the
+/// original output size as `truncated: {"originalBytes": N}`
+/// (`_truncated` when `truncated` is taken). Returns that size when the
+/// payload changed; smaller outputs are left untouched. Runs before the
+/// payload is sealed, so the summary, the full ciphertext and the live
+/// push all carry the same capped output.
+fn cap_tool_output(event_type: &str, payload: &mut Value) -> Option<usize> {
+    if event_type != "tool.completed" {
+        return None;
+    }
+    let mut leaves = Vec::new();
+    collect_output_leaves(payload, &mut String::new(), false, &mut leaves);
+    let total: usize = leaves.iter().map(|(_, bytes)| bytes).sum();
+    if total <= TOOL_OUTPUT_CAP_BYTES {
+        return None;
+    }
+    let tail_start = total - TOOL_OUTPUT_TAIL_BYTES;
+    let elided = tail_start - TOOL_OUTPUT_HEAD_BYTES;
+    let mut marked = false;
+    let mut offset = 0usize;
+    for (pointer, bytes) in &leaves {
+        let start = offset;
+        offset += bytes;
+        let Some(Value::String(text)) = payload.pointer_mut(pointer) else {
+            continue;
+        };
+        // Leaf-local bounds of the kept head and tail.
+        let head = TOOL_OUTPUT_HEAD_BYTES.saturating_sub(start).min(text.len());
+        let tail = tail_start.saturating_sub(start).min(text.len());
+        if head >= tail {
+            continue;
+        }
+        let mut head = head;
+        while !text.is_char_boundary(head) {
+            head -= 1;
+        }
+        let mut tail = tail;
+        while !text.is_char_boundary(tail) {
+            tail += 1;
+        }
+        let mut kept = String::with_capacity(head + text.len() - tail + 64);
+        kept.push_str(&text[..head]);
+        if !marked {
+            kept.push_str(&format!("\n…[{elided} bytes of tool output truncated]…\n"));
+            marked = true;
+        }
+        kept.push_str(&text[tail..]);
+        *text = kept;
+    }
+    if let Value::Object(map) = payload {
+        if let Some(key) = ["truncated", "_truncated"]
+            .into_iter()
+            .find(|key| !map.contains_key(*key))
+        {
+            map.insert(
+                key.to_owned(),
+                serde_json::json!({ "originalBytes": total }),
+            );
+        }
+    }
+    Some(total)
+}
+
+/// `(JSON pointer, UTF-8 bytes)` of the output strings of a tool payload,
+/// in document order; see [`cap_tool_output`].
+fn collect_output_leaves(
+    value: &Value,
+    pointer: &mut String,
+    in_output: bool,
+    leaves: &mut Vec<(String, usize)>,
+) {
+    let parent = pointer.len();
+    match value {
+        Value::String(text) if in_output && text.len() >= TOOL_OUTPUT_MIN_LEAF_BYTES => {
+            leaves.push((pointer.clone(), text.len()));
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                pointer.push('/');
+                pointer.push_str(&index.to_string());
+                collect_output_leaves(item, pointer, in_output, leaves);
+                pointer.truncate(parent);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                if !in_output && TOOL_INPUT_KEYS.contains(&key.as_str()) {
+                    continue;
+                }
+                pointer.push('/');
+                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                let output = in_output || TOOL_OUTPUT_KEYS.contains(&key.as_str());
+                collect_output_leaves(item, pointer, output, leaves);
+                pointer.truncate(parent);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Serialized size an oversized payload is cut down to. The headroom below
 /// `MAX_EVENT_PAYLOAD_BYTES` absorbs the truncation bookkeeping, so the hard
 /// limit only rejects payloads that could not be bounded at all.
@@ -6159,10 +6300,11 @@ mod tests {
             .await
             .unwrap();
         let output = "x".repeat(2 * 1024 * 1024);
+        // Not `tool.completed`, whose output is capped well below this first.
         let appended = store
             .append(
                 &conversation.id,
-                "tool.completed",
+                "provider.event",
                 json!({ "turnId": "t", "itemId": "i", "output": output }),
             )
             .await
@@ -6180,6 +6322,90 @@ mod tests {
         assert!(kept.ends_with(&format!("…[truncated {} bytes]", output.len() - kept_bytes)));
         assert_eq!(stored["truncated"]["/output"], output.len());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tool_output_keeps_head_and_tail_on_char_boundaries() {
+        // 3-byte characters, so neither cut lands on a boundary by chance.
+        let text = "é中".repeat(100_000) + "END";
+        let total = text.len();
+        let mut payload = json!({
+            "provider": "codex",
+            "item": { "type": "commandExecution", "command": "cat big", "aggregatedOutput": text },
+            "block": { "id": "item-1", "phase": "completed" },
+        });
+        assert_eq!(cap_tool_output("tool.completed", &mut payload), Some(total));
+        assert_eq!(payload["truncated"], json!({ "originalBytes": total }));
+        assert_eq!(payload["item"]["command"], "cat big");
+        assert_eq!(payload["block"]["id"], "item-1");
+        let kept = payload["item"]["aggregatedOutput"].as_str().unwrap();
+        let (head, rest) = kept.split_once("\n…[").unwrap();
+        let (marker, tail) = rest.split_once("]…\n").unwrap();
+        assert!(text.starts_with(head));
+        assert!(text.ends_with(tail));
+        assert!(TOOL_OUTPUT_HEAD_BYTES - head.len() < 4);
+        assert!(tail.len() <= TOOL_OUTPUT_TAIL_BYTES && TOOL_OUTPUT_TAIL_BYTES - tail.len() < 4);
+        assert_eq!(
+            marker,
+            format!(
+                "{} bytes of tool output truncated",
+                total - TOOL_OUTPUT_HEAD_BYTES - TOOL_OUTPUT_TAIL_BYTES
+            )
+        );
+        // Other events and outputs within the cap are left alone.
+        let mut other = json!({ "output": "x".repeat(TOOL_OUTPUT_CAP_BYTES + 1) });
+        let before = other.clone();
+        assert_eq!(cap_tool_output("tool.updated", &mut other), None);
+        assert_eq!(other, before);
+        let mut small = json!({ "result": "x".repeat(TOOL_OUTPUT_CAP_BYTES) });
+        let before = small.clone();
+        assert_eq!(cap_tool_output("tool.completed", &mut small), None);
+        assert_eq!(small, before);
+    }
+
+    #[test]
+    fn tool_output_spread_over_content_items_is_capped_as_one_text() {
+        // An MCP result: 40 text items of 10 KiB; the tool's input (a file
+        // write) is never touched, however large.
+        let items: Vec<Value> = (0..40)
+            .map(|index| json!({ "type": "text", "text": format!("{index:02}").repeat(5 * 1024) }))
+            .collect();
+        let input = "i".repeat(TOOL_OUTPUT_CAP_BYTES * 2);
+        let mut payload = json!({
+            "toolCallId": "call-1",
+            "arguments": { "content": input },
+            "result": { "content": items },
+            "truncated": "taken",
+        });
+        let total = 40 * 10 * 1024;
+        assert_eq!(cap_tool_output("tool.completed", &mut payload), Some(total));
+        assert_eq!(payload["_truncated"], json!({ "originalBytes": total }));
+        assert_eq!(payload["truncated"], "taken");
+        assert_eq!(
+            payload["arguments"]["content"].as_str().unwrap().len(),
+            input.len()
+        );
+        let items = payload["result"]["content"].as_array().unwrap();
+        assert_eq!(items.len(), 40);
+        let texts: Vec<&str> = items
+            .iter()
+            .map(|item| item["text"].as_str().unwrap())
+            .collect();
+        // Items 0..19 make up the 192 KiB head; 37..39 hold the 32 KiB
+        // tail minus 2 KiB of item 36, whose last 2 KiB stay.
+        for (index, text) in texts.iter().enumerate().take(19) {
+            assert_eq!(*text, format!("{index:02}").repeat(5 * 1024));
+            assert_eq!(items[index]["type"], "text");
+        }
+        assert!(texts[19].starts_with("19"));
+        assert!(texts[19].contains("bytes of tool output truncated"));
+        for text in &texts[20..36] {
+            assert!(text.is_empty());
+        }
+        assert_eq!(texts[36], "36".repeat(1024));
+        for (index, text) in texts.iter().enumerate().skip(37) {
+            assert_eq!(*text, format!("{index:02}").repeat(5 * 1024));
+        }
     }
 
     #[test]

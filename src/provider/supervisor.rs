@@ -5451,14 +5451,15 @@ mod tests {
             stored <= crate::conversation::MAX_EVENT_PAYLOAD_BYTES,
             "{stored}"
         );
-        assert!(
-            tool.payload.get("truncated").is_some(),
-            "{:?}",
-            tool.payload.get("truncated")
-        );
+        // The output keeps its head and tail (docs/API.md, `tool.completed`).
+        let original = tool.payload["truncated"]["originalBytes"]
+            .as_u64()
+            .expect("the original output size is recorded");
+        assert!(original > 256 * 1024, "{original}");
+        assert!(stored < 300 * 1024, "{stored}");
         assert!(serde_json::to_string(&tool.payload)
             .unwrap()
-            .contains("[truncated "));
+            .contains("bytes of tool output truncated]"));
         fs::remove_dir_all(root).unwrap();
     }
 

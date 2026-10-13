@@ -193,6 +193,8 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 journal 不设总容量上限：追加永不因体积被拒绝，进行中的 turn 总能写完，单个会话也不再有体积上限。只有数据目录所在磁盘可用空间低于 1 GiB 时，新 prompt（保存请求快照时）返回 `STORAGE_LOW`（HTTP 507），释放磁盘空间后重试即可；`JOURNAL_FULL` 不再产生。超过 1 MiB − 16 KiB 的事件 payload 在脱敏后截断而非拒绝：最大的字符串按 UTF-8 边界截断并追加 `…[truncated N bytes]`，对象 payload 顶层增加 `truncated`（该键已被占用时为 `_truncated`）映射，记录 JSON pointer → 原始字节数；仅截断字符串仍放不下时，payload 替换为 `{ "truncated": true, "originalBytes": N }` 加上较短的顶层标量字段。
 
+`tool.completed` 的工具输出在此之前另有上限：payload 中输出字段（`aggregatedOutput`、`output`、`result`、`partialResult`、`content`、`contentItems`、`structuredContent`、`rawOutput`、`stdout`、`stderr`、`formattedOutput` 之下的字符串，不含 `arguments`/`input` 等工具输入；短于 256 字节的字符串不计、不截）按文档顺序视作一段文本，超过 256 KiB（UTF-8 字节）时只保留前 192 KiB 与后 32 KiB（均按字符边界截断），中间整段落在省略区的字符串变为空串，保留区开头处插入一行 `…[N bytes of tool output truncated]…`，payload 顶层增加 `truncated: { "originalBytes": N }`（`truncated` 已被占用时为 `_truncated`），N 为原始输出字节数。256 KiB 以内的输出不变。截断发生在加密之前，摘要密文、完整密文与实时推送都来自同一份截断后的 payload。
+
 事件回放支持 `detail=summary`（默认 `full`）：summary 模式把只产生折叠过程行的事件（工具调用、思考、状态、进度）的 `payload` 替换为 `{ "detailStub": true, ... }` 占位对象，保留分类、turn 与流身份所需的元数据，因此事件 sequence 与投影出的时间线条目身份保持不变；结果输出、审批、权限、队列、配置、压缩、subagent、memory、extension 及携带用量数据的事件始终完整返回。客户端展开过程组时用同一接口按 `afterSequence`/`limit` 以 `detail=full` 拉取对应序列区间。
 
 HTTP 响应在请求携带 `Accept-Encoding: gzip` 且响应体不小于 1 KiB 时使用 gzip 压缩（图片、gRPC 与 SSE 除外）；压缩只作用于响应体，设备签名覆盖的请求方法、路径、查询与请求体不受影响，WebSocket 升级不压缩。
