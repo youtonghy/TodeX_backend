@@ -32,6 +32,8 @@ const HEALTH_TIMEOUT: Duration = Duration::from_millis(200);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// A found update restarts the daemon only after Agents were idle this long.
 const UPDATE_RESTART_IDLE_AFTER: Duration = Duration::from_secs(5 * 60);
+/// How often Agent idleness is sampled while an update waits to install.
+const IDLE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonProcess {
@@ -649,24 +651,35 @@ fn set_owner_only_directory(path: &Path) -> Result<()> {
 
 /// Serves until shutdown. Returns the release to restart into once one is
 /// available and no Agent has run for `UPDATE_RESTART_IDLE_AFTER`.
+///
+/// Sleeps on the shutdown signal, server exit and the update channel; Agent
+/// idleness is only sampled while an update is pending.
 async fn wait_for_shutdown_or_server_exit(
     server: ManagedServer,
-    update: watch::Receiver<Option<String>>,
+    mut update: watch::Receiver<Option<String>>,
 ) -> Result<Option<String>> {
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     let mut idle = IdleTimer::default();
+    // Without update checks the sender is gone and `changed` never waits.
+    let mut updates_open = true;
     loop {
-        if server.is_finished() {
-            server.wait().await?;
-            return Ok(None);
-        }
-
+        let pending = update.borrow().is_some();
         tokio::select! {
-            signal = shutdown_signal() => {
+            signal = &mut shutdown => {
                 signal?;
                 server.stop().await?;
                 return Ok(None);
             }
-            _ = sleep(STATUS_POLL_INTERVAL) => {}
+            () = server.finished() => {
+                server.wait().await?;
+                return Ok(None);
+            }
+            changed = update.changed(), if updates_open && !pending => {
+                updates_open = changed.is_ok();
+                continue;
+            }
+            _ = sleep(IDLE_SAMPLE_INTERVAL), if pending => {}
         }
 
         let idle_for = idle.observe(server.is_agent_idle(), Instant::now());
@@ -1218,27 +1231,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn idle_timer_restarts_whenever_an_agent_runs() {
-        let start = Instant::now();
-        let mut idle = IdleTimer::default();
-        assert_eq!(idle.observe(true, start), Duration::ZERO);
-        assert_eq!(
-            idle.observe(true, start + UPDATE_RESTART_IDLE_AFTER),
-            UPDATE_RESTART_IDLE_AFTER
-        );
-        assert_eq!(
-            idle.observe(false, start + Duration::from_secs(301)),
-            Duration::ZERO
-        );
-        let resumed = start + Duration::from_secs(302);
-        assert_eq!(idle.observe(true, resumed), Duration::ZERO);
-        assert_eq!(
-            idle.observe(true, resumed + Duration::from_secs(60)),
-            Duration::from_secs(60)
-        );
-    }
-
-    #[test]
     fn daemon_log_rotates_past_the_limit_and_keeps_three() {
         let dir = unique_tmp_dir("todex-daemon-log-rotation");
         let _ = fs::remove_dir_all(&dir);
@@ -1260,6 +1252,27 @@ mod tests {
         assert_eq!(fs::read_to_string(rotated(3)).unwrap(), "generation 2");
         assert!(!rotated(4).exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn idle_timer_restarts_whenever_an_agent_runs() {
+        let start = Instant::now();
+        let mut idle = IdleTimer::default();
+        assert_eq!(idle.observe(true, start), Duration::ZERO);
+        assert_eq!(
+            idle.observe(true, start + UPDATE_RESTART_IDLE_AFTER),
+            UPDATE_RESTART_IDLE_AFTER
+        );
+        assert_eq!(
+            idle.observe(false, start + Duration::from_secs(301)),
+            Duration::ZERO
+        );
+        let resumed = start + Duration::from_secs(302);
+        assert_eq!(idle.observe(true, resumed), Duration::ZERO);
+        assert_eq!(
+            idle.observe(true, resumed + Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]

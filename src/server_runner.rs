@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::info;
@@ -18,6 +18,8 @@ pub struct ManagedServer {
     state: AppState,
     shutdown: Option<oneshot::Sender<()>>,
     handle: JoinHandle<Result<()>>,
+    /// Never sent; its sender drops when the server task ends.
+    exited: watch::Receiver<()>,
     retention_task: Option<JoinHandle<()>>,
     /// Applies the tenants' saved history cleanup policies.
     history_cleanup_task: Option<JoinHandle<()>>,
@@ -154,7 +156,9 @@ impl ManagedServer {
             );
         }
 
+        let (exited_tx, exited) = watch::channel(());
         let handle = tokio::spawn(async move {
+            let _exited = exited_tx;
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -211,6 +215,7 @@ impl ManagedServer {
             state,
             shutdown: Some(shutdown_tx),
             handle,
+            exited,
             retention_task,
             history_cleanup_task,
             kanban_schedule_task,
@@ -235,8 +240,11 @@ impl ManagedServer {
         self.addr
     }
 
-    pub fn is_finished(&self) -> bool {
-        self.handle.is_finished()
+    /// Resolves once the server task has ended; `wait` then returns its
+    /// result without blocking.
+    pub async fn finished(&self) {
+        let mut exited = self.exited.clone();
+        while exited.changed().await.is_ok() {}
     }
 
     /// No Agent turn or local Codex adapter is running, no follow-up queue is

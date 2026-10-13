@@ -458,7 +458,6 @@ async fn active_turn(
     let mut interrupt_ack = false;
     let mut cancel_deadline = None;
     let mut item_phases = HashMap::<String, String>::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
     loop {
         // All writes already accepted by this worker settle before finishing or advancing the queue.
         if start_request.is_none()
@@ -490,6 +489,15 @@ async fn active_turn(
                 cancelled: status == "interrupted",
             });
         }
+        // Sleep until the earliest timeout instead of polling for it.
+        let next_deadline = [
+            (start_request.is_some() && permissions.is_empty()).then_some(start_deadline),
+            cancel_deadline,
+            pending.values().map(|p| p.deadline).min(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         tokio::select! {
             biased;
             _ = cancel.changed(), if !interrupted => {
@@ -545,7 +553,7 @@ async fn active_turn(
                     if start_request.is_some() { start_deadline = tokio::time::Instant::now() + super::super::process::control_timeout()?; }
                 }
             }
-            _ = tick.tick() => {
+            _ = tokio::time::sleep_until(next_deadline.unwrap_or_else(tokio::time::Instant::now)), if next_deadline.is_some() => {
                 let now = tokio::time::Instant::now();
                 if start_request.is_some() && now >= start_deadline && permissions.is_empty() { return Err(AppError::ProviderUnavailable("Codex turn start acknowledgement timed out".to_owned())); }
                 if cancel_deadline.is_some_and(|deadline| now >= deadline) { return Err(AppError::ProviderUnavailable("Codex interrupt timed out; worker was stopped".to_owned())); }

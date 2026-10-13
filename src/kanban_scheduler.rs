@@ -25,9 +25,10 @@ use crate::{
     provider::{ConversationPrompt, FollowUpAddOutcome},
 };
 
-/// How often due schedules are looked for. Re-reading the wall clock on
-/// every tick keeps runs on time across machine sleep, which pauses
-/// monotonic timers.
+/// The longest wait between looks for due schedules; the scheduler wakes
+/// earlier when a schedule falls due sooner. Re-reading the wall clock on
+/// every pass keeps runs on time across machine sleep, which pauses
+/// monotonic timers, and picks up schedules clients added meanwhile.
 const TICK: Duration = Duration::from_secs(15);
 /// A schedule the backend was not running for is skipped once it is this
 /// late rather than started long after the time the user picked.
@@ -56,10 +57,34 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
         recover_interrupted(&state).await;
         loop {
-            run_due(&state, Utc::now()).await;
-            tokio::time::sleep(TICK).await;
+            let now = Utc::now();
+            run_due(&state, now).await;
+            let upcoming = state
+                .kanban_tasks
+                .due_schedules(now + chrono::Duration::from_std(TICK).unwrap_or_default())
+                .await
+                .into_iter()
+                .map(|due| due.due_at);
+            tokio::time::sleep(next_wait(upcoming, now, Utc::now())).await;
         }
     })
+}
+
+/// How long to sleep after a pass at `checked_at`: until the earliest
+/// schedule that was not yet due then, at most `TICK`. Schedules due at the
+/// pass were already attempted and wait for the next regular pass.
+fn next_wait(
+    due_ats: impl IntoIterator<Item = DateTime<Utc>>,
+    checked_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Duration {
+    due_ats
+        .into_iter()
+        .filter(|due_at| *due_at > checked_at)
+        .min()
+        .map_or(TICK, |due_at| {
+            (due_at - now).to_std().unwrap_or(Duration::ZERO).min(TICK)
+        })
 }
 
 /// Finishes runs a previous process claimed. One that already recorded its
@@ -315,6 +340,32 @@ mod tests {
     use std::{collections::BTreeMap, fs, path::Path};
 
     use super::*;
+
+    #[test]
+    fn scheduler_sleeps_until_the_next_schedule_at_most_a_tick() {
+        let checked = Utc::now();
+        let seconds = chrono::Duration::seconds;
+        assert_eq!(next_wait([], checked, checked), TICK);
+        // Due at or before the pass: attempted already, not a reason to spin.
+        assert_eq!(
+            next_wait([checked, checked - seconds(5)], checked, checked),
+            TICK
+        );
+        assert_eq!(
+            next_wait(
+                [checked + seconds(9), checked + seconds(3)],
+                checked,
+                checked
+            ),
+            Duration::from_secs(3)
+        );
+        assert_eq!(next_wait([checked + seconds(60)], checked, checked), TICK);
+        // The pass itself took longer than the wait.
+        assert_eq!(
+            next_wait([checked + seconds(1)], checked, checked + seconds(2)),
+            Duration::ZERO
+        );
+    }
     use crate::{
         config::{AgentConfig, Config, PairingEncryption, SecurityConfig},
         kanban_store::KANBAN_SCHEDULE_TIME_FORMAT,
