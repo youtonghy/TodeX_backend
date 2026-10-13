@@ -28,8 +28,8 @@ use super::segment::{
 };
 use super::{
     redact_secrets, status_after_conversation_event, ConversationEvent, ConversationEventHub,
-    ConversationManifest, ConversationReplay, ConversationSnapshot, ProviderState,
-    CONVERSATION_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES,
+    ConversationManifest, ConversationReplay, ConversationSnapshot, ConversationStatus,
+    ProviderState, CONVERSATION_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES,
 };
 use crate::history_crypto::{self, ContentStream, SegmentKey};
 use crate::history_keys::{FingerprintKey, HistoryKeys};
@@ -3886,6 +3886,16 @@ impl ConversationStore {
             if !still_idle {
                 continue;
             }
+            // A turn idle on an approval still appends under the active key:
+            // sealing would release it mid-turn. The turn's end seals instead.
+            match self.turn_open_locked(&conversation_id).await {
+                Ok(false) => {}
+                Ok(true) | Err(AppError::NotFound(_)) => continue,
+                Err(error) => {
+                    tracing::warn!(conversation_id, error = %error, "failed to check an idle conversation for an open turn");
+                    continue;
+                }
+            }
             match self
                 .seal_active_if_locked(&conversation_id, min_bytes)
                 .await
@@ -3898,6 +3908,22 @@ impl ConversationStore {
             }
         }
         sealed
+    }
+
+    /// Whether `conversation_id` has a turn in progress: its manifest is
+    /// `running` / `waitingPermission`, or its journal holds a started turn
+    /// without a turn- or conversation-terminal event. Callers hold the
+    /// conversation lock.
+    async fn turn_open_locked(&self, conversation_id: &str) -> Result<bool, AppError> {
+        let status = self.get_unlocked(conversation_id).await?.status;
+        if matches!(
+            status,
+            ConversationStatus::Running | ConversationStatus::WaitingPermission
+        ) {
+            return Ok(true);
+        }
+        self.ensure_digest_locked(conversation_id, |digest| digest.open_turn().is_some())
+            .await
     }
 
     pub(super) fn directory(&self, conversation_id: &str) -> Result<PathBuf, AppError> {

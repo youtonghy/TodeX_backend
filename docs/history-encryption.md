@@ -118,7 +118,7 @@ keyring.json            e2e 才有
 manifest.json  snapshot.json  provider-state.json  last-request.json
 ```
 
-活动分片原始大小超过 16 MiB 时封存（改名为 `events.NNNNNN.jsonl`），后台任务转为 `.seg + .idx`。为了在 DEK 仍在内存时完成封存（否则只能按 passthrough 打包，几乎不压缩），活动分片达到 `history_seal_min_bytes`（顶层配置，默认 2 MiB，环境变量 `TODEX_AGENTD_HISTORY_SEAL_MIN_BYTES`，`0` 关闭）时还会提前封存：turn 结束（终态事件写入后）、会话 15 分钟没有追加（后台维护任务每分钟检查，只看本进程内追加过的会话）、活动 DEK 因超过 24 小时即将轮换前（追加或新 prompt 换新 DEK 之前先封存，被换下的 DEK 只覆盖这一个分片）。提前封存与追加持有同一把会话锁，只在活动分片以完整记录结尾时进行（撕裂的尾部留给下一次追加处理），旧版明文会话不封存；daemon 关闭时不封存。转换过程同下：写临时文件 → fsync → rename `.idx` → rename `.seg` → fsync 目录 → 删除明文分片 → fsync 目录。恢复规则：同号 `.jsonl` 与 `.seg` 并存且 `.idx` 校验通过时删除 `.jsonl`，否则删除 `.seg/.idx` 重做。
+活动分片原始大小超过 16 MiB 时封存（改名为 `events.NNNNNN.jsonl`），后台任务转为 `.seg + .idx`。为了在 DEK 仍在内存时完成封存（否则只能按 passthrough 打包，几乎不压缩），活动分片达到 `history_seal_min_bytes`（顶层配置，默认 2 MiB，环境变量 `TODEX_AGENTD_HISTORY_SEAL_MIN_BYTES`，`0` 关闭）时还会提前封存：turn 结束（终态事件写入后）、会话 15 分钟没有追加（后台维护任务每分钟检查，只看本进程内追加过的会话；manifest 状态为 `running`/`waitingPermission` 或 journal 中仍有未以 turn/会话终态事件结束的 turn 时跳过，例如等待审批中的 turn，留待 turn 结束时封存）、活动 DEK 因超过 24 小时即将轮换前（追加或新 prompt 换新 DEK 之前先封存，被换下的 DEK 只覆盖这一个分片）。提前封存与追加持有同一把会话锁，只在活动分片以完整记录结尾时进行（撕裂的尾部留给下一次追加处理），旧版明文会话不封存；daemon 关闭时不封存。转换过程同下：写临时文件 → fsync → rename `.idx` → rename `.seg` → fsync 目录 → 删除明文分片 → fsync 目录。恢复规则：同号 `.jsonl` 与 `.seg` 并存且 `.idx` 校验通过时删除 `.jsonl`，否则删除 `.seg/.idx` 重做。
 
 ### 4.2 v3 行
 

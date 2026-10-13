@@ -1547,7 +1547,8 @@ async fn idle_conversations_are_sealed_once_and_small_ones_never() {
     let store = e2e.store.clone().with_seal_min_bytes(8 * 1024);
     let large = e2e.create(None).await.id;
     let small = e2e.create(None).await.id;
-    for index in 0..60 {
+    // Two whole turns: an open turn is never sealed while idle.
+    for index in 0..80 {
         let (event_type, payload) = mixed_payload(index);
         store.append(&large, event_type, payload).await.unwrap();
     }
@@ -1579,7 +1580,7 @@ async fn idle_conversations_are_sealed_once_and_small_ones_never() {
     assert_eq!(store.seal_all_for_tests(&large).await.unwrap(), 1);
     // Proactive sealing off: nothing is sealed.
     let off = store.clone().with_seal_min_bytes(0);
-    for index in 60..120 {
+    for index in 80..160 {
         let (event_type, payload) = mixed_payload(index);
         off.append(&large, event_type, payload).await.unwrap();
     }
@@ -1593,6 +1594,70 @@ async fn idle_conversations_are_sealed_once_and_small_ones_never() {
         .unwrap()
         .join("events.000002.jsonl")
         .exists());
+    e2e.cleanup();
+}
+
+/// A turn idle on an approval keeps its active key: the idle pass skips it
+/// until the turn ends.
+#[tokio::test]
+async fn idle_pass_skips_a_conversation_whose_turn_is_still_open() {
+    let e2e = E2e::new("todex-e2e-idle-open-turn", true).await;
+    let store = e2e.store.clone().with_seal_min_bytes(4 * 1024);
+    let id = e2e.create(None).await.id;
+    for index in 0..40 {
+        let (event_type, payload) = mixed_payload(index);
+        store.append(&id, event_type, payload).await.unwrap();
+    }
+    store
+        .append(&id, "turn.started", json!({"turnId": "turn_9"}))
+        .await
+        .unwrap();
+    store
+        .append(
+            &id,
+            "permission.requested",
+            json!({"turnId": "turn_9", "toolCallId": "call_9"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(&id).await.unwrap().status,
+        ConversationStatus::WaitingPermission
+    );
+    let directory = store.directory(&id).unwrap();
+    assert!(store
+        .seal_idle_conversations(std::time::Duration::ZERO)
+        .await
+        .is_empty());
+    assert!(!directory.join("events.000001.jsonl").exists());
+
+    // Running again, still without a terminal event: still skipped.
+    store
+        .append(
+            &id,
+            "permission.resolved",
+            json!({"turnId": "turn_9", "toolCallId": "call_9"}),
+        )
+        .await
+        .unwrap();
+    assert!(store
+        .seal_idle_conversations(std::time::Duration::ZERO)
+        .await
+        .is_empty());
+    assert!(!directory.join("events.000001.jsonl").exists());
+
+    // The turn ended: the next idle pass seals.
+    store
+        .append(&id, "turn.completed", json!({"turnId": "turn_9"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .seal_idle_conversations(std::time::Duration::ZERO)
+            .await,
+        vec![id.clone()]
+    );
+    assert!(directory.join("events.000001.jsonl").exists());
     e2e.cleanup();
 }
 
