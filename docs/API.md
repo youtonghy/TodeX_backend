@@ -462,7 +462,7 @@ Pi 在回合之间持续读取 RPC stdout，支持后台通知、消息、工具
 
 ### 预热（conversation.warm）
 
-客户端可在用户提交 prompt 之前请求 daemon 预先启动当前会话的 Agent，省去首个 turn 的进程启动、`initialize` 与会话建立/恢复耗时。WebSocket 命令 `conversation.warm` 的 payload 为 `{ "conversationId": "..." }`，与 HTTP `POST /v2/conversations/{conversationId}/warm`（无请求体）等价；它在读循环之外执行，不阻塞同一连接上的其他命令。结果为 `{ "conversationId", "warmed": true }`，或跳过时 `{ "conversationId", "warmed": false, "reason" }`。预热是尽力而为：只有会话不存在或不属于该设备所有者（`NOT_FOUND`）以及请求无效（缺少 `conversationId`）才返回错误，其余情况都以 `warmed: false` 应答，`reason` 取值：
+客户端可在用户提交 prompt 之前请求 daemon 预先启动当前会话的 Agent，省去首个 turn 的进程启动、`initialize` 与会话建立/恢复耗时。WebSocket 命令 `conversation.warm` 的 payload 为 `{ "conversationId": "..." }`，与 HTTP `POST /v2/conversations/{conversationId}/warm`（无请求体）等价；它在读循环之外执行，不阻塞同一连接上的其他命令。结果为 `{ "conversationId", "warmed": true }`，或跳过时 `{ "conversationId", "warmed": false, "reason" }`。预热是尽力而为：只有会话不存在或不属于该设备所有者（`NOT_FOUND`；预热期间会话被删除或过期时同样如此，预热启动的进程随即关闭）以及请求无效（缺少 `conversationId`）才返回错误，其余情况都以 `warmed: false` 应答，`reason` 取值：
 
 | reason | 含义 |
 | --- | --- |
@@ -473,14 +473,15 @@ Pi 在回合之间持续读取 RPC stdout，支持后台通知、消息、工具
 | `unavailable` | Provider CLI 不可用 |
 | `untrusted_workspace` | 工作区未被信任 |
 | `workspace_unavailable` | 工作区路径无效或不在允许的根目录下 |
-| `busy` | 已有 4 个预热在进行、CLI 升级占用执行闸门，或工作区信任正在变更 |
+| `busy` | 已有 4 个预热在进行、CLI 升级或过期清理占用执行闸门、工作区信任正在变更，或 daemon 正在关闭 |
 | `unsupported_provider` | Provider 每个 turn 启动一个进程（Antigravity、`resident = false` 的 ACP profile） |
 | `already_warm` | 会话已有常驻进程 |
 | `limit` | Provider 的常驻进程已达上限；预热不会淘汰其他会话的进程 |
+| `auth_required` | 登录可能需要用户操作（如未配置 API key 时 Devin 的浏览器登录、ACP profile 只配置了 `auth_method`）；预热从不发起交互式登录，也不启动进程，由首个 turn 完成登录 |
 | `failed` | 启动或握手失败（详情只写入 daemon 日志） |
 | `timeout` | 30 秒内未完成；进程继续在后台准备，下一 turn 照常复用或重启 |
 
-预热按会话最近一次请求快照中的 `model`、`reasoningEffort`、`permissionMode`、`workMode`、`permissionProfile`、`sandboxMode`、`approvalPolicy`（无快照或已无法校验时用默认值）启动进程，并完成首个 turn 在发送 prompt 之前的全部步骤：常驻 ACP 进程（ACP profile、Grok Build、Devin、OpenCode、DeepSeek Harness）完成 `initialize`（及 `authenticate`）与 `session/new` / `session/resume` / `session/load`；Codex 完成 `initialize` 与 `thread/start` / `thread/resume`；Claude Code 启动 stream-json 进程并完成 `initialize`；Pi 启动 RPC runtime。随后的 turn 若设置不同，按各 Provider 的既有规则处理（ACP 通过 `session/set_config_option`，Claude Code 以 `--resume` 重启进程）。预热不写入会话日志、不改变 manifest 状态，也不保存 Provider 状态：新建的原生会话由首个 turn 记录。预热期间 Provider 发出的事件（如 `provider.commands.updated`、`session/recreated`、Codex 的 `turn.configuration`）先由 daemon 暂存，在下一个 turn 的 `turn.started` 之后写入日志。Pi runtime 的 `provider.runtime` `ready` 事件推迟到首个 turn 才记录；未被使用的预热进程在 `provider_keepalive_seconds` 后静默停止。与预热同时到达的 turn 在同一进程上排队，等预热完成后执行。
+预热按会话最近一次请求快照中的 `model`、`reasoningEffort`、`permissionMode`、`workMode`、`permissionProfile`、`sandboxMode`、`approvalPolicy`（无快照或已无法校验时用默认值）启动进程，并完成首个 turn 在发送 prompt 之前的全部步骤：常驻 ACP 进程（ACP profile、Grok Build、Devin、OpenCode、DeepSeek Harness）完成 `initialize`（及 `authenticate`）与 `session/new` / `session/resume` / `session/load`；Codex 完成 `initialize` 与 `thread/start` / `thread/resume`；Claude Code 启动 stream-json 进程并完成 `initialize`；Pi 启动 RPC runtime。随后的 turn 若设置不同，按各 Provider 的既有规则处理（ACP 通过 `session/set_config_option`；只能经命令行参数应用某项设置的 Agent（如 Grok Build 未暴露的选项）在预热后的首个 turn 按该 turn 的设置重启进程，与冷启动一致；Claude Code 以 `--resume` 重启进程）。Codex 的 `turn.configuration` 由首个 turn 记录：设置与预热相同时为 `thread/start` / `thread/resume` 响应确认的值（`effective.source: "provider-confirmed"`），不同时为该 turn 的 `turn/start` 所覆盖的值（`effective.source: "requested"`）。预热不写入会话日志、不改变 manifest 状态，也不保存 Provider 状态：新建的原生会话由首个 turn 记录。预热期间 Provider 发出的事件（如 `provider.commands.updated`、`session/recreated`）先由 daemon 暂存，在下一个 turn 的 `turn.started` 之后写入日志；此后（包括预热仍在进行或已超时时提交的 turn）预热进程再发出的事件直接记入该 turn，与常驻进程在 turn 之间的通知相同，不会留给之后的 turn。Pi runtime 的 `provider.runtime` `ready` 事件推迟到首个 turn 才记录；未被使用的预热进程在 `provider_keepalive_seconds` 后静默停止，不记录 `stopped`。与预热同时到达的 turn 在同一进程上排队，等预热完成后执行。
 
 Pi capability 额外声明 `runtimeStop`、`sessionCommands`、`extensionMessages` 与 `extensionUi` 方法列表。标准 RPC 扩展输入 `select`、`confirm`、`input`、`editor` 继续经 permission broker 回答；`permission.requested` / `permission.resolved` 带 `runtimeId` 与 `scope: "session" | "turn"`，请求 details 中也保留上下文。session 表单可跨越回合，回合取消只关闭 turn 表单。
 

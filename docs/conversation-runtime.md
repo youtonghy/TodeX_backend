@@ -131,10 +131,15 @@ optional and canonical aliases are recomputed when old journals are replayed.
   process before its next prompt, prepared with the settings of its last
   request: spawn, `initialize` and the native session setup run, nothing is
   journalled meanwhile; events the provider sends during the prewarm are
-  held and journalled after the next turn's `turn.started`. At most 4 prewarms run at once; one never evicts another
-  conversation's process. `false` makes every warm request answer
-  `warmed: false` with `reason: "disabled"`. See docs/API.md for the skip
-  reasons.
+  held and journalled after the next turn's `turn.started`, and anything it
+  sends once that turn started (even when it was submitted while the warm
+  still ran) is journalled with that turn. At most 4 prewarms run at once;
+  one never evicts another conversation's process, never starts a sign-in
+  that may need the user (`auth_required`), and never holds the CLI
+  execution gate while the provider starts. A conversation deleted or
+  expired during its warm has the revived process shut down again. `false`
+  makes every warm request answer `warmed: false` with
+  `reason: "disabled"`. See docs/API.md for the skip reasons.
 - WebSocket delivery never waits on a stuck peer: a socket send over 20 s or an
   outgoing queue full for over 10 s closes the connection. Subscribe backfill
   runs beside the read loop, so replies to later commands may interleave with
