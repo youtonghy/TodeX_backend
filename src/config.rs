@@ -155,13 +155,16 @@ pub const DEFAULT_PROVIDER_KEEPALIVE_SECONDS: u64 = 300;
 /// Shorter keepalives are raised to this; a process that stops between
 /// quick follow-up turns would pay its whole startup again.
 pub const MIN_PROVIDER_KEEPALIVE_SECONDS: u64 = 30;
+/// Longer keepalives are lowered to this (a week): deadlines are computed as
+/// `Instant::now() + keepalive`, which a value near `u64::MAX` overflows.
+pub const MAX_PROVIDER_KEEPALIVE_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 /// The keepalive of [`Config::load`], for runtimes built without the config.
 static PROVIDER_KEEPALIVE_SECONDS: AtomicU64 = AtomicU64::new(DEFAULT_PROVIDER_KEEPALIVE_SECONDS);
 
 impl AgentConfig {
-    /// The idle keepalive of resident provider processes, at least
-    /// [`MIN_PROVIDER_KEEPALIVE_SECONDS`].
+    /// The idle keepalive of resident provider processes, clamped to
+    /// [`MIN_PROVIDER_KEEPALIVE_SECONDS`]..=[`MAX_PROVIDER_KEEPALIVE_SECONDS`].
     pub fn provider_keepalive(&self) -> Duration {
         keepalive_duration(self.provider_keepalive_seconds)
     }
@@ -175,7 +178,10 @@ pub fn provider_keepalive() -> Duration {
 }
 
 fn keepalive_duration(seconds: u64) -> Duration {
-    Duration::from_secs(seconds.max(MIN_PROVIDER_KEEPALIVE_SECONDS))
+    Duration::from_secs(seconds.clamp(
+        MIN_PROVIDER_KEEPALIVE_SECONDS,
+        MAX_PROVIDER_KEEPALIVE_SECONDS,
+    ))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1311,6 +1317,12 @@ mod tests {
         if env::var_os("TODEX_AGENTD_PROVIDER_KEEPALIVE_SECONDS").is_none() {
             assert_eq!(config.agent.provider_keepalive_seconds, 900);
             assert_eq!(config.agent.provider_keepalive(), Duration::from_secs(900));
+            let mut forever = config.agent.clone();
+            forever.provider_keepalive_seconds = u64::MAX;
+            assert_eq!(
+                forever.provider_keepalive(),
+                Duration::from_secs(crate::config::MAX_PROVIDER_KEEPALIVE_SECONDS)
+            );
         }
         if env::var_os("TODEX_AGENTD_PROVIDER_PREWARM").is_none() {
             assert!(!config.agent.provider_prewarm);

@@ -116,7 +116,7 @@ optional and canonical aliases are recomputed when old journals are replayed.
   permission request of the conversation is pending. The turn is cancelled
   normally, the driver is aborted if it has not finished 30 s later, and the
   turn ends with `turn.failed` code `PROVIDER_IDLE_TIMEOUT`.
-- `[agent].provider_keepalive_seconds` (default 300, minimum 30; env
+- `[agent].provider_keepalive_seconds` (default 300, clamped to 30..=604800; env
   `TODEX_AGENTD_PROVIDER_KEEPALIVE_SECONDS`) is how long a resident provider
   process (Codex, Claude Code, Pi, OpenCode, Grok Build, Devin, DeepSeek Harness and ACP
   profiles unless `resident = false`) is kept with no turn before it is

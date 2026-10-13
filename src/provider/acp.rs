@@ -1554,18 +1554,16 @@ async fn prepare_acp_session(
                 ));
                 }
                 let loaded = if can_resume {
-                    let request_id = send_request(
-                        process,
-                        "session/resume",
-                        with_agent_mcp(
-                            json!({
-                                "sessionId": session_id,
-                                "cwd": context.manifest.workspace,
-                            }),
-                            context,
-                        ),
-                    )
-                    .await?;
+                    let mut request = json!({
+                        "sessionId": session_id,
+                        "cwd": context.manifest.workspace,
+                    });
+                    // Resume reopens the session in the agent's default mode
+                    // too; ask mode must be requested as on new and load.
+                    apply_session_metadata(&mut request, options, false);
+                    let request_id =
+                        send_request(process, "session/resume", with_agent_mcp(request, context))
+                            .await?;
                     wait_for_response(
                         process,
                         &request_id,
