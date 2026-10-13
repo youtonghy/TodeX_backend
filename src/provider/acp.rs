@@ -139,6 +139,15 @@ pub(super) struct AcpRuntimeOptions {
     pub snake_case_image_mime: bool,
 }
 
+impl AcpRuntimeOptions {
+    /// Whether `authenticate` may wait for the user (a browser sign-in):
+    /// exactly the launches given the extended [`INTERACTIVE_AUTH_TIMEOUT`],
+    /// those without a headless credential.
+    pub fn interactive_auth(&self) -> bool {
+        self.authenticate && self.auth_timeout.is_some()
+    }
+}
+
 /// How one ACP agent deviates from plain ACP. Each ACP-based driver declares
 /// its own (`ACP_QUIRKS`); configured ACP profiles use [`GENERIC_ACP`].
 #[derive(Clone, Copy)]
@@ -4411,6 +4420,11 @@ mod tests {
     #[cfg(unix)]
     impl GenericFixture {
         async fn new(resident: bool) -> Self {
+            Self::with_auth(resident, None).await
+        }
+
+        /// A fixture whose profile signs in with `auth_method` (no API key).
+        async fn with_auth(resident: bool, auth_method: Option<&str>) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let root =
                 std::env::temp_dir().join(format!("todex-acp-generic-{}", uuid::Uuid::new_v4()));
@@ -4430,7 +4444,7 @@ mod tests {
                     command: binary.to_string_lossy().to_string(),
                     args: Vec::new(),
                     env: BTreeMap::new(),
-                    auth_method: None,
+                    auth_method: auth_method.map(ToOwned::to_owned),
                     api_key_env: None,
                     resident,
                 },
@@ -4675,6 +4689,23 @@ mod tests {
         assert_eq!(fixture.processes(), 1);
         assert_eq!(fixture.count("initialize"), 1);
         assert_eq!(fixture.count("session/new"), 1);
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prewarm_never_starts_an_interactive_sign_in() {
+        // Without an API key the configured method may need the user.
+        let fixture = GenericFixture::with_auth(true, Some("opencode-login")).await;
+        assert_eq!(
+            fixture.prewarm().await.unwrap(),
+            ProviderPrewarm::AuthRequired
+        );
+        assert_eq!(
+            ProviderPrewarm::AuthRequired.reason(),
+            Some("auth_required")
+        );
+        assert_eq!(fixture.processes(), 0);
         fixture.finish().await;
     }
 

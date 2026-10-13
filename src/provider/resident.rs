@@ -9,7 +9,9 @@
 //! supplies how to launch it; everything else is shared.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -44,6 +46,8 @@ pub(super) struct ResidentLaunch {
 #[derive(Clone)]
 struct SessionHandle {
     workspace: PathBuf,
+    /// Set while a prewarm's process waits for its first turn.
+    warm_pending: Arc<AtomicBool>,
     turns: mpsc::Sender<ResidentRequest>,
     controls: mpsc::Sender<PendingProviderControl>,
     shutdown: watch::Sender<bool>,
@@ -93,6 +97,9 @@ struct ResidentTurn {
     cancel: watch::Receiver<bool>,
     launch_permit: WorkspaceTrustPermit,
     respond_to: oneshot::Sender<ResidentReply>,
+    /// How a cold start would launch this turn; set for the first turn
+    /// after a prewarm, which may need a process started with its flags.
+    relaunch: Option<Box<ResidentLaunch>>,
 }
 
 enum ResidentReply {
@@ -161,10 +168,15 @@ impl ResidentSessions {
             cancel,
             launch_permit,
             respond_to: oneshot::channel().0,
+            relaunch: None,
         };
         let mut retried = false;
         loop {
             let handle = self.session(&conversation_id, &turn, &launch).await?;
+            if turn.relaunch.is_none() && handle.warm_pending.load(Ordering::Acquire) {
+                // Without one, the turn runs strictly on the warm process.
+                turn.relaunch = launch(&turn.context, &turn.prompt).ok().map(Box::new);
+            }
             let (respond_to, response) = oneshot::channel();
             turn.respond_to = respond_to;
             let (returned, retry) = match handle.turns.send(ResidentRequest::Turn(turn)).await {
@@ -226,7 +238,10 @@ impl ResidentSessions {
                                 self.max_sessions
                             )));
                         }
-                        let handle = self.spawn_session(&turn.context, &turn.prompt, launch)?;
+                        let handle = self.spawn_session(
+                            &turn.context.manifest.workspace,
+                            launch(&turn.context, &turn.prompt)?,
+                        );
                         sessions.insert(conversation_id.to_owned(), handle.clone());
                         return Ok(handle);
                     }
@@ -247,7 +262,10 @@ impl ResidentSessions {
     /// Starts the conversation's session and prepares it for its first turn
     /// (see [`super::acp::prewarm_acp_session`]). A conversation that has a
     /// session, or a full session table, is left alone: a prewarm never
-    /// evicts. A turn arriving meanwhile waits for the prewarm on the actor.
+    /// evicts. Neither does it start a sign-in that may need the user (it
+    /// would hold the actor for the interactive auth timeout); the first
+    /// turn does that. A turn arriving meanwhile waits for the prewarm on
+    /// the actor.
     pub(super) async fn prewarm(
         &self,
         context: DriverContext,
@@ -268,7 +286,12 @@ impl ResidentSessions {
             if sessions.len() >= self.max_sessions {
                 return Ok(ProviderPrewarm::Limit);
             }
-            let handle = self.spawn_session(&context, &settings, &launch)?;
+            let launched = launch(&context, &settings)?;
+            if launched.runtime.interactive_auth() {
+                return Ok(ProviderPrewarm::AuthRequired);
+            }
+            let handle = self.spawn_session(&context.manifest.workspace, launched);
+            handle.warm_pending.store(true, Ordering::Release);
             // The actor's queue is new and empty: the prewarm is queued
             // before any turn can find the session.
             if handle
@@ -297,13 +320,9 @@ impl ResidentSessions {
         }
     }
 
-    fn spawn_session(
-        &self,
-        context: &DriverContext,
-        prompt: &DriverPrompt,
-        launch: &impl Fn(&DriverContext, &DriverPrompt) -> Result<ResidentLaunch, AppError>,
-    ) -> Result<SessionHandle, AppError> {
-        let ResidentLaunch { spec, runtime } = launch(context, prompt)?;
+    fn spawn_session(&self, workspace: &Path, launch: ResidentLaunch) -> SessionHandle {
+        let ResidentLaunch { spec, runtime } = launch;
+        let warm_pending = Arc::new(AtomicBool::new(false));
         let (turns, turn_rx) = mpsc::channel(1);
         let (controls, control_rx) = mpsc::channel(16);
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -315,16 +334,18 @@ impl ResidentSessions {
                 idle_timeout: self.idle_timeout,
                 spec,
                 runtime,
+                warm_pending: warm_pending.clone(),
             }
             .run(turn_rx, control_rx, shutdown_rx, stopped_tx),
         );
-        Ok(SessionHandle {
-            workspace: context.manifest.workspace.clone(),
+        SessionHandle {
+            workspace: workspace.to_owned(),
+            warm_pending,
             turns,
             controls,
             shutdown,
             stopped,
-        })
+        }
     }
 
     /// Whether a turn is queued behind the running one.
@@ -421,11 +442,12 @@ struct SessionActor {
     idle_timeout: Duration,
     spec: CommandSpec,
     runtime: AcpRuntimeOptions,
+    warm_pending: Arc<AtomicBool>,
 }
 
 impl SessionActor {
     async fn run(
-        self,
+        mut self,
         mut turns: mpsc::Receiver<ResidentRequest>,
         mut controls: mpsc::Receiver<PendingProviderControl>,
         mut shutdown: watch::Receiver<bool>,
@@ -472,6 +494,7 @@ impl SessionActor {
                 mut cancel,
                 launch_permit,
                 respond_to,
+                relaunch,
             } = match request {
                 ResidentRequest::Turn(turn) => turn,
                 ResidentRequest::Warm(warm) => {
@@ -515,6 +538,27 @@ impl SessionActor {
                     continue;
                 }
             };
+            self.warm_pending.store(false, Ordering::Release);
+            let warmed = warmed_with.take();
+            // A process a prewarm started with this turn's settings still
+            // has the flags they map to.
+            let warmed_for_turn = warmed
+                .as_ref()
+                .is_some_and(|warmed| *warmed == WarmSettings::of(&prompt));
+            if warmed.is_some() && !warmed_for_turn && self.runtime.allow_cli_config_fallback {
+                // The warm's flags do not match and this agent may only take
+                // the turn's config as flags: start over as a cold first
+                // turn would, instead of failing on the warm process.
+                if let Some(relaunch) = relaunch {
+                    if let Some(mut stale) = process.take() {
+                        stale.terminate().await;
+                    }
+                    connection = AcpConnectionState::default();
+                    last_sink = None;
+                    self.spec = relaunch.spec;
+                    self.runtime = relaunch.runtime;
+                }
+            }
             if process.is_none() {
                 match JsonLineProcess::spawn_trusted(&self.spec, launch_permit).await {
                     Ok(spawned) => process = Some(spawned),
@@ -528,11 +572,7 @@ impl SessionActor {
             }
             let mut options = self.runtime.clone();
             // A reused process cannot apply a new CLI fallback; require a
-            // protocol ACK. A process a prewarm started with this turn's
-            // settings still has the flags they map to.
-            let warmed_for_turn = warmed_with
-                .take()
-                .is_some_and(|warmed| warmed == WarmSettings::of(&prompt));
+            // protocol ACK.
             if last_sink.is_some() && !warmed_for_turn {
                 options.allow_cli_config_fallback = false;
             }

@@ -715,6 +715,19 @@ mod tests {
             watch::Sender<bool>,
             tokio::task::JoinHandle<Result<DriverTurnResult, AppError>>,
         ) {
+            self.start_with(turn_id, text, model, None).await
+        }
+
+        async fn start_with(
+            &self,
+            turn_id: &str,
+            text: &str,
+            model: Option<&str>,
+            effort: Option<&str>,
+        ) -> (
+            watch::Sender<bool>,
+            tokio::task::JoinHandle<Result<DriverTurnResult, AppError>>,
+        ) {
             let context = DriverContext {
                 manifest: self.manifest.clone(),
                 provider_state: self.store.provider_state(&self.manifest.id).await.unwrap(),
@@ -726,7 +739,7 @@ mod tests {
                 content: vec![],
                 skills: vec![],
                 model: model.map(ToOwned::to_owned),
-                reasoning_effort: None,
+                reasoning_effort: effort.map(ToOwned::to_owned),
                 permission_mode: None,
                 work_mode: None,
                 permission_profile: None,
@@ -766,6 +779,52 @@ mod tests {
             })
             .await
             .expect("fixture request deadline");
+        }
+
+        /// Prepares the conversation's process with the default settings.
+        async fn prewarm(&self) -> ProviderPrewarm {
+            let context = DriverContext {
+                manifest: self.manifest.clone(),
+                provider_state: self.store.provider_state(&self.manifest.id).await.unwrap(),
+                agent_mcp: None,
+            };
+            let settings = DriverPrompt {
+                turn_id: "prewarm".to_owned(),
+                text: String::new(),
+                content: vec![],
+                skills: vec![],
+                model: None,
+                reasoning_effort: None,
+                permission_mode: None,
+                work_mode: None,
+                permission_profile: None,
+                sandbox_mode: None,
+                approval_policy: None,
+            };
+            let sink = DriverEventSink::new(
+                self.store.clone(),
+                crate::conversation::ConversationEventHub::default(),
+                super::super::types::PermissionBroker::default(),
+                &self.manifest.id,
+            )
+            .muted();
+            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.driver.prewarm(context, settings, sink, permit),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        /// The argv of every process the fixture ran, in launch order.
+        fn launches(&self) -> Vec<Vec<String>> {
+            std::fs::read_to_string(self.root.join("grok-launches.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
         }
 
         fn requests(&self) -> Vec<Value> {
@@ -962,6 +1021,33 @@ mod tests {
                 .count(),
             3
         );
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_first_turn_needing_other_flags_than_its_prewarm_relaunches() {
+        let fixture = Fixture::new().await;
+        // Only the `--reasoning-effort` flag can set the effort.
+        std::fs::write(fixture.root.join("no-effort-option"), "").unwrap();
+        assert_eq!(fixture.prewarm().await, ProviderPrewarm::Warmed);
+        assert_eq!(fixture.launches().len(), 1);
+        let (_cancel, task) = fixture
+            .start_with("turn-first", "normal", None, Some("high"))
+            .await;
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.stop_reason, "end_turn");
+        // As a cold first turn: a process started with the turn's flags.
+        let launches = fixture.launches();
+        assert_eq!(launches.len(), 2);
+        assert!(!launches[0].contains(&"--reasoning-effort".to_owned()));
+        assert!(launches[1]
+            .windows(2)
+            .any(|pair| pair == ["--reasoning-effort", "high"]));
         fixture.finish().await;
     }
 

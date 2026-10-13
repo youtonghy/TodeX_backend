@@ -1120,6 +1120,9 @@ pub enum ProviderPrewarm {
     Unsupported,
     /// The provider's resident process limit is reached; nothing is evicted.
     Limit,
+    /// Signing in may need the user (a browser login), which a warm never
+    /// starts; the first turn authenticates.
+    AuthRequired,
 }
 
 impl ProviderPrewarm {
@@ -1130,6 +1133,7 @@ impl ProviderPrewarm {
             Self::AlreadyWarm => Some("already_warm"),
             Self::Unsupported => Some("unsupported_provider"),
             Self::Limit => Some("limit"),
+            Self::AuthRequired => Some("auth_required"),
         }
     }
 }

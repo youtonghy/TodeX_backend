@@ -25,12 +25,17 @@ def result(request_id, value):
 
 
 def options():
-    return [
+    entries = [
         {"id": "model", "name": "Model", "type": "select", "currentValue": model,
          "options": [{"value": "grok-fixture", "name": "Fixture"}, {"value": "grok-other", "name": "Other"}]},
         {"id": "reasoning_effort", "name": "Reasoning effort", "type": "select", "currentValue": effort,
          "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]},
     ]
+    # A test hides the effort option (only the `--reasoning-effort` flag sets
+    # it) with a marker in the workspace.
+    if os.path.exists("no-effort-option"):
+        entries.pop()
+    return entries
 
 
 def update(kind, **fields):
@@ -49,6 +54,9 @@ def finish(stop="end_turn"):
     }})
     active = None
 
+
+with open("grok-launches.jsonl", "a") as launches:
+    launches.write(json.dumps(sys.argv[1:]) + "\n")
 
 for line in sys.stdin:
     request = json.loads(line)

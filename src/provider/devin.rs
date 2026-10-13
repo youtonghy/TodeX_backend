@@ -1124,6 +1124,8 @@ mod tests {
             driver.runtime_options().unwrap().auth_timeout,
             Some(INTERACTIVE_AUTH_TIMEOUT)
         );
+        // The browser fallback: a prewarm skips it (`auth_required`).
+        assert!(driver.runtime_options().unwrap().interactive_auth());
 
         unsafe {
             std::env::set_var("DEVIN_TEST_TIMEOUT_KEY", "key-value");
@@ -1133,6 +1135,7 @@ mod tests {
             ..driver
         };
         assert_eq!(keyed.auth_timeout().unwrap(), None);
+        assert!(!keyed.runtime_options().unwrap().interactive_auth());
         unsafe {
             std::env::remove_var("DEVIN_TEST_TIMEOUT_KEY");
         }
