@@ -669,11 +669,17 @@ mod tests {
         }
 
         impl Harness {
+            /// As agy names it: without Windows' verbatim `\\?\` prefix, which
+            /// the hook treats as a device path.
             fn workspace(&self) -> String {
-                std::fs::canonicalize(self.root.join("workspaces/project"))
+                let path = std::fs::canonicalize(self.root.join("workspaces/project"))
                     .unwrap()
                     .display()
-                    .to_string()
+                    .to_string();
+                match path.strip_prefix(r"\\?\") {
+                    Some(local) => local.to_owned(),
+                    None => path,
+                }
             }
 
             async fn post(&self, token: Option<&str>, tool: &str, args: Value) -> (u16, Value) {

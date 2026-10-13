@@ -392,15 +392,25 @@ async fn turns_stream_their_events_as_sse_and_resume_by_last_event_id() {
         .any(|(_, kind, data)| kind == "turn.started" && data["payload"]["turnId"] == turn_id));
     assert!(!String::from_utf8_lossy(&body).contains("$enc"));
 
-    // A second turn while none runs, then a non-streamed one: 202.
-    let (status, accepted) = fixture
-        .call(
-            "POST",
-            &format!("/api/v1/conversations/{id}/turns"),
-            Some(&key),
-            Some(json!({ "text": "hello again" })),
-        )
-        .await;
+    // A second turn while none runs, then a non-streamed one: 202. The
+    // conversation is released shortly after `turn.completed` is journaled,
+    // so a turn sent right away may still find the first one running.
+    let mut attempts = 0;
+    let (status, accepted) = loop {
+        let (status, accepted) = fixture
+            .call(
+                "POST",
+                &format!("/api/v1/conversations/{id}/turns"),
+                Some(&key),
+                Some(json!({ "text": "hello again" })),
+            )
+            .await;
+        attempts += 1;
+        if status != StatusCode::CONFLICT || attempts == 250 {
+            break (status, accepted);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
     assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
     assert!(accepted["turnId"].is_string());
 

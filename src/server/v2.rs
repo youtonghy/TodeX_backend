@@ -8900,7 +8900,13 @@ mod tests {
 
         let foreign = state
             .conversations
-            .create_owned("other-owner", ProviderKind::Codex, workspace, None, None)
+            .create_owned(
+                "other-owner",
+                ProviderKind::ClaudeCode,
+                workspace,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let denied = app

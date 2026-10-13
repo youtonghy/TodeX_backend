@@ -2749,7 +2749,26 @@ mod tests {
                 settle(&entry.unwrap().path());
             }
         }
-        fs::File::open(root).unwrap().set_modified(past).unwrap();
+        open_to_set_times(root).set_modified(past).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    fn open_to_set_times(path: &Path) -> fs::File {
+        fs::File::open(path).unwrap()
+    }
+
+    /// Windows needs write-attribute access to change times, and backup
+    /// semantics to open a directory at all.
+    #[cfg(windows)]
+    fn open_to_set_times(path: &Path) -> fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap()
     }
 
     fn builds(service: &CatalogService) -> usize {
