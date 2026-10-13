@@ -570,7 +570,9 @@ pub(super) async fn workspace_entries(
 
     let raw_query = query.query.as_deref().unwrap_or("");
     let relative_query = normalize_relative_query(raw_query)?;
+    let roots = canonical_workspace_roots(&state.config.workspace_access_roots());
     let entries = list_workspace_entries(
+        &roots,
         &cwd,
         &relative_query,
         raw_query.trim().ends_with('/'),
@@ -1162,7 +1164,12 @@ pub(super) fn mime_for_name(name: &str) -> String {
     .to_owned()
 }
 
+/// Lists entries under `cwd` matching the query. Directory entries are read
+/// without following symlinks; a queried directory path may pass through a
+/// symlink, so it is listed only when its canonical target stays inside one of
+/// the canonical workspace `roots` (as `/v2/workspace/directories` requires).
 async fn list_workspace_entries(
+    roots: &[PathBuf],
     cwd: &Path,
     relative_query: &Path,
     trailing_slash_query: bool,
@@ -1170,7 +1177,7 @@ async fn list_workspace_entries(
 ) -> Result<Vec<WorkspaceEntry>, AppError> {
     let query_text = slash_path(relative_query);
     if query_text.is_empty() {
-        return list_direct_workspace_entries(cwd, Path::new(""), "", limit).await;
+        return list_direct_workspace_entries(roots, cwd, Path::new(""), "", limit).await;
     }
 
     let include_hidden = query_includes_hidden_path(&query_text);
@@ -1179,12 +1186,17 @@ async fn list_workspace_entries(
         if !directory.exists() || !directory.is_dir() {
             return Ok(vec![]);
         }
-        return list_direct_workspace_entries(cwd, relative_query, "", limit).await;
+        return list_direct_workspace_entries(roots, cwd, relative_query, "", limit).await;
     }
 
     let mut entries = Vec::new();
     let mut queue = VecDeque::from([PathBuf::new()]);
     let query = query_text.to_ascii_lowercase();
+    if canonical_listing_directory(roots, cwd).await?.is_none() {
+        return Ok(vec![]);
+    }
+    // Only real directories (never symlinks) are queued below, so every
+    // directory visited stays under the checked `cwd`.
     while let Some(directory_query) = queue.pop_front() {
         let directory = cwd.join(&directory_query);
         let mut read_dir = match tokio::fs::read_dir(&directory).await {
@@ -1231,15 +1243,16 @@ async fn list_workspace_entries(
 }
 
 async fn list_direct_workspace_entries(
+    roots: &[PathBuf],
     cwd: &Path,
     directory_query: &Path,
     filter: &str,
     limit: usize,
 ) -> Result<Vec<WorkspaceEntry>, AppError> {
-    let directory = cwd.join(directory_query);
-    if !directory.exists() || !directory.is_dir() {
+    let Some(directory) = canonical_listing_directory(roots, &cwd.join(directory_query)).await?
+    else {
         return Ok(vec![]);
-    }
+    };
 
     let mut entries = Vec::new();
     let filter = filter.to_ascii_lowercase();
@@ -1266,6 +1279,33 @@ async fn list_direct_workspace_entries(
     sort_workspace_entries(&mut entries);
     entries.truncate(limit);
     Ok(entries)
+}
+
+/// The canonical form of `directory` when it is an existing directory inside
+/// one of the canonical workspace `roots`; `None` when it is missing, not a
+/// directory, or resolves (through a symlink) outside every root.
+async fn canonical_listing_directory(
+    roots: &[PathBuf],
+    directory: &Path,
+) -> Result<Option<PathBuf>, AppError> {
+    let canonical = match tokio::fs::canonicalize(directory).await {
+        Ok(canonical) => canonical,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if containing_workspace_root(roots, &canonical).is_none() || !canonical.is_dir() {
+        return Ok(None);
+    }
+    Ok(Some(canonical))
 }
 
 async fn list_workspace_directories(
@@ -5890,14 +5930,59 @@ mod tests {
         fs::write(root.join("docs/routes.md"), "").unwrap();
         fs::write(root.join("README.md"), "").unwrap();
 
-        let entries = list_workspace_entries(&root, Path::new("routes"), false, 20)
-            .await
-            .unwrap();
+        let entries = list_workspace_entries(
+            std::slice::from_ref(&root),
+            &root,
+            Path::new("routes"),
+            false,
+            20,
+        )
+        .await
+        .unwrap();
         let paths = entry_paths(&entries);
 
         assert_eq!(paths, vec!["docs/routes.md", "src/server/routes.rs"]);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_entries_do_not_follow_symlinks_out_of_the_root() {
+        let base = fs::canonicalize(make_temp_workspace("entries-symlink")).unwrap();
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(outside.join("secret")).unwrap();
+        fs::write(outside.join("secret/key.pem"), "").unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(root.join("src"), root.join("inside")).unwrap();
+        let roots = [root.clone()];
+
+        for query in ["escape", "escape/secret"] {
+            let entries = list_workspace_entries(&roots, &root, Path::new(query), true, 20)
+                .await
+                .unwrap();
+            assert!(entries.is_empty(), "{query}: {:?}", entry_paths(&entries));
+        }
+        let entries = list_workspace_entries(&roots, &root, Path::new("key"), false, 20)
+            .await
+            .unwrap();
+        assert!(entries.is_empty(), "{:?}", entry_paths(&entries));
+        // A symlink that stays inside the root still lists.
+        let entries = list_workspace_entries(&roots, &root, Path::new("inside"), true, 20)
+            .await
+            .unwrap();
+        assert_eq!(entry_paths(&entries), vec!["inside/lib.rs"]);
+        // A cwd that itself resolves outside the roots lists nothing.
+        let entries =
+            list_workspace_entries(&roots, &root.join("escape"), Path::new(""), false, 20)
+                .await
+                .unwrap();
+        assert!(entries.is_empty());
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[tokio::test]
@@ -5908,14 +5993,26 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/settings.json"), "").unwrap();
 
-        let visible = list_workspace_entries(&root, Path::new("settings"), false, 20)
-            .await
-            .unwrap();
+        let visible = list_workspace_entries(
+            std::slice::from_ref(&root),
+            &root,
+            Path::new("settings"),
+            false,
+            20,
+        )
+        .await
+        .unwrap();
         assert_eq!(entry_paths(&visible), vec!["src/settings.json"]);
 
-        let hidden = list_workspace_entries(&root, Path::new(".config"), false, 20)
-            .await
-            .unwrap();
+        let hidden = list_workspace_entries(
+            std::slice::from_ref(&root),
+            &root,
+            Path::new(".config"),
+            false,
+            20,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             entry_paths(&hidden),
             vec![".config/", ".config/settings.json"]
