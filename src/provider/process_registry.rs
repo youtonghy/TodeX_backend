@@ -5,7 +5,9 @@
 //! group whose leader is still the recorded process, identified by PID *and*
 //! start time so a reused PID is never signalled (read from the kernel on
 //! macOS and Linux; `ps` elsewhere and for records of older daemons). The file
-//! is rewritten off the async runtime, newest snapshot last. It also names the
+//! is rewritten off the async runtime by one background writer that always
+//! persists the newest snapshot, so spawning a provider never waits for the
+//! disk and the file never regresses to an older snapshot. It also names the
 //! server that owns it; while that server is still alive a second server on
 //! the same data directory neither reaps nor takes over its records.
 //!
@@ -81,6 +83,16 @@ mod unix {
         /// Generation of the snapshot last written; writers hold it, so an
         /// older snapshot never replaces a newer one.
         written: Mutex<u64>,
+        /// The newest snapshot not yet handed to the writer, and whether a
+        /// writer task is running. Snapshots queued while one write is in
+        /// flight coalesce into the newest.
+        pending: Mutex<PendingWrite>,
+    }
+
+    #[derive(Default)]
+    struct PendingWrite {
+        snapshot: Option<Snapshot>,
+        writing: bool,
     }
 
     #[derive(Default)]
@@ -107,15 +119,7 @@ mod unix {
             }) else {
                 return;
             };
-            let registry = self.registry.clone();
-            // Dropped on a runtime thread when a provider exits: write the
-            // file from the blocking pool instead of stalling the runtime.
-            match tokio::runtime::Handle::try_current() {
-                Ok(runtime) => {
-                    runtime.spawn_blocking(move || registry.write(snapshot));
-                }
-                Err(_) => registry.write(snapshot),
-            }
+            self.registry.clone().persist(snapshot);
         }
     }
 
@@ -152,6 +156,7 @@ mod unix {
             owner,
             records: Mutex::new(Records::default()),
             written: Mutex::new(0),
+            pending: Mutex::new(PendingWrite::default()),
         });
         let initial = registry.clone();
         if let Err(error) =
@@ -181,7 +186,26 @@ mod unix {
                 owner,
                 records: Mutex::new(Records::default()),
                 written: Mutex::new(0),
+                pending: Mutex::new(PendingWrite::default()),
             })
+        }
+
+        /// Waits until every snapshot queued so far is on disk.
+        #[cfg(test)]
+        pub(super) async fn flushed(&self) {
+            let generation = self
+                .records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .generation;
+            while *self
+                .written
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                < generation
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
         }
 
         pub(super) async fn track(
@@ -207,21 +231,64 @@ mod unix {
                 });
                 true
             });
-            // Owns the record from here: if this future is dropped while the
-            // write below runs, the record is removed again.
+            // Owns the record from here: dropping it removes the record again
+            // with a newer generation, which the writer persists after this one.
             let tracked = TrackedProcess {
                 registry: self.clone(),
                 pid,
             };
             if let Some(snapshot) = snapshot {
-                let registry = self;
-                if let Err(error) =
-                    tokio::task::spawn_blocking(move || registry.write(snapshot)).await
-                {
-                    tracing::warn!(error = %error, "failed to persist the provider process registry");
-                }
+                // Not awaited: the provider starts without waiting for the
+                // fsync. A daemon crash in that window can leave this one
+                // provider unrecorded, as a crash before tracking always could.
+                self.persist(snapshot);
             }
             Some(tracked)
+        }
+
+        /// Queues `snapshot` for the background writer, starting it if idle.
+        /// Without a runtime (a drop during shutdown) the write is inline.
+        fn persist(self: Arc<Self>, snapshot: Snapshot) {
+            let runtime = match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => runtime,
+                Err(_) => {
+                    self.write(snapshot);
+                    return;
+                }
+            };
+            {
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if pending
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|(queued, _)| *queued < snapshot.0)
+                {
+                    pending.snapshot = Some(snapshot);
+                }
+                if pending.writing {
+                    return;
+                }
+                pending.writing = true;
+            }
+            runtime.spawn_blocking(move || loop {
+                let next = {
+                    let mut pending = self
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match pending.snapshot.take() {
+                        Some(snapshot) => snapshot,
+                        None => {
+                            pending.writing = false;
+                            return;
+                        }
+                    }
+                };
+                self.write(next);
+            });
         }
 
         /// Applies `change` to the records; returns the new snapshot when it
@@ -542,6 +609,7 @@ mod tests {
         let registry = ProcessRegistry::new(path.clone(), None);
         let mut child = spawn_group_leader();
         let tracked = registry.clone().track(child.id(), "fixture").await.unwrap();
+        registry.flushed().await;
         let recorded: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(recorded["processes"][0]["pid"], child.id());
@@ -616,6 +684,7 @@ mod tests {
             .track(provider.id(), "fixture")
             .await
             .unwrap();
+        registry.flushed().await;
 
         assert_eq!(reap_orphans(&path).await, Err(owner));
         assert!(provider.try_wait().unwrap().is_none());
