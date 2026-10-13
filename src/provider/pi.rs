@@ -179,12 +179,12 @@ fn pi_closing_error() -> AppError {
 
 impl PiDriver {
     /// The command line of a runtime serving `context` with `prompt`'s model
-    /// and thinking level, and the configuration it starts with.
+    /// and thinking level.
     fn launch(
         &self,
         context: &DriverContext,
         prompt: &DriverPrompt,
-    ) -> Result<(CommandSpec, PiLaunchConfig), AppError> {
+    ) -> Result<CommandSpec, AppError> {
         super::types::resolve_execution_config(
             context.manifest.provider,
             prompt.permission_mode.as_deref(),
@@ -217,11 +217,7 @@ impl PiDriver {
         if let Some(effort) = &prompt.reasoning_effort {
             spec.push_flag_value("--thinking", effort)?;
         }
-        let launch_config = PiLaunchConfig {
-            model: prompt.model.clone(),
-            thinking: prompt.reasoning_effort.clone(),
-        };
-        Ok((spec, launch_config))
+        Ok(spec)
     }
 
     /// Spawns the conversation's runtime and registers it. The caller holds
@@ -231,7 +227,6 @@ impl PiDriver {
         &self,
         conversation_id: &str,
         spec: &CommandSpec,
-        launch_config: PiLaunchConfig,
         permit: WorkspaceTrustPermit,
         sink: &DriverEventSink,
     ) -> Result<PiSessionHandle, AppError> {
@@ -260,7 +255,6 @@ impl PiDriver {
             shutdown_rx,
             stopping,
             self.idle_timeout,
-            launch_config,
         ));
         let mut sessions = self.sessions.lock().await;
         // A close that arrived during the spawn found only the
@@ -659,7 +653,7 @@ impl ProviderDriver for PiDriver {
         sink: DriverEventSink,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<ProviderPrewarm, AppError> {
-        let (spec, launch_config) = self.launch(&context, &settings)?;
+        let spec = self.launch(&context, &settings)?;
         let conversation_id = context.manifest.id.clone();
         {
             let mut sessions = self.sessions.lock().await;
@@ -680,7 +674,7 @@ impl ProviderDriver for PiDriver {
             starting: &self.starting,
             conversation_id: &conversation_id,
         };
-        self.start_runtime(&conversation_id, &spec, launch_config, launch_permit, &sink)
+        self.start_runtime(&conversation_id, &spec, launch_permit, &sink)
             .await?;
         Ok(ProviderPrewarm::Warmed)
     }
@@ -693,7 +687,7 @@ impl ProviderDriver for PiDriver {
         cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
-        let (spec, launch_config) = self.launch(&context, &prompt)?;
+        let spec = self.launch(&context, &prompt)?;
 
         let conversation_id = context.manifest.id.clone();
         let mut context = context;
@@ -763,14 +757,8 @@ impl ProviderDriver for PiDriver {
                     if let Some(gate) = &self.spawn_gate {
                         let _ = gate.acquire().await;
                     }
-                    self.start_runtime(
-                        &conversation_id,
-                        &spec,
-                        launch_config.clone(),
-                        permit,
-                        &sink,
-                    )
-                    .await?
+                    self.start_runtime(&conversation_id, &spec, permit, &sink)
+                        .await?
                 }
             };
             let (result, response) = oneshot::channel();
@@ -963,10 +951,7 @@ async fn pi_session_worker(
     mut shutdown: watch::Receiver<Option<String>>,
     stopping: Arc<AtomicBool>,
     idle_timeout: Duration,
-    launch_config: PiLaunchConfig,
 ) {
-    // Only the first turn runs with the configuration the CLI started with.
-    let mut launch_config = Some(launch_config);
     let (_idle_cancel, idle_cancel) = watch::channel(false);
     let mut rpc = PiRpc::new(&mut process, Some(session_sink.clone()), idle_cancel);
     rpc.session_sink = Some(session_sink.clone());
@@ -1073,7 +1058,7 @@ async fn pi_session_worker(
             rpc.begin_turn(sink.clone(), turn.cancel.clone());
             let mut queue = Vec::new();
             let mut result = tokio::select! {
-                result = run_pi_turn(&mut rpc, turn.context, turn.prompt, launch_config.take(), &sink, &mut controls, &mut requests, &mut queue) => result,
+                result = run_pi_turn(&mut rpc, turn.context, turn.prompt, &sink, &mut controls, &mut requests, &mut queue) => result,
                 _ = shutdown.changed() => Err(AppError::TurnCancelled),
             };
             // Text and tool progress streamed right before a cancel or failure
@@ -1161,14 +1146,18 @@ async fn pi_session_worker(
         tracing::warn!(error = %error, "failed to persist final Pi UI state");
     }
     rpc.process.terminate().await;
-    if let Err(error) = session_sink
-        .emit(
-            "provider.runtime",
-            json!({"provider":"pi","status":"stopped","reason":reason}),
-        )
-        .await
-    {
-        tracing::warn!(error = %error, "failed to persist Pi runtime closure");
+    // A prewarmed runtime that stops before its first turn never journalled
+    // `ready`, so it has no closure to journal either.
+    if announced {
+        if let Err(error) = session_sink
+            .emit(
+                "provider.runtime",
+                json!({"provider":"pi","status":"stopped","reason":reason}),
+            )
+            .await
+        {
+            tracing::warn!(error = %error, "failed to persist Pi runtime closure");
+        }
     }
     turns.close();
     controls.close();
@@ -1319,19 +1308,10 @@ fn pi_model_supports_images(item: &Value) -> bool {
         .is_some_and(|inputs| inputs.iter().any(|input| input.as_str() == Some("image")))
 }
 
-/// The `--model` / `--thinking` a Pi process was started with.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct PiLaunchConfig {
-    model: Option<String>,
-    thinking: Option<String>,
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn run_pi_turn(
     rpc: &mut PiRpc<'_>,
     context: DriverContext,
     prompt: DriverPrompt,
-    launch_config: Option<PiLaunchConfig>,
     sink: &DriverEventSink,
     controls: &mut mpsc::Receiver<PendingProviderControl>,
     requests: &mut mpsc::Receiver<PiSessionRequest>,
@@ -1354,20 +1334,15 @@ async fn run_pi_turn(
     let requested_model = prompt.model.as_deref();
     let requested_thinking = prompt.reasoning_effort.as_deref();
     validate_pi_config(requested_model, requested_thinking)?;
-    // A fresh process already applied the CLI flags it was started with;
-    // otherwise only values the runtime does not report are sent.
-    let launched = launch_config.is_some_and(|launched| {
-        launched.model.as_deref() == requested_model
-            && launched.thinking.as_deref() == requested_thinking
-    });
+    // Only values the runtime does not report are sent. Even a fresh
+    // process is checked: `--session` may restore the saved session's model
+    // over the `--model` it was started with.
     let current_model = state.pointer("/data/model").and_then(pi_model_id);
-    let set_model =
-        requested_model.filter(|model| !launched && current_model.as_deref() != Some(*model));
+    let set_model = requested_model.filter(|model| current_model.as_deref() != Some(*model));
     // A model switch may reset the level, so a requested level follows it.
     let set_thinking = requested_thinking.filter(|level| {
-        !launched
-            && (set_model.is_some()
-                || state.pointer("/data/thinkingLevel").and_then(Value::as_str) != Some(*level))
+        set_model.is_some()
+            || state.pointer("/data/thinkingLevel").and_then(Value::as_str) != Some(*level)
     });
     if set_model.is_some() || set_thinking.is_some() {
         rpc.reusable = false;
@@ -3487,6 +3462,49 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn a_prewarmed_runtime_stopped_before_any_turn_journals_no_closure() {
+        use crate::conversation::ConversationEventHub;
+        let fixture = Fixture::new().await;
+        let (context, settings) = fixture.turn_parts("", "prewarm").await;
+        let sink = DriverEventSink::new(
+            fixture.store.clone(),
+            ConversationEventHub::default(),
+            fixture.permissions.clone(),
+            &fixture.manifest.id,
+        );
+        let muted = sink.clone().muted();
+        let permit = fixture
+            .trust
+            .acquire_owned("local", &fixture.root)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .driver
+                .prewarm(context, settings, muted.clone(), permit)
+                .await
+                .unwrap(),
+            ProviderPrewarm::Warmed
+        );
+        fixture
+            .driver
+            .shutdown_session_with_reason(&fixture.manifest.id, "idle_timeout")
+            .await;
+        // A later turn takes the prewarm over: it must not inherit a
+        // `stopped` for a runtime whose `ready` was never journalled.
+        muted.hand_over(&sink).await;
+        assert!(!fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "provider.runtime"));
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn idle_resident_runtime_stops_and_the_next_turn_reopens_it() {
         let mut fixture = Fixture::new().await;
         Arc::get_mut(&mut fixture.driver).unwrap().idle_timeout = Duration::from_millis(200);
@@ -3863,31 +3881,26 @@ mod tests {
     #[cfg(unix)]
     async fn configuration_is_sent_only_when_the_runtime_differs() {
         let fixture = Fixture::new().await;
-        // A fresh process got `--model`/`--thinking` on its command line.
+        // A fresh process got `--model`/`--thinking` on its command line,
+        // but the fixture ignores them, as `--session` restoring a saved
+        // session's model would: the first turn still compares and applies.
         fixture
             .run_configured("normal", "turn-launch", "fixture/other", "low")
             .await
             .unwrap();
         assert_eq!(fixture.launches().await, 1);
-        assert_eq!(fixture.commands("set_model").await, 0);
-        assert_eq!(fixture.commands("set_thinking_level").await, 0);
-        // No second get_state to read back a configuration nothing changed.
-        assert_eq!(fixture.commands("configured-state").await, 0);
-        // The fixture ignores those flags, so the reused process reports
-        // other values and the next turn applies them once.
-        fixture
-            .run_configured("normal", "turn-apply", "fixture/other", "low")
-            .await
-            .unwrap();
         assert_eq!(fixture.commands("set_model").await, 1);
         assert_eq!(fixture.commands("set_thinking_level").await, 1);
-        // Now the runtime reports the requested values: nothing is re-sent.
+        assert_eq!(fixture.commands("configured-state").await, 1);
+        // Now the runtime reports the requested values: nothing is re-sent,
+        // and nothing changed needs reading back.
         fixture
             .run_configured("normal", "turn-same", "fixture/other", "low")
             .await
             .unwrap();
         assert_eq!(fixture.commands("set_model").await, 1);
         assert_eq!(fixture.commands("set_thinking_level").await, 1);
+        assert_eq!(fixture.commands("configured-state").await, 1);
         assert_eq!(fixture.launches().await, 1);
         fixture.finish().await;
     }
