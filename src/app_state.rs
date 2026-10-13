@@ -104,6 +104,10 @@ impl AppState {
         set_owner_only_directory(&config.data_dir).await?;
         set_owner_only_directory(&config.data_dir.join("logs")).await?;
         set_owner_only_directory(&config.data_dir.join("audit")).await?;
+        set_owner_only_directory(&config.scratch_workspace_root()).await?;
+        // The TUI writes new runs owner-only; runs saved by older builds may
+        // still be world-readable.
+        restrict_saved_tui_logs(&config.data_dir.join("tui-logs")).await;
 
         let config = Arc::new(config);
         let catalog = CatalogService::new(config.clone());
@@ -298,6 +302,30 @@ impl AppState {
 #[cfg(test)]
 pub(crate) const TEST_HISTORY_RECIPIENT: u8 = 0xE2;
 
+/// Makes an existing `tui-logs` directory 0700 and its files 0600. Best
+/// effort: a missing directory or a file that vanished is skipped.
+async fn restrict_saved_tui_logs(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+            return;
+        };
+        let _ = set_owner_only_directory(dir).await;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_type().await.is_ok_and(|kind| kind.is_file()) {
+                let _ = tokio::fs::set_permissions(
+                    entry.path(),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
 async fn set_owner_only_directory(path: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -474,6 +502,39 @@ mod tests {
         };
         AppState::new(config).await.unwrap();
 
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_makes_the_scratch_root_and_saved_tui_logs_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "todex-app-state-private-{}",
+            Uuid::new_v4().simple()
+        ));
+        let data_dir = root.join("data");
+        let tui_logs = data_dir.join("tui-logs");
+        tokio::fs::create_dir_all(&tui_logs).await.unwrap();
+        let saved = tui_logs.join("todex-tui-20260101-000000.log");
+        tokio::fs::write(&saved, b"log").await.unwrap();
+        for path in [&tui_logs, &saved] {
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+        }
+        let config = Config {
+            data_dir: data_dir.clone(),
+            workspace_roots: Vec::new(),
+            ..Config::default()
+        };
+        let scratch = config.scratch_workspace_root();
+        AppState::new(config).await.unwrap();
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&scratch), 0o700);
+        assert_eq!(mode(&tui_logs), 0o700);
+        assert_eq!(mode(&saved), 0o600);
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
