@@ -9,10 +9,19 @@
 //! agy has no auto-review tier) and, where it asks,
 //! raises the same `permission.requested` prompt as other provider tools.
 //!
-//! agy reads a hook's empty or failed answer as a denial, so every path
-//! that cannot reach a decision denies.
+//! In ask mode, read-class tools are allowed without a prompt only when
+//! every path they name resolves inside the conversation's workspace (or
+//! agy's own bundled docs and this conversation's artifacts); other reads
+//! ask like an edit.
+//!
+//! An empty hook answer leaves agy's own permissions in charge, which
+//! `--dangerously-skip-permissions` turns off, so every path that cannot
+//! reach a decision answers with an explicit denial.
 
-use std::time::Duration;
+use std::{
+    path::{Component, Path, PathBuf},
+    time::Duration,
+};
 
 use axum::{
     extract::{Request, State},
@@ -73,6 +82,9 @@ async fn decide_request(State(state): State<AppState>, request: Request) -> Resp
 enum ToolClass {
     /// Reads the workspace or agy's own state.
     Read,
+    /// A file read ([`PATH_READ_TOOLS`]) naming a path outside the allowed
+    /// roots, or no recognizable path at all.
+    ReadOutside,
     /// The agent's own bookkeeping: questions, subagents, waiting.
     Internal,
     /// Writes a file.
@@ -156,6 +168,8 @@ fn policy(permission_mode: &str, work_mode: &str, class: ToolClass) -> Policy {
         // agy's own review also refuses these: Plan turns keep it on.
         return match class {
             Read | Internal | Mcp { todex: true } => Policy::Allow,
+            ReadOutside if permission_mode == "full-access" => Policy::Allow,
+            ReadOutside => Policy::Ask,
             _ => Policy::Deny(
                 "The conversation is in Plan mode: only reading is allowed. Describe this step in \
                  your plan instead."
@@ -183,11 +197,142 @@ async fn decide(state: &AppState, conversation_id: &str, payload: &Value) -> Dec
         .pointer("/toolCall/args")
         .cloned()
         .unwrap_or(Value::Null);
-    let class = classify(name, &args);
+    let mut class = classify(name, &args);
+    if class == ToolClass::Read
+        && permission_mode != "full-access"
+        && PATH_READ_TOOLS.contains(&name)
+    {
+        let roots = match state.conversations.get(conversation_id).await {
+            Ok(manifest) => read_roots(&manifest.workspace, payload),
+            Err(_) => Vec::new(),
+        };
+        let paths = read_paths(&args);
+        let inside = tokio::task::spawn_blocking(move || paths_inside(&roots, &paths))
+            .await
+            .unwrap_or(false);
+        if !inside {
+            class = ToolClass::ReadOutside;
+        }
+    }
     match policy(&permission_mode, &work_mode, class) {
         Policy::Allow => Decision::Allow,
         Policy::Deny(reason) => Decision::Deny(reason),
         Policy::Ask => ask(state, conversation_id, name, args).await,
+    }
+}
+
+/// Read tools that take filesystem paths. In ask mode they are allowed
+/// without a prompt only inside [`read_roots`].
+const PATH_READ_TOOLS: &[&str] = &["view_file", "list_dir", "grep_search", "find_by_name"];
+
+/// Where reads need no prompt: the conversation's workspace, agy's bundled
+/// docs (`~/.gemini/antigravity-cli/builtin`), and this conversation's
+/// artifact directory when it lies under agy's `brain` directory.
+fn read_roots(workspace: &Path, payload: &Value) -> Vec<PathBuf> {
+    let mut roots = vec![workspace.to_path_buf()];
+    if let Some(gemini) = crate::provider::antigravity::integration_dir().parent() {
+        let cli = gemini.join("antigravity-cli");
+        roots.push(cli.join("builtin"));
+        if let Some(artifacts) = payload
+            .get("artifactDirectoryPath")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+        {
+            let brain = cli.join("brain");
+            let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+            if let (Some(brain), Some(artifacts)) = (canonical(&brain), canonical(&artifacts)) {
+                if artifacts.starts_with(&brain) && artifacts != brain {
+                    roots.push(artifacts);
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// Every path-like argument of a read: string (or string array) values whose
+/// key ends in `path`, `paths`, `directory`, `dir`, `file` or `uri`.
+fn read_paths(args: &Value) -> Vec<String> {
+    let Some(args) = args.as_object() else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for (key, value) in args {
+        let key = key.to_ascii_lowercase();
+        if !["path", "paths", "directory", "dir", "file", "uri"]
+            .iter()
+            .any(|suffix| key.ends_with(suffix))
+        {
+            continue;
+        }
+        match value {
+            Value::String(path) => paths.push(path.clone()),
+            Value::Array(items) => paths.extend(
+                items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_owned).unwrap_or_default()),
+            ),
+            _ => paths.push(String::new()),
+        }
+    }
+    paths
+}
+
+/// Whether there is at least one path and each resolves, component-wise,
+/// inside one of `roots`. Paths that do not exist yet are judged by their
+/// nearest existing ancestor; anything unclear counts as outside.
+fn paths_inside(roots: &[PathBuf], paths: &[String]) -> bool {
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    !roots.is_empty()
+        && !paths.is_empty()
+        && paths.iter().all(|path| {
+            resolve_read_path(&roots[0], path)
+                .is_some_and(|resolved| roots.iter().any(|root| resolved.starts_with(root)))
+        })
+}
+
+/// The canonical form of `path` (relative paths are taken from the
+/// workspace, the first root).
+fn resolve_read_path(workspace: &Path, path: &str) -> Option<PathBuf> {
+    let path = path.trim();
+    let path = path.strip_prefix("file://").unwrap_or(path);
+    // A percent-encoded path could decode to something else in agy.
+    if path.is_empty() || path.contains(['%', '\0']) {
+        return None;
+    }
+    let path = crate::config::expand_home(PathBuf::from(path));
+    let path = if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    };
+    let mut existing = path.as_path();
+    let mut rest = Vec::new();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(canonical) => {
+                let mut resolved = canonical;
+                for component in rest.iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            Err(_) => {
+                let name = existing.file_name()?;
+                // Only plain names may follow the existing ancestor.
+                if !matches!(
+                    Path::new(name).components().next(),
+                    Some(Component::Normal(_))
+                ) {
+                    return None;
+                }
+                rest.push(name.to_owned());
+                existing = existing.parent()?;
+            }
+        }
     }
 }
 
@@ -271,13 +416,13 @@ fn summary(name: &str, args: &Value) -> String {
 }
 
 /// `todex-agentd agy-hook`: reads the hook payload on stdin, asks the daemon
-/// and prints its decision. Started outside a TodeX turn it allows, which
-/// leaves agy's own permissions in charge; a failed exchange denies.
+/// and prints its decision. Started outside a TodeX turn it prints nothing,
+/// which leaves agy's own permissions in charge; a failed exchange denies.
 pub(crate) async fn run_hook() -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
     let (Some(endpoint), Some(token)) = (env(ENDPOINT_ENV), env(TOKEN_ENV)) else {
-        println!("{}", Decision::Allow.to_json());
+        let _ = tokio::io::copy(&mut tokio::io::stdin(), &mut tokio::io::sink()).await;
         return Ok(());
     };
     let mut payload = Vec::new();
@@ -364,6 +509,13 @@ mod tests {
             Policy::Deny(_)
         ));
         assert_eq!(policy("ask", "plan", Read), Policy::Allow);
+        assert_eq!(policy("ask", "implement", ReadOutside), Policy::Ask);
+        assert_eq!(policy("ask", "plan", ReadOutside), Policy::Ask);
+        assert_eq!(policy("full-access", "plan", ReadOutside), Policy::Allow);
+        assert_eq!(
+            policy("full-access", "implement", ReadOutside),
+            Policy::Allow
+        );
         // `auto` (not offered for agy) and unknown modes never skip approval.
         assert_eq!(policy("auto", "implement", Edit), Policy::Ask);
         assert_eq!(policy("bogus", "implement", Command), Policy::Ask);
@@ -584,6 +736,81 @@ mod tests {
             assert!(decision["reason"].as_str().unwrap().contains("Plan mode"));
             assert_eq!(
                 harness.decide("view_file", inside).await["decision"],
+                "allow"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn ask_mode_reads_outside_the_workspace_ask_first() {
+            let harness = std::sync::Arc::new(harness().await);
+            let id = &harness.conversation_id;
+            let outside = harness.root.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("secret.txt"), "x").unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside, harness.root.join("workspaces/project/link"))
+                .unwrap();
+            harness
+                .state
+                .agent_mcp
+                .record_turn_mode(id, "ask", "implement");
+            let workspace = harness.workspace();
+            for (tool, args) in [
+                (
+                    "view_file",
+                    json!({ "AbsolutePath": format!("{workspace}/a.txt") }),
+                ),
+                ("list_dir", json!({ "DirectoryPath": workspace.clone() })),
+                (
+                    "grep_search",
+                    json!({ "SearchPath": format!("{workspace}/src"), "Query": "x" }),
+                ),
+                (
+                    "find_by_name",
+                    json!({ "SearchDirectory": "src/new", "Pattern": "*" }),
+                ),
+                ("command_status", json!({ "CommandId": "1" })),
+            ] {
+                assert_eq!(
+                    harness.decide(tool, args.clone()).await["decision"],
+                    "allow",
+                    "{tool} {args}"
+                );
+            }
+
+            // Outside paths (directly, through `..`, or through a symlink),
+            // and reads without a recognizable path, ask like an edit.
+            let mut outside_reads = vec![
+                json!({ "AbsolutePath": outside.join("secret.txt").display().to_string() }),
+                json!({ "AbsolutePath": format!("{workspace}/../../outside/secret.txt") }),
+                json!({ "AbsolutePath": format!("{workspace}/new/../../../outside/x") }),
+                json!({ "toolAction": "Reading file" }),
+            ];
+            #[cfg(unix)]
+            outside_reads.push(json!({ "AbsolutePath": format!("{workspace}/link/secret.txt") }));
+            for args in outside_reads {
+                let call = {
+                    let harness = harness.clone();
+                    let args = args.clone();
+                    tokio::spawn(async move { harness.decide("view_file", args).await })
+                };
+                let prompt = harness.pending_permission().await;
+                assert_eq!(prompt["details"]["tool_name"], "view_file", "{args}");
+                harness
+                    .answer(&prompt, PermissionOutcome::RejectOnce, "reject_once")
+                    .await;
+                assert_eq!(call.await.unwrap()["decision"], "deny", "{args}");
+            }
+
+            // Full access reads anywhere without asking.
+            harness
+                .state
+                .agent_mcp
+                .record_turn_mode(id, "full-access", "implement");
+            let anywhere =
+                json!({ "AbsolutePath": outside.join("secret.txt").display().to_string() });
+            assert_eq!(
+                harness.decide("view_file", anywhere).await["decision"],
                 "allow"
             );
         }

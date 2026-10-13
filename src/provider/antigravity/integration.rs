@@ -9,9 +9,10 @@
 //!   `todex-agentd agent-mcp-bridge --route <route>`; outside a TodeX turn
 //!   they serve no tools.
 //! - `hooks.json`: `todex-approval`, a `PreToolUse` hook for every tool,
-//!   runs a small script next to it. Outside a TodeX turn the script allows
-//!   without starting the daemon, which leaves agy's own permissions in
-//!   charge; inside one it runs `todex-agentd agy-hook`.
+//!   runs a small script next to it. Outside a TodeX turn the script
+//!   prints nothing and exits 0 without starting the daemon; agy then
+//!   applies its own permissions as if no hook were installed. Inside one it
+//!   runs `todex-agentd agy-hook`.
 //!
 //! Only TodeX's own keys are written; everything else in those files is
 //! kept (JSONC comments are not). Files are rewritten only when an entry
@@ -118,8 +119,8 @@ fn hook_script(daemon: &Path) -> String {
     format!(
         "#!/bin/sh\n\
          # Installed by TodeX (todex-agentd) for the Antigravity CLI; remove it from TodeX's CLI settings.\n\
-         # Outside a TodeX turn it allows, leaving agy's own permissions in charge.\n\
-         if [ -z \"${ENDPOINT_ENV}\" ]; then\n  cat >/dev/null\n  echo '{{\"decision\":\"allow\"}}'\n  exit 0\nfi\n\
+         # Outside a TodeX turn it answers nothing, leaving agy's own permissions in charge.\n\
+         if [ -z \"${ENDPOINT_ENV}\" ]; then\n  cat >/dev/null\n  exit 0\nfi\n\
          exec '{daemon}' {AGY_HOOK_SUBCOMMAND}\n"
     )
 }
@@ -130,8 +131,8 @@ fn hook_script(daemon: &Path) -> String {
     format!(
         "@echo off\r\n\
          rem Installed by TodeX (todex-agentd) for the Antigravity CLI; remove it from TodeX's CLI settings.\r\n\
-         rem Outside a TodeX turn it allows, leaving agy's own permissions in charge.\r\n\
-         if not defined {ENDPOINT_ENV} (\r\n  echo {{\"decision\":\"allow\"}}\r\n  exit /b 0\r\n)\r\n\
+         rem Outside a TodeX turn it answers nothing, leaving agy's own permissions in charge.\r\n\
+         if not defined {ENDPOINT_ENV} exit /b 0\r\n\
          \"{daemon}\" {AGY_HOOK_SUBCOMMAND}\r\n"
     )
 }
@@ -275,7 +276,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_hook_script_allows_outside_todex_without_the_daemon() {
+    fn the_hook_script_defers_to_agy_outside_todex_without_the_daemon() {
         let dir = temp_dir();
         ensure(&dir, Path::new("/nonexistent/todex-agentd")).unwrap();
         let output = std::process::Command::new("sh")
@@ -285,9 +286,10 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
+        // No answer and exit 0: agy applies its own permissions, as if no
+        // hook were installed (an explicit "allow" would speak for TodeX).
         assert!(output.status.success());
-        let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(decision["decision"], "allow");
+        assert!(output.stdout.is_empty(), "{:?}", output.stdout);
         // Inside a turn the daemon decides; a missing daemon fails, which agy
         // reads as a denial.
         let output = std::process::Command::new("sh")
