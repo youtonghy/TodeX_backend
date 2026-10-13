@@ -583,6 +583,10 @@ impl ProviderDriver for PiDriver {
         if let Some(effort) = &prompt.reasoning_effort {
             spec.push_flag_value("--thinking", effort)?;
         }
+        let launch_config = PiLaunchConfig {
+            model: prompt.model.clone(),
+            thinking: prompt.reasoning_effort.clone(),
+        };
 
         let conversation_id = context.manifest.id.clone();
         let mut context = context;
@@ -677,6 +681,7 @@ impl ProviderDriver for PiDriver {
                         shutdown_rx,
                         stopping,
                         self.idle_timeout,
+                        launch_config.clone(),
                     ));
                     let mut sessions = self.sessions.lock().await;
                     // A close that arrived during the spawn found only the
@@ -887,7 +892,10 @@ async fn pi_session_worker(
     mut shutdown: watch::Receiver<Option<String>>,
     stopping: Arc<AtomicBool>,
     idle_timeout: Duration,
+    launch_config: PiLaunchConfig,
 ) {
+    // Only the first turn runs with the configuration the CLI started with.
+    let mut launch_config = Some(launch_config);
     let (_idle_cancel, idle_cancel) = watch::channel(false);
     let mut rpc = PiRpc::new(&mut process, Some(session_sink.clone()), idle_cancel);
     rpc.session_sink = Some(session_sink.clone());
@@ -969,7 +977,7 @@ async fn pi_session_worker(
             rpc.begin_turn(sink.clone(), turn.cancel.clone());
             let mut queue = Vec::new();
             let mut result = tokio::select! {
-                result = run_pi_turn(&mut rpc, turn.context, turn.prompt, &sink, &mut controls, &mut requests, &mut queue) => result,
+                result = run_pi_turn(&mut rpc, turn.context, turn.prompt, launch_config.take(), &sink, &mut controls, &mut requests, &mut queue) => result,
                 _ = shutdown.changed() => Err(AppError::TurnCancelled),
             };
             // Text and tool progress streamed right before a cancel or failure
@@ -1215,10 +1223,19 @@ fn pi_model_supports_images(item: &Value) -> bool {
         .is_some_and(|inputs| inputs.iter().any(|input| input.as_str() == Some("image")))
 }
 
+/// The `--model` / `--thinking` a Pi process was started with.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PiLaunchConfig {
+    model: Option<String>,
+    thinking: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_pi_turn(
     rpc: &mut PiRpc<'_>,
     context: DriverContext,
     prompt: DriverPrompt,
+    launch_config: Option<PiLaunchConfig>,
     sink: &DriverEventSink,
     controls: &mut mpsc::Receiver<PendingProviderControl>,
     requests: &mut mpsc::Receiver<PiSessionRequest>,
@@ -1238,15 +1255,27 @@ async fn run_pi_turn(
     if !pi_is_idle(&state) {
         return Err(AppError::Conflict("A Pi extension is still working in this runtime; wait for it to finish before starting another turn".to_owned()));
     }
-    if prompt.model.is_some() || prompt.reasoning_effort.is_some() {
+    let requested_model = prompt.model.as_deref();
+    let requested_thinking = prompt.reasoning_effort.as_deref();
+    validate_pi_config(requested_model, requested_thinking)?;
+    // A fresh process already applied the CLI flags it was started with;
+    // otherwise only values the runtime does not report are sent.
+    let launched = launch_config.is_some_and(|launched| {
+        launched.model.as_deref() == requested_model
+            && launched.thinking.as_deref() == requested_thinking
+    });
+    let current_model = state.pointer("/data/model").and_then(pi_model_id);
+    let set_model =
+        requested_model.filter(|model| !launched && current_model.as_deref() != Some(*model));
+    // A model switch may reset the level, so a requested level follows it.
+    let set_thinking = requested_thinking.filter(|level| {
+        !launched
+            && (set_model.is_some()
+                || state.pointer("/data/thinkingLevel").and_then(Value::as_str) != Some(*level))
+    });
+    if set_model.is_some() || set_thinking.is_some() {
         rpc.reusable = false;
-        pi_configure(
-            rpc,
-            "turn-config",
-            prompt.model.as_deref(),
-            prompt.reasoning_effort.as_deref(),
-        )
-        .await?;
+        pi_configure(rpc, "turn-config", set_model, set_thinking).await?;
         rpc.process
             .send(&json!({"id":"configured-state","type":"get_state"}))
             .await?;
@@ -1692,6 +1721,30 @@ async fn pi_configure(
     thinking: Option<&str>,
 ) -> Result<(), AppError> {
     // Validate the entire request before applying either part.
+    let model = validate_pi_config(model, thinking)?;
+    if let Some((provider, model)) = model {
+        let request_id = format!("{id}-model");
+        rpc.process
+            .send(&json!({"id":request_id,"type":"set_model","provider":provider,"modelId":model}))
+            .await?;
+        rpc.wait_response(&request_id).await?;
+    }
+    if let Some(level) = thinking {
+        let request_id = format!("{id}-thinking");
+        rpc.process
+            .send(&json!({"id":request_id,"type":"set_thinking_level","level":level}))
+            .await?;
+        rpc.wait_response(&request_id).await?;
+    }
+    Ok(())
+}
+
+/// Checks a requested model (`provider/model`) and thinking level; returns
+/// the model split into provider and id.
+fn validate_pi_config<'a>(
+    model: Option<&'a str>,
+    thinking: Option<&str>,
+) -> Result<Option<(&'a str, &'a str)>, AppError> {
     let model = model
         .map(|model| {
             model
@@ -1714,21 +1767,7 @@ async fn pi_configure(
             "Unsupported Pi thinking level".to_owned(),
         ));
     }
-    if let Some((provider, model)) = model {
-        let request_id = format!("{id}-model");
-        rpc.process
-            .send(&json!({"id":request_id,"type":"set_model","provider":provider,"modelId":model}))
-            .await?;
-        rpc.wait_response(&request_id).await?;
-    }
-    if let Some(level) = thinking {
-        let request_id = format!("{id}-thinking");
-        rpc.process
-            .send(&json!({"id":request_id,"type":"set_thinking_level","level":level}))
-            .await?;
-        rpc.wait_response(&request_id).await?;
-    }
-    Ok(())
+    Ok(model)
 }
 
 async fn pi_control(
@@ -3211,6 +3250,47 @@ mod tests {
             panic!("fixture event did not arrive");
         }
 
+        /// Runs `scenario` requesting `model` and `effort`.
+        async fn run_configured(
+            &self,
+            scenario: &str,
+            turn: &str,
+            model: &str,
+            effort: &str,
+        ) -> Result<DriverTurnResult, AppError> {
+            use crate::conversation::ConversationEventHub;
+            let (context, mut prompt) = self.turn_parts(scenario, turn).await;
+            prompt.model = Some(model.to_owned());
+            prompt.reasoning_effort = Some(effort.to_owned());
+            let sink = DriverEventSink::new(
+                self.store.clone(),
+                ConversationEventHub::default(),
+                self.permissions.clone(),
+                &self.manifest.id,
+            )
+            .with_turn_id(turn);
+            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
+            let (_cancel, receiver) = watch::channel(false);
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.driver
+                    .run_turn(context, prompt, sink, receiver, permit),
+            )
+            .await
+            .expect("Pi turn hung")
+        }
+
+        /// Commands the fixture received with this `type` or `id`.
+        async fn commands(&self, kind: &str) -> usize {
+            tokio::fs::read_to_string(self.root.join("pi-commands"))
+                .await
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|command| command["type"] == kind || command["id"] == kind)
+                .count()
+        }
+
         async fn launches(&self) -> usize {
             tokio::fs::read_to_string(self.root.join("pi-launches"))
                 .await
@@ -3620,6 +3700,39 @@ mod tests {
             events[completed - 1].sequence,
             progress[progress.len() - 1].sequence
         );
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn configuration_is_sent_only_when_the_runtime_differs() {
+        let fixture = Fixture::new().await;
+        // A fresh process got `--model`/`--thinking` on its command line.
+        fixture
+            .run_configured("normal", "turn-launch", "fixture/other", "low")
+            .await
+            .unwrap();
+        assert_eq!(fixture.launches().await, 1);
+        assert_eq!(fixture.commands("set_model").await, 0);
+        assert_eq!(fixture.commands("set_thinking_level").await, 0);
+        // No second get_state to read back a configuration nothing changed.
+        assert_eq!(fixture.commands("configured-state").await, 0);
+        // The fixture ignores those flags, so the reused process reports
+        // other values and the next turn applies them once.
+        fixture
+            .run_configured("normal", "turn-apply", "fixture/other", "low")
+            .await
+            .unwrap();
+        assert_eq!(fixture.commands("set_model").await, 1);
+        assert_eq!(fixture.commands("set_thinking_level").await, 1);
+        // Now the runtime reports the requested values: nothing is re-sent.
+        fixture
+            .run_configured("normal", "turn-same", "fixture/other", "low")
+            .await
+            .unwrap();
+        assert_eq!(fixture.commands("set_model").await, 1);
+        assert_eq!(fixture.commands("set_thinking_level").await, 1);
+        assert_eq!(fixture.launches().await, 1);
         fixture.finish().await;
     }
 
