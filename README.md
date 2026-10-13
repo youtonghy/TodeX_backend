@@ -229,6 +229,8 @@ pi_bin = "pi"
 provider_idle_timeout_minutes = 60
 # Stop a resident provider process after this many seconds without a turn (minimum 30).
 provider_keepalive_seconds = 300
+# Let clients start a conversation's provider process before its next prompt (conversation.warm).
+provider_prewarm = true
 
 [agent.acp_profiles.default]
 command = "mcp-server"

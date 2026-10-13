@@ -93,6 +93,7 @@ dsh --version
 | `TODEX_AGENTD_DSH_ENV_ALLOWLIST` | 允许传给 DeepSeek Harness 的逗号分隔环境变量名 |
 | `TODEX_AGENTD_PROVIDER_IDLE_TIMEOUT_MINUTES` | Provider 空闲超时分钟数（默认 60，`0` 关闭） |
 | `TODEX_AGENTD_PROVIDER_KEEPALIVE_SECONDS` | 常驻 Provider 进程无 turn 时的保活秒数（默认 300，最小 30） |
+| `TODEX_AGENTD_PROVIDER_PREWARM` | 是否允许 `conversation.warm` 预先启动会话的 Provider 进程（默认 `true`） |
 | `TODEX_AGENTD_DEFAULT_AGENT` | 默认 agent 名称 |
 | `TODEX_AGENTD_ENABLE_AUTH` | 是否开启认证 |
 | `TODEX_AGENTD_ENABLE_TLS` | 是否开启 TLS |
@@ -129,6 +130,7 @@ dsh_bin = "dsh"
 dsh_env_allowlist = ["DSH_HOME", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_SEARCH_BASE_URL"]
 provider_idle_timeout_minutes = 60   # Provider 连续无输出超过该分钟数时停止当前 turn（PROVIDER_IDLE_TIMEOUT）；0 关闭
 provider_keepalive_seconds = 300     # 常驻 Provider 进程（Codex/Pi/OpenCode/Grok/Devin/dsh/ACP profile）无 turn 多久后停止；最小 30
+provider_prewarm = true              # 允许客户端经 conversation.warm 在提交 prompt 前预先启动会话的 Provider 进程
 
 [agent.acp_profiles.example]
 command = "example-acp-agent"

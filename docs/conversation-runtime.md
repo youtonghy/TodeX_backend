@@ -125,6 +125,15 @@ optional and canonical aliases are recomputed when old journals are replayed.
   running turn. A resident ACP process also survives a cancelled turn when
   the agent answers `session/prompt` with `stopReason: "cancelled"` within
   3 s and nothing it asked for is still open; otherwise it is discarded.
+- `[agent].provider_prewarm` (default `true`; env
+  `TODEX_AGENTD_PROVIDER_PREWARM`) lets `conversation.warm` /
+  `POST /v2/conversations/{id}/warm` start a conversation's resident provider
+  process before its next prompt, prepared with the settings of its last
+  request: spawn, `initialize` and the native session setup run, nothing is
+  journalled. At most 4 prewarms run at once; one never evicts another
+  conversation's process. `false` makes every warm request answer
+  `warmed: false` with `reason: "disabled"`. See docs/API.md for the skip
+  reasons.
 - WebSocket delivery never waits on a stuck peer: a socket send over 20 s or an
   outgoing queue full for over 10 s closes the connection. Subscribe backfill
   runs beside the read loop, so replies to later commands may interleave with

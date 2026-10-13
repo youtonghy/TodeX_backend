@@ -220,6 +220,8 @@ pi_bin = "pi"
 provider_idle_timeout_minutes = 60
 # 常驻 Provider 进程无 turn 超过该秒数后停止（最小 30）
 provider_keepalive_seconds = 300
+# 允许客户端在提交 prompt 前预先启动会话的 Provider 进程（conversation.warm）
+provider_prewarm = true
 
 [agent.acp_profiles.default]
 command = "mcp-server"
