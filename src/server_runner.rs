@@ -149,7 +149,7 @@ impl ManagedServer {
                 "failed to list network interface addresses for the listener"
             ),
         }
-        if !config.security.enable_tls && config.host != "127.0.0.1" && config.host != "::1" {
+        if plaintext_listener_needs_warning(config.security.enable_tls, &config.host) {
             tracing::warn!(
                 host = %config.host,
                 "non-loopback listener is using plaintext HTTP; pairing encryption protects websocket frames but not bearer headers"
@@ -347,12 +347,36 @@ pub fn bind_addr(config: &Config) -> Result<SocketAddr> {
         .with_context(|| format!("invalid bind address {}:{}", config.host, config.port))
 }
 
+/// Whether the main listener serves plaintext HTTP beyond loopback
+/// (`localhost`, `127.0.0.0/8` and `::1` count as loopback).
+fn plaintext_listener_needs_warning(enable_tls: bool, host: &str) -> bool {
+    !enable_tls && !listen_addrs::is_loopback_host(host)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{env, fs};
 
-    use super::{ManagedServer, ProviderProcessTracking};
+    use super::{plaintext_listener_needs_warning, ManagedServer, ProviderProcessTracking};
     use crate::config::{AgentConfig, Config, PairingEncryption, SecurityConfig};
+
+    #[test]
+    fn plaintext_warning_skips_loopback_hosts_including_localhost() {
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "LOCALHOST",
+            "[::1]",
+            "127.0.0.2",
+        ] {
+            assert!(!plaintext_listener_needs_warning(false, host), "{host}");
+        }
+        for host in ["0.0.0.0", "192.168.1.10", "example.com"] {
+            assert!(plaintext_listener_needs_warning(false, host), "{host}");
+            assert!(!plaintext_listener_needs_warning(true, host), "{host}");
+        }
+    }
 
     #[tokio::test]
     async fn managed_server_serves_the_api_listener_only_when_enabled() {

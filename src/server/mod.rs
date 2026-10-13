@@ -51,7 +51,19 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(enforcement::enforce_transport_v2))
         .layer(compression_layer())
         .layer(cors_layer(&state.config.host))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span::<axum::body::Body>))
+}
+
+/// The request span: method, path and version. The query string is left out
+/// because signed requests carry `auth_sig`/`auth_nonce` (and other
+/// credentials) there.
+fn request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        version = ?request.version(),
+    )
 }
 
 /// The router as in-process tests drive it with `oneshot`: without a served
@@ -106,9 +118,49 @@ fn cors_layer(host: &str) -> CorsLayer {
 
 #[cfg(test)]
 mod tests {
-    use super::cors_layer;
+    use super::{cors_layer, request_span};
     use axum::{body::Body, http::Request, routing::get, Router};
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
+    use tower_http::trace::TraceLayer;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn request_spans_log_the_path_without_the_query() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let app = Router::new()
+            .route("/v2/events", get(|| async { "ok" }))
+            .layer(TraceLayer::new_for_http().make_span_with(request_span::<Body>));
+        app.oneshot(
+            Request::get("/v2/events?auth_sig=SECRET-SIG&auth_nonce=SECRET-NONCE")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("path=/v2/events"), "{logged}");
+        assert!(!logged.contains("SECRET"), "{logged}");
+    }
 
     #[tokio::test]
     async fn signed_request_preflights_are_cacheable() {
