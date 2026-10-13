@@ -1946,8 +1946,8 @@ impl ConversationSupervisor {
                 ));
             }
         }
-        let (content_text, driver_content) =
-            prepare_prompt_content(manifest.provider, &manifest.workspace, content).await?;
+        let (content_text, driver_content, content_hashes) =
+            prepare_prompt_content_hashed(manifest.provider, &manifest.workspace, content).await?;
         let loaded_skills = self.load_prompt_skills(&manifest, &skills).await?;
         let mut user_text = if text.is_empty() && !skills.is_empty() {
             "请使用已选择的 Skill。".to_owned()
@@ -2003,16 +2003,23 @@ impl ConversationSupervisor {
                 DriverPromptContent::Image { path, .. } => path.as_ref(),
             };
             if let Some(path) = path {
+                // Images were hashed from the bytes sent to the provider;
+                // only file attachments are read here.
+                let sha256 = match content_hashes.get(path) {
+                    Some(sha256) => sha256.clone(),
+                    None => fingerprint_file(path).await?,
+                };
                 snapshot_files.push(RequestFileFingerprint {
                     path: path.clone(),
-                    sha256: fingerprint_file(path).await?,
+                    sha256,
                 });
             }
         }
         for skill in &loaded_skills {
+            // The skill's whole file, as read (UTF-8, unmodified) for injection.
             snapshot_files.push(RequestFileFingerprint {
                 path: skill.path.clone(),
-                sha256: fingerprint_file(&skill.path).await?,
+                sha256: sha256_hex(skill.content.as_bytes()),
             });
         }
         let cli_start_permit = self.cli_execution_gate.read().await;
@@ -2727,16 +2734,17 @@ impl ConversationSupervisor {
         manifest: &ConversationManifest,
         skills: &[PromptSkillRef],
     ) -> Result<Vec<DriverSkill>, AppError> {
+        let resource_ids = skills
+            .iter()
+            .map(|skill| skill.resource_id.as_str())
+            .collect::<Vec<_>>();
+        // One scan of the skill roots serves every selected skill.
+        let resources = self
+            .catalog
+            .skill_resources(manifest.provider, manifest.workspace.clone(), &resource_ids)
+            .await?;
         let mut injected = Vec::new();
-        for skill in skills {
-            let resource = self
-                .catalog
-                .skill_resource(
-                    manifest.provider,
-                    manifest.workspace.clone(),
-                    &skill.resource_id,
-                )
-                .await?;
+        for (skill, resource) in skills.iter().zip(resources) {
             if !resource.descriptor.valid || !resource.descriptor.active {
                 return Err(AppError::InvalidRequest(format!(
                     "skill {} is not active",
@@ -2824,6 +2832,10 @@ struct RequestFileFingerprint {
     sha256: String,
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 async fn fingerprint_file(path: &Path) -> Result<String, AppError> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut hasher = Sha256::new();
@@ -2848,6 +2860,18 @@ async fn prepare_prompt_content(
     workspace: &Path,
     content: Vec<PromptContentRef>,
 ) -> Result<(String, Vec<DriverPromptContent>), AppError> {
+    prepare_prompt_content_hashed(provider, workspace, content)
+        .await
+        .map(|(text, content, _)| (text, content))
+}
+
+/// [`prepare_prompt_content`], also returning the SHA-256 of each local file
+/// it read, so the request snapshot need not read those files again.
+async fn prepare_prompt_content_hashed(
+    provider: ProviderKind,
+    workspace: &Path,
+    content: Vec<PromptContentRef>,
+) -> Result<(String, Vec<DriverPromptContent>, BTreeMap<PathBuf, String>), AppError> {
     if content.len() > MAX_PROMPT_CONTENT_ITEMS {
         return Err(AppError::InvalidRequest(format!(
             "prompt content allows at most {MAX_PROMPT_CONTENT_ITEMS} items"
@@ -2857,6 +2881,7 @@ async fn prepare_prompt_content(
     let mut text = Vec::new();
     let mut driver_content = Vec::new();
     let mut image_bytes = 0usize;
+    let mut hashes = BTreeMap::new();
     for item in content {
         match item {
             PromptContentRef::Text { text: value } => {
@@ -2872,6 +2897,7 @@ async fn prepare_prompt_content(
                 ensure_image_budget(image_bytes.saturating_add(file_bytes))?;
                 let bytes = tokio::fs::read(&path).await?;
                 image_bytes = image_bytes.saturating_add(bytes.len());
+                hashes.insert(path.clone(), sha256_hex(&bytes));
                 driver_content.push(DriverPromptContent::Image {
                     mime_type: image_mime_type(&path)?.to_owned(),
                     data: BASE64_STANDARD.encode(bytes),
@@ -2928,7 +2954,7 @@ async fn prepare_prompt_content(
             }
         }
     }
-    Ok((text.join("\n\n"), driver_content))
+    Ok((text.join("\n\n"), driver_content, hashes))
 }
 
 async fn canonical_workspace_file(workspace: &Path, path: PathBuf) -> Result<PathBuf, AppError> {

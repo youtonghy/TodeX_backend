@@ -279,29 +279,51 @@ impl CatalogService {
         workspace: PathBuf,
         resource_id: &str,
     ) -> Result<SkillResource, AppError> {
-        let catalog = self.skills(provider, workspace).await?;
-        let descriptor = catalog
-            .skills
-            .into_iter()
-            .find(|skill| skill.resource_id == resource_id)
-            .ok_or_else(|| AppError::NotFound(format!("skill resource {resource_id}")))?;
-        if !descriptor.valid {
-            return Err(AppError::InvalidRequest(
-                descriptor
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "skill resource is not readable".to_owned()),
-            ));
+        let mut resources = self
+            .skill_resources(provider, workspace, &[resource_id])
+            .await?;
+        Ok(resources.remove(0))
+    }
+
+    /// [`Self::skill_resource`] for each of `resource_ids`, in order, from one
+    /// scan of the skill roots.
+    pub async fn skill_resources(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_ids: &[&str],
+    ) -> Result<Vec<SkillResource>, AppError> {
+        if resource_ids.is_empty() {
+            return Ok(Vec::new());
         }
-        let path = descriptor.path.clone();
-        let content =
-            tokio::task::spawn_blocking(move || read_limited_text(&path, MAX_SKILL_BYTES))
-                .await
-                .map_err(|error| AppError::Anyhow(error.into()))??;
-        Ok(SkillResource {
-            descriptor,
-            content,
-        })
+        let catalog = self.skills(provider, workspace).await?;
+        let mut resources = Vec::with_capacity(resource_ids.len());
+        for resource_id in resource_ids {
+            let descriptor = catalog
+                .skills
+                .iter()
+                .find(|skill| skill.resource_id == *resource_id)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("skill resource {resource_id}")))?;
+            if !descriptor.valid {
+                return Err(AppError::InvalidRequest(
+                    descriptor
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "skill resource is not readable".to_owned()),
+                ));
+            }
+            let path = descriptor.path.clone();
+            let content =
+                tokio::task::spawn_blocking(move || read_limited_text(&path, MAX_SKILL_BYTES))
+                    .await
+                    .map_err(|error| AppError::Anyhow(error.into()))??;
+            resources.push(SkillResource {
+                descriptor,
+                content,
+            });
+        }
+        Ok(resources)
     }
 
     pub async fn mcp(
