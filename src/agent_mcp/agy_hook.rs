@@ -252,6 +252,8 @@ fn read_roots(workspace: &Path, payload: &Value) -> Vec<PathBuf> {
 
 /// Every path-like argument of a read: string (or string array) values whose
 /// key ends in `path`, `paths`, `directory`, `dir`, `file` or `uri`.
+/// Booleans, numbers and nulls under such keys (flags like `FullPath`) are
+/// not paths and are skipped; other values count as an unclear path.
 fn read_paths(args: &Value) -> Vec<String> {
     let Some(args) = args.as_object() else {
         return Vec::new();
@@ -265,13 +267,17 @@ fn read_paths(args: &Value) -> Vec<String> {
         {
             continue;
         }
+        let not_a_path =
+            |value: &Value| matches!(value, Value::Bool(_) | Value::Number(_) | Value::Null);
         match value {
             Value::String(path) => paths.push(path.clone()),
             Value::Array(items) => paths.extend(
                 items
                     .iter()
+                    .filter(|item| !not_a_path(item))
                     .map(|item| item.as_str().map(str::to_owned).unwrap_or_default()),
             ),
+            value if not_a_path(value) => {}
             _ => paths.push(String::new()),
         }
     }
@@ -298,9 +304,14 @@ fn paths_inside(roots: &[PathBuf], paths: &[String]) -> bool {
 /// workspace, the first root).
 fn resolve_read_path(workspace: &Path, path: &str) -> Option<PathBuf> {
     let path = path.trim();
-    let path = path.strip_prefix("file://").unwrap_or(path);
+    let path = match path.strip_prefix("file://") {
+        // `file://host/share` names a remote host.
+        Some(local) if !local.starts_with('/') => return None,
+        Some(local) => local,
+        None => path,
+    };
     // A percent-encoded path could decode to something else in agy.
-    if path.is_empty() || path.contains(['%', '\0']) {
+    if path.is_empty() || path.contains(['%', '\0']) || is_remote_or_device_path(path) {
         return None;
     }
     let path = crate::config::expand_home(PathBuf::from(path));
@@ -334,6 +345,24 @@ fn resolve_read_path(workspace: &Path, path: &str) -> Option<PathBuf> {
             }
         }
     }
+}
+
+/// UNC shares (`\\server\share`, `//server/share`), Windows device
+/// namespaces (`\\?\`, `\\.\`, `\??\`) and Unix network automount trees
+/// (`/net`, `/afs`). They count as outside without being resolved: even a
+/// `canonicalize` could reach out to a remote host.
+fn is_remote_or_device_path(path: &str) -> bool {
+    const NETWORK_ROOTS: &[&str] = &["/net", "/afs"];
+    let separator = |ch: char| matches!(ch, '/' | '\\');
+    let mut chars = path.chars();
+    let doubled_separator =
+        chars.next().is_some_and(separator) && chars.next().is_some_and(separator);
+    doubled_separator
+        || path.starts_with(r"\??\")
+        || NETWORK_ROOTS.iter().any(|root| {
+            path.strip_prefix(root)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(separator))
+        })
 }
 
 /// Asks the user's devices about one call.
@@ -519,6 +548,46 @@ mod tests {
         // `auto` (not offered for agy) and unknown modes never skip approval.
         assert_eq!(policy("auto", "implement", Edit), Policy::Ask);
         assert_eq!(policy("bogus", "implement", Command), Policy::Ask);
+    }
+
+    #[test]
+    fn non_string_path_flags_are_not_paths() {
+        let args = json!({
+            "AbsolutePath": "/workspace/a.txt",
+            "FullPath": true,
+            "MaxFile": 3,
+            "ExtraDir": null,
+            "SearchPaths": ["/workspace/b", false],
+        });
+        assert_eq!(
+            read_paths(&args),
+            vec!["/workspace/a.txt".to_owned(), "/workspace/b".to_owned()]
+        );
+        // An object is not a recognizable path: it counts as unclear.
+        assert_eq!(read_paths(&json!({ "File": {} })), vec![String::new()]);
+    }
+
+    #[test]
+    fn remote_and_device_paths_are_outside_without_resolving() {
+        let workspace = std::env::temp_dir();
+        for path in [
+            r"\\server\share\a.txt",
+            "//server/share/a.txt",
+            r"\\?\C:\secret",
+            r"\\.\PhysicalDrive0",
+            r"\??\C:\secret",
+            r"/\server\share",
+            "file://server/share/a.txt",
+            "file:////server/share/a.txt",
+            "/net/host/export",
+            "/net",
+            "/afs/cell/user",
+        ] {
+            assert_eq!(resolve_read_path(&workspace, path), None, "{path}");
+        }
+        for path in ["/network/a", "/afsx", "/tmp//a", "a//b"] {
+            assert!(!is_remote_or_device_path(path), "{path}");
+        }
     }
 
     #[test]
