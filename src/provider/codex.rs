@@ -455,6 +455,26 @@ impl ProviderDriver for CodexDriver {
             .collect())
     }
 
+    async fn prewarm(
+        &self,
+        context: DriverContext,
+        settings: DriverPrompt,
+        sink: DriverEventSink,
+        launch_permit: WorkspaceTrustPermit,
+    ) -> Result<super::types::ProviderPrewarm, AppError> {
+        self.sessions
+            .prewarm(
+                &self.binary,
+                runtime::Warm {
+                    context,
+                    settings,
+                    sink,
+                    permit: launch_permit,
+                },
+            )
+            .await
+    }
+
     async fn run_turn(
         &self,
         context: DriverContext,

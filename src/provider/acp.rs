@@ -36,6 +36,7 @@ use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
     PendingProviderControl, PermissionConfigCapabilities, PermissionOutcome, ProviderCapabilities,
     ProviderCommandDescriptor, ProviderControl, ProviderDescriptor, ProviderDriver,
+    ProviderPrewarm,
 };
 
 /// Interactive authentication methods (for example browser PKCE) need enough
@@ -241,6 +242,15 @@ fn quirks(provider: ProviderKind) -> &'static AcpQuirks {
 }
 
 impl AcpDriver {
+    /// How a resident profile's conversation process is started.
+    fn resident_launch(&self, context: &DriverContext) -> Result<ResidentLaunch, AppError> {
+        let profile = self.profile(context)?;
+        Ok(ResidentLaunch {
+            spec: acp_command_spec(profile, &context.manifest.workspace),
+            runtime: profile_runtime_options(profile)?,
+        })
+    }
+
     pub fn new(config: &AgentConfig) -> Self {
         Self {
             profiles: config.acp_profiles.clone(),
@@ -450,6 +460,28 @@ impl ProviderDriver for AcpDriver {
         self.sessions.stop_all().await;
     }
 
+    async fn prewarm(
+        &self,
+        context: DriverContext,
+        settings: DriverPrompt,
+        sink: DriverEventSink,
+        launch_permit: WorkspaceTrustPermit,
+    ) -> Result<ProviderPrewarm, AppError> {
+        // A per-turn profile has nothing to keep between turns.
+        if !self.profile(&context)?.resident {
+            return Ok(ProviderPrewarm::Unsupported);
+        }
+        self.sessions
+            .prewarm(
+                context,
+                settings,
+                sink,
+                launch_permit,
+                |context, _prompt| self.resident_launch(context),
+            )
+            .await
+    }
+
     async fn run_turn(
         &self,
         context: DriverContext,
@@ -470,13 +502,7 @@ impl ProviderDriver for AcpDriver {
                     sink,
                     cancel,
                     launch_permit,
-                    |context, _prompt| {
-                        let profile = self.profile(context)?;
-                        Ok(ResidentLaunch {
-                            spec: acp_command_spec(profile, &context.manifest.workspace),
-                            runtime: profile_runtime_options(profile)?,
-                        })
-                    },
+                    |context, _prompt| self.resident_launch(context),
                 )
                 .await;
         }
@@ -809,200 +835,23 @@ async fn run_acp_turn_steps(
         prompt.approval_policy.as_deref(),
     )?;
     let auto_approve = AutoApprove::for_turn(provider, prompt.permission_mode.as_deref());
-    let initialize_value = if let Some(initialize) = &connection.initialize {
-        initialize.clone()
-    } else {
-        let request_id = send_request(process, "initialize", initialize_request(provider)).await?;
-        let initialize = wait_for_response(
-            process,
-            &request_id,
-            sink,
-            cancel,
-            provider,
-            true,
-            auto_approve,
-            connection,
-        )
-        .await?;
-        initialize
-    };
-    let initialize: InitializeResponse =
-        serde_json::from_value(initialize_value.clone()).map_err(|error| {
-            AppError::InvalidRequest(format!("invalid ACP initialize response: {error}"))
-        })?;
-    if initialize.protocol_version != ProtocolVersion::V1 {
-        return Err(AppError::Unsupported(format!(
-            "ACP agent negotiated unsupported protocol version {}",
-            initialize.protocol_version
-        )));
-    }
-    ensure_acp_images_supported(
+    let PreparedAcpSession {
+        initialize_value,
+        initialize,
+        native_session_id,
+        config_options,
+        legacy_models,
+    } = prepare_acp_session(
+        process,
+        &context,
         &prompt,
-        initialize.agent_capabilities.prompt_capabilities.image,
-        options.allow_unadvertised_images,
-        context.manifest.provider,
-    )?;
-
-    if connection.initialize.is_none() {
-        authenticate_if_requested(
-            process,
-            &initialize_value,
-            sink,
-            cancel,
-            provider,
-            &options,
-            connection,
-        )
-        .await?;
-        connection.initialize = Some(initialize_value.clone());
-    }
-
-    let (native_session_id, config_options, legacy_models) = if let Some((id, response)) =
-        &connection.session
-    {
-        let options = response
-            .get("configOptions")
-            .cloned()
-            .map(serde_json::from_value::<Vec<SessionConfigOption>>)
-            .transpose()?;
-        (id.clone(), options, response.get("models").cloned())
-    } else {
-        match context.provider_state.native_session_id.clone() {
-            Some(session_id) => {
-                // `session/resume` attaches without replaying history; TodeX
-                // keeps its own event log, so agents that prefer it skip
-                // session/load.
-                let can_resume = quirks(provider).prefer_resume
-                    && initialize_value
-                        .pointer("/agentCapabilities/sessionCapabilities/resume")
-                        .is_some();
-                if !can_resume && !initialize.agent_capabilities.load_session {
-                    return Err(AppError::Unsupported(
-                    "ACP agent does not support session/load; historical prompts will not be replayed"
-                        .to_owned(),
-                ));
-                }
-                let loaded = if can_resume {
-                    let request_id = send_request(
-                        process,
-                        "session/resume",
-                        with_agent_mcp(
-                            json!({
-                                "sessionId": session_id,
-                                "cwd": context.manifest.workspace,
-                            }),
-                            &context,
-                        ),
-                    )
-                    .await?;
-                    wait_for_response(
-                        process,
-                        &request_id,
-                        sink,
-                        cancel,
-                        provider,
-                        false,
-                        auto_approve,
-                        connection,
-                    )
-                    .await
-                } else {
-                    let mut request = serde_json::to_value(LoadSessionRequest::new(
-                        session_id.clone(),
-                        context.manifest.workspace.clone(),
-                    ))?;
-                    apply_session_metadata(&mut request, &options, true);
-                    let request = with_agent_mcp(request, &context);
-                    let request_id = send_request(process, "session/load", request).await?;
-                    wait_for_response(
-                        process,
-                        &request_id,
-                        sink,
-                        cancel,
-                        provider,
-                        !options.suppress_load_replay,
-                        auto_approve,
-                        connection,
-                    )
-                    .await
-                };
-                let (session_id, response_value) = match loaded {
-                    Ok(response_value) => (session_id, response_value),
-                    Err(error @ AppError::TurnCancelled) => return Err(error),
-                    // Devin sessions live in a shared registry/lock table, so a
-                    // stored id can be held by another process or deleted
-                    // externally. Start a fresh session rather than failing the
-                    // turn — but only when the agent itself answered: a local
-                    // failure (journal full, write error) must surface as-is.
-                    Err(error)
-                        if quirks(provider).recreate_unloadable_session
-                            && matches!(
-                                error,
-                                AppError::Conflict(_) | AppError::ProviderUnavailable(_)
-                            ) =>
-                    {
-                        sink.emit(
-                            "provider.event",
-                            json!({"provider":provider.as_str(),"providerMethod":"session/recreated","metadata":{"reason":error.to_string(),"previousSessionId":session_id}}),
-                        )
-                        .await?;
-                        new_acp_session(
-                            process,
-                            &context,
-                            &options,
-                            sink,
-                            cancel,
-                            provider,
-                            auto_approve,
-                            connection,
-                        )
-                        .await?
-                    }
-                    Err(error) => return Err(error),
-                };
-                connection.session = Some((session_id.clone(), response_value.clone()));
-                let legacy_models = response_value.get("models").cloned();
-                let config_options = response_value
-                    .get("configOptions")
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(|error| {
-                        AppError::InvalidRequest(format!(
-                            "invalid ACP session resume response: {error}"
-                        ))
-                    })?;
-                (session_id, config_options, legacy_models)
-            }
-            None => {
-                let (session_id, response_value) = new_acp_session(
-                    process,
-                    &context,
-                    &options,
-                    sink,
-                    cancel,
-                    provider,
-                    auto_approve,
-                    connection,
-                )
-                .await?;
-                connection.session = Some((session_id.clone(), response_value.clone()));
-                let legacy_models = response_value.get("models").cloned();
-                let config_options = response_value
-                    .get("configOptions")
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(|error| {
-                        AppError::InvalidRequest(format!(
-                            "invalid ACP session/new response: {error}"
-                        ))
-                    })?;
-                (session_id, config_options, legacy_models)
-            }
-        }
-    };
-
+        sink,
+        cancel,
+        &options,
+        auto_approve,
+        connection,
+    )
+    .await?;
     let mut state = context.provider_state;
     state.native_session_id = Some(native_session_id.clone());
     // A session is recoverable when a later process can reattach to it.
@@ -1605,6 +1454,260 @@ fn apply_session_metadata(request: &mut Value, options: &AcpRuntimeOptions, load
     if loading && options.suppress_load_replay {
         request["_meta"]["noReplay"] = json!(true);
     }
+}
+
+/// What a turn needs from the connection's `initialize` and session.
+struct PreparedAcpSession {
+    initialize_value: Value,
+    initialize: InitializeResponse,
+    native_session_id: String,
+    config_options: Option<Vec<SessionConfigOption>>,
+    legacy_models: Option<Value>,
+}
+
+/// Everything a turn does before applying its config and sending
+/// `session/prompt`: `initialize` (and `authenticate`) and the session
+/// new/resume/load, each skipped when `connection` already holds it.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_acp_session(
+    process: &mut JsonLineProcess,
+    context: &DriverContext,
+    prompt: &DriverPrompt,
+    sink: &DriverEventSink,
+    cancel: &mut watch::Receiver<bool>,
+    options: &AcpRuntimeOptions,
+    auto_approve: AutoApprove,
+    connection: &mut AcpConnectionState,
+) -> Result<PreparedAcpSession, AppError> {
+    let provider = context.manifest.provider;
+    let initialize_value = if let Some(initialize) = &connection.initialize {
+        initialize.clone()
+    } else {
+        let request_id = send_request(process, "initialize", initialize_request(provider)).await?;
+        let initialize = wait_for_response(
+            process,
+            &request_id,
+            sink,
+            cancel,
+            provider,
+            true,
+            auto_approve,
+            connection,
+        )
+        .await?;
+        initialize
+    };
+    let initialize: InitializeResponse =
+        serde_json::from_value(initialize_value.clone()).map_err(|error| {
+            AppError::InvalidRequest(format!("invalid ACP initialize response: {error}"))
+        })?;
+    if initialize.protocol_version != ProtocolVersion::V1 {
+        return Err(AppError::Unsupported(format!(
+            "ACP agent negotiated unsupported protocol version {}",
+            initialize.protocol_version
+        )));
+    }
+    ensure_acp_images_supported(
+        prompt,
+        initialize.agent_capabilities.prompt_capabilities.image,
+        options.allow_unadvertised_images,
+        context.manifest.provider,
+    )?;
+
+    if connection.initialize.is_none() {
+        authenticate_if_requested(
+            process,
+            &initialize_value,
+            sink,
+            cancel,
+            provider,
+            options,
+            connection,
+        )
+        .await?;
+        connection.initialize = Some(initialize_value.clone());
+    }
+
+    let (native_session_id, config_options, legacy_models) = if let Some((id, response)) =
+        &connection.session
+    {
+        let options = response
+            .get("configOptions")
+            .cloned()
+            .map(serde_json::from_value::<Vec<SessionConfigOption>>)
+            .transpose()?;
+        (id.clone(), options, response.get("models").cloned())
+    } else {
+        match context.provider_state.native_session_id.clone() {
+            Some(session_id) => {
+                // `session/resume` attaches without replaying history; TodeX
+                // keeps its own event log, so agents that prefer it skip
+                // session/load.
+                let can_resume = quirks(provider).prefer_resume
+                    && initialize_value
+                        .pointer("/agentCapabilities/sessionCapabilities/resume")
+                        .is_some();
+                if !can_resume && !initialize.agent_capabilities.load_session {
+                    return Err(AppError::Unsupported(
+                    "ACP agent does not support session/load; historical prompts will not be replayed"
+                        .to_owned(),
+                ));
+                }
+                let loaded = if can_resume {
+                    let request_id = send_request(
+                        process,
+                        "session/resume",
+                        with_agent_mcp(
+                            json!({
+                                "sessionId": session_id,
+                                "cwd": context.manifest.workspace,
+                            }),
+                            context,
+                        ),
+                    )
+                    .await?;
+                    wait_for_response(
+                        process,
+                        &request_id,
+                        sink,
+                        cancel,
+                        provider,
+                        false,
+                        auto_approve,
+                        connection,
+                    )
+                    .await
+                } else {
+                    let mut request = serde_json::to_value(LoadSessionRequest::new(
+                        session_id.clone(),
+                        context.manifest.workspace.clone(),
+                    ))?;
+                    apply_session_metadata(&mut request, options, true);
+                    let request = with_agent_mcp(request, context);
+                    let request_id = send_request(process, "session/load", request).await?;
+                    wait_for_response(
+                        process,
+                        &request_id,
+                        sink,
+                        cancel,
+                        provider,
+                        !options.suppress_load_replay,
+                        auto_approve,
+                        connection,
+                    )
+                    .await
+                };
+                let (session_id, response_value) = match loaded {
+                    Ok(response_value) => (session_id, response_value),
+                    Err(error @ AppError::TurnCancelled) => return Err(error),
+                    // Devin sessions live in a shared registry/lock table, so a
+                    // stored id can be held by another process or deleted
+                    // externally. Start a fresh session rather than failing the
+                    // turn — but only when the agent itself answered: a local
+                    // failure (journal full, write error) must surface as-is.
+                    Err(error)
+                        if quirks(provider).recreate_unloadable_session
+                            && matches!(
+                                error,
+                                AppError::Conflict(_) | AppError::ProviderUnavailable(_)
+                            ) =>
+                    {
+                        sink.emit(
+                            "provider.event",
+                            json!({"provider":provider.as_str(),"providerMethod":"session/recreated","metadata":{"reason":error.to_string(),"previousSessionId":session_id}}),
+                        )
+                        .await?;
+                        new_acp_session(
+                            process,
+                            context,
+                            options,
+                            sink,
+                            cancel,
+                            provider,
+                            auto_approve,
+                            connection,
+                        )
+                        .await?
+                    }
+                    Err(error) => return Err(error),
+                };
+                connection.session = Some((session_id.clone(), response_value.clone()));
+                let legacy_models = response_value.get("models").cloned();
+                let config_options = response_value
+                    .get("configOptions")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|error| {
+                        AppError::InvalidRequest(format!(
+                            "invalid ACP session resume response: {error}"
+                        ))
+                    })?;
+                (session_id, config_options, legacy_models)
+            }
+            None => {
+                let (session_id, response_value) = new_acp_session(
+                    process,
+                    context,
+                    options,
+                    sink,
+                    cancel,
+                    provider,
+                    auto_approve,
+                    connection,
+                )
+                .await?;
+                connection.session = Some((session_id.clone(), response_value.clone()));
+                let legacy_models = response_value.get("models").cloned();
+                let config_options = response_value
+                    .get("configOptions")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|error| {
+                        AppError::InvalidRequest(format!(
+                            "invalid ACP session/new response: {error}"
+                        ))
+                    })?;
+                (session_id, config_options, legacy_models)
+            }
+        }
+    };
+
+    Ok(PreparedAcpSession {
+        initialize_value,
+        initialize,
+        native_session_id,
+        config_options,
+        legacy_models,
+    })
+}
+
+/// Prepares a resident connection ahead of its first turn (see
+/// [`prepare_acp_session`]); the next turn on `connection` reuses it.
+pub(super) async fn prewarm_acp_session(
+    process: &mut JsonLineProcess,
+    context: &DriverContext,
+    settings: &DriverPrompt,
+    sink: &DriverEventSink,
+    options: &AcpRuntimeOptions,
+    connection: &mut AcpConnectionState,
+) -> Result<(), AppError> {
+    let provider = context.manifest.provider;
+    let auto_approve = AutoApprove::for_turn(provider, settings.permission_mode.as_deref());
+    let (_cancel_tx, mut cancel) = watch::channel(false);
+    prepare_acp_session(
+        process,
+        context,
+        settings,
+        sink,
+        &mut cancel,
+        options,
+        auto_approve,
+        connection,
+    )
+    .await
+    .map(drop)
 }
 
 /// Open a new native ACP session. Shared by the cold-start path and the
@@ -4465,6 +4568,122 @@ mod tests {
         assert_eq!(fixture.count("initialize"), 1);
         assert_eq!(fixture.count("session/new"), 1);
         assert_eq!(fixture.count("session/prompt"), 2);
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    impl GenericFixture {
+        async fn prewarm(&self) -> Result<ProviderPrewarm, AppError> {
+            let context = DriverContext {
+                manifest: self.manifest.clone(),
+                provider_state: self.store.provider_state(&self.manifest.id).await.unwrap(),
+                agent_mcp: None,
+            };
+            let settings = DriverPrompt {
+                turn_id: "prewarm".to_owned(),
+                text: String::new(),
+                content: vec![],
+                skills: vec![],
+                model: None,
+                reasoning_effort: None,
+                permission_mode: None,
+                work_mode: None,
+                permission_profile: None,
+                sandbox_mode: None,
+                approval_policy: None,
+            };
+            let sink = DriverEventSink::new(
+                self.store.clone(),
+                crate::conversation::ConversationEventHub::default(),
+                super::super::types::PermissionBroker::default(),
+                &self.manifest.id,
+            )
+            .muted();
+            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.driver.prewarm(context, settings, sink, permit),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn journal_len(&self) -> usize {
+            self.store
+                .replay(&self.manifest.id, 0, 1000)
+                .await
+                .unwrap()
+                .events
+                .len()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prewarm_prepares_the_session_the_first_turn_uses() {
+        let fixture = GenericFixture::new(true).await;
+        assert_eq!(fixture.prewarm().await.unwrap(), ProviderPrewarm::Warmed);
+        assert_eq!(fixture.processes(), 1);
+        assert_eq!(fixture.count("initialize"), 1);
+        assert_eq!(fixture.count("session/new"), 1);
+        assert_eq!(fixture.count("session/prompt"), 0);
+        // A prewarm records nothing: no events, no native session.
+        assert_eq!(fixture.journal_len().await, 0);
+        let state = fixture
+            .store
+            .provider_state(&fixture.manifest.id)
+            .await
+            .unwrap();
+        assert!(state.native_session_id.is_none());
+        assert_eq!(
+            fixture.prewarm().await.unwrap(),
+            ProviderPrewarm::AlreadyWarm
+        );
+
+        let result = fixture.run("turn-first", "normal", None).await;
+        assert_eq!(result.stop_reason, "end_turn");
+        assert_eq!(fixture.processes(), 1);
+        assert_eq!(fixture.count("initialize"), 1);
+        assert_eq!(fixture.count("session/new"), 1);
+        assert_eq!(fixture.count("session/resume"), 0);
+        assert_eq!(fixture.count("session/prompt"), 1);
+        // The turn records the session the prewarm opened.
+        let state = fixture
+            .store
+            .provider_state(&fixture.manifest.id)
+            .await
+            .unwrap();
+        assert!(state.native_session_id.is_some());
+        assert_eq!(state.native_session_id, result.native_session_id);
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_turn_racing_a_prewarm_shares_its_session() {
+        let fixture = GenericFixture::new(true).await;
+        let (warmed, result) =
+            tokio::join!(fixture.prewarm(), fixture.run("turn-race", "normal", None));
+        assert!(matches!(
+            warmed.unwrap(),
+            ProviderPrewarm::Warmed | ProviderPrewarm::AlreadyWarm
+        ));
+        assert_eq!(result.stop_reason, "end_turn");
+        assert_eq!(fixture.processes(), 1);
+        assert_eq!(fixture.count("initialize"), 1);
+        assert_eq!(fixture.count("session/new"), 1);
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prewarm_skips_a_per_turn_profile() {
+        let fixture = GenericFixture::new(false).await;
+        assert_eq!(
+            fixture.prewarm().await.unwrap(),
+            ProviderPrewarm::Unsupported
+        );
+        assert_eq!(fixture.processes(), 0);
         fixture.finish().await;
     }
 

@@ -23,7 +23,9 @@ use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::super::process::JsonLineProcess;
-use super::super::types::{DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult};
+use super::super::types::{
+    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ProviderPrewarm,
+};
 use super::Catalogs;
 
 /// How long a cancelled turn may take to settle after `interrupt` before
@@ -52,6 +54,22 @@ struct Turn {
     reply: oneshot::Sender<Reply>,
 }
 
+/// A prewarm: start the process with `settings`' launch settings and
+/// `initialize` it, without a turn.
+pub(in crate::provider) struct Warm {
+    pub context: DriverContext,
+    pub settings: DriverPrompt,
+    pub permit: WorkspaceTrustPermit,
+}
+
+/// What a worker is asked to do, one at a time. Unboxed: the worker's
+/// queue holds a single request.
+#[allow(clippy::large_enum_variant)]
+enum Request {
+    Turn(Turn),
+    Warm(Warm, oneshot::Sender<Result<(), AppError>>),
+}
+
 enum Reply {
     Finished(Result<DriverTurnResult, AppError>),
     /// The worker stopped before starting this turn; `retry` is false when
@@ -64,7 +82,7 @@ enum Reply {
 
 #[derive(Clone)]
 struct Worker {
-    turns: mpsc::Sender<Turn>,
+    turns: mpsc::Sender<Request>,
     shutdown: watch::Sender<bool>,
     stopped: watch::Receiver<bool>,
     /// When the worker last finished a turn; `None` while one is running.
@@ -111,7 +129,7 @@ impl Sessions {
                 return run_once(&launcher, run).await;
             };
             let (reply, response) = oneshot::channel();
-            let retry = match worker.turns.send(Turn { run, reply }).await {
+            let retry = match worker.turns.send(Request::Turn(Turn { run, reply })).await {
                 Ok(()) => match response.await {
                     Ok(Reply::Finished(result)) => return result,
                     Ok(Reply::NotStarted {
@@ -124,9 +142,12 @@ impl Sessions {
                     Err(_) => return Err(unavailable()),
                 },
                 // Closed between lookup and send: the worker is stopping.
-                Err(mpsc::error::SendError(turn)) => {
+                Err(mpsc::error::SendError(Request::Turn(turn))) => {
                     run = turn.run;
                     !*worker.shutdown.borrow()
+                }
+                Err(mpsc::error::SendError(Request::Warm(..))) => {
+                    unreachable!("a turn was sent")
                 }
             };
             if !retry || retried {
@@ -184,6 +205,38 @@ impl Sessions {
                 workers.remove(id);
             }
         }
+    }
+
+    /// Starts the conversation's process with `warm.settings`' launch
+    /// settings and initializes it. A conversation with a worker, or a full
+    /// worker table, is left alone: a prewarm never evicts. The warm worker
+    /// stays idle, so a turn needing a slot may evict it.
+    pub async fn prewarm(
+        &self,
+        launcher: Launcher,
+        warm: Warm,
+    ) -> Result<ProviderPrewarm, AppError> {
+        let id = warm.context.manifest.id.clone();
+        let (reply, response) = oneshot::channel();
+        {
+            let mut workers = self.workers.lock().await;
+            workers.retain(|_, worker| !*worker.stopped.borrow());
+            if workers.contains_key(&id) {
+                return Ok(ProviderPrewarm::AlreadyWarm);
+            }
+            if workers.len() >= self.max_workers {
+                return Ok(ProviderPrewarm::Limit);
+            }
+            let worker = spawn_worker(launcher, self.idle_timeout);
+            // Queued before any turn can find the worker.
+            worker
+                .turns
+                .try_send(Request::Warm(warm, reply))
+                .map_err(|_| unavailable())?;
+            workers.insert(id, worker);
+        }
+        response.await.map_err(|_| unavailable())??;
+        Ok(ProviderPrewarm::Warmed)
     }
 
     /// Stops the conversation's process, if any, and waits for it to exit.
@@ -327,7 +380,7 @@ enum Ended {
 async fn worker(
     launcher: Launcher,
     idle_timeout: Duration,
-    mut turns: mpsc::Receiver<Turn>,
+    mut turns: mpsc::Receiver<Request>,
     mut shutdown: watch::Receiver<bool>,
     stopped: watch::Sender<bool>,
     idle_since: Arc<std::sync::Mutex<Option<Instant>>>,
@@ -352,7 +405,52 @@ async fn worker(
             },
             _ = tokio::time::sleep_until(idle_deadline) => break,
         };
-        let Turn { run, mut reply } = turn;
+        let Turn { run, mut reply } = match turn {
+            Request::Turn(turn) => turn,
+            Request::Warm(warm, reply) => {
+                if live.is_some() {
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
+                let Warm {
+                    context,
+                    settings,
+                    permit,
+                } = warm;
+                let (_cancel_tx, mut cancel) = watch::channel(false);
+                let started = tokio::select! {
+                    started = async {
+                        let key = LaunchKey::new(&launcher.binary, &context, &settings).await?;
+                        let process = super::start_claude(
+                            &launcher.binary,
+                            &launcher.catalogs,
+                            &context,
+                            &settings,
+                            permit,
+                            &mut cancel,
+                        )
+                        .await?;
+                        Ok::<_, AppError>(Live { process, key })
+                    } => started,
+                    _ = shutdown.changed() => {
+                        let _ = reply.send(Err(AppError::TurnCancelled));
+                        break;
+                    }
+                };
+                match started {
+                    Ok(started) => {
+                        live = Some(started);
+                        let _ = reply.send(Ok(()));
+                        idle_deadline = Instant::now() + idle_timeout;
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        };
         let Run {
             context,
             prompt,
@@ -443,11 +541,17 @@ async fn worker(
     // A turn queued before the close never reached Claude: hand it back,
     // after the process is gone, so the caller can reopen the session.
     let retry = !*shutdown.borrow();
-    while let Ok(Turn { run, reply }) = turns.try_recv() {
-        let _ = reply.send(Reply::NotStarted {
-            run: Box::new(run),
-            retry,
-        });
+    while let Ok(request) = turns.try_recv() {
+        match request {
+            Request::Turn(Turn { run, reply }) => {
+                let _ = reply.send(Reply::NotStarted {
+                    run: Box::new(run),
+                    retry,
+                });
+            }
+            // Dropping its reply tells the prewarm the worker stopped.
+            Request::Warm(..) => {}
+        }
     }
     let _ = stopped.send(true);
 }
@@ -809,6 +913,90 @@ done
         );
         sessions.stop_all().await;
         assert_eq!(sessions.worker_count().await, 0);
+        cleanup(&fixture.root);
+    }
+
+    impl Fixture {
+        async fn prewarm(
+            &self,
+            sessions: &Sessions,
+            manifest: &ConversationManifest,
+        ) -> Result<ProviderPrewarm, AppError> {
+            let warm = Warm {
+                context: DriverContext {
+                    manifest: manifest.clone(),
+                    provider_state: self.store.provider_state(&manifest.id).await.unwrap(),
+                    agent_mcp: None,
+                },
+                settings: DriverPrompt {
+                    turn_id: "prewarm".to_owned(),
+                    text: String::new(),
+                    content: vec![],
+                    skills: vec![],
+                    model: None,
+                    reasoning_effort: None,
+                    permission_mode: None,
+                    work_mode: None,
+                    permission_profile: None,
+                    sandbox_mode: None,
+                    approval_policy: None,
+                },
+                permit: self.trust.acquire_owned("local", &self.root).await.unwrap(),
+            };
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                sessions.prewarm(self.launcher.clone(), warm),
+            )
+            .await
+            .expect("prewarm finishes")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prewarm_starts_the_process_the_next_turn_uses() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        assert_eq!(
+            fixture.prewarm(&sessions, &manifest).await.unwrap(),
+            ProviderPrewarm::Warmed
+        );
+        assert_eq!(fixture.launches().len(), 1);
+        let wire = fixture.wire();
+        assert_eq!(wire.matches(r#""subtype":"initialize""#).count(), 1);
+        assert_eq!(wire.matches(r#""type":"user""#).count(), 0);
+        // Nothing was recorded for the conversation.
+        let state = fixture.store.provider_state(&manifest.id).await.unwrap();
+        assert!(state.native_session_id.is_none());
+        assert_eq!(
+            fixture.prewarm(&sessions, &manifest).await.unwrap(),
+            ProviderPrewarm::AlreadyWarm
+        );
+
+        let result = fixture.turn(&sessions, &manifest, "first").await;
+        assert!(!result.cancelled);
+        assert_eq!(fixture.launches().len(), 1);
+        let wire = fixture.wire();
+        assert_eq!(wire.matches(r#""subtype":"initialize""#).count(), 1);
+        assert_eq!(wire.matches(r#""type":"user""#).count(), 1);
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_prewarm_at_the_limit_is_skipped_without_evicting() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(1);
+        let first = fixture.conversation().await;
+        let second = fixture.conversation().await;
+        fixture.turn(&sessions, &first, "one").await;
+        assert_eq!(
+            fixture.prewarm(&sessions, &second).await.unwrap(),
+            ProviderPrewarm::Limit
+        );
+        assert!(sessions.workers.lock().await.contains_key(&first.id));
+        assert_eq!(fixture.launches().len(), 1);
+        sessions.stop_all().await;
         cleanup(&fixture.root);
     }
 

@@ -647,6 +647,9 @@ pub struct DriverEventSink {
     /// Last journalled payload (after attribution) and event per
     /// [`REPEATABLE_SNAPSHOT_EVENTS`] type, shared like `unparsed_lines`.
     snapshots: Arc<Mutex<HashMap<String, (Value, ConversationEvent)>>>,
+    /// Set for a provider prewarm: nothing is journalled or published, the
+    /// provider state is not saved and permission requests are refused.
+    muted: bool,
 }
 
 impl DriverEventSink {
@@ -668,7 +671,28 @@ impl DriverEventSink {
             activity: None,
             quota: crate::quota_store::QuotaStore::default(),
             snapshots: Arc::default(),
+            muted: false,
         }
+    }
+
+    /// A sink for [`ProviderDriver::prewarm`]: events are dropped, the
+    /// provider state is not saved and permission requests fail.
+    pub fn muted(mut self) -> Self {
+        self.muted = true;
+        self
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
+    fn refuse_muted_permission(&self) -> Result<(), AppError> {
+        if self.muted {
+            return Err(AppError::Conflict(
+                "a provider prewarm cannot ask for permission".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Every event and stdout frame routed through this sink (and its clones,
@@ -726,6 +750,14 @@ impl DriverEventSink {
         mut payload: Value,
     ) -> Result<ConversationEvent, AppError> {
         let event_type = event_type.into();
+        if self.muted {
+            return Ok(ConversationEvent::new(
+                &self.conversation_id,
+                0,
+                event_type,
+                payload,
+            ));
+        }
         self.touch();
         self.decorate(&event_type, &mut payload);
         if event_type == "quota.updated" {
@@ -780,6 +812,9 @@ impl DriverEventSink {
         text_pointers: &'static [&'static str],
         extra: Option<&str>,
     ) -> Result<(), AppError> {
+        if self.muted {
+            return Ok(());
+        }
         self.touch();
         self.decorate(event_type, &mut payload);
         let result = match DeltaFragment::from_payload(&payload, text_pointers, extra) {
@@ -869,6 +904,9 @@ impl DriverEventSink {
     }
 
     pub async fn save_provider_state(&self, state: ProviderState) -> Result<(), AppError> {
+        if self.muted {
+            return Ok(());
+        }
         self.store
             .save_provider_state(&self.conversation_id, state)
             .await
@@ -883,6 +921,7 @@ impl DriverEventSink {
         options: Value,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<PermissionDecision, AppError> {
+        self.refuse_muted_permission()?;
         self.permissions
             .request(
                 self.clone(),
@@ -909,6 +948,7 @@ impl DriverEventSink {
         options: Value,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<(PermissionDecision, String), AppError> {
+        self.refuse_muted_permission()?;
         self.permissions
             .request(
                 self.clone(),
@@ -937,6 +977,7 @@ impl DriverEventSink {
         allowed_devices: Vec<String>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<(PermissionDecision, String), AppError> {
+        self.refuse_muted_permission()?;
         self.permissions
             .request(
                 self.clone(),
@@ -949,6 +990,32 @@ impl DriverEventSink {
                 cancel,
             )
             .await
+    }
+}
+
+/// What [`ProviderDriver::prewarm`] did. Every value but `Warmed` is a skip,
+/// reported to the client as its `reason`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderPrewarm {
+    /// The provider process was started and prepared for the next turn.
+    Warmed,
+    /// The conversation already has a live process.
+    AlreadyWarm,
+    /// The provider (or this profile) starts a process for every turn.
+    Unsupported,
+    /// The provider's resident process limit is reached; nothing is evicted.
+    Limit,
+}
+
+impl ProviderPrewarm {
+    /// The skip reason; `None` for [`Self::Warmed`].
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Warmed => None,
+            Self::AlreadyWarm => Some("already_warm"),
+            Self::Unsupported => Some("unsupported_provider"),
+            Self::Limit => Some("limit"),
+        }
     }
 }
 
@@ -1064,6 +1131,22 @@ pub trait ProviderDriver: Send + Sync {
         _profile: Option<&str>,
     ) -> Result<bool, AppError> {
         Ok(self.descriptor().capabilities.image_input)
+    }
+
+    /// Starts the conversation's resident process and runs what its first
+    /// turn would do before sending the prompt (spawn, initialize, session
+    /// setup), so the next turn reuses it. `settings` is the prompt the
+    /// process is prepared for (its text and content are empty); `sink` is
+    /// [`DriverEventSink::muted`]. Never evicts another conversation's
+    /// process.
+    async fn prewarm(
+        &self,
+        _context: DriverContext,
+        _settings: DriverPrompt,
+        _sink: DriverEventSink,
+        _launch_permit: WorkspaceTrustPermit,
+    ) -> Result<ProviderPrewarm, AppError> {
+        Ok(ProviderPrewarm::Unsupported)
     }
 
     async fn run_turn(

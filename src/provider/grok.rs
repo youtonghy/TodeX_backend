@@ -25,7 +25,7 @@ use super::rpc::{FailureWording, RpcClient, RpcPeer};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
     PermissionConfigCapabilities, ProviderCommandDescriptor, ProviderControl, ProviderDescriptor,
-    ProviderDriver, ProviderModelDescriptor,
+    ProviderDriver, ProviderModelDescriptor, ProviderPrewarm,
 };
 
 const INSPECT_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -107,6 +107,29 @@ pub struct GrokBuildDriver {
 }
 
 impl GrokBuildDriver {
+    /// How a conversation's resident process is started.
+    fn resident_launch(
+        &self,
+        context: &DriverContext,
+        prompt: &DriverPrompt,
+    ) -> Result<ResidentLaunch, AppError> {
+        Ok(ResidentLaunch {
+            spec: self.command_spec(&context.manifest.workspace, Some(prompt))?,
+            runtime: AcpRuntimeOptions {
+                authenticate: true,
+                auth_method: self.auth_method.clone(),
+                auth_meta: Some(json!({ "headless": true })),
+                auth_timeout: None,
+                suppress_load_replay: true,
+                allow_cli_config_fallback: true,
+                request_ask_mode: true,
+                legacy_model_state: true,
+                allow_unadvertised_images: true,
+                snake_case_image_mime: false,
+            },
+        })
+    }
+
     pub fn new(config: &AgentConfig) -> Self {
         Self {
             binary: config.grok_bin.clone(),
@@ -293,6 +316,20 @@ impl ProviderDriver for GrokBuildDriver {
         self.commands.fetch(&self.binary, workspace, fetch).await
     }
 
+    async fn prewarm(
+        &self,
+        context: DriverContext,
+        settings: DriverPrompt,
+        sink: DriverEventSink,
+        launch_permit: WorkspaceTrustPermit,
+    ) -> Result<ProviderPrewarm, AppError> {
+        self.sessions
+            .prewarm(context, settings, sink, launch_permit, |context, prompt| {
+                self.resident_launch(context, prompt)
+            })
+            .await
+    }
+
     async fn run_turn(
         &self,
         context: DriverContext,
@@ -308,23 +345,7 @@ impl ProviderDriver for GrokBuildDriver {
                 sink,
                 cancel,
                 launch_permit,
-                |context, prompt| {
-                    Ok(ResidentLaunch {
-                        spec: self.command_spec(&context.manifest.workspace, Some(prompt))?,
-                        runtime: AcpRuntimeOptions {
-                            authenticate: true,
-                            auth_method: self.auth_method.clone(),
-                            auth_meta: Some(json!({ "headless": true })),
-                            auth_timeout: None,
-                            suppress_load_replay: true,
-                            allow_cli_config_fallback: true,
-                            request_ask_mode: true,
-                            legacy_model_state: true,
-                            allow_unadvertised_images: true,
-                            snake_case_image_mime: false,
-                        },
-                    })
-                },
+                |context, prompt| self.resident_launch(context, prompt),
             )
             .await
     }

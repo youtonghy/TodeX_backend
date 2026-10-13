@@ -602,6 +602,28 @@ impl ProviderDriver for ClaudeDriver {
         Ok(state)
     }
 
+    async fn prewarm(
+        &self,
+        context: DriverContext,
+        settings: DriverPrompt,
+        _sink: DriverEventSink,
+        launch_permit: WorkspaceTrustPermit,
+    ) -> Result<super::types::ProviderPrewarm, AppError> {
+        self.sessions
+            .prewarm(
+                runtime::Launcher {
+                    binary: self.binary.clone(),
+                    catalogs: self.catalogs.clone(),
+                },
+                runtime::Warm {
+                    context,
+                    settings,
+                    permit: launch_permit,
+                },
+            )
+            .await
+    }
+
     async fn run_turn(
         &self,
         context: DriverContext,

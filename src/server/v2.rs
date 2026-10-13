@@ -98,6 +98,7 @@ fn is_v2_native_command(command_type: &str) -> bool {
             | "conversation.interrupt"
             | "conversation.stop"
             | "conversation.runtime.stop"
+            | "conversation.warm"
             | "conversation.permission.respond"
             | "mcp.list"
             | "mcp.refresh"
@@ -140,7 +141,7 @@ const MAX_BROWSER_WATCHES: usize = 8;
 fn is_v2_background_command(command_type: &str) -> bool {
     matches!(
         command_type,
-        "mcp.refresh" | "mcp.call" | "conversation.control"
+        "mcp.refresh" | "mcp.call" | "conversation.control" | "conversation.warm"
     )
 }
 
@@ -226,6 +227,10 @@ fn authenticated_routes() -> Router<AppState> {
         .route(
             "/v2/conversations/{conversation_id}/runtime/stop",
             post(stop_provider_runtime),
+        )
+        .route(
+            "/v2/conversations/{conversation_id}/warm",
+            post(warm_conversation),
         )
         .route("/v2/catalog/skills", get(skills).post(create_skill))
         .route(
@@ -1946,6 +1951,28 @@ async fn stop_provider_runtime(
     ))
 }
 
+async fn warm_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(conversation_id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = require_auth(&state, &headers)?;
+    let skipped = state
+        .conversations
+        .warm_owned(&auth.tenant_id, &conversation_id)
+        .await?;
+    Ok(Json(warm_result(&conversation_id, skipped)))
+}
+
+/// The result of `conversation.warm`: `reason` names why it was skipped.
+fn warm_result(conversation_id: &str, skipped: Option<&str>) -> Value {
+    let mut result = json!({ "conversationId": conversation_id, "warmed": skipped.is_none() });
+    if let Some(reason) = skipped {
+        result["reason"] = json!(reason);
+    }
+    result
+}
+
 async fn list_conversations(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3544,6 +3571,8 @@ async fn dispatch_mcp_command_response(
 ) -> Value {
     let result = if command.command_type == "conversation.control" {
         dispatch_provider_control(state, owner_id, &command).await
+    } else if command.command_type == "conversation.warm" {
+        dispatch_warm(state, owner_id, &command).await
     } else {
         dispatch_mcp_command(state, owner_id, &command).await
     };
@@ -3555,6 +3584,26 @@ async fn dispatch_mcp_command_response(
         }),
         Err(error) => error_response(Some(command.id), error),
     }
+}
+
+/// `conversation.warm`; it runs off the read loop because starting a
+/// provider can take seconds.
+async fn dispatch_warm(
+    state: &AppState,
+    owner_id: &str,
+    command: &V2Command,
+) -> Result<Value, AppError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Request {
+        conversation_id: String,
+    }
+    let request: Request = Deserialize::deserialize(&command.payload)?;
+    let skipped = state
+        .conversations
+        .warm_owned(owner_id, &request.conversation_id)
+        .await?;
+    Ok(warm_result(&request.conversation_id, skipped))
 }
 
 async fn dispatch_provider_control(
@@ -4307,6 +4356,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -4568,6 +4618,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -4816,6 +4867,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -4931,6 +4983,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5095,6 +5148,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5265,6 +5319,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5406,6 +5461,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5550,6 +5606,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5767,6 +5824,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5905,6 +5963,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -6045,6 +6104,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -6271,6 +6331,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -6966,6 +7027,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -7185,6 +7247,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -7522,6 +7585,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: false,
@@ -7607,6 +7671,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -7755,6 +7820,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: false,
@@ -7932,6 +7998,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -8362,6 +8429,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -8639,6 +8707,95 @@ mod tests {
                 assert!(result["activeTurnId"].is_null());
             }
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_conversation_warm_answers_over_the_socket_and_http() {
+        let root = std::env::temp_dir().join(format!("todex-v2-warm-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = app.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, served).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/v2/ws?{}",
+            device.sign_query("/v2/ws")
+        ))
+        .await
+        .unwrap();
+        let send = |value: Value| WsMessage::Text(value.to_string().into());
+
+        ws.send(send(json!({ "id": "w0", "type": "conversation.warm", "payload": { "conversationId": "nope" } })))
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_ws_message(&mut ws, |m| m["id"] == "w0").await["type"],
+            "server.error"
+        );
+        ws.send(send(
+            json!({ "id": "w1", "type": "conversation.warm", "payload": {} }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            wait_for_ws_message(&mut ws, |m| m["id"] == "w1").await["type"],
+            "server.error"
+        );
+
+        // The workspace is not trusted: skipped with a reason.
+        let workspace = std::fs::canonicalize(root.join("workspaces/project")).unwrap();
+        let manifest = state
+            .conversations
+            .create_for_tests(ProviderKind::Codex, workspace.clone())
+            .await
+            .unwrap();
+        ws.send(send(json!({ "id": "w2", "type": "conversation.warm", "payload": { "conversationId": manifest.id } })))
+            .await
+            .unwrap();
+        let warmed = wait_for_ws_message(&mut ws, |m| m["id"] == "w2").await;
+        assert_eq!(warmed["type"], "server.result", "{warmed}");
+        assert_eq!(
+            warmed["payload"],
+            json!({ "conversationId": manifest.id, "warmed": false, "reason": "untrusted_workspace" })
+        );
+
+        let response = app
+            .clone()
+            .oneshot(signed_request(
+                &device,
+                "POST",
+                &format!("/v2/conversations/{}/warm", manifest.id),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body, warmed["payload"]);
+
+        let foreign = state
+            .conversations
+            .create_owned("other-owner", ProviderKind::Codex, workspace, None, None)
+            .await
+            .unwrap();
+        let denied = app
+            .clone()
+            .oneshot(signed_request(
+                &device,
+                "POST",
+                &format!("/v2/conversations/{}/warm", foreign.id),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9933,6 +10090,22 @@ mod tests {
             json!({ "conversationId": legacy.id, "text": "hi" })
         );
         assert_eq!(refused["payload"]["code"], "HISTORY_READ_ONLY", "{refused}");
+        // A prewarm of legacy history is skipped with a result, not refused.
+        let warm = dispatch_mcp_command_response(
+            &state,
+            "local",
+            V2Command {
+                id: "warm".to_owned(),
+                command_type: "conversation.warm".to_owned(),
+                payload: json!({ "conversationId": legacy.id }),
+            },
+        )
+        .await;
+        assert_eq!(warm["type"], "server.result", "{warm}");
+        assert_eq!(
+            warm["payload"],
+            json!({ "conversationId": legacy.id, "warmed": false, "reason": "read_only" })
+        );
         let listed = state.conversations.list_owned("local").await.unwrap();
         let wire = serde_json::to_value(&listed).unwrap();
         assert_eq!(wire[0]["legacyPlaintext"], true);

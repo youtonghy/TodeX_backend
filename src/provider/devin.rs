@@ -26,7 +26,7 @@ use super::rpc::{FailureWording, RpcClient, RpcPeer};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
     PermissionConfigCapabilities, ProviderCapabilities, ProviderCommandDescriptor, ProviderControl,
-    ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
+    ProviderDescriptor, ProviderDriver, ProviderModelDescriptor, ProviderPrewarm,
 };
 
 /// Budget for the headless `initialize` that probes fork support.
@@ -139,6 +139,18 @@ pub struct DevinDriver {
 }
 
 impl DevinDriver {
+    /// How a conversation's resident process is started.
+    fn resident_launch(
+        &self,
+        context: &DriverContext,
+        _prompt: &DriverPrompt,
+    ) -> Result<ResidentLaunch, AppError> {
+        Ok(ResidentLaunch {
+            spec: self.command_spec(&context.manifest.workspace),
+            runtime: self.runtime_options()?,
+        })
+    }
+
     pub fn new(config: &AgentConfig) -> Self {
         Self {
             binary: config.devin_bin.clone(),
@@ -524,6 +536,20 @@ impl ProviderDriver for DevinDriver {
         Ok(self.discovery_snapshot(workspace).await?.commands)
     }
 
+    async fn prewarm(
+        &self,
+        context: DriverContext,
+        settings: DriverPrompt,
+        sink: DriverEventSink,
+        launch_permit: WorkspaceTrustPermit,
+    ) -> Result<ProviderPrewarm, AppError> {
+        self.sessions
+            .prewarm(context, settings, sink, launch_permit, |context, prompt| {
+                self.resident_launch(context, prompt)
+            })
+            .await
+    }
+
     async fn run_turn(
         &self,
         context: DriverContext,
@@ -539,12 +565,7 @@ impl ProviderDriver for DevinDriver {
                 sink,
                 cancel,
                 launch_permit,
-                |context, _prompt| {
-                    Ok(ResidentLaunch {
-                        spec: self.command_spec(&context.manifest.workspace),
-                        runtime: self.runtime_options()?,
-                    })
-                },
+                |context, prompt| self.resident_launch(context, prompt),
             )
             .await
     }

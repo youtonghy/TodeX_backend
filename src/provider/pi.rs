@@ -25,7 +25,7 @@ use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
     PendingProviderControl, PermissionConfigCapabilities, PermissionOutcome,
     ProviderCommandDescriptor, ProviderControl, ProviderDescriptor, ProviderDriver,
-    ProviderSessionCommands,
+    ProviderPrewarm, ProviderSessionCommands,
 };
 
 const MAX_PI_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
@@ -157,6 +157,9 @@ struct PiTurnRequest {
     context: DriverContext,
     prompt: DriverPrompt,
     cancel: watch::Receiver<bool>,
+    /// The turn's sink; a runtime a prewarm started journals through it
+    /// from its first turn on.
+    sink: Option<DriverEventSink>,
     result: oneshot::Sender<PiTurnReply>,
 }
 
@@ -175,6 +178,110 @@ fn pi_closing_error() -> AppError {
 }
 
 impl PiDriver {
+    /// The command line of a runtime serving `context` with `prompt`'s model
+    /// and thinking level, and the configuration it starts with.
+    fn launch(
+        &self,
+        context: &DriverContext,
+        prompt: &DriverPrompt,
+    ) -> Result<(CommandSpec, PiLaunchConfig), AppError> {
+        super::types::resolve_execution_config(
+            context.manifest.provider,
+            prompt.permission_mode.as_deref(),
+            prompt.work_mode.as_deref(),
+            prompt.permission_profile.as_deref(),
+            prompt.sandbox_mode.as_deref(),
+            prompt.approval_policy.as_deref(),
+        )?;
+        let native_session_id = context
+            .provider_state
+            .native_session_id
+            .clone()
+            .unwrap_or_else(|| context.manifest.id.clone());
+        let mut spec = CommandSpec::new(&self.binary, &context.manifest.workspace);
+        spec.args = vec![
+            "--mode".to_owned(),
+            "rpc".to_owned(),
+            if context.provider_state.native_session_id.is_some() {
+                "--session"
+            } else {
+                "--session-id"
+            }
+            .to_owned(),
+            native_session_id,
+            "--approve".to_owned(),
+        ];
+        if let Some(model) = &prompt.model {
+            spec.push_flag_value("--model", model)?;
+        }
+        if let Some(effort) = &prompt.reasoning_effort {
+            spec.push_flag_value("--thinking", effort)?;
+        }
+        let launch_config = PiLaunchConfig {
+            model: prompt.model.clone(),
+            thinking: prompt.reasoning_effort.clone(),
+        };
+        Ok((spec, launch_config))
+    }
+
+    /// Spawns the conversation's runtime and registers it. The caller holds
+    /// the conversation's [`StartingReservation`]. A runtime started with a
+    /// muted `sink` (a prewarm) journals nothing until its first turn.
+    async fn start_runtime(
+        &self,
+        conversation_id: &str,
+        spec: &CommandSpec,
+        launch_config: PiLaunchConfig,
+        permit: WorkspaceTrustPermit,
+        sink: &DriverEventSink,
+    ) -> Result<PiSessionHandle, AppError> {
+        let process = JsonLineProcess::spawn_trusted(spec, permit).await?;
+        let (turns, turn_rx) = mpsc::channel(1);
+        let (controls, control_rx) = mpsc::channel(32);
+        let (requests, request_rx) = mpsc::channel(16);
+        let (shutdown, shutdown_rx) = watch::channel(None);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let runtime_id = format!("pi-runtime-{}", uuid::Uuid::new_v4().simple());
+        let session_sink = sink.clone().for_runtime(runtime_id.clone());
+        let handle = PiSessionHandle {
+            turns,
+            controls,
+            requests,
+            shutdown,
+            stopping: stopping.clone(),
+            runtime_id,
+        };
+        tokio::spawn(pi_session_worker(
+            process,
+            session_sink,
+            turn_rx,
+            control_rx,
+            request_rx,
+            shutdown_rx,
+            stopping,
+            self.idle_timeout,
+            launch_config,
+        ));
+        let mut sessions = self.sessions.lock().await;
+        // A close that arrived during the spawn found only the
+        // reservation; honor it now that there is a handle.
+        let close_reason = self
+            .starting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(conversation_id)
+            .and_then(|pending| pending.close_reason.clone());
+        let closing = close_reason.is_some();
+        if closing {
+            handle.shutdown.send_replace(close_reason);
+        }
+        sessions.insert(conversation_id.to_owned(), handle.clone());
+        if closing {
+            return Err(pi_closing_error());
+        }
+        Ok(handle)
+    }
+
     pub fn new(config: &AgentConfig) -> Self {
         Self {
             binary: config.pi_bin.clone(),
@@ -543,6 +650,41 @@ impl ProviderDriver for PiDriver {
         self.commands.fetch(&self.binary, workspace, fetch).await
     }
 
+    /// Spawns the conversation's runtime when it has none. Its
+    /// `provider.runtime` `ready` event waits for the first turn.
+    async fn prewarm(
+        &self,
+        context: DriverContext,
+        settings: DriverPrompt,
+        sink: DriverEventSink,
+        launch_permit: WorkspaceTrustPermit,
+    ) -> Result<ProviderPrewarm, AppError> {
+        let (spec, launch_config) = self.launch(&context, &settings)?;
+        let conversation_id = context.manifest.id.clone();
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|_, handle| !handle.turns.is_closed());
+            let mut starting = self
+                .starting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if sessions.contains_key(&conversation_id) || starting.contains_key(&conversation_id) {
+                return Ok(ProviderPrewarm::AlreadyWarm);
+            }
+            if sessions.len() + starting.len() >= MAX_PI_SESSIONS {
+                return Ok(ProviderPrewarm::Limit);
+            }
+            starting.insert(conversation_id.clone(), PendingStart::new());
+        }
+        let _reservation = StartingReservation {
+            starting: &self.starting,
+            conversation_id: &conversation_id,
+        };
+        self.start_runtime(&conversation_id, &spec, launch_config, launch_permit, &sink)
+            .await?;
+        Ok(ProviderPrewarm::Warmed)
+    }
+
     async fn run_turn(
         &self,
         context: DriverContext,
@@ -551,42 +693,7 @@ impl ProviderDriver for PiDriver {
         cancel: watch::Receiver<bool>,
         launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
-        super::types::resolve_execution_config(
-            context.manifest.provider,
-            prompt.permission_mode.as_deref(),
-            prompt.work_mode.as_deref(),
-            prompt.permission_profile.as_deref(),
-            prompt.sandbox_mode.as_deref(),
-            prompt.approval_policy.as_deref(),
-        )?;
-        let native_session_id = context
-            .provider_state
-            .native_session_id
-            .clone()
-            .unwrap_or_else(|| context.manifest.id.clone());
-        let mut spec = CommandSpec::new(&self.binary, &context.manifest.workspace);
-        spec.args = vec![
-            "--mode".to_owned(),
-            "rpc".to_owned(),
-            if context.provider_state.native_session_id.is_some() {
-                "--session"
-            } else {
-                "--session-id"
-            }
-            .to_owned(),
-            native_session_id.clone(),
-            "--approve".to_owned(),
-        ];
-        if let Some(model) = &prompt.model {
-            spec.push_flag_value("--model", model)?;
-        }
-        if let Some(effort) = &prompt.reasoning_effort {
-            spec.push_flag_value("--thinking", effort)?;
-        }
-        let launch_config = PiLaunchConfig {
-            model: prompt.model.clone(),
-            thinking: prompt.reasoning_effort.clone(),
-        };
+        let (spec, launch_config) = self.launch(&context, &prompt)?;
 
         let conversation_id = context.manifest.id.clone();
         let mut context = context;
@@ -656,51 +763,14 @@ impl ProviderDriver for PiDriver {
                     if let Some(gate) = &self.spawn_gate {
                         let _ = gate.acquire().await;
                     }
-                    let process = JsonLineProcess::spawn_trusted(&spec, permit).await?;
-                    let (turns, turn_rx) = mpsc::channel(1);
-                    let (controls, control_rx) = mpsc::channel(32);
-                    let (requests, request_rx) = mpsc::channel(16);
-                    let (shutdown, shutdown_rx) = watch::channel(None);
-                    let stopping = Arc::new(AtomicBool::new(false));
-                    let runtime_id = format!("pi-runtime-{}", uuid::Uuid::new_v4().simple());
-                    let session_sink = sink.clone().for_runtime(runtime_id.clone());
-                    let handle = PiSessionHandle {
-                        turns,
-                        controls,
-                        requests,
-                        shutdown,
-                        stopping: stopping.clone(),
-                        runtime_id,
-                    };
-                    tokio::spawn(pi_session_worker(
-                        process,
-                        session_sink,
-                        turn_rx,
-                        control_rx,
-                        request_rx,
-                        shutdown_rx,
-                        stopping,
-                        self.idle_timeout,
+                    self.start_runtime(
+                        &conversation_id,
+                        &spec,
                         launch_config.clone(),
-                    ));
-                    let mut sessions = self.sessions.lock().await;
-                    // A close that arrived during the spawn found only the
-                    // reservation; honor it now that there is a handle.
-                    let close_reason = self
-                        .starting
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .get(&conversation_id)
-                        .and_then(|pending| pending.close_reason.clone());
-                    let closing = close_reason.is_some();
-                    if closing {
-                        handle.shutdown.send_replace(close_reason);
-                    }
-                    sessions.insert(conversation_id.clone(), handle.clone());
-                    if closing {
-                        return Err(pi_closing_error());
-                    }
-                    handle
+                        permit,
+                        &sink,
+                    )
+                    .await?
                 }
             };
             let (result, response) = oneshot::channel();
@@ -710,6 +780,7 @@ impl ProviderDriver for PiDriver {
                     context,
                     prompt,
                     cancel: cancel.clone(),
+                    sink: Some(sink.clone()),
                     result,
                 })
                 .await
@@ -885,7 +956,7 @@ async fn pi_package_declares_resource(package: &Value, package_root: &Path, sour
 #[allow(clippy::too_many_arguments)]
 async fn pi_session_worker(
     mut process: JsonLineProcess,
-    session_sink: DriverEventSink,
+    mut session_sink: DriverEventSink,
     mut turns: mpsc::Receiver<PiTurnRequest>,
     mut controls: mpsc::Receiver<PendingProviderControl>,
     mut requests: mpsc::Receiver<PiSessionRequest>,
@@ -901,12 +972,19 @@ async fn pi_session_worker(
     rpc.session_sink = Some(session_sink.clone());
     rpc.shutdown = Some(shutdown.clone());
     rpc.cancel = None;
-    let ready = session_sink
-        .emit(
-            "provider.runtime",
-            json!({"provider":"pi","status":"ready"}),
-        )
-        .await;
+    // A prewarmed runtime announces itself with its first turn's sink.
+    let mut announced = !session_sink.is_muted();
+    let ready = if announced {
+        session_sink
+            .emit(
+                "provider.runtime",
+                json!({"provider":"pi","status":"ready"}),
+            )
+            .await
+            .map(drop)
+    } else {
+        Ok(())
+    };
     let mut reason = "process_exited".to_owned();
     let mut idle_deadline = tokio::time::Instant::now() + idle_timeout;
     if ready.is_ok() {
@@ -965,6 +1043,24 @@ async fn pi_session_worker(
             };
             if let Err(error) = rpc.flush_streamed().await {
                 tracing::warn!(error = %error, "failed to persist Pi background text");
+            }
+            if !announced {
+                if let Some(sink) = &turn.sink {
+                    let runtime_id = session_sink.runtime_id().unwrap_or_default().to_owned();
+                    session_sink = sink.clone().for_runtime(runtime_id);
+                    rpc.sink = Some(session_sink.clone());
+                    rpc.session_sink = Some(session_sink.clone());
+                    announced = true;
+                    if let Err(error) = session_sink
+                        .emit(
+                            "provider.runtime",
+                            json!({"provider":"pi","status":"ready"}),
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %error, "failed to persist Pi runtime start");
+                    }
+                }
             }
             let native = turn
                 .context
@@ -3331,6 +3427,66 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn a_prewarmed_runtime_serves_the_first_turn_and_announces_itself_then() {
+        use crate::conversation::ConversationEventHub;
+        let fixture = Fixture::new().await;
+        let (context, settings) = fixture.turn_parts("", "prewarm").await;
+        let sink = DriverEventSink::new(
+            fixture.store.clone(),
+            ConversationEventHub::default(),
+            fixture.permissions.clone(),
+            &fixture.manifest.id,
+        )
+        .muted();
+        let permit = fixture
+            .trust
+            .acquire_owned("local", &fixture.root)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .driver
+                .prewarm(context, settings, sink, permit)
+                .await
+                .unwrap(),
+            ProviderPrewarm::Warmed
+        );
+        // The process records its launch once it runs.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !fixture.root.join("pi-launches").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the prewarmed process starts");
+        assert_eq!(fixture.launches().await, 1);
+        // Nothing is journalled before the first turn.
+        assert!(fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!fixture.run("pure", "one").await.unwrap().cancelled);
+        assert_eq!(fixture.launches().await, 1);
+        let history = fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.event_type == "provider.runtime"
+                    && event.payload["status"] == "ready")
+                .count(),
+            1
+        );
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn idle_resident_runtime_stops_and_the_next_turn_reopens_it() {
         let mut fixture = Fixture::new().await;
         Arc::get_mut(&mut fixture.driver).unwrap().idle_timeout = Duration::from_millis(200);
@@ -4520,6 +4676,7 @@ mod tests {
                 context,
                 prompt,
                 cancel,
+                sink: None,
                 result,
             })
             .await

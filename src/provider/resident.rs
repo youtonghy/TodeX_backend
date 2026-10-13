@@ -19,13 +19,15 @@ use crate::conversation::ProviderKind;
 use crate::error::AppError;
 use crate::workspace_trust::WorkspaceTrustPermit;
 
-use super::acp::{run_acp_turn_controlled, AcpConnectionState, AcpRuntimeOptions};
+use super::acp::{
+    prewarm_acp_session, run_acp_turn_controlled, AcpConnectionState, AcpRuntimeOptions,
+};
 use super::process::{CommandSpec, JsonLineProcess};
 use super::profile::ProviderProfile;
 use super::rpc::{RpcClient, RpcPeer};
 use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, PendingProviderControl,
-    ProviderControl,
+    ProviderControl, ProviderPrewarm,
 };
 
 /// How long a live control waits for the running turn to acknowledge it.
@@ -42,10 +44,46 @@ pub(super) struct ResidentLaunch {
 #[derive(Clone)]
 struct SessionHandle {
     workspace: PathBuf,
-    turns: mpsc::Sender<ResidentTurn>,
+    turns: mpsc::Sender<ResidentRequest>,
     controls: mpsc::Sender<PendingProviderControl>,
     shutdown: watch::Sender<bool>,
     stopped: watch::Receiver<bool>,
+}
+
+/// What a session actor is asked to do, one at a time.
+enum ResidentRequest {
+    Turn(ResidentTurn),
+    Warm(ResidentWarm),
+}
+
+/// Prepares the session for its first turn without running one.
+struct ResidentWarm {
+    context: DriverContext,
+    settings: DriverPrompt,
+    sink: DriverEventSink,
+    launch_permit: WorkspaceTrustPermit,
+    respond_to: oneshot::Sender<Result<(), AppError>>,
+}
+
+/// The settings a process was started with by a prewarm; the CLI flags a
+/// launch derives from them are still valid for a turn with the same ones.
+#[derive(PartialEq, Eq)]
+struct WarmSettings {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    permission_mode: Option<String>,
+    work_mode: Option<String>,
+}
+
+impl WarmSettings {
+    fn of(prompt: &DriverPrompt) -> Self {
+        Self {
+            model: prompt.model.clone(),
+            reasoning_effort: prompt.reasoning_effort.clone(),
+            permission_mode: prompt.permission_mode.clone(),
+            work_mode: prompt.work_mode.clone(),
+        }
+    }
 }
 
 struct ResidentTurn {
@@ -129,7 +167,7 @@ impl ResidentSessions {
             let handle = self.session(&conversation_id, &turn, &launch).await?;
             let (respond_to, response) = oneshot::channel();
             turn.respond_to = respond_to;
-            let (returned, retry) = match handle.turns.send(turn).await {
+            let (returned, retry) = match handle.turns.send(ResidentRequest::Turn(turn)).await {
                 Ok(()) => match response.await {
                     Ok(ResidentReply::Finished(result)) => return result,
                     Ok(ResidentReply::NotStarted { turn, retry }) => (*turn, retry),
@@ -140,7 +178,12 @@ impl ResidentSessions {
                     }
                 },
                 // Closed between lookup and send: the actor is stopping.
-                Err(mpsc::error::SendError(turn)) => (turn, !*handle.shutdown.borrow()),
+                Err(mpsc::error::SendError(ResidentRequest::Turn(turn))) => {
+                    (turn, !*handle.shutdown.borrow())
+                }
+                Err(mpsc::error::SendError(ResidentRequest::Warm(_))) => {
+                    unreachable!("a turn was sent")
+                }
             };
             if !retry || retried {
                 return Err(AppError::Conflict(format!(
@@ -183,7 +226,7 @@ impl ResidentSessions {
                                 self.max_sessions
                             )));
                         }
-                        let handle = self.spawn_session(turn, launch)?;
+                        let handle = self.spawn_session(&turn.context, &turn.prompt, launch)?;
                         sessions.insert(conversation_id.to_owned(), handle.clone());
                         return Ok(handle);
                     }
@@ -201,12 +244,66 @@ impl ResidentSessions {
         }
     }
 
+    /// Starts the conversation's session and prepares it for its first turn
+    /// (see [`super::acp::prewarm_acp_session`]). A conversation that has a
+    /// session, or a full session table, is left alone: a prewarm never
+    /// evicts. A turn arriving meanwhile waits for the prewarm on the actor.
+    pub(super) async fn prewarm(
+        &self,
+        context: DriverContext,
+        settings: DriverPrompt,
+        sink: DriverEventSink,
+        launch_permit: WorkspaceTrustPermit,
+        launch: impl Fn(&DriverContext, &DriverPrompt) -> Result<ResidentLaunch, AppError>,
+    ) -> Result<ProviderPrewarm, AppError> {
+        let label = self.label;
+        let conversation_id = context.manifest.id.clone();
+        let (respond_to, response) = oneshot::channel();
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|_, handle| !*handle.stopped.borrow());
+            if sessions.contains_key(&conversation_id) {
+                return Ok(ProviderPrewarm::AlreadyWarm);
+            }
+            if sessions.len() >= self.max_sessions {
+                return Ok(ProviderPrewarm::Limit);
+            }
+            let handle = self.spawn_session(&context, &settings, &launch)?;
+            // The actor's queue is new and empty: the prewarm is queued
+            // before any turn can find the session.
+            if handle
+                .turns
+                .try_send(ResidentRequest::Warm(ResidentWarm {
+                    context,
+                    settings,
+                    sink,
+                    launch_permit,
+                    respond_to,
+                }))
+                .is_err()
+            {
+                return Err(AppError::ProviderUnavailable(format!(
+                    "{label} session stopped before it was prepared"
+                )));
+            }
+            sessions.insert(conversation_id, handle);
+        }
+        match response.await {
+            Ok(Ok(())) => Ok(ProviderPrewarm::Warmed),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(AppError::ProviderUnavailable(format!(
+                "{label} session stopped before it was prepared"
+            ))),
+        }
+    }
+
     fn spawn_session(
         &self,
-        turn: &ResidentTurn,
+        context: &DriverContext,
+        prompt: &DriverPrompt,
         launch: &impl Fn(&DriverContext, &DriverPrompt) -> Result<ResidentLaunch, AppError>,
     ) -> Result<SessionHandle, AppError> {
-        let ResidentLaunch { spec, runtime } = launch(&turn.context, &turn.prompt)?;
+        let ResidentLaunch { spec, runtime } = launch(context, prompt)?;
         let (turns, turn_rx) = mpsc::channel(1);
         let (controls, control_rx) = mpsc::channel(16);
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -222,7 +319,7 @@ impl ResidentSessions {
             .run(turn_rx, control_rx, shutdown_rx, stopped_tx),
         );
         Ok(SessionHandle {
-            workspace: turn.context.manifest.workspace.clone(),
+            workspace: context.manifest.workspace.clone(),
             turns,
             controls,
             shutdown,
@@ -329,7 +426,7 @@ struct SessionActor {
 impl SessionActor {
     async fn run(
         self,
-        mut turns: mpsc::Receiver<ResidentTurn>,
+        mut turns: mpsc::Receiver<ResidentRequest>,
         mut controls: mpsc::Receiver<PendingProviderControl>,
         mut shutdown: watch::Receiver<bool>,
         stopped: watch::Sender<bool>,
@@ -338,6 +435,8 @@ impl SessionActor {
         let mut process: Option<JsonLineProcess> = None;
         let mut connection = AcpConnectionState::default();
         let mut last_sink: Option<DriverEventSink> = None;
+        // Set by a prewarm until the next turn.
+        let mut warmed_with: Option<WarmSettings> = None;
         let mut idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
         loop {
             // Biased: a requested stop wins, then a waiting turn; the idle
@@ -373,7 +472,49 @@ impl SessionActor {
                 mut cancel,
                 launch_permit,
                 respond_to,
-            } = request;
+            } = match request {
+                ResidentRequest::Turn(turn) => turn,
+                ResidentRequest::Warm(warm) => {
+                    let ResidentWarm {
+                        context,
+                        settings,
+                        sink,
+                        launch_permit,
+                        respond_to,
+                    } = warm;
+                    if process.is_none() {
+                        match JsonLineProcess::spawn_trusted(&self.spec, launch_permit).await {
+                            Ok(spawned) => process = Some(spawned),
+                            Err(error) => {
+                                let _ = respond_to.send(Err(error));
+                                break;
+                            }
+                        }
+                    } else {
+                        drop(launch_permit);
+                    }
+                    let Some(running) = process.as_mut() else {
+                        break;
+                    };
+                    let result = tokio::select! {
+                        result = prewarm_acp_session(running, &context, &settings, &sink, &self.runtime, &mut connection) => result,
+                        _ = shutdown.changed() => { let _ = respond_to.send(Err(AppError::TurnCancelled)); break; }
+                    };
+                    let prepared = result.is_ok();
+                    let _ = respond_to.send(result);
+                    if !prepared {
+                        break;
+                    }
+                    // Notifications before the first turn are observed, not
+                    // journalled.
+                    if last_sink.is_none() {
+                        warmed_with = Some(WarmSettings::of(&settings));
+                        last_sink = Some(sink);
+                    }
+                    idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
+                    continue;
+                }
+            };
             if process.is_none() {
                 match JsonLineProcess::spawn_trusted(&self.spec, launch_permit).await {
                     Ok(spawned) => process = Some(spawned),
@@ -387,8 +528,12 @@ impl SessionActor {
             }
             let mut options = self.runtime.clone();
             // A reused process cannot apply a new CLI fallback; require a
-            // protocol ACK.
-            if last_sink.is_some() {
+            // protocol ACK. A process a prewarm started with this turn's
+            // settings still has the flags they map to.
+            let warmed_for_turn = warmed_with
+                .take()
+                .is_some_and(|warmed| warmed == WarmSettings::of(&prompt));
+            if last_sink.is_some() && !warmed_for_turn {
                 options.allow_cli_config_fallback = false;
             }
             let Some(running) = process.as_mut() else {
@@ -430,12 +575,18 @@ impl SessionActor {
         // A turn queued before the close never reached the agent: hand it
         // back, after the process is gone, so the caller can reopen.
         let retry = !*shutdown.borrow();
-        while let Ok(mut turn) = turns.try_recv() {
-            let respond_to = std::mem::replace(&mut turn.respond_to, oneshot::channel().0);
-            let _ = respond_to.send(ResidentReply::NotStarted {
-                turn: Box::new(turn),
-                retry,
-            });
+        while let Ok(request) = turns.try_recv() {
+            match request {
+                ResidentRequest::Turn(mut turn) => {
+                    let respond_to = std::mem::replace(&mut turn.respond_to, oneshot::channel().0);
+                    let _ = respond_to.send(ResidentReply::NotStarted {
+                        turn: Box::new(turn),
+                        retry,
+                    });
+                }
+                // Dropping its reply tells the prewarm the session stopped.
+                ResidentRequest::Warm(_) => {}
+            }
         }
         let _ = stopped.send(true);
     }

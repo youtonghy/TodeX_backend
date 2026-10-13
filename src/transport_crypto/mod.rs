@@ -765,6 +765,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,

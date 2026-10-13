@@ -145,6 +145,9 @@ pub struct AgentConfig {
     /// turn before it is stopped. Read it through
     /// [`AgentConfig::provider_keepalive`], which applies the minimum.
     pub provider_keepalive_seconds: u64,
+    /// Whether `conversation.warm` may start a conversation's provider
+    /// process before its first prompt.
+    pub provider_prewarm: bool,
 }
 
 pub const DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES: u64 = 60;
@@ -251,6 +254,7 @@ struct PartialAgentConfig {
     ssh_bin: Option<String>,
     provider_idle_timeout_minutes: Option<u64>,
     provider_keepalive_seconds: Option<u64>,
+    provider_prewarm: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -488,6 +492,12 @@ impl Config {
                     agent_file.provider_keepalive_seconds,
                     defaults.agent.provider_keepalive_seconds,
                 ),
+                provider_prewarm: coalesce(
+                    None,
+                    env_bool("TODEX_AGENTD_PROVIDER_PREWARM"),
+                    agent_file.provider_prewarm,
+                    defaults.agent.provider_prewarm,
+                ),
             },
             security: SecurityConfig {
                 enable_auth,
@@ -687,6 +697,7 @@ impl Default for Config {
                 acp_profiles: BTreeMap::new(),
                 provider_idle_timeout_minutes: DEFAULT_PROVIDER_IDLE_TIMEOUT_MINUTES,
                 provider_keepalive_seconds: DEFAULT_PROVIDER_KEEPALIVE_SECONDS,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -818,6 +829,7 @@ fn merge_file_config(mut base: FileConfig, overlay: FileConfig) -> FileConfig {
             base_agent.provider_keepalive_seconds,
             overlay_agent.provider_keepalive_seconds
         );
+        replace_some!(base_agent.provider_prewarm, overlay_agent.provider_prewarm);
     }
     if let Some(overlay_security) = overlay.security {
         let base_security = base
@@ -1286,7 +1298,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("config.toml"),
-            "[agent]\nprovider_keepalive_seconds = 900\n\n\
+            "[agent]\nprovider_keepalive_seconds = 900\nprovider_prewarm = false\n\n\
              [agent.acp_profiles.kept]\ncommand = \"agent\"\n\n\
              [agent.acp_profiles.per_turn]\ncommand = \"agent\"\nresident = false\n",
         )
@@ -1300,6 +1312,10 @@ mod tests {
             assert_eq!(config.agent.provider_keepalive_seconds, 900);
             assert_eq!(config.agent.provider_keepalive(), Duration::from_secs(900));
         }
+        if env::var_os("TODEX_AGENTD_PROVIDER_PREWARM").is_none() {
+            assert!(!config.agent.provider_prewarm);
+        }
+        assert!(defaults.agent.provider_prewarm);
         assert!(config.agent.acp_profiles["kept"].resident);
         assert!(!config.agent.acp_profiles["per_turn"].resident);
         // Too short a keepalive is raised to the minimum.

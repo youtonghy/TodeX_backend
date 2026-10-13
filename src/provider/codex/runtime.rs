@@ -1,5 +1,5 @@
 //! One process and one stdout consumer per native Codex session.
-use super::super::types::{PendingProviderControl, ProviderControl};
+use super::super::types::{PendingProviderControl, ProviderControl, ProviderPrewarm};
 use super::*;
 use std::{
     collections::{HashMap, VecDeque},
@@ -21,8 +21,17 @@ pub(super) struct Run {
     pub permit: WorkspaceTrustPermit,
 }
 
+/// A prewarm: the worker starts its process and prepares the thread.
+pub(super) struct Warm {
+    pub context: DriverContext,
+    pub settings: DriverPrompt,
+    pub sink: DriverEventSink,
+    pub permit: WorkspaceTrustPermit,
+}
+
 enum Command {
     Run(Run, oneshot::Sender<Result<DriverTurnResult, AppError>>),
+    Warm(Warm, oneshot::Sender<Result<(), AppError>>),
     Control(PendingProviderControl),
     Shutdown(oneshot::Sender<()>),
 }
@@ -59,6 +68,32 @@ impl Sessions {
             .await
             .map_err(|_| unavailable())?;
         rx.await.map_err(|_| unavailable())?
+    }
+
+    /// Starts the conversation's worker and prepares its thread (initialize
+    /// and `thread/resume` or `thread/start`) without starting a turn. A
+    /// conversation with a worker, or a full worker table, is left alone.
+    pub async fn prewarm(&self, binary: &str, warm: Warm) -> Result<ProviderPrewarm, AppError> {
+        let id = warm.context.manifest.id.clone();
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut workers = self.workers.lock().await;
+            workers.retain(|_, worker| !worker.is_closed());
+            if workers.contains_key(&id) {
+                return Ok(ProviderPrewarm::AlreadyWarm);
+            }
+            if workers.len() >= MAX_WORKERS {
+                return Ok(ProviderPrewarm::Limit);
+            }
+            let worker = spawn_worker(binary.to_owned());
+            // Queued before any turn can find the worker.
+            worker
+                .try_send(Command::Warm(warm, tx))
+                .map_err(|_| unavailable())?;
+            workers.insert(id, worker);
+        }
+        rx.await.map_err(|_| unavailable())??;
+        Ok(ProviderPrewarm::Warmed)
     }
 
     pub async fn control(
@@ -158,6 +193,8 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
     let mut native_model: Option<String> = None;
     let mut last_sink: Option<DriverEventSink> = None;
     let mut known_queue = VecDeque::<Value>::new();
+    // A new thread a prewarm started, saved with the next turn.
+    let mut warm_state: Option<ProviderState> = None;
     loop {
         let command = if let Some(process) = process.as_mut() {
             tokio::select! {
@@ -195,9 +232,7 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                     continue;
                 }
                 if process.is_none() {
-                    let mut spec = CommandSpec::new(&binary, &context.manifest.workspace);
-                    spec.args = vec!["app-server".into(), "--listen".into(), "stdio://".into()];
-                    match JsonLineProcess::spawn_trusted(&spec, permit).await {
+                    match spawn_app_server(&binary, &context, permit).await {
                         Ok(child) => process = Some(child),
                         Err(error) => {
                             let _ = respond.send(Err(error));
@@ -209,7 +244,7 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                 }
                 let child = process.as_mut().expect("spawned process");
                 let result = async {
-                    let mut state_to_save = None;
+                    let mut state_to_save = warm_state.take();
                     if native_thread.is_none() {
                         let (thread, model, state) = super::prepare_codex_thread(
                             child,
@@ -248,6 +283,45 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                     break;
                 }
             }
+            Some(Command::Warm(warm, respond)) => {
+                let Warm {
+                    context,
+                    settings,
+                    sink,
+                    permit,
+                } = warm;
+                if process.is_none() {
+                    match spawn_app_server(&binary, &context, permit).await {
+                        Ok(child) => process = Some(child),
+                        Err(error) => {
+                            let _ = respond.send(Err(error));
+                            break;
+                        }
+                    }
+                } else {
+                    drop(permit);
+                }
+                if native_thread.is_some() {
+                    let _ = respond.send(Ok(()));
+                    continue;
+                }
+                let child = process.as_mut().expect("spawned process");
+                let (_cancel_tx, mut cancel) = watch::channel(false);
+                match super::prepare_codex_thread(child, context, &settings, &sink, &mut cancel)
+                    .await
+                {
+                    Ok((thread, model, state)) => {
+                        native_thread = Some(thread);
+                        native_model = model;
+                        warm_state = state;
+                        let _ = respond.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = respond.send(Err(error));
+                        break;
+                    }
+                }
+            }
             Some(Command::Control(control)) => {
                 let _ = control.respond_to.send(Err(inactive()));
             }
@@ -269,6 +343,9 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
             Command::Run(_, reply) => {
                 let _ = reply.send(Err(unavailable()));
             }
+            Command::Warm(_, reply) => {
+                let _ = reply.send(Err(unavailable()));
+            }
             Command::Control(control) => {
                 let _ = control.respond_to.send(Err(unavailable()));
             }
@@ -277,6 +354,17 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
             }
         }
     }
+}
+
+/// Starts the conversation's `codex app-server`.
+async fn spawn_app_server(
+    binary: &str,
+    context: &DriverContext,
+    permit: WorkspaceTrustPermit,
+) -> Result<JsonLineProcess, AppError> {
+    let mut spec = CommandSpec::new(binary, &context.manifest.workspace);
+    spec.args = vec!["app-server".into(), "--listen".into(), "stdio://".into()];
+    JsonLineProcess::spawn_trusted(&spec, permit).await
 }
 
 struct Pending {
@@ -430,6 +518,8 @@ async fn active_turn(
                     process.terminate().await; let _ = done.send(()); return Err(AppError::TurnCancelled);
                 }
                 Some(Command::Run(_, reply)) => { let _ = reply.send(Err(AppError::Unsupported("Codex session already has an active turn".to_owned()))); }
+                // The thread is already prepared.
+                Some(Command::Warm(_, reply)) => { let _ = reply.send(Ok(())); }
                 None => return Err(unavailable()),
             },
             result = permissions.join_next(), if !permissions.is_empty() => {
@@ -722,6 +812,138 @@ mod tests {
         done.send(()).unwrap();
         stopping.await.unwrap();
         assert!(sessions.workers.lock().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_prewarm_prepares_the_thread_the_first_turn_uses() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("todex-codex-prewarm-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let root = tokio::fs::canonicalize(root).await.unwrap();
+        let script = root.join("fake-codex");
+        tokio::fs::write(
+            &script,
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+printf 'launch\n' >> "$dir/launches"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$dir/wire.jsonl"
+  id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":"%s","result":{}}\n' "$id" ;;
+    *'"method":"thread/start"'*) printf '{"id":"%s","result":{"thread":{"id":"native"},"model":"fixture-model"}}\n' "$id" ;;
+    *'"method":"turn/start"'*)
+      printf '{"id":"%s","result":{"turn":{"id":"active","status":"inProgress"}}}\n' "$id"
+      printf '{"method":"turn/started","params":{"threadId":"native","turn":{"id":"active","status":"inProgress"}}}\n'
+      printf '{"method":"turn/completed","params":{"threadId":"native","turn":{"id":"active","status":"completed"}}}\n' ;;
+  esac
+done
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let store = ConversationStore::new(root.join("data")).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let trust = WorkspaceTrustStore::new(root.join("trust"), vec![root.clone()])
+            .await
+            .unwrap();
+        trust.set_owned("local", &root, true).await.unwrap();
+        let sink = |turn: &str| {
+            DriverEventSink::new(
+                store.clone(),
+                ConversationEventHub::default(),
+                PermissionBroker::default(),
+                manifest.id.clone(),
+            )
+            .with_turn_id(turn)
+        };
+        let prompt = |turn: &str, text: &str| DriverPrompt {
+            turn_id: turn.into(),
+            text: text.into(),
+            content: vec![],
+            skills: vec![],
+            model: None,
+            reasoning_effort: None,
+            permission_mode: None,
+            work_mode: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
+        };
+        let context = || DriverContext {
+            manifest: manifest.clone(),
+            provider_state: ProviderState::new(ProviderKind::Codex),
+            agent_mcp: None,
+        };
+        let binary = script.display().to_string();
+        let sessions = Sessions::new();
+        let warm = Warm {
+            context: context(),
+            settings: prompt("prewarm", ""),
+            sink: sink("prewarm").muted(),
+            permit: trust.acquire_owned("local", &root).await.unwrap(),
+        };
+        assert_eq!(
+            sessions.prewarm(&binary, warm).await.unwrap(),
+            ProviderPrewarm::Warmed
+        );
+        let wire = || std::fs::read_to_string(root.join("wire.jsonl")).unwrap_or_default();
+        assert_eq!(wire().matches(r#""method":"thread/start""#).count(), 1);
+        assert_eq!(wire().matches(r#""method":"turn/start""#).count(), 0);
+        assert!(store
+            .provider_state(&manifest.id)
+            .await
+            .unwrap()
+            .native_session_id
+            .is_none());
+        let (_cancel, cancel) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            sessions.run(
+                &binary,
+                Run {
+                    context: context(),
+                    prompt: prompt("turn-1", "hello"),
+                    sink: sink("turn-1"),
+                    cancel,
+                    permit: trust.acquire_owned("local", &root).await.unwrap(),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!result.cancelled);
+        let launches = std::fs::read_to_string(root.join("launches")).unwrap();
+        assert_eq!(launches.lines().count(), 1);
+        assert_eq!(wire().matches(r#""method":"initialize""#).count(), 1);
+        assert_eq!(wire().matches(r#""method":"thread/start""#).count(), 1);
+        assert_eq!(wire().matches(r#""method":"turn/start""#).count(), 1);
+        // The thread the prewarm started is saved with the turn.
+        assert_eq!(
+            store
+                .provider_state(&manifest.id)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("native")
+        );
+        sessions.stop_all().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

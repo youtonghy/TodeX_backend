@@ -241,19 +241,50 @@ impl WorkspaceTrustStore {
         let workspace = self.validate(workspace)?;
         let workspace_path = workspace.display().to_string();
         let snapshot = self.inner.clone().read_owned().await;
-        if self.is_scratch(&workspace)
-            || snapshot.entries.iter().any(|entry| {
-                entry.owner_id == owner_id
-                    && entry.workspace_path == workspace_path
-                    && entry.trusted
-            })
-        {
+        if self.permits(&snapshot, owner_id, &workspace, &workspace_path) {
             Ok(WorkspaceTrustPermit {
                 _snapshot: snapshot,
             })
         } else {
             Err(AppError::WorkspaceTrustRequired(workspace_path))
         }
+    }
+
+    /// [`Self::acquire_owned`] without waiting: `Ok(None)` while a trust
+    /// change holds the store.
+    pub(crate) fn try_acquire_owned(
+        &self,
+        owner_id: &str,
+        workspace: &Path,
+    ) -> Result<Option<WorkspaceTrustPermit>, AppError> {
+        let workspace = self.validate(workspace)?;
+        let workspace_path = workspace.display().to_string();
+        let Ok(snapshot) = self.inner.clone().try_read_owned() else {
+            return Ok(None);
+        };
+        if self.permits(&snapshot, owner_id, &workspace, &workspace_path) {
+            Ok(Some(WorkspaceTrustPermit {
+                _snapshot: snapshot,
+            }))
+        } else {
+            Err(AppError::WorkspaceTrustRequired(workspace_path))
+        }
+    }
+
+    /// Whether `owner_id` may launch in the canonical `workspace`.
+    fn permits(
+        &self,
+        snapshot: &WorkspaceTrustSnapshot,
+        owner_id: &str,
+        workspace: &Path,
+        workspace_path: &str,
+    ) -> bool {
+        self.is_scratch(workspace)
+            || snapshot.entries.iter().any(|entry| {
+                entry.owner_id == owner_id
+                    && entry.workspace_path == workspace_path
+                    && entry.trusted
+            })
     }
 
     /// `workspace` must already be canonical.

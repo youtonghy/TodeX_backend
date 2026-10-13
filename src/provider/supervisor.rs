@@ -402,10 +402,17 @@ pub struct ConversationSupervisor {
     /// Shortest wait before a rate-limit continuation runs (doubled per
     /// consecutive failed continuation). Tests shorten it.
     rate_limit_retry_floor: Duration,
+    /// Prewarms in flight across conversations; see [`MAX_PREWARMS`].
+    prewarms: Arc<tokio::sync::Semaphore>,
 }
 
 /// Completed control results kept for retried requests.
 const CONTROL_RESULT_CACHE: usize = 256;
+/// Prewarms that may run at once; another is skipped as `busy`.
+const MAX_PREWARMS: usize = 4;
+/// How long a prewarm may take before its caller gets `timeout`; the
+/// provider keeps preparing in the background.
+const PREWARM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Result of [`ConversationSupervisor::cancel_owned`].
 #[derive(Debug, PartialEq, Eq)]
@@ -511,6 +518,7 @@ impl ConversationSupervisor {
             shutting_down: Arc::default(),
             follow_up_queues: Arc::default(),
             rate_limit_retry_floor: follow_ups::RATE_LIMIT_RETRY_FLOOR,
+            prewarms: Arc::new(tokio::sync::Semaphore::new(MAX_PREWARMS)),
         }
     }
 
@@ -560,6 +568,17 @@ impl ConversationSupervisor {
             McpInjection::None => None,
             McpInjection::GlobalConfigEnv => agent_mcp.launch_global(conversation_id).await,
             _ => agent_mcp.launch(conversation_id).await,
+        }
+    }
+
+    /// TodeX's MCP servers for a turn of `manifest`. API key conversations
+    /// get the provider's own tools only: TodeX's SSH, desktop and browser
+    /// tools reach past the key's scope.
+    async fn turn_agent_mcp(&self, manifest: &ConversationManifest) -> Option<AgentMcpLaunch> {
+        if manifest.owner_id.starts_with(crate::api_keys::OWNER_PREFIX) {
+            None
+        } else {
+            self.agent_mcp_for(manifest.provider, &manifest.id).await
         }
     }
 
@@ -1645,6 +1664,142 @@ impl ConversationSupervisor {
             .await
     }
 
+    /// Starts the conversation's provider process ahead of its next prompt,
+    /// prepared with the settings of its last request (`conversation.warm`).
+    /// Best effort: `Ok(Some(reason))` when it was skipped, `Ok(None)` when
+    /// it warmed. Only an unknown conversation or another owner's is an
+    /// error. Nothing is journalled and the manifest is not touched.
+    pub async fn warm_owned(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<&'static str>, AppError> {
+        let manifest = self.get_owned(owner_id, conversation_id).await?;
+        if !self.config.agent.provider_prewarm {
+            return Ok(Some("disabled"));
+        }
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(Some("busy"));
+        }
+        if self.active.contains_key(conversation_id) {
+            return Ok(Some("running"));
+        }
+        if manifest
+            .schedule
+            .as_ref()
+            .is_some_and(crate::conversation::ConversationSchedule::is_active)
+        {
+            return Ok(Some("scheduled"));
+        }
+        match self.store.ensure_not_legacy(conversation_id).await {
+            Ok(()) => {}
+            Err(AppError::HistoryReadOnly) => return Ok(Some("read_only")),
+            Err(error) => return Err(error),
+        }
+        let driver = self.registry.driver(manifest.provider)?;
+        if !driver.descriptor().available {
+            return Ok(Some("unavailable"));
+        }
+        let Ok(_slot) = self.prewarms.clone().try_acquire_owned() else {
+            return Ok(Some("busy"));
+        };
+        // A CLI upgrade holds the gate exclusively; never wait for it.
+        let Ok(_cli_permit) = self.cli_execution_gate.try_read() else {
+            return Ok(Some("busy"));
+        };
+        let launch_permit = match self
+            .workspace_trust
+            .try_acquire_owned(owner_id, &manifest.workspace)
+        {
+            Ok(Some(permit)) => permit,
+            Ok(None) => return Ok(Some("busy")),
+            Err(AppError::WorkspaceTrustRequired(_)) => {
+                return Ok(Some("untrusted_workspace"));
+            }
+            Err(error) => {
+                tracing::debug!(conversation_id, error = %error, "prewarm skipped: workspace unavailable");
+                return Ok(Some("workspace_unavailable"));
+            }
+        };
+        let provider_state = self.store.provider_state(conversation_id).await?;
+        let settings = self.warm_settings(&manifest).await?;
+        let agent_mcp = self.turn_agent_mcp(&manifest).await;
+        let sink = DriverEventSink::new(
+            self.store.clone(),
+            self.hub.clone(),
+            self.permissions.clone(),
+            conversation_id,
+        )
+        .muted();
+        let context = DriverContext {
+            manifest,
+            provider_state,
+            agent_mcp,
+        };
+        let warmed = tokio::time::timeout(
+            PREWARM_TIMEOUT,
+            driver.prewarm(context, settings, sink, launch_permit),
+        )
+        .await;
+        Ok(match warmed {
+            Ok(Ok(outcome)) => outcome.reason(),
+            Ok(Err(error)) => {
+                tracing::warn!(conversation_id, error = %error, "provider prewarm failed");
+                Some("failed")
+            }
+            Err(_) => Some("timeout"),
+        })
+    }
+
+    /// The settings of the conversation's last request (model, reasoning
+    /// effort, permission and work mode), or the provider defaults when
+    /// there is none or they no longer validate.
+    async fn warm_settings(
+        &self,
+        manifest: &ConversationManifest,
+    ) -> Result<DriverPrompt, AppError> {
+        let request = self
+            .store
+            .last_request(&manifest.id)
+            .await?
+            .and_then(|snapshot| snapshot.get("request").cloned())
+            .unwrap_or_default();
+        let field = |name: &str| request.get(name).and_then(Value::as_str).map(str::to_owned);
+        let mut settings = DriverPrompt {
+            turn_id: format!("prewarm_{}", Uuid::new_v4().simple()),
+            text: String::new(),
+            content: Vec::new(),
+            skills: Vec::new(),
+            model: field("model"),
+            reasoning_effort: field("reasoningEffort"),
+            permission_mode: field("permissionMode"),
+            work_mode: field("workMode"),
+            permission_profile: field("permissionProfile"),
+            sandbox_mode: field("sandboxMode"),
+            approval_policy: field("approvalPolicy"),
+        };
+        if super::types::resolve_execution_config(
+            manifest.provider,
+            settings.permission_mode.as_deref(),
+            settings.work_mode.as_deref(),
+            settings.permission_profile.as_deref(),
+            settings.sandbox_mode.as_deref(),
+            settings.approval_policy.as_deref(),
+        )
+        .is_err()
+        {
+            settings.permission_mode = None;
+            settings.work_mode = None;
+            settings.permission_profile = None;
+            settings.sandbox_mode = None;
+            settings.approval_policy = None;
+        }
+        Ok(settings)
+    }
+
     /// Persist an intent before sending any non-idempotent control. A lost
     /// acknowledgement is never grounds for submitting an interjection twice.
     pub async fn control_owned(
@@ -2011,13 +2166,7 @@ impl ConversationSupervisor {
             ));
         }
         let provider_state = self.store.provider_state(conversation_id).await?;
-        // API key conversations get the provider's own tools only: TodeX's
-        // SSH, desktop and browser tools reach past the key's scope.
-        let agent_mcp = if manifest.owner_id.starts_with(crate::api_keys::OWNER_PREFIX) {
-            None
-        } else {
-            self.agent_mcp_for(manifest.provider, conversation_id).await
-        };
+        let agent_mcp = self.turn_agent_mcp(&manifest).await;
 
         let mut snapshot_files = Vec::new();
         for item in &driver_content {
@@ -3327,6 +3476,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -3414,6 +3564,11 @@ mod tests {
                 .unwrap(),
         );
         assert!(!supervisor.has_pending_follow_ups());
+        // A prewarm is skipped, not refused.
+        assert_eq!(
+            supervisor.warm_owned("local", &id).await.unwrap(),
+            Some("read_only")
+        );
         assert!(!root
             .join("data")
             .join("conversations")
@@ -4176,6 +4331,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -4335,6 +4491,197 @@ mod tests {
         supervisor.registry = DriverRegistry {
             drivers: Arc::new(drivers),
         };
+    }
+
+    /// A driver reported available, so a prewarm reaches it.
+    struct AvailableDriver(Arc<dyn ProviderDriver>);
+
+    #[async_trait::async_trait]
+    impl ProviderDriver for AvailableDriver {
+        fn descriptor(&self) -> ProviderDescriptor {
+            let mut descriptor = self.0.descriptor();
+            descriptor.available = true;
+            descriptor.unavailable_reason = None;
+            descriptor
+        }
+
+        async fn prewarm(
+            &self,
+            context: DriverContext,
+            settings: DriverPrompt,
+            sink: DriverEventSink,
+            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
+        ) -> Result<super::super::types::ProviderPrewarm, AppError> {
+            self.0.prewarm(context, settings, sink, launch_permit).await
+        }
+
+        async fn run_turn(
+            &self,
+            context: DriverContext,
+            prompt: DriverPrompt,
+            sink: DriverEventSink,
+            cancel: watch::Receiver<bool>,
+            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
+        ) -> Result<DriverTurnResult, AppError> {
+            self.0
+                .run_turn(context, prompt, sink, cancel, launch_permit)
+                .await
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warm_starts_a_resident_agent_without_recording_anything() {
+        let (root, store, mut supervisor, workspace) =
+            control_fixture_with("todex-warm", true, false).await;
+        let manifest = supervisor
+            .create_owned(
+                "local",
+                ProviderKind::Acp,
+                workspace.clone(),
+                None,
+                Some("fixture".to_owned()),
+            )
+            .await
+            .unwrap();
+        let before = store.complete_history(&manifest.id).await.unwrap().len();
+        assert_eq!(
+            supervisor.warm_owned("local", &manifest.id).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            supervisor.warm_owned("local", &manifest.id).await.unwrap(),
+            Some("already_warm")
+        );
+        assert_eq!(
+            store.complete_history(&manifest.id).await.unwrap().len(),
+            before
+        );
+        let state = store.provider_state(&manifest.id).await.unwrap();
+        assert!(state.native_session_id.is_none());
+        assert_eq!(
+            store.get(&manifest.id).await.unwrap().status,
+            manifest.status
+        );
+
+        // Another owner's conversation is not found, as for any other command.
+        assert!(matches!(
+            supervisor.warm_owned("other", &manifest.id).await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            supervisor.warm_owned("local", "missing").await,
+            Err(AppError::NotFound(_) | AppError::InvalidRequest(_))
+        ));
+
+        // The prepared session serves the first turn.
+        supervisor
+            .prompt_owned(
+                "local",
+                &manifest.id,
+                ConversationPrompt {
+                    client_request_id: None,
+                    text: "hello".to_owned(),
+                    model: None,
+                    reasoning_effort: None,
+                    skills: Vec::new(),
+                    content: Vec::new(),
+                    permission_mode: None,
+                    work_mode: None,
+                    permission_profile: None,
+                    sandbox_mode: None,
+                    approval_policy: None,
+                },
+            )
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(history
+            .iter()
+            .any(|event| event.event_type == "turn.completed"));
+        assert!(store
+            .provider_state(&manifest.id)
+            .await
+            .unwrap()
+            .native_session_id
+            .is_some());
+
+        // A running conversation is left alone.
+        let (cancel, _) = watch::channel(false);
+        supervisor.active.insert(
+            manifest.id.clone(),
+            ActiveTurn {
+                turn_id: "turn-running".to_owned(),
+                cancel,
+                provider: ProviderKind::Acp,
+                provider_profile: Some("fixture".to_owned()),
+            },
+        );
+        assert_eq!(
+            supervisor.warm_owned("local", &manifest.id).await.unwrap(),
+            Some("running")
+        );
+        supervisor.active.remove(&manifest.id);
+
+        // A provider that starts a process per turn has nothing to warm.
+        replace_driver(&mut supervisor, ProviderKind::Antigravity, |real| {
+            Arc::new(AvailableDriver(real))
+        });
+        let antigravity = supervisor
+            .create_owned(
+                "local",
+                ProviderKind::Antigravity,
+                workspace.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            supervisor
+                .warm_owned("local", &antigravity.id)
+                .await
+                .unwrap(),
+            Some("unsupported_provider")
+        );
+
+        // An untrusted workspace never starts a process.
+        let other = supervisor
+            .create_owned(
+                "local",
+                ProviderKind::Acp,
+                workspace.clone(),
+                None,
+                Some("fixture".to_owned()),
+            )
+            .await
+            .unwrap();
+        supervisor
+            .workspace_trust
+            .revoke_owned("local", &workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            supervisor.warm_owned("local", &other.id).await.unwrap(),
+            Some("untrusted_workspace")
+        );
+
+        // Disabled by configuration.
+        let mut config = (*supervisor.config).clone();
+        config.agent.provider_prewarm = false;
+        let disabled = ConversationSupervisor::new(
+            Arc::new(config),
+            store.clone(),
+            ConversationEventHub::default(),
+            supervisor.workspace_trust.clone(),
+        );
+        assert_eq!(
+            disabled.warm_owned("local", &other.id).await.unwrap(),
+            Some("disabled")
+        );
+        supervisor.shutdown_all().await;
+        let _ = fs::remove_dir_all(root);
     }
 
     struct PanickingDriver(Arc<dyn ProviderDriver>);
@@ -5231,6 +5578,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5504,6 +5852,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5732,6 +6081,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -5798,6 +6148,7 @@ mod tests {
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
@@ -6276,6 +6627,7 @@ done
                 ssh_bin: "ssh".to_owned(),
                 provider_idle_timeout_minutes: 0,
                 provider_keepalive_seconds: 300,
+                provider_prewarm: true,
             },
             security: SecurityConfig {
                 enable_auth: true,
