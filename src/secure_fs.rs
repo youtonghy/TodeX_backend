@@ -44,6 +44,34 @@ pub(crate) fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> io::Result<(
     result
 }
 
+/// [`write_owner_only_atomic`] unless `path` already is a regular owner-only
+/// file holding exactly `bytes`; returns whether it wrote. Skipping saves the
+/// temp file, fsync and rename when the content is unchanged.
+pub(crate) fn write_owner_only_atomic_if_changed(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    if is_owner_only_file_with(path, bytes) {
+        return Ok(false);
+    }
+    write_owner_only_atomic(path, bytes)?;
+    Ok(true)
+}
+
+fn is_owner_only_file_with(path: &Path, bytes: &[u8]) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != bytes.len() as u64 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return false;
+        }
+    }
+    fs::read(path).is_ok_and(|existing| existing == bytes)
+}
+
 /// Atomically replaces a user-owned config file, keeping its permissions: a
 /// symlinked `path` is updated at its target, an existing file keeps its
 /// mode, and a missing one (and its parents) is created owner-only.
@@ -152,6 +180,41 @@ mod tests {
             assert_eq!(
                 fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
                 0o700
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unchanged_content_is_not_rewritten() {
+        let dir = temp_dir("unchanged");
+        ensure_owner_only_dir(&dir).unwrap();
+        let path = dir.join("config.json");
+        assert!(write_owner_only_atomic_if_changed(&path, b"one").unwrap());
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&path).unwrap().ino()
+        };
+        assert!(!write_owner_only_atomic_if_changed(&path, b"one").unwrap());
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        }
+        assert!(write_owner_only_atomic_if_changed(&path, b"two").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"two");
+        // A file that lost its owner-only mode is rewritten even when equal.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(write_owner_only_atomic_if_changed(&path, b"two").unwrap());
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
             );
         }
         fs::remove_dir_all(dir).unwrap();

@@ -61,7 +61,8 @@ pub(crate) fn acp_servers(launch: &AgentMcpLaunch) -> Value {
 }
 
 /// Claude Code arguments. The config goes to an owner-only file rather than
-/// the command line, where other local users could read the token.
+/// the command line, where other local users could read the token. A file
+/// that already holds the same config is left as is.
 pub(crate) async fn claude_args(launch: &AgentMcpLaunch) -> Result<Vec<String>, AppError> {
     let servers: serde_json::Map<String, Value> = launch
         .servers
@@ -82,9 +83,11 @@ pub(crate) async fn claude_args(launch: &AgentMcpLaunch) -> Result<Vec<String>, 
     let config = serde_json::to_vec(&json!({ "mcpServers": servers }))?;
     let path = launch.config_file.clone();
     let written = path.clone();
-    tokio::task::spawn_blocking(move || secure_fs::write_owner_only_atomic(&written, &config))
-        .await
-        .map_err(|error| AppError::Anyhow(error.into()))??;
+    tokio::task::spawn_blocking(move || {
+        secure_fs::write_owner_only_atomic_if_changed(&written, &config)
+    })
+    .await
+    .map_err(|error| AppError::Anyhow(error.into()))??;
     let allowed = launch
         .servers
         .iter()
