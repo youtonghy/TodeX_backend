@@ -4034,16 +4034,28 @@ fn owner_only_options() -> OpenOptions {
 }
 
 /// Restricts `root` and everything below it to the owner: directories 0700,
-/// files 0600. Symlinks are neither followed nor changed.
+/// files 0600. Symlinks are neither followed nor changed. Entries removed
+/// during the walk are skipped; only a missing `root` is an error.
 fn restrict_tree_to_owner(root: &Path) -> std::io::Result<()> {
+    restrict_tree_with(root, &mut crate::secure_fs::set_owner_only)
+}
+
+fn restrict_tree_with(
+    root: &Path,
+    restrict: &mut impl FnMut(&Path, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(root)?;
     if metadata.is_dir() {
-        crate::secure_fs::set_owner_only(root, true)?;
+        restrict(root, true)?;
         for entry in std::fs::read_dir(root)? {
-            restrict_tree_to_owner(&entry?.path())?;
+            let walked = entry.and_then(|entry| restrict_tree_with(&entry.path(), restrict));
+            match walked {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                walked => walked?,
+            }
         }
     } else if metadata.is_file() {
-        crate::secure_fs::set_owner_only(root, false)?;
+        restrict(root, false)?;
     }
     Ok(())
 }
@@ -4463,6 +4475,42 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn restricting_the_tree_skips_entries_removed_during_the_walk() {
+        let root = std::env::temp_dir().join(format!("todex-restrict-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("gone_dir/inner")).unwrap();
+        std::fs::write(root.join("gone_file"), b"x").unwrap();
+        std::fs::write(root.join("kept"), b"x").unwrap();
+        let mut restricted = Vec::new();
+        restrict_tree_with(&root, &mut |path: &Path, directory: bool| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            match name.as_str() {
+                // Deleted between listing and restricting its entries.
+                "gone_dir" => {
+                    std::fs::remove_dir_all(path)?;
+                    return Ok(());
+                }
+                // Deleted between listing and restricting it.
+                "gone_file" => {
+                    std::fs::remove_file(path)?;
+                    return Err(std::io::ErrorKind::NotFound.into());
+                }
+                _ => {}
+            }
+            crate::secure_fs::set_owner_only(path, directory)?;
+            restricted.push(name);
+            Ok(())
+        })
+        .unwrap();
+        assert!(restricted.contains(&"kept".to_owned()), "{restricted:?}");
+        assert!(!restricted.contains(&"inner".to_owned()), "{restricted:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            restrict_tree_to_owner(&root).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
