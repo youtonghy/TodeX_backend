@@ -1181,46 +1181,6 @@ impl ConversationStore {
         self.reconciled.remove(conversation_id);
     }
 
-    pub async fn cleanup_before(
-        &self,
-        cutoff: DateTime<Utc>,
-        protected: &std::collections::HashSet<String>,
-    ) -> Result<Vec<ConversationManifest>, AppError> {
-        let manifests = self.list().await?;
-        let mut removed = Vec::new();
-        for manifest in manifests {
-            if protected.contains(&manifest.id)
-                || manifest.updated_at >= cutoff
-                || matches!(
-                    manifest.status,
-                    super::ConversationStatus::Running
-                        | super::ConversationStatus::WaitingPermission
-                )
-            {
-                continue;
-            }
-            let id = manifest.id.clone();
-            let _guard = self.lock(&id).await;
-            let current = match self.get_unlocked(&id).await {
-                Ok(value) => value,
-                Err(AppError::NotFound(_)) => continue,
-                Err(error) => return Err(error),
-            };
-            if current.updated_at < cutoff
-                && !matches!(
-                    current.status,
-                    super::ConversationStatus::Running
-                        | super::ConversationStatus::WaitingPermission
-                )
-            {
-                tokio::fs::remove_dir_all(self.directory(&id)?).await?;
-                self.forget_locked(&id);
-                removed.push(current);
-            }
-        }
-        Ok(removed)
-    }
-
     pub async fn append(
         &self,
         conversation_id: &str,

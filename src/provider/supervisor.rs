@@ -1281,17 +1281,40 @@ impl ConversationSupervisor {
         &self,
         cutoff: DateTime<Utc>,
     ) -> Result<Vec<ConversationManifest>, AppError> {
-        // Prevent a new turn/fork reservation between capturing active IDs and cleanup.
+        let expired = |manifest: &ConversationManifest| {
+            manifest.updated_at < cutoff
+                && !matches!(
+                    manifest.status,
+                    ConversationStatus::Running | ConversationStatus::WaitingPermission
+                )
+        };
+        // Choose candidates before taking the gate: listing reads every
+        // manifest, and the gate blocks turn starts meanwhile.
+        let candidates = self
+            .store
+            .list()
+            .await?
+            .into_iter()
+            .filter(|manifest| expired(manifest))
+            .map(|manifest| manifest.id)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        // No turn/fork reservation starts while candidates are checked
+        // against the active set and removed; each is re-checked under its
+        // conversation lock, since it may have been used since the listing.
         let _cli_gate = self.cli_execution_gate.write().await;
-        let protected = self
-            .active
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-        let removed = self.store.cleanup_before(cutoff, &protected).await?;
-        for manifest in &removed {
-            self.release_removed(manifest, Some("conversation_expired"))
-                .await;
+        let mut removed = Vec::new();
+        for conversation_id in candidates {
+            if self.active.contains_key(&conversation_id) {
+                continue;
+            }
+            if let Some(manifest) = self.store.delete_if(&conversation_id, expired).await? {
+                self.release_removed(&manifest, Some("conversation_expired"))
+                    .await;
+                removed.push(manifest);
+            }
         }
         Ok(removed)
     }
@@ -3985,6 +4008,43 @@ mod tests {
         assert!(store.get(&manifest.id).await.is_ok());
         supervisor.active.remove(&manifest.id);
         assert_eq!(supervisor.cleanup_expired(cutoff).await.unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_only_waits_for_starting_turns_when_it_removes_something() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-retention-gate").await;
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Codex,
+                workspace,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        // A prompt that is starting holds the gate for reading.
+        let starting = supervisor.cli_execution_gate.clone().read_owned().await;
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let nothing =
+            tokio::time::timeout(Duration::from_secs(5), supervisor.cleanup_expired(past))
+                .await
+                .expect("a pass that removes nothing does not wait for the gate");
+        assert!(nothing.unwrap().is_empty());
+
+        let future = Utc::now() + chrono::Duration::hours(1);
+        let cleanup = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.cleanup_expired(future).await }
+        });
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !cleanup.is_finished(),
+            "removal waits for the starting turn"
+        );
+        assert!(store.get(&manifest.id).await.is_ok());
+        drop(starting);
+        assert_eq!(cleanup.await.unwrap().unwrap().len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 
