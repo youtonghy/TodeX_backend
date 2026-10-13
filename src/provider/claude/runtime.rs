@@ -52,6 +52,8 @@ pub(in crate::provider) struct Run {
 struct Turn {
     run: Run,
     reply: oneshot::Sender<Reply>,
+    /// Keeps the worker busy until it is done with this turn.
+    pending: Pending,
 }
 
 /// A prewarm: start the process with `settings`' launch settings and
@@ -80,27 +82,140 @@ enum Reply {
     },
 }
 
+/// Why a worker is asked to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    Running,
+    /// Its slot went to another conversation; the session itself is fine.
+    Evicted,
+    /// The session or the daemon was shut down.
+    Stopped,
+}
+
+impl Stop {
+    /// Whether a turn the stopping worker never started may reopen the
+    /// session on a new one.
+    fn retry(self) -> bool {
+        self != Self::Stopped
+    }
+}
+
+/// Turns a worker owes and when it last finished one.
+struct Activity {
+    pending: usize,
+    idle_since: Instant,
+}
+
+/// One turn handed to a worker, from `acquire` until the worker is done
+/// with it (interrupt included). A worker holding one is never evicted.
+struct Pending(Arc<std::sync::Mutex<Activity>>);
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let mut activity = self.0.lock().expect("Claude worker activity lock");
+        activity.pending -= 1;
+        activity.idle_since = Instant::now();
+    }
+}
+
+/// Resolves once a process, and the task that owns it, has exited.
+#[derive(Clone)]
+struct Exit(watch::Receiver<bool>);
+
+impl Exit {
+    fn done(&self) -> bool {
+        // A dropped sender means its owner is gone, process included.
+        *self.0.borrow() || self.0.has_changed().is_err()
+    }
+
+    /// Waits, bounded by [`STOP_TIMEOUT`], for the exit.
+    async fn wait(mut self) {
+        let _ = tokio::time::timeout(STOP_TIMEOUT, self.0.wait_for(|exited| *exited)).await;
+    }
+}
+
 #[derive(Clone)]
 struct Worker {
     turns: mpsc::Sender<Request>,
-    shutdown: watch::Sender<bool>,
-    stopped: watch::Receiver<bool>,
-    /// When the worker last finished a turn; `None` while one is running.
-    idle_since: Arc<std::sync::Mutex<Option<Instant>>>,
+    shutdown: watch::Sender<Stop>,
+    stopped: Exit,
+    activity: Arc<std::sync::Mutex<Activity>>,
 }
 
 impl Worker {
-    fn set_busy(&self) {
-        *self.idle_since.lock().expect("Claude worker activity lock") = None;
+    fn reserve(&self) -> Pending {
+        self.activity
+            .lock()
+            .expect("Claude worker activity lock")
+            .pending += 1;
+        Pending(self.activity.clone())
     }
 
+    /// When the worker last finished a turn; `None` while it owes one.
     fn idle_since(&self) -> Option<Instant> {
-        *self.idle_since.lock().expect("Claude worker activity lock")
+        let activity = self.activity.lock().expect("Claude worker activity lock");
+        (activity.pending == 0).then_some(activity.idle_since)
+    }
+
+    /// Stopping or stopped: it takes no new turn, and its process may still
+    /// be exiting.
+    fn stopping(&self) -> bool {
+        self.turns.is_closed() || *self.shutdown.borrow() != Stop::Running
+    }
+
+    fn stop(&self, stop: Stop) {
+        // `send_replace`: the reason must stick even once the worker is gone.
+        self.shutdown.send_replace(stop);
     }
 }
 
+#[derive(Default)]
+struct Table {
+    /// Every worker until its process has exited, stopping ones included,
+    /// so a conversation never gets a second process on its transcript.
+    workers: HashMap<String, Worker>,
+    /// One-off turns' processes (see [`run_once`]) until they have exited.
+    detached: HashMap<String, Exit>,
+    /// Set while [`Sessions::stop_all`] runs: no process starts behind its
+    /// back. Cleared afterwards, as the supervisor may serve turns again.
+    closing: bool,
+}
+
+impl Table {
+    fn prune(&mut self) {
+        self.workers.retain(|_, worker| !worker.stopped.done());
+        self.detached.retain(|_, exit| !exit.done());
+    }
+
+    /// The conversation's process that is exiting, if any.
+    fn exiting(&self, id: &str) -> Option<Exit> {
+        if let Some(exit) = self.detached.get(id) {
+            return Some(exit.clone());
+        }
+        self.workers
+            .get(id)
+            .filter(|worker| worker.stopping())
+            .map(|worker| worker.stopped.clone())
+    }
+
+    /// Workers holding a slot; stopping ones are already giving theirs up.
+    fn slots_taken(&self) -> usize {
+        self.workers
+            .values()
+            .filter(|worker| !worker.stopping())
+            .count()
+    }
+}
+
+enum Acquired {
+    Worker(Worker, Pending),
+    /// Every slot runs a turn: the turn gets a process of its own, and the
+    /// conversation stays reserved until the sender reports it exited.
+    Detached(watch::Sender<bool>),
+}
+
 pub(in crate::provider) struct Sessions {
-    workers: Mutex<HashMap<String, Worker>>,
+    table: Mutex<Table>,
     idle_timeout: Duration,
     max_workers: usize,
 }
@@ -108,15 +223,15 @@ pub(in crate::provider) struct Sessions {
 impl Sessions {
     pub fn new(idle_timeout: Duration, max_workers: usize) -> Self {
         Self {
-            workers: Mutex::new(HashMap::new()),
+            table: Mutex::new(Table::default()),
             idle_timeout,
             max_workers,
         }
     }
 
     /// Runs a turn on the conversation's resident process. A turn that raced
-    /// its worker's own exit (idle timeout, retired process) never reached
-    /// Claude and is retried once on a new worker.
+    /// its worker's own exit (idle timeout, retired process, eviction) never
+    /// reached Claude and is retried once on a new worker.
     pub async fn run(
         &self,
         launcher: Launcher,
@@ -125,11 +240,17 @@ impl Sessions {
         let id = run.context.manifest.id.clone();
         let mut retried = false;
         loop {
-            let Some(worker) = self.acquire(&id, &launcher).await else {
-                return run_once(&launcher, run).await;
+            let (worker, pending) = match self.acquire(&id, &launcher).await? {
+                Acquired::Worker(worker, pending) => (worker, pending),
+                Acquired::Detached(exited) => return run_once(&launcher, run, exited).await,
             };
             let (reply, response) = oneshot::channel();
-            let retry = match worker.turns.send(Request::Turn(Turn { run, reply })).await {
+            let turn = Turn {
+                run,
+                reply,
+                pending,
+            };
+            let retry = match worker.turns.send(Request::Turn(turn)).await {
                 Ok(()) => match response.await {
                     Ok(Reply::Finished(result)) => return result,
                     Ok(Reply::NotStarted {
@@ -144,7 +265,7 @@ impl Sessions {
                 // Closed between lookup and send: the worker is stopping.
                 Err(mpsc::error::SendError(Request::Turn(turn))) => {
                     run = turn.run;
-                    !*worker.shutdown.borrow()
+                    worker.shutdown.borrow().retry()
                 }
                 Err(mpsc::error::SendError(Request::Warm(..))) => {
                     unreachable!("a turn was sent")
@@ -156,54 +277,56 @@ impl Sessions {
                 ));
             }
             retried = true;
-            wait_stopped(worker).await;
+            worker.stopped.wait().await;
         }
     }
 
-    /// The conversation's worker, marked busy, or `None` when every slot is
-    /// running a turn. At the limit the longest-idle worker is stopped to
-    /// make room.
-    async fn acquire(&self, id: &str, launcher: &Launcher) -> Option<Worker> {
+    /// The conversation's worker, with the turn reserved on it, or a
+    /// detached slot when every worker is running a turn. At the limit the
+    /// longest-idle worker is stopped to make room. Never returns while the
+    /// conversation's previous process is still exiting.
+    async fn acquire(&self, id: &str, launcher: &Launcher) -> Result<Acquired, AppError> {
         loop {
-            let stopping = {
-                let mut workers = self.workers.lock().await;
-                workers.retain(|_, worker| !*worker.stopped.borrow());
-                match workers.get(id) {
-                    // Its process is still exiting; never run two on one session.
-                    Some(worker) if worker.turns.is_closed() => worker.clone(),
-                    Some(worker) => {
-                        worker.set_busy();
-                        return Some(worker.clone());
-                    }
+            let exiting = {
+                let mut table = self.table.lock().await;
+                if table.closing {
+                    return Err(shutting_down());
+                }
+                table.prune();
+                match table.exiting(id) {
+                    Some(exit) => exit,
                     None => {
-                        if workers.len() >= self.max_workers {
-                            let evict = workers
-                                .iter()
-                                .filter(|(_, worker)| !worker.turns.is_closed())
-                                .filter_map(|(id, worker)| Some((worker.idle_since()?, id)))
-                                .min()
-                                .map(|(_, id)| id.clone());
-                            let worker = workers.remove(&evict?)?;
+                        if let Some(worker) = table.workers.get(id) {
+                            return Ok(Acquired::Worker(worker.clone(), worker.reserve()));
+                        }
+                        if table.slots_taken() >= self.max_workers {
+                            let evict = table
+                                .workers
+                                .values()
+                                .filter(|worker| !worker.stopping())
+                                .filter_map(|worker| Some((worker.idle_since()?, worker)))
+                                .min_by_key(|(idle_since, _)| *idle_since)
+                                .map(|(_, worker)| worker);
+                            let Some(evict) = evict else {
+                                let (exited, exit) = watch::channel(false);
+                                table.detached.insert(id.to_owned(), Exit(exit));
+                                return Ok(Acquired::Detached(exited));
+                            };
                             tracing::debug!(
                                 "Claude resident session limit reached; stopping the longest-idle session"
                             );
-                            tokio::spawn(stop_worker(worker));
+                            // It stays in the table until its process is gone.
+                            evict.stop(Stop::Evicted);
                         }
                         let worker = spawn_worker(launcher.clone(), self.idle_timeout);
-                        worker.set_busy();
-                        workers.insert(id.to_owned(), worker.clone());
-                        return Some(worker);
+                        let pending = worker.reserve();
+                        table.workers.insert(id.to_owned(), worker.clone());
+                        return Ok(Acquired::Worker(worker, pending));
                     }
                 }
             };
-            wait_stopped(stopping.clone()).await;
-            let mut workers = self.workers.lock().await;
-            if workers
-                .get(id)
-                .is_some_and(|current| current.stopped.same_channel(&stopping.stopped))
-            {
-                workers.remove(id);
-            }
+            // Never two processes on one transcript.
+            exiting.wait().await;
         }
     }
 
@@ -218,22 +341,33 @@ impl Sessions {
     ) -> Result<ProviderPrewarm, AppError> {
         let id = warm.context.manifest.id.clone();
         let (reply, response) = oneshot::channel();
-        {
-            let mut workers = self.workers.lock().await;
-            workers.retain(|_, worker| !*worker.stopped.borrow());
-            if workers.contains_key(&id) {
-                return Ok(ProviderPrewarm::AlreadyWarm);
-            }
-            if workers.len() >= self.max_workers {
-                return Ok(ProviderPrewarm::Limit);
-            }
-            let worker = spawn_worker(launcher, self.idle_timeout);
-            // Queued before any turn can find the worker.
-            worker
-                .turns
-                .try_send(Request::Warm(warm, reply))
-                .map_err(|_| unavailable())?;
-            workers.insert(id, worker);
+        loop {
+            let exiting = {
+                let mut table = self.table.lock().await;
+                if table.closing {
+                    return Err(shutting_down());
+                }
+                table.prune();
+                if let Some(exit) = table.exiting(&id) {
+                    exit
+                } else {
+                    if table.workers.contains_key(&id) {
+                        return Ok(ProviderPrewarm::AlreadyWarm);
+                    }
+                    if table.slots_taken() >= self.max_workers {
+                        return Ok(ProviderPrewarm::Limit);
+                    }
+                    let worker = spawn_worker(launcher, self.idle_timeout);
+                    // Queued before any turn can find the worker.
+                    worker
+                        .turns
+                        .try_send(Request::Warm(warm, reply))
+                        .map_err(|_| unavailable())?;
+                    table.workers.insert(id, worker);
+                    break;
+                }
+            };
+            exiting.wait().await;
         }
         response.await.map_err(|_| unavailable())??;
         Ok(ProviderPrewarm::Warmed)
@@ -243,49 +377,70 @@ impl Sessions {
     pub async fn stop(&self, id: &str) {
         // Its own statement: a guard taken in an `if let` scrutinee would
         // hold every other session behind this shutdown.
-        let worker = self.workers.lock().await.remove(id);
+        let worker = self.table.lock().await.workers.get(id).cloned();
         if let Some(worker) = worker {
-            stop_worker(worker).await;
+            worker.stop(Stop::Stopped);
+            worker.stopped.wait().await;
         }
     }
 
-    /// Stops every process: all are signalled before any is awaited.
+    /// Stops every process: all are signalled before any is awaited. No
+    /// process starts until every one has exited.
     pub async fn stop_all(&self) {
-        let workers: Vec<_> = self
-            .workers
-            .lock()
-            .await
-            .drain()
-            .map(|(_, worker)| worker)
-            .collect();
+        let (workers, detached) = {
+            let mut table = self.table.lock().await;
+            table.closing = true;
+            let workers: Vec<_> = table.workers.values().cloned().collect();
+            let detached: Vec<_> = table.detached.values().cloned().collect();
+            (workers, detached)
+        };
         for worker in &workers {
-            let _ = worker.shutdown.send(true);
+            worker.stop(Stop::Stopped);
         }
-        futures_util::future::join_all(workers.into_iter().map(stop_worker)).await;
+        let exits = workers
+            .into_iter()
+            .map(|worker| worker.stopped)
+            .chain(detached);
+        futures_util::future::join_all(exits.map(Exit::wait)).await;
+        self.table.lock().await.closing = false;
     }
 
     #[cfg(test)]
     async fn worker_count(&self) -> usize {
-        let mut workers = self.workers.lock().await;
-        workers.retain(|_, worker| !*worker.stopped.borrow());
-        workers.len()
+        let mut table = self.table.lock().await;
+        table.prune();
+        table.workers.len()
     }
-}
 
-async fn stop_worker(worker: Worker) {
-    let _ = worker.shutdown.send(true);
-    wait_stopped(worker).await;
-}
-
-/// Waits, bounded by [`STOP_TIMEOUT`], for the worker to finish.
-async fn wait_stopped(mut worker: Worker) {
-    let _ = tokio::time::timeout(STOP_TIMEOUT, worker.stopped.wait_for(|stopped| *stopped)).await;
+    /// Whether the conversation has a worker that takes turns.
+    #[cfg(test)]
+    async fn holds(&self, id: &str) -> bool {
+        let mut table = self.table.lock().await;
+        table.prune();
+        table
+            .workers
+            .get(id)
+            .is_some_and(|worker| !worker.stopping())
+    }
 }
 
 fn unavailable() -> AppError {
     AppError::ProviderUnavailable(
         "Claude Code session stopped before the turn completed".to_owned(),
     )
+}
+
+fn shutting_down() -> AppError {
+    AppError::ProviderUnavailable("Claude Code sessions are shutting down".to_owned())
+}
+
+/// The result of a turn cancelled before its prompt reached Claude.
+fn cancelled_before_start(session_id: String) -> DriverTurnResult {
+    DriverTurnResult {
+        native_session_id: Some(session_id),
+        stop_reason: "cancelled".to_owned(),
+        cancelled: true,
+    }
 }
 
 /// The launch settings of a Claude process. Every one is fixed by the
@@ -350,22 +505,23 @@ struct Live {
 
 fn spawn_worker(launcher: Launcher, idle_timeout: Duration) -> Worker {
     let (turns, turn_rx) = mpsc::channel(1);
-    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (shutdown, shutdown_rx) = watch::channel(Stop::Running);
     let (stopped_tx, stopped) = watch::channel(false);
-    let idle_since = Arc::new(std::sync::Mutex::new(Some(Instant::now())));
     tokio::spawn(worker(
         launcher,
         idle_timeout,
         turn_rx,
         shutdown_rx,
         stopped_tx,
-        idle_since.clone(),
     ));
     Worker {
         turns,
         shutdown,
-        stopped,
-        idle_since,
+        stopped: Exit(stopped),
+        activity: Arc::new(std::sync::Mutex::new(Activity {
+            pending: 0,
+            idle_since: Instant::now(),
+        })),
     }
 }
 
@@ -381,9 +537,8 @@ async fn worker(
     launcher: Launcher,
     idle_timeout: Duration,
     mut turns: mpsc::Receiver<Request>,
-    mut shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<Stop>,
     stopped: watch::Sender<bool>,
-    idle_since: Arc<std::sync::Mutex<Option<Instant>>>,
 ) {
     let mut live: Option<Live> = None;
     let mut idle_deadline = Instant::now() + idle_timeout;
@@ -405,7 +560,11 @@ async fn worker(
             },
             _ = tokio::time::sleep_until(idle_deadline) => break,
         };
-        let Turn { run, mut reply } = match turn {
+        let Turn {
+            run,
+            mut reply,
+            pending,
+        } = match turn {
             Request::Turn(turn) => turn,
             Request::Warm(warm, reply) => {
                 if live.is_some() {
@@ -421,16 +580,21 @@ async fn worker(
                 let started = tokio::select! {
                     started = async {
                         let key = LaunchKey::new(&launcher.binary, &context, &settings).await?;
-                        let process = super::start_claude(
-                            &launcher.binary,
+                        let (process, runtime_id) =
+                            super::spawn_claude(&launcher.binary, &context, &settings, permit)
+                                .await?;
+                        // Held before `initialize`: a failed process is
+                        // stopped by this worker, which stays in the table
+                        // until it has exited.
+                        let started = live.insert(Live { process, key });
+                        super::initialize_session(
+                            &mut started.process,
                             &launcher.catalogs,
                             &context,
-                            &settings,
-                            permit,
+                            runtime_id,
                             &mut cancel,
                         )
-                        .await?;
-                        Ok::<_, AppError>(Live { process, key })
+                        .await
                     } => started,
                     _ = shutdown.changed() => {
                         let _ = reply.send(Err(AppError::TurnCancelled));
@@ -438,8 +602,7 @@ async fn worker(
                     }
                 };
                 match started {
-                    Ok(started) => {
-                        live = Some(started);
+                    Ok(()) => {
                         let _ = reply.send(Ok(()));
                         idle_deadline = Instant::now() + idle_timeout;
                         continue;
@@ -458,12 +621,17 @@ async fn worker(
             mut cancel,
             permit,
         } = run;
+        // Cancelled while it waited in the queue: it never reaches Claude.
+        if *cancel.borrow() {
+            let session_id = super::claude_session_id(&context);
+            let _ = reply.send(Reply::Finished(Ok(cancelled_before_start(session_id))));
+            continue;
+        }
         let key = match LaunchKey::new(&launcher.binary, &context, &prompt).await {
             Ok(key) => key,
             Err(error) => {
                 // Rejected before reaching Claude; the process is untouched.
                 let _ = reply.send(Reply::Finished(Err(error)));
-                *idle_since.lock().expect("Claude worker activity lock") = Some(Instant::now());
                 continue;
             }
         };
@@ -476,30 +644,35 @@ async fn worker(
         let outcome = tokio::select! {
             outcome = async {
                 if live.is_none() {
-                    let process = super::start_claude(
-                        &launcher.binary,
+                    let (process, runtime_id) =
+                        super::spawn_claude(&launcher.binary, &context, &prompt, permit).await?;
+                    let started = live.insert(Live { process, key });
+                    super::initialize_session(
+                        &mut started.process,
                         &launcher.catalogs,
                         &context,
-                        &prompt,
-                        permit,
+                        runtime_id,
                         &mut cancel,
                     )
                     .await?;
-                    live = Some(Live { process, key });
                 } else {
                     drop(permit);
+                }
+                if *cancel.borrow() {
+                    return Ok(None);
                 }
                 let process = &mut live.as_mut().expect("started process").process;
                 super::run_claude_turn(
                     process,
                     context,
                     prompt,
-                    session_id,
+                    session_id.clone(),
                     &sink,
                     &launcher.catalogs,
                     &mut cancel,
                 )
                 .await
+                .map(Some)
             } => Some(outcome),
             // The caller gave up on the turn (its task was aborted): nothing
             // will read the result, so stop the process mid-turn.
@@ -510,12 +683,15 @@ async fn worker(
             }
         };
         let Some(outcome) = outcome else { break };
-        let ended = match &outcome {
-            Ok(result) if !result.cancelled => Ended::Reusable,
-            Ok(_) => Ended::Retire,
-            Err(_) => Ended::Retire,
+        let (outcome, ended) = match outcome {
+            // Cancelled before its prompt was sent: the process is idle.
+            Ok(None) => (Ok(cancelled_before_start(session_id)), Ended::Reusable),
+            Ok(Some(result)) if !result.cancelled => (Ok(result), Ended::Reusable),
+            Ok(Some(result)) => (Ok(result), Ended::Retire),
+            Err(error) => (Err(error), Ended::Retire),
         };
-        let cancelled = outcome.as_ref().is_ok_and(|result| result.cancelled);
+        let cancelled =
+            matches!(ended, Ended::Retire) && outcome.as_ref().is_ok_and(|result| result.cancelled);
         // The caller has its result before any interrupt or teardown.
         let _ = reply.send(Reply::Finished(outcome));
         let ended = match (ended, live.as_mut()) {
@@ -531,7 +707,8 @@ async fn worker(
         if matches!(ended, Ended::Retire) {
             break;
         }
-        *idle_since.lock().expect("Claude worker activity lock") = Some(Instant::now());
+        // Done with the turn, interrupt included: the worker may be idle.
+        drop(pending);
         idle_deadline = Instant::now() + idle_timeout;
     }
     turns.close();
@@ -539,11 +716,12 @@ async fn worker(
         live.process.terminate().await;
     }
     // A turn queued before the close never reached Claude: hand it back,
-    // after the process is gone, so the caller can reopen the session.
-    let retry = !*shutdown.borrow();
+    // after the process is gone, so the caller can reopen the session
+    // unless the stop was requested.
+    let retry = shutdown.borrow().retry();
     while let Ok(request) = turns.try_recv() {
         match request {
-            Request::Turn(Turn { run, reply }) => {
+            Request::Turn(Turn { run, reply, .. }) => {
                 let _ = reply.send(Reply::NotStarted {
                     run: Box::new(run),
                     retry,
@@ -644,8 +822,13 @@ async fn interrupt(process: &mut JsonLineProcess) -> Ended {
 }
 
 /// A turn on a process of its own, for when every resident slot is busy.
-/// The process is stopped after the turn, off the caller's path.
-async fn run_once(launcher: &Launcher, run: Run) -> Result<DriverTurnResult, AppError> {
+/// The process is stopped after the turn, off the caller's path; `exited`
+/// reports when it is gone, so the conversation's next process waits.
+async fn run_once(
+    launcher: &Launcher,
+    run: Run,
+    exited: watch::Sender<bool>,
+) -> Result<DriverTurnResult, AppError> {
     let Run {
         context,
         prompt,
@@ -654,26 +837,39 @@ async fn run_once(launcher: &Launcher, run: Run) -> Result<DriverTurnResult, App
         permit,
     } = run;
     let session_id = super::claude_session_id(&context);
-    let mut process = super::start_claude(
-        &launcher.binary,
-        &launcher.catalogs,
-        &context,
-        &prompt,
-        permit,
-        &mut cancel,
-    )
-    .await?;
-    let result = super::run_claude_turn(
-        &mut process,
-        context,
-        prompt,
-        session_id,
-        &sink,
-        &launcher.catalogs,
-        &mut cancel,
-    )
+    if *cancel.borrow() {
+        return Ok(cancelled_before_start(session_id));
+    }
+    let (mut process, runtime_id) =
+        super::spawn_claude(&launcher.binary, &context, &prompt, permit).await?;
+    let result = async {
+        super::initialize_session(
+            &mut process,
+            &launcher.catalogs,
+            &context,
+            runtime_id,
+            &mut cancel,
+        )
+        .await?;
+        if *cancel.borrow() {
+            return Ok(cancelled_before_start(session_id.clone()));
+        }
+        super::run_claude_turn(
+            &mut process,
+            context,
+            prompt,
+            session_id.clone(),
+            &sink,
+            &launcher.catalogs,
+            &mut cancel,
+        )
+        .await
+    }
     .await;
-    tokio::spawn(async move { process.terminate().await });
+    tokio::spawn(async move {
+        process.terminate().await;
+        let _ = exited.send(true);
+    });
     result
 }
 
@@ -689,13 +885,29 @@ mod tests {
 
     /// A stream-json Claude stand-in. Each prompt's text picks a behavior:
     /// `block` waits for a `release` file, `silent` never answers nor
-    /// honors `interrupt`, `interruptible` streams until interrupted,
-    /// `late-permission` / `late-output` follow the turn with a frame while
-    /// no turn runs. Every launch's argv and every stdin line are logged.
+    /// honors `interrupt`, `interruptible` streams until interrupted
+    /// (`slow-interruptible` takes a moment to honor it), `slow-exit` makes
+    /// SIGTERM take a moment, `late-permission` / `late-output` follow the
+    /// turn with a frame while no turn runs. Every launch's argv and every
+    /// stdin line are logged; a launch while another process of the same
+    /// session still runs is logged to `overlap.log`.
     const FAKE_CLAUDE: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
 printf '%s\n' "$*" >> "$dir/argv.log"
+session=
+prev=
+for arg in "$@"; do
+  case "$prev" in --session-id|--resume) session=$arg ;; esac
+  prev=$arg
+done
+if [ -f "$dir/live-$session" ] && kill -0 "$(cat "$dir/live-$session")" 2>/dev/null; then
+  printf '%s\n' "$session" >> "$dir/overlap.log"
+fi
+printf '%s\n' "$$" > "$dir/live-$session"
+slow_exit=
+trap 'if [ -n "$slow_exit" ]; then sleep 0.5; fi; exit 0' TERM
 mode=
+slow=
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$dir/wire.jsonl"
   case "$line" in
@@ -704,6 +916,7 @@ while IFS= read -r line; do
       continue ;;
     *'"subtype":"interrupt"'*)
       if [ "$mode" = interruptible ]; then
+        if [ -n "$slow" ]; then sleep 0.3; fi
         rid=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
         printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$rid"
         printf '{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}\n'
@@ -714,6 +927,8 @@ while IFS= read -r line; do
     *'"type":"control_response"'*) continue ;;
   esac
   printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+  case "$line" in *slow-exit*) slow_exit=1 ;; esac
+  case "$line" in *slow-interrupt*) slow=1 ;; esac
   case "$line" in
     *block*) while [ ! -f "$dir/release" ]; do sleep 0.02; done ;;
   esac
@@ -724,6 +939,7 @@ while IFS= read -r line; do
       continue ;;
   esac
   mode=
+  slow=
   printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}}\n'
   printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"ok"}\n'
   printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
@@ -864,6 +1080,11 @@ done
         async fn wait_for_wire(&self, needle: &str) {
             wait_until(|| self.wire().contains(needle)).await;
         }
+
+        /// Sessions that had two processes at once.
+        fn overlaps(&self) -> String {
+            std::fs::read_to_string(self.root.join("overlap.log")).unwrap_or_default()
+        }
     }
 
     async fn wait_until(mut done: impl FnMut() -> bool) {
@@ -994,7 +1215,7 @@ done
             fixture.prewarm(&sessions, &second).await.unwrap(),
             ProviderPrewarm::Limit
         );
-        assert!(sessions.workers.lock().await.contains_key(&first.id));
+        assert!(sessions.holds(&first.id).await);
         assert_eq!(fixture.launches().len(), 1);
         sessions.stop_all().await;
         cleanup(&fixture.root);
@@ -1037,8 +1258,8 @@ done
         // Both slots are taken; the third conversation stops the first,
         // which has been idle the longest.
         fixture.turn(&sessions, &third, "three").await;
-        assert_eq!(sessions.worker_count().await, 2);
-        assert!(!sessions.workers.lock().await.contains_key(&first.id));
+        assert_eq!(sessions.table.lock().await.slots_taken(), 2);
+        assert!(!sessions.holds(&first.id).await);
         assert_eq!(fixture.launches().len(), 3);
 
         // With both slots running a turn, the first conversation still runs,
@@ -1059,7 +1280,7 @@ done
             wait_until(|| fixture.wire().matches("block").count() == 2).await;
             let result = fixture.turn(&sessions, &first, "fallback").await;
             assert_eq!(sessions.worker_count().await, 2);
-            assert!(!sessions.workers.lock().await.contains_key(&first.id));
+            assert!(!sessions.holds(&first.id).await);
             std::fs::write(fixture.root.join("release"), "").unwrap();
             result
         };
@@ -1095,9 +1316,9 @@ done
         fixture.turn(&sessions, &manifest, "late-output").await;
         wait_until(|| {
             sessions
-                .workers
+                .table
                 .try_lock()
-                .is_ok_and(|workers| workers.values().all(|worker| worker.turns.is_closed()))
+                .is_ok_and(|table| table.workers.values().all(Worker::stopping))
         })
         .await;
         fixture.turn(&sessions, &manifest, "after").await;
@@ -1184,6 +1405,148 @@ done
         fixture.turn(&sessions, &manifest, "second").await;
         assert_eq!(fixture.launches().len(), 2);
         sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn an_evicted_session_resumes_only_after_its_process_exits() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(1);
+        let first = fixture.conversation().await;
+        let second = fixture.conversation().await;
+        fixture.turn(&sessions, &first, "slow-exit").await;
+        // Evicts the first conversation, whose process takes a while to
+        // exit; its next turn must not start a second one meanwhile.
+        fixture.turn(&sessions, &second, "two").await;
+        fixture.turn(&sessions, &first, "again").await;
+        assert_eq!(fixture.launches().len(), 3);
+        assert_eq!(fixture.overlaps(), "");
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_turn_queued_during_an_interrupt_keeps_its_worker_from_eviction() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(1);
+        let first = fixture.conversation().await;
+        let second = fixture.conversation().await;
+        let (cancel_tx, cancel) = watch::channel(false);
+        let cancelling = async {
+            fixture.wait_for_wire("slow-interruptible").await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_tx.send(true).unwrap();
+        };
+        let (result, ()) = futures_util::future::join(
+            fixture.run(&sessions, &first, "slow-interruptible", None, cancel),
+            cancelling,
+        )
+        .await;
+        assert!(result.unwrap().cancelled);
+        // The worker is still interrupting: this turn queues behind it, and
+        // the worker stays busy through it.
+        let (_cancel, cancel) = watch::channel(false);
+        let queued = fixture.run(&sessions, &first, "block", None, cancel);
+        let other = async {
+            fixture.wait_for_wire("block").await;
+            // Every slot runs a turn: a one-off process, not an eviction.
+            let result = fixture.turn(&sessions, &second, "two").await;
+            assert!(sessions.holds(&first.id).await);
+            std::fs::write(fixture.root.join("release"), "").unwrap();
+            result
+        };
+        let (queued, other) = futures_util::future::join(queued, other).await;
+        assert!(!queued.unwrap().cancelled);
+        assert!(!other.cancelled);
+        assert_eq!(fixture.launches().len(), 2);
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_one_off_process_exits_before_its_session_resumes() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(1);
+        let first = fixture.conversation().await;
+        let second = fixture.conversation().await;
+        let (_cancel, cancel) = watch::channel(false);
+        let blocked = fixture.run(&sessions, &first, "block", None, cancel);
+        let one_off = async {
+            fixture.wait_for_wire("block").await;
+            // A one-off process, stopped (slowly) after the turn.
+            fixture.turn(&sessions, &second, "slow-exit").await;
+            std::fs::write(fixture.root.join("release"), "").unwrap();
+        };
+        let (blocked, ()) = futures_util::future::join(blocked, one_off).await;
+        blocked.unwrap();
+        // The first conversation is idle now: the second evicts it, and its
+        // worker waits for the one-off process to exit.
+        fixture.turn(&sessions, &second, "again").await;
+        assert_eq!(fixture.launches().len(), 3);
+        assert_eq!(fixture.overlaps(), "");
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_turn_cancelled_while_queued_never_reaches_claude() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let (_cancel, cancel) = watch::channel(false);
+        let blocked = fixture.run(&sessions, &manifest, "block", None, cancel);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let queued = async {
+            fixture.wait_for_wire("block").await;
+            let queued = fixture.run(&sessions, &manifest, "never-sent", None, cancel);
+            let cancelling = async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                cancel_tx.send(true).unwrap();
+                std::fs::write(fixture.root.join("release"), "").unwrap();
+            };
+            futures_util::future::join(queued, cancelling).await.0
+        };
+        let (blocked, queued) = futures_util::future::join(blocked, queued).await;
+        blocked.unwrap();
+        let queued = queued.unwrap();
+        assert!(queued.cancelled);
+        assert_eq!(queued.stop_reason, "cancelled");
+        assert_eq!(
+            queued.native_session_id.as_deref(),
+            Some(manifest.id.as_str())
+        );
+        // The process was left idle and serves the next turn, which also
+        // means it has read every line sent before.
+        fixture.turn(&sessions, &manifest, "next").await;
+        assert_eq!(fixture.launches().len(), 1);
+        let wire = fixture.wire();
+        assert!(wire.contains("next"));
+        assert!(!wire.contains("never-sent"));
+        assert!(!wire.contains(r#""subtype":"interrupt""#));
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn nothing_starts_while_sessions_are_shutting_down() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let first = fixture.conversation().await;
+        let second = fixture.conversation().await;
+        // Its process takes a while to exit, which keeps the shutdown open.
+        fixture.turn(&sessions, &first, "slow-exit").await;
+        let late = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (_cancel, cancel) = watch::channel(false);
+            let turn = fixture.run(&sessions, &second, "late", None, cancel).await;
+            let prewarm = fixture.prewarm(&sessions, &second).await;
+            (turn, prewarm)
+        };
+        let ((), (turn, prewarm)) = futures_util::future::join(sessions.stop_all(), late).await;
+        assert!(matches!(turn, Err(AppError::ProviderUnavailable(_))));
+        assert!(matches!(prewarm, Err(AppError::ProviderUnavailable(_))));
+        assert_eq!(fixture.launches().len(), 1);
+        assert_eq!(sessions.worker_count().await, 0);
         cleanup(&fixture.root);
     }
 }

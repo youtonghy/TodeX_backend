@@ -760,34 +760,38 @@ async fn claude_launch_spec(
     Ok((spec, requested_session_id))
 }
 
-/// Spawns Claude for `context` and completes the `initialize` handshake,
-/// recording the session's slash-command catalog.
-async fn start_claude(
+/// Spawns Claude for `context` with `prompt`'s launch settings. Returns the
+/// process and its session id; [`initialize_session`] completes the start.
+async fn spawn_claude(
     binary: &str,
-    catalogs: &Catalogs,
     context: &DriverContext,
     prompt: &DriverPrompt,
     permit: WorkspaceTrustPermit,
-    cancel: &mut watch::Receiver<bool>,
-) -> Result<JsonLineProcess, AppError> {
+) -> Result<(JsonLineProcess, String), AppError> {
     let (spec, session_id) = claude_launch_spec(binary, context, prompt).await?;
-    let mut process = JsonLineProcess::spawn_trusted(&spec, permit).await?;
-    let commands = match initialize_claude(&mut process, cancel).await {
-        Ok(commands) => commands,
-        Err(error) => {
-            // Never on the caller's path: the failed process exits on its own.
-            tokio::spawn(async move { process.terminate().await });
-            return Err(error);
-        }
-    };
+    let process = JsonLineProcess::spawn_trusted(&spec, permit).await?;
+    Ok((process, session_id))
+}
+
+/// Completes the `initialize` handshake of a process from [`spawn_claude`],
+/// recording the session's slash-command catalog. On failure the caller
+/// stops the process, so whoever owns the conversation knows when it is gone.
+async fn initialize_session(
+    process: &mut JsonLineProcess,
+    catalogs: &Catalogs,
+    context: &DriverContext,
+    runtime_id: String,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    let commands = initialize_claude(process, cancel).await?;
     catalogs.lock().await.insert(
         context.manifest.id.clone(),
         ProviderSessionCommands {
             commands,
-            runtime_id: session_id,
+            runtime_id,
         },
     );
-    Ok(process)
+    Ok(())
 }
 
 /// Whether the transcript at `path` can back a `--resume`: the file must
