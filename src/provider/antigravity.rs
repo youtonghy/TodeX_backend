@@ -8,16 +8,22 @@
 //! `~/.gemini/antigravity-cli`; the next turn resumes it with
 //! `--conversation <id>`.
 //!
-//! Headless `agy` cannot ask for approval: a tool needing it is denied. So
-//! implement turns run with `--dangerously-skip-permissions` and TodeX gates
-//! tools itself through a global `PreToolUse` hook ([`integration`],
-//! decided in `agent_mcp::agy_hook` by the turn's ask / full-access mode;
-//! agy has no auto-review tier, so `auto` is not offered). The same static
-//! config carries TodeX's MCP servers; both reach the conversation through
-//! variables in the `agy` process environment. When
-//! the hook cannot be installed or reached, ask turns keep agy's own
-//! review instead, which refuses whatever would need approval. Plan turns
-//! always keep it (`--mode plan`), so anything beyond reading is refused.
+//! Headless `agy` cannot ask for approval: a tool needing it is denied, and
+//! a hook's `allow` does not override that. So ask and full-access turns run
+//! with `--dangerously-skip-permissions` and TodeX gates tools itself through
+//! a global `PreToolUse` hook ([`integration`], decided in
+//! `agent_mcp::agy_hook` by the turn's mode). The same static config carries
+//! TodeX's MCP servers; both reach the conversation through variables in the
+//! `agy` process environment. When the hook cannot be installed or reached,
+//! ask turns keep agy's own review instead, which refuses whatever would need
+//! approval. Plan turns always keep it (`--mode plan`), so anything beyond
+//! reading is refused.
+//!
+//! Auto turns use agy's own Auto review (`--mode auto`, a preview offered per
+//! account): it runs what it judges safe and, headless, refuses the rest.
+//! agy silently falls back to its default mode on accounts without it, so a
+//! cached `--mode auto -p=/help` probe decides first; without Auto the turn
+//! runs like `ask`.
 
 mod integration;
 
@@ -31,6 +37,7 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::sync::watch;
 
+use crate::agent_mcp::AGY_NATIVE_AUTO_ENV;
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
@@ -57,14 +64,14 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     kind: ProviderKind::Antigravity,
     display_name: "Antigravity",
     permission_config: PermissionConfigCapabilities {
-        modes: &["ask", "full-access"],
+        modes: &["ask", "auto", "full-access"],
         default_mode: "ask",
         supports_plan: true,
         sandbox_modes: &[],
         approval_policies: &[],
         permission_profiles: &[],
         enforcement: "agent-policy",
-        description: "agy runs with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network, non-TodeX MCP tools and reads outside the workspace; full-access allows everything. agy has no auto-review tier, so auto is not offered. Plan uses agy --mode plan and only reads. Not an operating-system sandbox.",
+        description: "ask and full-access run agy with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network, non-TodeX MCP tools and reads outside the workspace; full-access allows everything. auto runs agy --mode auto, whose own review runs what it judges safe and refuses the rest without prompting; accounts without agy's Auto preview fall back to ask. Plan uses agy --mode plan and only reads. Not an operating-system sandbox.",
     },
     native_fork: false,
     native_compact: false,
@@ -110,6 +117,12 @@ const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 /// How long a finished turn's process may take to flush its history and
 /// exit after stdin closes, before it is stopped.
 const EXIT_GRACE: Duration = Duration::from_secs(10);
+/// What `agy --mode auto` prints (agy 1.3.5) on an account without its Auto
+/// preview, before continuing in the default mode.
+const AUTO_UNAVAILABLE: &str = "--mode auto is not available";
+/// The probe starts a full `agy` (about 10 s), so its answer is kept.
+const AUTO_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTO_PROBE_TTL: Duration = Duration::from_secs(30 * 60);
 
 pub struct AntigravityDriver {
     binary: String,
@@ -117,6 +130,9 @@ pub struct AntigravityDriver {
     /// provider processes otherwise start from a cleared environment.
     env_allowlist: Vec<String>,
     models: CatalogCache<Vec<ProviderModelDescriptor>>,
+    /// When the account was last probed for agy's Auto mode, and the answer.
+    /// The lock also keeps concurrent turns from probing twice.
+    auto_mode: tokio::sync::Mutex<Option<(std::time::Instant, bool)>>,
 }
 
 impl AntigravityDriver {
@@ -125,7 +141,42 @@ impl AntigravityDriver {
             binary: config.antigravity_bin.clone(),
             env_allowlist: config.antigravity_env_allowlist.clone(),
             models: CatalogCache::new(PROFILE.discovery_cache_ttl),
+            auto_mode: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Whether the signed-in account offers `--mode auto`. A failed probe is
+    /// not cached and counts as unavailable, so the turn falls back to `ask`.
+    async fn auto_available(&self, workspace: &Path) -> bool {
+        let mut cached = self.auto_mode.lock().await;
+        if let Some((at, available)) = *cached {
+            if at.elapsed() < AUTO_PROBE_TTL {
+                return available;
+            }
+        }
+        let spec = self.command_spec(workspace, &["--mode", "auto", "-p=/help"]);
+        match run_bounded_command(&spec, MAX_COMMAND_OUTPUT_BYTES, AUTO_PROBE_TIMEOUT).await {
+            Ok(output) if output.success => {
+                let available = !String::from_utf8_lossy(&output.stderr).contains(AUTO_UNAVAILABLE);
+                *cached = Some((std::time::Instant::now(), available));
+                available
+            }
+            Ok(output) => {
+                tracing::warn!(
+                    stderr = stderr_excerpt(&output.stderr).unwrap_or_default(),
+                    "agy Auto mode probe failed; running the turn as ask"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(%error, "agy Auto mode probe failed; running the turn as ask");
+                false
+            }
+        }
+    }
+
+    async fn forget_auto_mode(&self) {
+        *self.auto_mode.lock().await = None;
     }
 
     fn command_spec(&self, cwd: &Path, args: &[&str]) -> CommandSpec {
@@ -256,8 +307,27 @@ impl ProviderDriver for AntigravityDriver {
         if let (true, Some(global)) = (bridged, &global) {
             spec.env.extend(global.env.iter().cloned());
         }
+        let auto = controls.work_mode != "plan" && controls.permission_mode == "auto";
+        let native_auto = auto && self.auto_available(&workspace).await;
+        if auto && !native_auto {
+            sink.emit(
+                "provider.event",
+                json!({
+                    "provider": PROVIDER,
+                    "providerMethod": "auto_mode_unavailable",
+                    "metadata": {
+                        "reason": "This Antigravity account does not offer agy's Auto mode (or it could not be checked); the turn asks for approval as in ask mode.",
+                    },
+                }),
+            )
+            .await?;
+        }
         if controls.work_mode == "plan" {
             spec.args.extend(["--mode".to_owned(), "plan".to_owned()]);
+        } else if native_auto {
+            spec.args.extend(["--mode".to_owned(), "auto".to_owned()]);
+            spec.env
+                .insert(AGY_NATIVE_AUTO_ENV.to_owned(), "1".to_owned());
         } else if bridged || controls.permission_mode == "full-access" {
             spec.args.push("--dangerously-skip-permissions".to_owned());
         } else {
@@ -306,6 +376,26 @@ impl ProviderDriver for AntigravityDriver {
             }
         }
         process.terminate().await;
+        // The probe's answer went stale: agy ran in its default mode, which
+        // refused whatever needed approval. The next turn probes again.
+        if native_auto && process.stderr_contains(AUTO_UNAVAILABLE).await {
+            self.forget_auto_mode().await;
+            if let Err(error) = sink
+                .emit(
+                    "provider.event",
+                    json!({
+                        "provider": PROVIDER,
+                        "providerMethod": "auto_mode_unavailable",
+                        "metadata": {
+                            "reason": "agy reported that this account no longer offers its Auto mode and ran the turn in its default mode, refusing tools that needed approval. The next auto turn asks for approval as in ask mode.",
+                        },
+                    }),
+                )
+                .await
+            {
+                tracing::warn!(%error, "could not record that agy's Auto mode was unavailable");
+            }
+        }
         result
     }
 }
@@ -1162,6 +1252,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     binary,
                     env_allowlist: Vec::new(),
                     models: CatalogCache::new(None),
+                    auto_mode: tokio::sync::Mutex::new(None),
                 };
                 let store = ConversationStore::new(root.join("data")).await.unwrap();
                 let manifest = store
@@ -1265,7 +1356,38 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     .lines()
                     .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
                     .filter(|argv| argv.first().map(String::as_str) != Some("models"))
+                    .filter(|argv| !argv.contains(&"-p=/help".to_owned()))
                     .collect()
+            }
+
+            /// How many times the Auto mode probe ran.
+            fn auto_probes(&self) -> usize {
+                std::fs::read_to_string(self.root.join("argv.log"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| line.contains("-p=/help"))
+                    .count()
+            }
+
+            /// The native-auto hint of the last process started.
+            fn last_auto_hint(&self) -> String {
+                std::fs::read_to_string(self.root.join("auto-hint.log"))
+                    .unwrap_or_default()
+                    .lines()
+                    .last()
+                    .unwrap_or_default()
+                    .to_owned()
+            }
+
+            async fn auto_unavailable_events(&self) -> usize {
+                self.events()
+                    .await
+                    .iter()
+                    .filter(|(kind, payload)| {
+                        kind == "provider.event"
+                            && payload["providerMethod"] == "auto_mode_unavailable"
+                    })
+                    .count()
             }
         }
 
@@ -1317,6 +1439,61 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             assert!(!launch.contains(&"--dangerously-skip-permissions".to_owned()));
             let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
             assert_eq!(launch[mode + 1], "plan");
+        }
+
+        #[tokio::test]
+        async fn auto_turns_use_agys_auto_review_once_probed() {
+            let fixture = Fixture::new().await;
+            fixture
+                .run("turn-1", "hello", Some("auto"), None)
+                .await
+                .unwrap();
+            assert_eq!(fixture.last_auto_hint(), "1");
+            fixture
+                .run("turn-2", "again", Some("auto"), None)
+                .await
+                .unwrap();
+            for launch in fixture.launches() {
+                assert!(!launch.contains(&"--dangerously-skip-permissions".to_owned()));
+                let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
+                assert_eq!(launch[mode + 1], "auto");
+            }
+            assert_eq!(fixture.auto_probes(), 1);
+            assert_eq!(fixture.auto_unavailable_events().await, 0);
+        }
+
+        #[tokio::test]
+        async fn auto_without_agys_auto_preview_runs_as_ask() {
+            let fixture = Fixture::new().await;
+            std::fs::write(fixture.root.join("auto-unavailable"), "").unwrap();
+            fixture
+                .run("turn-1", "hello", Some("auto"), None)
+                .await
+                .unwrap();
+            let launch = &fixture.launches()[0];
+            assert!(!launch.contains(&"--mode".to_owned()));
+            assert_eq!(fixture.last_auto_hint(), "-");
+            assert_eq!(fixture.auto_unavailable_events().await, 1);
+        }
+
+        #[tokio::test]
+        async fn a_stale_auto_probe_is_reported_and_retried() {
+            let fixture = Fixture::new().await;
+            fixture
+                .run("turn-1", "hello", Some("auto"), None)
+                .await
+                .unwrap();
+            std::fs::write(fixture.root.join("auto-revoked"), "").unwrap();
+            fixture
+                .run("turn-2", "again", Some("auto"), None)
+                .await
+                .unwrap();
+            assert_eq!(fixture.auto_unavailable_events().await, 1);
+            fixture
+                .run("turn-3", "more", Some("auto"), None)
+                .await
+                .unwrap();
+            assert_eq!(fixture.auto_probes(), 2);
         }
 
         #[tokio::test]

@@ -257,6 +257,12 @@ impl JsonLineProcess {
         Ok(())
     }
 
+    /// Whether the retained tail of stderr mentions `needle`.
+    pub async fn stderr_contains(&self, needle: &str) -> bool {
+        let mut buffer = self.stderr.lock().await;
+        String::from_utf8_lossy(buffer.make_contiguous()).contains(needle)
+    }
+
     /// Closes stdin so a provider that reads prompts until end of input
     /// finishes its work and exits on its own.
     pub fn close_stdin(&mut self) {

@@ -761,6 +761,7 @@
       "permissionConfig": {
         "modes": [
           "ask",
+          "auto",
           "full-access"
         ],
         "defaultMode": "ask",
@@ -769,7 +770,7 @@
         "approvalPolicies": [],
         "permissionProfiles": [],
         "enforcement": "agent-policy",
-        "description": "agy runs with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network, non-TodeX MCP tools and reads outside the workspace; full-access allows everything. agy has no auto-review tier, so auto is not offered. Plan uses agy --mode plan and only reads. Not an operating-system sandbox."
+        "description": "ask and full-access run agy with --dangerously-skip-permissions and a TodeX PreToolUse hook approves each tool: ask prompts for edits, commands, network, non-TodeX MCP tools and reads outside the workspace; full-access allows everything. auto runs agy --mode auto, whose own review runs what it judges safe and refuses the rest without prompting; accounts without agy's Auto preview fall back to ask. Plan uses agy --mode plan and only reads. Not an operating-system sandbox."
       },
       "nativeFork": false,
       "nativeCompact": false,

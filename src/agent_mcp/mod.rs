@@ -88,6 +88,10 @@ pub(crate) const ROUTE_ARG: &str = "--route";
 /// Hidden subcommand an Antigravity `PreToolUse` hook runs; see [`agy_hook`].
 pub(crate) const AGY_HOOK_SUBCOMMAND: &str = "agy-hook";
 pub(crate) const AGY_HOOK_ROUTE: &str = "/internal/agent-mcp/agy-permission";
+/// Set in the `agy` environment when the turn runs agy's own Auto review
+/// (`--mode auto`); the hook forwards it as [`AGY_NATIVE_AUTO_HEADER`].
+pub(crate) const AGY_NATIVE_AUTO_ENV: &str = "TODEX_AGY_NATIVE_AUTO";
+pub(crate) const AGY_NATIVE_AUTO_HEADER: &str = "x-todex-agy-native-auto";
 pub(crate) const DESKTOP_SERVER: &str = "todex_desktop";
 pub(crate) const DESKTOP_ROUTE: &str = "/internal/agent-mcp/desktop";
 const STATE_DIR: &str = "agent-mcp";

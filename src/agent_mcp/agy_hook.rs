@@ -5,18 +5,24 @@
 //! `PreToolUse` hook (installed by `provider::antigravity`) runs
 //! `todex-agentd agy-hook`, which posts the hook payload to
 //! [`AGY_HOOK_ROUTE`] with the conversation's token and prints the answer.
-//! The decision follows the turn's permission mode (ask or full access;
-//! agy has no auto-review tier) and, where it asks,
+//! The decision follows the turn's permission mode and, where it asks,
 //! raises the same `permission.requested` prompt as other provider tools.
+//!
+//! An `auto` turn runs agy's own Auto review (`--mode auto`, without
+//! `--dangerously-skip-permissions`) when the account offers it; the hook
+//! then answers nothing for what that review decides. It does so only when
+//! the `agy` process says so through [`AGY_NATIVE_AUTO_ENV`]: an `auto` turn
+//! launched without it (Auto unavailable) runs with skipped permissions,
+//! so the hook asks as in `ask` mode.
 //!
 //! In ask mode, read-class tools are allowed without a prompt only when
 //! every path they name resolves inside the conversation's workspace (or
 //! agy's own bundled docs and this conversation's artifacts); other reads
 //! ask like an edit.
 //!
-//! An empty hook answer leaves agy's own permissions in charge, which
-//! `--dangerously-skip-permissions` turns off, so every path that cannot
-//! reach a decision answers with an explicit denial.
+//! Otherwise an empty hook answer leaves agy's own permissions in charge,
+//! which `--dangerously-skip-permissions` turns off, so every path that
+//! cannot reach a decision answers with an explicit denial.
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -34,7 +40,7 @@ use uuid::Uuid;
 
 use super::{
     authorizer::{action_key, Answerer, CancelSignal, Prompt},
-    server, AGY_HOOK_ROUTE, ENDPOINT_ENV, TOKEN_ENV,
+    server, AGY_HOOK_ROUTE, AGY_NATIVE_AUTO_ENV, AGY_NATIVE_AUTO_HEADER, ENDPOINT_ENV, TOKEN_ENV,
 };
 use crate::app_state::AppState;
 
@@ -51,6 +57,8 @@ pub(super) fn routes() -> Router<AppState> {
 enum Decision {
     Allow,
     Deny(String),
+    /// Leave the call to agy's own Auto review: the hook prints nothing.
+    Defer,
 }
 
 impl Decision {
@@ -58,6 +66,7 @@ impl Decision {
         match self {
             Self::Allow => json!({ "decision": "allow" }),
             Self::Deny(reason) => json!({ "decision": "deny", "reason": reason }),
+            Self::Defer => json!({ "decision": "defer" }),
         }
     }
 }
@@ -67,9 +76,13 @@ async fn decide_request(State(state): State<AppState>, request: Request) -> Resp
         Ok(conversation_id) => conversation_id,
         Err(response) => return *response,
     };
+    let native_auto = request
+        .headers()
+        .get(AGY_NATIVE_AUTO_HEADER)
+        .is_some_and(|value| value == "1");
     let decision = match axum::body::to_bytes(request.into_body(), MAX_PAYLOAD_BYTES).await {
         Ok(body) => match serde_json::from_slice::<Value>(&body) {
-            Ok(payload) => decide(&state, &conversation_id, &payload).await,
+            Ok(payload) => decide(&state, &conversation_id, native_auto, &payload).await,
             Err(error) => Decision::Deny(format!("TodeX could not read the hook payload: {error}")),
         },
         Err(error) => Decision::Deny(format!("TodeX could not read the hook payload: {error}")),
@@ -160,9 +173,11 @@ enum Policy {
     Allow,
     Ask,
     Deny(String),
+    Defer,
 }
 
-fn policy(permission_mode: &str, work_mode: &str, class: ToolClass) -> Policy {
+/// `native_auto`: agy itself reviews this turn's calls (`--mode auto`).
+fn policy(permission_mode: &str, native_auto: bool, work_mode: &str, class: ToolClass) -> Policy {
     use ToolClass::*;
     if work_mode == "plan" {
         // agy's own review also refuses these: Plan turns keep it on.
@@ -180,12 +195,19 @@ fn policy(permission_mode: &str, work_mode: &str, class: ToolClass) -> Policy {
     match (permission_mode, class) {
         ("full-access", _) => Policy::Allow,
         (_, Read | Internal | Mcp { todex: true }) => Policy::Allow,
-        // `ask`, and anything else (agy has no auto-review tier), asks.
+        // agy's Auto review decides; without it `auto` asks like `ask`.
+        ("auto", _) if native_auto => Policy::Defer,
+        // `ask`, and anything else, asks.
         _ => Policy::Ask,
     }
 }
 
-async fn decide(state: &AppState, conversation_id: &str, payload: &Value) -> Decision {
+async fn decide(
+    state: &AppState,
+    conversation_id: &str,
+    native_auto: bool,
+    payload: &Value,
+) -> Decision {
     let Some((permission_mode, work_mode)) = state.agent_mcp.turn_mode(conversation_id) else {
         return Decision::Deny("No TodeX turn is running in this conversation.".to_owned());
     };
@@ -214,9 +236,10 @@ async fn decide(state: &AppState, conversation_id: &str, payload: &Value) -> Dec
             class = ToolClass::ReadOutside;
         }
     }
-    match policy(&permission_mode, &work_mode, class) {
+    match policy(&permission_mode, native_auto, &work_mode, class) {
         Policy::Allow => Decision::Allow,
         Policy::Deny(reason) => Decision::Deny(reason),
+        Policy::Defer => Decision::Defer,
         Policy::Ask => ask(state, conversation_id, name, args).await,
     }
 }
@@ -445,8 +468,9 @@ fn summary(name: &str, args: &Value) -> String {
 }
 
 /// `todex-agentd agy-hook`: reads the hook payload on stdin, asks the daemon
-/// and prints its decision. Started outside a TodeX turn it prints nothing,
-/// which leaves agy's own permissions in charge; a failed exchange denies.
+/// and prints its decision. Started outside a TodeX turn, or told to defer to
+/// agy's Auto review, it prints nothing, which leaves agy's own permissions in
+/// charge; a failed exchange denies.
 pub(crate) async fn run_hook() -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
@@ -459,7 +483,9 @@ pub(crate) async fn run_hook() -> anyhow::Result<()> {
         .take(MAX_PAYLOAD_BYTES as u64 + 1)
         .read_to_end(&mut payload)
         .await?;
-    let decision = match ask_daemon(&endpoint, &token, payload).await {
+    let native_auto = env(AGY_NATIVE_AUTO_ENV).is_some_and(|value| value == "1");
+    let decision = match ask_daemon(&endpoint, &token, native_auto, payload).await {
+        Ok(decision) if decision["decision"] == "defer" => return Ok(()),
         Ok(decision) => decision,
         Err(error) => Decision::Deny(format!(
             "TodeX could not decide on this tool call ({error}); start a new turn if todex-agentd \
@@ -471,16 +497,25 @@ pub(crate) async fn run_hook() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn ask_daemon(endpoint: &str, token: &str, payload: Vec<u8>) -> anyhow::Result<Value> {
+async fn ask_daemon(
+    endpoint: &str,
+    token: &str,
+    native_auto: bool,
+    payload: Vec<u8>,
+) -> anyhow::Result<Value> {
     if payload.len() > MAX_PAYLOAD_BYTES {
         anyhow::bail!("the hook payload is too large");
     }
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .build()?;
-    let response = client
+    let mut request = client
         .post(format!("{endpoint}{AGY_HOOK_ROUTE}"))
-        .bearer_auth(token)
+        .bearer_auth(token);
+    if native_auto {
+        request = request.header(AGY_NATIVE_AUTO_HEADER, "1");
+    }
+    let response = request
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(payload)
         .send()
@@ -488,7 +523,7 @@ async fn ask_daemon(endpoint: &str, token: &str, payload: Vec<u8>) -> anyhow::Re
         .error_for_status()?;
     let decision: Value = response.json().await?;
     match decision.get("decision").and_then(Value::as_str) {
-        Some("allow" | "deny") => Ok(decision),
+        Some("allow" | "deny" | "defer") => Ok(decision),
         _ => anyhow::bail!("the daemon answered without a decision"),
     }
 }
@@ -521,33 +556,53 @@ mod tests {
     #[test]
     fn modes_decide_which_calls_ask() {
         use ToolClass::*;
-        assert_eq!(policy("full-access", "implement", Command), Policy::Allow);
-        assert_eq!(policy("ask", "implement", Read), Policy::Allow);
-        assert_eq!(policy("ask", "implement", Edit), Policy::Ask);
-        assert_eq!(policy("ask", "implement", Command), Policy::Ask);
         assert_eq!(
-            policy("ask", "implement", Mcp { todex: false }),
+            policy("full-access", false, "implement", Command),
+            Policy::Allow
+        );
+        assert_eq!(policy("ask", false, "implement", Read), Policy::Allow);
+        assert_eq!(policy("ask", false, "implement", Edit), Policy::Ask);
+        assert_eq!(policy("ask", false, "implement", Command), Policy::Ask);
+        assert_eq!(
+            policy("ask", false, "implement", Mcp { todex: false }),
             Policy::Ask
         );
         assert_eq!(
-            policy("ask", "implement", Mcp { todex: true }),
+            policy("ask", false, "implement", Mcp { todex: true }),
             Policy::Allow
         );
         assert!(matches!(
-            policy("full-access", "plan", Edit),
+            policy("full-access", false, "plan", Edit),
             Policy::Deny(_)
         ));
-        assert_eq!(policy("ask", "plan", Read), Policy::Allow);
-        assert_eq!(policy("ask", "implement", ReadOutside), Policy::Ask);
-        assert_eq!(policy("ask", "plan", ReadOutside), Policy::Ask);
-        assert_eq!(policy("full-access", "plan", ReadOutside), Policy::Allow);
+        assert_eq!(policy("ask", false, "plan", Read), Policy::Allow);
+        assert_eq!(policy("ask", false, "implement", ReadOutside), Policy::Ask);
+        assert_eq!(policy("ask", false, "plan", ReadOutside), Policy::Ask);
         assert_eq!(
-            policy("full-access", "implement", ReadOutside),
+            policy("full-access", false, "plan", ReadOutside),
             Policy::Allow
         );
-        // `auto` (not offered for agy) and unknown modes never skip approval.
-        assert_eq!(policy("auto", "implement", Edit), Policy::Ask);
-        assert_eq!(policy("bogus", "implement", Command), Policy::Ask);
+        assert_eq!(
+            policy("full-access", false, "implement", ReadOutside),
+            Policy::Allow
+        );
+        // agy's Auto review decides what it covers; reads stay free.
+        assert_eq!(policy("auto", true, "implement", Command), Policy::Defer);
+        assert_eq!(
+            policy("auto", true, "implement", ReadOutside),
+            Policy::Defer
+        );
+        assert_eq!(policy("auto", true, "implement", Read), Policy::Allow);
+        assert_eq!(policy("auto", true, "plan", ReadOutside), Policy::Ask);
+        assert!(matches!(
+            policy("auto", true, "plan", Edit),
+            Policy::Deny(_)
+        ));
+        // Without agy's review (Auto unavailable), `auto` asks; so do unknown
+        // modes, and the hint never loosens `ask`.
+        assert_eq!(policy("auto", false, "implement", Edit), Policy::Ask);
+        assert_eq!(policy("ask", true, "implement", Command), Policy::Ask);
+        assert_eq!(policy("bogus", false, "implement", Command), Policy::Ask);
     }
 
     #[test]
@@ -683,9 +738,22 @@ mod tests {
             }
 
             async fn post(&self, token: Option<&str>, tool: &str, args: Value) -> (u16, Value) {
+                self.post_as(token, false, tool, args).await
+            }
+
+            async fn post_as(
+                &self,
+                token: Option<&str>,
+                native_auto: bool,
+                tool: &str,
+                args: Value,
+            ) -> (u16, Value) {
                 let mut builder = axum::http::Request::post(AGY_HOOK_ROUTE)
                     .header(header::HOST, "127.0.0.1:7345")
                     .header(header::CONTENT_TYPE, "application/json");
+                if native_auto {
+                    builder = builder.header(AGY_NATIVE_AUTO_HEADER, "1");
+                }
                 if let Some(token) = token {
                     builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
                 }
@@ -813,6 +881,41 @@ mod tests {
                 harness.decide("view_file", inside).await["decision"],
                 "allow"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn auto_defers_to_agy_only_when_agy_reviews() {
+            let harness = std::sync::Arc::new(harness().await);
+            let id = &harness.conversation_id;
+            let command = json!({ "CommandLine": "rm -rf x" });
+            harness
+                .state
+                .agent_mcp
+                .record_turn_mode(id, "auto", "implement");
+            let (status, decision) = harness
+                .post_as(Some(&harness.token), true, "run_command", command.clone())
+                .await;
+            assert_eq!(status, 200);
+            assert_eq!(decision["decision"], "defer");
+
+            // The hint cannot loosen a turn the user put in `ask`.
+            harness
+                .state
+                .agent_mcp
+                .record_turn_mode(id, "ask", "implement");
+            let pending = {
+                let harness = harness.clone();
+                tokio::spawn(async move {
+                    harness
+                        .post_as(Some(&harness.token), true, "run_command", command)
+                        .await
+                })
+            };
+            let prompt = harness.pending_permission().await;
+            harness
+                .answer(&prompt, PermissionOutcome::RejectOnce, "reject_once")
+                .await;
+            assert_eq!(pending.await.unwrap().1["decision"], "deny");
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

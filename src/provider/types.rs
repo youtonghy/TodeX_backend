@@ -446,14 +446,13 @@ pub fn resolve_execution_config(
         return Ok(legacy);
     }
     let mode = permission_mode.unwrap_or(capabilities.default_mode);
-    // Devin and Antigravity expose no auto-approval tier; a stale `auto`
-    // selection degrades to manual approval rather than failing the prompt.
-    let mode =
-        if matches!(provider, ProviderKind::Devin | ProviderKind::Antigravity) && mode == "auto" {
-            "ask"
-        } else {
-            mode
-        };
+    // Devin exposes no auto-approval tier; a stale `auto` selection degrades
+    // to manual approval rather than failing the prompt.
+    let mode = if provider == ProviderKind::Devin && mode == "auto" {
+        "ask"
+    } else {
+        mode
+    };
     if !capabilities.modes.contains(&mode) {
         return Err(AppError::Unsupported(format!(
             "{} does not support permission mode {mode}",
@@ -1989,6 +1988,8 @@ mod tests {
         assert_eq!(stale_auto.permission_mode, "ask");
         assert!(config(ProviderKind::Devin, "ask", "plan").is_ok());
         assert!(config(ProviderKind::Devin, "full-access", "implement").is_ok());
+        let auto = config(ProviderKind::Antigravity, "auto", "implement").unwrap();
+        assert_eq!(auto.permission_mode, "auto");
         for provider in [ProviderKind::Acp, ProviderKind::GrokBuild] {
             assert!(config(provider, "ask", "implement").is_ok());
             assert!(config(provider, "auto", "implement").is_err());

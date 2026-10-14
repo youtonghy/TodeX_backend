@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Stands in for the Antigravity CLI (`agy`) in driver tests.
 
-Logs its argv to argv.log next to itself, answers `agy models`, and plays
-one stream-json print-mode turn chosen by the prompt text:
+Logs its argv to argv.log (and the native-auto hint to auto-hint.log)
+next to itself, answers `agy models` and the
+`--mode auto -p=/help` probe, and plays one stream-json print-mode turn
+chosen by the prompt text:
   FAIL <message>  a failing `result`
   HANG            init, then waits until it is killed
   anything else   text deltas, one tool step and a successful `result`
-Like agy, it exits only once stdin closes after the turn.
+Like agy, it exits only once stdin closes after the turn. With
+`--mode auto` it warns that Auto is unavailable when an `auto-unavailable`
+file sits next to it (probe and turns) or `auto-revoked` (turns only).
 """
 import json
 import os
@@ -16,12 +20,29 @@ import time
 here = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(here, "argv.log"), "a") as log:
     log.write(json.dumps(sys.argv[1:]) + "\n")
+with open(os.path.join(here, "auto-hint.log"), "a") as log:
+    log.write(os.environ.get("TODEX_AGY_NATIVE_AUTO", "-") + "\n")
 
 args = sys.argv[1:]
 if args[:1] == ["models"]:
     print("gemini-3.8-flash-high\tGemini 3.8 Flash (High)")
     print("gemini-3.8-flash-low\tGemini 3.8 Flash (Low)")
     sys.exit(0)
+
+
+def marked(name):
+    return os.path.exists(os.path.join(here, name))
+
+
+if "--mode" in args and args[args.index("--mode") + 1] == "auto":
+    probe = "-p=/help" in args
+    if marked("auto-unavailable") or (not probe and marked("auto-revoked")):
+        sys.stderr.write("warning: --mode auto is not available for this account; "
+                         "continuing in the default mode.\n")
+        sys.stderr.flush()
+    if probe:
+        print("/help\tShow help")
+        sys.exit(0)
 
 
 def emit(frame):
