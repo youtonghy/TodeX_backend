@@ -7,13 +7,21 @@ on:
         description: Release version (for example, 1.2.3 or v1.2.3)
         required: true
         type: string
+      dry_run:
+        description: Validate and build every platform without tagging or publishing
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: backend-release
+  group: backend-release${{ inputs.dry_run && '-dry-run' || '' }}
   cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   prepare:
@@ -39,6 +47,7 @@ jobs:
           echo "tag=v${version}" >> "${GITHUB_OUTPUT}"
 
       - name: Reject an existing release
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
@@ -53,7 +62,7 @@ jobs:
           fi
 
   source:
-    name: Tag release source
+    name: ${{ inputs.dry_run && 'Record' || 'Tag' }} release source
     needs: prepare
     runs-on: ubuntu-24.04
     permissions:
@@ -62,7 +71,7 @@ jobs:
       sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -71,6 +80,7 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
       - name: Push release tag
+        if: ${{ !inputs.dry_run }}
         env:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
@@ -89,15 +99,14 @@ jobs:
       TODEX_RELEASE_BUILD: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.source.outputs.sha }}
 
       - name: Setup Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup component add rustfmt clippy
+        uses: ./.github/actions/setup-rust
+        with:
+          components: rustfmt clippy
 
       - name: Validate backend
         run: |
@@ -128,15 +137,23 @@ jobs:
             archive: tar.gz
             cargo_target: x86_64-unknown-linux-gnu
             glibc: "2.28"
+          - os: ubuntu-24.04-arm
+            label: linux-arm64-gnu
+            archive: tar.gz
+            cargo_target: aarch64-unknown-linux-gnu
+            glibc: "2.28"
           - os: macos-15
             label: macos-arm64
             archive: tar.gz
           - os: windows-2025
             label: windows-x64
             archive: zip
+          - os: windows-11-arm
+            label: windows-arm64
+            archive: zip
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.source.outputs.sha }}
 
@@ -155,15 +172,13 @@ jobs:
           fi
 
       - name: Setup Rust
-        shell: bash
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.cargo_target }}
 
       - name: Install cargo-zigbuild
         if: ${{ matrix.glibc }}
         run: |
-          rustup target add "${{ matrix.cargo_target }}"
           python3 -m venv "${RUNNER_TEMP}/zigbuild"
           "${RUNNER_TEMP}/zigbuild/bin/pip" install --disable-pip-version-check cargo-zigbuild==0.23.4 ziglang==0.16.0
           # cargo-zigbuild locates Zig through `python3 -m ziglang`, so the venv must come first on PATH.
@@ -373,7 +388,11 @@ jobs:
           pushd dist >/dev/null
           if [[ "${ARCHIVE_FORMAT}" == "zip" ]]; then
             archive_name="${package_name}.zip"
-            7z a "${archive_name}" "${package_name}" >/dev/null
+            if command -v 7z >/dev/null 2>&1; then
+              7z a "${archive_name}" "${package_name}" >/dev/null
+            else
+              pwsh -NoProfile -Command "Compress-Archive -Path '${package_name}' -DestinationPath '${archive_name}'"
+            fi
           else
             archive_name="${package_name}.tar.gz"
             tar -czf "${archive_name}" "${package_name}"
@@ -405,6 +424,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
+    if: ${{ !inputs.dry_run }}
     needs:
       - prepare
       - source
@@ -452,7 +472,7 @@ jobs:
 
   cleanup:
     name: Clean up a failed release
-    if: ${{ always() && needs.source.outputs.sha != '' && needs.release.result != 'success' }}
+    if: ${{ always() && !inputs.dry_run && needs.source.outputs.sha != '' && needs.release.result != 'success' }}
     needs:
       - prepare
       - source

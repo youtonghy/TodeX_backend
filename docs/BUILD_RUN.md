@@ -498,13 +498,16 @@ compile-time marker and a strict stable `TODEX_BUILD_VERSION=X.Y.Z` other than
 `0.0.0`. Ordinary
 `cargo run`, debug builds, and unversioned builds perform no update network calls.
 Only newer stable releases are considered; no downgrades or prereleases.
-Supported update platforms match the release matrix: Linux x64 GNU, macOS arm64,
-and Windows x64. The macOS release binary is code signed with a stable identity
+Supported update platforms match the release matrix: Linux x64 and arm64 (GNU),
+macOS arm64, and Windows x64 and arm64. An update keeps the running binary's
+architecture, so an x64 build running under emulation on Windows ARM keeps
+receiving x64 updates; install the `windows-arm64` asset once to switch to the
+native build. The macOS release binary is code signed with a stable identity
 (see [RELEASING.md](RELEASING.md)), so the Screen Recording and Accessibility
 permissions that Computer Use needs survive in-place updates as long as the
-binary stays at the same path. The Linux build is linked with `cargo zigbuild` against glibc 2.28,
-so it runs on Debian 10, Ubuntu 20.04, RHEL 8, and newer; the release workflow fails
-if the binary requires a newer glibc symbol.
+binary stays at the same path. The Linux builds are linked with `cargo zigbuild` against glibc 2.28,
+so they run on Debian 10, Ubuntu 20.04, RHEL 8, and newer; the release workflow fails
+if a binary requires a newer glibc symbol.
 
 ```sh
 # Read-only JSON status (also reports enabled=false for development builds)

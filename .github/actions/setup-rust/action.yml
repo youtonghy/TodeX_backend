@@ -1,0 +1,62 @@
+name: Setup Rust
+description: Install the stable Rust toolchain, including on runner images without rustup.
+
+inputs:
+  components:
+    description: Space-separated rustup components to install
+    required: false
+    default: ""
+  targets:
+    description: Space-separated rustup targets to install
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      shell: bash
+      env:
+        RUST_COMPONENTS: ${{ inputs.components }}
+        RUST_TARGETS: ${{ inputs.targets }}
+      run: |
+        # Some images (such as windows-11-arm) ship without rustup.
+        if ! command -v rustup >/dev/null 2>&1; then
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            case "${RUNNER_ARCH}" in
+              ARM64) host="aarch64-pc-windows-msvc" ;;
+              *) host="x86_64-pc-windows-msvc" ;;
+            esac
+            curl -fsSLo "${RUNNER_TEMP}/rustup-init.exe" "https://static.rust-lang.org/rustup/dist/${host}/rustup-init.exe"
+            "${RUNNER_TEMP}/rustup-init.exe" -y --profile minimal --default-toolchain none
+            cargo_bin="$(cygpath -w "${USERPROFILE}\\.cargo\\bin")"
+          else
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            cargo_bin="${HOME}/.cargo/bin"
+          fi
+          echo "${cargo_bin}" >> "${GITHUB_PATH}"
+          export PATH="$(cygpath -u "${cargo_bin}" 2>/dev/null || echo "${cargo_bin}"):${PATH}"
+        fi
+
+        args=(--profile minimal)
+        for component in ${RUST_COMPONENTS}; do args+=(--component "${component}"); done
+        for target in ${RUST_TARGETS}; do args+=(--target "${target}"); done
+        rustup toolchain install stable "${args[@]}"
+        rustup default stable
+        rustc --version --verbose
+
+    # ring builds its aarch64 Windows assembly with clang, which MSVC lacks.
+    - name: Provide clang for Windows ARM64
+      if: runner.os == 'Windows' && runner.arch == 'ARM64'
+      shell: bash
+      run: |
+        if command -v clang >/dev/null 2>&1; then
+          clang --version
+          exit 0
+        fi
+        llvm_bin="C:\\Program Files\\LLVM\\bin"
+        if [[ ! -x "$(cygpath -u "${llvm_bin}")/clang.exe" ]]; then
+          choco install llvm --yes --no-progress
+        fi
+        echo "${llvm_bin}" >> "${GITHUB_PATH}"
+        "$(cygpath -u "${llvm_bin}")/clang.exe" --version

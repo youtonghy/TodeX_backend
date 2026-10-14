@@ -4,14 +4,20 @@ Backend releases are created manually from **Actions > Release backend binaries*
 
 Enter a stable semantic version such as `1.2.3` (an optional leading `v` is
 accepted). The workflow tags the selected source commit, injects the version at
-compile time, runs the backend checks, and builds native Linux x64, macOS ARM64,
-and Windows x64 binaries. It verifies their embedded version and publishes all
-archives plus `SHA256SUMS` to the `v1.2.3` GitHub Release.
+compile time, runs the backend checks, and builds native Linux x64, Linux ARM64,
+macOS ARM64, Windows x64, and Windows ARM64 binaries on matching GitHub-hosted
+runners. It verifies their embedded version and publishes all archives plus
+`SHA256SUMS` to the `v1.2.3` GitHub Release.
+
+Tick **dry_run** to run the same validation and builds without creating the tag
+or the Release; the binaries are kept as workflow artifacts for 7 days. Use it to
+try workflow changes or a new platform before a real release.
 
 Development builds report `DEV0.0.0`; Cargo metadata retains the valid placeholder
 version `0.0.0` because the release version belongs to the CI build, not the source.
 
-The Linux archive targets GNU/glibc systems. Every target machine must also have
+The Linux archives target GNU/glibc 2.28+ systems. The agent browser has no
+Chrome for Testing build for Windows ARM64, so it is unavailable there. Every target machine must also have
 the selected provider CLI installed and authenticated. See `BUILD_RUN.md` for
 runtime configuration and deployment details.
 
