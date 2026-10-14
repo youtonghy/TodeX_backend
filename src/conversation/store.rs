@@ -4677,11 +4677,7 @@ async fn write_atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), A
     file.flush().await?;
     file.sync_all().await?;
     drop(file);
-    #[cfg(windows)]
-    if tokio::fs::try_exists(path).await? {
-        tokio::fs::remove_file(path).await?;
-    }
-    tokio::fs::rename(&temporary, path).await?;
+    crate::secure_fs::replace_file_async(&temporary, path).await?;
     set_owner_only(path, false).await?;
     sync_directory(parent).await
 }
@@ -5164,11 +5160,7 @@ async fn replace_journal<L: AsRef<[u8]>>(
         }
         writer.flush().await?;
         writer.into_inner().sync_all().await?;
-        #[cfg(windows)]
-        if tokio::fs::try_exists(path).await? {
-            tokio::fs::remove_file(path).await?;
-        }
-        tokio::fs::rename(&temporary, path).await?;
+        crate::secure_fs::replace_file_async(&temporary, path).await?;
         Ok::<_, AppError>(offsets)
     }
     .await;

@@ -3,7 +3,8 @@
 use std::{
     fs,
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use uuid::Uuid;
@@ -31,11 +32,7 @@ pub(crate) fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> io::Result<(
     ));
     let result = (|| {
         write_new_file(&temporary, bytes)?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        fs::rename(&temporary, path)?;
+        replace_file(&temporary, path)?;
         set_owner_only(path, false)
     })();
     if result.is_err() {
@@ -102,16 +99,74 @@ pub(crate) fn replace_keeping_mode(path: &Path, bytes: &[u8]) -> io::Result<()> 
         if let Some(permissions) = permissions {
             fs::set_permissions(&temporary, permissions)?;
         }
-        #[cfg(windows)]
-        if target.exists() {
-            fs::remove_file(&target)?;
-        }
-        fs::rename(&temporary, &target)
+        replace_file(&temporary, &target)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Renames `from` over `to`, replacing an existing file in one step, so `to`
+/// always holds either its old or its new content, even across a crash.
+///
+/// `fs::rename` replaces atomically on Windows too (POSIX rename semantics or
+/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`); deleting `to` first, as
+/// this code once did, left a window in which the file did not exist. A
+/// target that another process (often a virus scanner) briefly holds open
+/// without delete sharing fails with `PermissionDenied`, so Windows retries
+/// a few times before giving up.
+pub(crate) fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        const RETRY_DELAYS_MS: [u64; 5] = [10, 30, 60, 150, 300];
+        for delay in RETRY_DELAYS_MS {
+            match fs::rename(from, to) {
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
+                result => return result,
+            }
+        }
+    }
+    fs::rename(from, to)
+}
+
+/// [`replace_file`] off the async runtime, as its Windows retries sleep.
+pub(crate) async fn replace_file_async(from: &Path, to: &Path) -> io::Result<()> {
+    let (from, to): (PathBuf, PathBuf) = (from.to_owned(), to.to_owned());
+    tokio::task::spawn_blocking(move || replace_file(&from, &to))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// Identity of a file version for change detection: modification time,
+/// length and, on Unix, inode. Every atomic replacement gets a new inode, so
+/// Unix sees a rewrite even within one mtime tick (about 16 ms on Windows,
+/// where an equal-length rewrite in the same tick stays invisible: stable Rust
+/// exposes no Windows file ID).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileStamp {
+    pub(crate) fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(metadata),
+        }
+    }
+
+    /// The stamp of the file `path` resolves to.
+    pub(crate) fn read(path: &Path) -> io::Result<Self> {
+        fs::metadata(path).map(|metadata| Self::of(&metadata))
+    }
 }
 
 /// Writes `bytes` to a new 0600 file and fails with `AlreadyExists` instead of
@@ -217,6 +272,54 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replace_file_swaps_content_and_creates_a_missing_target() {
+        let dir = temp_dir("replace");
+        ensure_owner_only_dir(&dir).unwrap();
+        let target = dir.join("state.json");
+        let first = dir.join("first.tmp");
+        fs::write(&first, b"one").unwrap();
+        replace_file(&first, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"one");
+        let before = FileStamp::read(&target).unwrap();
+        let second = dir.join("second.tmp");
+        fs::write(&second, b"two!").unwrap();
+        replace_file(&second, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"two!");
+        assert_ne!(FileStamp::read(&target).unwrap(), before);
+        assert!(!first.exists() && !second.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The target never disappears while it is being replaced, which a
+    /// delete-then-rename on Windows violated.
+    #[test]
+    fn replaced_file_is_always_present_to_readers() {
+        let dir = temp_dir("replace-race");
+        ensure_owner_only_dir(&dir).unwrap();
+        let target = dir.join("manifest.json");
+        write_owner_only_atomic(&target, b"0").unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (target, done) = (target.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut missing = 0;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if fs::metadata(&target).is_err() {
+                        missing += 1;
+                    }
+                }
+                missing
+            })
+        };
+        for round in 0..300 {
+            write_owner_only_atomic(&target, round.to_string().as_bytes()).unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reader.join().unwrap(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 

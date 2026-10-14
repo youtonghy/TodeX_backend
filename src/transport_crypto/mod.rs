@@ -19,7 +19,6 @@ pub(crate) use channel::TransportCryptoError;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -33,6 +32,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
 use crate::config::{Config, PairingEncryption};
 use crate::error::AppError;
+use crate::secure_fs::FileStamp;
 
 const PAIRING_VERSION: u8 = 1;
 /// Version 2 links carry only the server address; the transport key is
@@ -104,11 +104,7 @@ impl PairingKeys {
         let tmp_path = path.with_extension("json.tmp");
         tokio::fs::write(&tmp_path, json).await?;
         set_owner_only_permissions(&tmp_path).await?;
-        #[cfg(windows)]
-        if tokio::fs::try_exists(path).await? {
-            tokio::fs::remove_file(path).await?;
-        }
-        tokio::fs::rename(&tmp_path, path).await?;
+        crate::secure_fs::replace_file_async(&tmp_path, path).await?;
         Ok(())
     }
 
@@ -146,30 +142,10 @@ impl PairingKeys {
     }
 }
 
-/// Version of `pairing_keys.json` the in-memory keys were read from. `reset`
-/// publishes by rename, so on Unix the inode changes even when a coarse mtime
-/// does not.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileStamp {
-    modified: Option<SystemTime>,
-    len: u64,
-    #[cfg(unix)]
-    inode: u64,
-}
-
-fn file_stamp(path: &Path) -> std::io::Result<FileStamp> {
-    let metadata = std::fs::metadata(path)?;
-    Ok(FileStamp {
-        modified: metadata.modified().ok(),
-        len: metadata.len(),
-        #[cfg(unix)]
-        inode: std::os::unix::fs::MetadataExt::ino(&metadata),
-    })
-}
-
 struct KeyStoreState {
     path: PathBuf,
     keys: Arc<PairingKeys>,
+    /// Version of `pairing_keys.json` the keys were read from.
     stamp: FileStamp,
 }
 
@@ -186,7 +162,7 @@ impl PairingKeyStore {
     pub(crate) async fn load(data_dir: &Path) -> Result<Self, AppError> {
         let keys = PairingKeys::load_or_generate(data_dir).await?;
         let path = data_dir.join(PAIRING_KEYS_FILE);
-        let stamp = file_stamp(&path)?;
+        let stamp = FileStamp::read(&path)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(KeyStoreState {
                 path,
@@ -208,7 +184,7 @@ impl PairingKeyStore {
             .inner
             .lock()
             .map_err(|_| AppError::InvalidRequest("pairing keys are unavailable".to_owned()))?;
-        let stamp = file_stamp(&state.path)?;
+        let stamp = FileStamp::read(&state.path)?;
         if stamp != state.stamp {
             // A replacement between the stat and the read only causes one
             // more (identical) reload on the next call.
@@ -712,6 +688,16 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &store.current().unwrap()));
 
         let reset = PairingKeys::reset(&data_dir).await.unwrap();
+        // The reset rewrites an equal-length file; on Windows (no inode in
+        // the stamp) one within the load's clock tick needs a later mtime.
+        let path = data_dir.join(PAIRING_KEYS_FILE);
+        let loaded = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(loaded + std::time::Duration::from_secs(1))
+            .unwrap();
         let current = store.current().unwrap();
         assert_eq!(
             current.transport_public_key(PairingEncryption::MlKem768),

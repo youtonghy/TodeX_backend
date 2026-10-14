@@ -610,11 +610,7 @@ async fn write_mapping(path: &Path, mapping: &MigrationMap) -> Result<(), AppErr
     file.flush().await?;
     file.sync_all().await?;
     drop(file);
-    #[cfg(windows)]
-    if tokio::fs::try_exists(path).await? {
-        tokio::fs::remove_file(path).await?;
-    }
-    tokio::fs::rename(&temporary, path).await?;
+    crate::secure_fs::replace_file_async(&temporary, path).await?;
     set_owner_only(path, false).await
 }
 

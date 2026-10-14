@@ -229,11 +229,7 @@ async fn write_snapshot(
     file.flush().await?;
     file.sync_all().await?;
     drop(file);
-    #[cfg(windows)]
-    if tokio::fs::try_exists(path).await? {
-        tokio::fs::remove_file(path).await?;
-    }
-    tokio::fs::rename(&tmp_path, path).await?;
+    crate::secure_fs::replace_file_async(&tmp_path, path).await?;
     set_owner_only(path).await?;
     Ok(())
 }

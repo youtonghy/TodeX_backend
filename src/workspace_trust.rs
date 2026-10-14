@@ -350,11 +350,7 @@ async fn write_snapshot(path: &Path, snapshot: &WorkspaceTrustSnapshot) -> Resul
     file.flush().await?;
     file.sync_all().await?;
     drop(file);
-    #[cfg(windows)]
-    if tokio::fs::try_exists(path).await? {
-        tokio::fs::remove_file(path).await?;
-    }
-    tokio::fs::rename(&temporary, path).await?;
+    crate::secure_fs::replace_file_async(&temporary, path).await?;
     set_owner_only(path).await
 }
 
