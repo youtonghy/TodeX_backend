@@ -28,10 +28,7 @@ async fn provider_quota(
 
     let (codex, antigravity) = tokio::join!(fetch_codex(&state), fetch_antigravity(&state));
     let codex = match codex {
-        Ok(quota) => {
-            state.quota.record(&quota);
-            quota
-        }
+        Ok(quota) => state.quota.record(&quota).unwrap_or(quota),
         Err(reason) => state.quota.get("codex").unwrap_or_else(
             || json!({"provider":"codex","scope":"account","state":"unavailable","reason":reason}),
         ),
@@ -39,10 +36,7 @@ async fn provider_quota(
     providers.insert("codex".to_owned(), codex);
 
     let antigravity = match antigravity {
-        Ok(quota) => {
-            state.quota.record(&quota);
-            quota
-        }
+        Ok(quota) => state.quota.record(&quota).unwrap_or(quota),
         Err(reason) => state.quota.get("antigravity").unwrap_or_else(
             || json!({"provider":"antigravity","scope":"account","state":"unavailable","reason":reason}),
         ),

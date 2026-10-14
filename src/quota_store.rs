@@ -32,12 +32,11 @@ pub struct QuotaStore {
 
 impl QuotaStore {
     /// Records a provider's newest quota snapshot, stamping it with the
-    /// daemon's fetch time. Payloads without a `provider` string are ignored —
-    /// they cannot be keyed.
-    pub fn record(&self, payload: &Value) {
-        let Some(provider) = payload.get("provider").and_then(Value::as_str) else {
-            return;
-        };
+    /// daemon's fetch time, and returns the stamped snapshot as clients read
+    /// it. Payloads without a `provider` string are ignored — they cannot be
+    /// keyed.
+    pub fn record(&self, payload: &Value) -> Option<Value> {
+        let provider = payload.get("provider").and_then(Value::as_str)?;
         if let Some(turn_id) = payload.get("turnId").and_then(Value::as_str) {
             match exhausted_until(payload) {
                 Some(until) => {
@@ -51,7 +50,8 @@ impl QuotaStore {
         let mut entry = payload.clone();
         entry["fetchedAt"] = json!(now_ms());
         entry["state"] = json!("ok");
-        self.entries.insert(provider.to_owned(), entry);
+        self.entries.insert(provider.to_owned(), entry.clone());
+        Some(entry)
     }
 
     pub fn get(&self, provider: &str) -> Option<Value> {
@@ -117,8 +117,11 @@ mod tests {
     #[test]
     fn record_keys_by_provider_and_stamps_fetch_time() {
         let store = QuotaStore::default();
-        store.record(&json!({"provider": "claude-code", "windows": []}));
+        let returned = store
+            .record(&json!({"provider": "claude-code", "windows": []}))
+            .expect("keyed payload is recorded");
         let entry = store.get("claude-code").expect("entry recorded");
+        assert_eq!(entry, returned);
         assert_eq!(entry["state"], "ok");
         assert!(entry["fetchedAt"].as_u64().unwrap_or(0) > 0);
         assert!(store.get("codex").is_none());
@@ -213,7 +216,7 @@ mod tests {
     #[test]
     fn record_ignores_unkeyed_payloads() {
         let store = QuotaStore::default();
-        store.record(&json!({"windows": []}));
+        assert!(store.record(&json!({"windows": []})).is_none());
         assert!(store.get("claude-code").is_none());
     }
 }
