@@ -2,10 +2,11 @@
 //!
 //! The daemon registers a device when its pairing request is approved. The TUI
 //! lists and revokes devices through the same file; the daemon notices file
-//! changes by mtime so revocation applies without a restart. The file is the
-//! source of truth: deleting it locks out every paired device.
+//! changes by their [`FileStamp`] so revocation applies without a restart.
+//! The file is the source of truth: deleting it locks out every paired device.
 use crate::error::AppError;
 use crate::history_keys::DeviceRevocation;
+use crate::secure_fs::FileStamp;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -71,7 +72,7 @@ pub(crate) fn parse_public_key(value: &str) -> Result<[u8; 32]> {
 struct Inner {
     path: PathBuf,
     devices: BTreeMap<String, DeviceRecord>,
-    mtime: Option<SystemTime>,
+    stamp: Option<FileStamp>,
     /// `last_seen_at` changed in memory but is not on disk yet.
     dirty: bool,
     last_flush: Instant,
@@ -97,12 +98,12 @@ impl DeviceRegistry {
 
     fn load_with_flush_interval(data_dir: &Path, flush_interval: Duration) -> Result<Self> {
         let path = data_dir.join(FILE_NAME);
-        let (devices, mtime) = read_records(&path)?.unwrap_or_default();
+        let (devices, stamp) = read_records(&path)?.unwrap_or_default();
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 path,
                 devices,
-                mtime,
+                stamp,
                 dirty: false,
                 last_flush: Instant::now(),
                 flush_interval,
@@ -221,15 +222,13 @@ impl Inner {
     /// did; an external writer (TUI revocation) wins over unflushed
     /// last_seen updates, which are best-effort anyway.
     fn reload_if_changed(&mut self) -> Result<bool> {
-        let mtime = fs::metadata(&self.path)
-            .and_then(|metadata| metadata.modified())
-            .ok();
-        if mtime == self.mtime {
+        let stamp = FileStamp::read(&self.path).ok();
+        if stamp == self.stamp {
             return Ok(false);
         }
-        let (devices, mtime) = read_records(&self.path)?.unwrap_or_default();
+        let (devices, stamp) = read_records(&self.path)?.unwrap_or_default();
         self.devices = devices;
-        self.mtime = mtime;
+        self.stamp = stamp;
         self.dirty = false;
         Ok(true)
     }
@@ -265,9 +264,7 @@ impl Inner {
                 devices: self.devices.clone(),
             },
         )?;
-        self.mtime = fs::metadata(&self.path)
-            .and_then(|metadata| metadata.modified())
-            .ok();
+        self.stamp = FileStamp::read(&self.path).ok();
         self.dirty = false;
         self.last_flush = Instant::now();
         Ok(())
@@ -333,7 +330,7 @@ fn revoke_history_recipients(data_dir: &Path, devices: DeviceRevocation<'_>) -> 
         })
 }
 
-type RecordsSnapshot = (BTreeMap<String, DeviceRecord>, Option<SystemTime>);
+type RecordsSnapshot = (BTreeMap<String, DeviceRecord>, Option<FileStamp>);
 
 fn read_records(path: &Path) -> Result<Option<RecordsSnapshot>> {
     let metadata = match fs::symlink_metadata(path) {
@@ -366,7 +363,7 @@ fn read_records(path: &Path) -> Result<Option<RecordsSnapshot>> {
             return Err(invalid("device registry contains an invalid record"));
         }
     }
-    Ok(Some((file.devices, metadata.modified().ok())))
+    Ok(Some((file.devices, Some(FileStamp::of(&metadata)))))
 }
 
 fn write_records(path: &Path, file: &RegistryFile) -> Result<()> {
@@ -444,7 +441,7 @@ mod tests {
         assert_eq!(updated.device_id, record.device_id);
         assert_eq!(list_devices(&root).unwrap().len(), 1);
 
-        // File-level revocation is observed by the live registry via mtime.
+        // File-level revocation is observed by the live registry via its stamp.
         assert!(revoke_device(&root, &record.device_id).unwrap());
         assert!(registry.get(&record.device_id).unwrap().is_none());
         assert!(!revoke_device(&root, &record.device_id).unwrap());
@@ -606,9 +603,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// An external rewrite with a modification time past the previous one:
-    /// two writes within one clock tick (about 16 ms on Windows) can share an
-    /// mtime, which the registry would not see as a change.
+    /// An external in-place rewrite with a modification time past the
+    /// previous one: an equal-length rewrite within one clock tick (about
+    /// 16 ms on Windows) keeps the same [`FileStamp`], which the registry
+    /// would not see as a change.
     fn write_externally(path: &Path, contents: &str) {
         let previous = fs::metadata(path).unwrap().modified().unwrap();
         fs::write(path, contents).unwrap();
