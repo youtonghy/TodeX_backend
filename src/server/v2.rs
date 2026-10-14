@@ -16,7 +16,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tracing::warn;
 
 use crate::app_state::AppState;
@@ -58,6 +58,10 @@ const MAX_WS_CONCURRENT_BACKFILLS: usize = 4;
 /// messages before it stops early with `hasMore` (history encryption).
 const MAX_WS_BACKFILL_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WS_IN_FLIGHT_OPERATIONS: usize = 16;
+/// Lane commands one connection may have queued or running. A client past
+/// it is not refused: the read loop waits for room, as it did when every
+/// command ran inline.
+const MAX_WS_LANE_COMMANDS: usize = 64;
 /// Commands and subscription backfill wait at most this long for room in the
 /// outgoing queue; a queue that stays full means the send side is stuck.
 const WS_QUEUE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -143,6 +147,52 @@ fn is_v2_background_command(command_type: &str) -> bool {
         command_type,
         "mcp.refresh" | "mcp.call" | "conversation.control" | "conversation.warm"
     )
+}
+
+/// Commands the read loop answers itself: they change this connection's
+/// subscriptions or event scope, which must apply in arrival order, and they
+/// never wait on a provider. Every other native command runs in a lane.
+fn is_v2_connection_command(command_type: &str) -> bool {
+    matches!(
+        command_type,
+        "conversation.subscribe" | "conversation.unsubscribe" | "session.resume" | "server.ping"
+    )
+}
+
+/// Per-connection ordering for commands run off the read loop. Commands for
+/// one conversation (or, without a `conversationId`, the connection's global
+/// lane) run one at a time in arrival order; different lanes run
+/// concurrently, so a command stuck on one conversation (a provider start, a
+/// contended lock) delays neither `server.ping` nor other conversations.
+#[derive(Default)]
+struct CommandLanes {
+    /// Each lane's most recently queued command; its sender drops when that
+    /// command finishes, however it ends.
+    tails: HashMap<Option<String>, oneshot::Receiver<()>>,
+}
+
+impl CommandLanes {
+    /// Queues a command on `lane`. It must await the returned predecessor, if
+    /// any, before running and hold the guard until it is done.
+    fn enqueue(
+        &mut self,
+        lane: Option<String>,
+    ) -> (Option<oneshot::Receiver<()>>, oneshot::Sender<()>) {
+        // Forget lanes whose last command already finished.
+        self.tails
+            .retain(|_, tail| matches!(tail.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        let (done, tail) = oneshot::channel();
+        (self.tails.insert(lane, tail), done)
+    }
+}
+
+/// The lane of a command: its `conversationId`, or the global lane.
+fn command_lane(command: &V2Command) -> Option<String> {
+    command
+        .payload
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 pub fn routes(state: &AppState) -> Router<AppState> {
@@ -2519,6 +2569,8 @@ async fn handle_socket(
     let mut browser_watches: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let operation_limit = Arc::new(Semaphore::new(MAX_WS_IN_FLIGHT_OPERATIONS));
     let mut operation_tasks = Vec::new();
+    let lane_limit = Arc::new(Semaphore::new(MAX_WS_LANE_COMMANDS));
+    let mut lanes = CommandLanes::default();
     loop {
         let text = tokio::select! {
             text = ws_socket::next_text(&mut receiver, opener.as_mut(), &close_handle) => text,
@@ -2605,6 +2657,43 @@ async fn handle_socket(
                         // aborts this task during teardown.
                         let _ = queue_frame(&operation_outgoing, response).await;
                     }));
+                    continue;
+                }
+                if !is_v2_connection_command(&command.command_type) {
+                    let permit = tokio::select! {
+                        permit = lane_limit.clone().acquire_owned() => match permit {
+                            Ok(permit) => permit,
+                            // The semaphore is never closed.
+                            Err(_) => break,
+                        },
+                        _ = outgoing_tx.closed() => break,
+                    };
+                    let (predecessor, done) = lanes.enqueue(command_lane(&command));
+                    let lane_state = state.clone();
+                    // Weak, so a command still running after the client left
+                    // does not hold the send task open during teardown.
+                    let lane_outgoing = outgoing_tx.downgrade();
+                    let owner_id = auth.tenant_id.clone();
+                    let device_id = auth.principal_id.clone();
+                    // Not aborted at teardown: a command that started (a
+                    // prompt journaling its turn) must not stop halfway, the
+                    // same as when it ran inline and finished before the read
+                    // loop noticed the disconnect.
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let _done = done;
+                        if let Some(predecessor) = predecessor {
+                            // Resolves however the previous command ended.
+                            let _ = predecessor.await;
+                        }
+                        let id = command.id.clone();
+                        let result =
+                            dispatch_lane_command(&lane_state, &owner_id, &device_id, &command)
+                                .await;
+                        if let Some(outgoing) = lane_outgoing.upgrade() {
+                            let _ = queue_frame(&outgoing, command_result(id, result)).await;
+                        }
+                    });
                     continue;
                 }
                 let response = dispatch_command(
@@ -3223,14 +3312,19 @@ async fn dispatch_command(
         )
         .await
     };
-    Some(match result {
+    Some(command_result(command.id, result))
+}
+
+/// The `server.result` or `server.error` frame answering command `id`.
+fn command_result(id: String, result: Result<Value, AppError>) -> Value {
+    match result {
         Ok(payload) => json!({
-            "id": command.id,
+            "id": id,
             "type": "server.result",
             "payload": payload,
         }),
-        Err(error) => error_response(Some(command.id), error),
-    })
+        Err(error) => error_response(Some(id), error),
+    }
 }
 
 /// Validates a `conversation.subscribe`, reserves its slot and creates the
@@ -3351,6 +3445,34 @@ async fn dispatch_command_inner(
                 "unsubscribed": was_subscribed,
             }))
         }
+        "session.resume" => {
+            // Replaces the transport-hello session cursor replay: grant this
+            // connection visibility for still-existing Codex sessions and
+            // replay gateway events after each cursor directly to this connection,
+            // serialized with its live forwarding (never republished globally).
+            let request: SessionResumeRequest = Deserialize::deserialize(&command.payload)?;
+            let resumed = websocket::resume_session_cursors(
+                state,
+                event_scope,
+                &request.session_cursors,
+                outgoing,
+            )
+            .await?;
+            Ok(json!({ "resumed": resumed }))
+        }
+        _ => dispatch_lane_command(state, owner_id, device_id, command).await,
+    }
+}
+
+/// Native commands that touch no connection state. The socket runs them in
+/// [`CommandLanes`]; [`dispatch_command_inner`] falls through to them too.
+async fn dispatch_lane_command(
+    state: &AppState,
+    owner_id: &str,
+    device_id: &str,
+    command: &V2Command,
+) -> Result<Value, AppError> {
+    match command.command_type.as_str() {
         "conversation.create" => {
             let request: CreateConversationRequest = Deserialize::deserialize(&command.payload)?;
             Ok(serde_json::to_value(
@@ -3583,21 +3705,6 @@ async fn dispatch_command_inner(
         command_type if history_keys::is_history_command(command_type) => {
             history_keys::dispatch(state, owner_id, device_id, command_type, &command.payload).await
         }
-        "session.resume" => {
-            // Replaces the transport-hello session cursor replay: grant this
-            // connection visibility for still-existing Codex sessions and
-            // replay gateway events after each cursor directly to this connection,
-            // serialized with its live forwarding (never republished globally).
-            let request: SessionResumeRequest = Deserialize::deserialize(&command.payload)?;
-            let resumed = websocket::resume_session_cursors(
-                state,
-                event_scope,
-                &request.session_cursors,
-                outgoing,
-            )
-            .await?;
-            Ok(json!({ "resumed": resumed }))
-        }
         other => Err(AppError::Unsupported(format!(
             "v2 websocket command {other}"
         ))),
@@ -3616,14 +3723,7 @@ async fn dispatch_mcp_command_response(
     } else {
         dispatch_mcp_command(state, owner_id, &command).await
     };
-    match result {
-        Ok(payload) => json!({
-            "id": command.id,
-            "type": "server.result",
-            "payload": payload,
-        }),
-        Err(error) => error_response(Some(command.id), error),
-    }
+    command_result(command.id, result)
 }
 
 /// `conversation.warm`; it runs off the read loop because starting a
@@ -8920,6 +9020,162 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn command_lanes_chain_one_lane_and_forget_finished_ones() {
+        let mut lanes = CommandLanes::default();
+        let (first_waits, first) = lanes.enqueue(Some("a".to_owned()));
+        assert!(first_waits.is_none());
+        let (second_waits, second) = lanes.enqueue(Some("a".to_owned()));
+        let (other_waits, other) = lanes.enqueue(None);
+        assert!(other_waits.is_none(), "lanes are independent");
+        let mut second_waits = second_waits.expect("same lane waits");
+        assert!(second_waits.try_recv().is_err());
+        // A finished command, however it ended, releases the next one.
+        drop(first);
+        assert!(second_waits.await.is_err());
+        drop((second, other));
+        lanes.enqueue(Some("b".to_owned()));
+        assert_eq!(lanes.tails.len(), 1, "finished lanes are dropped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_ws_a_stuck_conversation_command_blocks_only_its_own_lane() {
+        let root = std::env::temp_dir().join(format!("todex-v2-lanes-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/v2/ws?{}",
+            device.sign_query("/v2/ws")
+        ))
+        .await
+        .unwrap();
+        let workspace = std::fs::canonicalize(root.join("workspaces/project")).unwrap();
+        let stuck = state
+            .conversations
+            .create_for_tests(ProviderKind::ClaudeCode, workspace.clone())
+            .await
+            .unwrap();
+        let other = state
+            .conversations
+            .create_for_tests(ProviderKind::ClaudeCode, workspace.clone())
+            .await
+            .unwrap();
+
+        // A held trust permit with a trust change queued behind it holds
+        // every later trust check (the store's lock is fair): the prompt
+        // waits until the permit is released.
+        let trust = state.workspace_trust.clone();
+        trust.set_owned("local", &workspace, true).await.unwrap();
+        let permit = trust.acquire_owned("local", &workspace).await.unwrap();
+        let writer = tokio::spawn({
+            let trust = trust.clone();
+            let workspace = workspace.clone();
+            async move { trust.set_owned("local", &workspace, false).await }
+        });
+        while trust
+            .try_acquire_owned("local", &workspace)
+            .unwrap()
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        let command = |id: String, command_type: &str, conversation_id: &str| {
+            WsMessage::Text(
+                json!({ "id": id, "type": command_type, "payload": {
+                    "conversationId": conversation_id, "text": "hello",
+                } })
+                .to_string()
+                .into(),
+            )
+        };
+        let ping = |id: &str| {
+            WsMessage::Text(
+                json!({ "id": id, "type": "server.ping", "payload": {} })
+                    .to_string()
+                    .into(),
+            )
+        };
+        ws.send(command("a0".into(), "conversation.prompt", &stuck.id))
+            .await
+            .unwrap();
+        ws.send(command("a1".into(), "conversation.queue.list", &stuck.id))
+            .await
+            .unwrap();
+        ws.send(command("b0".into(), "conversation.queue.list", &other.id))
+            .await
+            .unwrap();
+        ws.send(ping("p0")).await.unwrap();
+
+        // Answers in arrival order, keyed by command id.
+        async fn answers(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            until: impl Fn(&[(String, Value)]) -> bool,
+        ) -> Vec<(String, Value)> {
+            let mut seen = Vec::new();
+            while !until(&seen) {
+                let message = wait_for_ws_message(ws, |m| m["id"].is_string()).await;
+                seen.push((message["id"].as_str().unwrap().to_owned(), message));
+            }
+            seen
+        }
+        let has = |seen: &[(String, Value)], id: &str| seen.iter().any(|(seen, _)| seen == id);
+        let early = answers(&mut ws, |seen| has(seen, "p0") && has(seen, "b0")).await;
+        assert!(
+            !has(&early, "a0") && !has(&early, "a1"),
+            "the stuck conversation answered early: {early:?}"
+        );
+        let other_queue = &early.iter().find(|(id, _)| id == "b0").unwrap().1;
+        assert_eq!(other_queue["type"], "server.result", "{other_queue}");
+
+        // More commands than one connection may queue: the read loop waits
+        // for room instead of refusing them.
+        let queued = (2..MAX_WS_LANE_COMMANDS + 8)
+            .map(|index| format!("a{index}"))
+            .collect::<Vec<_>>();
+        for id in &queued {
+            ws.send(command(id.clone(), "conversation.queue.list", &stuck.id))
+                .await
+                .unwrap();
+        }
+        ws.send(ping("p1")).await.unwrap();
+        drop(permit);
+        writer.await.unwrap().unwrap();
+
+        let rest = answers(&mut ws, |seen| {
+            has(seen, "p1") && queued.iter().all(|id| has(seen, id)) && has(seen, "a1")
+        })
+        .await;
+        let lane = rest
+            .iter()
+            .filter(|(id, _)| id.starts_with('a'))
+            .collect::<Vec<_>>();
+        let expected = ["a0", "a1"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(queued.iter().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lane.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            expected,
+            "one conversation's commands ran out of order"
+        );
+        // The prompt waited for the trust change and saw its outcome.
+        assert_eq!(lane[0].1["type"], "server.error", "{}", lane[0].1);
+        for (id, answer) in &lane[1..] {
+            assert_eq!(answer["type"], "server.result", "{id}: {answer}");
+        }
         let _ = fs::remove_dir_all(root);
     }
 
