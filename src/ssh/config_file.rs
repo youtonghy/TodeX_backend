@@ -6,6 +6,7 @@
 
 use std::{
     collections::HashSet,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -75,14 +76,27 @@ fn discover_aliases(config: &Path, home: &Path) -> Vec<DiscoveredAlias> {
     discover_with_inputs(config, home).0
 }
 
-/// A path's modification time and length (`None` when it cannot be read),
-/// compared to tell whether a discovery input changed.
-type Stamp = Option<(Option<SystemTime>, u64)>;
+/// A path's modification time, length and, for a directory, sorted entry
+/// names (`None` when it cannot be read), compared to tell whether a
+/// discovery input changed.
+type Stamp = Option<(Option<SystemTime>, u64, Vec<OsString>)>;
 
 fn stamp(path: &Path) -> Stamp {
-    fs::metadata(path)
-        .ok()
-        .map(|metadata| (metadata.modified().ok(), metadata.len()))
+    let metadata = fs::metadata(path).ok()?;
+    // A directory's mtime misses an entry added within the same clock tick
+    // (about 16 ms on Windows, where its length is also 0), so it is stamped
+    // by its listing too.
+    let mut names = Vec::new();
+    if metadata.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            names = entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name())
+                .collect();
+            names.sort();
+        }
+    }
+    Some((metadata.modified().ok(), metadata.len(), names))
 }
 
 /// The aliases, and every input they were read from: each config file
@@ -106,7 +120,8 @@ fn discover_with_inputs(
 
 /// [`discover_aliases`] for repeated calls (every agent turn checks the
 /// hosts): the last result is reused while none of its inputs changed, which
-/// costs a `stat` per input instead of re-reading the whole `Include` tree.
+/// costs a `stat` per input (and a listing per globbed directory) instead
+/// of re-reading the whole `Include` tree.
 #[derive(Default)]
 pub(crate) struct AliasCache {
     last: Mutex<Option<CachedAliases>>,
