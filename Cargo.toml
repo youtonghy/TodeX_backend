@@ -23,7 +23,9 @@ hmac = "0.12"
 if-addrs = "0.15"
 json5 = "0.4"
 libc = "0.2"
-pqcrypto-mlkem = "0.1"
+# SIMD backends are enabled per target below: MSVC cannot compile the NEON C
+# sources, so Windows ARM64 uses the portable implementation.
+pqcrypto-mlkem = { version = "0.1", default-features = false, features = ["std"] }
 pqcrypto-traits = "0.3"
 portable-pty = "0.9"
 qrcodegen = "1"
@@ -68,6 +70,9 @@ jpeg-encoder = "0.7"
 # Agent browser: the DevTools socket on Windows, and unpacking Chromium.
 tokio-tungstenite = "0.29"
 zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[target.'cfg(not(all(windows, target_arch = "aarch64")))'.dependencies]
+pqcrypto-mlkem = { version = "0.1", features = ["avx2", "neon"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 xa11y-macos = "=0.15.2"
