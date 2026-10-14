@@ -155,19 +155,22 @@ detect_platform() {
             fi
             die "unsupported macOS architecture '$arch' (releases ship macos-arm64 only); build from source with: cargo build --release" ;;
         Linux)
-            if [[ "$arch" != "x86_64" ]]; then
-                die "unsupported Linux architecture '$arch' (releases ship linux-x64-gnu only); build from source with: cargo build --release"
-            fi
+            local label
+            case "$arch" in
+                x86_64) label="linux-x64-gnu" ;;
+                aarch64|arm64) label="linux-arm64-gnu" ;;
+                *) die "unsupported Linux architecture '$arch' (releases ship linux-x64-gnu and linux-arm64-gnu); build from source with: cargo build --release" ;;
+            esac
             if command -v ldd >/dev/null 2>&1; then
                 # musl's ldd exits non-zero for --version, so capture instead of piping under pipefail.
                 local libc
                 libc="$(ldd --version 2>&1 || true)"
                 if [[ "$libc" == *[Mm]usl* ]]; then
-                    die "musl-based Linux is not supported by release binaries (linux-x64-gnu only); build from source with: cargo build --release"
+                    die "musl-based Linux is not supported by release binaries (glibc builds only); build from source with: cargo build --release"
                 fi
             fi
-            echo "linux-x64-gnu"; return ;;
-        *) die "unsupported operating system '$os'; on Windows use the windows-x64 release asset or WSL" ;;
+            echo "$label"; return ;;
+        *) die "unsupported operating system '$os'; on Windows use the windows-x64 or windows-arm64 release asset, or WSL" ;;
     esac
 }
 
@@ -566,7 +569,7 @@ main() {
     PLATFORM="$(detect_platform)"
     if [[ "$PLATFORM" == linux-* ]] && is_wsl; then
         WSL=1
-        info "WSL detected; using the linux-x64-gnu build"
+        info "WSL detected; using the $PLATFORM build"
     fi
 
     case "$COMMAND" in

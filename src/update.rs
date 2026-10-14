@@ -86,11 +86,22 @@ fn stable_version(value: &str) -> Option<[u64; 3]> {
     Some(version)
 }
 
+/// The release asset label for this build; matches the release workflow matrix.
 fn platform() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") if cfg!(target_env = "gnu") => Some("linux-x64-gnu"),
+    platform_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(target_env = "gnu"),
+    )
+}
+
+fn platform_for(os: &str, arch: &str, gnu: bool) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") if gnu => Some("linux-x64-gnu"),
+        ("linux", "aarch64") if gnu => Some("linux-arm64-gnu"),
         ("macos", "aarch64") => Some("macos-arm64"),
         ("windows", "x86_64") => Some("windows-x64"),
+        ("windows", "aarch64") => Some("windows-arm64"),
         _ => None,
     }
 }
@@ -526,6 +537,23 @@ mod tests {
         assert!(!eligible_version("0.0.0"));
         assert!(!eligible_version("DEV0.0.0"));
         assert!(eligible_version("0.0.1"));
+    }
+
+    #[test]
+    fn platform_labels_match_release_assets() {
+        for (os, arch, label) in [
+            ("linux", "x86_64", "linux-x64-gnu"),
+            ("linux", "aarch64", "linux-arm64-gnu"),
+            ("macos", "aarch64", "macos-arm64"),
+            ("windows", "x86_64", "windows-x64"),
+            ("windows", "aarch64", "windows-arm64"),
+        ] {
+            assert_eq!(platform_for(os, arch, true), Some(label), "{os}/{arch}");
+        }
+        assert!(platform_for("linux", "x86_64", false).is_none());
+        assert!(platform_for("linux", "aarch64", false).is_none());
+        assert!(platform_for("macos", "x86_64", false).is_none());
+        assert!(platform_for("freebsd", "x86_64", false).is_none());
     }
 
     #[test]
