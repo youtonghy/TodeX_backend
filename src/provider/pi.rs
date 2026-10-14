@@ -160,6 +160,11 @@ struct PiTurnRequest {
     /// The turn's sink; a runtime a prewarm started journals through it
     /// from its first turn on.
     sink: Option<DriverEventSink>,
+    /// Still held when the turn targets an already running runtime, so a
+    /// turn handed back unstarted can reopen it. The worker drops it as soon
+    /// as the turn starts: holding the trust read lock for a whole turn
+    /// would queue trust writers and every later trust check behind them.
+    launch_permit: Option<WorkspaceTrustPermit>,
     result: oneshot::Sender<PiTurnReply>,
 }
 
@@ -169,6 +174,7 @@ enum PiTurnReply {
     /// the stop was requested, so the turn must not reopen the runtime.
     NotStarted {
         turn: Box<(DriverContext, DriverPrompt)>,
+        launch_permit: Option<WorkspaceTrustPermit>,
         retry: bool,
     },
 }
@@ -769,6 +775,7 @@ impl ProviderDriver for PiDriver {
                     prompt,
                     cancel: cancel.clone(),
                     sink: Some(sink.clone()),
+                    launch_permit: launch_permit.take(),
                     result,
                 })
                 .await
@@ -779,7 +786,11 @@ impl ProviderDriver for PiDriver {
                 })?;
             match response.await {
                 Ok(PiTurnReply::Finished(result)) => return result,
-                Ok(PiTurnReply::NotStarted { turn, retry }) => {
+                Ok(PiTurnReply::NotStarted {
+                    turn,
+                    launch_permit: returned_permit,
+                    retry,
+                }) => {
                     // The turn raced the worker's own stop and never reached
                     // Pi, so reopening the session once cannot repeat it.
                     if !retry || retried {
@@ -787,6 +798,7 @@ impl ProviderDriver for PiDriver {
                     }
                     retried = true;
                     (context, prompt) = *turn;
+                    launch_permit = returned_permit;
                 }
                 Err(_) => {
                     return Err(AppError::ProviderUnavailable(
@@ -1053,6 +1065,7 @@ async fn pi_session_worker(
                 .native_session_id
                 .clone()
                 .unwrap_or_else(|| turn.context.manifest.id.clone());
+            drop(turn.launch_permit);
             let prompt = turn.prompt.clone();
             let sink = session_sink.clone().with_turn_id(prompt.turn_id.clone());
             rpc.begin_turn(sink.clone(), turn.cancel.clone());
@@ -1178,6 +1191,7 @@ async fn pi_session_worker(
     while let Ok(turn) = turns.try_recv() {
         let _ = turn.result.send(PiTurnReply::NotStarted {
             turn: Box::new((turn.context, turn.prompt)),
+            launch_permit: turn.launch_permit,
             retry,
         });
     }
@@ -4487,6 +4501,33 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn a_turn_on_a_resident_runtime_does_not_hold_the_trust_lock() {
+        let fixture = Fixture::new().await;
+        // The first turn spawns the runtime; the second reuses it, which is
+        // where the launch permit used to outlive the spawn.
+        fixture.run("normal", "spawn").await.unwrap();
+        let (running, cancel) = fixture.start_cancellable("hold", "long").await;
+        fixture.running().await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture.trust.set_owned("local", &fixture.root, true),
+        )
+        .await
+        .expect("a trust change waited for the running turn")
+        .unwrap();
+        cancel.send_replace(true);
+        let result = tokio::time::timeout(Duration::from_secs(3), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.cancelled);
+        assert_eq!(fixture.launches().await, 1);
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn rpc_confirmed_abort_rejected_commands_and_invalid_frames_keep_runtime() {
         let fixture = Fixture::new().await;
         let (running, cancel) = fixture.start_cancellable("hold", "abort-me").await;
@@ -4690,6 +4731,7 @@ mod tests {
                 prompt,
                 cancel,
                 sink: None,
+                launch_permit: None,
                 result,
             })
             .await
@@ -4701,7 +4743,7 @@ mod tests {
             .unwrap()
             .unwrap()
         {
-            PiTurnReply::NotStarted { turn, retry } => {
+            PiTurnReply::NotStarted { turn, retry, .. } => {
                 assert!(retry);
                 assert_eq!(turn.1.turn_id, "queued");
             }

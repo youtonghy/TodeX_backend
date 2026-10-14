@@ -184,17 +184,29 @@ impl WorkspaceTrustStore {
                     .map(|path| path.display().to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let decided = |snapshot: &WorkspaceTrustSnapshot, workspace_path: &str| {
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.owner_id == owner_id && entry.workspace_path == workspace_path)
+        };
+        // Clients sync their workspace list on every reconnect. A no-op sync
+        // must not queue a writer: the store's lock is fair, so a waiting
+        // writer would stall every later trust check behind any long-held
+        // launch permit.
+        {
+            let current = self.inner.read().await;
+            if workspace_paths.iter().all(|path| decided(&current, path)) {
+                return Ok(Vec::new());
+            }
+        }
         let mut current = self.inner.write().await;
         let mut snapshot = current.clone();
         let decided_at = now_millis();
         let mut trusted = Vec::new();
 
         for workspace_path in workspace_paths {
-            let already_decided = snapshot
-                .entries
-                .iter()
-                .any(|entry| entry.owner_id == owner_id && entry.workspace_path == workspace_path);
-            if already_decided {
+            if decided(&snapshot, &workspace_path) {
                 continue;
             }
             snapshot.entries.push(WorkspaceTrustEntry {
@@ -472,6 +484,18 @@ mod tests {
             store.acquire_owned("owner", &first).await,
             Err(AppError::WorkspaceTrustRequired(_))
         ));
+        // A sync with nothing undecided neither waits for a held permit nor
+        // queues a writer that would block the next permit.
+        let held = store.acquire_owned("owner", &second).await.unwrap();
+        let granted = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.auto_trust_undecided_owned("owner", &[first.clone(), second.clone()]),
+        )
+        .await
+        .expect("a no-op sync waited for a held permit")
+        .unwrap();
+        assert!(granted.is_empty());
+        drop(held);
 
         let reloaded = WorkspaceTrustStore::new(root.clone(), vec![workspace_root])
             .await
