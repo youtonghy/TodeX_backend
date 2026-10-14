@@ -606,6 +606,20 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// An external rewrite with a modification time past the previous one:
+    /// two writes within one clock tick (about 16 ms on Windows) can share an
+    /// mtime, which the registry would not see as a change.
+    fn write_externally(path: &Path, contents: &str) {
+        let previous = fs::metadata(path).unwrap().modified().unwrap();
+        fs::write(path, contents).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(previous + std::time::Duration::from_secs(1))
+            .unwrap();
+    }
+
     #[test]
     fn registry_file_rejects_foreign_keys_and_unknown_ids() {
         let (root, registry) = fixture();
@@ -621,9 +635,9 @@ mod tests {
             &URL_SAFE_NO_PAD.encode(key(9)),
             1,
         );
-        fs::write(&path, &tampered).unwrap();
+        write_externally(&path, &tampered);
         assert!(registry.get("dev_anything").is_err());
-        fs::write(&path, "{\"version\":9,\"devices\":{}}").unwrap();
+        write_externally(&path, "{\"version\":9,\"devices\":{}}");
         assert!(registry.get("dev_anything").is_err());
         let _ = fs::remove_dir_all(&root);
     }
