@@ -15,6 +15,10 @@ optional and canonical aliases are recomputed when old journals are replayed.
   backend and disabled by its advertised permission matrix.
 - Two minutes without protocol progress displays a waiting notice. Approval
   waiting is excluded and quiet turns have no fixed overall deadline.
+  A running tool suppresses that notice; its card shows the elapsed time from
+  the `tool.started` event and, after two minutes without a tool event, a
+  quiet notice with a stop action. Providers send nothing while a command is
+  silent and the daemon adds no heartbeat (see `docs/API.md` "工具事件").
 - Fork and manual compact are exposed only when advertised. Codex uses native
   operations; legacy resume is not presented as retry. Retry starts a new turn
   from a validated request snapshot and does not undo prior file changes.
