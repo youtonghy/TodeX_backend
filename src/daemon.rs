@@ -1395,20 +1395,8 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp dir");
         let executable = root.join("todex-agentd");
         fs::copy("/bin/sleep", &executable).expect("copy sleep");
-        // Concurrent tests forking while the copy was open can briefly keep
-        // a write handle alive, which fails exec with ETXTBSY.
-        let mut child = (0..50)
-            .find_map(|_| match Command::new(&executable).arg("30").spawn() {
-                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
-                    thread::sleep(Duration::from_millis(20));
-                    None
-                }
-                result => Some(result),
-            })
-            .expect("executable stayed busy")
-            .expect("spawn copied executable");
-        let process = DaemonProcess {
-            pid: child.id(),
+        let record = |pid| DaemonProcess {
+            pid,
             host: "127.0.0.1".to_owned(),
             port: 0,
             data_dir: root.clone(),
@@ -1418,7 +1406,44 @@ mod tests {
             api_listen: None,
             outdated: false,
         };
-        assert!(process_matches_record(&process));
+        // Concurrent tests forking while the copy was open can briefly keep
+        // a write handle alive, which fails exec with ETXTBSY, and under a
+        // loaded full test run the helper occasionally dies before it is
+        // inspected. Retry until a live helper runs the copied executable.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut child, process) = loop {
+            assert!(
+                Instant::now() < deadline,
+                "no live helper ran the copied executable"
+            );
+            let mut child = match Command::new(&executable).arg("30").spawn() {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                result => result.expect("spawn copied executable"),
+            };
+            let process = record(child.id());
+            let settle = Instant::now() + Duration::from_secs(1);
+            while !process_matches_record(&process) && Instant::now() < settle {
+                if child.try_wait().expect("poll helper").is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            if process_matches_record(&process) {
+                break (child, process);
+            }
+            match child.try_wait().expect("poll helper") {
+                Some(status) => eprintln!("helper {} exited early: {status}", process.pid),
+                None => panic!(
+                    "live helper {} runs {:?}, not {}",
+                    process.pid,
+                    fs::read_link(format!("/proc/{}/exe", process.pid)),
+                    executable.display()
+                ),
+            }
+        };
         assert!(!executable_is_outdated(&process));
 
         fs::remove_file(&executable).expect("remove executable");
