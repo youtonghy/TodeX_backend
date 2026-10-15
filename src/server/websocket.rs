@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tracing::debug;
+use zeroize::Zeroizing;
 
 use crate::{
     app_state::AppState,
@@ -1028,7 +1029,15 @@ async fn dispatch(
             let (cwd, command) = match &payload.ssh {
                 Some(target) => {
                     state.ssh.require_host(&target.host).await?;
-                    let command = state.ssh.terminal_command(&target.host);
+                    let password = target
+                        .password
+                        .clone()
+                        .map(Zeroizing::new)
+                        .filter(|password| !password.is_empty());
+                    let command = state
+                        .ssh
+                        .terminal_command(&target.host, password.as_deref().map(String::as_str))
+                        .await?;
                     (command.cwd.display().to_string(), Some(command))
                 }
                 None => {

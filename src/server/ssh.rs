@@ -8,6 +8,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use zeroize::Zeroizing;
 
 use crate::app_state::AppState;
 use crate::error::AppError;
@@ -30,6 +31,15 @@ struct ImportRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AgentAccessRequest {
     enabled: bool,
+}
+
+/// Optional body of `POST /v2/ssh/hosts/{alias}/test`. No `Debug`: it
+/// carries a password.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TestRequest {
+    #[serde(default)]
+    password: Option<String>,
 }
 
 pub(super) fn routes() -> Router<AppState> {
@@ -135,10 +145,18 @@ async fn test_host(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(alias): AxumPath<String>,
+    body: Option<Json<TestRequest>>,
 ) -> Result<Json<Value>, AppError> {
     require_auth(&state, &headers)?;
+    let password = body
+        .and_then(|Json(request)| request.password)
+        .map(Zeroizing::new)
+        .filter(|password| !password.is_empty());
     Ok(Json(serde_json::to_value(
-        state.ssh.test_connection(&alias).await?,
+        state
+            .ssh
+            .test_connection(&alias, password.as_deref().map(String::as_str))
+            .await?,
     )?))
 }
 

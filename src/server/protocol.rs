@@ -609,10 +609,22 @@ pub struct TerminalStartRequest {
     pub ssh: Option<TerminalSshTarget>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TerminalSshTarget {
     pub host: String,
+    /// Answers the host's password prompt once; never stored or logged.
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for TerminalSshTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalSshTarget")
+            .field("host", &self.host)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

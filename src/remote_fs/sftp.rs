@@ -23,7 +23,7 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use super::{
-    askpass, file_name, finish_listing, join_path, listable_name, parent_path, permission_string,
+    file_name, finish_listing, join_path, listable_name, parent_path, permission_string,
     system_time_millis, too_large, EntryKind, Listing, RemoteEntry, RemoteFs, RemoteStat,
     STREAM_CHUNK_BYTES,
 };
@@ -55,28 +55,10 @@ impl SftpFs {
         alias: &str,
         password: Option<Zeroizing<String>>,
     ) -> Result<Self, AppError> {
-        if password.is_some() {
-            // Jump hosts and proxy programs inherit ssh's environment, and a
-            // jump host's own password prompt would receive this secret.
-            let resolved = ssh.resolved_host(alias).await?;
-            if resolved.proxy_jump.is_some() || resolved.proxy_command.is_some() {
-                return Err(AppError::InvalidRequest(
-                    "password sign-in is not supported for hosts behind ProxyJump or \
-                     ProxyCommand; log in from the TodeX Terminal first and the file \
-                     session reuses that connection"
-                        .to_owned(),
-                ));
-            }
-        }
         let mut command = match &password {
             Some(password) => {
-                let program = std::env::current_exe().map_err(|error| {
-                    AppError::Unsupported(format!("askpass helper unavailable: {error}"))
-                })?;
                 let mut command = ssh.command(SshMode::Askpass);
-                command
-                    .env("SSH_ASKPASS", program)
-                    .env(askpass::SECRET_ENV, password.as_str());
+                command.envs(ssh.askpass_env(alias, password).await?);
                 command
             }
             None => ssh.command(SshMode::Batch),

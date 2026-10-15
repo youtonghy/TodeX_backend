@@ -4,7 +4,8 @@
 //! TodeX-managed list rendered to `$DATA_DIR/ssh/hosts.conf`. Every ssh run
 //! uses a generated `-F` wrapper that includes both, TodeX's connection
 //! defaults (`defaults.conf`) and the system config, so OpenSSH itself handles
-//! keys, agents, ProxyJump and `known_hosts`. TodeX never stores passwords.
+//! keys, agents, ProxyJump and `known_hosts`. TodeX never stores passwords: a
+//! client may send one per connection, answered via the askpass helper.
 
 pub(crate) mod config_file;
 pub(crate) mod keys;
@@ -28,6 +29,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     external_command::{self, bounded_text, prepare_captured, CommandLimits, ExternalCommandError},
+    remote_fs::askpass,
     secure_fs,
 };
 
@@ -320,23 +322,83 @@ impl SshService {
 
     /// `ssh -tt <alias>` for a PTY, with the same sanitized environment as
     /// [`Self::command`]. Host-key and password prompts reach the user.
-    pub(crate) fn terminal_command(&self, alias: &str) -> TerminalCommand {
+    ///
+    /// With `password`, the askpass helper answers the one password prompt
+    /// instead. Unknown host keys are then rejected rather than asked about,
+    /// so the client can retry without a password to confirm them. Hosts
+    /// behind ProxyJump/ProxyCommand ignore the password and prompt as usual.
+    pub(crate) async fn terminal_command(
+        &self,
+        alias: &str,
+        password: Option<&str>,
+    ) -> Result<TerminalCommand, AppError> {
         let mut args = self.options(SshMode::Interactive);
+        let mut env: Vec<(String, OsString)> = external_command::inherited_env()
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect();
+        let askpass = match password {
+            Some(password) => match self.askpass_env(alias, password).await {
+                Ok(vars) => Some(vars),
+                // Behind a jump host or proxy the password must not travel;
+                // the user signs in at the terminal prompt instead.
+                Err(AppError::InvalidRequest(_)) => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        if let Some(vars) = askpass {
+            env.extend(vars.map(|(key, value)| (key.to_owned(), value)));
+            env.push(("SSH_ASKPASS_REQUIRE".to_owned(), "force".into()));
+            args.extend(
+                [
+                    "-o",
+                    "NumberOfPasswordPrompts=1",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                ]
+                .map(OsString::from),
+            );
+        }
         args.extend(["-tt".into(), "--".into(), alias.into()]);
-        TerminalCommand {
+        Ok(TerminalCommand {
             program: self.inner.ssh_bin.clone(),
             args,
-            env: external_command::inherited_env()
-                .into_iter()
-                .map(|(key, value)| (key.to_owned(), value))
-                .collect(),
+            env,
             cwd: self
                 .inner
                 .home
                 .clone()
                 .unwrap_or_else(|| self.inner.dir.clone()),
             ssh_host: alias.to_owned(),
+        })
+    }
+
+    /// Environment that lets one ssh child answer a password prompt with
+    /// `password` through the askpass helper. Refused for hosts behind a jump
+    /// host or proxy program: those inherit ssh's environment, and a jump
+    /// host's own password prompt would receive the secret.
+    pub(crate) async fn askpass_env(
+        &self,
+        alias: &str,
+        password: &str,
+    ) -> Result<[(&'static str, OsString); 2], AppError> {
+        let resolved = self.resolved_host(alias).await?;
+        if resolved.proxy_jump.is_some() || resolved.proxy_command.is_some() {
+            return Err(AppError::InvalidRequest(
+                "password sign-in is not supported for hosts behind ProxyJump or \
+                 ProxyCommand; log in from the TodeX Terminal first and later \
+                 sessions reuse that connection"
+                    .to_owned(),
+            ));
         }
+        let program = std::env::current_exe().map_err(|error| {
+            AppError::Unsupported(format!("askpass helper unavailable: {error}"))
+        })?;
+        Ok([
+            ("SSH_ASKPASS", program.into()),
+            (askpass::SECRET_ENV, password.into()),
+        ])
     }
 
     fn options(&self, mode: SshMode) -> Vec<OsString> {
@@ -690,9 +752,22 @@ impl SshService {
         }
     }
 
-    pub async fn test_connection(&self, alias: &str) -> Result<ConnectionTestResult, AppError> {
+    /// Runs `exit 0` on `alias`. Without a password only keys and agents are
+    /// tried; with one, a single password prompt is answered.
+    pub async fn test_connection(
+        &self,
+        alias: &str,
+        password: Option<&str>,
+    ) -> Result<ConnectionTestResult, AppError> {
         self.require_host(alias).await?;
-        let mut command = self.command(SshMode::Batch);
+        let mut command = match password {
+            Some(password) => {
+                let mut command = self.command(SshMode::Askpass);
+                command.envs(self.askpass_env(alias, password).await?);
+                command
+            }
+            None => self.command(SshMode::Batch),
+        };
         // `exit 0` works in sh, cmd.exe and PowerShell login shells alike.
         command.arg("--").arg(alias).arg("exit 0");
         prepare_captured(&mut command, false);
@@ -1101,9 +1176,9 @@ exit 0
     #[tokio::test]
     async fn connection_test_uses_batch_mode_and_classifies_failures() {
         let fixture = fixture("Host good bad1\n").await;
-        let ok = fixture.service.test_connection("good").await.unwrap();
+        let ok = fixture.service.test_connection("good", None).await.unwrap();
         assert!(ok.ok);
-        let failed = fixture.service.test_connection("bad1").await.unwrap();
+        let failed = fixture.service.test_connection("bad1", None).await.unwrap();
         assert!(!failed.ok);
         assert_eq!(failed.failure, Some(SshFailureKind::AuthenticationFailed));
         let log = std::fs::read_to_string(fixture.root.join("ssh.log")).unwrap();
@@ -1114,6 +1189,47 @@ exit 0
         assert!(test_line.contains("-o BatchMode=yes -o StrictHostKeyChecking=yes"));
         assert!(test_line.contains("-F "));
         assert!(test_line.contains("-- good exit 0"));
+    }
+
+    #[tokio::test]
+    async fn terminal_password_goes_to_askpass_only() {
+        let fixture = fixture("Host good\n").await;
+        let plain = fixture
+            .service
+            .terminal_command("good", None)
+            .await
+            .unwrap();
+        assert!(!plain.env.iter().any(|(key, _)| key == askpass::SECRET_ENV));
+        assert!(!plain
+            .args
+            .iter()
+            .any(|arg| arg == "NumberOfPasswordPrompts=1"));
+
+        let command = fixture
+            .service
+            .terminal_command("good", Some("hunter2"))
+            .await
+            .unwrap();
+        let env = |name: &str| {
+            command
+                .env
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(env(askpass::SECRET_ENV), Some("hunter2".into()));
+        assert_eq!(env("SSH_ASKPASS_REQUIRE"), Some("force".into()));
+        assert!(env("SSH_ASKPASS").is_some());
+        let args: Vec<String> = command
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let args = args.join(" ");
+        assert!(
+            args.contains("-o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=yes -tt -- good")
+        );
+        assert!(!args.contains("hunter2"));
     }
 
     #[tokio::test]

@@ -1070,11 +1070,11 @@ POST /v2/browser/fetch
 | 接口 | 说明 |
 | --- | --- |
 | `GET /v2/ssh/hosts` | `{ hosts: SshHost[], ftpSites: FtpSite[] }`。`SshHost`：`alias`、`source`（`sshConfig` 只读 / `managed`）、`sourcePath?`、`agentAccess`、`resolved?`（`hostName`、`user`、`port`、`proxyJump`、`identityFiles`）、`resolveError?`、`managed?`（可编辑定义）。 |
-| `POST /v2/ssh/hosts` | 新建自管主机 `{ alias, hostName, user?, port?, identityFile?, proxyJump?, options?: [{key, value}] }`。别名已存在于 `~/.ssh/config` 或自管列表返回 409；拒绝换行、引号、以 `-` 开头的值以及 `Host`/`Match`/`Include`/`LocalCommand`/`PermitLocalCommand`/`KnownHostsCommand` 选项。 |
+| `POST /v2/ssh/hosts` | 新建自管主机 `{ alias, hostName, user?, port?, identityFile?, proxyJump?, options?: [{key, value}], authMethod? }`。`authMethod` 为 `key`（默认，省略时即此值）或 `password`：`password` 主机渲染 `PreferredAuthentications keyboard-interactive,password` 与 `PubkeyAuthentication no` 并忽略 `identityFile`；密码本身从不保存。别名已存在于 `~/.ssh/config` 或自管列表返回 409；拒绝换行、引号、以 `-` 开头的值以及 `Host`/`Match`/`Include`/`LocalCommand`/`PermitLocalCommand`/`KnownHostsCommand` 选项。 |
 | `POST /v2/ssh/hosts/import` | `{ text }` 粘贴 `ssh_config` 片段，返回 `{ hosts, errors }`；通配符、`Match`、`Include` 只报告不导入。 |
 | `PUT` / `DELETE /v2/ssh/hosts/{alias}` | 修改或删除自管主机（`~/.ssh/config` 中的主机只读）。 |
 | `PUT /v2/ssh/hosts/{alias}/agent-access` | `{ enabled }`，默认关闭，见「Agent SSH 工具」。 |
-| `POST /v2/ssh/hosts/{alias}/test` | 以 BatchMode、严格主机密钥校验执行一次 `exit 0`，返回 `{ ok, durationMs, failure?, detail? }`；`failure` 为 `hostKeyUnverified`、`hostKeyChanged`、`authenticationFailed`、`unreachable`、`timedOut`、`other`。 |
+| `POST /v2/ssh/hosts/{alias}/test` | 以 BatchMode、严格主机密钥校验执行一次 `exit 0`；可选请求体 `{ password? }` 时改为只应答一次密码提示（askpass，密码只存在于该 ssh 子进程环境中，不落盘；ProxyJump/ProxyCommand 主机返回 400）。返回 `{ ok, durationMs, failure?, detail? }`；`failure` 为 `hostKeyUnverified`、`hostKeyChanged`、`authenticationFailed`、`unreachable`、`timedOut`、`other`。 |
 | `POST /v2/ssh/hosts/{alias}/disconnect` | `ssh -O exit` 关闭共享 master，返回 `{ disconnected }`。 |
 | `GET` / `PUT /v2/ssh/settings` | 连接设置 `{ serverAliveEnabled, serverAliveInterval, serverAliveCountMax }`，默认 `{ false, 15, 3 }`；`PUT` 需提供全部字段（间隔 5–600 秒、次数 1–10，越界返回 400），返回保存后的设置。开启时渲染为 `defaults.conf` 中的 `Host *` 块，位于 `~/.ssh/config` 之后，因此用户为某主机写的 `ServerAlive*` 优先。只影响之后启动的 ssh 进程；已建立的共享 master 保持原参数，直到断开或空闲关闭。 |
 | `POST /v2/ftp/sites`、`PUT` / `DELETE /v2/ftp/sites/{id}` | FTP 站点 `{ name, protocol: "ftp"|"ftps", host, port?（默认 21）, user?, initialDirectory? }`，不含密码。 |
@@ -1093,7 +1093,7 @@ POST /v2/browser/fetch
 
 ### SSH 终端
 
-`terminal.start`（见「统一 WebSocket 命令面」）可带 `ssh: { host }`：后端在 PTY 中运行 `ssh -tt <alias>`，工作目录为用户主目录，环境变量清空后只保留白名单（不继承 `TODEX_AGENTD_*`）。此时忽略 `cwd` 与 `workspaceId`，也不做 workspace 根目录与信任检查，只要求别名存在于主机清单。主机密钥确认与密码提示直接在终端里完成；登录后的共享连接可被 SFTP 与 Agent 命令复用。`terminal.started` 事件额外带 `ssh: { host }`，其余 `terminal.*` 命令与事件不变。
+`terminal.start`（见「统一 WebSocket 命令面」）可带 `ssh: { host }`：后端在 PTY 中运行 `ssh -tt <alias>`，工作目录为用户主目录，环境变量清空后只保留白名单（不继承 `TODEX_AGENTD_*`）。此时忽略 `cwd` 与 `workspaceId`，也不做 workspace 根目录与信任检查，只要求别名存在于主机清单。主机密钥确认与密码提示直接在终端里完成；也可带 `ssh: { host, password }`，由 askpass 应答一次密码提示（不落盘、不写日志），此时未知主机密钥直接拒绝而不询问（客户端可不带密码重试以确认指纹）；ProxyJump/ProxyCommand 主机忽略该密码，照常在终端中提示；登录后的共享连接可被 SFTP 与 Agent 命令复用。`terminal.started` 事件额外带 `ssh: { host }`，其余 `terminal.*` 命令与事件不变。
 
 ### 远程文件（SFTP / FTP）
 
