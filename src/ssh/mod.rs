@@ -2,9 +2,9 @@
 //!
 //! Hosts come from the backend user's `~/.ssh/config` (read-only) and from a
 //! TodeX-managed list rendered to `$DATA_DIR/ssh/hosts.conf`. Every ssh run
-//! uses a generated `-F` wrapper that includes both plus the system config, so
-//! OpenSSH itself handles keys, agents, ProxyJump and `known_hosts`. TodeX
-//! never stores passwords.
+//! uses a generated `-F` wrapper that includes both, TodeX's connection
+//! defaults (`defaults.conf`) and the system config, so OpenSSH itself handles
+//! keys, agents, ProxyJump and `known_hosts`. TodeX never stores passwords.
 
 pub(crate) mod config_file;
 pub(crate) mod keys;
@@ -31,10 +31,11 @@ use crate::{
     secure_fs,
 };
 
-pub(crate) use config_file::{ManagedHost, SnippetImport};
+pub(crate) use config_file::{ConnectionSettings, ManagedHost, SnippetImport};
 
 const STORE_FILE: &str = "store.json";
 const MANAGED_HOSTS_FILE: &str = "hosts.conf";
+const DEFAULTS_FILE: &str = "defaults.conf";
 const WRAPPER_FILE: &str = "ssh_config";
 const CONTROL_DIR: &str = "cm";
 /// `ssh -G` output only changes when config files change; a short cache keeps
@@ -102,6 +103,8 @@ struct SshStore {
     /// Aliases agents may use. Empty by default: access is opt-in per host.
     #[serde(default)]
     agent_access: BTreeSet<String>,
+    #[serde(default)]
+    connection: ConnectionSettings,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -278,18 +281,22 @@ impl SshService {
     /// Writes `hosts.conf` and the `-F` wrapper. Called under the store lock.
     async fn write_config_files(&self, store: &SshStore) -> Result<(), AppError> {
         let managed_path = self.inner.dir.join(MANAGED_HOSTS_FILE);
+        let defaults_path = self.inner.dir.join(DEFAULTS_FILE);
         let wrapper = config_file::render_wrapper_config(
             &managed_path,
             &self
                 .user_config()
                 .unwrap_or_else(|| PathBuf::from("/nonexistent/.ssh/config")),
+            &defaults_path,
             system_config().as_deref(),
         );
         let managed = config_file::render_managed_hosts(&store.managed_hosts);
+        let defaults = config_file::render_connection_defaults(&store.connection);
         let store_json = serde_json::to_vec_pretty(store)?;
         let dir = self.inner.dir.clone();
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             secure_fs::write_owner_only_atomic(&dir.join(MANAGED_HOSTS_FILE), managed.as_bytes())?;
+            secure_fs::write_owner_only_atomic(&dir.join(DEFAULTS_FILE), defaults.as_bytes())?;
             secure_fs::write_owner_only_atomic(&dir.join(WRAPPER_FILE), wrapper.as_bytes())?;
             secure_fs::write_owner_only_atomic(&dir.join(STORE_FILE), &store_json)
         })
@@ -624,6 +631,28 @@ impl SshService {
             self.write_config_files(&store).await?;
         }
         Ok(())
+    }
+
+    pub async fn connection_settings(&self) -> ConnectionSettings {
+        self.inner.store.read().await.connection.clone()
+    }
+
+    /// Applies to ssh processes started afterwards; a running shared master
+    /// keeps its options until it exits.
+    pub async fn set_connection_settings(
+        &self,
+        settings: ConnectionSettings,
+    ) -> Result<ConnectionSettings, AppError> {
+        settings.validate()?;
+        let mut store = self.inner.store.write().await;
+        if store.connection != settings {
+            let previous = std::mem::replace(&mut store.connection, settings);
+            if let Err(error) = self.write_config_files(&store).await {
+                store.connection = previous;
+                return Err(error);
+            }
+        }
+        Ok(store.connection.clone())
     }
 
     /// Agent-enabled hosts that still exist, with resolved parameters.
@@ -1160,6 +1189,72 @@ exit 0
             classify_failure("ssh: Could not resolve hostname x: nodename nor servname"),
             SshFailureKind::Unreachable
         );
+    }
+
+    #[test]
+    fn stores_without_connection_settings_load_with_defaults() {
+        let store: SshStore =
+            serde_json::from_str(r#"{"managedHosts":[],"agentAccess":["web"]}"#).unwrap();
+        assert_eq!(store.connection, ConnectionSettings::default());
+        assert!(!store.connection.server_alive_enabled);
+    }
+
+    /// OpenSSH itself must read the defaults after the user's config, and a
+    /// `Host *` there must not leak into the includes that follow.
+    #[tokio::test]
+    async fn connection_defaults_reach_openssh_below_user_config() {
+        let fixture = fixture("Host web\n  ServerAliveInterval 7\n").await;
+        let saved = fixture
+            .service
+            .set_connection_settings(ConnectionSettings {
+                server_alive_enabled: true,
+                server_alive_interval: 20,
+                server_alive_count_max: 4,
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved, fixture.service.connection_settings().await);
+        let wrapper = fixture.root.join("data/ssh").join(WRAPPER_FILE);
+        let effective = |alias: &str| match std::process::Command::new("ssh")
+            .arg("-F")
+            .arg(&wrapper)
+            .args(["-G", alias])
+            .env("HOME", fixture.root.join("home"))
+            .output()
+        {
+            Ok(output) => {
+                assert!(output.status.success(), "{output:?}");
+                Some(String::from_utf8(output.stdout).unwrap())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("ssh -G: {error}"),
+        };
+        let Some(web) = effective("web") else {
+            eprintln!("skipping: ssh not installed");
+            return;
+        };
+        assert!(web.contains("\nserveraliveinterval 7\n"), "{web}");
+        assert!(web.contains("\nserveralivecountmax 4\n"), "{web}");
+        let other = effective("other").unwrap();
+        assert!(other.contains("\nserveraliveinterval 20\n"), "{other}");
+
+        fixture
+            .service
+            .set_connection_settings(ConnectionSettings::default())
+            .await
+            .unwrap();
+        let other = effective("other").unwrap();
+        assert!(!other.contains("\nserveraliveinterval 20\n"), "{other}");
+        assert!(matches!(
+            fixture
+                .service
+                .set_connection_settings(ConnectionSettings {
+                    server_alive_interval: 0,
+                    ..ConnectionSettings::default()
+                })
+                .await,
+            Err(AppError::InvalidRequest(_))
+        ));
     }
 
     /// Manual smoke test against the real OpenSSH and `~/.ssh/config`:

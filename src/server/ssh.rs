@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::app_state::AppState;
 use crate::error::AppError;
 use crate::ssh::keys::{KeyGenerateRequest, KeyImportRequest};
-use crate::ssh::{FtpSiteInput, ManagedHost};
+use crate::ssh::{ConnectionSettings, FtpSiteInput, ManagedHost};
 
 use super::v2::require_auth;
 
@@ -46,6 +46,10 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/v2/ssh/hosts/{alias}/agent-access", put(set_agent_access))
         .route("/v2/ssh/hosts/{alias}/test", post(test_host))
         .route("/v2/ssh/hosts/{alias}/disconnect", post(disconnect_host))
+        .route(
+            "/v2/ssh/settings",
+            get(get_connection_settings).put(set_connection_settings),
+        )
         .route("/v2/ssh/keys", get(list_keys))
         .route(
             "/v2/ssh/keys/import",
@@ -146,6 +150,23 @@ async fn disconnect_host(
     require_auth(&state, &headers)?;
     let disconnected = state.ssh.disconnect(&alias).await?;
     Ok(Json(json!({ "disconnected": disconnected })))
+}
+
+async fn get_connection_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ConnectionSettings>, AppError> {
+    require_auth(&state, &headers)?;
+    Ok(Json(state.ssh.connection_settings().await))
+}
+
+async fn set_connection_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(settings): Json<ConnectionSettings>,
+) -> Result<Json<ConnectionSettings>, AppError> {
+    require_auth(&state, &headers)?;
+    Ok(Json(state.ssh.set_connection_settings(settings).await?))
 }
 
 async fn list_keys(

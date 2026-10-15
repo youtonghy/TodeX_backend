@@ -4788,6 +4788,8 @@ mod tests {
             ("GET", "/v2/ssh/hosts"),
             ("POST", "/v2/ssh/hosts/web/test"),
             ("PUT", "/v2/ssh/hosts/web/agent-access"),
+            ("GET", "/v2/ssh/settings"),
+            ("PUT", "/v2/ssh/settings"),
             ("POST", "/v2/ftp/sites"),
         ] {
             let response = app
@@ -4803,6 +4805,41 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
+
+        let settings = app
+            .clone()
+            .oneshot(signed_request(&device, "GET", "/v2/ssh/settings", ""))
+            .await
+            .unwrap();
+        assert_eq!(settings.status(), StatusCode::OK);
+        let settings_body = to_bytes(settings.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&settings_body).unwrap(),
+            json!({ "serverAliveEnabled": false, "serverAliveInterval": 15, "serverAliveCountMax": 3 })
+        );
+        let enabled =
+            r#"{"serverAliveEnabled":true,"serverAliveInterval":20,"serverAliveCountMax":4}"#;
+        let saved = app
+            .clone()
+            .oneshot(signed_request(&device, "PUT", "/v2/ssh/settings", enabled))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let defaults = std::fs::read_to_string(root.join("data/ssh/defaults.conf")).unwrap();
+        assert!(defaults.contains("ServerAliveInterval 20\n  ServerAliveCountMax 4\n"));
+        let out_of_range =
+            r#"{"serverAliveEnabled":true,"serverAliveInterval":1,"serverAliveCountMax":4}"#;
+        let rejected = app
+            .clone()
+            .oneshot(signed_request(
+                &device,
+                "PUT",
+                "/v2/ssh/settings",
+                out_of_range,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 
         let providers = app
             .clone()

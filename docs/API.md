@@ -1059,7 +1059,7 @@ POST /v2/browser/fetch
 
 - 自动发现：递归解析 `~/.ssh/config`（跟随 `Include`，相对路径按 `~/.ssh` 解析、glob 按字典序展开），列出具体的 `Host` 别名；通配符、`!` 否定模式与 `Match` 块只参与连接参数解析，不单独列出。
 - TodeX 自管主机与 FTP 站点保存在 `$DATA_DIR/ssh/store.json`，SSH 主机渲染为 `$DATA_DIR/ssh/hosts.conf`（均为 0600）。
-- 所有 ssh 调用都使用生成的 `-F $DATA_DIR/ssh/ssh_config`，依次 `Include` 自管主机、`~/.ssh/config` 与系统 `ssh_config`，所以密钥、ssh-agent、ProxyJump、`known_hosts` 行为与用户 shell 中的 `ssh` 一致；有效参数由 `ssh -G` 解析（缓存 30 秒）。Unix 上同一主机的终端、SFTP 与 Agent 命令通过 `ControlMaster`（`$DATA_DIR/ssh/cm/%C`，空闲 5 分钟关闭）复用一次登录。
+- 所有 ssh 调用都使用生成的 `-F $DATA_DIR/ssh/ssh_config`，依次 `Include` 自管主机、`~/.ssh/config`、TodeX 连接默认值（`$DATA_DIR/ssh/defaults.conf`）与系统 `ssh_config`，所以密钥、ssh-agent、ProxyJump、`known_hosts` 行为与用户 shell 中的 `ssh` 一致；有效参数由 `ssh -G` 解析（缓存 30 秒）。Unix 上同一主机的终端、SFTP 与 Agent 命令通过 `ControlMaster`（`$DATA_DIR/ssh/cm/%C`，空闲 5 分钟关闭）复用一次登录。
 
 | 接口 | 说明 |
 | --- | --- |
@@ -1070,6 +1070,7 @@ POST /v2/browser/fetch
 | `PUT /v2/ssh/hosts/{alias}/agent-access` | `{ enabled }`，默认关闭，见「Agent SSH 工具」。 |
 | `POST /v2/ssh/hosts/{alias}/test` | 以 BatchMode、严格主机密钥校验执行一次 `exit 0`，返回 `{ ok, durationMs, failure?, detail? }`；`failure` 为 `hostKeyUnverified`、`hostKeyChanged`、`authenticationFailed`、`unreachable`、`timedOut`、`other`。 |
 | `POST /v2/ssh/hosts/{alias}/disconnect` | `ssh -O exit` 关闭共享 master，返回 `{ disconnected }`。 |
+| `GET` / `PUT /v2/ssh/settings` | 连接设置 `{ serverAliveEnabled, serverAliveInterval, serverAliveCountMax }`，默认 `{ false, 15, 3 }`；`PUT` 需提供全部字段（间隔 5–600 秒、次数 1–10，越界返回 400），返回保存后的设置。开启时渲染为 `defaults.conf` 中的 `Host *` 块，位于 `~/.ssh/config` 之后，因此用户为某主机写的 `ServerAlive*` 优先。只影响之后启动的 ssh 进程；已建立的共享 master 保持原参数，直到断开或空闲关闭。 |
 | `POST /v2/ftp/sites`、`PUT` / `DELETE /v2/ftp/sites/{id}` | FTP 站点 `{ name, protocol: "ftp"|"ftps", host, port?（默认 21）, user?, initialDirectory? }`，不含密码。 |
 
 ### SSH 密钥
