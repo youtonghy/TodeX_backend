@@ -906,6 +906,12 @@ GET /v2/workspace/directories?path=/home/user/projects/demo
 
 `path` 为空时从主 workspace 根目录（`workspace_roots` 第一项）开始，也可以指向任一已配置根目录或其子目录。`root` 是包含 `current` 的那个根目录，`roots` 列出全部生效的根目录，`parent` 只允许向上走到所在根的边界。返回值只包含可进入的子目录，会跳过隐藏目录、文件，以及 canonical path 落在所有根目录之外的目录或符号链接。
 
+```http
+POST /v2/workspace/directories
+```
+
+请求体 `{ "parent": "/home/user/projects", "name": "demo" }`，在 `parent` 下新建一级目录，响应与 `GET` 相同，`current` 为新目录的规范路径。`parent` 必须是任一根目录或其子目录；`name` 去除首尾空白后必须是单个路径组件（非空、不超过 255 字节、不是 `.`/`..`、不含 `/`、`\` 或控制字符），否则返回 `400 INVALID_REQUEST`。从不创建多级目录，也从不覆盖：同名条目已存在时返回 `409 CONFLICT`。
+
 ### 文件 `@` 引用建议
 
 ```http

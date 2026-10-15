@@ -31,7 +31,8 @@ use crate::provider::{
     FollowUpAddOutcome, ManagedCli, PermissionDecision, PromptContentRef, PromptSkillRef,
 };
 use crate::workspace_paths::{
-    canonical_workspace_roots, containing_workspace_root, validate_workspace_directory_text,
+    canonical_workspace_roots, containing_workspace_root, validate_workspace_directory,
+    validate_workspace_directory_text,
 };
 use crate::workspace_store::{RejectedWorkspace, WorkspaceRecord};
 
@@ -224,7 +225,10 @@ fn authenticated_routes() -> Router<AppState> {
             get(workspace_trust).put(update_workspace_trust),
         )
         .route("/v2/workspace/entries", get(workspace_entries))
-        .route("/v2/workspace/directories", get(workspace_directories))
+        .route(
+            "/v2/workspace/directories",
+            get(workspace_directories).post(create_workspace_directory),
+        )
         .route(
             "/v2/workspace/file",
             get(workspace_file)
@@ -654,6 +658,50 @@ pub(super) async fn workspace_directories(
             .ok_or_else(|| AppError::InvalidRequest("workspace root is unavailable".to_owned()))?,
     };
     let limit = query.limit.unwrap_or(100).clamp(1, 300);
+    workspace_directories_response(roots, current, limit)
+        .await
+        .map(Json)
+}
+
+/// Creates one directory under a browsable workspace directory and answers
+/// with the directory listing of the new folder, like `GET` would.
+pub(super) async fn create_workspace_directory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateWorkspaceDirectoryRequest>,
+) -> Result<Json<WorkspaceDirectoriesResponse>, AppError> {
+    require_auth(&state, &headers)?;
+
+    let parent = validate_workspace_directory_text(&state.config.workspace_roots, &request.parent)?;
+    let name = validate_new_directory_name(&request.name)?;
+    let target = parent.join(name);
+    match tokio::fs::create_dir(&target).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(AppError::Conflict(format!("{name} already exists")));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(AppError::Unauthorized(format!(
+                "permission denied creating {}",
+                target.display()
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // `parent` is canonical and `name` is a single plain component, so the new
+    // directory cannot leave the root; revalidate to return its canonical path.
+    let current = validate_workspace_directory(&state.config.workspace_roots, &target)?;
+    let roots = canonical_workspace_roots(&state.config.workspace_roots);
+    workspace_directories_response(roots, current, 100)
+        .await
+        .map(Json)
+}
+
+async fn workspace_directories_response(
+    roots: Vec<PathBuf>,
+    current: PathBuf,
+    limit: usize,
+) -> Result<WorkspaceDirectoriesResponse, AppError> {
     let containing_root = containing_workspace_root(&roots, &current)
         .map(Path::to_path_buf)
         .unwrap_or_else(|| current.clone());
@@ -663,7 +711,7 @@ pub(super) async fn workspace_directories(
         .filter(|parent| current != containing_root && parent.starts_with(&containing_root))
         .map(|parent| parent.display().to_string());
 
-    Ok(Json(WorkspaceDirectoriesResponse {
+    Ok(WorkspaceDirectoriesResponse {
         root: containing_root.display().to_string(),
         roots: roots
             .iter()
@@ -672,7 +720,35 @@ pub(super) async fn workspace_directories(
         current: current.display().to_string(),
         parent,
         entries,
-    }))
+    })
+}
+
+const MAX_DIRECTORY_NAME_BYTES: usize = 255;
+
+/// A new folder name must be one plain path component.
+fn validate_new_directory_name(name: &str) -> Result<&str, AppError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "folder name is required".to_owned(),
+        ));
+    }
+    if name.len() > MAX_DIRECTORY_NAME_BYTES {
+        return Err(AppError::InvalidRequest(
+            "folder name is too long".to_owned(),
+        ));
+    }
+    if name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|ch| matches!(ch, '/' | '\\') || ch.is_control())
+    {
+        return Err(AppError::InvalidRequest(
+            "folder name must be a single path component".to_owned(),
+        ));
+    }
+    Ok(name)
 }
 
 pub(super) async fn workspace_file(
@@ -3996,6 +4072,13 @@ pub(super) struct WorkspaceDirectoriesQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct CreateWorkspaceDirectoryRequest {
+    parent: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub(super) struct WorkspaceFileQuery {
     path: String,
 }
@@ -6460,6 +6543,7 @@ mod tests {
         assert_eq!(names, vec!["app-b"]);
 
         let directories = app
+            .clone()
             .oneshot(signed_request(
                 &device,
                 "GET",
@@ -6477,7 +6561,51 @@ mod tests {
         .unwrap();
         assert_eq!(body["current"], canonical_primary.display().to_string());
 
+        let create_directory = |parent: &Path, name: &str| {
+            let payload =
+                json!({ "parent": parent.display().to_string(), "name": name }).to_string();
+            signed_request(&device, "POST", "/v2/workspace/directories", &payload)
+        };
+        let created = app
+            .clone()
+            .oneshot(create_directory(&secondary, " new-app "))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        let new_app = canonical_secondary.join("new-app");
+        assert!(new_app.is_dir());
+        assert_eq!(body["current"], new_app.display().to_string());
+        assert_eq!(body["root"], canonical_secondary.display().to_string());
+        assert_eq!(body["parent"], canonical_secondary.display().to_string());
+
+        for (parent, name, status) in [
+            (&secondary, "new-app", StatusCode::CONFLICT),
+            (&secondary, "..", StatusCode::BAD_REQUEST),
+            (&secondary, "a/b", StatusCode::BAD_REQUEST),
+            (&secondary, "  ", StatusCode::BAD_REQUEST),
+            (&outside, "escape", StatusCode::FORBIDDEN),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(create_directory(parent, name))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{name:?} under {parent:?}");
+        }
+        assert!(!outside.join("escape").exists());
+
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_directory_name_must_be_one_component() {
+        assert_eq!(validate_new_directory_name(" demo ").unwrap(), "demo");
+        for name in ["", ".", "..", "a/b", "a\\b", "a\nb", &"x".repeat(256)] {
+            assert!(validate_new_directory_name(name).is_err(), "{name:?}");
+        }
     }
 
     #[tokio::test]
