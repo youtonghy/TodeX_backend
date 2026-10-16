@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 /// Milliseconds since epoch; matches the timestamp style used elsewhere in
 /// event payloads.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -36,6 +36,14 @@ impl QuotaStore {
     /// it. Payloads without a `provider` string are ignored — they cannot be
     /// keyed.
     pub fn record(&self, payload: &Value) -> Option<Value> {
+        self.record_sampled(payload, now_ms())
+    }
+
+    /// [`Self::record`] for a snapshot taken at `sampled_at` (epoch ms), such
+    /// as an on-demand fetch that started then. A snapshot recorded since
+    /// (a turn's `quota.updated` while the fetch ran) is newer and stays; it
+    /// is returned instead.
+    pub fn record_sampled(&self, payload: &Value, sampled_at: u64) -> Option<Value> {
         let provider = payload.get("provider").and_then(Value::as_str)?;
         if let Some(turn_id) = payload.get("turnId").and_then(Value::as_str) {
             match exhausted_until(payload) {
@@ -48,10 +56,19 @@ impl QuotaStore {
             }
         }
         let mut entry = payload.clone();
-        entry["fetchedAt"] = json!(now_ms());
+        entry["fetchedAt"] = json!(sampled_at);
         entry["state"] = json!("ok");
-        self.entries.insert(provider.to_owned(), entry.clone());
-        Some(entry)
+        match self.entries.entry(provider.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(existing)
+                if existing.get()["fetchedAt"].as_u64().unwrap_or(0) > sampled_at =>
+            {
+                Some(existing.get().clone())
+            }
+            slot => {
+                slot.insert(entry.clone());
+                Some(entry)
+            }
+        }
     }
 
     pub fn get(&self, provider: &str) -> Option<Value> {
@@ -125,6 +142,34 @@ mod tests {
         assert_eq!(entry["state"], "ok");
         assert!(entry["fetchedAt"].as_u64().unwrap_or(0) > 0);
         assert!(store.get("codex").is_none());
+    }
+
+    #[test]
+    fn an_older_sample_does_not_replace_a_newer_snapshot() {
+        let store = QuotaStore::default();
+        let sampled_at = now_ms();
+        // A turn reports while the on-demand fetch is still running.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let event = store
+            .record(&json!({"provider": "codex", "windows": [], "source": "event"}))
+            .unwrap();
+        let returned = store
+            .record_sampled(
+                &json!({"provider": "codex", "windows": [], "source": "fetch"}),
+                sampled_at,
+            )
+            .unwrap();
+        assert_eq!(returned, event);
+        assert_eq!(store.get("codex").unwrap()["source"], "event");
+        // A sample newer than the stored snapshot replaces it.
+        let later = store
+            .record_sampled(
+                &json!({"provider": "codex", "windows": [], "source": "fetch"}),
+                now_ms() + 1,
+            )
+            .unwrap();
+        assert_eq!(later["source"], "fetch");
+        assert_eq!(store.get("codex").unwrap(), later);
     }
 
     #[test]

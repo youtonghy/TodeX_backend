@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use crate::app_state::AppState;
 use crate::error::AppError;
 use crate::provider::process::executable_available;
+use crate::quota_store::now_ms;
 
 use super::v2::require_auth;
 
@@ -26,21 +27,25 @@ async fn provider_quota(
     require_auth(&state, &headers)?;
     let mut providers = serde_json::Map::new();
 
-    let (codex, antigravity) = tokio::join!(fetch_codex(&state), fetch_antigravity(&state));
-    let codex = match codex {
-        Ok(quota) => state.quota.record(&quota).unwrap_or(quota),
-        Err(reason) => state.quota.get("codex").unwrap_or_else(
-            || json!({"provider":"codex","scope":"account","state":"unavailable","reason":reason}),
-        ),
-    };
+    // Each result is recorded as soon as it arrives, stamped with the time
+    // its fetch started: a turn's `quota.updated` recorded meanwhile is newer
+    // and wins over the slower sample.
+    let (codex, antigravity) = tokio::join!(
+        async {
+            let sampled_at = now_ms();
+            settle(&state, "codex", sampled_at, fetch_codex(&state).await)
+        },
+        async {
+            let sampled_at = now_ms();
+            settle(
+                &state,
+                "antigravity",
+                sampled_at,
+                fetch_antigravity(&state).await,
+            )
+        },
+    );
     providers.insert("codex".to_owned(), codex);
-
-    let antigravity = match antigravity {
-        Ok(quota) => state.quota.record(&quota).unwrap_or(quota),
-        Err(reason) => state.quota.get("antigravity").unwrap_or_else(
-            || json!({"provider":"antigravity","scope":"account","state":"unavailable","reason":reason}),
-        ),
-    };
     providers.insert("antigravity".to_owned(), antigravity);
 
     let claude = state.quota.get("claude-code").unwrap_or_else(|| {
@@ -57,6 +62,25 @@ async fn provider_quota(
     );
 
     Ok(Json(json!({ "providers": providers })))
+}
+
+/// The provider's entry after a fetch: the recorded sample (or a newer one
+/// already stored), else the last known snapshot, else why none is available.
+fn settle(
+    state: &AppState,
+    provider: &str,
+    sampled_at: u64,
+    fetched: Result<Value, String>,
+) -> Value {
+    match fetched {
+        Ok(quota) => state
+            .quota
+            .record_sampled(&quota, sampled_at)
+            .unwrap_or(quota),
+        Err(reason) => state.quota.get(provider).unwrap_or_else(
+            || json!({"provider":provider,"scope":"account","state":"unavailable","reason":reason}),
+        ),
+    }
 }
 
 async fn fetch_antigravity(state: &AppState) -> Result<Value, String> {
