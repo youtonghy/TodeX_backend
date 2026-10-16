@@ -43,9 +43,10 @@ use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill,
     DriverTurnResult, ImageInputMode, PermissionBroker, PermissionDecision, PermissionOutcome,
     ProviderActivity, ProviderCommandDescriptor, ProviderControl, ProviderDriver,
-    ProviderImageInputCapability, ProviderModelDescriptor, ProviderSnapshot, TrustGate,
-    TurnHandles, TurnModeHandle,
+    ProviderImageInputCapability, ProviderModelDescriptor, ProviderSnapshot, ProviderWork,
+    ProviderWorkHandle, TrustGate, TurnHandles, TurnModeHandle,
 };
+use crate::workspace_trust::WorkspaceTrustPermit;
 
 mod follow_ups;
 mod history_cleanup;
@@ -429,6 +430,23 @@ pub enum CancelOutcome {
     /// The request named a turn that is not the active one; nothing was
     /// signalled. Carries the turn that is running, if any.
     NotActive { active_turn_id: Option<String> },
+}
+
+/// A turn that is registered and journalled, ready to run its driver.
+struct SpawnTurn {
+    owner_id: String,
+    turn_id: String,
+    client_request_id: Option<String>,
+    manifest: ConversationManifest,
+    provider_state: ProviderState,
+    agent_mcp: Option<AgentMcpLaunch>,
+    effective_permissions: super::types::EffectivePermissionConfig,
+    driver: Arc<dyn ProviderDriver>,
+    prompt: DriverPrompt,
+    cancel: watch::Receiver<bool>,
+    launch_permit: WorkspaceTrustPermit,
+    /// See [`TurnHandles::adopt`].
+    adopt: Option<String>,
 }
 
 struct ActiveTurn {
@@ -2244,43 +2262,9 @@ impl ConversationSupervisor {
                 sha256: sha256_hex(skill.content.as_bytes()),
             });
         }
-        let cli_start_permit = self.cli_execution_gate.read().await;
-        let turn_id = format!("turn_{}", Uuid::new_v4().simple());
-        let (cancel, cancel_rx) = watch::channel(false);
-        match self.active.entry(conversation_id.to_owned()) {
-            Entry::Occupied(entry) => {
-                return Err(AppError::Conflict(format!(
-                    "conversation {conversation_id} is already running turn {}",
-                    entry.get().turn_id
-                )));
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(ActiveTurn {
-                    turn_id: turn_id.clone(),
-                    cancel,
-                    provider: manifest.provider,
-                    provider_profile: manifest.provider_profile.clone(),
-                });
-            }
-        }
-        drop(cli_start_permit);
-
-        let launch_permit = match self
-            .workspace_trust
-            .acquire_owned(owner_id, &manifest.workspace)
-            .await
-        {
-            Ok(permit) => permit,
-            Err(error) => {
-                self.active.remove(conversation_id);
-                return Err(error);
-            }
-        };
-        let trust_gate = TrustGate {
-            store: self.workspace_trust.clone(),
-            owner_id: owner_id.to_owned(),
-            workspace: manifest.workspace.clone(),
-        };
+        let (turn_id, cancel_rx, launch_permit) = self
+            .begin_turn(owner_id, conversation_id, &manifest)
+            .await?;
 
         let sealed_key = fingerprint_key
             .as_deref()
@@ -2346,18 +2330,125 @@ impl ConversationSupervisor {
             "provider prompt includes injected skill context"
         );
 
+        self.spawn_turn(SpawnTurn {
+            owner_id: owner_id.to_owned(),
+            turn_id: turn_id.clone(),
+            client_request_id,
+            manifest,
+            provider_state,
+            agent_mcp,
+            effective_permissions,
+            driver,
+            prompt: DriverPrompt {
+                turn_id: turn_id.clone(),
+                text: provider_text,
+                content: driver_content,
+                skills: loaded_skills,
+                model,
+                reasoning_effort,
+                permission_mode,
+                work_mode,
+                permission_profile,
+                sandbox_mode,
+                approval_policy,
+            },
+            cancel: cancel_rx,
+            launch_permit,
+            adopt: None,
+        });
+        Ok(turn_id)
+    }
+
+    /// Registers `conversation_id`'s new turn as running and takes its
+    /// workspace launch permit. Fails when a turn already runs there.
+    async fn begin_turn(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        manifest: &ConversationManifest,
+    ) -> Result<(String, watch::Receiver<bool>, WorkspaceTrustPermit), AppError> {
+        let cli_start_permit = self.cli_execution_gate.read().await;
+        let turn_id = format!("turn_{}", Uuid::new_v4().simple());
+        let (cancel, cancel_rx) = watch::channel(false);
+        match self.active.entry(conversation_id.to_owned()) {
+            Entry::Occupied(entry) => {
+                return Err(AppError::Conflict(format!(
+                    "conversation {conversation_id} is already running turn {}",
+                    entry.get().turn_id
+                )));
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(ActiveTurn {
+                    turn_id: turn_id.clone(),
+                    cancel,
+                    provider: manifest.provider,
+                    provider_profile: manifest.provider_profile.clone(),
+                });
+            }
+        }
+        drop(cli_start_permit);
+
+        match self
+            .workspace_trust
+            .acquire_owned(owner_id, &manifest.workspace)
+            .await
+        {
+            Ok(permit) => Ok((turn_id, cancel_rx, permit)),
+            Err(error) => {
+                self.active.remove(conversation_id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Runs a journalled, registered turn's driver in the background and
+    /// journals its terminal event.
+    fn spawn_turn(&self, turn: SpawnTurn) {
+        let SpawnTurn {
+            owner_id,
+            turn_id,
+            client_request_id,
+            manifest,
+            provider_state,
+            agent_mcp,
+            effective_permissions,
+            driver,
+            prompt: driver_prompt,
+            cancel: cancel_rx,
+            launch_permit,
+            adopt,
+        } = turn;
+        let conversation_id = manifest.id.clone();
         // The turn has started: TodeX's own MCP tools follow its permission
         // mode until it ends (then they fall back to asking).
         if let Some(agent_mcp) = &self.agent_mcp {
             agent_mcp.record_turn_mode(
-                conversation_id,
+                &conversation_id,
                 &effective_permissions.permission_mode,
                 &effective_permissions.work_mode,
             );
         }
+        let trust_gate = TrustGate {
+            store: self.workspace_trust.clone(),
+            owner_id: owner_id.clone(),
+            workspace: manifest.workspace.clone(),
+        };
+        let provider_work = {
+            let supervisor = self.clone();
+            let conversation_id = conversation_id.clone();
+            ProviderWorkHandle::new(move |work| {
+                let supervisor = supervisor.clone();
+                let owner_id = owner_id.clone();
+                let conversation_id = conversation_id.clone();
+                Box::pin(async move {
+                    supervisor
+                        .start_provider_turn(&owner_id, &conversation_id, work)
+                        .await
+                })
+            })
+        };
         let supervisor = self.clone();
-        let conversation_id = conversation_id.to_owned();
-        let spawned_turn_id = turn_id.clone();
+        let spawned_turn_id = turn_id;
         let cleanup = ActiveTurnCleanup {
             active: self.active.clone(),
             conversation_id: conversation_id.clone(),
@@ -2391,20 +2482,9 @@ impl ConversationSupervisor {
                             conversation_id: conversation_id.clone(),
                         }),
                     trust: Some(trust_gate),
+                    provider_work: Some(provider_work),
+                    adopt,
                 },
-            };
-            let driver_prompt = DriverPrompt {
-                turn_id: spawned_turn_id.clone(),
-                text: provider_text,
-                content: driver_content,
-                skills: loaded_skills,
-                model,
-                reasoning_effort,
-                permission_mode,
-                work_mode,
-                permission_profile,
-                sandbox_mode,
-                approval_policy,
             };
             // The driver runs in its own task so a panic surfaces as a
             // JoinError here and still produces a terminal event.
@@ -2446,7 +2526,89 @@ impl ConversationSupervisor {
             drop(cleanup);
             supervisor.schedule_after_turn(conversation_id, Some(spawned_turn_id), terminal);
         });
-        Ok(turn_id)
+    }
+
+    /// Opens a turn for work the provider started on its own after the
+    /// conversation's last turn ended: no user message, the last turn's
+    /// launch settings, and `trigger: "provider"` on `turn.started`. Refused
+    /// like a prompt when the conversation is busy, gone, read-only or its
+    /// workspace is no longer trusted; the driver then stops the work.
+    pub(crate) async fn start_provider_turn(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        work: ProviderWork,
+    ) -> Result<(), AppError> {
+        self.writable_owned(owner_id, conversation_id).await?;
+        let _request_guard = self.request_gate(conversation_id).lock_owned().await;
+        self.store.ensure_not_legacy(conversation_id).await?;
+        let manifest = self.store.get(conversation_id).await?;
+        ensure_owner(&manifest, owner_id)?;
+        self.workspace_trust
+            .ensure_trusted(owner_id, &manifest.workspace)
+            .await?;
+        let ProviderWork {
+            adoption,
+            settings,
+            trigger,
+        } = work;
+        let effective_permissions = super::types::resolve_execution_config(
+            manifest.provider,
+            settings.permission_mode.as_deref(),
+            settings.work_mode.as_deref(),
+            settings.permission_profile.as_deref(),
+            settings.sandbox_mode.as_deref(),
+            settings.approval_policy.as_deref(),
+        )?;
+        let driver = self.registry.driver(manifest.provider)?;
+        let provider_state = self.store.provider_state(conversation_id).await?;
+        let agent_mcp = self.turn_agent_mcp(&manifest).await;
+        let (turn_id, cancel_rx, launch_permit) = self
+            .begin_turn(owner_id, conversation_id, &manifest)
+            .await?;
+        let started = json!({
+            "turnId": turn_id, "clientRequestId": null, "provider": manifest.provider,
+            "requestedPermissions": { "permissionMode": settings.permission_mode, "workMode": settings.work_mode, "profile": settings.permission_profile, "sandboxMode": settings.sandbox_mode, "approvalPolicy": settings.approval_policy },
+            "effectivePermissions": effective_permissions, "configurationStatus": "validated",
+            "trigger": "provider", "triggerDetail": trigger,
+        });
+        if let Err(error) = self
+            .store
+            .append_many_and_publish(
+                conversation_id,
+                vec![("turn.started".to_owned(), started)],
+                &self.hub,
+            )
+            .await
+        {
+            self.active.remove(conversation_id);
+            return Err(error);
+        }
+        tracing::info!(
+            conversation_id,
+            "provider started work on its own; opened a turn for it"
+        );
+        self.spawn_turn(SpawnTurn {
+            owner_id: owner_id.to_owned(),
+            turn_id: turn_id.clone(),
+            client_request_id: None,
+            manifest,
+            provider_state,
+            agent_mcp,
+            effective_permissions,
+            driver,
+            prompt: DriverPrompt {
+                turn_id,
+                text: String::new(),
+                content: Vec::new(),
+                skills: Vec::new(),
+                ..settings
+            },
+            cancel: cancel_rx,
+            launch_permit,
+            adopt: Some(adoption),
+        });
+        Ok(())
     }
 
     /// Journals exactly one terminal event for a turn whose driver task ended,
@@ -5578,6 +5740,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn work_claude_starts_after_its_turn_is_journalled_as_a_provider_turn() {
+        let (root, store, supervisor, workspace) = control_fixture("todex-claude-own-work").await;
+        fs::write(root.join("own-work-after-idle"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        let user_turn = supervisor
+            .prompt(&manifest.id, "start it".to_owned(), None)
+            .await
+            .unwrap();
+        let started = wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "turn.started" && event.payload["trigger"] == "provider"
+        })
+        .await;
+        let provider_turn = started.payload["turnId"].as_str().unwrap().to_owned();
+        assert_ne!(provider_turn, user_turn);
+        assert_eq!(started.payload["triggerDetail"]["kind"], "background_task");
+        assert_eq!(started.payload["triggerDetail"]["taskIds"], json!(["b74"]));
+        assert_eq!(
+            started.payload["triggerDetail"]["summary"],
+            "Background command done (exit code 0)"
+        );
+        assert_eq!(
+            started.payload["effectivePermissions"],
+            supervisor_effective_permissions(&store, &manifest.id, &user_turn).await
+        );
+        wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "turn.completed" && event.payload["turnId"] == provider_turn
+        })
+        .await;
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let of_turn = |turn: &str| {
+            history
+                .iter()
+                .filter(|event| event.payload["turnId"] == turn)
+                .map(|event| (event.event_type.clone(), event.payload.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let provider_events = of_turn(&provider_turn);
+        assert!(
+            provider_events
+                .iter()
+                .any(|(_, payload)| payload.contains("background done")),
+            "{provider_events:?}"
+        );
+        // No user message opens it.
+        assert!(!provider_events
+            .iter()
+            .any(|(event_type, _)| event_type == "message.created"));
+        assert!(!of_turn(&user_turn)
+            .iter()
+            .any(|(_, payload)| payload.contains("background done")));
+
+        // The same process answers the next prompt.
+        let next = supervisor
+            .prompt(&manifest.id, "and now".to_owned(), None)
+            .await
+            .unwrap();
+        wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "turn.completed" && event.payload["turnId"] == next
+        })
+        .await;
+        let stdin = fs::read_to_string(root.join("stdin.log")).unwrap();
+        assert_eq!(
+            stdin.matches(r#""subtype":"initialize""#).count(),
+            1,
+            "{stdin}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn own_work_in_an_untrusted_workspace_opens_no_turn() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-own-work-untrusted").await;
+        fs::write(root.join("own-work-after-idle"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace.clone(), None, None)
+            .await
+            .unwrap();
+        let user_turn = supervisor
+            .prompt(&manifest.id, "start it".to_owned(), None)
+            .await
+            .unwrap();
+        wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "turn.completed" && event.payload["turnId"] == user_turn
+        })
+        .await;
+        supervisor
+            .workspace_trust
+            .set_owned("local", &workspace, false)
+            .await
+            .unwrap();
+        // Past the background task and the takeover deadline.
+        sleep(Duration::from_secs(2)).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(!history
+            .iter()
+            .any(|event| event.event_type == "turn.started"
+                && event.payload["trigger"] == "provider"));
+        assert!(!history
+            .iter()
+            .any(|event| event.payload.to_string().contains("background done")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn supervisor_effective_permissions(
+        store: &ConversationStore,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Value {
+        store
+            .complete_history(conversation_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "turn.started" && event.payload["turnId"] == turn_id)
+            .unwrap()
+            .payload["effectivePermissions"]
+            .clone()
+    }
+
+    #[tokio::test]
     async fn a_queued_peer_hand_back_keeps_the_claude_turn_open_until_idle() {
         let (root, store, supervisor, workspace) =
             control_fixture("todex-claude-peer-handback").await;
@@ -6830,6 +7118,44 @@ elif [ -f "$(dirname "$0")/late-notification" ]; then
       printf '{"type":"system","subtype":"init"}\n'
       printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"fixture hand-back"}}}\n'
       printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"claude-native","result":"fixture hand-back"}\n'
+    ) &
+  done
+elif [ -f "$(dirname "$0")/own-work-after-idle" ]; then
+  # Frame order captured from Claude Code 2.1.299: a backgrounded command is
+  # still running at `idle`; when it finishes, Claude starts an invocation of
+  # its own. Later prompts are answered normally.
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$(dirname "$0")/stdin.log"
+    case "$line" in
+      *'"subtype":"initialize"'*)
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"todex-initialize","response":{}}}\n'
+        continue
+        ;;
+    esac
+    printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+    printf '%s\n' "$line"
+    if [ -n "$started" ]; then
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"answered"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"answered"}\n'
+      printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+      continue
+    fi
+    started=1
+    printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b74","task_type":"local_bash"}]}\n'
+    printf '{"type":"system","subtype":"task_started","task_id":"b74","is_backgrounded":true,"task_type":"local_bash"}\n'
+    printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"started"}}}\n'
+    printf '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"started"}\n'
+    printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+    (
+      sleep 0.3
+      printf '{"type":"system","subtype":"task_updated","task_id":"b74","patch":{"status":"completed"}}\n'
+      printf '{"type":"system","subtype":"task_notification","task_id":"b74","status":"completed","summary":"Background command done (exit code 0)"}\n'
+      printf '{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n'
+      printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+      printf '{"type":"system","subtype":"init"}\n'
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"background done"}}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"background done"}\n'
+      printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
     ) &
   done
 elif [ -f "$(dirname "$0")/peer-handback" ]; then

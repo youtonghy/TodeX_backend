@@ -1443,6 +1443,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                         owner_id: "local".to_owned(),
                         workspace: self.root.clone(),
                     }),
+                    ..Default::default()
                 };
                 let mut agent_mcp = None;
                 if let Some(bridge) = &self.bridge {

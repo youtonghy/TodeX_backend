@@ -80,6 +80,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
 };
 
 mod runtime;
+mod session_work;
 
 /// Slash-command catalogs captured from each process's `initialize` control
 /// response, keyed by conversation id. Kept apart from the resident process
@@ -2331,9 +2332,24 @@ fn claude_command_catalog(initialize_response: &Value) -> Vec<ProviderCommandDes
         .collect()
 }
 
-/// One turn on an initialized Claude process: sends the prompt and reads
-/// until the turn ends. A cancelled turn returns at once with the process
-/// still mid-turn; the caller interrupts or stops it.
+/// How a turn meets the Claude process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnStart {
+    /// An idle process: the prompt starts the work.
+    Prompt,
+    /// Claude already started an invocation of its own (see
+    /// [`session_work`]) that no turn took over: the prompt queues behind
+    /// it and the turn reads both.
+    AfterOwnWork,
+    /// A provider-initiated turn: nothing is sent, the turn reads the
+    /// invocation Claude started on its own.
+    Adopt,
+}
+
+/// One turn on an initialized Claude process: sends the prompt (see
+/// [`TurnStart`]) and reads until the turn ends. `work` follows the
+/// session's background work across turns. A cancelled turn returns at once
+/// with the process still mid-turn; the caller interrupts or stops it.
 #[allow(clippy::too_many_arguments)]
 async fn run_claude_turn(
     process: &mut JsonLineProcess,
@@ -2344,7 +2360,11 @@ async fn run_claude_turn(
     sink: &DriverEventSink,
     catalogs: &Catalogs,
     cancel: &mut watch::Receiver<bool>,
+    work: &mut session_work::SessionWork,
+    start: TurnStart,
 ) -> Result<DriverTurnResult, AppError> {
+    work.begin_turn();
+    let adopt = start == TurnStart::Adopt;
     let expected_mode = super::types::resolve_execution_config(
         context.manifest.provider,
         prompt.permission_mode.as_deref(),
@@ -2363,7 +2383,14 @@ async fn run_claude_turn(
             "content": claude_user_content(&prompt),
         }
     });
-    process.send(&user_message).await?;
+    if !adopt {
+        process.send(&user_message).await?;
+    }
+    // Behind Claude's own invocation, its `idle` ends nothing: only the one
+    // after Claude took (and replayed) this prompt does.
+    let mut unreplayed = (start == TurnStart::AfterOwnWork)
+        .then(|| user_message.pointer("/message/content").cloned())
+        .flatten();
     // The transcript exists once initialize succeeds; persist its id right
     // away so a failed or cancelled turn still resumes instead of hitting
     // "Session ID is already in use" on the next launch. Written after the
@@ -2398,7 +2425,12 @@ async fn run_claude_turn(
     // answered, a zero-turn `result` is a follow-up invocation for a task
     // notification another hand-back already covered; resending then would
     // replay the user's prompt into the conversation.
-    let mut empty_results = 0_u32;
+    // An adopted invocation has no prompt of ours to resend.
+    let mut empty_results = if adopt {
+        MAX_EMPTY_RESULT_RESENDS
+    } else {
+        0_u32
+    };
     // With `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` Claude reports
     // `session_state_changed`, and `idle` comes only once its input queue and
     // background work are drained. That is the authoritative end of the turn:
@@ -2408,7 +2440,8 @@ async fn run_claude_turn(
     // the process before the model reads it. `settled` holds the latest
     // successful `result` until `idle`; a CLI that never reports session
     // state falls back to `BackgroundTasks`.
-    let mut session_states = false;
+    // Claude's own invocation began with a `running` the worker already read.
+    let mut session_states = start != TurnStart::Prompt;
     let mut settled: Option<Value> = None;
     // `can_use_tool` waits on the user for up to the permission timeout, so
     // control requests are answered by detached tasks while this loop keeps
@@ -2541,6 +2574,9 @@ async fn run_claude_turn(
                 // The streamed `tool_use` start carries an empty input; the
                 // complete assistant message is the first with arguments.
                 for block in content_blocks(&message, "tool_use") {
+                    if subagent.is_none() {
+                        work.apply_tool_use(block);
+                    }
                     if let Some(id) = tools.record(block, subagent) {
                         if ClaudeSubagents::is_agent_tool(block.get("name")) {
                             if let Some(payload) = subagents.start_from_tool(block, &prompt.turn_id)
@@ -2554,9 +2590,17 @@ async fn run_claude_turn(
                 }
             }
             Some("user") => {
+                if unreplayed.is_some()
+                    && message.pointer("/message/content") == unreplayed.as_ref()
+                {
+                    unreplayed = None;
+                }
                 background_tasks.delivered(&message);
                 let subagent = message.get("parent_tool_use_id").and_then(Value::as_str);
                 for block in content_blocks(&message, "tool_result") {
+                    if subagent.is_none() {
+                        work.apply_tool_result(block, tokio::time::Instant::now());
+                    }
                     if let Some(id) = tools.complete(block, subagent) {
                         let payload = tools.payload(&id, &prompt.turn_id, "completed");
                         sink.emit("tool.completed", payload.clone()).await?;
@@ -2594,12 +2638,15 @@ async fn run_claude_turn(
                     // zero-turn `result` whose prompt was just resent.
                     if message.get("state").and_then(Value::as_str) == Some("idle") {
                         if let Some(result) = settled.take() {
-                            break result;
+                            if unreplayed.is_none() {
+                                break result;
+                            }
                         }
                     }
                     continue;
                 }
                 background_tasks.apply(&message);
+                work.apply_system(&message);
                 if let Some((event, payload)) = subagents.system_event(&message, &prompt.turn_id) {
                     sink.emit(event, payload).await?;
                 }
@@ -2670,7 +2717,8 @@ async fn run_claude_turn(
             None => {}
         }
     };
-    if !saw_output {
+    // Work Claude did on its own may end without visible output.
+    if !saw_output && !adopt {
         return Err(AppError::ProviderUnavailable(
             "Claude Code completed without producing output; please retry".to_owned(),
         ));

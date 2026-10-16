@@ -1,0 +1,29 @@
+{"scenario": "background_bash", "t": 2.0, "frame": {"type": "system", "subtype": "session_state_changed", "state": "running"}}
+{"scenario": "background_bash", "t": 2.02, "frame": {"type": "system", "subtype": "init"}}
+{"scenario": "background_bash", "t": 5.34, "frame": {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_011aaGx6WYsJEwLeCMbQcxPd", "name": "Bash", "input": {"command": "sleep 15; echo bg-done", "description": "Run delayed echo in background", "run_in_background": true}}]}}}
+{"scenario": "background_bash", "t": 6.26, "frame": {"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "b74ng0615", "run_id": "0mvajs55v-2d8d6cb5", "task_type": "local_bash", "description": "Run delayed echo in background"}]}}
+{"scenario": "background_bash", "t": 6.26, "frame": {"type": "system", "subtype": "task_started", "task_id": "b74ng0615", "run_id": "0mvajs55v-2d8d6cb5", "tool_use_id": "toolu_011aaGx6WYsJEwLeCMbQcxPd", "description": "Run delayed echo in background", "is_backgrounded": true, "task_type": "local_bash"}}
+{"scenario": "background_bash", "t": 6.26, "frame": {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_011aaGx6WYsJEwLeCMbQcxPd", "content": "Command running in background with ID: b74ng0615."}]}}}
+{"scenario": "background_bash", "t": 10.15, "frame": {"type": "assistant", "message": {"content": [{"type": "text", "text": "started"}]}}}
+{"scenario": "background_bash", "t": 10.22, "frame": {"type": "result", "subtype": "success", "is_error": false, "num_turns": 2, "result": "started"}}
+{"scenario": "background_bash", "t": 10.22, "frame": {"type": "system", "subtype": "session_state_changed", "state": "idle"}}
+{"scenario": "background_bash", "t": 21.27, "frame": {"type": "system", "subtype": "task_updated", "task_id": "b74ng0615", "run_id": "0mvajs55v-2d8d6cb5", "patch": {"status": "completed", "end_time": 1792129765063}}}
+{"scenario": "background_bash", "t": 21.27, "frame": {"type": "system", "subtype": "task_notification", "task_id": "b74ng0615", "run_id": "0mvajs55v-2d8d6cb5", "tool_use_id": "toolu_011aaGx6WYsJEwLeCMbQcxPd", "status": "completed", "summary": "Background command \"Run delayed echo in background\" completed (exit code 0)"}}
+{"scenario": "background_bash", "t": 21.27, "frame": {"type": "system", "subtype": "background_tasks_changed", "tasks": []}}
+{"scenario": "background_bash", "t": 21.3, "frame": {"type": "system", "subtype": "session_state_changed", "state": "running"}}
+{"scenario": "background_bash", "t": 21.31, "frame": {"type": "system", "subtype": "init"}}
+{"scenario": "background_bash", "t": 24.12, "frame": {"type": "assistant", "message": {"content": [{"type": "text", "text": "finished"}]}}}
+{"scenario": "background_bash", "t": 24.13, "frame": {"type": "result", "subtype": "success", "is_error": false, "num_turns": 1, "result": "finished"}}
+{"scenario": "background_bash", "t": 24.13, "frame": {"type": "system", "subtype": "session_state_changed", "state": "idle"}}
+{"scenario": "schedule_wakeup", "t": 2.0, "frame": {"type": "system", "subtype": "session_state_changed", "state": "running"}}
+{"scenario": "schedule_wakeup", "t": 2.03, "frame": {"type": "system", "subtype": "init"}}
+{"scenario": "schedule_wakeup", "t": 5.53, "frame": {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_0143gBGTVZhJhiNcSUDLKX3Y", "name": "ScheduleWakeup", "input": {"delaySeconds": 60, "prompt": "wake-test", "reason": "frame recording", "noop": false}}]}}}
+{"scenario": "schedule_wakeup", "t": 5.53, "frame": {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_0143gBGTVZhJhiNcSUDLKX3Y", "content": "Next wakeup scheduled for 13:52:00 (in 98s). If you owe the user a status update this tick, write it now as ordinary response text; then end the turn — the harness re-invokes you when the wakeup fires or a task-notification arrives."}]}}}
+{"scenario": "schedule_wakeup", "t": 7.71, "frame": {"type": "assistant", "message": {"content": [{"type": "text", "text": "scheduled"}]}}}
+{"scenario": "schedule_wakeup", "t": 7.71, "frame": {"type": "result", "subtype": "success", "is_error": false, "num_turns": 2, "result": "scheduled"}}
+{"scenario": "schedule_wakeup", "t": 7.71, "frame": {"type": "system", "subtype": "session_state_changed", "state": "idle"}}
+{"scenario": "schedule_wakeup", "t": 103.61, "frame": {"type": "system", "subtype": "session_state_changed", "state": "running"}}
+{"scenario": "schedule_wakeup", "t": 103.62, "frame": {"type": "system", "subtype": "init"}}
+{"scenario": "schedule_wakeup", "t": 106.36, "frame": {"type": "assistant", "message": {"content": [{"type": "text", "text": "woke"}]}}}
+{"scenario": "schedule_wakeup", "t": 106.37, "frame": {"type": "result", "subtype": "success", "is_error": false, "num_turns": 1, "result": "woke"}}
+{"scenario": "schedule_wakeup", "t": 106.37, "frame": {"type": "system", "subtype": "session_state_changed", "state": "idle"}}

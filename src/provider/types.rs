@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch};
@@ -285,6 +286,14 @@ pub struct TurnHandles {
     /// Takes the workspace-trust launch permit again, for a driver that
     /// releases it during a long wait before its launch.
     pub trust: Option<TrustGate>,
+    /// Opens a provider-initiated turn when the provider starts work of its
+    /// own after this turn ended (a background task finished, a scheduled
+    /// wakeup fired). `None` where no such turn can be opened.
+    pub provider_work: Option<ProviderWorkHandle>,
+    /// Set on a provider-initiated turn: the token of the work it takes
+    /// over. The driver sends no prompt and reads what the provider is
+    /// already doing.
+    pub adopt: Option<String>,
 }
 
 impl std::fmt::Debug for TurnHandles {
@@ -296,7 +305,43 @@ impl std::fmt::Debug for TurnHandles {
                 &self.mode.as_ref().map(|mode| &mode.conversation_id),
             )
             .field("trust", &self.trust.as_ref().map(|trust| &trust.workspace))
+            .field("provider_work", &self.provider_work.is_some())
+            .field("adopt", &self.adopt)
             .finish()
+    }
+}
+
+/// Work a provider started on its own between turns, to be journalled as a
+/// provider-initiated turn.
+#[derive(Debug)]
+pub struct ProviderWork {
+    /// Token the driver matches against [`TurnHandles::adopt`].
+    pub adoption: String,
+    /// The launch settings of the turn before, which the provider process
+    /// still runs with; only the control fields are used.
+    pub settings: DriverPrompt,
+    /// `triggerDetail` of the turn's `turn.started`.
+    pub trigger: Value,
+}
+
+type StartProviderWork =
+    dyn Fn(ProviderWork) -> BoxFuture<'static, Result<(), AppError>> + Send + Sync;
+
+/// Asks the supervisor to open a turn for [`ProviderWork`].
+#[derive(Clone)]
+pub struct ProviderWorkHandle(Arc<StartProviderWork>);
+
+impl ProviderWorkHandle {
+    pub(crate) fn new(
+        start: impl Fn(ProviderWork) -> BoxFuture<'static, Result<(), AppError>> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(start))
+    }
+
+    /// Resolves once the turn was opened or refused; the turn itself runs
+    /// on its own.
+    pub(crate) fn start(&self, work: ProviderWork) -> BoxFuture<'static, Result<(), AppError>> {
+        (self.0)(work)
     }
 }
 

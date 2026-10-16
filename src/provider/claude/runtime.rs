@@ -4,7 +4,9 @@
 //! stream-json` process: turns are written to the same stdin, so only the
 //! first turn pays for process start-up and `initialize`. Between turns the
 //! worker drains stdout and refuses control requests; output that is not
-//! part of a turn retires the process instead of reaching the journal. A
+//! part of a turn retires the process instead of reaching the journal,
+//! except an invocation Claude starts on its own for background work (see
+//! [`super::session_work`]): that becomes a provider-initiated turn. A
 //! turn whose launch settings ([`LaunchKey`]) differ from the running
 //! process restarts it with `--resume`. When every slot runs a turn, a new
 //! conversation falls back to a process for just that turn.
@@ -24,15 +26,27 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::super::process::JsonLineProcess;
 use super::super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ProviderPrewarm,
+    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ProviderPrewarm, ProviderWork,
+    ProviderWorkHandle,
 };
-use super::Catalogs;
+use super::session_work::SessionWork;
+use super::{Catalogs, TurnStart};
 
 /// How long a cancelled turn may take to settle after `interrupt` before
 /// its process is stopped instead of reused.
 const INTERRUPT_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long stopping a session waits for its worker to exit.
 const STOP_TIMEOUT: Duration = Duration::from_secs(6);
+/// How long work Claude started on its own waits for the supervisor's turn
+/// before the process is stopped instead.
+const ADOPT_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
+/// The longest background work keeps a process past its keepalive, counted
+/// from the end of its last turn: a backgrounded server never finishes.
+const MAX_BACKGROUND_HOLD: Duration = Duration::from_secs(6 * 3600);
 
 /// Everything a turn needs to start Claude.
 #[derive(Clone)]
@@ -104,6 +118,9 @@ impl Stop {
 struct Activity {
     pending: usize,
     idle_since: Instant,
+    /// The session holds background work (or Claude started some): evicted
+    /// only after workers without.
+    background: bool,
 }
 
 /// One turn handed to a worker, from `acquire` until the worker is done
@@ -151,10 +168,11 @@ impl Worker {
         Pending(self.activity.clone())
     }
 
-    /// When the worker last finished a turn; `None` while it owes one.
-    fn idle_since(&self) -> Option<Instant> {
+    /// When the worker last finished a turn, and whether it holds
+    /// background work; `None` while it owes a turn.
+    fn idle_since(&self) -> Option<(bool, Instant)> {
         let activity = self.activity.lock().expect("Claude worker activity lock");
-        (activity.pending == 0).then_some(activity.idle_since)
+        (activity.pending == 0).then_some((activity.background, activity.idle_since))
     }
 
     /// Stopping or stopped: it takes no new turn, and its process may still
@@ -305,6 +323,8 @@ impl Sessions {
                                 .values()
                                 .filter(|worker| !worker.stopping())
                                 .filter_map(|worker| Some((worker.idle_since()?, worker)))
+                                // Without background work first, then the
+                                // longest idle.
                                 .min_by_key(|(idle_since, _)| *idle_since)
                                 .map(|(_, worker)| worker);
                             let Some(evict) = evict else {
@@ -503,27 +523,91 @@ struct Live {
     key: LaunchKey,
     /// The process's usage counters run across its turns.
     usage: super::ClaudeUsageLedger,
+    work: SessionWork,
+    /// From the last turn: how to open a turn for work Claude starts on its
+    /// own, and the launch settings that turn reports.
+    provider_work: Option<(ProviderWorkHandle, DriverPrompt)>,
+}
+
+impl Live {
+    fn new(process: JsonLineProcess, key: LaunchKey) -> Self {
+        Self {
+            process,
+            key,
+            usage: Default::default(),
+            work: SessionWork::default(),
+            provider_work: None,
+        }
+    }
+
+    /// Asks the supervisor for a turn to take over the invocation Claude
+    /// just started; returns the adoption token, or `None` when no turn can
+    /// be opened.
+    fn offer_work(&mut self) -> Option<String> {
+        let (handle, settings) = self.provider_work.clone()?;
+        let adoption = uuid::Uuid::new_v4().simple().to_string();
+        let work = ProviderWork {
+            adoption: adoption.clone(),
+            settings,
+            trigger: self.work.trigger(Instant::now()),
+        };
+        tokio::spawn(async move {
+            if let Err(error) = handle.start(work).await {
+                tracing::warn!(%error, "could not open a turn for Claude Code's own work");
+            }
+        });
+        Some(adoption)
+    }
+}
+
+/// When an idle process stops: after the keepalive, or later while its
+/// session holds background work, bounded by [`MAX_BACKGROUND_HOLD`].
+fn idle_deadline(ended: Instant, keepalive: Duration, work: &mut SessionWork) -> Instant {
+    let base = ended + keepalive;
+    match work.hold_until(Instant::now(), ended + MAX_BACKGROUND_HOLD) {
+        Some(until) => base.max(until),
+        None => base,
+    }
+}
+
+fn mark_background(activity: &std::sync::Mutex<Activity>, background: bool) {
+    activity
+        .lock()
+        .expect("Claude worker activity lock")
+        .background = background;
+}
+
+/// What the idle worker waits for next. Unboxed like [`Request`]: it
+/// lives for one loop iteration.
+#[allow(clippy::large_enum_variant)]
+enum Next {
+    Request(Request),
+    Between(Ended),
+    Stop,
 }
 
 fn spawn_worker(launcher: Launcher, idle_timeout: Duration) -> Worker {
     let (turns, turn_rx) = mpsc::channel(1);
     let (shutdown, shutdown_rx) = watch::channel(Stop::Running);
     let (stopped_tx, stopped) = watch::channel(false);
+    let activity = Arc::new(std::sync::Mutex::new(Activity {
+        pending: 0,
+        idle_since: Instant::now(),
+        background: false,
+    }));
     tokio::spawn(worker(
         launcher,
         idle_timeout,
         turn_rx,
         shutdown_rx,
         stopped_tx,
+        activity.clone(),
     ));
     Worker {
         turns,
         shutdown,
         stopped: Exit(stopped),
-        activity: Arc::new(std::sync::Mutex::new(Activity {
-            pending: 0,
-            idle_since: Instant::now(),
-        })),
+        activity,
     }
 }
 
@@ -533,6 +617,8 @@ enum Ended {
     Reusable,
     /// The process must be stopped.
     Retire,
+    /// Claude started work of its own between turns.
+    Unsolicited,
 }
 
 async fn worker(
@@ -541,26 +627,63 @@ async fn worker(
     mut turns: mpsc::Receiver<Request>,
     mut shutdown: watch::Receiver<Stop>,
     stopped: watch::Sender<bool>,
+    activity: Arc<std::sync::Mutex<Activity>>,
 ) {
     let mut live: Option<Live> = None;
-    let mut idle_deadline = Instant::now() + idle_timeout;
+    let mut turn_ended = Instant::now();
+    let mut idle_at = turn_ended + idle_timeout;
+    // Work Claude started on its own, waiting for the supervisor's turn: the
+    // adoption token and when to give up. Its frames stay unread meanwhile.
+    let mut awaiting: Option<(String, Instant)> = None;
     loop {
-        // Biased: a requested stop wins, then a waiting turn; the idle
-        // deadline only fires when nothing else is ready.
-        let turn = tokio::select! {
+        // Biased: a requested stop wins, then a waiting turn; the deadlines
+        // only fire when nothing else is ready.
+        let next = tokio::select! {
             biased;
-            _ = shutdown.changed() => break,
-            turn = turns.recv() => match turn { Some(turn) => turn, None => break },
+            _ = shutdown.changed() => Next::Stop,
+            turn = turns.recv() => match turn { Some(turn) => Next::Request(turn), None => Next::Stop },
             between = async {
-                match live.as_mut() {
-                    Some(live) => between_turns(&mut live.process).await,
-                    None => std::future::pending().await,
+                match (live.as_mut(), &awaiting) {
+                    (Some(live), None) => between_turns(live).await,
+                    _ => std::future::pending().await,
                 }
-            } => match between {
-                Ended::Reusable => continue,
-                Ended::Retire => break,
-            },
-            _ = tokio::time::sleep_until(idle_deadline) => break,
+            } => Next::Between(between),
+            _ = async {
+                match &awaiting {
+                    Some((_, deadline)) => tokio::time::sleep_until(*deadline).await,
+                    None => tokio::time::sleep_until(idle_at).await,
+                }
+            } => {
+                if awaiting.is_some() {
+                    tracing::warn!("no turn took over Claude Code's own work; restarting its process");
+                }
+                Next::Stop
+            }
+        };
+        let turn = match next {
+            Next::Stop => break,
+            Next::Request(request) => request,
+            Next::Between(Ended::Retire) => break,
+            Next::Between(Ended::Reusable) => {
+                // A background task may have started or ended.
+                if let Some(live) = live.as_mut() {
+                    idle_at = idle_deadline(turn_ended, idle_timeout, &mut live.work);
+                    mark_background(&activity, live.work.pending());
+                }
+                continue;
+            }
+            Next::Between(Ended::Unsolicited) => {
+                let offered = live.as_mut().and_then(Live::offer_work);
+                let Some(adoption) = offered else {
+                    tracing::warn!(
+                        "Claude Code started work between turns; restarting its process"
+                    );
+                    break;
+                };
+                mark_background(&activity, true);
+                awaiting = Some((adoption, Instant::now() + ADOPT_TIMEOUT));
+                continue;
+            }
         };
         let Turn {
             run,
@@ -588,7 +711,7 @@ async fn worker(
                         // Held before `initialize`: a failed process is
                         // stopped by this worker, which stays in the table
                         // until it has exited.
-                        let started = live.insert(Live { process, key, usage: Default::default() });
+                        let started = live.insert(Live::new(process, key));
                         super::initialize_session(
                             &mut started.process,
                             &launcher.catalogs,
@@ -606,7 +729,8 @@ async fn worker(
                 match started {
                     Ok(()) => {
                         let _ = reply.send(Ok(()));
-                        idle_deadline = Instant::now() + idle_timeout;
+                        turn_ended = Instant::now();
+                        idle_at = turn_ended + idle_timeout;
                         continue;
                     }
                     Err(error) => {
@@ -623,6 +747,24 @@ async fn worker(
             mut cancel,
             permit,
         } = run;
+        let mut start = match (&context.handles.adopt, &awaiting) {
+            (Some(token), Some((expected, _))) if token == expected && live.is_some() => {
+                TurnStart::Adopt
+            }
+            // The work it was opened for is gone (the process restarted or
+            // another turn read it): nothing to take over.
+            (Some(_), _) => {
+                let session_id = super::claude_session_id(&context);
+                let _ = reply.send(Reply::Finished(Ok(nothing_to_adopt(session_id))));
+                continue;
+            }
+            // A prompt arriving first reads Claude's own invocation along
+            // with its answer: Claude queues the prompt behind it.
+            (None, Some(_)) => TurnStart::AfterOwnWork,
+            (None, None) => TurnStart::Prompt,
+        };
+        let adopt = start == TurnStart::Adopt;
+        awaiting = None;
         // Cancelled while it waited in the queue: it never reaches Claude.
         if *cancel.borrow() {
             let session_id = super::claude_session_id(&context);
@@ -637,18 +779,38 @@ async fn worker(
                 continue;
             }
         };
-        if let Some(mut stale) = live.take_if(|live| live.key != key) {
+        // An adopted invocation runs on the process that started it.
+        if let Some(mut stale) = live.take_if(|live| !adopt && live.key != key) {
             // Never two processes on one transcript: the old one is gone
-            // before the new one resumes it.
+            // before the new one resumes it, Claude's own work with it.
             stale.process.terminate().await;
+            start = TurnStart::Prompt;
         }
-        let session_id = key.session_id.clone();
+        let session_id = live.as_ref().filter(|_| adopt).map_or_else(
+            || key.session_id.clone(),
+            |live| live.key.session_id.clone(),
+        );
+        let mut pending_provider_work = None;
+        if !adopt {
+            // The settings a later provider-initiated turn reports.
+            let settings = DriverPrompt {
+                text: String::new(),
+                content: Vec::new(),
+                skills: Vec::new(),
+                ..prompt.clone()
+            };
+            pending_provider_work = context
+                .handles
+                .provider_work
+                .clone()
+                .map(|handle| (handle, settings));
+        }
         let outcome = tokio::select! {
             outcome = async {
                 if live.is_none() {
                     let (process, runtime_id) =
                         super::spawn_claude(&launcher.binary, &context, &prompt, permit).await?;
-                    let started = live.insert(Live { process, key, usage: Default::default() });
+                    let started = live.insert(Live::new(process, key));
                     super::initialize_session(
                         &mut started.process,
                         &launcher.catalogs,
@@ -663,16 +825,21 @@ async fn worker(
                 if *cancel.borrow() {
                     return Ok(None);
                 }
-                let Live { process, usage, .. } = live.as_mut().expect("started process");
+                let started = live.as_mut().expect("started process");
+                if let Some(provider_work) = pending_provider_work.take() {
+                    started.provider_work = Some(provider_work);
+                }
                 super::run_claude_turn(
-                    process,
-                    usage,
+                    &mut started.process,
+                    &mut started.usage,
                     context,
                     prompt,
                     session_id.clone(),
                     &sink,
                     &launcher.catalogs,
                     &mut cancel,
+                    &mut started.work,
+                    start,
                 )
                 .await
                 .map(Some)
@@ -711,8 +878,13 @@ async fn worker(
             break;
         }
         // Done with the turn, interrupt included: the worker may be idle.
+        turn_ended = Instant::now();
+        idle_at = turn_ended + idle_timeout;
+        if let Some(live) = live.as_mut() {
+            idle_at = idle_deadline(turn_ended, idle_timeout, &mut live.work);
+            mark_background(&activity, live.work.pending());
+        }
         drop(pending);
-        idle_deadline = Instant::now() + idle_timeout;
     }
     turns.close();
     if let Some(mut live) = live {
@@ -737,8 +909,10 @@ async fn worker(
     let _ = stopped.send(true);
 }
 
-/// Reads one frame while no turn runs. Nothing here reaches the journal.
-async fn between_turns(process: &mut JsonLineProcess) -> Ended {
+/// Reads one frame while no turn runs. Nothing here reaches the journal;
+/// background task frames update the session's work.
+async fn between_turns(live: &mut Live) -> Ended {
+    let process = &mut live.process;
     let message = match process.read().await {
         Ok(Some(message)) => message,
         Ok(None) | Err(_) => return Ended::Retire,
@@ -763,10 +937,22 @@ async fn between_turns(process: &mut JsonLineProcess) -> Ended {
             if message.get("subtype").and_then(Value::as_str) == Some("session_state_changed")
                 && message.get("state").and_then(Value::as_str) == Some("running") =>
         {
-            tracing::warn!("Claude Code started work between turns; restarting its process");
-            Ended::Retire
+            Ended::Unsolicited
+        }
+        Some("system") => {
+            live.work.apply_system(&message);
+            Ended::Reusable
         }
         _ => Ended::Reusable,
+    }
+}
+
+/// The result of a provider-initiated turn whose work was already gone.
+fn nothing_to_adopt(session_id: String) -> DriverTurnResult {
+    DriverTurnResult {
+        native_session_id: Some(session_id),
+        stop_reason: "no_work".to_owned(),
+        cancelled: false,
     }
 }
 
@@ -840,6 +1026,11 @@ async fn run_once(
         permit,
     } = run;
     let session_id = super::claude_session_id(&context);
+    // Claude's own work lived on a resident process this one is not.
+    if context.handles.adopt.is_some() {
+        let _ = exited.send(true);
+        return Ok(nothing_to_adopt(session_id));
+    }
     if *cancel.borrow() {
         return Ok(cancelled_before_start(session_id));
     }
@@ -857,6 +1048,7 @@ async fn run_once(
         if *cancel.borrow() {
             return Ok(cancelled_before_start(session_id.clone()));
         }
+        // The process ends with the turn, and its background work with it.
         super::run_claude_turn(
             &mut process,
             &mut super::ClaudeUsageLedger::default(),
@@ -866,6 +1058,8 @@ async fn run_once(
             &sink,
             &launcher.catalogs,
             &mut cancel,
+            &mut SessionWork::default(),
+            TurnStart::Prompt,
         )
         .await
     }
@@ -883,7 +1077,7 @@ mod tests {
     use crate::conversation::{
         ConversationEventHub, ConversationManifest, ConversationStore, ProviderKind, ProviderState,
     };
-    use crate::provider::types::PermissionBroker;
+    use crate::provider::types::{PermissionBroker, TurnHandles};
     use crate::workspace_trust::WorkspaceTrustStore;
     use std::path::Path;
 
@@ -892,7 +1086,10 @@ mod tests {
     /// honors `interrupt`, `interruptible` streams until interrupted
     /// (`slow-interruptible` takes a moment to honor it), `slow-exit` makes
     /// SIGTERM take a moment, `late-permission` / `late-output` follow the
-    /// turn with a frame while no turn runs. Every launch's argv and every
+    /// turn with a frame while no turn runs, `background` leaves a background
+    /// task that finishes once a `finish-bg` file appears, after which Claude
+    /// starts an invocation of its own (as Claude Code 2.1.299 does). User
+    /// lines are replayed, as with `--replay-user-messages`. Every launch's argv and every
     /// stdin line are logged; a launch while another process of the same
     /// session still runs is logged to `overlap.log`.
     const FAKE_CLAUDE: &str = r#"#!/bin/sh
@@ -931,6 +1128,7 @@ while IFS= read -r line; do
     *'"type":"control_response"'*) continue ;;
   esac
   printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+  printf '%s\n' "$line"
   case "$line" in *slow-exit*) slow_exit=1 ;; esac
   case "$line" in *slow-interrupt*) slow=1 ;; esac
   case "$line" in
@@ -944,6 +1142,25 @@ while IFS= read -r line; do
   esac
   mode=
   slow=
+  case "$line" in
+    *background*)
+      printf '{"type":"system","subtype":"task_started","task_id":"bg-1","is_backgrounded":true,"task_type":"local_bash"}\n'
+      printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bg-1"}]}\n'
+      parent=$$
+      (
+        while [ ! -f "$dir/finish-bg" ] && kill -0 "$parent" 2>/dev/null; do sleep 0.02; done
+        [ -f "$dir/finish-bg" ] || exit 0
+        rm -f "$dir/finish-bg"
+        printf '{"type":"system","subtype":"task_notification","task_id":"bg-1","status":"completed","task_type":"local_bash","summary":"Background command x completed (exit code 0)"}\n'
+        printf '{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n'
+        printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
+        printf '{"type":"system","subtype":"init"}\n'
+        printf '{"type":"assistant","message":{"content":[{"type":"text","text":"own work done"}]}}\n'
+        printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"own work done"}\n'
+        printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
+      ) &
+      ;;
+  esac
   printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}}\n'
   printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"ok"}\n'
   printf '{"type":"system","subtype":"session_state_changed","state":"idle"}\n'
@@ -1013,6 +1230,26 @@ done
             model: Option<&str>,
             cancel: watch::Receiver<bool>,
         ) -> Result<DriverTurnResult, AppError> {
+            self.run_with(
+                sessions,
+                manifest,
+                text,
+                model,
+                cancel,
+                TurnHandles::default(),
+            )
+            .await
+        }
+
+        async fn run_with(
+            &self,
+            sessions: &Sessions,
+            manifest: &ConversationManifest,
+            text: &str,
+            model: Option<&str>,
+            cancel: watch::Receiver<bool>,
+            handles: TurnHandles,
+        ) -> Result<DriverTurnResult, AppError> {
             let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
             let sink = DriverEventSink::new(
                 self.store.clone(),
@@ -1031,7 +1268,7 @@ done
                     manifest: manifest.clone(),
                     provider_state,
                     agent_mcp: None,
-                    handles: Default::default(),
+                    handles,
                 },
                 prompt: DriverPrompt {
                     turn_id,
@@ -1296,6 +1533,239 @@ done
         second_result.unwrap();
         third_result.unwrap();
         assert_eq!(fixture.launches().len(), 4);
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    /// What the worker offers the supervisor, recorded instead of opening a
+    /// turn.
+    fn recorded_offers() -> (ProviderWorkHandle, mpsc::UnboundedReceiver<ProviderWork>) {
+        let (offers, received) = mpsc::unbounded_channel();
+        let handle = ProviderWorkHandle::new(move |work| {
+            let _ = offers.send(work);
+            Box::pin(async { Ok(()) })
+        });
+        (handle, received)
+    }
+
+    fn offering(handle: &ProviderWorkHandle) -> TurnHandles {
+        TurnHandles {
+            provider_work: Some(handle.clone()),
+            ..TurnHandles::default()
+        }
+    }
+
+    fn adopting(token: &str) -> TurnHandles {
+        TurnHandles {
+            adopt: Some(token.to_owned()),
+            ..TurnHandles::default()
+        }
+    }
+
+    impl Fixture {
+        async fn turn_with(
+            &self,
+            sessions: &Sessions,
+            manifest: &ConversationManifest,
+            text: &str,
+            handles: TurnHandles,
+        ) -> DriverTurnResult {
+            let (_cancel, cancel) = watch::channel(false);
+            self.run_with(sessions, manifest, text, None, cancel, handles)
+                .await
+                .unwrap()
+        }
+
+        fn finish_background(&self) {
+            std::fs::write(self.root.join("finish-bg"), "").unwrap();
+        }
+
+        async fn history_text(&self, manifest: &ConversationManifest) -> String {
+            self.store
+                .complete_history(&manifest.id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|event| event.payload.to_string())
+                .collect()
+        }
+    }
+
+    async fn next_offer(offers: &mut mpsc::UnboundedReceiver<ProviderWork>) -> ProviderWork {
+        tokio::time::timeout(Duration::from_secs(10), offers.recv())
+            .await
+            .expect("work offered in time")
+            .expect("offer channel open")
+    }
+
+    /// The incident behind this: a backgrounded command finished after the
+    /// turn ended, Claude started an invocation of its own, and TodeX
+    /// stopped the process, losing the work and any scheduled wakeup.
+    #[tokio::test]
+    async fn work_claude_starts_after_a_turn_is_offered_and_adopted_on_its_process() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let (handle, mut offers) = recorded_offers();
+        fixture
+            .turn_with(&sessions, &manifest, "background", offering(&handle))
+            .await;
+        fixture.finish_background();
+        let work = next_offer(&mut offers).await;
+        assert_eq!(work.trigger["kind"], "background_task");
+        assert_eq!(work.trigger["taskIds"], json!(["bg-1"]));
+        assert_eq!(work.trigger["taskType"], "local_bash");
+        assert!(work.settings.text.is_empty());
+
+        let adopted = fixture
+            .turn_with(&sessions, &manifest, "unused", adopting(&work.adoption))
+            .await;
+        assert!(!adopted.cancelled);
+        assert!(fixture
+            .history_text(&manifest)
+            .await
+            .contains("own work done"));
+        // Nothing was sent for the adopted turn.
+        assert_eq!(fixture.wire().matches(r#""type":"user""#).count(), 1);
+
+        fixture.turn(&sessions, &manifest, "after").await;
+        assert_eq!(fixture.launches().len(), 1);
+        assert!(fixture.overlaps().is_empty());
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn background_work_keeps_the_process_past_its_keepalive() {
+        let fixture = Fixture::new().await;
+        let sessions = Sessions::new(Duration::from_millis(200), 16);
+        let busy = fixture.conversation().await;
+        let quiet = fixture.conversation().await;
+        let (handle, mut offers) = recorded_offers();
+        fixture
+            .turn_with(&sessions, &busy, "background", offering(&handle))
+            .await;
+        fixture.turn(&sessions, &quiet, "plain").await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(sessions.holds(&busy.id).await);
+        assert!(!sessions.holds(&quiet.id).await);
+
+        // Once the work is done the keepalive applies again.
+        fixture.finish_background();
+        let work = next_offer(&mut offers).await;
+        fixture
+            .turn_with(&sessions, &busy, "unused", adopting(&work.adoption))
+            .await;
+        wait_until(|| {
+            sessions
+                .table
+                .try_lock()
+                .is_ok_and(|table| table.workers.values().all(Worker::stopping))
+        })
+        .await;
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn own_work_nobody_can_take_over_restarts_the_process() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        // No handle: the turn came from somewhere that cannot open turns.
+        fixture.turn(&sessions, &manifest, "background").await;
+        fixture.finish_background();
+        wait_until(|| {
+            sessions
+                .table
+                .try_lock()
+                .is_ok_and(|table| table.workers.values().all(Worker::stopping))
+        })
+        .await;
+        fixture.turn(&sessions, &manifest, "after").await;
+        assert_eq!(fixture.launches().len(), 2);
+        assert!(!fixture
+            .history_text(&manifest)
+            .await
+            .contains("own work done"));
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn an_offer_not_taken_in_time_restarts_the_process_and_its_late_turn_finds_nothing() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let (handle, mut offers) = recorded_offers();
+        fixture
+            .turn_with(&sessions, &manifest, "background", offering(&handle))
+            .await;
+        fixture.finish_background();
+        let work = next_offer(&mut offers).await;
+        wait_until(|| {
+            sessions
+                .table
+                .try_lock()
+                .is_ok_and(|table| table.workers.values().all(Worker::stopping))
+        })
+        .await;
+        let late = fixture
+            .turn_with(&sessions, &manifest, "unused", adopting(&work.adoption))
+            .await;
+        assert_eq!(late.stop_reason, "no_work");
+        // The late turn started no process.
+        assert_eq!(fixture.launches().len(), 1);
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_arriving_before_the_takeover_reads_claudes_work_and_its_answer() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let (handle, mut offers) = recorded_offers();
+        fixture
+            .turn_with(&sessions, &manifest, "background", offering(&handle))
+            .await;
+        fixture.finish_background();
+        let work = next_offer(&mut offers).await;
+        let result = fixture
+            .turn_with(&sessions, &manifest, "user-next", offering(&handle))
+            .await;
+        assert!(!result.cancelled);
+        let history = fixture.history_text(&manifest).await;
+        assert!(history.contains("own work done"));
+        // Its own answer belongs to this turn, not to another offer.
+        let late = fixture
+            .turn_with(&sessions, &manifest, "unused", adopting(&work.adoption))
+            .await;
+        assert_eq!(late.stop_reason, "no_work");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(offers.try_recv().is_err());
+        fixture.turn(&sessions, &manifest, "after").await;
+        assert_eq!(fixture.launches().len(), 1);
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn the_limit_evicts_sessions_without_background_work_first() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(2);
+        let busy = fixture.conversation().await;
+        let quiet = fixture.conversation().await;
+        let third = fixture.conversation().await;
+        let (handle, _offers) = recorded_offers();
+        // Idle the longest, but holding background work.
+        fixture
+            .turn_with(&sessions, &busy, "background", offering(&handle))
+            .await;
+        fixture.turn(&sessions, &quiet, "plain").await;
+        fixture.turn(&sessions, &third, "plain").await;
+        assert!(sessions.holds(&busy.id).await);
+        assert!(!sessions.holds(&quiet.id).await);
         sessions.stop_all().await;
         cleanup(&fixture.root);
     }

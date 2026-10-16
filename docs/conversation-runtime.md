@@ -30,7 +30,18 @@ optional and canonical aliases are recomputed when old journals are replayed.
   `user` frame to it; a changed launch setting (model, effort, permission
   mode, MCP config, settings) or a dead process restarts it with `--resume`.
   Between turns stdout is drained, not journalled: control requests are
-  refused and unprompted output retires the process. Cancel returns at once,
+  refused and unprompted output retires the process. Background work outlives
+  the turn: a backgrounded Bash task, a pending `ScheduleWakeup` or a
+  `CronCreate` job keeps the process past the keepalive (at most 6 h after
+  the last turn; a wakeup until 2 min after it is due), and such sessions are
+  evicted last. When that work finishes or fires, Claude starts an invocation
+  of its own (`running` between turns); the worker leaves its frames unread
+  and asks the supervisor for a provider-initiated turn (`trigger:
+  "provider"` on `turn.started`, no user message, the previous turn's launch
+  settings), which reads them on the same process. If that turn cannot open
+  within 10 s the process is retired as before; a prompt that gets there
+  first reads Claude's invocation together with its own answer, ending only
+  at the `idle` after Claude replayed the prompt. Cancel returns at once,
   then sends `interrupt` and keeps the process only if it settles to `idle`
   within 5 s.
 - Claude Code `result` frames close a model turn, not the process. Claude runs
