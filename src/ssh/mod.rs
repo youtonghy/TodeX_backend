@@ -1309,7 +1309,10 @@ exit 0
             aliases,
             [("db", HostSource::Managed), ("web", HostSource::SshConfig)]
         );
-        let web = hosts[1].resolved.as_ref().unwrap_or_else(|| panic!("{:?}", hosts[1].resolve_error));
+        let web = hosts[1]
+            .resolved
+            .as_ref()
+            .unwrap_or_else(|| panic!("{:?}", hosts[1].resolve_error));
         assert_eq!(web.host_name.as_deref(), Some("web.example"));
         assert_eq!(web.port, Some(22));
         assert!(hosts.iter().all(|host| !host.agent_access));
