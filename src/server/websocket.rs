@@ -1026,7 +1026,7 @@ async fn dispatch(
             // An SSH terminal only reaches a host from the inventory; it is
             // not tied to a workspace, so workspace roots and trust do not
             // apply. Local shells keep both checks.
-            let (cwd, command) = match &payload.ssh {
+            let (cwd, command, askpass_secret) = match &payload.ssh {
                 Some(target) => {
                     state.ssh.require_host(&target.host).await?;
                     let password = target
@@ -1034,11 +1034,11 @@ async fn dispatch(
                         .clone()
                         .map(Zeroizing::new)
                         .filter(|password| !password.is_empty());
-                    let command = state
+                    let (command, secret) = state
                         .ssh
                         .terminal_command(&target.host, password.as_deref().map(String::as_str))
                         .await?;
-                    (command.cwd.display().to_string(), Some(command))
+                    (command.cwd.display().to_string(), Some(command), secret)
                 }
                 None => {
                     let cwd = validate_workspace_directory_text(
@@ -1049,7 +1049,7 @@ async fn dispatch(
                         .workspace_trust
                         .ensure_trusted(&payload.tenant_id, &cwd)
                         .await?;
-                    (cwd.display().to_string(), None)
+                    (cwd.display().to_string(), None, None)
                 }
             };
             state
@@ -1070,6 +1070,11 @@ async fn dispatch(
                     command,
                 })
                 .await?;
+            // A failed start dropped the password file above; a running ssh
+            // gets until the deadline to read it.
+            if let Some(secret) = askpass_secret {
+                secret.expire_after(crate::ssh::TERMINAL_ASKPASS_DEADLINE);
+            }
         }
         ClientMessageKind::TerminalInput(payload) => {
             authorize_terminal_request(

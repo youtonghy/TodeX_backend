@@ -5,7 +5,8 @@
 //! uses a generated `-F` wrapper that includes both, TodeX's connection
 //! defaults (`defaults.conf`) and the system config, so OpenSSH itself handles
 //! keys, agents, ProxyJump and `known_hosts`. TodeX never stores passwords: a
-//! client may send one per connection, answered via the askpass helper.
+//! client may send one per connection, answered via the askpass helper from
+//! a one-shot file (see [`askpass`]).
 
 pub(crate) mod config_file;
 pub(crate) mod keys;
@@ -29,7 +30,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     external_command::{self, bounded_text, prepare_captured, CommandLimits, ExternalCommandError},
-    remote_fs::askpass,
+    remote_fs::askpass::{self, AskpassSecret},
     secure_fs,
 };
 
@@ -40,6 +41,12 @@ const MANAGED_HOSTS_FILE: &str = "hosts.conf";
 const DEFAULTS_FILE: &str = "defaults.conf";
 const WRAPPER_FILE: &str = "ssh_config";
 const CONTROL_DIR: &str = "cm";
+/// One-shot password files for the askpass helper.
+const ASKPASS_DIR: &str = "askpass";
+/// How long a terminal's password file may wait for ssh's prompt. The
+/// terminal's ssh may become the long-lived shared master, so the file is
+/// not tied to that process.
+pub(crate) const TERMINAL_ASKPASS_DEADLINE: Duration = Duration::from_secs(120);
 /// `ssh -G` output only changes when config files change; a short cache keeps
 /// host lists fast without watching files.
 const RESOLVE_TTL: Duration = Duration::from_secs(30);
@@ -236,11 +243,14 @@ impl SshService {
             // The parent holds the managed config, host store and control
             // sockets, so it is owner-only too (also tightening older data
             // directories created with the default umask).
+            // Password files left by a daemon that did not exit cleanly
+            // are removed.
             let dir = dir.clone();
             let control_dir = control_dir.clone();
             tokio::task::spawn_blocking(move || {
                 secure_fs::ensure_owner_only_dir(&dir)?;
-                secure_fs::ensure_owner_only_dir(&control_dir)
+                secure_fs::ensure_owner_only_dir(&control_dir)?;
+                askpass::purge(&dir.join(ASKPASS_DIR))
             })
             .await
             .map_err(|error| AppError::Anyhow(error.into()))??;
@@ -327,11 +337,13 @@ impl SshService {
     /// instead. Unknown host keys are then rejected rather than asked about,
     /// so the client can retry without a password to confirm them. Hosts
     /// behind ProxyJump/ProxyCommand ignore the password and prompt as usual.
+    /// The caller keeps the returned secret until ssh started, then hands it
+    /// to [`AskpassSecret::expire_after`] with [`TERMINAL_ASKPASS_DEADLINE`].
     pub(crate) async fn terminal_command(
         &self,
         alias: &str,
         password: Option<&str>,
-    ) -> Result<TerminalCommand, AppError> {
+    ) -> Result<(TerminalCommand, Option<AskpassSecret>), AppError> {
         let mut args = self.options(SshMode::Interactive);
         let mut env: Vec<(String, OsString)> = external_command::inherited_env()
             .into_iter()
@@ -347,7 +359,7 @@ impl SshService {
             },
             None => None,
         };
-        if let Some(vars) = askpass {
+        let secret = askpass.map(|(vars, secret)| {
             env.extend(vars.map(|(key, value)| (key.to_owned(), value)));
             env.push(("SSH_ASKPASS_REQUIRE".to_owned(), "force".into()));
             args.extend(
@@ -359,9 +371,10 @@ impl SshService {
                 ]
                 .map(OsString::from),
             );
-        }
+            secret
+        });
         args.extend(["-tt".into(), "--".into(), alias.into()]);
-        Ok(TerminalCommand {
+        let command = TerminalCommand {
             program: self.inner.ssh_bin.clone(),
             args,
             env,
@@ -371,18 +384,20 @@ impl SshService {
                 .clone()
                 .unwrap_or_else(|| self.inner.dir.clone()),
             ssh_host: alias.to_owned(),
-        })
+        };
+        Ok((command, secret))
     }
 
     /// Environment that lets one ssh child answer a password prompt with
-    /// `password` through the askpass helper. Refused for hosts behind a jump
-    /// host or proxy program: those inherit ssh's environment, and a jump
-    /// host's own password prompt would receive the secret.
+    /// `password` through the askpass helper, and the guard of the file that
+    /// holds it (the environment only names the file). Refused for hosts
+    /// behind a jump host or proxy program: those inherit ssh's environment,
+    /// and a jump host's own password prompt would receive the secret.
     pub(crate) async fn askpass_env(
         &self,
         alias: &str,
         password: &str,
-    ) -> Result<[(&'static str, OsString); 2], AppError> {
+    ) -> Result<([(&'static str, OsString); 2], AskpassSecret), AppError> {
         let resolved = self.resolved_host(alias).await?;
         if resolved.proxy_jump.is_some() || resolved.proxy_command.is_some() {
             return Err(AppError::InvalidRequest(
@@ -395,10 +410,18 @@ impl SshService {
         let program = std::env::current_exe().map_err(|error| {
             AppError::Unsupported(format!("askpass helper unavailable: {error}"))
         })?;
-        Ok([
-            ("SSH_ASKPASS", program.into()),
-            (askpass::SECRET_ENV, password.into()),
-        ])
+        let dir = self.inner.dir.join(ASKPASS_DIR);
+        let password = zeroize::Zeroizing::new(password.to_owned());
+        let secret = tokio::task::spawn_blocking(move || AskpassSecret::create(&dir, &password))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
+        Ok((
+            [
+                ("SSH_ASKPASS", program.into()),
+                (askpass::FILE_ENV, secret.path().into()),
+            ],
+            secret,
+        ))
     }
 
     fn options(&self, mode: SshMode) -> Vec<OsString> {
@@ -420,8 +443,8 @@ impl SshService {
 
     fn control_options(&self, mode: SshMode) -> Vec<OsString> {
         let control_path = self.inner.dir.join(CONTROL_DIR).join("%C");
-        // An askpass process carries a password in its environment; it may
-        // use an existing master but must not become a long-lived one.
+        // An askpass process may use an existing master but must not become
+        // a long-lived one that outlives the request.
         let master = if mode == SshMode::Askpass {
             "no"
         } else {
@@ -760,13 +783,15 @@ impl SshService {
         password: Option<&str>,
     ) -> Result<ConnectionTestResult, AppError> {
         self.require_host(alias).await?;
-        let mut command = match password {
+        // The password file lives until ssh exited.
+        let (mut command, _secret) = match password {
             Some(password) => {
                 let mut command = self.command(SshMode::Askpass);
-                command.envs(self.askpass_env(alias, password).await?);
-                command
+                let (vars, secret) = self.askpass_env(alias, password).await?;
+                command.envs(vars);
+                (command, Some(secret))
             }
-            None => self.command(SshMode::Batch),
+            None => (self.command(SshMode::Batch), None),
         };
         // `exit 0` works in sh, cmd.exe and PowerShell login shells alike.
         command.arg("--").arg(alias).arg("exit 0");
@@ -989,7 +1014,8 @@ pub(crate) mod tests {
     }
 
     /// A fake `ssh` that answers `-G` like OpenSSH and logs every argv; hosts
-    /// named `bad*` fail authentication.
+    /// named `bad*` fail authentication. With an askpass file it also logs
+    /// its environment and whether the file existed to `askpass.log`.
     pub(crate) async fn fixture(user_config: &str) -> Fixture {
         let root = std::env::temp_dir().join(format!("todex-ssh-{}", Uuid::new_v4().simple()));
         let home = root.join("home");
@@ -1001,6 +1027,10 @@ pub(crate) mod tests {
             format!(
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> "{log}"
+if [ -n "$TODEX_SSH_ASKPASS_FILE" ]; then
+  env >> "{askpass_log}"
+  [ -f "$TODEX_SSH_ASKPASS_FILE" ] && echo "askpass-file-present" >> "{askpass_log}"
+fi
 last=""; for arg in "$@"; do prev="$last"; last="$arg"; done
 case " $* " in
   *" -G "*) printf 'hostname %s.example\nuser ops\nport 22\nidentityfile ~/.ssh/id_ed25519\n' "$last"; exit 0;;
@@ -1010,7 +1040,8 @@ case "$prev" in
 esac
 exit 0
 "#,
-                log = root.join("ssh.log").display()
+                log = root.join("ssh.log").display(),
+                askpass_log = root.join("askpass.log").display(),
             ),
         )
         .unwrap();
@@ -1191,25 +1222,34 @@ exit 0
         assert!(test_line.contains("-- good exit 0"));
     }
 
+    pub(crate) fn askpass_files(fixture: &Fixture) -> Vec<PathBuf> {
+        std::fs::read_dir(fixture.root.join("data/ssh").join(ASKPASS_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
     #[tokio::test]
     async fn terminal_password_goes_to_askpass_only() {
         let fixture = fixture("Host good\n").await;
-        let plain = fixture
+        let (plain, secret) = fixture
             .service
             .terminal_command("good", None)
             .await
             .unwrap();
-        assert!(!plain.env.iter().any(|(key, _)| key == askpass::SECRET_ENV));
+        assert!(secret.is_none());
+        assert!(!plain.env.iter().any(|(key, _)| key == askpass::FILE_ENV));
         assert!(!plain
             .args
             .iter()
             .any(|arg| arg == "NumberOfPasswordPrompts=1"));
 
-        let command = fixture
+        let (command, secret) = fixture
             .service
             .terminal_command("good", Some("hunter2"))
             .await
             .unwrap();
+        let secret = secret.unwrap();
         let env = |name: &str| {
             command
                 .env
@@ -1217,9 +1257,14 @@ exit 0
                 .find(|(key, _)| key == name)
                 .map(|(_, value)| value.clone())
         };
-        assert_eq!(env(askpass::SECRET_ENV), Some("hunter2".into()));
+        assert_eq!(env(askpass::FILE_ENV), Some(secret.path().into()));
         assert_eq!(env("SSH_ASKPASS_REQUIRE"), Some("force".into()));
         assert!(env("SSH_ASKPASS").is_some());
+        assert!(!command
+            .env
+            .iter()
+            .any(|(_, value)| value.to_string_lossy().contains("hunter2")));
+        assert_eq!(std::fs::read(secret.path()).unwrap(), b"hunter2");
         let args: Vec<String> = command
             .args
             .iter()
@@ -1230,6 +1275,44 @@ exit 0
             args.contains("-o NumberOfPasswordPrompts=1 -o StrictHostKeyChecking=yes -tt -- good")
         );
         assert!(!args.contains("hunter2"));
+
+        // The terminal deadline deletes a file ssh never asked for.
+        let path = secret.path().to_owned();
+        secret.expire_after(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!path.exists());
+        assert!(askpass_files(&fixture).is_empty());
+    }
+
+    #[tokio::test]
+    async fn password_test_keeps_the_secret_out_of_the_environment() {
+        let fixture = fixture("Host good\n").await;
+        let result = fixture
+            .service
+            .test_connection("good", Some("hunter2-secret"))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let log = std::fs::read_to_string(fixture.root.join("askpass.log")).unwrap();
+        assert!(log.contains("askpass-file-present"), "{log}");
+        assert!(log.contains(askpass::FILE_ENV), "{log}");
+        assert!(!log.contains("hunter2-secret"), "{log}");
+        assert!(askpass_files(&fixture).is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_purges_leftover_askpass_files() {
+        let fixture = fixture("").await;
+        let dir = fixture.root.join("data/ssh").join(ASKPASS_DIR);
+        std::fs::write(dir.join("leftover"), "old").unwrap();
+        SshService::with_home(
+            &fixture.root.join("data"),
+            "ssh".into(),
+            Some(fixture.root.join("home")),
+        )
+        .await
+        .unwrap();
+        assert!(askpass_files(&fixture).is_empty());
     }
 
     #[tokio::test]

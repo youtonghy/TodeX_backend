@@ -55,13 +55,16 @@ impl SftpFs {
         alias: &str,
         password: Option<Zeroizing<String>>,
     ) -> Result<Self, AppError> {
-        let mut command = match &password {
+        // The password file outlives authentication only until this returns:
+        // a finished SFTP handshake means ssh is past its prompts.
+        let (mut command, _secret) = match &password {
             Some(password) => {
                 let mut command = ssh.command(SshMode::Askpass);
-                command.envs(ssh.askpass_env(alias, password).await?);
-                command
+                let (vars, secret) = ssh.askpass_env(alias, password).await?;
+                command.envs(vars);
+                (command, Some(secret))
             }
-            None => ssh.command(SshMode::Batch),
+            None => (ssh.command(SshMode::Batch), None),
         };
         drop(password);
         command
@@ -98,7 +101,6 @@ impl SftpFs {
                 AppError::RemoteFailed(format!("ssh could not be started: {error}"))
             }
         })?;
-        // The child's copy of the environment is all that held the secret.
         drop(command);
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let stderr_task = tokio::spawn(collect_stderr(child.stderr.take(), stderr.clone()));
@@ -546,6 +548,25 @@ mod tests {
         assert_eq!(error.code(), "REMOTE_UNREACHABLE");
         let error = connect_error("db", "subsystem request failed on channel 0", None);
         assert_eq!(error.code(), "REMOTE_OPERATION_FAILED");
+    }
+
+    /// The fake ssh exits without speaking SFTP, so the connect fails; the
+    /// password must still have reached it only as a file, gone afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn password_reaches_ssh_only_as_a_one_shot_file() {
+        let fixture = crate::ssh::tests::fixture("Host good\n").await;
+        let result = SftpFs::connect(
+            &fixture.service,
+            "good",
+            Some(Zeroizing::new("hunter2-secret".to_owned())),
+        )
+        .await;
+        assert!(result.is_err());
+        let log = std::fs::read_to_string(fixture.root.join("askpass.log")).unwrap();
+        assert!(log.contains("askpass-file-present"), "{log}");
+        assert!(!log.contains("hunter2-secret"), "{log}");
+        assert!(crate::ssh::tests::askpass_files(&fixture).is_empty());
     }
 
     /// Real roundtrip against `TODEX_REMOTE_FS_SFTP_TEST=<alias>`, an ssh
