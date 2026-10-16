@@ -910,7 +910,7 @@ GET /v2/workspace/directories?path=/home/user/projects/demo
 POST /v2/workspace/directories
 ```
 
-请求体 `{ "parent": "/home/user/projects", "name": "demo" }`，在 `parent` 下新建一级目录，响应与 `GET` 相同，`current` 为新目录的规范路径。`parent` 必须是任一根目录或其子目录；`name` 去除首尾空白后必须是单个路径组件（非空、不超过 255 字节、不是 `.`/`..`、不含 `/`、`\` 或控制字符），否则返回 `400 INVALID_REQUEST`。从不创建多级目录，也从不覆盖：同名条目已存在时返回 `409 CONFLICT`。
+请求体 `{ "parent": "/home/user/projects", "name": "demo" }`，在 `parent` 下新建一级目录，响应与 `GET` 相同，`current` 为新目录的规范路径。`parent` 必须是任一根目录或其子目录；`name` 去除首尾空白后必须是单个路径组件，否则返回 `400 INVALID_REQUEST`：非空、不超过 255 字节（按 UTF-8 字节计）、不是 `.`/`..`，在所有平台上都不含 `/ \ : * ? " < > |`、控制字符或 Unicode 格式字符（类别 Cf，如双向控制符 U+202A–U+202E、U+2066–U+2069，零宽字符 U+200B–U+200F、U+FEFF）；Windows 上还拒绝设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9`、`LPT1`–`LPT9` 及 `COM¹²³`/`LPT¹²³`，不区分大小写，带不带扩展名都算）和以 `.` 结尾的名称。以 `.` 开头的隐藏目录可以创建，但不会出现在目录列表中。从不创建多级目录，也从不覆盖：同名条目（包括悬空符号链接）已存在时返回 `409 CONFLICT`，并发创建同名目录只有一个成功。创建后若新目录的规范路径校验失败，会删除该目录并返回错误。
 
 ### 文件 `@` 引用建议
 

@@ -675,6 +675,12 @@ pub(super) async fn create_workspace_directory(
     let parent = validate_workspace_directory_text(&state.config.workspace_roots, &request.parent)?;
     let name = validate_new_directory_name(&request.name)?;
     let target = parent.join(name);
+    // A prefix or root component would make `join` replace `parent`.
+    if target.parent() != Some(parent.as_path()) {
+        return Err(AppError::InvalidRequest(
+            "folder name must be a single path component".to_owned(),
+        ));
+    }
     match tokio::fs::create_dir(&target).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -689,8 +695,15 @@ pub(super) async fn create_workspace_directory(
         Err(error) => return Err(error.into()),
     }
     // `parent` is canonical and `name` is a single plain component, so the new
-    // directory cannot leave the root; revalidate to return its canonical path.
-    let current = validate_workspace_directory(&state.config.workspace_roots, &target)?;
+    // directory cannot leave the root; revalidate to return its canonical path,
+    // and take the directory back if that still fails.
+    let current = match validate_workspace_directory(&state.config.workspace_roots, &target) {
+        Ok(current) => current,
+        Err(error) => {
+            let _ = tokio::fs::remove_dir(&target).await;
+            return Err(error);
+        }
+    };
     let roots = canonical_workspace_roots(&state.config.workspace_roots);
     workspace_directories_response(roots, current, 100)
         .await
@@ -725,7 +738,9 @@ async fn workspace_directories_response(
 
 const MAX_DIRECTORY_NAME_BYTES: usize = 255;
 
-/// A new folder name must be one plain path component.
+/// A new folder name must be one plain path component that every platform
+/// accepts as is: no separators, drive prefixes, wildcards, control or
+/// invisible formatting characters, and (on Windows) no device name.
 fn validate_new_directory_name(name: &str) -> Result<&str, AppError> {
     let name = name.trim();
     if name.is_empty() {
@@ -738,17 +753,101 @@ fn validate_new_directory_name(name: &str) -> Result<&str, AppError> {
             "folder name is too long".to_owned(),
         ));
     }
-    if name == "."
-        || name == ".."
-        || name
-            .chars()
-            .any(|ch| matches!(ch, '/' | '\\') || ch.is_control())
-    {
+    if name.chars().any(|ch| {
+        matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || ch.is_control()
+    }) {
+        return Err(AppError::InvalidRequest(
+            r#"folder name cannot contain / \ : * ? " < > | or control characters"#.to_owned(),
+        ));
+    }
+    if name.chars().any(is_format_char) {
+        return Err(AppError::InvalidRequest(
+            "folder name cannot contain invisible formatting characters".to_owned(),
+        ));
+    }
+    #[cfg(windows)]
+    if is_windows_reserved_name(name) {
+        return Err(AppError::InvalidRequest(format!(
+            "{name} is a reserved name on Windows"
+        )));
+    }
+    // Windows drops a trailing dot, so `foo.` would create `foo`.
+    #[cfg(windows)]
+    if name.ends_with('.') {
+        return Err(AppError::InvalidRequest(
+            "folder name cannot end with a dot".to_owned(),
+        ));
+    }
+    // Also rejects `.` and `..`.
+    let mut components = Path::new(name).components();
+    if !matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) {
         return Err(AppError::InvalidRequest(
             "folder name must be a single path component".to_owned(),
         ));
     }
     Ok(name)
+}
+
+/// Unicode general category Cf (format): bidi controls, zero-width
+/// characters and the like, which render as nothing or reorder the name.
+fn is_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Windows device names (`CON`, `NUL`, `COM1`, ...), which name the device
+/// instead of a folder, with or without an extension.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let numbered = |prefix: &str| {
+        stem.get(..3)
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            && matches!(
+                &stem[3..],
+                "1" | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "\u{B9}"
+                    | "\u{B2}"
+                    | "\u{B3}"
+            )
+    };
+    ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        || numbered("COM")
+        || numbered("LPT")
 }
 
 pub(super) async fn workspace_file(
@@ -6603,9 +6702,142 @@ mod tests {
     #[test]
     fn new_directory_name_must_be_one_component() {
         assert_eq!(validate_new_directory_name(" demo ").unwrap(), "demo");
-        for name in ["", ".", "..", "a/b", "a\\b", "a\nb", &"x".repeat(256)] {
+        // Hidden folders stay allowed (listings skip them).
+        for name in [".hidden", "a.b", "日本語", "café"] {
+            assert_eq!(validate_new_directory_name(name).unwrap(), name);
+        }
+        for name in ["", "  ", ".", "..", " .. "] {
             assert!(validate_new_directory_name(name).is_err(), "{name:?}");
         }
+        // Separators, drive prefixes and Windows wildcards, everywhere.
+        for name in [
+            "a/b",
+            "a\\b",
+            "C:evil",
+            "D:x",
+            "a:b",
+            "a*b",
+            "a?b",
+            "a\"b",
+            "a<b",
+            "a>b",
+            "a|b",
+            "/abs",
+            "\\\\server\\share",
+        ] {
+            assert!(validate_new_directory_name(name).is_err(), "{name:?}");
+        }
+        // Control and invisible formatting characters.
+        for name in [
+            "a\nb",
+            "a\tb",
+            "a\u{0}b",
+            "a\u{7f}b",
+            "a\u{85}b",
+            "a\u{202E}b",
+            "a\u{202A}b",
+            "a\u{2066}b",
+            "a\u{2069}b",
+            "a\u{200B}b",
+            "a\u{200D}b",
+            "a\u{200F}b",
+            "\u{FEFF}a",
+            "a\u{AD}b",
+            "a\u{E0041}b",
+        ] {
+            assert!(validate_new_directory_name(name).is_err(), "{name:?}");
+        }
+        // 255 bytes after trimming, counted in bytes, not characters.
+        assert!(validate_new_directory_name(&"x".repeat(255)).is_ok());
+        assert!(validate_new_directory_name(&format!("  {}  ", "x".repeat(255))).is_ok());
+        assert!(validate_new_directory_name(&"x".repeat(256)).is_err());
+        assert!(validate_new_directory_name(&"€".repeat(85)).is_ok());
+        assert!(validate_new_directory_name(&"€".repeat(86)).is_err());
+    }
+
+    #[test]
+    fn windows_reserved_names_include_extensions_and_superscripts() {
+        for name in [
+            "CON",
+            "con",
+            "Prn",
+            "aux",
+            "NUL",
+            "nul.txt",
+            "NUL.tar.gz",
+            "COM1",
+            "com9",
+            "LPT1",
+            "lpt9",
+            "COM¹",
+            "LPT³",
+            "con .txt",
+        ] {
+            assert!(is_windows_reserved_name(name), "{name:?}");
+        }
+        for name in [
+            "CONSOLE", "nulls", "COM0", "COM10", "LPT", "com", "xCON", "a.CON", "COM⁴",
+        ] {
+            assert!(!is_windows_reserved_name(name), "{name:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_directory_name_rejects_windows_only_names() {
+        for name in ["C:evil", "D:x", "CON", "nul.txt", "foo.", "foo.."] {
+            assert!(validate_new_directory_name(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn new_directory_name_keeps_names_only_windows_refuses() {
+        for name in ["CON", "nul.txt", "foo."] {
+            assert_eq!(validate_new_directory_name(name).unwrap(), name);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn create_workspace_directory_is_atomic_and_never_follows_a_symlink() {
+        let root = std::env::temp_dir().join(format!("todex-v2-mkdir-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state);
+        let parent = fs::canonicalize(root.join("workspaces/project")).unwrap();
+        let create = |name: &str| {
+            let payload =
+                json!({ "parent": parent.display().to_string(), "name": name }).to_string();
+            app.clone().oneshot(signed_request(
+                &device,
+                "POST",
+                "/v2/workspace/directories",
+                &payload,
+            ))
+        };
+
+        // Two requests for one name race: exactly one creates it.
+        let (first, second) = tokio::join!(create("race"), create("race"));
+        let mut statuses = [first.unwrap().status(), second.unwrap().status()];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+        assert!(parent.join("race").is_dir());
+
+        // A dangling symlink at the name is an existing entry, not a path to
+        // create through.
+        #[cfg(unix)]
+        {
+            let target = root.join("outside-target");
+            std::os::unix::fs::symlink(&target, parent.join("link")).unwrap();
+            let response = create("link").await.unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(!target.exists());
+            assert!(fs::symlink_metadata(parent.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
