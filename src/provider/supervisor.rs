@@ -333,8 +333,10 @@ impl DriverRegistry {
             ),
             (
                 ProviderKind::Antigravity,
-                Arc::new(super::antigravity::AntigravityDriver::new(&config.agent))
-                    as Arc<dyn ProviderDriver>,
+                Arc::new(super::antigravity::AntigravityDriver::new(
+                    &config.agent,
+                    &config.data_dir,
+                )) as Arc<dyn ProviderDriver>,
             ),
             (
                 ProviderKind::DeepseekHarness,

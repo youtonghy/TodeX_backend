@@ -227,7 +227,13 @@ async fn decide(
         && PATH_READ_TOOLS.contains(&name)
     {
         let roots = match state.conversations.get(conversation_id).await {
-            Ok(manifest) => read_roots(&manifest.workspace, payload),
+            Ok(manifest) => {
+                let attachments = crate::provider::antigravity::attachments_dir(
+                    &state.config.data_dir,
+                    &manifest.id,
+                );
+                read_roots(&manifest.workspace, attachments, payload)
+            }
             Err(_) => Vec::new(),
         };
         let paths = read_paths(&args);
@@ -250,11 +256,12 @@ async fn decide(
 /// without a prompt only inside [`read_roots`].
 const PATH_READ_TOOLS: &[&str] = &["view_file", "list_dir", "grep_search", "find_by_name"];
 
-/// Where reads need no prompt: the conversation's workspace, agy's bundled
-/// docs (`~/.gemini/antigravity-cli/builtin`), and this conversation's
-/// artifact directory when it lies under agy's `brain` directory.
-fn read_roots(workspace: &Path, payload: &Value) -> Vec<PathBuf> {
-    let mut roots = vec![workspace.to_path_buf()];
+/// Where reads need no prompt: the conversation's workspace, the images
+/// TodeX staged for it (`attachments`), agy's bundled docs
+/// (`~/.gemini/antigravity-cli/builtin`), and this conversation's artifact
+/// directory when it lies under agy's `brain` directory.
+fn read_roots(workspace: &Path, attachments: PathBuf, payload: &Value) -> Vec<PathBuf> {
+    let mut roots = vec![workspace.to_path_buf(), attachments];
     if let Some(gemini) = crate::provider::antigravity::integration_dir().parent() {
         let cli = gemini.join("antigravity-cli");
         roots.push(cli.join("builtin"));

@@ -782,7 +782,7 @@
       "nativeMcp": true,
       "managedMcp": true,
       "modelSelection": true,
-      "imageInput": false,
+      "imageInput": true,
       "imageInputMode": "model",
       "controlActions": [
         "cancel",

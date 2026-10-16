@@ -31,10 +31,11 @@ mod integration;
 pub(crate) use integration::{config_dir as integration_dir, remove as remove_integration};
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -53,8 +54,9 @@ use super::profile::{
     ProviderProfile, SkillInjection, UserConfigFile,
 };
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
-    PermissionConfigCapabilities, ProviderDescriptor, ProviderDriver, ProviderModelDescriptor,
+    DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverTurnResult,
+    ImageInputMode, PermissionConfigCapabilities, ProviderDescriptor, ProviderDriver,
+    ProviderModelDescriptor,
 };
 
 const PROVIDER: &str = "antigravity";
@@ -82,7 +84,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     native_skills: true,
     native_mcp: true,
     model_selection: true,
-    image_input: false,
+    image_input: true,
     image_input_mode: ImageInputMode::Model,
     mcp_injection: McpInjection::GlobalConfigEnv,
     skill_injection: SkillInjection::PromptText,
@@ -153,16 +155,20 @@ pub struct AntigravityDriver {
     auto_mode: tokio::sync::Mutex<Option<AutoProbe>>,
     /// Where TodeX's hook and MCP entries go: agy's global config.
     integration_dir: std::path::PathBuf,
+    /// TodeX's data directory; prompt images are staged under it, see
+    /// [`attachments_dir`].
+    data_dir: PathBuf,
 }
 
 impl AntigravityDriver {
-    pub fn new(config: &AgentConfig) -> Self {
+    pub fn new(config: &AgentConfig, data_dir: &Path) -> Self {
         Self {
             binary: config.antigravity_bin.clone(),
             env_allowlist: config.antigravity_env_allowlist.clone(),
             models: CatalogCache::new(PROFILE.discovery_cache_ttl),
             auto_mode: tokio::sync::Mutex::new(None),
             integration_dir: integration::config_dir(),
+            data_dir: data_dir.to_path_buf(),
         }
     }
 
@@ -312,7 +318,7 @@ impl ProviderDriver for AntigravityDriver {
     async fn run_turn(
         &self,
         context: DriverContext,
-        prompt: DriverPrompt,
+        mut prompt: DriverPrompt,
         sink: DriverEventSink,
         mut cancel: watch::Receiver<bool>,
     ) -> Result<DriverTurnResult, AppError> {
@@ -421,6 +427,12 @@ impl ProviderDriver for AntigravityDriver {
         if let Some(model) = &model {
             spec.push_flag_value("--model", model)?;
         }
+        let images = stage_images(&self.data_dir, &context.manifest.id, &prompt).await?;
+        if !images.is_empty() {
+            let staged = attachments_dir(&self.data_dir, &context.manifest.id);
+            spec.push_flag_value("--add-dir", &staged.to_string_lossy())?;
+            prompt.text = image_prompt(&prompt.text, &images);
+        }
         // `-p` takes a value and would swallow the next flag; the prompt
         // arrives on stdin, so the flag closes the argument list empty.
         spec.args.push("-p=".to_owned());
@@ -469,6 +481,72 @@ impl ProviderDriver for AntigravityDriver {
         }
         result
     }
+}
+
+/// Where a conversation's pasted prompt images are written for agy to open.
+/// TodeX's approval hook lets agy read here without asking.
+pub(crate) fn attachments_dir(data_dir: &Path, conversation_id: &str) -> PathBuf {
+    data_dir
+        .join("antigravity-attachments")
+        .join(conversation_id)
+}
+
+/// agy's stream-json input takes only text blocks, so images reach the
+/// model as files its `view_file` tool opens. Images already in the
+/// workspace are named where they are; pasted ones are written to
+/// [`attachments_dir`] and kept, so later turns can open them again.
+async fn stage_images(
+    data_dir: &Path,
+    conversation_id: &str,
+    prompt: &DriverPrompt,
+) -> Result<Vec<PathBuf>, AppError> {
+    let mut images = Vec::new();
+    for content in &prompt.content {
+        let DriverPromptContent::Image {
+            path,
+            data,
+            mime_type,
+        } = content
+        else {
+            continue;
+        };
+        if let Some(path) = path {
+            images.push(path.clone());
+            continue;
+        }
+        let extension = match mime_type.as_str() {
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "png",
+        };
+        let bytes = BASE64_STANDARD.decode(data).map_err(|error| {
+            AppError::InvalidRequest(format!("invalid prompt image base64: {error}"))
+        })?;
+        let dir = attachments_dir(data_dir, conversation_id);
+        tokio::fs::create_dir_all(&dir).await?;
+        let turn: String = prompt
+            .turn_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            .collect();
+        let file = dir.join(format!("{turn}-{}.{extension}", images.len() + 1));
+        tokio::fs::write(&file, bytes).await?;
+        images.push(file);
+    }
+    Ok(images)
+}
+
+fn image_prompt(text: &str, images: &[PathBuf]) -> String {
+    let mut lines = vec![text.to_owned()];
+    lines.extend(images.iter().map(|image| {
+        format!(
+            "Attached image: {} (open it with view_file to see it)",
+            image.display()
+        )
+    }));
+    lines.retain(|line| !line.is_empty());
+    lines.join("\n\n")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -929,7 +1007,9 @@ fn parse_models(stdout: &str) -> Vec<ProviderModelDescriptor> {
                     supported_reasoning_efforts: Vec::new(),
                     default_reasoning_effort: None,
                     context_window: None,
-                    image_input: Some(false),
+                    // gpt-oss is text-only; the Gemini and Claude models
+                    // agy offers read images.
+                    image_input: Some(!base.starts_with("gpt-oss")),
                     family: base.split('-').next().map(str::to_owned),
                 });
                 models.last_mut().expect("just pushed")
@@ -1156,6 +1236,69 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
     }
 
     #[test]
+    fn only_gpt_oss_models_lack_image_input() {
+        let models = parse_models(MODELS);
+        let images: Vec<_> = models
+            .iter()
+            .map(|model| (model.id.as_str(), model.image_input))
+            .collect();
+        assert_eq!(
+            images,
+            [
+                ("gemini-3.8-flash", Some(true)),
+                ("gemini-3.1-pro", Some(true)),
+                ("claude-opus-4-6-thinking", Some(true)),
+                ("gpt-oss-120b", Some(false)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pasted_images_are_staged_as_files_the_prompt_names() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "todex-agy-images-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let in_workspace = PathBuf::from("/workspace/shot.png");
+        let prompt = DriverPrompt {
+            turn_id: "turn/1".to_owned(),
+            text: "What does it say?".to_owned(),
+            content: vec![
+                DriverPromptContent::Image {
+                    path: None,
+                    data: BASE64_STANDARD.encode(b"jpeg bytes"),
+                    mime_type: "image/jpeg".to_owned(),
+                },
+                DriverPromptContent::Image {
+                    path: Some(in_workspace.clone()),
+                    data: String::new(),
+                    mime_type: "image/png".to_owned(),
+                },
+            ],
+            skills: vec![],
+            model: None,
+            reasoning_effort: None,
+            permission_mode: None,
+            work_mode: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
+        };
+        let images = stage_images(&data_dir, "conv-1", &prompt).await.unwrap();
+        let staged = attachments_dir(&data_dir, "conv-1").join("turn1-1.jpg");
+        assert_eq!(images, [staged.clone(), in_workspace]);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"jpeg bytes");
+        assert_eq!(
+            image_prompt(&prompt.text, &images[..1]),
+            format!(
+                "What does it say?\n\nAttached image: {} (open it with view_file to see it)",
+                staged.display()
+            )
+        );
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
     fn the_selected_effort_picks_the_variant() {
         let efforts = vec!["low".to_owned(), "high".to_owned()];
         assert_eq!(
@@ -1326,6 +1469,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     models: CatalogCache::new(None),
                     auto_mode: tokio::sync::Mutex::new(None),
                     integration_dir: root.join("gemini-config"),
+                    data_dir: root.join("data"),
                 };
                 let store = ConversationStore::new(root.join("data")).await.unwrap();
                 let manifest = store
