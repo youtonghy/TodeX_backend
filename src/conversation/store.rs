@@ -4657,29 +4657,20 @@ async fn read_json<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T, A
 /// Replace `path` atomically. The parent directory must already exist, so a
 /// late manifest flush can never resurrect a deleted conversation directory.
 async fn write_atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::InvalidRequest("persisted file has no parent".to_owned()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state.json");
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
+    if path.parent().is_none() {
+        return Err(AppError::InvalidRequest(
+            "persisted file has no parent".to_owned(),
+        ));
+    }
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
-    let mut file = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .await?;
-    set_owner_only(&temporary, false).await?;
-    file.write_all(&bytes).await?;
-    file.flush().await?;
-    file.sync_all().await?;
-    drop(file);
-    crate::secure_fs::replace_file_async(&temporary, path).await?;
-    set_owner_only(path, false).await?;
-    sync_directory(parent).await
+    crate::secure_fs::write_owner_only_atomic_async(
+        path,
+        bytes,
+        crate::secure_fs::ParentDir::MustExist,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Keep the sealed frames a fork's copied records refer to in its

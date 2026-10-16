@@ -6,7 +6,6 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -592,37 +591,19 @@ async fn load_mapping(path: &Path) -> Result<MigrationMap, AppError> {
 }
 
 async fn write_mapping(path: &Path, mapping: &MigrationMap) -> Result<(), AppError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::InvalidRequest("migration map has no parent".to_owned()))?;
-    tokio::fs::create_dir_all(parent).await?;
-    set_owner_only(parent, true).await?;
-    let temporary = parent.join(format!(".codex-gateway-v1.{}.tmp", Uuid::new_v4().simple()));
+    if path.parent().is_none() {
+        return Err(AppError::InvalidRequest(
+            "migration map has no parent".to_owned(),
+        ));
+    }
     let mut bytes = serde_json::to_vec_pretty(mapping)?;
     bytes.push(b'\n');
-    let mut file = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .await?;
-    set_owner_only(&temporary, false).await?;
-    file.write_all(&bytes).await?;
-    file.flush().await?;
-    file.sync_all().await?;
-    drop(file);
-    crate::secure_fs::replace_file_async(&temporary, path).await?;
-    set_owner_only(path, false).await
-}
-
-async fn set_owner_only(path: &Path, directory: bool) -> Result<(), AppError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = if directory { 0o700 } else { 0o600 };
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await?;
-    }
-    #[cfg(not(unix))]
-    let _ = (path, directory);
+    crate::secure_fs::write_owner_only_atomic_async(
+        path,
+        bytes,
+        crate::secure_fs::ParentDir::CreateOwnerOnly,
+    )
+    .await?;
     Ok(())
 }
 

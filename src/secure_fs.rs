@@ -41,6 +41,47 @@ pub(crate) fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> io::Result<(
     result
 }
 
+/// How [`write_owner_only_atomic_async`] treats the target's parent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ParentDir {
+    /// Create missing parents with default permissions.
+    Create,
+    /// Create missing parents and restrict the parent to its owner (0700).
+    CreateOwnerOnly,
+    /// Fail with `NotFound` when the parent is missing, so a late write
+    /// never resurrects a deleted directory.
+    MustExist,
+}
+
+/// [`write_owner_only_atomic`] off the async runtime, made durable: after
+/// the rename the parent directory is synced (Unix), so the new content
+/// survives a crash. The temp file is 0600 from creation and removed on
+/// every error.
+pub(crate) async fn write_owner_only_atomic_async(
+    path: &Path,
+    bytes: impl AsRef<[u8]> + Send + 'static,
+    parent: ParentDir,
+) -> io::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || write_owner_only_durable(&path, bytes.as_ref(), parent))
+        .await
+        .map_err(io::Error::other)?
+}
+
+fn write_owner_only_durable(path: &Path, bytes: &[u8], parent_dir: ParentDir) -> io::Result<()> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    match parent_dir {
+        ParentDir::Create => fs::create_dir_all(parent)?,
+        ParentDir::CreateOwnerOnly => ensure_owner_only_dir(parent)?,
+        ParentDir::MustExist => {}
+    }
+    write_owner_only_atomic(path, bytes)?;
+    sync_directory(parent)
+}
+
 /// [`write_owner_only_atomic`] unless `path` already is a regular owner-only
 /// file holding exactly `bytes`; returns whether it wrote. Skipping saves the
 /// temp file, fsync and rename when the content is unchanged.
@@ -113,23 +154,54 @@ pub(crate) fn replace_keeping_mode(path: &Path, bytes: &[u8]) -> io::Result<()> 
 /// `fs::rename` replaces atomically on Windows too (POSIX rename semantics or
 /// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`); deleting `to` first, as
 /// this code once did, left a window in which the file did not exist. A
-/// target that another process (often a virus scanner) briefly holds open
-/// without delete sharing fails with `PermissionDenied`, so Windows retries
-/// a few times before giving up.
+/// target that another process (often a virus scanner or indexer) briefly
+/// holds open fails with an access, sharing or lock violation, so Windows
+/// retries for about two seconds before giving up.
 pub(crate) fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        const RETRY_DELAYS_MS: [u64; 5] = [10, 30, 60, 150, 300];
-        for delay in RETRY_DELAYS_MS {
-            match fs::rename(from, to) {
-                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
-                }
-                result => return result,
+    rename_over(from, to)
+}
+
+#[cfg(not(windows))]
+fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+    /// Backoff between attempts; about two seconds in total.
+    const RETRY_DELAYS_MS: [u64; 8] = [10, 20, 40, 80, 160, 320, 640, 730];
+    for (attempt, delay) in RETRY_DELAYS_MS.into_iter().enumerate() {
+        match fs::rename(from, to) {
+            Err(error) if is_transient_windows_error(&error) => {
+                tracing::debug!(
+                    target_path = %to.display(),
+                    attempt = attempt + 1,
+                    error = %error,
+                    "file replacement blocked by another process; retrying"
+                );
+                std::thread::sleep(Duration::from_millis(delay));
             }
+            result => return result,
         }
     }
-    fs::rename(from, to)
+    let result = fs::rename(from, to);
+    if let Err(error) = &result {
+        if is_transient_windows_error(error) {
+            tracing::warn!(
+                target_path = %to.display(),
+                error = %error,
+                "file replacement still blocked by another process; giving up"
+            );
+        }
+    }
+    result
+}
+
+/// `ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION` or `ERROR_LOCK_VIOLATION`:
+/// another process has the file open, which usually passes quickly.
+#[cfg(windows)]
+fn is_transient_windows_error(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
 /// [`replace_file`] off the async runtime, as its Windows retries sleep.
@@ -410,6 +482,78 @@ mod tests {
         assert!(!waiter.is_finished(), "the lock is still held");
         drop(held);
         assert!(waiter.join().unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_atomic_write_is_owner_only_and_honours_the_parent_mode() {
+        let dir = temp_dir("async");
+        let path = dir.join("nested").join("state.json");
+        write_owner_only_atomic_async(&path, b"one".to_vec(), ParentDir::Create)
+            .await
+            .unwrap();
+        write_owner_only_atomic_async(&path, b"two".to_vec(), ParentDir::MustExist)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"two");
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+
+        let missing = dir.join("gone").join("state.json");
+        let error = write_owner_only_atomic_async(&missing, b"x".to_vec(), ParentDir::MustExist)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!missing.parent().unwrap().exists());
+
+        let private = dir.join("private").join("map.json");
+        write_owner_only_atomic_async(&private, b"{}".to_vec(), ParentDir::CreateOwnerOnly)
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(&private), 0o600);
+            assert_eq!(mode(private.parent().unwrap()), 0o700);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A failed replacement (the target is a directory) reports the error
+    /// and leaves no temp file behind.
+    #[tokio::test]
+    async fn a_failed_async_write_leaves_no_temp_file() {
+        let dir = temp_dir("async-fail");
+        let path = dir.join("state.json");
+        fs::create_dir_all(&path).unwrap();
+        assert!(
+            write_owner_only_atomic_async(&path, b"x".to_vec(), ParentDir::Create)
+                .await
+                .is_err()
+        );
+        let entries = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, ["state.json"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The temp file is created 0600, not chmodded later: a reader racing
+    /// the write never sees the content under the umask's mode.
+    #[cfg(unix)]
+    #[test]
+    fn temp_files_are_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("temp-mode");
+        ensure_owner_only_dir(&dir).unwrap();
+        let temporary = dir.join("temp");
+        write_new_file(&temporary, b"secret").unwrap();
+        assert_eq!(
+            fs::metadata(&temporary).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

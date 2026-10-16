@@ -4,9 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
@@ -213,34 +211,13 @@ async fn write_snapshot(
     path: &std::path::Path,
     snapshot: &AgentProviderSnapshot,
 ) -> Result<(), AppError> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp_path = path.with_file_name(format!(".agent-providers.{}.tmp", Uuid::new_v4().simple()));
     let mut bytes = serde_json::to_vec_pretty(snapshot)?;
     bytes.push(b'\n');
-    let mut file = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)
-        .await?;
-    set_owner_only(&tmp_path).await?;
-    file.write_all(&bytes).await?;
-    file.flush().await?;
-    file.sync_all().await?;
-    drop(file);
-    crate::secure_fs::replace_file_async(&tmp_path, path).await?;
-    set_owner_only(path).await?;
-    Ok(())
-}
-
-async fn set_owner_only(path: &std::path::Path) -> Result<(), AppError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
+    crate::secure_fs::write_owner_only_atomic_async(
+        path,
+        bytes,
+        crate::secure_fs::ParentDir::Create,
+    )
+    .await?;
     Ok(())
 }

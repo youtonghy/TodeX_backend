@@ -6,9 +6,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
-use uuid::Uuid;
 
 use crate::{
     error::AppError,
@@ -348,32 +346,14 @@ async fn load_snapshot(
 }
 
 async fn write_snapshot(path: &Path, snapshot: &WorkspaceTrustSnapshot) -> Result<(), AppError> {
-    let temporary =
-        path.with_file_name(format!(".workspace-trust.{}.tmp", Uuid::new_v4().simple()));
     let mut bytes = serde_json::to_vec_pretty(snapshot)?;
     bytes.push(b'\n');
-    let mut file = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .await?;
-    set_owner_only(&temporary).await?;
-    file.write_all(&bytes).await?;
-    file.flush().await?;
-    file.sync_all().await?;
-    drop(file);
-    crate::secure_fs::replace_file_async(&temporary, path).await?;
-    set_owner_only(path).await
-}
-
-async fn set_owner_only(path: &Path) -> Result<(), AppError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
+    crate::secure_fs::write_owner_only_atomic_async(
+        path,
+        bytes,
+        crate::secure_fs::ParentDir::MustExist,
+    )
+    .await?;
     Ok(())
 }
 
@@ -391,6 +371,7 @@ fn default_trusted() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn trust_is_owner_scoped_and_persistent() {

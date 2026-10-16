@@ -103,23 +103,8 @@ impl PairingKeys {
             ml_kem_public: encode_b64(&self.ml_kem_public),
             ml_kem_secret: encode_b64(self.ml_kem_secret.as_bytes()),
         };
-        let json = zeroize::Zeroizing::new(serde_json::to_string_pretty(&persisted)?);
-        let path = path.to_owned();
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            let parent = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty());
-            if let Some(parent) = parent {
-                std::fs::create_dir_all(parent)?;
-            }
-            secure_fs::write_owner_only_atomic(&path, json.as_bytes())?;
-            match parent {
-                Some(parent) => secure_fs::sync_directory(parent),
-                None => Ok(()),
-            }
-        })
-        .await
-        .map_err(std::io::Error::other)??;
+        let json = zeroize::Zeroizing::new(serde_json::to_vec_pretty(&persisted)?);
+        secure_fs::write_owner_only_atomic_async(path, json, secure_fs::ParentDir::Create).await?;
         Ok(())
     }
 
