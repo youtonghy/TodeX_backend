@@ -79,6 +79,75 @@ impl SshAuthMethod {
     fn is_key(&self) -> bool {
         *self == Self::Key
     }
+
+    /// Name in `store.json`'s `authMethods` table.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Password => "password",
+        }
+    }
+
+    pub(crate) fn from_stored(value: &str) -> Option<Self> {
+        match value {
+            "key" => Some(Self::Key),
+            "password" => Some(Self::Password),
+            _ => None,
+        }
+    }
+}
+
+/// A managed host as kept in `store.json`. Daemons up to v2.3.1 read host
+/// records strictly ([`ManagedHost`] with `deny_unknown_fields`), and one
+/// that cannot read the store does not start, so records carry only the
+/// v2.3.0 fields; the auth method lives in the store's `authMethods` table.
+/// Reading is lenient and still accepts v2.3.1's inline `authMethod`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StoredHost {
+    pub alias: String,
+    pub host_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_jump: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<SshOption>,
+    /// Written inline by v2.3.1 only; never written back.
+    #[serde(default, skip_serializing)]
+    pub auth_method: Option<String>,
+}
+
+impl StoredHost {
+    pub(crate) fn from_host(host: &ManagedHost) -> Self {
+        Self {
+            alias: host.alias.clone(),
+            host_name: host.host_name.clone(),
+            user: host.user.clone(),
+            port: host.port,
+            identity_file: host.identity_file.clone(),
+            proxy_jump: host.proxy_jump.clone(),
+            options: host.options.clone(),
+            auth_method: None,
+        }
+    }
+
+    pub(crate) fn into_host(self, auth_method: SshAuthMethod) -> ManagedHost {
+        ManagedHost {
+            alias: self.alias,
+            host_name: self.host_name,
+            user: self.user,
+            port: self.port,
+            identity_file: self.identity_file,
+            proxy_jump: self.proxy_jump,
+            options: self.options,
+            auth_method,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -132,6 +201,54 @@ impl ConnectionSettings {
             )));
         }
         Ok(())
+    }
+
+    /// The nearest valid settings: out-of-range values are clamped.
+    pub(crate) fn clamped(self) -> Self {
+        let clamp = |value: u32, range: std::ops::RangeInclusive<u32>| {
+            value.clamp(*range.start(), *range.end())
+        };
+        Self {
+            server_alive_enabled: self.server_alive_enabled,
+            server_alive_interval: clamp(self.server_alive_interval, SERVER_ALIVE_INTERVAL_RANGE),
+            server_alive_count_max: clamp(
+                self.server_alive_count_max,
+                SERVER_ALIVE_COUNT_MAX_RANGE,
+            ),
+        }
+    }
+}
+
+/// [`ConnectionSettings`] as read from `store.json`: unlike the API body,
+/// missing fields take their defaults and unknown fields are ignored, so a
+/// store written by another version still loads.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct StoredConnection {
+    server_alive_enabled: bool,
+    server_alive_interval: u32,
+    server_alive_count_max: u32,
+}
+
+impl Default for StoredConnection {
+    fn default() -> Self {
+        let defaults = ConnectionSettings::default();
+        Self {
+            server_alive_enabled: defaults.server_alive_enabled,
+            server_alive_interval: defaults.server_alive_interval,
+            server_alive_count_max: defaults.server_alive_count_max,
+        }
+    }
+}
+
+impl From<StoredConnection> for ConnectionSettings {
+    fn from(stored: StoredConnection) -> Self {
+        Self {
+            server_alive_enabled: stored.server_alive_enabled,
+            server_alive_interval: stored.server_alive_interval,
+            server_alive_count_max: stored.server_alive_count_max,
+        }
+        .clamped()
     }
 }
 

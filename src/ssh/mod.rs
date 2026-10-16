@@ -12,7 +12,7 @@ pub(crate) mod config_file;
 pub(crate) mod keys;
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsString,
     path::{Path, PathBuf},
     sync::Arc,
@@ -34,7 +34,7 @@ use crate::{
     secure_fs,
 };
 
-pub(crate) use config_file::{ConnectionSettings, ManagedHost, SnippetImport};
+pub(crate) use config_file::{ConnectionSettings, ManagedHost, SnippetImport, SshAuthMethod};
 
 const STORE_FILE: &str = "store.json";
 const MANAGED_HOSTS_FILE: &str = "hosts.conf";
@@ -102,18 +102,102 @@ pub(crate) struct FtpSiteInput {
     pub initial_directory: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Default)]
 struct SshStore {
-    #[serde(default)]
     managed_hosts: Vec<ManagedHost>,
-    #[serde(default)]
     ftp_sites: Vec<FtpSite>,
     /// Aliases agents may use. Empty by default: access is opt-in per host.
+    agent_access: BTreeSet<String>,
+    connection: ConnectionSettings,
+}
+
+/// `store.json`. Older daemons ignore unknown top-level fields but reject
+/// unknown fields in host records, so everything newer than v2.3.0 that
+/// belongs to a host is kept beside the records, keyed by alias.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedStore {
+    #[serde(default)]
+    managed_hosts: Vec<config_file::StoredHost>,
+    #[serde(default)]
+    ftp_sites: Vec<FtpSite>,
     #[serde(default)]
     agent_access: BTreeSet<String>,
+    /// Non-key auth methods by alias; hosts not listed use keys.
     #[serde(default)]
-    connection: ConnectionSettings,
+    auth_methods: BTreeMap<String, String>,
+    #[serde(default)]
+    connection: Option<config_file::StoredConnection>,
+}
+
+/// The written form of [`SshStore`], read back as [`PersistedStore`].
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedStoreRef<'a> {
+    managed_hosts: Vec<config_file::StoredHost>,
+    ftp_sites: &'a [FtpSite],
+    agent_access: &'a BTreeSet<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    auth_methods: BTreeMap<&'a str, &'static str>,
+    connection: &'a ConnectionSettings,
+}
+
+impl SshStore {
+    /// Reads `store.json` from any version. Inline auth methods (v2.3.1)
+    /// move to the side table with the next write; invalid parts fall back
+    /// to defaults with a warning instead of keeping the daemon from starting.
+    fn from_json(bytes: &[u8]) -> Result<Self, AppError> {
+        let persisted: PersistedStore = serde_json::from_slice(bytes)?;
+        let mut auth_methods = persisted.auth_methods;
+        let parse = |alias: &str, value: &str| {
+            SshAuthMethod::from_stored(value).unwrap_or_else(|| {
+                tracing::warn!(alias, value, "unknown ssh auth method in store; using keys");
+                SshAuthMethod::Key
+            })
+        };
+        let managed_hosts = persisted
+            .managed_hosts
+            .into_iter()
+            .map(|mut host| {
+                let stored = auth_methods.remove(&host.alias);
+                // An inline value was written by v2.3.1 after it dropped the
+                // table, so it is the newer one.
+                let method = match host.auth_method.take().or(stored) {
+                    Some(value) => parse(&host.alias, &value),
+                    None => SshAuthMethod::Key,
+                };
+                host.into_host(method)
+            })
+            .collect();
+        Ok(Self {
+            managed_hosts,
+            ftp_sites: persisted.ftp_sites,
+            agent_access: persisted.agent_access,
+            connection: persisted.connection.map(Into::into).unwrap_or_default(),
+        })
+    }
+
+    fn to_json(&self) -> Result<Vec<u8>, AppError> {
+        // Derived from the hosts on every write, so renames and deletes
+        // carry over to the table.
+        let persisted = PersistedStoreRef {
+            managed_hosts: self
+                .managed_hosts
+                .iter()
+                .map(config_file::StoredHost::from_host)
+                .collect(),
+            ftp_sites: &self.ftp_sites,
+            agent_access: &self.agent_access,
+            auth_methods: self
+                .managed_hosts
+                .iter()
+                .filter(|host| host.auth_method != SshAuthMethod::Key)
+                .map(|host| (host.alias.as_str(), host.auth_method.as_str()))
+                .collect(),
+            connection: &self.connection,
+        };
+        Ok(serde_json::to_vec_pretty(&persisted)?)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -256,7 +340,7 @@ impl SshService {
             .map_err(|error| AppError::Anyhow(error.into()))??;
         }
         let store = match tokio::fs::read(dir.join(STORE_FILE)).await {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Ok(bytes) => SshStore::from_json(&bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => SshStore::default(),
             Err(error) => return Err(error.into()),
         };
@@ -274,7 +358,12 @@ impl SshService {
         };
         {
             let store = service.inner.store.read().await;
-            service.write_config_files(&store).await?;
+            service.write_generated_files(&store).await?;
+            // Rewritten in the current format (migrating older fields);
+            // the store loaded fine, so a failed write need not stop ssh.
+            if let Err(error) = service.write_store(&store).await {
+                tracing::warn!(%error, "cannot rewrite ssh store");
+            }
         }
         Ok(service)
     }
@@ -290,8 +379,24 @@ impl SshService {
         self.inner.dir.join(WRAPPER_FILE)
     }
 
-    /// Writes `hosts.conf` and the `-F` wrapper. Called under the store lock.
+    /// Writes the generated ssh config and `store.json`. Called under the
+    /// store lock.
     async fn write_config_files(&self, store: &SshStore) -> Result<(), AppError> {
+        self.write_generated_files(store).await?;
+        self.write_store(store).await
+    }
+
+    async fn write_store(&self, store: &SshStore) -> Result<(), AppError> {
+        let store_json = store.to_json()?;
+        let path = self.inner.dir.join(STORE_FILE);
+        tokio::task::spawn_blocking(move || secure_fs::write_owner_only_atomic(&path, &store_json))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
+        Ok(())
+    }
+
+    /// Writes `hosts.conf`, `defaults.conf` and the `-F` wrapper.
+    async fn write_generated_files(&self, store: &SshStore) -> Result<(), AppError> {
         let managed_path = self.inner.dir.join(MANAGED_HOSTS_FILE);
         let defaults_path = self.inner.dir.join(DEFAULTS_FILE);
         let wrapper = config_file::render_wrapper_config(
@@ -304,13 +409,11 @@ impl SshService {
         );
         let managed = config_file::render_managed_hosts(&store.managed_hosts);
         let defaults = config_file::render_connection_defaults(&store.connection);
-        let store_json = serde_json::to_vec_pretty(store)?;
         let dir = self.inner.dir.clone();
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             secure_fs::write_owner_only_atomic(&dir.join(MANAGED_HOSTS_FILE), managed.as_bytes())?;
             secure_fs::write_owner_only_atomic(&dir.join(DEFAULTS_FILE), defaults.as_bytes())?;
-            secure_fs::write_owner_only_atomic(&dir.join(WRAPPER_FILE), wrapper.as_bytes())?;
-            secure_fs::write_owner_only_atomic(&dir.join(STORE_FILE), &store_json)
+            secure_fs::write_owner_only_atomic(&dir.join(WRAPPER_FILE), wrapper.as_bytes())
         })
         .await
         .map_err(|error| AppError::Anyhow(error.into()))??;
@@ -1456,10 +1559,218 @@ exit 0
 
     #[test]
     fn stores_without_connection_settings_load_with_defaults() {
-        let store: SshStore =
-            serde_json::from_str(r#"{"managedHosts":[],"agentAccess":["web"]}"#).unwrap();
+        let store = SshStore::from_json(br#"{"managedHosts":[],"agentAccess":["web"]}"#).unwrap();
         assert_eq!(store.connection, ConnectionSettings::default());
         assert!(!store.connection.server_alive_enabled);
+    }
+
+    /// The store as another daemon version wrote it: partial, out of range
+    /// or with fields this version does not know.
+    #[test]
+    fn stored_connection_settings_load_leniently_and_clamp() {
+        let load = |json: &str| SshStore::from_json(json.as_bytes()).unwrap().connection;
+        assert_eq!(
+            load(r#"{"connection":{"serverAliveEnabled":true}}"#),
+            ConnectionSettings {
+                server_alive_enabled: true,
+                ..ConnectionSettings::default()
+            }
+        );
+        assert_eq!(
+            load(
+                r#"{"connection":{"serverAliveEnabled":true,"serverAliveInterval":1,
+                "serverAliveCountMax":99,"futureField":"x"}}"#
+            ),
+            ConnectionSettings {
+                server_alive_enabled: true,
+                server_alive_interval: 5,
+                server_alive_count_max: 10,
+            }
+        );
+        assert_eq!(
+            load(r#"{"connection":{"serverAliveInterval":9000,"serverAliveCountMax":0}}"#),
+            ConnectionSettings {
+                server_alive_enabled: false,
+                server_alive_interval: 600,
+                server_alive_count_max: 1,
+            }
+        );
+        assert_eq!(load(r#"{"connection":{}}"#), ConnectionSettings::default());
+    }
+
+    /// `ManagedHost` exactly as v2.3.0 and v2.3.1 before password hosts
+    /// declared it (`git show v2.3.0:src/ssh/config_file.rs`). Those
+    /// versions refuse to start when a stored record does not fit it.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct ManagedHostV230 {
+        alias: String,
+        host_name: String,
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        port: Option<u16>,
+        #[serde(default)]
+        identity_file: Option<String>,
+        #[serde(default)]
+        proxy_jump: Option<String>,
+        #[serde(default)]
+        options: Vec<SshOptionV230>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct SshOptionV230 {
+        key: String,
+        value: String,
+    }
+
+    /// `SshStore` of v2.3.0: unknown top-level fields are ignored.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    #[allow(dead_code)]
+    struct SshStoreV230 {
+        #[serde(default)]
+        managed_hosts: Vec<ManagedHostV230>,
+        #[serde(default)]
+        ftp_sites: Vec<FtpSite>,
+        #[serde(default)]
+        agent_access: BTreeSet<String>,
+    }
+
+    async fn service_with_store(store_json: &str) -> (PathBuf, SshService) {
+        let root = std::env::temp_dir().join(format!("todex-ssh-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(root.join("data/ssh")).unwrap();
+        std::fs::write(root.join("data/ssh").join(STORE_FILE), store_json).unwrap();
+        let service = SshService::with_home(&root.join("data"), "ssh".into(), None)
+            .await
+            .unwrap();
+        (root, service)
+    }
+
+    fn stored_json(root: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(root.join("data/ssh").join(STORE_FILE)).unwrap())
+            .unwrap()
+    }
+
+    async fn auth_methods(service: &SshService) -> Vec<(String, SshAuthMethod)> {
+        service
+            .inner
+            .store
+            .read()
+            .await
+            .managed_hosts
+            .iter()
+            .map(|host| (host.alias.clone(), host.auth_method))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn inline_auth_methods_migrate_to_the_side_table() {
+        // As v2.3.1 wrote it.
+        let (root, service) = service_with_store(
+            r#"{"managedHosts":[
+                {"alias":"db","hostName":"db.example","authMethod":"password"},
+                {"alias":"web","hostName":"web.example","authMethod":"key"}
+            ],"agentAccess":["db"],"connection":{"serverAliveEnabled":false,
+            "serverAliveInterval":15,"serverAliveCountMax":3}}"#,
+        )
+        .await;
+        assert_eq!(
+            auth_methods(&service).await,
+            [
+                ("db".to_owned(), SshAuthMethod::Password),
+                ("web".to_owned(), SshAuthMethod::Key)
+            ]
+        );
+        let stored = stored_json(&root);
+        assert_eq!(stored["authMethods"], serde_json::json!({"db": "password"}));
+        for host in stored["managedHosts"].as_array().unwrap() {
+            assert!(host.get("authMethod").is_none(), "{host}");
+        }
+        // API views still carry the method inline.
+        let views = service.host_views().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&views[0]).unwrap()["managed"]["authMethod"],
+            "password"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn new_stores_stay_readable_by_v2_3_0() {
+        let (root, service) = service_with_store("{}").await;
+        service
+            .create_host(ManagedHost {
+                auth_method: SshAuthMethod::Password,
+                options: vec![config_file::SshOption {
+                    key: "Compression".into(),
+                    value: "yes".into(),
+                }],
+                ..managed("db")
+            })
+            .await
+            .unwrap();
+        service.create_host(managed("web")).await.unwrap();
+        service
+            .set_connection_settings(ConnectionSettings {
+                server_alive_enabled: true,
+                ..ConnectionSettings::default()
+            })
+            .await
+            .unwrap();
+        let bytes = std::fs::read(root.join("data/ssh").join(STORE_FILE)).unwrap();
+        let old: SshStoreV230 = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(old.managed_hosts.len(), 2);
+        assert_eq!(
+            stored_json(&root)["authMethods"],
+            serde_json::json!({"db": "password"})
+        );
+
+        // Renames and deletes carry over to the side table.
+        service
+            .update_host(
+                "db",
+                ManagedHost {
+                    auth_method: SshAuthMethod::Password,
+                    ..managed("db2")
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_json(&root)["authMethods"],
+            serde_json::json!({"db2": "password"})
+        );
+        service.delete_host("db2").await.unwrap();
+        assert!(stored_json(&root).get("authMethods").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn side_table_entries_load_and_unknown_methods_fall_back_to_keys() {
+        let (root, service) = service_with_store(
+            r#"{"managedHosts":[
+                {"alias":"db","hostName":"db.example"},
+                {"alias":"web","hostName":"web.example","futureField":1}
+            ],"authMethods":{"db":"password","web":"passkey","gone":"password"}}"#,
+        )
+        .await;
+        assert_eq!(
+            auth_methods(&service).await,
+            [
+                ("db".to_owned(), SshAuthMethod::Password),
+                ("web".to_owned(), SshAuthMethod::Key)
+            ]
+        );
+        // Entries for unknown aliases and methods are not written back.
+        assert_eq!(
+            stored_json(&root)["authMethods"],
+            serde_json::json!({"db": "password"})
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// OpenSSH itself must read the defaults after the user's config, and a
