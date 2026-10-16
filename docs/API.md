@@ -1066,7 +1066,7 @@ POST /v2/browser/fetch
 - 自动发现：递归解析 `~/.ssh/config`（跟随 `Include`，相对路径按 `~/.ssh` 解析、glob 按字典序展开），列出具体的 `Host` 别名；通配符、`!` 否定模式与 `Match` 块只参与连接参数解析，不单独列出。
 - TodeX 自管主机与 FTP 站点保存在 `$DATA_DIR/ssh/store.json`，SSH 主机渲染为 `$DATA_DIR/ssh/hosts.conf`（均为 0600）。主机的 `authMethod` 记在 `store.json` 顶层的 `authMethods`（别名 → `password`，`key` 不记录），不写进主机记录，因此回退到 v2.3.0/v2.3.1 的 daemon 仍能读取该文件并启动（这些主机在旧版本中按密钥主机处理）；v2.3.1 写在主机记录里的 `authMethod` 在加载时迁移到 `authMethods` 并重写文件（重写失败只记警告），无法识别的认证方式按 `key` 处理。`store.json` 中的 `connection` 读取时缺失字段取默认值、忽略未知字段，越界值收敛到合法范围（`PUT /v2/ssh/settings` 仍严格校验）。
 - 所有 ssh 调用都使用生成的 `-F $DATA_DIR/ssh/ssh_config`，依次 `Include` 自管主机、`~/.ssh/config`、TodeX 连接默认值（`$DATA_DIR/ssh/defaults.conf`）与系统 `ssh_config`，所以密钥、ssh-agent、ProxyJump、`known_hosts` 行为与用户 shell 中的 `ssh` 一致；有效参数由 `ssh -G` 解析（缓存 30 秒）。Unix 上同一主机的终端、SFTP 与 Agent 命令通过 `ControlMaster`（`$DATA_DIR/ssh/cm/%C`，空闲 5 分钟关闭）复用一次登录。
-- 带密码的 ssh 调用（连接测试、终端、SFTP）由 askpass 辅助程序（`todex-agentd ssh-askpass`）应答：daemon 把密码写入一次性文件 `$DATA_DIR/ssh/askpass/<随机名>`（目录 0700、文件 0600），ssh 子进程环境中只有该文件路径 `TODEX_SSH_ASKPASS_FILE`，密码不进入任何进程环境或命令行。辅助程序只回答密码与密钥口令提示（主机密钥确认等其他提示一律拒绝）；回答密码提示时读取并立即删除该文件，口令提示不删除。连接测试在 ssh 退出后、SFTP 在握手完成后删除该文件；终端的 ssh 可能成为长期共享 master，文件最迟在终端启动 120 秒后删除。daemon 启动时清理残留的密码文件。
+- 带密码的 ssh 调用（连接测试、终端、SFTP）由 askpass 辅助程序（`todex-agentd ssh-askpass`）应答：daemon 把密码写入一次性文件 `$DATA_DIR/ssh/askpass/<随机名>`（目录 0700、文件 0600），ssh 子进程环境中只有该文件路径 `TODEX_SSH_ASKPASS_FILE`，密码不进入任何进程环境或命令行。辅助程序只回答密码与密钥口令提示（主机密钥确认等其他提示一律拒绝）；回答密码提示时读取并立即删除该文件，口令提示不删除。连接测试在 ssh 退出后、SFTP 在握手完成后删除该文件；终端的 ssh 可能成为长期共享 master，文件最迟在终端启动 120 秒后删除。daemon 启动时清理残留的密码文件。密码不能包含 NUL、CR 或 LF，且最长 4096 字节，否则返回 400 `INVALID_REQUEST`（错误信息不含密码）；带密码时总是重新运行 `ssh -G` 检查 ProxyJump/ProxyCommand，不使用上述缓存。
 
 | 接口 | 说明 |
 | --- | --- |
@@ -1075,9 +1075,9 @@ POST /v2/browser/fetch
 | `POST /v2/ssh/hosts/import` | `{ text }` 粘贴 `ssh_config` 片段，返回 `{ hosts, errors }`；通配符、`Match`、`Include` 只报告不导入。 |
 | `PUT` / `DELETE /v2/ssh/hosts/{alias}` | 修改或删除自管主机（`~/.ssh/config` 中的主机只读）。 |
 | `PUT /v2/ssh/hosts/{alias}/agent-access` | `{ enabled }`，默认关闭，见「Agent SSH 工具」。 |
-| `POST /v2/ssh/hosts/{alias}/test` | 以 BatchMode、严格主机密钥校验执行一次 `exit 0`；可选请求体 `{ password? }` 时改为只应答一次密码提示（askpass，一次性密码文件见上文；ProxyJump/ProxyCommand 主机返回 400），且以 `ControlMaster=no`、`ControlPath=none` 单独建立连接，既不复用已有的共享 master（否则任意密码都会显示成功），也不会成为新的 master。返回 `{ ok, durationMs, failure?, detail? }`；`failure` 为 `hostKeyUnverified`、`hostKeyChanged`、`authenticationFailed`、`unreachable`、`timedOut`、`other`。 |
+| `POST /v2/ssh/hosts/{alias}/test` | 以 BatchMode、严格主机密钥校验执行一次 `exit 0`；可选请求体 `{ password? }` 时改为只应答一次密码提示（askpass，一次性密码文件见上文；ProxyJump/ProxyCommand 主机返回 400），且以 `ControlMaster=no`、`ControlPath=none` 单独建立连接，既不复用已有的共享 master（否则任意密码都会显示成功），也不会成为新的 master。请求体可省略或为空白（与 `{}` 相同；不检查 `Content-Type`），`password` 为 `null` 或空字符串时按无密码测试；含其他字段、不是 JSON 或类型不符时返回 400 `INVALID_REQUEST`（`{ code, message }`，不回显请求内容）。返回 `{ ok, durationMs, failure?, detail? }`；`failure` 为 `hostKeyUnverified`、`hostKeyChanged`、`authenticationFailed`、`unreachable`、`timedOut`、`other`。 |
 | `POST /v2/ssh/hosts/{alias}/disconnect` | `ssh -O exit` 关闭共享 master，返回 `{ disconnected }`。 |
-| `GET` / `PUT /v2/ssh/settings` | 连接设置 `{ serverAliveEnabled, serverAliveInterval, serverAliveCountMax }`，默认 `{ false, 15, 3 }`；`PUT` 需提供全部字段（间隔 5–600 秒、次数 1–10，越界返回 400），返回保存后的设置。开启时渲染为 `defaults.conf` 中的 `Host *` 块，位于 `~/.ssh/config` 之后，因此用户为某主机写的 `ServerAlive*` 优先。只影响之后启动的 ssh 进程；已建立的共享 master 保持原参数，直到断开或空闲关闭。 |
+| `GET` / `PUT /v2/ssh/settings` | 连接设置 `{ serverAliveEnabled, serverAliveInterval, serverAliveCountMax }`，默认 `{ false, 15, 3 }`；`PUT` 需提供全部字段（间隔 5–600 秒、次数 1–10，越界返回 400），返回保存后的设置。开启时渲染为 `defaults.conf` 中的 `Host *` 块，位于 `~/.ssh/config` 之后，因此用户为某主机写的 `ServerAlive*` 优先。只影响之后启动的 ssh 进程；已建立的共享 master 保持原参数，直到断开或空闲关闭。保存时（主机、Agent access 与 FTP 站点的修改相同）先写 `store.json`，再写 `hosts.conf`、`defaults.conf` 与 `-F` 包装配置；任一写入失败则恢复原有文件与内存中的状态并返回错误，因此 `GET` 与 ssh 实际读取的配置一致。 |
 | `POST /v2/ftp/sites`、`PUT` / `DELETE /v2/ftp/sites/{id}` | FTP 站点 `{ name, protocol: "ftp"|"ftps", host, port?（默认 21）, user?, initialDirectory? }`，不含密码。 |
 
 ### SSH 密钥

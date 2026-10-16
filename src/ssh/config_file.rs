@@ -1011,6 +1011,16 @@ Host db
                 matches!(invalid.validate(), Err(AppError::InvalidRequest(_))),
                 "{interval}/{count}"
             );
+            assert!(invalid.clamped().validate().is_ok(), "{interval}/{count}");
+        }
+        for (interval, count) in [(5, 1), (600, 10), (5, 10), (600, 1)] {
+            let boundary = ConnectionSettings {
+                server_alive_interval: interval,
+                server_alive_count_max: count,
+                ..settings.clone()
+            };
+            assert!(boundary.validate().is_ok(), "{interval}/{count}");
+            assert_eq!(boundary.clone().clamped(), boundary);
         }
     }
 

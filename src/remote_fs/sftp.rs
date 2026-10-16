@@ -567,6 +567,14 @@ mod tests {
         assert!(log.contains("askpass-file-present"), "{log}");
         assert!(!log.contains("hunter2-secret"), "{log}");
         assert!(crate::ssh::tests::askpass_files(&fixture).is_empty());
+
+        let invalid = SftpFs::connect(
+            &fixture.service,
+            "good",
+            Some(Zeroizing::new("hunter2\nsecret".to_owned())),
+        )
+        .await;
+        assert!(matches!(invalid, Err(AppError::InvalidRequest(_))));
     }
 
     /// Real roundtrip against `TODEX_REMOTE_FS_SFTP_TEST=<alias>`, an ssh

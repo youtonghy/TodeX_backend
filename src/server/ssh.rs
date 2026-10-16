@@ -2,6 +2,7 @@
 //! All routes sit behind the device-signature middleware like the rest of
 //! `/v2`; hosts and keys are those of the user running the daemon.
 
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post, put};
@@ -35,7 +36,7 @@ struct AgentAccessRequest {
 
 /// Optional body of `POST /v2/ssh/hosts/{alias}/test`. No `Debug`: it
 /// carries a password.
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TestRequest {
     #[serde(default)]
@@ -145,11 +146,11 @@ async fn test_host(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(alias): AxumPath<String>,
-    body: Option<Json<TestRequest>>,
+    body: Bytes,
 ) -> Result<Json<Value>, AppError> {
     require_auth(&state, &headers)?;
-    let password = body
-        .and_then(|Json(request)| request.password)
+    let password = parse_test_request(&body)?
+        .password
         .map(Zeroizing::new)
         .filter(|password| !password.is_empty());
     Ok(Json(serde_json::to_value(
@@ -158,6 +159,26 @@ async fn test_host(
             .test_connection(&alias, password.as_deref().map(String::as_str))
             .await?,
     )?))
+}
+
+/// A blank body (whatever its content type) means no password. Parse
+/// errors carry only serde's position and category: its messages may quote
+/// the rejected value, which can be the password.
+fn parse_test_request(body: &[u8]) -> Result<TestRequest, AppError> {
+    if body.trim_ascii().is_empty() {
+        return Ok(TestRequest::default());
+    }
+    serde_json::from_slice(body).map_err(|error| {
+        let problem = match error.classify() {
+            serde_json::error::Category::Data => "expected { password?: string }",
+            _ => "not valid JSON",
+        };
+        AppError::InvalidRequest(format!(
+            "invalid test request body at line {} column {}: {problem}",
+            error.line(),
+            error.column()
+        ))
+    })
 }
 
 async fn disconnect_host(
@@ -244,4 +265,102 @@ async fn delete_ftp_site(
     require_auth(&state, &headers)?;
     state.ssh.delete_ftp_site(&id).await?;
     Ok(Json(json!({ "deleted": true })))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::device_auth::test_support::TestDevice;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// Every body shape a client may send to the test endpoint gets either
+    /// a result or the usual `{ code, message }` error, never echoing the
+    /// password.
+    #[tokio::test]
+    async fn test_endpoint_accepts_optional_bodies_and_rejects_bad_ones() {
+        let fake = crate::ssh::tests::fixture("").await;
+        let root = fake.root.join("app");
+        let mut config = Config {
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..Config::default()
+        };
+        config.agent.ssh_bin = fake.root.join("fake-ssh").display().to_string();
+        let state = AppState::new_for_tests(config).await.unwrap();
+        let alias = "todex-body-test-host";
+        state
+            .ssh
+            .create_host(ManagedHost {
+                alias: alias.into(),
+                host_name: "10.0.0.5".into(),
+                ..ManagedHost::default()
+            })
+            .await
+            .unwrap();
+        let app = crate::server::loopback_test_router(state);
+        let device = TestDevice::new(37);
+        device.enroll(&root.join("data"));
+        let uri = format!("/v2/ssh/hosts/{alias}/test");
+        let send = |content_type: Option<&'static str>, body: &'static str| {
+            let mut builder = Request::builder().method("POST").uri(&uri);
+            if let Some(content_type) = content_type {
+                builder = builder.header("content-type", content_type);
+            }
+            for (name, value) in device.sign("POST", &uri, body.as_bytes()) {
+                builder = builder.header(name, value);
+            }
+            let request = builder.body(Body::from(body)).unwrap();
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let json = Some("application/json");
+        for (content_type, body) in [
+            (None, ""),
+            (json, ""),
+            (json, " \n"),
+            (json, "{}"),
+            (json, r#"{"password":null}"#),
+            (json, r#"{"password":""}"#),
+            (json, r#"{"password":"hunter2"}"#),
+            // The content type is not checked.
+            (Some("text/plain"), r#"{"password":"hunter2"}"#),
+            (Some("application/x-www-form-urlencoded"), ""),
+        ] {
+            let (status, value) = send(content_type, body).await;
+            assert_eq!(status, StatusCode::OK, "{content_type:?} {body:?}: {value}");
+            assert_eq!(value["ok"], true, "{body:?}: {value}");
+        }
+        for (content_type, body) in [
+            (json, r#"{"password":"hunter2","extra":1}"#),
+            (json, r#"{"pasword":"hunter2"}"#),
+            (json, r#""hunter2""#),
+            (json, r#"{"password":5}"#),
+            (json, r#"{"password":"hunter2"#),
+            (Some("text/plain"), "hunter2"),
+            (json, r#"{"password":"hunter2\n"}"#),
+            (json, r#"{"password":"hunter2\u0000"}"#),
+        ] {
+            let (status, value) = send(content_type, body).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{content_type:?} {body:?}: {value}"
+            );
+            assert_eq!(value["code"], "INVALID_REQUEST", "{value}");
+            assert!(
+                !value["message"].as_str().unwrap().contains("hunter2"),
+                "{value}"
+            );
+        }
+    }
 }

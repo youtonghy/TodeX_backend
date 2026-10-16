@@ -1014,7 +1014,7 @@ async fn dispatch(
                 .await?;
             publish_codex_gateway_record(state, record).await;
         }
-        ClientMessageKind::TerminalStart(payload) => {
+        ClientMessageKind::TerminalStart(mut payload) => {
             authorize_terminal_request(
                 &message.id,
                 &payload.tenant_id,
@@ -1026,12 +1026,13 @@ async fn dispatch(
             // An SSH terminal only reaches a host from the inventory; it is
             // not tied to a workspace, so workspace roots and trust do not
             // apply. Local shells keep both checks.
-            let (cwd, command, askpass_secret) = match &payload.ssh {
+            let (cwd, command, askpass_secret) = match payload.ssh.as_mut() {
                 Some(target) => {
                     state.ssh.require_host(&target.host).await?;
+                    // Moved out, not copied, so the only copy is zeroized.
                     let password = target
                         .password
-                        .clone()
+                        .take()
                         .map(Zeroizing::new)
                         .filter(|password| !password.is_empty());
                     let (command, secret) = state

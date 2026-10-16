@@ -102,7 +102,7 @@ pub(crate) struct FtpSiteInput {
     pub initial_directory: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct SshStore {
     managed_hosts: Vec<ManagedHost>,
     ftp_sites: Vec<FtpSite>,
@@ -269,7 +269,7 @@ pub(crate) enum SshFailureKind {
 }
 
 /// A PTY launch of `ssh` (see [`SshService::terminal_command`]).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct TerminalCommand {
     pub program: String,
     pub args: Vec<OsString>,
@@ -277,6 +277,23 @@ pub(crate) struct TerminalCommand {
     pub env: Vec<(String, OsString)>,
     pub cwd: PathBuf,
     pub ssh_host: String,
+}
+
+/// Environment values are left out: an ssh child's environment may carry
+/// credentials.
+impl std::fmt::Debug for TerminalCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalCommand")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field(
+                "env",
+                &self.env.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            )
+            .field("cwd", &self.cwd)
+            .field("ssh_host", &self.ssh_host)
+            .finish()
+    }
 }
 
 /// How an ssh process may interact with the user.
@@ -379,11 +396,28 @@ impl SshService {
         self.inner.dir.join(WRAPPER_FILE)
     }
 
-    /// Writes the generated ssh config and `store.json`. Called under the
-    /// store lock.
-    async fn write_config_files(&self, store: &SshStore) -> Result<(), AppError> {
-        self.write_generated_files(store).await?;
-        self.write_store(store).await
+    /// Makes `next` the store: `store.json` first, then the generated ssh
+    /// config. If any write fails, the files are rewritten from `current`,
+    /// which stays in memory, so what the API reports matches what ssh
+    /// reads. Called under the store write lock.
+    async fn save(&self, current: &mut SshStore, next: SshStore) -> Result<(), AppError> {
+        let written = match self.write_store(&next).await {
+            Ok(()) => self.write_generated_files(&next).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = written {
+            let restored = match self.write_store(current).await {
+                Ok(()) => self.write_generated_files(current).await,
+                Err(error) => Err(error),
+            };
+            if let Err(restore_error) = restored {
+                tracing::warn!(%restore_error, "cannot restore ssh config files");
+            }
+            self.inner.resolve_cache.lock().await.clear();
+            return Err(error);
+        }
+        *current = next;
+        Ok(())
     }
 
     async fn write_store(&self, store: &SshStore) -> Result<(), AppError> {
@@ -472,6 +506,10 @@ impl SshService {
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value))
             .collect();
+        if let Some(password) = password {
+            // Checked here: the fallback below must not swallow it.
+            validate_password(password)?;
+        }
         let askpass = match password {
             Some(password) => match self.askpass_env(alias, password).await {
                 Ok(vars) => Some(vars),
@@ -521,7 +559,14 @@ impl SshService {
         alias: &str,
         password: &str,
     ) -> Result<([(&'static str, OsString); 2], AskpassSecret), AppError> {
-        let resolved = self.resolved_host(alias).await?;
+        validate_password(password)?;
+        // Fresh, not cached: a ProxyJump added within the cache lifetime
+        // must not see the password.
+        self.require_host(alias).await?;
+        let resolved = self
+            .resolve_with(alias, false)
+            .await
+            .map_err(AppError::InvalidRequest)?;
         if resolved.proxy_jump.is_some() || resolved.proxy_command.is_some() {
             return Err(AppError::InvalidRequest(
                 "password sign-in is not supported for hosts behind ProxyJump or \
@@ -530,9 +575,7 @@ impl SshService {
                     .to_owned(),
             ));
         }
-        let program = std::env::current_exe().map_err(|error| {
-            AppError::Unsupported(format!("askpass helper unavailable: {error}"))
-        })?;
+        let program = askpass_program()?;
         let dir = self.inner.dir.join(ASKPASS_DIR);
         let password = zeroize::Zeroizing::new(password.to_owned());
         let secret = tokio::task::spawn_blocking(move || AskpassSecret::create(&dir, &password))
@@ -704,16 +747,18 @@ impl SshService {
         }
     }
 
-    /// Effective connection parameters for a known host (`ssh -G`).
-    pub(crate) async fn resolved_host(&self, alias: &str) -> Result<ResolvedHost, AppError> {
-        self.require_host(alias).await?;
-        self.resolve(alias).await.map_err(AppError::InvalidRequest)
+    async fn resolve(&self, alias: &str) -> Result<ResolvedHost, String> {
+        self.resolve_with(alias, true).await
     }
 
-    async fn resolve(&self, alias: &str) -> Result<ResolvedHost, String> {
-        if let Some((at, result)) = self.inner.resolve_cache.lock().await.get(alias) {
-            if at.elapsed() < RESOLVE_TTL {
-                return result.clone();
+    /// `ssh -G` for `alias`; `cached` allows a result up to [`RESOLVE_TTL`]
+    /// old. A fresh result refreshes the cache either way.
+    async fn resolve_with(&self, alias: &str, cached: bool) -> Result<ResolvedHost, String> {
+        if cached {
+            if let Some((at, result)) = self.inner.resolve_cache.lock().await.get(alias) {
+                if at.elapsed() < RESOLVE_TTL {
+                    return result.clone();
+                }
             }
         }
         let mut command = external_command::secure_command(&self.inner.ssh_bin);
@@ -755,8 +800,9 @@ impl SshService {
                 host.alias
             )));
         }
-        store.managed_hosts.push(host.clone());
-        self.write_config_files(&store).await?;
+        let mut next = store.clone();
+        next.managed_hosts.push(host.clone());
+        self.save(&mut store, next).await?;
         Ok(host)
     }
 
@@ -776,26 +822,27 @@ impl SshService {
                 host.alias
             )));
         }
-        let Some(slot) = store.managed_hosts.iter_mut().find(|h| h.alias == alias) else {
+        let mut next = store.clone();
+        let Some(slot) = next.managed_hosts.iter_mut().find(|h| h.alias == alias) else {
             return Err(AppError::NotFound(format!("managed ssh host {alias}")));
         };
         *slot = host.clone();
-        if host.alias != alias && store.agent_access.remove(alias) {
-            store.agent_access.insert(host.alias.clone());
+        if host.alias != alias && next.agent_access.remove(alias) {
+            next.agent_access.insert(host.alias.clone());
         }
-        self.write_config_files(&store).await?;
+        self.save(&mut store, next).await?;
         Ok(host)
     }
 
     pub async fn delete_host(&self, alias: &str) -> Result<(), AppError> {
         let mut store = self.inner.store.write().await;
-        let before = store.managed_hosts.len();
-        store.managed_hosts.retain(|h| h.alias != alias);
-        if store.managed_hosts.len() == before {
+        let mut next = store.clone();
+        next.managed_hosts.retain(|h| h.alias != alias);
+        if next.managed_hosts.len() == store.managed_hosts.len() {
             return Err(AppError::NotFound(format!("managed ssh host {alias}")));
         }
-        store.agent_access.remove(alias);
-        self.write_config_files(&store).await
+        next.agent_access.remove(alias);
+        self.save(&mut store, next).await
     }
 
     /// Imports every valid host of a pasted snippet; per-host problems are
@@ -839,13 +886,14 @@ impl SshService {
             self.require_host(alias).await?;
         }
         let mut store = self.inner.store.write().await;
+        let mut next = store.clone();
         let changed = if enabled {
-            store.agent_access.insert(alias.to_owned())
+            next.agent_access.insert(alias.to_owned())
         } else {
-            store.agent_access.remove(alias)
+            next.agent_access.remove(alias)
         };
         if changed {
-            self.write_config_files(&store).await?;
+            self.save(&mut store, next).await?;
         }
         Ok(())
     }
@@ -863,11 +911,11 @@ impl SshService {
         settings.validate()?;
         let mut store = self.inner.store.write().await;
         if store.connection != settings {
-            let previous = std::mem::replace(&mut store.connection, settings);
-            if let Err(error) = self.write_config_files(&store).await {
-                store.connection = previous;
-                return Err(error);
-            }
+            let next = SshStore {
+                connection: settings,
+                ..store.clone()
+            };
+            self.save(&mut store, next).await?;
         }
         Ok(store.connection.clone())
     }
@@ -991,31 +1039,70 @@ impl SshService {
     ) -> Result<FtpSite, AppError> {
         let site = normalize_ftp_site(id.map(str::to_owned), input)?;
         let mut store = self.inner.store.write().await;
-        match store.ftp_sites.iter_mut().find(|s| s.id == site.id) {
+        let mut next = store.clone();
+        match next.ftp_sites.iter_mut().find(|s| s.id == site.id) {
             Some(slot) => *slot = site.clone(),
             None if id.is_some() => {
                 return Err(AppError::NotFound(format!("ftp site {}", site.id)))
             }
             None => {
-                if store.ftp_sites.len() >= MAX_FTP_SITES {
+                if next.ftp_sites.len() >= MAX_FTP_SITES {
                     return Err(AppError::ResourceExhausted("too many ftp sites".to_owned()));
                 }
-                store.ftp_sites.push(site.clone());
+                next.ftp_sites.push(site.clone());
             }
         }
-        self.write_config_files(&store).await?;
+        self.save(&mut store, next).await?;
         Ok(site)
     }
 
     pub async fn delete_ftp_site(&self, id: &str) -> Result<(), AppError> {
         let mut store = self.inner.store.write().await;
-        let before = store.ftp_sites.len();
-        store.ftp_sites.retain(|site| site.id != id);
-        if store.ftp_sites.len() == before {
+        let mut next = store.clone();
+        next.ftp_sites.retain(|site| site.id != id);
+        if next.ftp_sites.len() == store.ftp_sites.len() {
             return Err(AppError::NotFound(format!("ftp site {id}")));
         }
-        self.write_config_files(&store).await
+        self.save(&mut store, next).await
     }
+}
+
+/// Longest password accepted for askpass; far above real passwords.
+pub(crate) const MAX_PASSWORD_BYTES: usize = 4096;
+
+/// Rejects passwords ssh cannot receive intact: askpass answers one line
+/// (CR/LF would cut it short) and NUL cannot be passed on. The message
+/// never includes the password.
+pub(crate) fn validate_password(password: &str) -> Result<(), AppError> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(AppError::InvalidRequest(format!(
+            "password must be at most {MAX_PASSWORD_BYTES} bytes"
+        )));
+    }
+    if password.contains(['\0', '\r', '\n']) {
+        return Err(AppError::InvalidRequest(
+            "password must not contain NUL, CR or LF characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// This executable, run by ssh as `SSH_ASKPASS`. Resolved once: after an
+/// in-place upgrade Linux reports the running binary as `<path> (deleted)`,
+/// while the path itself holds the new binary, which has the same helper.
+fn askpass_program() -> Result<PathBuf, AppError> {
+    static PROGRAM: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    PROGRAM
+        .get_or_init(|| {
+            let path = std::env::current_exe().map_err(|error| error.to_string())?;
+            Ok(path
+                .to_str()
+                .and_then(|raw| raw.strip_suffix(" (deleted)"))
+                .map(PathBuf::from)
+                .unwrap_or(path))
+        })
+        .clone()
+        .map_err(|error| AppError::Unsupported(format!("askpass helper unavailable: {error}")))
 }
 
 fn normalize_ftp_site(id: Option<String>, input: FtpSiteInput) -> Result<FtpSite, AppError> {
@@ -1222,7 +1309,7 @@ exit 0
             aliases,
             [("db", HostSource::Managed), ("web", HostSource::SshConfig)]
         );
-        let web = &hosts[1].resolved.as_ref().unwrap();
+        let web = hosts[1].resolved.as_ref().unwrap_or_else(|| panic!("{:?}", hosts[1].resolve_error));
         assert_eq!(web.host_name.as_deref(), Some("web.example"));
         assert_eq!(web.port, Some(22));
         assert!(hosts.iter().all(|host| !host.agent_access));
@@ -1465,6 +1552,142 @@ exit 0
         if fixture.service.inner.multiplex {
             assert!(line.contains("ControlPersist=300"), "{line}");
         }
+    }
+
+    #[tokio::test]
+    async fn password_content_is_checked_before_use() {
+        let fixture = fixture("Host good\n").await;
+        let long = "x".repeat(MAX_PASSWORD_BYTES + 1);
+        for bad in ["sec\0ret", "sec\rret", "sec\nret", long.as_str()] {
+            let error = fixture
+                .service
+                .test_connection("good", Some(bad))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AppError::InvalidRequest(_)), "{error}");
+            assert!(!error.to_string().contains("sec"), "{error}");
+            assert!(!error.to_string().contains("xxxx"), "{error}");
+            // Not swallowed by the terminal's ProxyJump fallback.
+            assert!(matches!(
+                fixture.service.terminal_command("good", Some(bad)).await,
+                Err(AppError::InvalidRequest(_))
+            ));
+        }
+        assert!(askpass_files(&fixture).is_empty());
+        assert!(!fixture.root.join("askpass.log").exists());
+
+        let longest = "x".repeat(MAX_PASSWORD_BYTES);
+        for good in [longest.as_str(), "pässwörd 密码 🔑", " spaced "] {
+            let result = fixture
+                .service
+                .test_connection("good", Some(good))
+                .await
+                .unwrap();
+            assert!(result.ok);
+        }
+    }
+
+    /// The ProxyJump guard must see the config as it is now, not as it was
+    /// when the host list was last resolved.
+    #[tokio::test]
+    async fn password_use_resolves_the_host_afresh() {
+        let fixture = fixture("Host good\n").await;
+        let resolutions = || {
+            std::fs::read_to_string(fixture.root.join("ssh.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains(" -G "))
+                .count()
+        };
+        fixture.service.list_hosts().await.unwrap();
+        assert_eq!(resolutions(), 1);
+        fixture.service.list_hosts().await.unwrap();
+        assert_eq!(resolutions(), 1, "cached");
+        fixture
+            .service
+            .test_connection("good", Some("hunter2"))
+            .await
+            .unwrap();
+        assert_eq!(resolutions(), 2);
+        let (_command, _secret) = fixture
+            .service
+            .terminal_command("good", Some("hunter2"))
+            .await
+            .unwrap();
+        assert_eq!(resolutions(), 3);
+    }
+
+    #[test]
+    fn terminal_command_debug_omits_environment_values() {
+        let command = TerminalCommand {
+            program: "ssh".into(),
+            args: vec!["-tt".into()],
+            env: vec![("SECRET_THING".into(), "hunter2".into())],
+            cwd: PathBuf::from("/home/u"),
+            ssh_host: "good".into(),
+        };
+        let debug = format!("{command:?}");
+        assert!(debug.contains("SECRET_THING"), "{debug}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        let options = crate::local_terminal::TerminalStartOptions {
+            request_id: "r".into(),
+            terminal_id: None,
+            tenant_id: "local".into(),
+            workspace_id: None,
+            cwd: String::new(),
+            shell: None,
+            rows: None,
+            cols: None,
+            command: Some(command),
+        };
+        assert!(!format!("{options:?}").contains("hunter2"));
+        let target = crate::server::protocol::TerminalSshTarget {
+            host: "good".into(),
+            password: Some("hunter2".into()),
+        };
+        assert!(!format!("{target:?}").contains("hunter2"));
+    }
+
+    /// A failed write leaves memory and every file as before, so the API
+    /// reports what ssh actually reads.
+    #[tokio::test]
+    async fn failed_writes_restore_files_and_memory() {
+        let fixture = fixture("").await;
+        let dir = fixture.root.join("data/ssh");
+        let before = std::fs::read(dir.join(STORE_FILE)).unwrap();
+        // A directory cannot be replaced by the atomic rename.
+        std::fs::remove_file(dir.join(DEFAULTS_FILE)).unwrap();
+        std::fs::create_dir(dir.join(DEFAULTS_FILE)).unwrap();
+        let enabled = ConnectionSettings {
+            server_alive_enabled: true,
+            ..ConnectionSettings::default()
+        };
+        assert!(fixture
+            .service
+            .set_connection_settings(enabled.clone())
+            .await
+            .is_err());
+        assert_eq!(
+            fixture.service.connection_settings().await,
+            ConnectionSettings::default()
+        );
+        assert_eq!(std::fs::read(dir.join(STORE_FILE)).unwrap(), before);
+        assert!(fixture.service.create_host(managed("db")).await.is_err());
+        assert!(fixture.service.host_views().await.unwrap().is_empty());
+        assert!(!std::fs::read_to_string(dir.join(MANAGED_HOSTS_FILE))
+            .unwrap()
+            .contains("Host db"));
+        assert_eq!(std::fs::read(dir.join(STORE_FILE)).unwrap(), before);
+
+        std::fs::remove_dir(dir.join(DEFAULTS_FILE)).unwrap();
+        fixture
+            .service
+            .set_connection_settings(enabled)
+            .await
+            .unwrap();
+        assert!(std::fs::read_to_string(dir.join(DEFAULTS_FILE))
+            .unwrap()
+            .contains("ServerAliveInterval 15"));
     }
 
     #[tokio::test]
