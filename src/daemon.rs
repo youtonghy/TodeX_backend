@@ -1406,23 +1406,32 @@ mod tests {
             api_listen: None,
             outdated: false,
         };
+        // Stops the `sleep 30` helper however the test ends, panics included.
+        struct Helper(std::process::Child);
+        impl Drop for Helper {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
         // Concurrent tests forking while the copy was open can briefly keep
         // a write handle alive, which fails exec with ETXTBSY, and under a
         // loaded full test run the helper occasionally dies before it is
         // inspected. Retry until a live helper runs the copied executable.
         let deadline = Instant::now() + Duration::from_secs(10);
-        let (mut child, process) = loop {
+        let (_helper, process) = loop {
             assert!(
                 Instant::now() < deadline,
                 "no live helper ran the copied executable"
             );
-            let mut child = match Command::new(&executable).arg("30").spawn() {
+            let mut helper = match Command::new(&executable).arg("30").spawn() {
                 Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
                     thread::sleep(Duration::from_millis(20));
                     continue;
                 }
-                result => result.expect("spawn copied executable"),
+                result => Helper(result.expect("spawn copied executable")),
             };
+            let child = &mut helper.0;
             let process = record(child.id());
             let settle = Instant::now() + Duration::from_secs(1);
             while !process_matches_record(&process) && Instant::now() < settle {
@@ -1432,7 +1441,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
             }
             if process_matches_record(&process) {
-                break (child, process);
+                break (helper, process);
             }
             match child.try_wait().expect("poll helper") {
                 Some(status) => eprintln!("helper {} exited early: {status}", process.pid),
@@ -1456,8 +1465,6 @@ mod tests {
         assert!(process_started_at(process.pid)
             .is_some_and(|started| (Utc::now() - started).num_seconds().abs() < 60));
 
-        let _ = child.kill();
-        let _ = child.wait();
         let _ = fs::remove_dir_all(root);
     }
 
