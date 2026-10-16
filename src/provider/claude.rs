@@ -1921,6 +1921,26 @@ mod tests {
     }
 
     #[test]
+    fn context_window_comes_from_the_main_model_usage() {
+        let result = json!({ "modelUsage": {
+            "claude-opus-5-5": { "contextWindow": 1_000_000 },
+            "claude-haiku-5-5": { "contextWindow": 200_000 },
+        }});
+        assert_eq!(
+            super::claude_context_window(&result, Some("claude-opus-5-5")),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            super::claude_context_window(&result, Some("claude-haiku-5-5")),
+            Some(200_000)
+        );
+        assert_eq!(super::claude_context_window(&result, None), None);
+        let single = json!({ "modelUsage": { "claude-haiku-5-5": { "contextWindow": 200_000 } } });
+        assert_eq!(super::claude_context_window(&single, None), Some(200_000));
+        assert_eq!(super::claude_context_window(&json!({}), None), None);
+    }
+
+    #[test]
     fn usage_limit_text_resolves_the_reported_zone_and_weekday() {
         use chrono::{TimeZone, Utc};
 
@@ -2006,6 +2026,23 @@ mod tests {
         });
         assert!(claude_frame_limit_reset(&claude_quota_event(&allowed).unwrap()).is_none());
     }
+}
+
+/// Context window of the main model from a `result` frame's `modelUsage`,
+/// keyed by model id. With no main model seen, a single entry is unambiguous.
+fn claude_context_window(result: &Value, model: Option<&str>) -> Option<u64> {
+    let models = result.get("modelUsage")?.as_object()?;
+    let entry = match model {
+        Some(model) => models.get(model).or_else(|| {
+            models
+                .iter()
+                .find(|(id, _)| id.starts_with(model) || model.starts_with(id.as_str()))
+                .map(|(_, entry)| entry)
+        }),
+        None if models.len() == 1 => models.values().next(),
+        None => None,
+    }?;
+    entry.get("contextWindow").and_then(Value::as_u64)
 }
 
 /// The error text inside a Claude `result` frame. Current CLI releases put
@@ -2214,6 +2251,9 @@ async fn run_claude_turn(
     // Text of an API-error assistant frame, used when the following `result`
     // has no usable message of its own.
     let mut limit_text: Option<String> = None;
+    // Model of the latest main-thread API call, which picks the context
+    // window out of the process-wide `modelUsage` ledger.
+    let mut main_model: Option<String> = None;
     // A `result` with zero model turns means the invocation ended without an
     // API call — a task notification queued during resume consumes the prompt
     // without answering it. The process stays alive on the open stream, so
@@ -2271,7 +2311,9 @@ async fn run_claude_turn(
         match message.get("type").and_then(Value::as_str) {
             Some("result") => {
                 if let Some(usage) = message.get("usage").filter(|usage| usage.is_object()) {
-                    sink.emit("usage.updated", json!({ "provider": "claude-code", "turnId": prompt.turn_id, "source": "provider", "scope": "turn", "usage": usage, "costUsd": message.get("total_cost_usd") })).await?;
+                    // `usage` sums every API call of the turn, so it is not a
+                    // context snapshot; the per-call `assistant` frames are.
+                    sink.emit("usage.updated", json!({ "provider": "claude-code", "turnId": prompt.turn_id, "source": "provider", "scope": "turn", "aggregation": "sum", "usage": usage, "costUsd": message.get("total_cost_usd"), "contextWindow": claude_context_window(&message, main_model.as_deref()) })).await?;
                 }
                 let is_error = message
                     .get("is_error")
@@ -2348,6 +2390,11 @@ async fn run_claude_turn(
                     }
                 }
                 let subagent = message.get("parent_tool_use_id").and_then(Value::as_str);
+                if subagent.is_none() {
+                    if let Some(model) = message.pointer("/message/model").and_then(Value::as_str) {
+                        main_model = Some(model.to_owned());
+                    }
+                }
                 sink.emit(
                     "message.completed",
                     json!({ "provider": "claude-code", "message": message.get("message"), "subagentId": subagent }),
