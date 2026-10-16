@@ -165,7 +165,7 @@ fn permission_mapping_matches_golden() {
 pub(super) const MCP_INJECTION: [(ProviderKind, Option<&str>); 8] = [
     (ProviderKind::Acp, Some("acp-servers")),
     (ProviderKind::Codex, Some("codex-config")),
-    (ProviderKind::Pi, None),
+    (ProviderKind::Pi, Some("pi-extension")),
     (ProviderKind::ClaudeCode, Some("claude-args")),
     (ProviderKind::GrokBuild, Some("acp-servers")),
     (ProviderKind::Devin, Some("acp-servers")),
@@ -189,6 +189,7 @@ async fn agent_mcp_injection_matrix_is_frozen() {
             McpInjection::CodexConfig => Some("codex-config"),
             McpInjection::AcpServers => Some("acp-servers"),
             McpInjection::ClaudeArgs => Some("claude-args"),
+            McpInjection::PiExtension => Some("pi-extension"),
             McpInjection::GlobalConfigEnv => Some("global-config-env"),
         };
         assert_eq!(declared, format, "{provider:?}");

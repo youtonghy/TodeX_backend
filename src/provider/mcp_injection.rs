@@ -104,12 +104,40 @@ pub(crate) async fn claude_args(launch: &AgentMcpLaunch) -> Result<Vec<String>, 
     ])
 }
 
+/// Pi arguments loading TodeX's agent MCP extension. The per-conversation
+/// token goes in [`pi_env`] rather than the command line.
+pub(crate) fn pi_args(launch: &AgentMcpLaunch) -> [String; 2] {
+    ["-e".to_owned(), launch.pi_extension.display().to_string()]
+}
+
+/// Environment variable consumed by `todex-pi-mcp.mjs` (`pi_args`), holding
+/// the conversation's enabled bridge servers.
+pub(crate) fn pi_env(launch: &AgentMcpLaunch) -> Result<(String, String), AppError> {
+    let servers: Vec<Value> = launch
+        .servers
+        .iter()
+        .map(|server| {
+            json!({
+                "name": server.name,
+                "command": server.command,
+                "args": server.args(),
+                "env": env_map(server),
+                "timeoutMs": server.tool_timeout_seconds * 1000,
+            })
+        })
+        .collect();
+    Ok((
+        crate::agent_mcp::PI_SERVERS_ENV.to_owned(),
+        serde_json::to_string(&servers)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::agent_mcp::{TOKEN_ENV, URL_ENV};
+    use crate::agent_mcp::{PI_SERVERS_ENV, TOKEN_ENV, URL_ENV};
 
     fn server(name: &'static str, url: &str) -> AgentMcpServer {
         AgentMcpServer {
@@ -134,6 +162,7 @@ mod tests {
                 server("todex_other", "http://127.0.0.1:1/other"),
             ],
             config_file: root.join("claude.json"),
+            pi_extension: root.join("todex-pi-mcp.mjs"),
             global: None,
         };
 
@@ -173,6 +202,28 @@ mod tests {
             config["mcpServers"]["todex_other"]["env"][URL_ENV],
             "http://127.0.0.1:1/other"
         );
+
+        let pi = pi_args(&launch);
+        assert_eq!(
+            pi,
+            [
+                "-e".to_owned(),
+                root.join("todex-pi-mcp.mjs").display().to_string()
+            ]
+        );
+        assert!(
+            !pi.iter().any(|arg| arg.contains("http://127.0.0.1")),
+            "command line must not carry MCP URLs or tokens"
+        );
+        let (env_key, env_val) = pi_env(&launch).unwrap();
+        assert_eq!(env_key, PI_SERVERS_ENV);
+        let pi_servers: Value = serde_json::from_str(&env_val).unwrap();
+        assert_eq!(pi_servers[0]["name"], "todex_ssh");
+        assert_eq!(pi_servers[0]["args"], json!(["agent-mcp-bridge"]));
+        assert_eq!(pi_servers[0]["env"][TOKEN_ENV], "t");
+        assert_eq!(pi_servers[0]["timeoutMs"], 660_000);
+        assert_eq!(pi_servers[1]["env"][URL_ENV], "http://127.0.0.1:1/other");
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

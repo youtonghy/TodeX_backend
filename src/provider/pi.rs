@@ -61,7 +61,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     model_selection: true,
     image_input: true,
     image_input_mode: ImageInputMode::Model,
-    mcp_injection: McpInjection::None,
+    mcp_injection: McpInjection::PiExtension,
     skill_injection: SkillInjection::PromptText,
     file_attachments: FileAttachmentStyle::AtMention,
     profile_required: false,
@@ -113,6 +113,10 @@ struct PiSessionHandle {
     /// process exit, protocol error). New turns wait for it to finish.
     stopping: Arc<AtomicBool>,
     runtime_id: String,
+    /// The TodeX MCP servers the resident process was spawned with; a turn
+    /// whose [`DriverContext::agent_mcp`] differs reopens the runtime so newly
+    /// enabled or disabled servers take effect.
+    agent_mcp: Option<crate::agent_mcp::AgentMcpLaunch>,
 }
 
 /// A spawn in progress. Closing paths record their reason here and wait
@@ -216,6 +220,11 @@ impl PiDriver {
         if let Some(effort) = &prompt.reasoning_effort {
             spec.push_flag_value("--thinking", effort)?;
         }
+        if let Some(launch) = &context.agent_mcp {
+            spec.args.extend(super::mcp_injection::pi_args(launch));
+            let (key, val) = super::mcp_injection::pi_env(launch)?;
+            spec.env.insert(key, val);
+        }
         Ok(spec)
     }
 
@@ -227,6 +236,7 @@ impl PiDriver {
         conversation_id: &str,
         spec: &CommandSpec,
         sink: &DriverEventSink,
+        agent_mcp: Option<crate::agent_mcp::AgentMcpLaunch>,
     ) -> Result<PiSessionHandle, AppError> {
         let process = JsonLineProcess::spawn(spec).await?;
         let (turns, turn_rx) = mpsc::channel(1);
@@ -243,6 +253,7 @@ impl PiDriver {
             shutdown,
             stopping: stopping.clone(),
             runtime_id,
+            agent_mcp,
         };
         tokio::spawn(pi_session_worker(
             process,
@@ -665,7 +676,8 @@ impl ProviderDriver for PiDriver {
             starting: &self.starting,
             conversation_id: &conversation_id,
         };
-        self.start_runtime(&conversation_id, &spec, &sink).await?;
+        self.start_runtime(&conversation_id, &spec, &sink, context.agent_mcp)
+            .await?;
         Ok(ProviderPrewarm::Warmed)
     }
 
@@ -719,6 +731,14 @@ impl ProviderDriver for PiDriver {
                 }
             };
             let handle = match slot {
+                Slot::Running(handle) if handle.agent_mcp != context.agent_mcp => {
+                    // The set of enabled TodeX MCP servers changed since this
+                    // resident process was spawned (for example an SSH host
+                    // was granted agent access after prewarm). Close it so the
+                    // next iteration spawns with the updated `-e` / env.
+                    self.close_session(&conversation_id, "mcp_changed").await;
+                    continue;
+                }
                 Slot::Running(handle) => handle,
                 Slot::Stopping(handle) => {
                     // The worker stopped on its own (usually idle). Wait for
@@ -746,7 +766,8 @@ impl ProviderDriver for PiDriver {
                     if let Some(gate) = &self.spawn_gate {
                         let _ = gate.acquire().await;
                     }
-                    self.start_runtime(&conversation_id, &spec, &sink).await?
+                    self.start_runtime(&conversation_id, &spec, &sink, context.agent_mcp.clone())
+                        .await?
                 }
             };
             let (result, response) = oneshot::channel();
@@ -4532,6 +4553,7 @@ mod tests {
                     shutdown,
                     stopping: Arc::default(),
                     runtime_id: format!("occupied-{index}"),
+                    agent_mcp: None,
                 },
             );
             receivers.push((turn_rx, control_rx, request_rx));
@@ -4720,6 +4742,81 @@ mod tests {
                     && event.payload.get("reason") == Some(&json!("user_closed"))
             })
             .await;
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn prewarm_reopens_runtime_when_agent_mcp_changes() {
+        use crate::conversation::ConversationEventHub;
+        let fixture = Fixture::new().await;
+        let ssh = crate::ssh::tests::fixture("Host web\n").await;
+        let agent_mcp = crate::agent_mcp::tests::registry(ssh.service.clone(), &fixture.root).await;
+        ssh.service.set_agent_access("web", true).await.unwrap();
+        let launch = agent_mcp.launch(&fixture.manifest.id).await.unwrap();
+        assert!(launch.pi_extension.is_file());
+        let make_sink = |turn_id: &str| {
+            DriverEventSink::new(
+                fixture.store.clone(),
+                ConversationEventHub::default(),
+                fixture.permissions.clone(),
+                &fixture.manifest.id,
+            )
+            .with_turn_id(turn_id)
+        };
+
+        // Prewarm before MCP is attached to the context.
+        let (prewarm_context, prewarm_settings) = fixture.turn_parts("pure", "warm").await;
+        let sink = make_sink("warm").muted();
+        assert_eq!(
+            fixture
+                .driver
+                .prewarm(prewarm_context, prewarm_settings, sink)
+                .await
+                .unwrap(),
+            ProviderPrewarm::Warmed
+        );
+        fixture
+            .driver
+            .session_commands(&fixture.manifest.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixture.launches().await, 1);
+
+        // A turn whose context now carries `agent_mcp` closes the prewarmed
+        // process and respawns `pi` with `-e <todex-pi-mcp.mjs>` and env.
+        let (mut turn_context, turn_prompt) = fixture.turn_parts("pure", "turn-1").await;
+        turn_context.agent_mcp = Some(launch.clone());
+        let spec = fixture.driver.launch(&turn_context, &turn_prompt).unwrap();
+        assert!(spec.args.windows(2).any(|pair| {
+            pair[0] == "-e" && pair[1] == launch.pi_extension.display().to_string()
+        }));
+        assert!(spec.env.contains_key(crate::agent_mcp::PI_SERVERS_ENV));
+
+        let (_cancel, cancel) = watch::channel(false);
+        fixture
+            .driver
+            .run_turn(
+                turn_context.clone(),
+                turn_prompt,
+                make_sink("turn-1"),
+                cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fixture.launches().await, 2);
+
+        // A second turn with the same `agent_mcp` reuses the running process.
+        let (mut second_context, second_prompt) = fixture.turn_parts("pure", "turn-2").await;
+        second_context.agent_mcp = Some(launch);
+        let (_cancel, cancel) = watch::channel(false);
+        fixture
+            .driver
+            .run_turn(second_context, second_prompt, make_sink("turn-2"), cancel)
+            .await
+            .unwrap();
+        assert_eq!(fixture.launches().await, 2);
         fixture.finish().await;
     }
 }

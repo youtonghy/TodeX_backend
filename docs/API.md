@@ -84,7 +84,7 @@ DeepSeek Harness 通过 `dsh --profile acp` 接入（`npm install -g @deepseek-a
 
 会话分叉（`conversation.fork`）只在 Provider 真实支持时通过 `capabilities.controlActions` 的 `fork` 项暴露：Codex 走 app-server `thread/fork`，Pi 走 RPC `clone`，Grok Build 走 `_x.ai/session/fork`，OpenCode 走 ACP `session/fork`；Claude Code 由 daemon 复制 `~/.claude` 下的会话 transcript 并改写 `sessionId`（等价于 `claude --resume --fork-session`，不消耗额外汇合）。通用 ACP profile 与 Devin 的分叉能力按已安装 agent 动态探测——daemon 在其 `initialize` 响应中检查 `agentCapabilities.sessionCapabilities.fork`，结果缓存约 5 分钟；声明该能力的 agent 自动开放分叉（Devin CLI 目前未声明，升级后无需改动即可启用），未声明时 `fork` 不出现在 `controlActions` 中，`conversation.fork` 直接返回 unsupported 错误。
 
-`capabilities.managedMcp` 表示 daemon 能否把自己的 agent 工具（SSH、桌面 MCP 服务器）注入该 Provider：Codex 经 `config` 覆盖、Claude Code 经 `--mcp-config` 文件、ACP profile / Grok Build / Devin / OpenCode / DeepSeek Harness 经 ACP `mcpServers` 注入、Antigravity 经全局 `mcp_config.json` 静态条目加进程环境变量注入，均为 `true`；Pi 不加载外部 MCP 服务器，为 `false`。`nativeMcp` 则表示 Provider 是否自行加载用户配置的 MCP 服务器。各 Provider 的这类静态能力在后端各驱动的 `ProviderProfile`（`src/provider/profile.rs`）中统一声明。
+`capabilities.managedMcp` 表示 daemon 能否把自己的 agent 工具（SSH、桌面 MCP 服务器）注入该 Provider：Codex 经 `config` 覆盖、Claude Code 经 `--mcp-config` 文件、Pi 经 `-e` 扩展脚本与进程环境变量注入、ACP profile / Grok Build / Devin / OpenCode / DeepSeek Harness 经 ACP `mcpServers` 注入、Antigravity 经全局 `mcp_config.json` 静态条目加进程环境变量注入，均为 `true`。`nativeMcp` 则表示 Provider 是否自行加载用户配置的 MCP 服务器。各 Provider 的这类静态能力在后端各驱动的 `ProviderProfile`（`src/provider/profile.rs`）中统一声明。
 
 ```http
 GET /v2/providers

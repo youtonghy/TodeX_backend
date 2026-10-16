@@ -1874,4 +1874,122 @@ exit 3
             .cloned();
         assert_eq!(desktop.unwrap()["status"], "connected");
     }
+
+    /// Manual check against the installed Pi CLI: `pi --mode rpc` loads
+    /// `todex-pi-mcp.mjs` via `-e` and invokes `mcp__todex_ssh__ssh_list_hosts`
+    /// through the real `todex-agentd agent-mcp-bridge` even when
+    /// `pi-mcp-adapter` is installed in the user's `~/.pi/agent/settings.json`.
+    /// `cargo build && TODEX_PI_REAL=1 cargo test pi_loads_the_bridge -- --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pi_loads_the_bridge() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        if std::env::var_os("TODEX_PI_REAL").is_none() {
+            return;
+        }
+        let harness = harness().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::loopback_test_router(harness.state.clone());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        harness
+            .state
+            .agent_mcp
+            .desktop()
+            .set_enabled(true)
+            .await
+            .unwrap();
+        let mut launch = harness
+            .state
+            .agent_mcp
+            .launch(&harness.conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(launch.servers.len(), 2);
+        for server in &mut launch.servers {
+            server.command = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("todex-agentd");
+            let route = if server.name == SERVER_NAME {
+                ROUTE
+            } else {
+                super::super::DESKTOP_ROUTE
+            };
+            server.env[0].1 = format!("http://{addr}{route}");
+        }
+
+        // Write a tiny probe extension that verifies the registered tools and
+        // calls `mcp__todex_ssh__ssh_list_hosts` on a custom command.
+        let probe_ext = harness.root.join("probe-todex-mcp.mjs");
+        std::fs::write(
+            &probe_ext,
+            r#"export default function probe(pi) {
+  pi.registerCommand("todex-mcp-probe", {
+    description: "Probe TodeX MCP tools",
+    handler: async (_args, ctx) => {
+      const tools = pi.getAllTools().map((t) => t.name);
+      const active = pi.getActiveTools();
+      ctx.ui.notify(JSON.stringify({ todex_probe: true, tools, active }), "info");
+    },
+  });
+}
+"#,
+        )
+        .unwrap();
+
+        let (env_key, env_val) = crate::provider::mcp_injection::pi_env(&launch).unwrap();
+        let mut child = tokio::process::Command::new("pi")
+            .args(["--mode", "rpc", "--no-session", "--approve"])
+            .args(crate::provider::mcp_injection::pi_args(&launch))
+            .args(["-e", &probe_ext.display().to_string()])
+            .env(env_key, env_val)
+            .current_dir(&harness.root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        stdin
+            .write_all(b"{\"id\":\"p\",\"type\":\"prompt\",\"message\":\"/todex-mcp-probe\"}\n")
+            .await
+            .unwrap();
+        let mut tools_json = String::new();
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await
+        {
+            let value: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+            if value["type"] == "extension_ui_request" && value["method"] == "notify" {
+                let msg = value["message"].as_str().unwrap_or_default();
+                if msg.contains("todex_probe") {
+                    tools_json = msg.to_owned();
+                    break;
+                }
+            }
+        }
+        assert!(
+            tools_json.contains("mcp__todex_ssh__ssh_list_hosts"),
+            "registered tools: {tools_json}"
+        );
+        assert!(
+            tools_json.contains("mcp__todex_ssh__ssh_exec"),
+            "registered tools: {tools_json}"
+        );
+        assert!(
+            tools_json.contains("mcp__todex_desktop__browser_snapshot"),
+            "registered tools: {tools_json}"
+        );
+        let _ = child.kill().await;
+    }
 }

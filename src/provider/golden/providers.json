@@ -141,7 +141,7 @@
       "toolEvents": true,
       "nativeSkills": true,
       "nativeMcp": false,
-      "managedMcp": false,
+      "managedMcp": true,
       "modelSelection": true,
       "imageInput": true,
       "imageInputMode": "model",

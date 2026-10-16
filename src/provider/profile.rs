@@ -25,6 +25,8 @@ pub enum McpInjection {
     AcpServers,
     /// Claude Code `--mcp-config` file plus `--allowedTools`.
     ClaudeArgs,
+    /// Pi `-e` extension plus environment variables for the bridge servers.
+    PiExtension,
     /// Static entries in the provider's global config (Antigravity
     /// `mcp_config.json`, plus its approval hook) pointed at the
     /// conversation through the provider process's environment.

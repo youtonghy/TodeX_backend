@@ -95,6 +95,11 @@ pub(crate) const AGY_NATIVE_AUTO_ENV: &str = "TODEX_AGY_NATIVE_AUTO";
 pub(crate) const AGY_NATIVE_AUTO_HEADER: &str = "x-todex-agy-native-auto";
 pub(crate) const DESKTOP_SERVER: &str = "todex_desktop";
 pub(crate) const DESKTOP_ROUTE: &str = "/internal/agent-mcp/desktop";
+/// JSON array of TodeX MCP bridge servers passed to `todex-pi-mcp.mjs` in the
+/// `pi` process environment (deleted from `process.env` at extension startup).
+pub(crate) const PI_SERVERS_ENV: &str = "TODEX_AGENT_MCP_PI_SERVERS";
+const PI_EXTENSION_FILE: &str = "todex-pi-mcp.mjs";
+const PI_EXTENSION_SOURCE: &str = include_str!("pi_extension.js");
 const STATE_DIR: &str = "agent-mcp";
 
 /// Per-conversation tokens and the endpoint agents connect to.
@@ -153,9 +158,16 @@ impl AgentMcp {
         }
         {
             let state_dir = state_dir.clone();
-            tokio::task::spawn_blocking(move || secure_fs::ensure_owner_only_dir(&state_dir))
-                .await
-                .map_err(|error| AppError::Anyhow(error.into()))??;
+            tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+                secure_fs::ensure_owner_only_dir(&state_dir)?;
+                secure_fs::write_owner_only_atomic_if_changed(
+                    &state_dir.join(PI_EXTENSION_FILE),
+                    PI_EXTENSION_SOURCE.as_bytes(),
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
         }
         Ok(Self {
             inner: Arc::new(Inner {
@@ -275,6 +287,10 @@ impl AgentMcp {
         self.inner
             .state_dir
             .join(format!("claude-{}.json", file_key(conversation_id)))
+    }
+
+    fn pi_extension_path(&self) -> PathBuf {
+        self.inner.state_dir.join(PI_EXTENSION_FILE)
     }
 
     fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Sessions>> {
@@ -411,6 +427,7 @@ impl AgentMcp {
                 })
                 .collect(),
             config_file: self.claude_config_path(conversation_id),
+            pi_extension: self.pi_extension_path(),
             global: None,
         })
     }
@@ -516,6 +533,9 @@ pub struct AgentMcpLaunch {
     /// Owner-only file for providers that read their MCP config from disk
     /// (removed on [`AgentMcp::revoke`]).
     pub(crate) config_file: PathBuf,
+    /// Owner-only Pi extension script (`-e <path>`), written once in
+    /// `state_dir` when [`AgentMcp`] starts.
+    pub(crate) pi_extension: PathBuf,
     /// Set by [`AgentMcp::launch_global`].
     pub(crate) global: Option<GlobalLaunch>,
 }
