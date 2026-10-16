@@ -47,7 +47,8 @@ use crate::{
 };
 
 pub(crate) use agy_hook::run_hook as run_agy_hook;
-use authorizer::{Authorizer, AuthorizerState, ToolMode};
+pub(crate) use authorizer::ToolMode;
+use authorizer::{Authorizer, AuthorizerState};
 pub(crate) use bridge::run_bridge;
 
 /// Every agent MCP endpoint, behind the same loopback + token guard.

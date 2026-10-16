@@ -2086,6 +2086,7 @@ done
                         manifest: manifest.clone(),
                         provider_state: provider_state.clone(),
                         agent_mcp: None,
+                        handles: Default::default(),
                     },
                     DriverPrompt {
                         turn_id: "turn".to_owned(),
@@ -2112,6 +2113,7 @@ done
             manifest,
             provider_state,
             agent_mcp: None,
+            handles: Default::default(),
         };
         let fork = driver
             .fork_session(

@@ -272,6 +272,45 @@ pub struct DriverContext {
     pub provider_state: ProviderState,
     /// TodeX's own MCP server to load into the session, when enabled.
     pub agent_mcp: Option<crate::agent_mcp::AgentMcpLaunch>,
+    /// Ways a driver acts on the running turn's daemon-side state.
+    pub handles: TurnHandles,
+}
+
+/// What a driver may change about its running turn outside the provider
+/// process. Empty for prewarms, forks and tests that do not need them.
+#[derive(Clone, Default)]
+pub struct TurnHandles {
+    /// The turn mode TodeX's own MCP tools follow; `None` without agent MCP.
+    pub mode: Option<TurnModeHandle>,
+}
+
+impl std::fmt::Debug for TurnHandles {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnHandles")
+            .field(
+                "mode",
+                &self.mode.as_ref().map(|mode| &mode.conversation_id),
+            )
+            .finish()
+    }
+}
+
+/// The recorded mode of one conversation's running turn.
+#[derive(Clone)]
+pub struct TurnModeHandle {
+    pub(crate) agent_mcp: crate::agent_mcp::AgentMcp,
+    pub(crate) conversation_id: String,
+}
+
+impl TurnModeHandle {
+    /// The provider cannot honour the requested `auto` (e.g. agy without its
+    /// Auto preview): TodeX's own tools ask for approval for the rest of the
+    /// turn, as in `ask`.
+    pub fn downgrade_to_ask(&self, work_mode: &str) {
+        self.agent_mcp
+            .record_turn_mode(&self.conversation_id, "ask", work_mode);
+    }
 }
 
 #[derive(Clone, Debug)]

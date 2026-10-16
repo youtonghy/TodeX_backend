@@ -640,6 +640,7 @@ mod tests {
                 manifest: self.manifest.clone(),
                 provider_state: self.store.provider_state(&self.manifest.id).await.unwrap(),
                 agent_mcp: None,
+                handles: Default::default(),
             };
             let prompt = DriverPrompt {
                 turn_id: turn_id.to_owned(),
@@ -1148,6 +1149,7 @@ mod tests {
                 .await
                 .unwrap(),
             agent_mcp: None,
+            handles: Default::default(),
         };
         let permit = fixture
             .trust

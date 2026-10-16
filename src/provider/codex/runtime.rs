@@ -910,6 +910,7 @@ done
             manifest: manifest.clone(),
             provider_state: ProviderState::new(ProviderKind::Codex),
             agent_mcp: None,
+            handles: Default::default(),
         };
         let binary = script.display().to_string();
         let sessions = Sessions::new();
@@ -1149,6 +1150,7 @@ done
             manifest: manifest.clone(),
             provider_state: ProviderState::new(ProviderKind::Codex),
             agent_mcp: None,
+            handles: Default::default(),
         };
         let permit = trust.acquire_owned("local", &root).await.unwrap();
         let runner = {

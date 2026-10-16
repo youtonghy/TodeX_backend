@@ -3268,6 +3268,7 @@ mod tests {
                 manifest: self.manifest.clone(),
                 provider_state: self.store.provider_state(&self.manifest.id).await.unwrap(),
                 agent_mcp: None,
+                handles: Default::default(),
             };
             let prompt = DriverPrompt {
                 turn_id: turn.to_owned(),
@@ -4041,6 +4042,7 @@ mod tests {
                 .await
                 .unwrap(),
             agent_mcp: None,
+            handles: Default::default(),
         };
         let (_cancel, cancel) = watch::channel(false);
         fixture
@@ -4642,6 +4644,7 @@ mod tests {
             provider_state: fixture.store.provider_state(&manifest.id).await.unwrap(),
             manifest: manifest.clone(),
             agent_mcp: None,
+            handles: Default::default(),
         };
         let prompt = DriverPrompt {
             turn_id: "over-capacity".to_owned(),

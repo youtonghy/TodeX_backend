@@ -23,7 +23,8 @@
 //! account): it runs what it judges safe and, headless, refuses the rest.
 //! agy silently falls back to its default mode on accounts without it, so a
 //! cached `--mode auto -p=/help` probe decides first; without Auto the turn
-//! runs like `ask`.
+//! runs like `ask`, and TodeX's own MCP tools, which the supervisor set to
+//! follow `auto`, are switched to asking as well.
 
 mod integration;
 
@@ -133,6 +134,8 @@ pub struct AntigravityDriver {
     /// When the account was last probed for agy's Auto mode, and the answer.
     /// The lock also keeps concurrent turns from probing twice.
     auto_mode: tokio::sync::Mutex<Option<(std::time::Instant, bool)>>,
+    /// Where TodeX's hook and MCP entries go: agy's global config.
+    integration_dir: std::path::PathBuf,
 }
 
 impl AntigravityDriver {
@@ -142,6 +145,7 @@ impl AntigravityDriver {
             env_allowlist: config.antigravity_env_allowlist.clone(),
             models: CatalogCache::new(PROFILE.discovery_cache_ttl),
             auto_mode: tokio::sync::Mutex::new(None),
+            integration_dir: integration::config_dir(),
         }
     }
 
@@ -286,13 +290,15 @@ impl ProviderDriver for AntigravityDriver {
             .as_ref()
             .and_then(|launch| launch.global.clone());
         let bridged = match &global {
-            Some(global) => match install_integration(&global.daemon).await {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::warn!(%error, "could not install TodeX's Antigravity hook and MCP entries");
-                    false
+            Some(global) => {
+                match install_integration(&self.integration_dir, &global.daemon).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not install TodeX's Antigravity hook and MCP entries");
+                        false
+                    }
                 }
-            },
+            }
             None => false,
         };
         let mut spec = self.command_spec(
@@ -310,6 +316,11 @@ impl ProviderDriver for AntigravityDriver {
         let auto = controls.work_mode != "plan" && controls.permission_mode == "auto";
         let native_auto = auto && self.auto_available(&workspace).await;
         if auto && !native_auto {
+            // The supervisor recorded `auto` for TodeX's own MCP tools; the
+            // turn runs as `ask`, so they ask too.
+            if let Some(mode) = &context.handles.mode {
+                mode.downgrade_to_ask(&controls.work_mode);
+            }
             sink.emit(
                 "provider.event",
                 json!({
@@ -604,10 +615,10 @@ static INTEGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 
 /// Brings TodeX's hook and MCP entries in `~/.gemini/config` up to date,
 /// retrying once when another tool edited a file meanwhile.
-async fn install_integration(daemon: &Path) -> Result<(), AppError> {
+async fn install_integration(dir: &Path, daemon: &Path) -> Result<(), AppError> {
     let _serial = INTEGRATION_LOCK.lock().await;
     let daemon = daemon.to_owned();
-    let dir = integration::config_dir();
+    let dir = dir.to_owned();
     tokio::task::spawn_blocking(move || match integration::ensure(&dir, &daemon) {
         Err(AppError::Conflict(_)) => integration::ensure(&dir, &daemon),
         other => other,
@@ -1223,6 +1234,8 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             store: ConversationStore,
             manifest: ConversationManifest,
             trust: crate::workspace_trust::WorkspaceTrustStore,
+            /// TodeX's agent MCP with its approval hook, for bridged turns.
+            bridge: Option<crate::agent_mcp::AgentMcp>,
         }
 
         impl Fixture {
@@ -1253,6 +1266,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     env_allowlist: Vec::new(),
                     models: CatalogCache::new(None),
                     auto_mode: tokio::sync::Mutex::new(None),
+                    integration_dir: root.join("gemini-config"),
                 };
                 let store = ConversationStore::new(root.join("data")).await.unwrap();
                 let manifest = store
@@ -1277,7 +1291,38 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     store,
                     manifest,
                     trust,
+                    bridge: None,
                 }
+            }
+
+            /// Turns get TodeX's approval hook, as when agent MCP is on.
+            async fn with_bridge() -> Self {
+                let mut fixture = Self::new().await;
+                let data = fixture.root.join("bridge");
+                let ssh = crate::ssh::SshService::with_home(&data, "ssh".into(), None)
+                    .await
+                    .unwrap();
+                let desktop = crate::agent_desktop::AgentDesktop::load(&data)
+                    .await
+                    .unwrap();
+                let bridge = crate::agent_mcp::AgentMcp::with_bridge_command(
+                    &data,
+                    ssh,
+                    desktop,
+                    Some(PathBuf::from("/opt/todex/todex-agentd")),
+                )
+                .await
+                .unwrap();
+                bridge.set_listen_addr("127.0.0.1:7345".parse().unwrap());
+                fixture.bridge = Some(bridge);
+                fixture
+            }
+
+            /// The mode TodeX's own MCP tools follow in this conversation.
+            fn tool_mode(&self) -> Option<crate::agent_mcp::ToolMode> {
+                self.bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.authorizer_state().mode(&self.manifest.id))
             }
 
             async fn run(
@@ -1288,10 +1333,27 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 mode: Option<&str>,
                 cancel_after: Option<Duration>,
             ) -> Result<DriverTurnResult, AppError> {
+                let mut handles = crate::provider::types::TurnHandles::default();
+                let mut agent_mcp = None;
+                if let Some(bridge) = &self.bridge {
+                    // What the supervisor does as the turn starts.
+                    let (permission, work) = match mode {
+                        None => ("full-access", "implement"),
+                        Some("plan") => ("full-access", "plan"),
+                        Some(mode) => (mode, "implement"),
+                    };
+                    bridge.record_turn_mode(&self.manifest.id, permission, work);
+                    agent_mcp = bridge.launch_global(&self.manifest.id).await;
+                    handles.mode = Some(crate::provider::types::TurnModeHandle {
+                        agent_mcp: bridge.clone(),
+                        conversation_id: self.manifest.id.clone(),
+                    });
+                }
                 let context = DriverContext {
                     manifest: self.manifest.clone(),
                     provider_state: self.store.provider_state(&self.manifest.id).await.unwrap(),
-                    agent_mcp: None,
+                    agent_mcp,
+                    handles,
                 };
                 let prompt = DriverPrompt {
                     turn_id: turn_id.to_owned(),
@@ -1474,6 +1536,44 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             assert!(!launch.contains(&"--mode".to_owned()));
             assert_eq!(fixture.last_auto_hint(), "-");
             assert_eq!(fixture.auto_unavailable_events().await, 1);
+        }
+
+        #[tokio::test]
+        async fn bridged_auto_without_agys_auto_asks_for_todex_tools_too() {
+            use crate::agent_mcp::ToolMode;
+            let fixture = Fixture::with_bridge().await;
+            std::fs::write(fixture.root.join("auto-unavailable"), "").unwrap();
+            fixture
+                .run("turn-1", "hello", Some("auto"), None)
+                .await
+                .unwrap();
+            let launch = &fixture.launches()[0];
+            assert!(launch.contains(&"--dangerously-skip-permissions".to_owned()));
+            assert!(!launch.contains(&"--mode".to_owned()));
+            assert_eq!(fixture.last_auto_hint(), "-");
+            assert_eq!(fixture.tool_mode(), Some(ToolMode::Ask));
+            let bridge = fixture.bridge.as_ref().unwrap();
+            assert_eq!(
+                bridge.turn_mode(&fixture.manifest.id),
+                Some(("ask".to_owned(), "implement".to_owned()))
+            );
+            assert_eq!(fixture.auto_unavailable_events().await, 1);
+        }
+
+        #[tokio::test]
+        async fn bridged_native_auto_keeps_todex_tools_unrestricted() {
+            use crate::agent_mcp::ToolMode;
+            let fixture = Fixture::with_bridge().await;
+            fixture
+                .run("turn-1", "hello", Some("auto"), None)
+                .await
+                .unwrap();
+            let launch = &fixture.launches()[0];
+            assert!(!launch.contains(&"--dangerously-skip-permissions".to_owned()));
+            let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
+            assert_eq!(launch[mode + 1], "auto");
+            assert_eq!(fixture.last_auto_hint(), "1");
+            assert_eq!(fixture.tool_mode(), Some(ToolMode::Unrestricted));
         }
 
         #[tokio::test]

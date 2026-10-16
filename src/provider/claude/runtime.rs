@@ -1027,6 +1027,7 @@ done
                     manifest: manifest.clone(),
                     provider_state,
                     agent_mcp: None,
+                    handles: Default::default(),
                 },
                 prompt: DriverPrompt {
                     turn_id,
@@ -1148,6 +1149,7 @@ done
                     manifest: manifest.clone(),
                     provider_state: self.store.provider_state(&manifest.id).await.unwrap(),
                     agent_mcp: None,
+                    handles: Default::default(),
                 },
                 settings: DriverPrompt {
                     turn_id: "prewarm".to_owned(),

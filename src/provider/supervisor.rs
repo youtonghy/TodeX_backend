@@ -43,7 +43,8 @@ use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill,
     DriverTurnResult, ImageInputMode, PermissionBroker, PermissionDecision, PermissionOutcome,
     ProviderActivity, ProviderCommandDescriptor, ProviderControl, ProviderDriver,
-    ProviderImageInputCapability, ProviderModelDescriptor, ProviderSnapshot,
+    ProviderImageInputCapability, ProviderModelDescriptor, ProviderSnapshot, TurnHandles,
+    TurnModeHandle,
 };
 
 mod follow_ups;
@@ -1514,6 +1515,7 @@ impl ConversationSupervisor {
                     manifest: source.clone(),
                     provider_state,
                     agent_mcp: None,
+                    handles: Default::default(),
                 },
                 launch_permit,
             )
@@ -1627,6 +1629,7 @@ impl ConversationSupervisor {
                         manifest,
                         provider_state,
                         agent_mcp: None,
+                        handles: Default::default(),
                     },
                     cancel_rx,
                     launch_permit,
@@ -1750,6 +1753,7 @@ impl ConversationSupervisor {
             manifest,
             provider_state,
             agent_mcp,
+            handles: Default::default(),
         };
         // Registered before the provider is awaited, so a turn submitted
         // during the warm (or after a timeout) still takes its events over.
@@ -2373,6 +2377,15 @@ impl ConversationSupervisor {
                 manifest,
                 provider_state: provider_state.clone(),
                 agent_mcp,
+                handles: TurnHandles {
+                    mode: supervisor
+                        .agent_mcp
+                        .clone()
+                        .map(|agent_mcp| TurnModeHandle {
+                            agent_mcp,
+                            conversation_id: conversation_id.clone(),
+                        }),
+                },
             };
             let driver_prompt = DriverPrompt {
                 turn_id: spawned_turn_id.clone(),
