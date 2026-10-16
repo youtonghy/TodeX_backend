@@ -5,8 +5,10 @@
 //! the public key of the history recipient derived from it
 //! ([`history_crypto::api_key_recipient_seed`]), so the file never holds
 //! anything that authenticates or decrypts. Like `devices.json` the file is
-//! owner-only, replaced atomically and reloaded by mtime, so the CLI and the
-//! TUI manage keys while the daemon runs.
+//! owner-only, replaced atomically and reloaded when its [`FileStamp`]
+//! changes, so the CLI and the TUI manage keys while the daemon runs. Every
+//! read-modify-write, in any process, holds the cross-process
+//! `api-keys.json.lock`, so a revocation is never overwritten.
 use std::{
     collections::BTreeMap,
     fs,
@@ -27,6 +29,7 @@ use crate::conversation::ProviderKind;
 use crate::error::AppError;
 use crate::history_crypto::{self, RecipientPublicKey};
 use crate::history_keys::OwnerRecipients;
+use crate::secure_fs::{self, FileStamp};
 
 type Result<T> = std::result::Result<T, AppError>;
 
@@ -247,7 +250,7 @@ struct KeysFile {
 struct Inner {
     path: PathBuf,
     keys: BTreeMap<String, ApiKeyRecord>,
-    mtime: Option<SystemTime>,
+    stamp: Option<FileStamp>,
     dirty: bool,
     last_flush: Instant,
 }
@@ -262,12 +265,12 @@ pub(crate) struct ApiKeyStore {
 impl ApiKeyStore {
     pub(crate) fn load(data_dir: &Path) -> Result<Self> {
         let path = data_dir.join(FILE_NAME);
-        let (keys, mtime) = read_records(&path)?.unwrap_or_default();
+        let (keys, stamp) = read_records(&path)?.unwrap_or_default();
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 path,
                 keys,
-                mtime,
+                stamp,
                 dirty: false,
                 last_flush: Instant::now(),
             })),
@@ -303,6 +306,7 @@ impl ApiKeyStore {
             revoked_at: None,
         };
         let mut inner = self.lock()?;
+        let _file_lock = lock_file(&inner.path)?;
         inner.reload_if_changed()?;
         let active = inner.keys.values().filter(|key| key.is_active(now)).count();
         if active >= MAX_ACTIVE_KEYS {
@@ -323,6 +327,7 @@ impl ApiKeyStore {
     pub(crate) fn list(&self) -> Result<Vec<ApiKeyRecord>> {
         let mut inner = self.lock()?;
         inner.reload_if_changed()?;
+        inner.flush_if_due();
         let mut keys = inner.keys.values().cloned().collect::<Vec<_>>();
         keys.sort_by_key(|key| key.created_at);
         Ok(keys)
@@ -331,11 +336,13 @@ impl ApiKeyStore {
     pub(crate) fn get(&self, id: &str) -> Result<Option<ApiKeyRecord>> {
         let mut inner = self.lock()?;
         inner.reload_if_changed()?;
+        inner.flush_if_due();
         Ok(inner.keys.get(id).cloned())
     }
 
     pub(crate) fn update(&self, id: &str, update: ApiKeyUpdate) -> Result<ApiKeyRecord> {
         let mut inner = self.lock()?;
+        let _file_lock = lock_file(&inner.path)?;
         inner.reload_if_changed()?;
         let record = inner
             .keys
@@ -367,6 +374,7 @@ impl ApiKeyStore {
     /// already revoked.
     pub(crate) fn revoke(&self, id: &str) -> Result<bool> {
         let mut inner = self.lock()?;
+        let _file_lock = lock_file(&inner.path)?;
         inner.reload_if_changed()?;
         let Some(record) = inner.keys.get_mut(id) else {
             return Ok(false);
@@ -400,9 +408,7 @@ impl ApiKeyStore {
         record.last_used_at = Some(now);
         let record = record.clone();
         inner.dirty = true;
-        if inner.last_flush.elapsed() >= USE_FLUSH_INTERVAL {
-            let _ = inner.write();
-        }
+        inner.flush_if_due();
         Ok(AuthenticatedKey {
             record,
             seed: history_crypto::api_key_recipient_seed(secret.as_slice()),
@@ -428,23 +434,39 @@ impl OwnerRecipients for ApiKeyStore {
 }
 
 impl Inner {
-    fn reload_if_changed(&mut self) -> Result<()> {
-        let mtime = fs::metadata(&self.path)
-            .and_then(|metadata| metadata.modified())
-            .ok();
-        if mtime != self.mtime {
-            // An external writer (CLI, TUI) wins over unflushed lastUsedAt
-            // updates; those are best-effort.
-            let (keys, mtime) = read_records(&self.path)?.unwrap_or_default();
-            self.keys = keys;
-            self.mtime = mtime;
-            self.dirty = false;
-            return Ok(());
+    /// Reloads the file when another process changed it. Returns whether
+    /// it did; an external writer (CLI, TUI) wins over unflushed lastUsedAt
+    /// updates, which are best-effort.
+    fn reload_if_changed(&mut self) -> Result<bool> {
+        let stamp = FileStamp::read(&self.path).ok();
+        if stamp == self.stamp {
+            return Ok(false);
         }
-        if self.dirty && self.last_flush.elapsed() >= USE_FLUSH_INTERVAL {
-            self.write()?;
+        let (keys, stamp) = read_records(&self.path)?.unwrap_or_default();
+        self.keys = keys;
+        self.stamp = stamp;
+        self.dirty = false;
+        Ok(true)
+    }
+
+    /// Writes pending lastUsedAt updates once the flush interval passed,
+    /// under the file lock and only when the file did not change meanwhile.
+    /// A failure is logged and retried after another interval.
+    fn flush_if_due(&mut self) {
+        if !self.dirty || self.last_flush.elapsed() < USE_FLUSH_INTERVAL {
+            return;
         }
-        Ok(())
+        let result = lock_file(&self.path).and_then(|_file_lock| {
+            if self.reload_if_changed()? {
+                Ok(())
+            } else {
+                self.write()
+            }
+        });
+        if let Err(error) = result {
+            self.last_flush = Instant::now();
+            tracing::warn!(error = %error, "failed to record API key use");
+        }
     }
 
     /// Drops the oldest revoked records beyond [`MAX_RECORDS`].
@@ -463,17 +485,17 @@ impl Inner {
         }
     }
 
+    /// Publishes the in-memory keys. Callers hold [`lock_file`] and reloaded
+    /// under it, so no external change is overwritten.
     fn write(&mut self) -> Result<()> {
-        write_records(
+        let stamp = write_records(
             &self.path,
             &KeysFile {
                 version: 1,
                 keys: self.keys.clone(),
             },
         )?;
-        self.mtime = fs::metadata(&self.path)
-            .and_then(|metadata| metadata.modified())
-            .ok();
+        self.stamp = Some(stamp);
         self.dirty = false;
         self.last_flush = Instant::now();
         Ok(())
@@ -518,7 +540,14 @@ fn validate_name(name: &str) -> Result<String> {
     Ok(name.to_owned())
 }
 
-type RecordsSnapshot = (BTreeMap<String, ApiKeyRecord>, Option<SystemTime>);
+/// Takes the cross-process lock that serializes read-modify-write cycles of
+/// the key file at `path`.
+fn lock_file(path: &Path) -> Result<fs::File> {
+    secure_fs::lock_exclusive(&secure_fs::lock_path(path), secure_fs::STATE_LOCK_TIMEOUT)
+        .map_err(|error| invalid(&format!("API key file is locked: {error}")))
+}
+
+type RecordsSnapshot = (BTreeMap<String, ApiKeyRecord>, Option<FileStamp>);
 
 fn read_records(path: &Path) -> Result<Option<RecordsSnapshot>> {
     let metadata = match fs::symlink_metadata(path) {
@@ -552,10 +581,14 @@ fn read_records(path: &Path) -> Result<Option<RecordsSnapshot>> {
             return Err(invalid("API key file contains an invalid record"));
         }
     }
-    Ok(Some((file.keys, metadata.modified().ok())))
+    Ok(Some((file.keys, Some(FileStamp::of(&metadata)))))
 }
 
-fn write_records(path: &Path, file: &KeysFile) -> Result<()> {
+/// Atomically replaces the key file and returns the [`FileStamp`] of the
+/// version written, read from the temporary file before the rename (which
+/// keeps inode, length and modification time), so a newer external version
+/// at the path is never mistaken for this one.
+fn write_records(path: &Path, file: &KeysFile) -> Result<FileStamp> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -567,7 +600,7 @@ fn write_records(path: &Path, file: &KeysFile) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<FileStamp> {
         let mut handle = options.open(&temporary)?;
         let bytes = serde_json::to_vec(file)?;
         if bytes.len() as u64 > MAX_FILE_BYTES {
@@ -576,8 +609,9 @@ fn write_records(path: &Path, file: &KeysFile) -> Result<()> {
         handle.write_all(&bytes)?;
         handle.sync_all()?;
         drop(handle);
-        fs::rename(&temporary, path)?;
-        Ok(())
+        let stamp = FileStamp::read(&temporary)?;
+        secure_fs::replace_file(&temporary, path)?;
+        Ok(stamp)
     })();
     let _ = fs::remove_file(&temporary);
     result
@@ -698,6 +732,47 @@ pub(crate) mod tests {
             store.authenticate(&text),
             Err(AppError::Unauthenticated)
         ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A revocation by another process within one mtime tick (simulated by
+    /// restoring the modification time) is seen, and the daemon's pending
+    /// lastUsedAt flush does not write the key back as active.
+    #[test]
+    fn a_same_mtime_external_revocation_is_seen_and_not_written_back() {
+        let (root, store) = fixture();
+        let (record, text) = store.create(named("CI")).unwrap();
+        store.authenticate(&text).unwrap();
+        assert!(store.inner.lock().unwrap().dirty);
+        let path = root.join(FILE_NAME);
+        let original = fs::metadata(&path).unwrap().modified().unwrap();
+
+        let cli = ApiKeyStore::load(&root).unwrap();
+        assert!(cli.revoke(&record.id).unwrap());
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(original)
+            .unwrap();
+        // The daemon's lastUsedAt flush is due.
+        store.inner.lock().unwrap().last_flush =
+            Instant::now().checked_sub(USE_FLUSH_INTERVAL).unwrap();
+
+        assert!(matches!(
+            store.authenticate(&text),
+            Err(AppError::Unauthenticated)
+        ));
+        assert_eq!(
+            store.get(&record.id).unwrap().unwrap().status(unix_ms()),
+            "revoked"
+        );
+        let on_disk = ApiKeyStore::load(&root)
+            .unwrap()
+            .get(&record.id)
+            .unwrap()
+            .unwrap();
+        assert!(on_disk.revoked_at.is_some());
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use uuid::Uuid;
@@ -169,6 +169,54 @@ impl FileStamp {
     }
 }
 
+/// How long writers of a shared state file wait for its [`lock_exclusive`]
+/// lock. Holders only read, merge and atomically replace one small file.
+pub(crate) const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `<path>.lock`: the lock file guarding read-modify-write cycles of `path`.
+pub(crate) fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+/// Takes an exclusive cross-process advisory lock on `lock_path`, creating
+/// it (owner-only) and its parent directory when missing. Waits at most
+/// `timeout` for another holder and then fails with `TimedOut`. The lock is
+/// released when the returned file is dropped; std opens it close-on-exec,
+/// so spawned programs do not keep it. The lock file itself is never
+/// removed, as unlinking it would let two writers lock different files.
+pub(crate) fn lock_exclusive(lock_path: &Path, timeout: Duration) -> io::Result<fs::File> {
+    const POLL: Duration = Duration::from_millis(5);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(lock_path)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) => {}
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{} is held by another process", lock_path.display()),
+            ));
+        }
+        std::thread::sleep(POLL.min(deadline - now));
+    }
+}
+
 /// Writes `bytes` to a new 0600 file and fails with `AlreadyExists` instead of
 /// replacing an existing one. A partially written file is removed.
 pub(crate) fn create_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -320,6 +368,37 @@ mod tests {
         }
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(reader.join().unwrap(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exclusive_lock_waits_for_the_holder_and_times_out() {
+        let dir = temp_dir("lock");
+        let lock = lock_path(&dir.join("state.json"));
+        assert_eq!(lock.file_name().unwrap(), "state.json.lock");
+        // The parent is created on demand.
+        let held = lock_exclusive(&lock, Duration::from_millis(100)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let started = Instant::now();
+        let error = lock_exclusive(&lock, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+
+        let waiter = {
+            let lock = lock.clone();
+            std::thread::spawn(move || lock_exclusive(&lock, Duration::from_secs(5)).is_ok())
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "the lock is still held");
+        drop(held);
+        assert!(waiter.join().unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 

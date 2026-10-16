@@ -22,13 +22,16 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::SystemTime,
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 
-use crate::{devices::DeviceRegistry, error::AppError, secure_fs};
+use crate::{
+    devices::DeviceRegistry,
+    error::AppError,
+    secure_fs::{self, FileStamp},
+};
 
 pub(crate) use dek::{DekManager, OwnerRecipients};
 pub(crate) use fingerprint::FingerprintKey;
@@ -135,15 +138,10 @@ pub(crate) fn validate_conversation_id(id: &str) -> Result<()> {
     }
 }
 
-/// Identifies one version of a file for reload-on-change: modification time
-/// plus length, so two writes within one mtime tick are still noticed when
-/// their sizes differ.
-pub(crate) type FileStamp = (Option<SystemTime>, u64);
-
+/// Identifies one version of a file for reload-on-change; `None` when it
+/// cannot be read (missing file).
 fn file_stamp(path: &Path) -> Option<FileStamp> {
-    fs::metadata(path)
-        .ok()
-        .map(|metadata| (metadata.modified().ok(), metadata.len()))
+    FileStamp::read(path).ok()
 }
 
 /// Reads an owner-only regular file. `None` when it does not exist; an error

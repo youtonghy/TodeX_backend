@@ -4,9 +4,12 @@
 //! lists and revokes devices through the same file; the daemon notices file
 //! changes by their [`FileStamp`] so revocation applies without a restart.
 //! The file is the source of truth: deleting it locks out every paired device.
+//! Every read-modify-write, in either process, holds the cross-process
+//! `devices.json.lock` ([`secure_fs::lock_exclusive`]), so a revocation is
+//! never overwritten by a write based on an older version of the file.
 use crate::error::AppError;
 use crate::history_keys::DeviceRevocation;
-use crate::secure_fs::FileStamp;
+use crate::secure_fs::{self, FileStamp};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -123,6 +126,7 @@ impl DeviceRegistry {
             last_seen_at: None,
         };
         let mut inner = self.lock()?;
+        let _file_lock = lock_file(&inner.path)?;
         inner.reload_if_changed()?;
         if inner.devices.len() >= MAX_DEVICES && !inner.devices.contains_key(&record.device_id) {
             return Err(AppError::ResourceExhausted(
@@ -168,6 +172,7 @@ impl DeviceRegistry {
     /// change to the file still wins over them.
     pub(crate) fn flush(&self) -> Result<()> {
         let mut inner = self.lock()?;
+        let _file_lock = lock_file(&inner.path)?;
         if inner.reload_if_changed()? || !inner.dirty {
             return Ok(());
         }
@@ -245,26 +250,30 @@ impl Inner {
         {
             self.flush_attempts += 1;
         }
-        let result = match self.reload_if_changed() {
-            Ok(true) => Ok(()),
-            Ok(false) => self.write(),
-            Err(error) => Err(error),
-        };
+        let result = lock_file(&self.path).and_then(|_file_lock| {
+            if self.reload_if_changed()? {
+                Ok(())
+            } else {
+                self.write()
+            }
+        });
         if result.is_err() {
             self.last_flush = Instant::now();
         }
         result
     }
 
+    /// Publishes the in-memory registry. Callers hold [`lock_file`] and
+    /// reloaded under it, so no external change is overwritten.
     fn write(&mut self) -> Result<()> {
-        write_records(
+        let stamp = write_records(
             &self.path,
             &RegistryFile {
                 version: 1,
                 devices: self.devices.clone(),
             },
         )?;
-        self.stamp = FileStamp::read(&self.path).ok();
+        self.stamp = Some(stamp);
         self.dirty = false;
         self.last_flush = Instant::now();
         Ok(())
@@ -285,6 +294,7 @@ pub(crate) fn list_devices(data_dir: &Path) -> Result<Vec<DeviceRecord>> {
 /// its next history access.
 pub(crate) fn revoke_device(data_dir: &Path, device_id: &str) -> Result<bool> {
     let path = data_dir.join(FILE_NAME);
+    let file_lock = lock_file(&path)?;
     let (mut devices, _) = read_records(&path)?.unwrap_or_default();
     if devices.remove(device_id).is_none() {
         return Ok(false);
@@ -296,11 +306,14 @@ pub(crate) fn revoke_device(data_dir: &Path, device_id: &str) -> Result<bool> {
             devices,
         },
     )?;
+    drop(file_lock);
     revoke_history_recipients(data_dir, DeviceRevocation::One(device_id))?;
     Ok(true)
 }
 
 pub(crate) fn revoke_all_devices(data_dir: &Path) -> Result<()> {
+    let path = data_dir.join(FILE_NAME);
+    let file_lock = lock_file(&path)?;
     // An unreadable file must not stop a revoke-all; devices with a history
     // recipient are still blocked through their recipient records.
     let paired = match list_devices(data_dir) {
@@ -311,12 +324,13 @@ pub(crate) fn revoke_all_devices(data_dir: &Path) -> Result<()> {
         }
     };
     write_records(
-        &data_dir.join(FILE_NAME),
+        &path,
         &RegistryFile {
             version: 1,
             devices: BTreeMap::new(),
         },
     )?;
+    drop(file_lock);
     revoke_history_recipients(data_dir, DeviceRevocation::All(&paired))
 }
 
@@ -328,6 +342,13 @@ fn revoke_history_recipients(data_dir: &Path, devices: DeviceRevocation<'_>) -> 
                 "device revoked, but its history recipient was not updated: {error}"
             ))
         })
+}
+
+/// Takes the cross-process lock that serializes read-modify-write cycles of
+/// the registry file at `path`.
+fn lock_file(path: &Path) -> Result<fs::File> {
+    secure_fs::lock_exclusive(&secure_fs::lock_path(path), secure_fs::STATE_LOCK_TIMEOUT)
+        .map_err(|error| invalid(&format!("device registry is locked: {error}")))
 }
 
 type RecordsSnapshot = (BTreeMap<String, DeviceRecord>, Option<FileStamp>);
@@ -366,7 +387,12 @@ fn read_records(path: &Path) -> Result<Option<RecordsSnapshot>> {
     Ok(Some((file.devices, Some(FileStamp::of(&metadata)))))
 }
 
-fn write_records(path: &Path, file: &RegistryFile) -> Result<()> {
+/// Atomically replaces the registry file and returns the [`FileStamp`] of
+/// the version written. The stamp is read from the temporary file before the
+/// rename, which keeps its inode, length and modification time: reading the
+/// target afterwards could pick up a newer external version instead and so
+/// hide that change from [`Inner::reload_if_changed`].
+fn write_records(path: &Path, file: &RegistryFile) -> Result<FileStamp> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -378,7 +404,7 @@ fn write_records(path: &Path, file: &RegistryFile) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<FileStamp> {
         let mut handle = options.open(&temporary)?;
         let bytes = serde_json::to_vec(file)?;
         if bytes.len() as u64 > MAX_FILE_BYTES {
@@ -387,8 +413,11 @@ fn write_records(path: &Path, file: &RegistryFile) -> Result<()> {
         handle.write_all(&bytes)?;
         handle.sync_all()?;
         drop(handle);
-        fs::rename(&temporary, path)?;
-        Ok(())
+        let stamp = FileStamp::read(&temporary)?;
+        secure_fs::replace_file(&temporary, path)?;
+        #[cfg(test)]
+        tests::after_rename();
+        Ok(stamp)
     })();
     let _ = fs::remove_file(&temporary);
     result
@@ -408,6 +437,39 @@ fn invalid(message: &str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static AFTER_RENAME: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Runs the hook [`on_next_rename`] set on this thread, right after
+    /// [`write_records`] renamed its file into place.
+    pub(super) fn after_rename() {
+        if let Some(hook) = AFTER_RENAME.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    fn on_next_rename(hook: impl FnOnce() + 'static) {
+        AFTER_RENAME.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// An external atomic replacement (a new inode on Unix), optionally
+    /// carrying over a given modification time.
+    fn replace_externally(path: &Path, contents: &str, modified: Option<SystemTime>) {
+        let temporary = path.with_file_name(format!(".external-{}.tmp", uuid::Uuid::new_v4()));
+        secure_fs::create_owner_only(&temporary, contents.as_bytes()).unwrap();
+        if let Some(modified) = modified {
+            fs::File::options()
+                .write(true)
+                .open(&temporary)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+        fs::rename(&temporary, path).unwrap();
+    }
 
     fn key(byte: u8) -> [u8; 32] {
         // Deterministic but valid Ed25519 public keys: derive them from fixed
@@ -616,6 +678,116 @@ mod tests {
             .unwrap()
             .set_modified(previous + std::time::Duration::from_secs(1))
             .unwrap();
+    }
+
+    /// Regression test for change detection by [`FileStamp`]: a replacement
+    /// that restores the previous modification time is still noticed, by
+    /// its inode on Unix and by its length everywhere.
+    #[test]
+    fn an_atomic_replace_keeping_the_mtime_is_reloaded() {
+        let (root, registry) = fixture();
+        let phone = registry.register("Phone", &key(7)).unwrap();
+        let path = root.join(FILE_NAME);
+        let original = fs::metadata(&path).unwrap().modified().unwrap();
+        #[cfg(unix)]
+        {
+            let raw = fs::read_to_string(&path).unwrap();
+            let renamed = raw.replace("\"Phone\"", "\"Phony\"");
+            assert_eq!(renamed.len(), raw.len());
+            replace_externally(&path, &renamed, Some(original));
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), original);
+            assert_eq!(
+                registry.get(&phone.device_id).unwrap().unwrap().name,
+                "Phony"
+            );
+        }
+        replace_externally(&path, "{\"version\":1,\"devices\":{}}", Some(original));
+        assert!(registry.get(&phone.device_id).unwrap().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_in_place_rewrite_keeping_the_mtime_is_reloaded() {
+        let (root, registry) = fixture();
+        let phone = registry.register("Phone", &key(7)).unwrap();
+        let path = root.join(FILE_NAME);
+        let original = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, "{\"version\":1,\"devices\":{}}").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(original)
+            .unwrap();
+        assert!(registry.get(&phone.device_id).unwrap().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A change that lands between the daemon's rename and its bookkeeping
+    /// (an external writer that ignores the lock) is still noticed: the
+    /// daemon records the stamp of the version it wrote, not of whatever the
+    /// path holds afterwards.
+    #[test]
+    fn a_change_right_after_the_daemon_renamed_is_not_missed() {
+        let (root, registry) = fixture();
+        let phone = registry.register("Phone", &key(7)).unwrap();
+        let laptop = registry.register("Laptop", &key(8)).unwrap();
+        let path = root.join(FILE_NAME);
+        {
+            let (path, phone) = (path.clone(), phone.device_id.clone());
+            on_next_rename(move || {
+                let mut file: RegistryFile =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                file.devices.remove(&phone);
+                replace_externally(&path, &serde_json::to_string(&file).unwrap(), None);
+            });
+        }
+        let tablet = registry.register("Tablet", &key(9)).unwrap();
+        assert!(registry.get(&phone.device_id).unwrap().is_none());
+        assert!(registry.get(&tablet.device_id).unwrap().is_some());
+
+        registry.touch(&laptop.device_id);
+        registry.flush().unwrap();
+        let (raw, _) = registry_file(&root);
+        assert!(!raw.contains(&phone.device_id));
+        assert!(raw.contains("lastSeenAt"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A revocation started while the daemon holds the registry lock waits
+    /// for it, then applies on top of the daemon's write and stays.
+    #[test]
+    fn a_revocation_waits_for_the_daemon_write_and_is_preserved() {
+        let (root, registry) = fixture();
+        let phone = registry.register("Phone", &key(7)).unwrap();
+        let laptop = registry.register("Laptop", &key(8)).unwrap();
+        registry.touch(&phone.device_id);
+        registry.touch(&laptop.device_id);
+        let revoker = Arc::new(Mutex::new(None));
+        {
+            let (root, phone, revoker) = (root.clone(), phone.device_id.clone(), revoker.clone());
+            on_next_rename(move || {
+                let handle = std::thread::spawn(move || revoke_device(&root, &phone).unwrap());
+                std::thread::sleep(Duration::from_millis(150));
+                assert!(
+                    !handle.is_finished(),
+                    "the revocation must wait for the daemon's lock"
+                );
+                *revoker.lock().unwrap() = Some(handle);
+            });
+        }
+        // The daemon's shutdown flush writes both timestamps under the lock.
+        registry.flush().unwrap();
+        let handle = revoker.lock().unwrap().take().expect("hook ran");
+        assert!(handle.join().unwrap());
+
+        assert!(registry.get(&phone.device_id).unwrap().is_none());
+        registry.touch(&laptop.device_id);
+        registry.flush().unwrap();
+        let (raw, _) = registry_file(&root);
+        assert!(!raw.contains(&phone.device_id));
+        assert!(raw.contains(&laptop.device_id));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
