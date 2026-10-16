@@ -321,8 +321,28 @@ impl SshService {
     /// An `ssh` command that reads only TodeX's wrapper config. Callers append
     /// `--`, the alias, and an optional remote command.
     pub(crate) fn command(&self, mode: SshMode) -> Command {
+        let control = if self.inner.multiplex {
+            self.control_options(mode)
+        } else {
+            Vec::new()
+        };
+        self.command_with(mode, control)
+    }
+
+    /// [`Self::command`] that neither uses nor becomes a shared master, so
+    /// the connection really authenticates.
+    fn unshared_command(&self, mode: SshMode) -> Command {
+        self.command_with(
+            mode,
+            ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+                .map(OsString::from)
+                .into(),
+        )
+    }
+
+    fn command_with(&self, mode: SshMode, control: Vec<OsString>) -> Command {
         let mut command = external_command::secure_command(&self.inner.ssh_bin);
-        command.args(self.options(mode));
+        command.args(self.options_with(mode, control));
         if mode == SshMode::Askpass {
             // Use SSH_ASKPASS even without a display or with a tty.
             command.env("SSH_ASKPASS_REQUIRE", "force");
@@ -425,10 +445,19 @@ impl SshService {
     }
 
     fn options(&self, mode: SshMode) -> Vec<OsString> {
+        let control = if self.inner.multiplex {
+            self.control_options(mode)
+        } else {
+            Vec::new()
+        };
+        self.options_with(mode, control)
+    }
+
+    /// `control` comes right after `-F`, before any other `-o`: for options
+    /// given more than once, OpenSSH uses the first value.
+    fn options_with(&self, mode: SshMode, control: Vec<OsString>) -> Vec<OsString> {
         let mut args: Vec<OsString> = vec!["-F".into(), self.wrapper_path().into()];
-        if self.inner.multiplex {
-            args.extend(self.control_options(mode));
-        }
+        args.extend(control);
         let mode_options: &[&str] = match mode {
             SshMode::Batch => &["-o", "BatchMode=yes"],
             SshMode::Askpass => &["-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1"],
@@ -776,7 +805,8 @@ impl SshService {
     }
 
     /// Runs `exit 0` on `alias`. Without a password only keys and agents are
-    /// tried; with one, a single password prompt is answered.
+    /// tried; with one, a single password prompt is answered on a connection
+    /// of its own: reusing a master would report success for any password.
     pub async fn test_connection(
         &self,
         alias: &str,
@@ -786,7 +816,7 @@ impl SshService {
         // The password file lives until ssh exited.
         let (mut command, _secret) = match password {
             Some(password) => {
-                let mut command = self.command(SshMode::Askpass);
+                let mut command = self.unshared_command(SshMode::Askpass);
                 let (vars, secret) = self.askpass_env(alias, password).await?;
                 command.envs(vars);
                 (command, Some(secret))
@@ -1298,6 +1328,40 @@ exit 0
         assert!(log.contains(askpass::FILE_ENV), "{log}");
         assert!(!log.contains("hunter2-secret"), "{log}");
         assert!(askpass_files(&fixture).is_empty());
+    }
+
+    /// A shared master would let any password pass, so a password test
+    /// gets a connection of its own; a key test may still reuse one.
+    #[tokio::test]
+    async fn password_test_never_shares_a_connection() {
+        let fixture = fixture("Host good\n").await;
+        fixture
+            .service
+            .test_connection("good", Some("hunter2"))
+            .await
+            .unwrap();
+        let log = std::fs::read_to_string(fixture.root.join("ssh.log")).unwrap();
+        let line = log.lines().find(|l| l.ends_with("good exit 0")).unwrap();
+        let rest = line
+            .split_once(&format!("{} ", fixture.service.wrapper_path().display()))
+            .unwrap()
+            .1;
+        assert!(
+            rest.starts_with("-o ControlMaster=no -o ControlPath=none -o BatchMode=no"),
+            "{line}"
+        );
+        assert!(!line.contains("ControlPersist"), "{line}");
+        assert!(!line.contains("ControlMaster=auto"), "{line}");
+        assert_eq!(line.matches("ControlPath").count(), 1, "{line}");
+
+        std::fs::remove_file(fixture.root.join("ssh.log")).unwrap();
+        fixture.service.test_connection("good", None).await.unwrap();
+        let log = std::fs::read_to_string(fixture.root.join("ssh.log")).unwrap();
+        let line = log.lines().find(|l| l.ends_with("good exit 0")).unwrap();
+        assert!(!line.contains("ControlPath=none"), "{line}");
+        if fixture.service.inner.multiplex {
+            assert!(line.contains("ControlPersist=300"), "{line}");
+        }
     }
 
     #[tokio::test]
