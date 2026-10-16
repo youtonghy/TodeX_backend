@@ -10,7 +10,10 @@ chosen by the prompt text:
   anything else   text deltas, one tool step and a successful `result`
 Like agy, it exits only once stdin closes after the turn. With
 `--mode auto` it warns that Auto is unavailable when an `auto-unavailable`
-file sits next to it (probe and turns) or `auto-revoked` (turns only).
+file sits next to it (probe and turns) or `auto-revoked` (turns only),
+followed by 200 KiB more stderr when `stderr-noise` exists. The probe logs
+its cwd to probe-cwd.log, fails when `auto-probe-fails` exists, and while
+`auto-probe-gate` exists appends to probe-started and waits for its removal.
 """
 import json
 import os
@@ -36,9 +39,24 @@ def marked(name):
 
 if "--mode" in args and args[args.index("--mode") + 1] == "auto":
     probe = "-p=/help" in args
+    if probe:
+        with open(os.path.join(here, "probe-cwd.log"), "a") as log:
+            log.write(os.getcwd() + "\n")
+        if marked("auto-probe-gate"):
+            with open(os.path.join(here, "probe-started"), "a") as log:
+                log.write("probe\n")
+            deadline = time.time() + 60
+            while marked("auto-probe-gate") and time.time() < deadline:
+                time.sleep(0.05)
+        if marked("auto-probe-fails"):
+            sys.stderr.write("error: probe crashed\n")
+            sys.exit(1)
     if marked("auto-unavailable") or (not probe and marked("auto-revoked")):
         sys.stderr.write("warning: --mode auto is not available for this account; "
                          "continuing in the default mode.\n")
+        if not probe and marked("stderr-noise"):
+            for _ in range(200):
+                sys.stderr.write("n" * 1023 + "\n")
         sys.stderr.flush()
     if probe:
         print("/help\tShow help")

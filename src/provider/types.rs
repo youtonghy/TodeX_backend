@@ -282,6 +282,9 @@ pub struct DriverContext {
 pub struct TurnHandles {
     /// The turn mode TodeX's own MCP tools follow; `None` without agent MCP.
     pub mode: Option<TurnModeHandle>,
+    /// Takes the workspace-trust launch permit again, for a driver that
+    /// releases it during a long wait before its launch.
+    pub trust: Option<TrustGate>,
 }
 
 impl std::fmt::Debug for TurnHandles {
@@ -292,7 +295,25 @@ impl std::fmt::Debug for TurnHandles {
                 "mode",
                 &self.mode.as_ref().map(|mode| &mode.conversation_id),
             )
+            .field("trust", &self.trust.as_ref().map(|trust| &trust.workspace))
             .finish()
+    }
+}
+
+/// Re-acquires the launch permit of a turn's workspace, checking trust anew.
+#[derive(Clone)]
+pub struct TrustGate {
+    pub(crate) store: crate::workspace_trust::WorkspaceTrustStore,
+    pub(crate) owner_id: String,
+    pub(crate) workspace: PathBuf,
+}
+
+impl TrustGate {
+    /// Fails with `WorkspaceTrustRequired` once trust was revoked.
+    pub(crate) async fn acquire(&self) -> Result<WorkspaceTrustPermit, AppError> {
+        self.store
+            .acquire_owned(&self.owner_id, &self.workspace)
+            .await
     }
 }
 

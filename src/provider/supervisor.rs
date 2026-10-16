@@ -43,8 +43,8 @@ use super::types::{
     DriverContext, DriverEventSink, DriverPrompt, DriverPromptContent, DriverSkill,
     DriverTurnResult, ImageInputMode, PermissionBroker, PermissionDecision, PermissionOutcome,
     ProviderActivity, ProviderCommandDescriptor, ProviderControl, ProviderDriver,
-    ProviderImageInputCapability, ProviderModelDescriptor, ProviderSnapshot, TurnHandles,
-    TurnModeHandle,
+    ProviderImageInputCapability, ProviderModelDescriptor, ProviderSnapshot, TrustGate,
+    TurnHandles, TurnModeHandle,
 };
 
 mod follow_ups;
@@ -2276,6 +2276,11 @@ impl ConversationSupervisor {
                 return Err(error);
             }
         };
+        let trust_gate = TrustGate {
+            store: self.workspace_trust.clone(),
+            owner_id: owner_id.to_owned(),
+            workspace: manifest.workspace.clone(),
+        };
 
         let sealed_key = fingerprint_key
             .as_deref()
@@ -2385,6 +2390,7 @@ impl ConversationSupervisor {
                             agent_mcp,
                             conversation_id: conversation_id.clone(),
                         }),
+                    trust: Some(trust_gate),
                 },
             };
             let driver_prompt = DriverPrompt {

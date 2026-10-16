@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -141,6 +142,57 @@ pub(crate) enum BoundedLine {
     Oversized(usize),
 }
 
+/// Latches once a provider's stderr contains `needle`, wherever it falls in
+/// the output: stderr is scanned as it arrives, so a warning stays seen after
+/// the retained tail has moved past it.
+#[derive(Clone)]
+pub(crate) struct StderrWatch {
+    needle: Arc<[u8]>,
+    seen: Arc<AtomicBool>,
+}
+
+impl StderrWatch {
+    pub(crate) fn new(needle: &str) -> Self {
+        Self {
+            needle: needle.as_bytes().into(),
+            seen: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn seen(&self) -> bool {
+        self.seen.load(Ordering::Acquire)
+    }
+}
+
+/// Scans one stream for a [`StderrWatch`] needle across chunk boundaries.
+struct WatchScanner {
+    watch: StderrWatch,
+    /// The end of the previous chunks, shorter than the needle.
+    carry: Vec<u8>,
+}
+
+impl WatchScanner {
+    fn scan(&mut self, chunk: &[u8]) {
+        let needle = &self.watch.needle;
+        if needle.is_empty() || self.watch.seen() {
+            return;
+        }
+        self.carry.extend_from_slice(chunk);
+        if self
+            .carry
+            .windows(needle.len())
+            .any(|window| window == &needle[..])
+        {
+            self.watch.seen.store(true, Ordering::Release);
+            self.carry = Vec::new();
+            return;
+        }
+        let keep = needle.len() - 1;
+        let excess = self.carry.len().saturating_sub(keep);
+        self.carry.drain(..excess);
+    }
+}
+
 pub struct JsonLineProcess {
     child: Child,
     /// `None` once [`Self::close_stdin`] signalled end of input.
@@ -159,6 +211,13 @@ pub struct JsonLineProcess {
 
 impl JsonLineProcess {
     pub async fn spawn(spec: &CommandSpec) -> Result<Self, AppError> {
+        Self::spawn_watching(spec, None).await
+    }
+
+    async fn spawn_watching(
+        spec: &CommandSpec,
+        watch: Option<StderrWatch>,
+    ) -> Result<Self, AppError> {
         if !spec.cwd.is_absolute() {
             return Err(AppError::InvalidRequest(
                 "provider working directory must be absolute".to_owned(),
@@ -198,10 +257,11 @@ impl JsonLineProcess {
             AppError::ProviderUnavailable("provider process did not expose stderr".to_owned())
         })?;
         let stderr = Arc::new(Mutex::new(VecDeque::new()));
-        let stderr_task = tokio::spawn(drain_stderr(
+        let stderr_task = tokio::spawn(drain_stderr_watching(
             stderr_reader,
             stderr.clone(),
             MAX_STDERR_BYTES,
+            watch,
         ));
         group.disarm();
 
@@ -222,7 +282,16 @@ impl JsonLineProcess {
         spec: &CommandSpec,
         permit: WorkspaceTrustPermit,
     ) -> Result<Self, AppError> {
-        let process = Self::spawn(spec).await?;
+        Self::spawn_trusted_watching(spec, permit, None).await
+    }
+
+    /// [`Self::spawn_trusted`], latching `watch` when stderr shows its needle.
+    pub(crate) async fn spawn_trusted_watching(
+        spec: &CommandSpec,
+        permit: WorkspaceTrustPermit,
+        watch: Option<StderrWatch>,
+    ) -> Result<Self, AppError> {
+        let process = Self::spawn_watching(spec, watch).await?;
         drop(permit);
         Ok(process)
     }
@@ -255,12 +324,6 @@ impl JsonLineProcess {
             AppError::ProviderUnavailable("provider protocol write timed out".to_owned())
         })??;
         Ok(())
-    }
-
-    /// Whether the retained tail of stderr mentions `needle`.
-    pub async fn stderr_contains(&self, needle: &str) -> bool {
-        let mut buffer = self.stderr.lock().await;
-        String::from_utf8_lossy(buffer.make_contiguous()).contains(needle)
     }
 
     /// Closes stdin so a provider that reads prompts until end of input
@@ -906,17 +969,36 @@ pub(crate) fn secure_command(program: impl AsRef<OsStr>) -> Command {
 /// until EOF. Run it for the process's whole lifetime: a full pipe would block
 /// the child.
 pub(crate) async fn drain_stderr<R>(
-    mut reader: R,
+    reader: R,
     destination: Arc<Mutex<VecDeque<u8>>>,
     max_bytes: usize,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
+    drain_stderr_watching(reader, destination, max_bytes, None).await;
+}
+
+/// [`drain_stderr`], also scanning every byte for `watch`'s needle.
+async fn drain_stderr_watching<R>(
+    mut reader: R,
+    destination: Arc<Mutex<VecDeque<u8>>>,
+    max_bytes: usize,
+    watch: Option<StderrWatch>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut scanner = watch.map(|watch| WatchScanner {
+        watch,
+        carry: Vec::new(),
+    });
     let mut chunk = [0_u8; 4096];
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(count) => {
+                if let Some(scanner) = &mut scanner {
+                    scanner.scan(&chunk[..count]);
+                }
                 let mut destination = destination.lock().await;
                 destination.extend(&chunk[..count]);
                 // A ring buffer: dropping the oldest bytes is O(dropped), not
@@ -1233,6 +1315,53 @@ mod tests {
         );
         assert_eq!(process.read().await.unwrap(), None);
         process.terminate().await;
+    }
+
+    #[tokio::test]
+    async fn a_stderr_watch_latches_across_chunks_and_past_the_tail() {
+        let needle = "--mode auto is not available";
+        // Split across reads, then buried under more than the tail keeps.
+        let mut input = b"noise\nwarning: --mode au".to_vec();
+        let split = input.len();
+        input.extend_from_slice(b"to is not available; continuing\n");
+        input.extend(std::iter::repeat_n(b'x', 3 * MAX_STDERR_BYTES));
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        let watch = StderrWatch::new(needle);
+        let drain = tokio::spawn(drain_stderr_watching(
+            reader,
+            tail.clone(),
+            MAX_STDERR_BYTES,
+            Some(watch.clone()),
+        ));
+        writer.write_all(&input[..split]).await.unwrap();
+        writer.flush().await.unwrap();
+        tokio::task::yield_now().await;
+        writer.write_all(&input[split..]).await.unwrap();
+        drop(writer);
+        drain.await.unwrap();
+        assert!(watch.seen());
+        assert!(!String::from_utf8_lossy(tail.lock().await.make_contiguous()).contains(needle));
+
+        let mut scanner = WatchScanner {
+            watch: StderrWatch::new(needle),
+            carry: Vec::new(),
+        };
+        scanner.scan(b"warning: --mode au");
+        assert!(!scanner.watch.seen());
+        scanner.scan(b"to is not");
+        scanner.scan(b" available");
+        assert!(scanner.watch.seen());
+
+        let quiet = StderrWatch::new(needle);
+        drain_stderr_watching(
+            &b"--mode auto is available\n"[..],
+            Arc::new(Mutex::new(VecDeque::new())),
+            MAX_STDERR_BYTES,
+            Some(quiet.clone()),
+        )
+        .await;
+        assert!(!quiet.seen());
     }
 
     #[tokio::test]

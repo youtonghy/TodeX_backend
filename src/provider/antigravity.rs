@@ -47,7 +47,7 @@ use crate::workspace_trust::WorkspaceTrustPermit;
 use super::discovery::CatalogCache;
 use super::process::{
     executable_available, provider_exit_error, run_bounded_command, stderr_excerpt, CommandSpec,
-    JsonLineProcess,
+    JsonLineProcess, StderrWatch,
 };
 use super::profile::{
     CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
@@ -119,11 +119,29 @@ const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 /// exit after stdin closes, before it is stopped.
 const EXIT_GRACE: Duration = Duration::from_secs(10);
 /// What `agy --mode auto` prints (agy 1.3.5) on an account without its Auto
-/// preview, before continuing in the default mode.
+/// preview, before continuing in the default mode. It is the only signal:
+/// `init.permission_mode` reads `request-review` in every mode, including
+/// plan and skipped permissions (agy 1.3.6).
 const AUTO_UNAVAILABLE: &str = "--mode auto is not available";
 /// The probe starts a full `agy` (about 10 s), so its answer is kept.
 const AUTO_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTO_PROBE_TTL: Duration = Duration::from_secs(30 * 60);
+/// A failed probe (timeout, crash) is retried after this long; until then
+/// auto turns run as `ask` without probing again.
+const AUTO_PROBE_FAILURE_TTL: Duration = Duration::from_secs(2 * 60);
+
+/// The answer of the last Auto mode probe.
+#[derive(Clone, Copy, Debug)]
+struct AutoProbe {
+    expires: std::time::Instant,
+    available: bool,
+}
+
+impl AutoProbe {
+    fn fresh(self) -> Option<bool> {
+        (std::time::Instant::now() < self.expires).then_some(self.available)
+    }
+}
 
 pub struct AntigravityDriver {
     binary: String,
@@ -131,9 +149,9 @@ pub struct AntigravityDriver {
     /// provider processes otherwise start from a cleared environment.
     env_allowlist: Vec<String>,
     models: CatalogCache<Vec<ProviderModelDescriptor>>,
-    /// When the account was last probed for agy's Auto mode, and the answer.
-    /// The lock also keeps concurrent turns from probing twice.
-    auto_mode: tokio::sync::Mutex<Option<(std::time::Instant, bool)>>,
+    /// The account's last Auto mode probe. The lock is held while probing,
+    /// so concurrent turns share one probe.
+    auto_mode: tokio::sync::Mutex<Option<AutoProbe>>,
     /// Where TodeX's hook and MCP entries go: agy's global config.
     integration_dir: std::path::PathBuf,
 }
@@ -149,34 +167,77 @@ impl AntigravityDriver {
         }
     }
 
-    /// Whether the signed-in account offers `--mode auto`. A failed probe is
-    /// not cached and counts as unavailable, so the turn falls back to `ask`.
-    async fn auto_available(&self, workspace: &Path) -> bool {
+    /// The cached answer, without waiting for a probe in progress.
+    fn cached_auto_mode(&self) -> Option<bool> {
+        let cached = self.auto_mode.try_lock().ok()?;
+        cached.and_then(AutoProbe::fresh)
+    }
+
+    /// Whether the signed-in account offers `--mode auto`, probing when the
+    /// cached answer expired. A failed probe counts as unavailable, so the
+    /// turn falls back to `ask`, and is retried after
+    /// [`AUTO_PROBE_FAILURE_TTL`]. The probe runs outside any workspace: the
+    /// answer is per account.
+    async fn auto_available(&self) -> bool {
         let mut cached = self.auto_mode.lock().await;
-        if let Some((at, available)) = *cached {
-            if at.elapsed() < AUTO_PROBE_TTL {
-                return available;
-            }
+        if let Some(available) = cached.and_then(AutoProbe::fresh) {
+            return available;
         }
-        let spec = self.command_spec(workspace, &["--mode", "auto", "-p=/help"]);
-        match run_bounded_command(&spec, MAX_COMMAND_OUTPUT_BYTES, AUTO_PROBE_TIMEOUT).await {
-            Ok(output) if output.success => {
-                let available = !String::from_utf8_lossy(&output.stderr).contains(AUTO_UNAVAILABLE);
-                *cached = Some((std::time::Instant::now(), available));
-                available
-            }
-            Ok(output) => {
-                tracing::warn!(
-                    stderr = stderr_excerpt(&output.stderr).unwrap_or_default(),
-                    "agy Auto mode probe failed; running the turn as ask"
-                );
-                false
-            }
-            Err(error) => {
-                tracing::warn!(%error, "agy Auto mode probe failed; running the turn as ask");
-                false
-            }
+        let spec = self.command_spec(&std::env::temp_dir(), &["--mode", "auto", "-p=/help"]);
+        let (available, ttl) =
+            match run_bounded_command(&spec, MAX_COMMAND_OUTPUT_BYTES, AUTO_PROBE_TIMEOUT).await {
+                Ok(output) if output.success => (
+                    !String::from_utf8_lossy(&output.stderr).contains(AUTO_UNAVAILABLE),
+                    AUTO_PROBE_TTL,
+                ),
+                Ok(output) => {
+                    tracing::warn!(
+                        stderr = stderr_excerpt(&output.stderr).unwrap_or_default(),
+                        "agy Auto mode probe failed; running auto turns as ask"
+                    );
+                    (false, AUTO_PROBE_FAILURE_TTL)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "agy Auto mode probe failed; running auto turns as ask");
+                    (false, AUTO_PROBE_FAILURE_TTL)
+                }
+            };
+        *cached = Some(AutoProbe {
+            expires: std::time::Instant::now() + ttl,
+            available,
+        });
+        available
+    }
+
+    /// Whether an auto turn runs agy's own Auto, and the launch permit to
+    /// start it with. A probe can take [`AUTO_PROBE_TIMEOUT`], so the permit
+    /// is released meanwhile (trust changes must not queue behind it) and
+    /// taken again afterwards, which fails if trust was revoked. `None`: the
+    /// turn was cancelled while waiting.
+    async fn native_auto(
+        &self,
+        trust: Option<&super::types::TrustGate>,
+        cancel: &mut watch::Receiver<bool>,
+        permit: WorkspaceTrustPermit,
+    ) -> Result<Option<(bool, WorkspaceTrustPermit)>, AppError> {
+        if let Some(available) = self.cached_auto_mode() {
+            return Ok(Some((available, permit)));
         }
+        let probe = async {
+            tokio::select! {
+                available = self.auto_available() => Some(available),
+                _ = cancel.changed() => None,
+            }
+        };
+        let Some(trust) = trust else {
+            // Without a way to take it again, the permit is kept meanwhile.
+            return Ok(probe.await.map(|available| (available, permit)));
+        };
+        drop(permit);
+        let Some(available) = probe.await else {
+            return Ok(None);
+        };
+        Ok(Some((available, trust.acquire().await?)))
     }
 
     async fn forget_auto_mode(&self) {
@@ -314,7 +375,23 @@ impl ProviderDriver for AntigravityDriver {
             spec.env.extend(global.env.iter().cloned());
         }
         let auto = controls.work_mode != "plan" && controls.permission_mode == "auto";
-        let native_auto = auto && self.auto_available(&workspace).await;
+        let (native_auto, launch_permit) = if auto {
+            match self
+                .native_auto(context.handles.trust.as_ref(), &mut cancel, launch_permit)
+                .await?
+            {
+                Some(answer) => answer,
+                None => {
+                    return Ok(DriverTurnResult {
+                        native_session_id: context.provider_state.native_session_id.clone(),
+                        stop_reason: "cancelled".to_owned(),
+                        cancelled: true,
+                    })
+                }
+            }
+        } else {
+            (false, launch_permit)
+        };
         if auto && !native_auto {
             // The supervisor recorded `auto` for TodeX's own MCP tools; the
             // turn runs as `ask`, so they ask too.
@@ -368,7 +445,12 @@ impl ProviderDriver for AntigravityDriver {
         // arrives on stdin, so the flag closes the argument list empty.
         spec.args.push("-p=".to_owned());
 
-        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
+        // agy only warns on stderr when Auto is unavailable after all; it is
+        // watched as it streams, so later output cannot push it out of view.
+        let auto_watch = native_auto.then(|| StderrWatch::new(AUTO_UNAVAILABLE));
+        let mut process =
+            JsonLineProcess::spawn_trusted_watching(&spec, launch_permit, auto_watch.clone())
+                .await?;
         let result = run_agy_turn(
             &mut process,
             self,
@@ -389,7 +471,7 @@ impl ProviderDriver for AntigravityDriver {
         process.terminate().await;
         // The probe's answer went stale: agy ran in its default mode, which
         // refused whatever needed approval. The next turn probes again.
-        if native_auto && process.stderr_contains(AUTO_UNAVAILABLE).await {
+        if auto_watch.as_ref().is_some_and(StderrWatch::seen) {
             self.forget_auto_mode().await;
             if let Err(error) = sink
                 .emit(
@@ -1333,15 +1415,34 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 mode: Option<&str>,
                 cancel_after: Option<Duration>,
             ) -> Result<DriverTurnResult, AppError> {
-                let mut handles = crate::provider::types::TurnHandles::default();
+                let (permission, work) = match mode {
+                    None => ("full-access", "implement"),
+                    Some("plan") => ("full-access", "plan"),
+                    Some(mode) => (mode, "implement"),
+                };
+                self.run_with(turn_id, text, permission, work, cancel_after)
+                    .await
+            }
+
+            async fn run_with(
+                &self,
+                turn_id: &str,
+                text: &str,
+                permission: &str,
+                work: &str,
+                cancel_after: Option<Duration>,
+            ) -> Result<DriverTurnResult, AppError> {
+                let mut handles = crate::provider::types::TurnHandles {
+                    mode: None,
+                    trust: Some(crate::provider::types::TrustGate {
+                        store: self.trust.clone(),
+                        owner_id: "local".to_owned(),
+                        workspace: self.root.clone(),
+                    }),
+                };
                 let mut agent_mcp = None;
                 if let Some(bridge) = &self.bridge {
                     // What the supervisor does as the turn starts.
-                    let (permission, work) = match mode {
-                        None => ("full-access", "implement"),
-                        Some("plan") => ("full-access", "plan"),
-                        Some(mode) => (mode, "implement"),
-                    };
                     bridge.record_turn_mode(&self.manifest.id, permission, work);
                     agent_mcp = bridge.launch_global(&self.manifest.id).await;
                     handles.mode = Some(crate::provider::types::TurnModeHandle {
@@ -1362,14 +1463,8 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     skills: vec![],
                     model: Some("gemini-3.8-flash".to_owned()),
                     reasoning_effort: Some("low".to_owned()),
-                    permission_mode: Some(
-                        match mode {
-                            None | Some("plan") => "full-access",
-                            Some(mode) => mode,
-                        }
-                        .to_owned(),
-                    ),
-                    work_mode: mode.filter(|mode| *mode == "plan").map(ToOwned::to_owned),
+                    permission_mode: Some(permission.to_owned()),
+                    work_mode: Some(work.to_owned()),
                     permission_profile: None,
                     sandbox_mode: None,
                     approval_policy: None,
@@ -1439,6 +1534,31 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     .last()
                     .unwrap_or_default()
                     .to_owned()
+            }
+
+            /// Waits until `count` gated probes have started.
+            async fn probes_started(&self, count: usize) {
+                let path = self.root.join("probe-started");
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    while std::fs::read_to_string(&path)
+                        .unwrap_or_default()
+                        .lines()
+                        .count()
+                        < count
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("the Auto mode probe starts");
+            }
+
+            fn mark(&self, name: &str) {
+                std::fs::write(self.root.join(name), "").unwrap();
+            }
+
+            fn unmark(&self, name: &str) {
+                std::fs::remove_file(self.root.join(name)).unwrap();
             }
 
             async fn auto_unavailable_events(&self) -> usize {
@@ -1594,6 +1714,171 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 .await
                 .unwrap();
             assert_eq!(fixture.auto_probes(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_failed_probe_is_cached_briefly_then_retried() {
+            let fixture = Fixture::new().await;
+            fixture.mark("auto-probe-fails");
+            fixture
+                .run("turn-1", "hello", Some("auto"), None)
+                .await
+                .unwrap();
+            assert!(!fixture.launches()[0].contains(&"--mode".to_owned()));
+            let cached = fixture.driver.auto_mode.lock().await.unwrap();
+            assert!(!cached.available);
+            let left = cached
+                .expires
+                .saturating_duration_since(std::time::Instant::now());
+            assert!(left > Duration::from_secs(60) && left <= AUTO_PROBE_FAILURE_TTL);
+
+            fixture
+                .run("turn-2", "again", Some("auto"), None)
+                .await
+                .unwrap();
+            assert_eq!(fixture.auto_probes(), 1);
+
+            // Two minutes later the probe runs again.
+            fixture.unmark("auto-probe-fails");
+            fixture
+                .driver
+                .auto_mode
+                .lock()
+                .await
+                .as_mut()
+                .unwrap()
+                .expires = std::time::Instant::now();
+            fixture
+                .run("turn-3", "more", Some("auto"), None)
+                .await
+                .unwrap();
+            assert_eq!(fixture.auto_probes(), 2);
+            let launch = fixture.launches().pop().unwrap();
+            let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
+            assert_eq!(launch[mode + 1], "auto");
+        }
+
+        #[tokio::test]
+        async fn concurrent_auto_turns_share_one_probe() {
+            let fixture = Fixture::new().await;
+            fixture.mark("auto-probe-gate");
+            let release = async {
+                fixture.probes_started(1).await;
+                // Give the second turn time to queue behind the probe.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                fixture.unmark("auto-probe-gate");
+            };
+            let (first, second, ()) = tokio::join!(
+                fixture.run("turn-1", "hello", Some("auto"), None),
+                fixture.run("turn-2", "again", Some("auto"), None),
+                release,
+            );
+            first.unwrap();
+            second.unwrap();
+            assert_eq!(fixture.auto_probes(), 1);
+            assert_eq!(fixture.launches().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn cancel_during_the_probe_ends_the_turn_before_agy_starts() {
+            let fixture = Fixture::new().await;
+            fixture.mark("auto-probe-gate");
+            let result = fixture
+                .run(
+                    "turn-1",
+                    "hello",
+                    Some("auto"),
+                    Some(Duration::from_millis(500)),
+                )
+                .await
+                .unwrap();
+            assert!(result.cancelled);
+            assert_eq!(result.stop_reason, "cancelled");
+            assert_eq!(fixture.auto_probes(), 1);
+            assert!(fixture.launches().is_empty());
+            // An abandoned probe leaves nothing cached.
+            assert!(fixture.driver.auto_mode.lock().await.is_none());
+        }
+
+        #[tokio::test]
+        async fn the_probe_runs_outside_the_workspace_without_holding_trust() {
+            let fixture = Fixture::new().await;
+            fixture.mark("auto-probe-gate");
+            let meanwhile = async {
+                fixture.probes_started(1).await;
+                // A trust change would queue behind a held launch permit.
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    fixture.trust.set_owned("local", &fixture.root, true),
+                )
+                .await
+                .expect("trust changes are not blocked by the probe")
+                .unwrap();
+                fixture.unmark("auto-probe-gate");
+            };
+            let (result, ()) = tokio::join!(
+                fixture.run("turn-1", "hello", Some("auto"), None),
+                meanwhile
+            );
+            result.unwrap();
+            assert_eq!(fixture.launches().len(), 1);
+            let cwd = std::fs::read_to_string(fixture.root.join("probe-cwd.log")).unwrap();
+            assert!(
+                !cwd.trim_end().starts_with(&*fixture.root.to_string_lossy()),
+                "{cwd}"
+            );
+        }
+
+        #[tokio::test]
+        async fn trust_revoked_during_the_probe_fails_the_turn() {
+            let fixture = Fixture::new().await;
+            fixture.mark("auto-probe-gate");
+            let revoke = async {
+                fixture.probes_started(1).await;
+                fixture
+                    .trust
+                    .set_owned("local", &fixture.root, false)
+                    .await
+                    .unwrap();
+                fixture.unmark("auto-probe-gate");
+            };
+            let (result, ()) =
+                tokio::join!(fixture.run("turn-1", "hello", Some("auto"), None), revoke);
+            assert!(
+                matches!(result, Err(AppError::WorkspaceTrustRequired(_))),
+                "{result:?}"
+            );
+            assert!(fixture.launches().is_empty());
+        }
+
+        #[tokio::test]
+        async fn auto_unavailable_is_seen_behind_lots_of_stderr() {
+            let fixture = Fixture::new().await;
+            fixture
+                .run("turn-1", "hello", Some("auto"), None)
+                .await
+                .unwrap();
+            fixture.mark("auto-revoked");
+            fixture.mark("stderr-noise");
+            fixture
+                .run("turn-2", "again", Some("auto"), None)
+                .await
+                .unwrap();
+            assert_eq!(fixture.auto_unavailable_events().await, 1);
+            assert!(fixture.driver.auto_mode.lock().await.is_none());
+        }
+
+        #[tokio::test]
+        async fn auto_plan_turns_do_not_probe() {
+            let fixture = Fixture::new().await;
+            fixture
+                .run_with("turn-1", "hello", "auto", "plan", None)
+                .await
+                .unwrap();
+            assert_eq!(fixture.auto_probes(), 0);
+            let launch = &fixture.launches()[0];
+            let mode = launch.iter().position(|arg| arg == "--mode").unwrap();
+            assert_eq!(launch[mode + 1], "plan");
         }
 
         #[tokio::test]
