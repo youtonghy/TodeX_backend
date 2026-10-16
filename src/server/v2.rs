@@ -9968,6 +9968,7 @@ mod tests {
     }
 
     /// The journal's terminal event for `turn_id`, once there is one.
+    #[cfg(unix)]
     async fn terminal_turn_event(
         state: &AppState,
         conversation_id: &str,
@@ -10000,6 +10001,7 @@ mod tests {
     /// The turn ended because it was cancelled. A cancel that lands while
     /// Claude Code is still in its startup handshake is journalled by the
     /// driver as a failed initialization rather than `turn.cancelled`.
+    #[cfg(unix)]
     fn assert_ended_by_cancel(terminal: &crate::conversation::ConversationEvent) {
         let cancelled = terminal.event_type == "turn.cancelled"
             || (terminal.event_type == "turn.failed"
