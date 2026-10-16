@@ -158,7 +158,13 @@ detect_platform() {
             local label
             case "$arch" in
                 x86_64) label="linux-x64-gnu" ;;
-                aarch64|arm64) label="linux-arm64-gnu" ;;
+                aarch64|arm64)
+                    # A 64-bit kernel can run a 32-bit userland (Raspberry Pi
+                    # OS 32-bit), which cannot load the arm64 binary.
+                    if [[ "$(getconf LONG_BIT 2>/dev/null || echo 64)" != 64 ]]; then
+                        die "this Linux runs a 32-bit userland on a 64-bit ARM kernel; release binaries need a 64-bit (arm64) userland; build from source with: cargo build --release"
+                    fi
+                    label="linux-arm64-gnu" ;;
                 *) die "unsupported Linux architecture '$arch' (releases ship linux-x64-gnu and linux-arm64-gnu); build from source with: cargo build --release" ;;
             esac
             if command -v ldd >/dev/null 2>&1; then
