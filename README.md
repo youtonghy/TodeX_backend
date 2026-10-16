@@ -264,9 +264,8 @@ With `[api] enabled = true` (or `--enable-api`) the daemon also serves REST + SS
 - `GET /health`: Health status probe.
 - `GET /v2/version`: Returns daemon version and capabilities; signed requests also get the data directory and workspace roots.
 - `GET /v2/workspaces`: List cached workspaces for current tenant.
-- `PUT /v2/workspaces`: Merge workspace caches, return canonical workspace IDs, and automatically trust undecided directories within the backend workspace boundary.
-- `GET|PUT /v2/workspaces/{workspaceId}/trust`: Read or explicitly change owner-scoped execution trust. New workspaces are untrusted by default.
-- `DELETE /v2/workspaces/{workspaceId}`: Revoke trust, cancel active turns, and remove one workspace from the current tenant's catalog without deleting its conversations.
+- `PUT /v2/workspaces`: Merge workspace caches and return canonical workspace IDs. Any directory inside the backend workspace roots can run agents; there is no separate trust step.
+- `DELETE /v2/workspaces/{workspaceId}`: Cancel active turns and remove one workspace from the current tenant's catalog without deleting its conversations.
 - `GET /v2/workspace/entries?workspace=...&query=...`: Workspace file and folder suggestions for `@` picker.
 - `GET /v2/workspace/directories?path=...`: Directory tree explorer.
 - `GET /v2/workspace/file?path=...`: Read file contents within sandbox root.
@@ -282,7 +281,7 @@ With `[api] enabled = true` (or `--enable-api`) the daemon also serves REST + SS
 - `POST /v2/conversations`: Create a new conversation folder with selected agent provider.
 - `GET /v2/conversations/{id}`: Fetch conversation manifest and details.
 - `GET /v2/conversations/{id}/events?afterSequence=0&limit=200`: Paginated event journal query. `beforeSequence=N` pages backwards (`sequence <= N`, `hasMore` = earlier events remain) for lazy history loading.
-- `POST /v2/conversations/{id}/prompt`: Dispatch a prompt turn with text, typed content, model, reasoning effort, and skill resource IDs. Local files remain confined to the trusted workspace.
+- `POST /v2/conversations/{id}/prompt`: Dispatch a prompt turn with text, typed content, model, reasoning effort, and skill resource IDs. Local files remain confined to the conversation workspace.
 - `POST /v2/conversations/{id}/cancel`: Cancel active running turn.
 - `POST /v2/conversations/{id}/permissions/{permissionId}`: Resolve interactive approval request.
 - `/v2/ssh/hosts*`, `/v2/ssh/keys*`, `/v2/ftp/sites*`, `/v2/remote/connections*`: SSH hosts, keys, FTP sites and SFTP/FTP file sessions on the backend host.

@@ -254,9 +254,8 @@ port = 7346
 - `GET /health`：服务健康检查。
 - `GET /v2/version`：获取服务端版本号与支持能力；带设备签名的请求另外返回数据目录与工作区根目录。
 - `GET /v2/workspaces`：获取当前租户已缓存的工作区列表。
-- `PUT /v2/workspaces`：合并当前租户的工作区缓存、返回统一的工作区 ID，并自动信任位于后端工作区范围内且尚未做过信任决定的目录。
-- `GET|PUT /v2/workspaces/{workspaceId}/trust`：读取或显式修改按租户隔离的执行信任；新工作区默认不信任。
-- `DELETE /v2/workspaces/{workspaceId}`：撤销信任、取消活动 turn，并从当前租户的目录中移除工作区，但保留其对话历史。
+- `PUT /v2/workspaces`：合并当前租户的工作区缓存并返回统一的工作区 ID。后端工作区根目录内的任何目录都可以直接运行 Agent，没有单独的信任步骤。
+- `DELETE /v2/workspaces/{workspaceId}`：取消活动 turn，并从当前租户的目录中移除工作区，但保留其对话历史。
 - `GET /v2/workspace/entries?workspace=...&query=...`：为 `@` 提及提供工作区文件与目录补全。
 - `GET /v2/workspace/directories?path=...`：目录树浏览查询。
 - `GET /v2/workspace/file?path=...`：读取沙箱内指定文件内容。
@@ -268,7 +267,7 @@ port = 7346
 - `POST /v2/conversations`：创建新会话目录并锁定指定 Agent Provider。
 - `GET /v2/conversations/{id}`：获取指定会话的元数据清单。
 - `GET /v2/conversations/{id}/events?afterSequence=0&limit=200`：分页拉取事件日志。
-- `POST /v2/conversations/{id}/prompt`：发送 prompt（支持文本、类型化内容、模型覆盖、推理强度及 Skill resourceId）；本地文件只能来自受信任工作区。
+- `POST /v2/conversations/{id}/prompt`：发送 prompt（支持文本、类型化内容、模型覆盖、推理强度及 Skill resourceId）；本地文件只能来自会话所在工作区。
 - `POST /v2/conversations/{id}/cancel`：取消当前正在执行的 turn。
 - `POST /v2/conversations/{id}/permissions/{permissionId}`：响应交互式权限审批请求。
 - `/v2/ssh/hosts*`、`/v2/ssh/keys*`、`/v2/ftp/sites*`、`/v2/remote/connections*`：后端主机上的 SSH 主机、密钥、FTP 站点与 SFTP/FTP 文件会话。

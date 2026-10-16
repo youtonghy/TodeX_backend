@@ -154,11 +154,11 @@ language = "zh-CN" # 也可使用 "en"；可在 TUI 中按 l 切换并持久化
 
 `enable_tls = true` 会直接拒绝启动，因为当前 binary 没有证书/私钥配置入口。需要 TLS 时应由可信反向代理终止 TLS；不要把明文监听端口直接暴露到公网。
 
-认证客户端同步工作区时，后端会自动信任位于 `workspace_root` 内且尚未做过信任决定的目录；显式撤销的工作区不会因后续同步而重新获得信任。旧版本只保存可信记录，撤销后不会留下拒绝记录，因此首次升级时，旧版曾被撤销的工作区会被视为“尚未决定”；如需继续阻止执行，应在升级后再次显式撤销。
+`workspace_root` 就是执行边界：其中的任何目录都可以直接运行 Agent、终端和 Git 写操作，没有单独的工作区信任步骤。只把允许 Agent 以 daemon 用户权限运行的目录配置为根目录。旧版本留下的 `workspace-trust.json` 会在启动时删除。
 
 TUI 默认不捕获鼠标，终端中的文本可以直接拖选复制。按 `c` 打开“凭据与复制”，可完整查看并复制 Auth Token 与当前加密方式的公钥；私钥不会显示或复制。日志使用 `PageUp`、`PageDown`、`Home`、`End` 滚动。daemon 启动会先检查端口占用，并等待最多 30 秒完成核心初始化和监听；旧 Codex 会话随后在后台迁移，不阻塞 daemon 就绪。
 
-Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径、用户目录、locale、代理和 SSH agent 等运行环境。ACP profile 中的 `env` 会显式传入，但名称以 `TODEX_AGENTD_` 开头的变量会被拒绝。Codex、Pi、Claude Code 和 Grok Build 因此应优先使用各自保存在用户目录中的原生登录配置。Grok Build 通过 `grok --no-auto-update agent --no-leader stdio` 启动；仅 `grok_env_allowlist` 中名称合法的变量会额外传入。首次运行前使用 daemon 用户执行 `grok login`，或在白名单中保留 `XAI_API_KEY`。Pi 始终使用 RPC `--approve`：工作区通过 TodeX 信任门禁后，Pi 的工具和项目资源按 daemon 用户权限全自动运行。Pi 没有通用逐工具审批，也没有 OS sandbox；`permissions` capability 因此保持 `false`。
+Provider 子进程会清空 daemon 的其余环境，只继承基础系统路径、用户目录、locale、代理和 SSH agent 等运行环境。ACP profile 中的 `env` 会显式传入，但名称以 `TODEX_AGENTD_` 开头的变量会被拒绝。Codex、Pi、Claude Code 和 Grok Build 因此应优先使用各自保存在用户目录中的原生登录配置。Grok Build 通过 `grok --no-auto-update agent --no-leader stdio` 启动；仅 `grok_env_allowlist` 中名称合法的变量会额外传入。首次运行前使用 daemon 用户执行 `grok login`，或在白名单中保留 `XAI_API_KEY`。Pi 始终使用 RPC `--approve`：Pi 的工具和项目资源按 daemon 用户权限全自动运行。Pi 没有通用逐工具审批，也没有 OS sandbox；`permissions` capability 因此保持 `false`。
 
 Devin 通过 `devin acp` 接入，每个对话对应一个常驻 ACP 进程。`devin acp` 自身有意不读取本地 `devin auth login` 登录态（官方理由是避免用量归属到错误账号），daemon 会在每个 ACP 进程启动时执行 `authenticate`，按以下顺序解析 API key 并以 `_meta.api_key` 无头发送（不写入日志）：先读 `devin_api_key_env`（例如 `"DEVIN_API_KEY"`）指向的 daemon 环境变量，再默认回退读取 `devin auth login` 写入的 `~/.local/share/devin/credentials.toml` 中的 `windsurf_api_key`——因此已登录的 CLI 开箱即用；将 `TODEX_AGENTD_DEVIN_CLI_CREDENTIALS` 设为 `false` 可禁用该回退。两者都不可用时按上游声明的 `devin-browser` 方法执行一次浏览器授权，daemon 最多等待 5 分钟供用户完成批准。会话分叉能力按已安装 CLI 动态探测：daemon 在 `devin acp` 的 `initialize` 响应中检查 `sessionCapabilities.fork`（结果缓存约 5 分钟），声明后自动开放；当前版本未声明时 fork 保持不可用。
 
@@ -226,7 +226,7 @@ cargo run -- doctor providers --provider codex,pi,opencode --format json
 
 ### 真实 Codex/Pi E2E
 
-真实 smoke 会启动 `todex-agentd` 子进程，经公开 workspace trust API 建立信任，并通过 v2 HTTP/WebSocket 驱动真实 Codex/Pi。默认不会运行，必须同时显式确认测试和模型额度：
+真实 smoke 会启动 `todex-agentd` 子进程，经公开 workspace API 注册工作区，并通过 v2 HTTP/WebSocket 驱动真实 Codex/Pi。默认不会运行，必须同时显式确认测试和模型额度：
 
 ```bash
 TODEX_REAL_E2E=1 TODEX_REAL_ALLOW_BILLABLE=1 TODEX_REAL_PROVIDERS=codex,pi \

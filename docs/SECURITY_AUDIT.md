@@ -18,8 +18,8 @@
 - ACP 的 command、args、env 只来自管理员配置的 profile；客户端只能提交 profile 名称。`TODEX_AGENTD_*` 不会被传入 Provider 子进程。
 - Provider 子进程清空环境后只恢复允许的基础变量；stdout 单行上限 4 MiB（超长行不缓冲、丢弃到下一个换行，与非 JSON 行一样每 turn 最多 20 条记为 `provider.event`，preview 脱敏且不超过 512 字节，不再使 turn 失败），stderr 保留窗口 64 KiB，停止时处理 Unix process group。
 - Unix 上已启动的 Provider（含 `codex.local` 的 app-server，同样独立进程组、停止时整组终止）以 pid、pgid 与启动时间（macOS/Linux 由内核读取，其他平台与旧记录用 `ps`）记录在 `<data_dir>/provider_processes.json`（0600、原子写入，另记录所属 server 的 pid 与启动时间）；server 启动时只 kill 首进程启动时间仍匹配的进程组，避免误杀复用 PID；所属 server 仍存活时第二个 server 既不回收也不接管。Linux 另设 `PR_SET_PDEATHSIG`；Windows 不做回收。
-- Provider 在信任读许可仍有效时完成子进程 spawn；撤销工作区信任取得写锁后会阻止后续启动，并取消已登记的活动 turn。信任状态只有在快照成功落盘后才更新内存。
-- Pi 在工作区获得 TodeX 信任后固定使用 `--approve` 全自动运行；TodeX 不为 Pi 声明逐工具审批或 OS sandbox，`permissions` capability 保持 `false`。
+- 工作区没有单独的信任状态，`workspace_roots` 即执行边界：每次启动 Provider、发现、MCP、Git 写操作和终端前都会重新校验目录存在且位于根目录内。删除工作区会取消其中已登记的活动 turn。
+- Pi 固定使用 `--approve` 全自动运行；TodeX 不为 Pi 声明逐工具审批或 OS sandbox，`permissions` capability 保持 `false`。
 - conversation event payload 上限 1 MiB：超过 1 MiB − 16 KiB 的 payload 在脱敏之后截断（最大字符串截断并记录原长度，必要时整体替换为 `{"truncated": true, "originalBytes": N}`），1 MiB 检查保留为最后防线。journal 与单个会话都不设体积上限：追加永不拒绝，进行中的 turn 总能写完；只有新 prompt 有闸门——数据目录所在磁盘可用空间低于 1 GiB 时返回 `STORAGE_LOW`（HTTP 507）。活动文件超过 64 MiB 封存，后台转为 raw DEFLATE 分帧的 `.seg`（帧约 1 MiB，CRC-32 校验；`.idx` 带 SHA-256），封存时把已有终态记录覆盖的流式进度记录换成 `journal.compacted` 标记。内存有界：解压帧缓存全局 32 MiB、会话索引最多 64 个（LRU），封存分片只常驻分片表与帧表，活动文件按记录保留偏移（≤64 MiB）。replay limit 上限 1000，且每页不超过约 8 MiB journal。v2 WebSocket 单消息上限 8 MiB（升级层强制，超限关闭连接）、单连接订阅上限 128、并发补放上限 4；socket 发送超过 20 秒或出站队列阻塞超过 10 秒即断开连接。
 - MCP/Skill catalog 只读取配置，跳过 symlink，限制扫描深度、文件数和文件大小；响应不包含 command、args、env、URL 或凭据；现有测试验证输入文件未被修改。
 - 旧 Codex session migration 是 copy-only、redacted、idempotent，并保留原始文件。
