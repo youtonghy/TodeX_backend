@@ -258,11 +258,16 @@ struct LaneContext {
     /// Set as soon as the connection starts tearing down: a queued command
     /// that has not started by then never does.
     closed: Arc<AtomicBool>,
+    /// Wakes the read loop to tear the connection down when an answer could
+    /// not be queued within `queue_timeout`.
+    stalled: Arc<tokio::sync::Notify>,
+    queue_timeout: Duration,
 }
 
 impl LaneContext {
     /// Runs `command` in its own task, after the slot's predecessor if it
-    /// has a lane slot, and answers it unless `answer` is false.
+    /// has a lane slot, and answers it unless `answer` is false. A panic is
+    /// answered as `INTERNAL_ERROR` and still releases the lane.
     fn spawn(
         &self,
         permit: tokio::sync::OwnedSemaphorePermit,
@@ -288,18 +293,35 @@ impl LaneContext {
                 }
             }
             let id = command.id.clone();
-            let result = dispatch_lane_command(
-                &context.state,
-                &context.owner_id,
-                &context.device_id,
-                &command,
-            )
-            .await;
+            let result = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                dispatch_lane_command(
+                    &context.state,
+                    &context.owner_id,
+                    &context.device_id,
+                    &command,
+                ),
+            ))
+            .await
+            .unwrap_or_else(|_| {
+                warn!(command_type = %command.command_type, "v2 websocket command panicked");
+                Err(AppError::Anyhow(anyhow::anyhow!(
+                    "{} failed unexpectedly",
+                    command.command_type
+                )))
+            });
             if !answer {
                 return;
             }
             if let Some(outgoing) = context.outgoing.upgrade() {
-                let _ = queue_frame(&outgoing, command_result(id, result)).await;
+                let delivered = queue_frame_within(
+                    context.queue_timeout,
+                    &outgoing,
+                    command_result(id, result),
+                )
+                .await;
+                if delivered == Err(SendFailure::Stalled) {
+                    context.stalled.notify_one();
+                }
             }
         });
     }
@@ -2742,10 +2764,18 @@ async fn queue_frame(
     outgoing: &mpsc::Sender<Outbound>,
     message: impl Into<Outbound>,
 ) -> Result<(), SendFailure> {
-    let result = send_with_deadline(WS_QUEUE_SEND_TIMEOUT, outgoing.send(message.into())).await;
+    queue_frame_within(WS_QUEUE_SEND_TIMEOUT, outgoing, message).await
+}
+
+async fn queue_frame_within(
+    deadline: Duration,
+    outgoing: &mpsc::Sender<Outbound>,
+    message: impl Into<Outbound>,
+) -> Result<(), SendFailure> {
+    let result = send_with_deadline(deadline, outgoing.send(message.into())).await;
     if result == Err(SendFailure::Stalled) {
         warn!(
-            timeout_secs = WS_QUEUE_SEND_TIMEOUT.as_secs(),
+            timeout_secs = deadline.as_secs(),
             "v2 websocket outgoing queue stayed full, closing connection"
         );
     }
@@ -2871,13 +2901,18 @@ async fn handle_socket(
         device_id: auth.principal_id.clone(),
         outgoing: outgoing_tx.downgrade(),
         closed: closed.clone(),
+        stalled: Arc::new(tokio::sync::Notify::new()),
+        queue_timeout: WS_QUEUE_SEND_TIMEOUT,
     };
+    let stalled = lane_context.stalled.clone();
     loop {
         let text = tokio::select! {
             text = ws_socket::next_text(&mut receiver, opener.as_mut(), &close_handle) => text,
             // The send task stopped (socket error or send deadline): nothing
             // queued from here on can reach the client.
             _ = outgoing_tx.closed() => break,
+            // A command off the read loop could not queue its answer.
+            _ = stalled.notified() => break,
         };
         let Some(text) = text else { break };
         // Parse once; every dispatcher below takes the parsed value.
@@ -2949,14 +2984,18 @@ async fn handle_socket(
                     let operation_state = state.clone();
                     let operation_outgoing = outgoing_tx.clone();
                     let owner_id = auth.tenant_id.clone();
+                    let operation_stalled = stalled.clone();
                     operation_tasks.push(tokio::spawn(async move {
                         let _permit = permit;
                         let response =
                             dispatch_mcp_command_response(&operation_state, &owner_id, command)
                                 .await;
-                        // A failed delivery also stops the read loop, which
-                        // aborts this task during teardown.
-                        let _ = queue_frame(&operation_outgoing, response).await;
+                        // A stalled queue stops the read loop, which aborts
+                        // this task during teardown; a closed one already did.
+                        let delivered = queue_frame(&operation_outgoing, response).await;
+                        if delivered == Err(SendFailure::Stalled) {
+                            operation_stalled.notify_one();
+                        }
                     }));
                     continue;
                 }
@@ -3803,6 +3842,10 @@ async fn dispatch_lane_command(
     device_id: &str,
     command: &V2Command,
 ) -> Result<Value, AppError> {
+    #[cfg(test)]
+    if command.payload["panicForTests"] == true {
+        panic!("{} panicked for a test", command.command_type);
+    }
     match command.command_type.as_str() {
         "conversation.create" => {
             let request: CreateConversationRequest = Deserialize::deserialize(&command.payload)?;
@@ -9604,6 +9647,61 @@ mod tests {
         assert!(!lanes.is_full(&a), "a finished command frees its place");
         drop(held);
         assert!(!lanes.is_full(&a));
+    }
+
+    #[tokio::test]
+    async fn a_lane_answer_stuck_behind_a_full_queue_wakes_the_read_loop() {
+        let root = std::env::temp_dir().join(format!("todex-v2-lane-stall-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        // A queue nobody reads, already full.
+        let (outgoing, _unread) = mpsc::channel::<Outbound>(1);
+        outgoing.send(json!({}).into()).await.unwrap();
+        let context = LaneContext {
+            state,
+            owner_id: "local".to_owned(),
+            device_id: "local".to_owned(),
+            outgoing: outgoing.downgrade(),
+            closed: Arc::default(),
+            stalled: Arc::new(tokio::sync::Notify::new()),
+            queue_timeout: Duration::from_millis(100),
+        };
+        let limit = Arc::new(Semaphore::new(1));
+        context.spawn(
+            limit.clone().try_acquire_owned().unwrap(),
+            None,
+            V2Command {
+                id: "p0".to_owned(),
+                command_type: "server.ping".to_owned(),
+                payload: json!({}),
+            },
+            true,
+        );
+        tokio::time::timeout(Duration::from_secs(5), context.stalled.notified())
+            .await
+            .expect("a stalled answer must stop the connection");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_ws_a_panicking_lane_command_is_answered_and_frees_its_lane() {
+        let mut lane = StuckLane::new("lanes-panic", true, None).await;
+        lane.release().await;
+        lane.send(ws_command(
+            "a0",
+            "conversation.queue.list",
+            json!({ "conversationId": lane.stuck.id, "panicForTests": true }),
+        ))
+        .await;
+        lane.send(lane.command("a1", "conversation.queue.list"))
+            .await;
+        let seen = ws_answers(&mut lane.ws, |seen| {
+            answered(seen, "a0") && answered(seen, "a1")
+        })
+        .await;
+        assert_eq!(seen[0].0, "a0", "{seen:?}");
+        assert_eq!(seen[0].1["type"], "server.error", "{seen:?}");
+        assert_eq!(seen[0].1["payload"]["code"], "INTERNAL_ERROR", "{seen:?}");
+        assert_eq!(seen[1].1["type"], "server.result", "{seen:?}");
     }
 
     type TestWs = tokio_tungstenite::WebSocketStream<
