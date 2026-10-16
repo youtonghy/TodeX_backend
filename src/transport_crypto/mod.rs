@@ -32,7 +32,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
 use crate::config::{Config, PairingEncryption};
 use crate::error::AppError;
-use crate::secure_fs::FileStamp;
+use crate::secure_fs::{self, FileStamp};
 
 const PAIRING_VERSION: u8 = 1;
 /// Version 2 links carry only the server address; the transport key is
@@ -93,6 +93,9 @@ impl PairingKeys {
         }
     }
 
+    /// Writes the keys owner-only from the start (no window in which the
+    /// secrets follow the umask), atomically and durably: the temp file and
+    /// the directory entry are synced, and a failed write leaves no temp.
     async fn persist(&self, path: &Path) -> Result<(), AppError> {
         let persisted = PersistedPairingKeys {
             version: PAIRING_VERSION,
@@ -100,11 +103,23 @@ impl PairingKeys {
             ml_kem_public: encode_b64(&self.ml_kem_public),
             ml_kem_secret: encode_b64(self.ml_kem_secret.as_bytes()),
         };
-        let json = serde_json::to_string_pretty(&persisted)?;
-        let tmp_path = path.with_extension("json.tmp");
-        tokio::fs::write(&tmp_path, json).await?;
-        set_owner_only_permissions(&tmp_path).await?;
-        crate::secure_fs::replace_file_async(&tmp_path, path).await?;
+        let json = zeroize::Zeroizing::new(serde_json::to_string_pretty(&persisted)?);
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty());
+            if let Some(parent) = parent {
+                std::fs::create_dir_all(parent)?;
+            }
+            secure_fs::write_owner_only_atomic(&path, json.as_bytes())?;
+            match parent {
+                Some(parent) => secure_fs::sync_directory(parent),
+                None => Ok(()),
+            }
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         Ok(())
     }
 
@@ -350,19 +365,6 @@ fn decode_fixed_32(value: &str, label: &str) -> Result<[u8; 32], AppError> {
     bytes
         .try_into()
         .map_err(|_| AppError::InvalidRequest(format!("{label} must be 32 bytes")))
-}
-
-#[cfg(unix)]
-async fn set_owner_only_permissions(path: &Path) -> Result<(), AppError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-async fn set_owner_only_permissions(_path: &Path) -> Result<(), AppError> {
-    Ok(())
 }
 
 /// Render locally generated QR geometry only. Payload text never becomes HTML,
@@ -655,6 +657,46 @@ mod tests {
         let client_shared = client.diffie_hellman(&X25519PublicKey::from(server_public));
         assert_eq!(server_shared.as_slice(), client_shared.as_bytes());
 
+        tokio::fs::remove_dir_all(&data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pairing_keys_are_written_owner_only_without_leftovers() {
+        let data_dir = unique_tmp_dir("todex-pairing-keys-mode");
+        // A missing data directory is created.
+        PairingKeys::load_or_generate(&data_dir).await.unwrap();
+        PairingKeys::reset(&data_dir).await.unwrap();
+        let entries = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [PAIRING_KEYS_FILE]);
+        // Created 0600 regardless of the process umask (typically 022).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(data_dir.join(PAIRING_KEYS_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        tokio::fs::remove_dir_all(&data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_pairing_key_write_leaves_no_temp_file() {
+        let data_dir = unique_tmp_dir("todex-pairing-keys-fail");
+        // The target is a directory, so the final rename fails.
+        let path = data_dir.join(PAIRING_KEYS_FILE);
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(PairingKeys::generate().persist(&path).await.is_err());
+        let entries = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [PAIRING_KEYS_FILE]);
+        assert!(path.is_dir());
         tokio::fs::remove_dir_all(&data_dir).await.unwrap();
     }
 

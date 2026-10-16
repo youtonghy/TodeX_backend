@@ -140,6 +140,17 @@ pub(crate) async fn replace_file_async(from: &Path, to: &Path) -> io::Result<()>
         .map_err(io::Error::other)?
 }
 
+/// Flushes the directory entry of `path` (a directory) to disk, so a
+/// rename into it survives a crash. A no-op where directories cannot be
+/// opened for syncing (Windows).
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// Identity of a file version for change detection: modification time,
 /// length and, on Unix, inode. Every atomic replacement gets a new inode, so
 /// Unix sees a rewrite even within one mtime tick (about 16 ms on Windows,
