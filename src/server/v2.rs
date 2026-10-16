@@ -808,7 +808,7 @@ pub(super) async fn workspace_directories(
 pub(super) async fn create_workspace_directory(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<CreateWorkspaceDirectoryRequest>,
+    ApiJson(request): ApiJson<CreateWorkspaceDirectoryRequest>,
 ) -> Result<Json<WorkspaceDirectoriesResponse>, AppError> {
     require_auth(&state, &headers)?;
 
@@ -821,18 +821,8 @@ pub(super) async fn create_workspace_directory(
             "folder name must be a single path component".to_owned(),
         ));
     }
-    match tokio::fs::create_dir(&target).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(AppError::Conflict(format!("{name} already exists")));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(AppError::Unauthorized(format!(
-                "permission denied creating {}",
-                target.display()
-            )));
-        }
-        Err(error) => return Err(error.into()),
+    if let Err(error) = tokio::fs::create_dir(&target).await {
+        return Err(create_directory_error(error, name, &target));
     }
     // `parent` is canonical and `name` is a single plain component, so the new
     // directory cannot leave the root; revalidate to return its canonical path,
@@ -848,6 +838,50 @@ pub(super) async fn create_workspace_directory(
     workspace_directories_response(roots, current, 100)
         .await
         .map(Json)
+}
+
+/// The API error for a failed `mkdir` of `target`.
+fn create_directory_error(error: std::io::Error, name: &str, target: &Path) -> AppError {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::AlreadyExists => AppError::Conflict(format!("{name} already exists")),
+        ErrorKind::PermissionDenied => {
+            AppError::Unauthorized(format!("permission denied creating {}", target.display()))
+        }
+        // The parent went away after it was validated.
+        ErrorKind::NotFound => AppError::WorkspacePathNotFound,
+        // Too long for the file system, or a name it refuses.
+        ErrorKind::InvalidFilename => {
+            AppError::InvalidRequest(format!("cannot create a folder named {name}: {error}"))
+        }
+        ErrorKind::StorageFull => AppError::StorageLow(format!("no space left to create {name}")),
+        _ => AppError::Io(error),
+    }
+}
+
+/// `Json` whose rejections (malformed or mistyped body, missing or wrong
+/// content type) answer with the API error envelope (400 INVALID_REQUEST)
+/// instead of axum's plain-text 4xx.
+pub(super) struct ApiJson<T>(T);
+
+impl<S, T> axum::extract::FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = AppError;
+
+    async fn from_request(
+        request: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match <Json<T> as axum::extract::FromRequest<S>>::from_request(request, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(AppError::InvalidRequest(format!(
+                "invalid request body: {rejection}"
+            ))),
+        }
+    }
 }
 
 async fn workspace_directories_response(
@@ -7037,6 +7071,103 @@ mod tests {
                 .is_symlink());
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn create_workspace_directory_answers_every_failure_with_the_error_envelope() {
+        let root = std::env::temp_dir().join(format!("todex-v2-mkdir-errors-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state);
+        let project = fs::canonicalize(root.join("workspaces/project")).unwrap();
+        let parent = project.display().to_string();
+        let uri = "/v2/workspace/directories";
+        async fn check(response: axum::response::Response, status: StatusCode, code: &str) {
+            assert_eq!(response.status(), status);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["code"], code, "{body}");
+            assert!(body["message"].is_string(), "{body}");
+        }
+
+        // Malformed bodies.
+        for body in [
+            json!({ "parent": parent }).to_string(),
+            json!({ "parent": parent, "name": 1 }).to_string(),
+            json!({ "parent": parent, "name": "x", "extra": true }).to_string(),
+            "{".to_owned(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(signed_request(&device, "POST", uri, &body))
+                .await
+                .unwrap();
+            check(response, StatusCode::BAD_REQUEST, "INVALID_REQUEST").await;
+        }
+        let body = json!({ "parent": parent, "name": "typed" }).to_string();
+        for content_type in [Some("text/plain"), None] {
+            let mut request = Request::builder().method("POST").uri(uri);
+            if let Some(content_type) = content_type {
+                request = request.header("content-type", content_type);
+            }
+            let request = resign(&device, request.body(Body::from(body.clone())).unwrap()).await;
+            let response = app.clone().oneshot(request).await.unwrap();
+            check(response, StatusCode::BAD_REQUEST, "INVALID_REQUEST").await;
+        }
+        assert!(!project.join("typed").exists());
+
+        let create = |parent: &Path, name: &str| {
+            let payload =
+                json!({ "parent": parent.display().to_string(), "name": name }).to_string();
+            app.clone()
+                .oneshot(signed_request(&device, "POST", uri, &payload))
+        };
+        // A parent that is missing, or is a file.
+        let response = create(&project.join("missing"), "x").await.unwrap();
+        check(response, StatusCode::NOT_FOUND, "WORKSPACE_PATH_NOT_FOUND").await;
+        fs::write(project.join("file"), "").unwrap();
+        let response = create(&project.join("file"), "x").await.unwrap();
+        check(response, StatusCode::BAD_REQUEST, "INVALID_REQUEST").await;
+
+        // A parent the daemon may not write to (root ignores the mode).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = project.join("locked");
+            fs::create_dir(&locked).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+            if fs::create_dir(locked.join("probe")).is_err() {
+                let response = create(&locked, "x").await.unwrap();
+                check(response, StatusCode::FORBIDDEN, "UNAUTHORIZED").await;
+                assert!(!locked.join("x").exists());
+            }
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_directory_errors_map_to_api_errors() {
+        use std::io::{Error, ErrorKind};
+        let target = Path::new("/w/x");
+        for (error, code) in [
+            (Error::from(ErrorKind::AlreadyExists), "CONFLICT"),
+            (Error::from(ErrorKind::PermissionDenied), "UNAUTHORIZED"),
+            (Error::from(ErrorKind::NotFound), "WORKSPACE_PATH_NOT_FOUND"),
+            (Error::from(ErrorKind::InvalidFilename), "INVALID_REQUEST"),
+            (Error::from(ErrorKind::StorageFull), "STORAGE_LOW"),
+            (Error::from(ErrorKind::Other), "IO_ERROR"),
+        ] {
+            assert_eq!(create_directory_error(error, "x", target).code(), code);
+        }
+        // What the OS reports for a name or path that is too long.
+        #[cfg(unix)]
+        assert_eq!(
+            create_directory_error(Error::from_raw_os_error(libc::ENAMETOOLONG), "x", target)
+                .code(),
+            "INVALID_REQUEST"
+        );
     }
 
     #[tokio::test]
