@@ -60,7 +60,7 @@
           "auto",
           "full-access"
         ],
-        "defaultMode": "ask",
+        "defaultMode": "auto",
         "supportsPlan": true,
         "sandboxModes": [
           "read-only",
@@ -191,7 +191,7 @@
           "auto",
           "full-access"
         ],
-        "defaultMode": "ask",
+        "defaultMode": "auto",
         "supportsPlan": true,
         "sandboxModes": [
           "read-only",
@@ -700,7 +700,7 @@
           "auto",
           "full-access"
         ],
-        "defaultMode": "ask",
+        "defaultMode": "auto",
         "supportsPlan": true,
         "sandboxModes": [],
         "approvalPolicies": [],
@@ -764,7 +764,7 @@
           "auto",
           "full-access"
         ],
-        "defaultMode": "ask",
+        "defaultMode": "auto",
         "supportsPlan": true,
         "sandboxModes": [],
         "approvalPolicies": [],
@@ -812,7 +812,7 @@
           "auto",
           "full-access"
         ],
-        "defaultMode": "ask",
+        "defaultMode": "auto",
         "supportsPlan": false,
         "sandboxModes": [],
         "approvalPolicies": [],

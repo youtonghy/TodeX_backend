@@ -32,7 +32,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     display_name: "Claude Code",
     permission_config: PermissionConfigCapabilities {
         modes: &["ask", "auto", "full-access"],
-        default_mode: "ask",
+        default_mode: "auto",
         supports_plan: true,
         sandbox_modes: &["read-only", "workspace-write", "danger-full-access"],
         approval_policies: &["on-request", "never"],

@@ -74,7 +74,7 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
     display_name: "DeepSeek Harness",
     permission_config: PermissionConfigCapabilities {
         modes: &["ask", "auto", "full-access"],
-        default_mode: "ask",
+        default_mode: "auto",
         supports_plan: false,
         sandbox_modes: &[],
         approval_policies: &[],

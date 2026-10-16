@@ -413,7 +413,9 @@ partial replay approvals, legacy gaps, usage snapshots and status rendering.
 
 Prompt requests accept optional `permissionMode` (`ask`, `auto`, `full-access`) and
 `workMode` (`implement`, `plan`). The advertised permissionConfig includes `modes`,
-`defaultMode`, and `supportsPlan`. Legacy sandbox/profile/approval inputs retain
+`defaultMode`, and `supportsPlan`. `defaultMode` is `auto` wherever a provider
+advertises it; Devin, Grok and generic ACP default to `ask`, and Pi to
+`full-access`. Legacy sandbox/profile/approval inputs retain
 their restrictions; incompatible mixed formats are rejected, including replacing
 saved read-only settings with a broader preset. Old native Codex adapter turns
 also forward `approvalsReviewer` separately from approvalPolicy.

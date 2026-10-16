@@ -135,9 +135,9 @@
   },
   "codex": {
     "mode=- work=- profile=- sandbox=- approval=-": {
-      "permissionMode": "ask",
+      "permissionMode": "auto",
       "workMode": "implement",
-      "approvalsReviewer": "user",
+      "approvalsReviewer": "auto_review",
       "sandboxMode": "workspace-write",
       "approvalPolicy": "on-request",
       "providerMode": null,
@@ -171,9 +171,9 @@
       "source": "validated-provider-controls"
     },
     "mode=- work=plan profile=- sandbox=- approval=-": {
-      "permissionMode": "ask",
+      "permissionMode": "auto",
       "workMode": "plan",
-      "approvalsReviewer": "user",
+      "approvalsReviewer": "auto_review",
       "sandboxMode": "workspace-write",
       "approvalPolicy": "on-request",
       "providerMode": null,
@@ -475,12 +475,12 @@
   },
   "claude-code": {
     "mode=- work=- profile=- sandbox=- approval=-": {
-      "permissionMode": "ask",
+      "permissionMode": "auto",
       "workMode": "implement",
       "approvalsReviewer": null,
       "sandboxMode": null,
       "approvalPolicy": null,
-      "providerMode": "default",
+      "providerMode": "auto",
       "source": "validated-provider-controls"
     },
     "mode=- work=- profile=read-only sandbox=- approval=-": {
@@ -499,7 +499,7 @@
       "error": "unsupported capability: Claude stream-json does not support this permission combination"
     },
     "mode=- work=plan profile=- sandbox=- approval=-": {
-      "permissionMode": "ask",
+      "permissionMode": "auto",
       "workMode": "plan",
       "approvalsReviewer": null,
       "sandboxMode": null,
@@ -961,7 +961,7 @@
   },
   "opencode": {
     "mode=- work=- profile=- sandbox=- approval=-": {
-      "permissionMode": "ask",
+      "permissionMode": "auto",
       "workMode": "implement",
       "approvalsReviewer": null,
       "sandboxMode": null,
@@ -979,7 +979,7 @@
       "error": "unsupported capability: opencode does not expose sandbox or approval overrides"
     },
     "mode=- work=plan profile=- sandbox=- approval=-": {
-      "permissionMode": "ask",
+      "permissionMode": "auto",
       "workMode": "plan",
       "approvalsReviewer": null,
       "sandboxMode": null,
@@ -1131,7 +1131,7 @@
   },
   "antigravity": {
     "mode=- work=- profile=- sandbox=- approval=-": {
-      "permissionMode": "ask",
+      "permissionMode": "auto",
       "workMode": "implement",
       "approvalsReviewer": null,
       "sandboxMode": null,
@@ -1149,7 +1149,7 @@
       "error": "unsupported capability: antigravity does not expose sandbox or approval overrides"
     },
     "mode=- work=plan profile=- sandbox=- approval=-": {
-      "permissionMode": "ask",
+      "permissionMode": "auto",
       "workMode": "plan",
       "approvalsReviewer": null,
       "sandboxMode": null,
@@ -1301,7 +1301,7 @@
   },
   "deepseek-harness": {
     "mode=- work=- profile=- sandbox=- approval=-": {
-      "permissionMode": "ask",
+      "permissionMode": "auto",
       "workMode": "implement",
       "approvalsReviewer": null,
       "sandboxMode": null,
