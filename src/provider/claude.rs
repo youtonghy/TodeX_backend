@@ -1921,6 +1921,45 @@ mod tests {
     }
 
     #[test]
+    fn turn_usage_is_the_process_ledger_difference_across_results() {
+        let result = |input: u64, cache_read: u64, cache_write: u64, output: u64, cost: f64| {
+            json!({
+                "usage": { "input_tokens": 1, "output_tokens": 1 },
+                "total_cost_usd": cost,
+                "modelUsage": { "claude-haiku-5-5": {
+                    "inputTokens": input, "outputTokens": output,
+                    "cacheReadInputTokens": cache_read, "cacheCreationInputTokens": cache_write,
+                }},
+            })
+        };
+        let mut ledger = super::ClaudeUsageLedger::default();
+        // A turn with a subagent, then a follow-up invocation in the same turn.
+        let first = ledger.advance(&result(6, 32597, 34135, 369, 0.01)).unwrap();
+        let second = ledger
+            .advance(&result(8, 60712, 34850, 492, 0.015))
+            .unwrap();
+        let mut turn = super::ClaudeUsage::default();
+        turn.add(&first);
+        turn.add(&second);
+        assert_eq!(
+            turn.counters(),
+            json!({ "input_tokens": 8, "output_tokens": 492, "cache_read_input_tokens": 60712, "cache_creation_input_tokens": 34850 })
+        );
+        assert!((turn.cost_usd - 0.015).abs() < 1e-9);
+        // The next turn on the same process counts only its own calls.
+        let next = ledger
+            .advance(&result(10, 88827, 35565, 495, 0.016))
+            .unwrap();
+        assert_eq!(next.counters()["cache_read_input_tokens"], 28115);
+        // Older CLIs without `modelUsage` fall back to the frame's usage.
+        let legacy = ledger
+            .advance(&json!({ "usage": { "input_tokens": 4, "output_tokens": 2 } }))
+            .unwrap();
+        assert_eq!(legacy.counters()["input_tokens"], 4);
+        assert!(ledger.advance(&json!({})).is_none());
+    }
+
+    #[test]
     fn context_window_comes_from_the_main_model_usage() {
         let result = json!({ "modelUsage": {
             "claude-opus-5-5": { "contextWindow": 1_000_000 },
@@ -2025,6 +2064,99 @@ mod tests {
             "rate_limit_info": { "status": "allowed", "resetsAt": 1791279000, "rateLimitType": "five_hour" }
         });
         assert!(claude_frame_limit_reset(&claude_quota_event(&allowed).unwrap()).is_none());
+    }
+}
+
+/// Token and cost counters of Claude model calls, in Anthropic's sense: cache
+/// reads and writes are counted beside `input`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct ClaudeUsage {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cost_usd: f64,
+}
+
+impl ClaudeUsage {
+    /// Sum of a `result` frame's `modelUsage`, which covers every model the
+    /// process has called (subagents included) since it started.
+    fn from_model_usage(result: &Value) -> Option<Self> {
+        let models = result.get("modelUsage")?.as_object()?;
+        let count = |entry: &Value, key: &str| entry.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let mut total = Self::default();
+        for entry in models.values() {
+            total.input += count(entry, "inputTokens");
+            total.output += count(entry, "outputTokens");
+            total.cache_read += count(entry, "cacheReadInputTokens");
+            total.cache_write += count(entry, "cacheCreationInputTokens");
+        }
+        total.cost_usd = result
+            .get("total_cost_usd")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        Some(total)
+    }
+
+    /// A `result` frame's own `usage`: the main thread of one invocation.
+    fn from_result_usage(result: &Value) -> Option<Self> {
+        let usage = result.get("usage").filter(|usage| usage.is_object())?;
+        let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        Some(Self {
+            input: count("input_tokens"),
+            output: count("output_tokens"),
+            cache_read: count("cache_read_input_tokens"),
+            cache_write: count("cache_creation_input_tokens"),
+            cost_usd: 0.0,
+        })
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+        self.cost_usd += other.cost_usd;
+    }
+
+    /// `self - earlier`, or `None` when a counter went backwards.
+    fn since(&self, earlier: &Self) -> Option<Self> {
+        Some(Self {
+            input: self.input.checked_sub(earlier.input)?,
+            output: self.output.checked_sub(earlier.output)?,
+            cache_read: self.cache_read.checked_sub(earlier.cache_read)?,
+            cache_write: self.cache_write.checked_sub(earlier.cache_write)?,
+            cost_usd: (self.cost_usd - earlier.cost_usd).max(0.0),
+        })
+    }
+
+    fn counters(&self) -> Value {
+        json!({
+            "input_tokens": self.input,
+            "output_tokens": self.output,
+            "cache_read_input_tokens": self.cache_read,
+            "cache_creation_input_tokens": self.cache_write,
+        })
+    }
+}
+
+/// Claude's `modelUsage` and `total_cost_usd` count from process start, so
+/// the share of each `result` is its difference from the previous one.
+#[derive(Default)]
+pub(super) struct ClaudeUsageLedger {
+    seen: ClaudeUsage,
+}
+
+impl ClaudeUsageLedger {
+    /// The usage a `result` frame adds. Without `modelUsage` (older CLIs)
+    /// the frame's own `usage` stands in, which misses subagent calls.
+    fn advance(&mut self, result: &Value) -> Option<ClaudeUsage> {
+        let Some(total) = ClaudeUsage::from_model_usage(result) else {
+            return ClaudeUsage::from_result_usage(result);
+        };
+        let added = total.since(&self.seen).unwrap_or_else(|| total.clone());
+        self.seen = total;
+        Some(added)
     }
 }
 
@@ -2202,8 +2334,10 @@ fn claude_command_catalog(initialize_response: &Value) -> Vec<ProviderCommandDes
 /// One turn on an initialized Claude process: sends the prompt and reads
 /// until the turn ends. A cancelled turn returns at once with the process
 /// still mid-turn; the caller interrupts or stops it.
+#[allow(clippy::too_many_arguments)]
 async fn run_claude_turn(
     process: &mut JsonLineProcess,
+    usage_ledger: &mut ClaudeUsageLedger,
     context: DriverContext,
     prompt: DriverPrompt,
     requested_session_id: String,
@@ -2254,6 +2388,9 @@ async fn run_claude_turn(
     // Model of the latest main-thread API call, which picks the context
     // window out of the process-wide `modelUsage` ledger.
     let mut main_model: Option<String> = None;
+    // Every model call of this turn, subagents and follow-up invocations
+    // included; each `result` adds its share of the process ledger.
+    let mut turn_usage = ClaudeUsage::default();
     // A `result` with zero model turns means the invocation ended without an
     // API call — a task notification queued during resume consumes the prompt
     // without answering it. The process stays alive on the open stream, so
@@ -2310,10 +2447,11 @@ async fn run_claude_turn(
         }
         match message.get("type").and_then(Value::as_str) {
             Some("result") => {
-                if let Some(usage) = message.get("usage").filter(|usage| usage.is_object()) {
-                    // `usage` sums every API call of the turn, so it is not a
-                    // context snapshot; the per-call `assistant` frames are.
-                    sink.emit("usage.updated", json!({ "provider": "claude-code", "turnId": prompt.turn_id, "source": "provider", "scope": "turn", "aggregation": "sum", "usage": usage, "costUsd": message.get("total_cost_usd"), "contextWindow": claude_context_window(&message, main_model.as_deref()) })).await?;
+                if let Some(usage) = usage_ledger.advance(&message) {
+                    turn_usage.add(&usage);
+                    // A sum of the turn's calls, so it is not a context
+                    // snapshot; the per-call `assistant` frames are.
+                    sink.emit("usage.updated", json!({ "provider": "claude-code", "turnId": prompt.turn_id, "source": "provider", "scope": "turn", "aggregation": "sum", "usage": turn_usage.counters(), "costUsd": turn_usage.cost_usd, "contextWindow": claude_context_window(&message, main_model.as_deref()) })).await?;
                 }
                 let is_error = message
                     .get("is_error")

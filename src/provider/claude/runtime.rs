@@ -501,6 +501,8 @@ impl LaunchKey {
 struct Live {
     process: JsonLineProcess,
     key: LaunchKey,
+    /// The process's usage counters run across its turns.
+    usage: super::ClaudeUsageLedger,
 }
 
 fn spawn_worker(launcher: Launcher, idle_timeout: Duration) -> Worker {
@@ -586,7 +588,7 @@ async fn worker(
                         // Held before `initialize`: a failed process is
                         // stopped by this worker, which stays in the table
                         // until it has exited.
-                        let started = live.insert(Live { process, key });
+                        let started = live.insert(Live { process, key, usage: Default::default() });
                         super::initialize_session(
                             &mut started.process,
                             &launcher.catalogs,
@@ -646,7 +648,7 @@ async fn worker(
                 if live.is_none() {
                     let (process, runtime_id) =
                         super::spawn_claude(&launcher.binary, &context, &prompt, permit).await?;
-                    let started = live.insert(Live { process, key });
+                    let started = live.insert(Live { process, key, usage: Default::default() });
                     super::initialize_session(
                         &mut started.process,
                         &launcher.catalogs,
@@ -661,9 +663,10 @@ async fn worker(
                 if *cancel.borrow() {
                     return Ok(None);
                 }
-                let process = &mut live.as_mut().expect("started process").process;
+                let Live { process, usage, .. } = live.as_mut().expect("started process");
                 super::run_claude_turn(
                     process,
+                    usage,
                     context,
                     prompt,
                     session_id.clone(),
@@ -856,6 +859,7 @@ async fn run_once(
         }
         super::run_claude_turn(
             &mut process,
+            &mut super::ClaudeUsageLedger::default(),
             context,
             prompt,
             session_id.clone(),
