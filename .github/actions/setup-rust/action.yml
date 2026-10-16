@@ -27,7 +27,14 @@ runs:
               ARM64) host="aarch64-pc-windows-msvc" ;;
               *) host="x86_64-pc-windows-msvc" ;;
             esac
-            curl -fsSLo "${RUNNER_TEMP}/rustup-init.exe" "https://static.rust-lang.org/rustup/dist/${host}/rustup-init.exe"
+            url="https://static.rust-lang.org/rustup/dist/${host}/rustup-init.exe"
+            curl --proto '=https' --tlsv1.2 -fsSLo "${RUNNER_TEMP}/rustup-init.exe" "${url}"
+            expected="$(curl --proto '=https' --tlsv1.2 -fsSL "${url}.sha256" | cut -d' ' -f1)"
+            actual="$(sha256sum "${RUNNER_TEMP}/rustup-init.exe" | cut -d' ' -f1)"
+            if [[ -z "${expected}" || "${expected}" != "${actual}" ]]; then
+              echo "rustup-init.exe checksum mismatch (expected '${expected}', got '${actual}')" >&2
+              exit 1
+            fi
             "${RUNNER_TEMP}/rustup-init.exe" -y --profile minimal --default-toolchain none
             cargo_bin="$(cygpath -w "${USERPROFILE}\\.cargo\\bin")"
           else
@@ -56,7 +63,7 @@ runs:
         fi
         llvm_bin="C:\\Program Files\\LLVM\\bin"
         if [[ ! -x "$(cygpath -u "${llvm_bin}")/clang.exe" ]]; then
-          choco install llvm --yes --no-progress
+          choco install llvm --version 19.1.7 --yes --no-progress
         fi
         echo "${llvm_bin}" >> "${GITHUB_PATH}"
         "$(cygpath -u "${llvm_bin}")/clang.exe" --version
