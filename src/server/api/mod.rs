@@ -111,10 +111,7 @@ async fn agent_models(
     let agent = parse_agent(&agent)?;
     key.ensure_agent(agent)?;
     let workspace = authorize_workspace(&state, &key, &query.workspace).await?;
-    let models = state
-        .conversations
-        .models_live(&key.owner_id(), agent, &workspace)
-        .await?;
+    let models = state.conversations.models_live(agent, &workspace).await?;
     Ok(Json(json!({ "agent": agent, "models": models })))
 }
 
@@ -144,11 +141,8 @@ fn parse_agent(agent: &str) -> Result<ProviderKind, AppError> {
     agent.parse().map_err(AppError::InvalidRequest)
 }
 
-/// The canonical `workspace` if this key may run agents in it. The path
-/// must be inside a workspace root and the key's scope, and trusted: a
-/// workspace listed in the key's scope is trusted by issuing the key; any
-/// other must already be trusted on a paired device. The key's own trust
-/// record is written on first use.
+/// The canonical `workspace` if this key may run agents in it: the path
+/// must be inside a workspace root and the key's scope.
 async fn authorize_workspace(
     state: &AppState,
     key: &ApiKeyContext,
@@ -160,23 +154,8 @@ async fn authorize_workspace(
             "workspace is outside this API key's scope".to_owned(),
         ));
     }
-    let owner = key.owner_id();
-    let trust = &state.workspace_trust;
-    if !trust.status_owned(&owner, &workspace).await?.trusted {
-        let granted = key.record.scopes.lists_workspace(&workspace)
-            || trust.status_owned(DEVICE_OWNER, &workspace).await?.trusted;
-        if !granted {
-            return Err(AppError::WorkspaceTrustRequired(
-                workspace.display().to_string(),
-            ));
-        }
-        trust.set_owned(&owner, &workspace, true).await?;
-    }
     Ok(workspace)
 }
-
-/// Paired devices share this owner (`device_auth::verified_context`).
-const DEVICE_OWNER: &str = "local";
 
 /// A manifest as the API returns it: the title decrypted for the key.
 async fn present_manifest(

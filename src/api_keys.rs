@@ -109,12 +109,6 @@ impl ApiKeyScopes {
         }
     }
 
-    /// Whether the scope lists `workspace` (or a parent of it) explicitly,
-    /// which grants the key trust in it; see docs/API.md.
-    pub(crate) fn lists_workspace(&self, workspace: &Path) -> bool {
-        self.workspaces.is_some() && self.allows_workspace(workspace)
-    }
-
     fn validate(&self) -> Result<()> {
         if let Some(agents) = &self.agents {
             if agents.is_empty() {
@@ -807,7 +801,6 @@ pub(crate) mod tests {
         assert!(scopes.allows_workspace(&root.join("a").join("b")));
         assert!(!scopes.allows_workspace(&root.join("ab")));
         assert!(ApiKeyScopes::default().allows_workspace(&root));
-        assert!(!ApiKeyScopes::default().lists_workspace(&root));
         let _ = fs::remove_dir_all(&root);
     }
 

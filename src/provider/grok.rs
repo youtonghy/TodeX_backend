@@ -9,7 +9,6 @@ use tokio::sync::watch;
 use crate::config::AgentConfig;
 use crate::conversation::{ProviderKind, ProviderState};
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{AcpQuirks, AcpRuntimeOptions, ExtensionUpdates, PromptUsage, PLAIN_ACP};
 use super::discovery::CatalogCache;
@@ -209,21 +208,14 @@ impl ProviderDriver for GrokBuildDriver {
         true
     }
 
-    async fn fork_session(
-        &self,
-        context: DriverContext,
-        launch_permit: WorkspaceTrustPermit,
-    ) -> Result<ProviderState, AppError> {
+    async fn fork_session(&self, context: DriverContext) -> Result<ProviderState, AppError> {
         let source = context
             .provider_state
             .native_session_id
             .as_deref()
             .ok_or_else(|| AppError::InvalidRequest("Grok session has not started".to_owned()))?;
-        let mut process = JsonLineProcess::spawn_trusted(
-            &self.command_spec(&context.manifest.workspace, None)?,
-            launch_permit,
-        )
-        .await?;
+        let mut process =
+            JsonLineProcess::spawn(&self.command_spec(&context.manifest.workspace, None)?).await?;
         let result = async {
             let initialize = initialize_process(&mut process).await?;
             self.authenticate(&mut process, &initialize).await?;
@@ -321,10 +313,9 @@ impl ProviderDriver for GrokBuildDriver {
         context: DriverContext,
         settings: DriverPrompt,
         sink: DriverEventSink,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<ProviderPrewarm, AppError> {
         self.sessions
-            .prewarm(context, settings, sink, launch_permit, |context, prompt| {
+            .prewarm(context, settings, sink, |context, prompt| {
                 self.resident_launch(context, prompt)
             })
             .await
@@ -336,17 +327,11 @@ impl ProviderDriver for GrokBuildDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         self.sessions
-            .run_turn(
-                context,
-                prompt,
-                sink,
-                cancel,
-                launch_permit,
-                |context, prompt| self.resident_launch(context, prompt),
-            )
+            .run_turn(context, prompt, sink, cancel, |context, prompt| {
+                self.resident_launch(context, prompt)
+            })
             .await
     }
 }
@@ -641,7 +626,6 @@ mod tests {
         driver: std::sync::Arc<GrokBuildDriver>,
         store: crate::conversation::ConversationStore,
         manifest: crate::conversation::ConversationManifest,
-        trust: crate::workspace_trust::WorkspaceTrustStore,
     }
 
     #[cfg(unix)]
@@ -679,19 +663,11 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let trust = crate::workspace_trust::WorkspaceTrustStore::new(
-                root.join("data"),
-                vec![root.clone()],
-            )
-            .await
-            .unwrap();
-            trust.set_owned("local", &root, true).await.unwrap();
             Self {
                 root,
                 driver,
                 store,
                 manifest,
-                trust,
             }
         }
 
@@ -754,14 +730,10 @@ mod tests {
                 &self.manifest.id,
             )
             .with_turn_id(turn_id);
-            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
             let driver = self.driver.clone();
             let (cancel, receiver) = watch::channel(false);
-            let task = tokio::spawn(async move {
-                driver
-                    .run_turn(context, prompt, sink, receiver, permit)
-                    .await
-            });
+            let task =
+                tokio::spawn(async move { driver.run_turn(context, prompt, sink, receiver).await });
             (cancel, task)
         }
 
@@ -810,10 +782,9 @@ mod tests {
                 &self.manifest.id,
             )
             .muted();
-            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
             tokio::time::timeout(
                 Duration::from_secs(10),
-                self.driver.prewarm(context, settings, sink, permit),
+                self.driver.prewarm(context, settings, sink),
             )
             .await
             .unwrap()
@@ -1149,19 +1120,12 @@ mod tests {
         state.native_session_id = Some("source-session".to_owned());
         let forked = fixture
             .driver
-            .fork_session(
-                DriverContext {
-                    manifest: fixture.manifest.clone(),
-                    provider_state: state,
-                    agent_mcp: None,
-                    handles: Default::default(),
-                },
-                fixture
-                    .trust
-                    .acquire_owned("local", &fixture.root)
-                    .await
-                    .unwrap(),
-            )
+            .fork_session(DriverContext {
+                manifest: fixture.manifest.clone(),
+                provider_state: state,
+                agent_mcp: None,
+                handles: Default::default(),
+            })
             .await
             .unwrap();
         assert_eq!(forked.native_session_id.as_deref(), Some("forked-session"));

@@ -86,13 +86,8 @@ async fn golden_supervisor(
     let store = ConversationStore::new(config.data_dir.clone())
         .await
         .unwrap();
-    let trust = trust_store(&config, "owner-a", Some(&workspace)).await;
-    let supervisor = ConversationSupervisor::new(
-        Arc::new(config),
-        store,
-        ConversationEventHub::default(),
-        trust,
-    );
+    let supervisor =
+        ConversationSupervisor::new(Arc::new(config), store, ConversationEventHub::default());
     (root, workspace, supervisor)
 }
 

@@ -42,7 +42,6 @@ use crate::agent_mcp::AGY_NATIVE_AUTO_ENV;
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::discovery::CatalogCache;
 use super::process::{
@@ -209,35 +208,16 @@ impl AntigravityDriver {
         available
     }
 
-    /// Whether an auto turn runs agy's own Auto, and the launch permit to
-    /// start it with. A probe can take [`AUTO_PROBE_TIMEOUT`], so the permit
-    /// is released meanwhile (trust changes must not queue behind it) and
-    /// taken again afterwards, which fails if trust was revoked. `None`: the
-    /// turn was cancelled while waiting.
-    async fn native_auto(
-        &self,
-        trust: Option<&super::types::TrustGate>,
-        cancel: &mut watch::Receiver<bool>,
-        permit: WorkspaceTrustPermit,
-    ) -> Result<Option<(bool, WorkspaceTrustPermit)>, AppError> {
+    /// Whether an auto turn runs agy's own Auto. `None`: the turn was
+    /// cancelled while waiting for the probe.
+    async fn native_auto(&self, cancel: &mut watch::Receiver<bool>) -> Option<bool> {
         if let Some(available) = self.cached_auto_mode() {
-            return Ok(Some((available, permit)));
+            return Some(available);
         }
-        let probe = async {
-            tokio::select! {
-                available = self.auto_available() => Some(available),
-                _ = cancel.changed() => None,
-            }
-        };
-        let Some(trust) = trust else {
-            // Without a way to take it again, the permit is kept meanwhile.
-            return Ok(probe.await.map(|available| (available, permit)));
-        };
-        drop(permit);
-        let Some(available) = probe.await else {
-            return Ok(None);
-        };
-        Ok(Some((available, trust.acquire().await?)))
+        tokio::select! {
+            available = self.auto_available() => Some(available),
+            _ = cancel.changed() => None,
+        }
     }
 
     async fn forget_auto_mode(&self) {
@@ -335,7 +315,6 @@ impl ProviderDriver for AntigravityDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         mut cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         let controls = super::types::resolve_execution_config(
             context.manifest.provider,
@@ -375,11 +354,8 @@ impl ProviderDriver for AntigravityDriver {
             spec.env.extend(global.env.iter().cloned());
         }
         let auto = controls.work_mode != "plan" && controls.permission_mode == "auto";
-        let (native_auto, launch_permit) = if auto {
-            match self
-                .native_auto(context.handles.trust.as_ref(), &mut cancel, launch_permit)
-                .await?
-            {
+        let native_auto = if auto {
+            match self.native_auto(&mut cancel).await {
                 Some(answer) => answer,
                 None => {
                     return Ok(DriverTurnResult {
@@ -390,7 +366,7 @@ impl ProviderDriver for AntigravityDriver {
                 }
             }
         } else {
-            (false, launch_permit)
+            false
         };
         if auto && !native_auto {
             // The supervisor recorded `auto` for TodeX's own MCP tools; the
@@ -452,9 +428,7 @@ impl ProviderDriver for AntigravityDriver {
         // agy only warns on stderr when Auto is unavailable after all; it is
         // watched as it streams, so later output cannot push it out of view.
         let auto_watch = native_auto.then(|| StderrWatch::new(AUTO_UNAVAILABLE));
-        let mut process =
-            JsonLineProcess::spawn_trusted_watching(&spec, launch_permit, auto_watch.clone())
-                .await?;
+        let mut process = JsonLineProcess::spawn_watching(&spec, auto_watch.clone()).await?;
         let result = run_agy_turn(
             &mut process,
             self,
@@ -1319,7 +1293,6 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             driver: AntigravityDriver,
             store: ConversationStore,
             manifest: ConversationManifest,
-            trust: crate::workspace_trust::WorkspaceTrustStore,
             /// TodeX's agent MCP with its approval hook, for bridged turns.
             bridge: Option<crate::agent_mcp::AgentMcp>,
         }
@@ -1364,19 +1337,11 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     ))
                     .await
                     .unwrap();
-                let trust = crate::workspace_trust::WorkspaceTrustStore::new(
-                    root.join("data"),
-                    vec![root.clone()],
-                )
-                .await
-                .unwrap();
-                trust.set_owned("local", &root, true).await.unwrap();
                 Self {
                     root,
                     driver,
                     store,
                     manifest,
-                    trust,
                     bridge: None,
                 }
             }
@@ -1438,11 +1403,6 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             ) -> Result<DriverTurnResult, AppError> {
                 let mut handles = crate::provider::types::TurnHandles {
                     mode: None,
-                    trust: Some(crate::provider::types::TrustGate {
-                        store: self.trust.clone(),
-                        owner_id: "local".to_owned(),
-                        workspace: self.root.clone(),
-                    }),
                     ..Default::default()
                 };
                 let mut agent_mcp = None;
@@ -1481,21 +1441,15 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                     &self.manifest.id,
                 )
                 .with_turn_id(turn_id);
-                let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
                 let (cancel, receiver) = watch::channel(false);
                 if let Some(delay) = cancel_after {
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
                         let _ = cancel.send(true);
                     });
-                    self.driver
-                        .run_turn(context, prompt, sink, receiver, permit)
-                        .await
+                    self.driver.run_turn(context, prompt, sink, receiver).await
                 } else {
-                    let result = self
-                        .driver
-                        .run_turn(context, prompt, sink, receiver, permit)
-                        .await;
+                    let result = self.driver.run_turn(context, prompt, sink, receiver).await;
                     drop(cancel);
                     result
                 }
@@ -1829,54 +1783,18 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
         }
 
         #[tokio::test]
-        async fn the_probe_runs_outside_the_workspace_without_holding_trust() {
+        async fn the_probe_runs_outside_the_workspace() {
             let fixture = Fixture::new().await;
-            fixture.mark("auto-probe-gate");
-            let meanwhile = async {
-                fixture.probes_started(1).await;
-                // A trust change would queue behind a held launch permit.
-                tokio::time::timeout(
-                    Duration::from_secs(5),
-                    fixture.trust.set_owned("local", &fixture.root, true),
-                )
+            fixture
+                .run("turn-1", "hello", Some("auto"), None)
                 .await
-                .expect("trust changes are not blocked by the probe")
                 .unwrap();
-                fixture.unmark("auto-probe-gate");
-            };
-            let (result, ()) = tokio::join!(
-                fixture.run("turn-1", "hello", Some("auto"), None),
-                meanwhile
-            );
-            result.unwrap();
             assert_eq!(fixture.launches().len(), 1);
             let cwd = std::fs::read_to_string(fixture.root.join("probe-cwd.log")).unwrap();
             assert!(
                 !cwd.trim_end().starts_with(&*fixture.root.to_string_lossy()),
                 "{cwd}"
             );
-        }
-
-        #[tokio::test]
-        async fn trust_revoked_during_the_probe_fails_the_turn() {
-            let fixture = Fixture::new().await;
-            fixture.mark("auto-probe-gate");
-            let revoke = async {
-                fixture.probes_started(1).await;
-                fixture
-                    .trust
-                    .set_owned("local", &fixture.root, false)
-                    .await
-                    .unwrap();
-                fixture.unmark("auto-probe-gate");
-            };
-            let (result, ()) =
-                tokio::join!(fixture.run("turn-1", "hello", Some("auto"), None), revoke);
-            assert!(
-                matches!(result, Err(AppError::WorkspaceTrustRequired(_))),
-                "{result:?}"
-            );
-            assert!(fixture.launches().is_empty());
         }
 
         #[tokio::test]

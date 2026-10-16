@@ -294,9 +294,6 @@ fn shared_error(error: &AppError) -> AppError {
         AppError::Conflict(detail) => AppError::Conflict(detail.clone()),
         AppError::NotFound(detail) => AppError::NotFound(detail.clone()),
         AppError::Unauthorized(detail) => AppError::Unauthorized(detail.clone()),
-        AppError::WorkspaceTrustRequired(detail) => {
-            AppError::WorkspaceTrustRequired(detail.clone())
-        }
         AppError::ResourceExhausted(detail) => AppError::ResourceExhausted(detail.clone()),
         AppError::Unauthenticated => AppError::Unauthenticated,
         AppError::TurnCancelled => AppError::TurnCancelled,

@@ -33,7 +33,6 @@ impl ProviderDriver for GatedDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         mut cancel: watch::Receiver<bool>,
-        _launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         self.prompts.lock().unwrap().push(prompt.text);
         tokio::select! {
@@ -538,7 +537,6 @@ fn restarted(
         supervisor.config.clone(),
         store.clone(),
         ConversationEventHub::default(),
-        supervisor.workspace_trust.clone(),
     )
 }
 

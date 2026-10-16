@@ -22,7 +22,6 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::time::Instant;
 
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::super::process::JsonLineProcess;
 use super::super::types::{
@@ -60,7 +59,6 @@ pub(in crate::provider) struct Run {
     pub prompt: DriverPrompt,
     pub sink: DriverEventSink,
     pub cancel: watch::Receiver<bool>,
-    pub permit: WorkspaceTrustPermit,
 }
 
 struct Turn {
@@ -75,7 +73,6 @@ struct Turn {
 pub(in crate::provider) struct Warm {
     pub context: DriverContext,
     pub settings: DriverPrompt,
-    pub permit: WorkspaceTrustPermit,
 }
 
 /// What a worker is asked to do, one at a time. Unboxed: the worker's
@@ -696,17 +693,13 @@ async fn worker(
                     let _ = reply.send(Ok(()));
                     continue;
                 }
-                let Warm {
-                    context,
-                    settings,
-                    permit,
-                } = warm;
+                let Warm { context, settings } = warm;
                 let (_cancel_tx, mut cancel) = watch::channel(false);
                 let started = tokio::select! {
                     started = async {
                         let key = LaunchKey::new(&launcher.binary, &context, &settings).await?;
                         let (process, runtime_id) =
-                            super::spawn_claude(&launcher.binary, &context, &settings, permit)
+                            super::spawn_claude(&launcher.binary, &context, &settings)
                                 .await?;
                         // Held before `initialize`: a failed process is
                         // stopped by this worker, which stays in the table
@@ -745,7 +738,6 @@ async fn worker(
             prompt,
             sink,
             mut cancel,
-            permit,
         } = run;
         let mut start = match (&context.handles.adopt, &awaiting) {
             (Some(token), Some((expected, _))) if token == expected && live.is_some() => {
@@ -809,7 +801,7 @@ async fn worker(
             outcome = async {
                 if live.is_none() {
                     let (process, runtime_id) =
-                        super::spawn_claude(&launcher.binary, &context, &prompt, permit).await?;
+                        super::spawn_claude(&launcher.binary, &context, &prompt).await?;
                     let started = live.insert(Live::new(process, key));
                     super::initialize_session(
                         &mut started.process,
@@ -819,8 +811,6 @@ async fn worker(
                         &mut cancel,
                     )
                     .await?;
-                } else {
-                    drop(permit);
                 }
                 if *cancel.borrow() {
                     return Ok(None);
@@ -1023,7 +1013,6 @@ async fn run_once(
         prompt,
         sink,
         mut cancel,
-        permit,
     } = run;
     let session_id = super::claude_session_id(&context);
     // Claude's own work lived on a resident process this one is not.
@@ -1035,7 +1024,7 @@ async fn run_once(
         return Ok(cancelled_before_start(session_id));
     }
     let (mut process, runtime_id) =
-        super::spawn_claude(&launcher.binary, &context, &prompt, permit).await?;
+        super::spawn_claude(&launcher.binary, &context, &prompt).await?;
     let result = async {
         super::initialize_session(
             &mut process,
@@ -1078,7 +1067,6 @@ mod tests {
         ConversationEventHub, ConversationManifest, ConversationStore, ProviderKind, ProviderState,
     };
     use crate::provider::types::{PermissionBroker, TurnHandles};
-    use crate::workspace_trust::WorkspaceTrustStore;
     use std::path::Path;
 
     /// A stream-json Claude stand-in. Each prompt's text picks a behavior:
@@ -1178,7 +1166,6 @@ done
     struct Fixture {
         root: PathBuf,
         store: ConversationStore,
-        trust: WorkspaceTrustStore,
         launcher: Launcher,
     }
 
@@ -1195,10 +1182,6 @@ done
                 .await
                 .unwrap();
             let store = ConversationStore::new(root.join("data")).await.unwrap();
-            let trust = WorkspaceTrustStore::new(root.join("trust"), vec![root.clone()])
-                .await
-                .unwrap();
-            trust.set_owned("local", &root, true).await.unwrap();
             Self {
                 launcher: Launcher {
                     binary: script.display().to_string(),
@@ -1206,7 +1189,6 @@ done
                 },
                 root,
                 store,
-                trust,
             }
         }
 
@@ -1285,7 +1267,6 @@ done
                 },
                 sink,
                 cancel,
-                permit: self.trust.acquire_owned("local", &self.root).await.unwrap(),
             };
             tokio::time::timeout(
                 Duration::from_secs(15),
@@ -1405,7 +1386,6 @@ done
                     sandbox_mode: None,
                     approval_policy: None,
                 },
-                permit: self.trust.acquire_owned("local", &self.root).await.unwrap(),
             };
             tokio::time::timeout(
                 Duration::from_secs(15),

@@ -9,7 +9,6 @@ use crate::{
         ProviderKind,
     },
     error::AppError,
-    workspace_trust::WorkspaceTrustStore,
 };
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
@@ -18,7 +17,6 @@ struct Harness {
     root: PathBuf,
     supervisor: ConversationSupervisor,
     store: ConversationStore,
-    trust: WorkspaceTrustStore,
     manifest: ConversationManifest,
 }
 
@@ -97,19 +95,8 @@ impl Harness {
                 .unwrap();
             store = store.with_history_keys(keys);
         }
-        let trust = WorkspaceTrustStore::new(root.join("trust"), vec![root.clone()])
-            .await
-            .unwrap();
-        trust
-            .set_owned("owner-a", &root.join("workspace"), true)
-            .await
-            .unwrap();
-        let supervisor = ConversationSupervisor::new(
-            config,
-            store.clone(),
-            ConversationEventHub::default(),
-            trust.clone(),
-        );
+        let supervisor =
+            ConversationSupervisor::new(config, store.clone(), ConversationEventHub::default());
         let manifest = supervisor
             .create_owned(
                 "owner-a",
@@ -124,7 +111,6 @@ impl Harness {
             root,
             supervisor,
             store,
-            trust,
             manifest,
         }
     }
@@ -214,7 +200,7 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn controls_check_owner_trust_and_stale_turn_before_native_mutation() {
+async fn controls_check_owner_and_stale_turn_before_native_mutation() {
     let harness = Harness::new().await;
     let turn = harness.start().await;
     let command = ProviderControl::Steer {
@@ -231,29 +217,6 @@ async fn controls_check_owner_trust_and_stale_turn_before_native_mutation() {
         )
         .await
         .is_err());
-    harness
-        .trust
-        .set_owned("owner-a", &harness.manifest.workspace, false)
-        .await
-        .unwrap();
-    assert!(matches!(
-        harness
-            .supervisor
-            .control_owned(
-                "owner-a",
-                &harness.manifest.id,
-                &turn,
-                "untrusted",
-                command.clone()
-            )
-            .await,
-        Err(AppError::WorkspaceTrustRequired(_))
-    ));
-    harness
-        .trust
-        .set_owned("owner-a", &harness.manifest.workspace, true)
-        .await
-        .unwrap();
     assert!(matches!(
         harness
             .supervisor

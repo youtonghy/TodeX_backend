@@ -24,8 +24,6 @@ pub enum AppError {
     WorkspacePathNotFound,
     #[error("workspace path escapes configured workspace root")]
     WorkspacePathOutsideRoot,
-    #[error("workspace must be trusted before execution: {0}")]
-    WorkspaceTrustRequired(String),
     #[error("codex binary not found in PATH")]
     CodexNotFound,
     #[error("git executable not found in PATH")]
@@ -151,7 +149,6 @@ impl AppError {
             Self::Unauthorized(_) => "UNAUTHORIZED",
             Self::WorkspacePathNotFound => "WORKSPACE_PATH_NOT_FOUND",
             Self::WorkspacePathOutsideRoot => "WORKSPACE_PATH_OUTSIDE_ROOT",
-            Self::WorkspaceTrustRequired(_) => "WORKSPACE_TRUST_REQUIRED",
             Self::CodexNotFound => "CODEX_NOT_FOUND",
             Self::GitUnavailable => "GIT_UNAVAILABLE",
             Self::GitRepositoryNotFound => "GIT_REPOSITORY_NOT_FOUND",
@@ -202,7 +199,6 @@ impl IntoResponse for AppError {
             Self::Unauthorized(_) => StatusCode::FORBIDDEN,
             Self::WorkspacePathNotFound => StatusCode::NOT_FOUND,
             Self::WorkspacePathOutsideRoot => StatusCode::FORBIDDEN,
-            Self::WorkspaceTrustRequired(_) => StatusCode::FORBIDDEN,
             Self::GitUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::GitRepositoryNotFound => StatusCode::NOT_FOUND,
             Self::GitCommandFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,

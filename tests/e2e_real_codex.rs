@@ -1083,11 +1083,11 @@ async fn spawn_daemon() -> Daemon {
         workspace_root,
     };
     wait_for_health(daemon.port).await;
-    register_and_trust_workspace(&daemon).await;
+    register_workspace(&daemon).await;
     daemon
 }
 
-async fn register_and_trust_workspace(daemon: &Daemon) {
+async fn register_workspace(daemon: &Daemon) {
     let replaced = http_request(
         daemon.port,
         "PUT",
@@ -1114,21 +1114,6 @@ async fn register_and_trust_workspace(daemon: &Daemon) {
     )
     .await;
     assert_eq!(replaced.0, 200, "register E2E workspace: {}", replaced.1);
-    let replaced: Value = serde_json::from_str(&replaced.1).expect("workspace response JSON");
-    let workspace_id = replaced["workspaces"][0]["id"]
-        .as_str()
-        .expect("workspace id");
-    let trusted = http_request(
-        daemon.port,
-        "PUT",
-        &format!("/v2/workspaces/{workspace_id}/trust"),
-        Some(&test_device()),
-        Some(json!({ "trusted": true })),
-    )
-    .await;
-    assert_eq!(trusted.0, 200, "trust E2E workspace: {}", trusted.1);
-    let trusted: Value = serde_json::from_str(&trusted.1).expect("trust response JSON");
-    assert_eq!(trusted["trusted"], true);
 }
 
 fn write_real_acp_profile(data_dir: &Path) {
@@ -1193,7 +1178,7 @@ async fn spawn_fake_history_daemon() -> Daemon {
         workspace_root,
     };
     wait_for_health(daemon.port).await;
-    register_and_trust_workspace(&daemon).await;
+    register_workspace(&daemon).await;
     daemon
 }
 

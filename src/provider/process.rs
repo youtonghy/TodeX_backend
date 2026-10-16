@@ -13,7 +13,6 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process_registry::{self, TrackedProcess};
 
@@ -214,7 +213,7 @@ impl JsonLineProcess {
         Self::spawn_watching(spec, None).await
     }
 
-    async fn spawn_watching(
+    pub(crate) async fn spawn_watching(
         spec: &CommandSpec,
         watch: Option<StderrWatch>,
     ) -> Result<Self, AppError> {
@@ -276,24 +275,6 @@ impl JsonLineProcess {
             pid,
             tracked,
         })
-    }
-
-    pub async fn spawn_trusted(
-        spec: &CommandSpec,
-        permit: WorkspaceTrustPermit,
-    ) -> Result<Self, AppError> {
-        Self::spawn_trusted_watching(spec, permit, None).await
-    }
-
-    /// [`Self::spawn_trusted`], latching `watch` when stderr shows its needle.
-    pub(crate) async fn spawn_trusted_watching(
-        spec: &CommandSpec,
-        permit: WorkspaceTrustPermit,
-        watch: Option<StderrWatch>,
-    ) -> Result<Self, AppError> {
-        let process = Self::spawn_watching(spec, watch).await?;
-        drop(permit);
-        Ok(process)
     }
 
     pub async fn send(&mut self, value: &Value) -> Result<(), AppError> {

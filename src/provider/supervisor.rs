@@ -27,7 +27,6 @@ use crate::history_keys::FingerprintKey;
 use crate::mcp;
 use crate::workspace_paths::validate_workspace_directory_text;
 use crate::workspace_store::stable_workspace_id;
-use crate::workspace_trust::WorkspaceTrustStore;
 
 use super::acp::AcpDriver;
 use super::claude::ClaudeDriver;
@@ -44,9 +43,8 @@ use super::types::{
     DriverTurnResult, ImageInputMode, PermissionBroker, PermissionDecision, PermissionOutcome,
     ProviderActivity, ProviderCommandDescriptor, ProviderControl, ProviderDriver,
     ProviderImageInputCapability, ProviderModelDescriptor, ProviderSnapshot, ProviderWork,
-    ProviderWorkHandle, TrustGate, TurnHandles, TurnModeHandle,
+    ProviderWorkHandle, TurnHandles, TurnModeHandle,
 };
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 mod follow_ups;
 mod history_cleanup;
@@ -382,7 +380,6 @@ pub struct ConversationSupervisor {
     active: Arc<DashMap<String, ActiveTurn>>,
     request_gates: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     cli_execution_gate: Arc<RwLock<()>>,
-    workspace_trust: WorkspaceTrustStore,
     /// `[agent].provider_idle_timeout_minutes`; `None` disables the watchdog.
     provider_idle_timeout: Option<Duration>,
     /// SSH tools injected into provider sessions; `None` in bare test setups.
@@ -444,7 +441,6 @@ struct SpawnTurn {
     driver: Arc<dyn ProviderDriver>,
     prompt: DriverPrompt,
     cancel: watch::Receiver<bool>,
-    launch_permit: WorkspaceTrustPermit,
     /// See [`TurnHandles::adopt`].
     adopt: Option<String>,
 }
@@ -476,37 +472,18 @@ impl Drop for ActiveTurnCleanup {
 
 impl ConversationSupervisor {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn new(
-        config: Arc<Config>,
-        store: ConversationStore,
-        hub: ConversationEventHub,
-        workspace_trust: WorkspaceTrustStore,
-    ) -> Self {
-        Self::new_with_execution_gate(
-            config,
-            store,
-            hub,
-            workspace_trust,
-            Arc::new(RwLock::new(())),
-        )
+    pub fn new(config: Arc<Config>, store: ConversationStore, hub: ConversationEventHub) -> Self {
+        Self::new_with_execution_gate(config, store, hub, Arc::new(RwLock::new(())))
     }
 
     pub fn new_with_execution_gate(
         config: Arc<Config>,
         store: ConversationStore,
         hub: ConversationEventHub,
-        workspace_trust: WorkspaceTrustStore,
         cli_execution_gate: Arc<RwLock<()>>,
     ) -> Self {
         let catalog = CatalogService::new(config.clone());
-        Self::new_with_catalog_and_gate(
-            config,
-            store,
-            hub,
-            catalog,
-            workspace_trust,
-            cli_execution_gate,
-        )
+        Self::new_with_catalog_and_gate(config, store, hub, catalog, cli_execution_gate)
     }
 
     fn new_with_catalog_and_gate(
@@ -514,7 +491,6 @@ impl ConversationSupervisor {
         store: ConversationStore,
         hub: ConversationEventHub,
         catalog: CatalogService,
-        workspace_trust: WorkspaceTrustStore,
         cli_execution_gate: Arc<RwLock<()>>,
     ) -> Self {
         let provider_idle_timeout = match config.agent.provider_idle_timeout_minutes {
@@ -531,7 +507,6 @@ impl ConversationSupervisor {
             permissions: PermissionBroker::default(),
             active: Arc::new(DashMap::new()),
             request_gates: Arc::new(DashMap::new()),
-            workspace_trust,
             cli_execution_gate,
             agent_mcp: None,
             quota: crate::quota_store::QuotaStore::default(),
@@ -924,17 +899,13 @@ impl ConversationSupervisor {
 
     pub async fn models_live(
         &self,
-        owner_id: &str,
         provider: ProviderKind,
         workspace: &Path,
     ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
         let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
             AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
         })?;
-        let _launch_permit = self
-            .workspace_trust
-            .acquire_owned(owner_id, workspace)
-            .await?;
+        self.validate_workspace(workspace)?;
         let driver = self.registry.driver(provider)?;
         tokio::time::timeout(
             driver.discovery_timeout(),
@@ -951,7 +922,6 @@ impl ConversationSupervisor {
 
     pub async fn image_input_live(
         &self,
-        owner_id: &str,
         provider: ProviderKind,
         workspace: &Path,
         profile: Option<&str>,
@@ -961,7 +931,7 @@ impl ConversationSupervisor {
         let (image_input, source, reason) = match descriptor.capabilities.image_input_mode {
             ImageInputMode::Always => (true, "provider".to_owned(), None),
             ImageInputMode::Model => {
-                let models = self.models_live(owner_id, provider, workspace).await?;
+                let models = self.models_live(provider, workspace).await?;
                 let selected = model
                     .and_then(|id| models.iter().find(|candidate| candidate.id == id))
                     .or_else(|| models.iter().find(|candidate| candidate.is_default));
@@ -984,10 +954,7 @@ impl ConversationSupervisor {
                 let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
                     AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
                 })?;
-                let _launch_permit = self
-                    .workspace_trust
-                    .acquire_owned(owner_id, workspace)
-                    .await?;
+                self.validate_workspace(workspace)?;
                 let driver = self.registry.driver(provider)?;
                 let image_input = tokio::time::timeout(
                     driver.discovery_timeout(),
@@ -1021,17 +988,13 @@ impl ConversationSupervisor {
 
     pub async fn commands_live(
         &self,
-        owner_id: &str,
         provider: ProviderKind,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
         let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
             AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
         })?;
-        let _launch_permit = self
-            .workspace_trust
-            .acquire_owned(owner_id, workspace)
-            .await?;
+        self.validate_workspace(workspace)?;
         let driver = self.registry.driver(provider)?;
         tokio::time::timeout(
             driver.discovery_timeout(),
@@ -1058,10 +1021,7 @@ impl ConversationSupervisor {
         let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
             AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
         })?;
-        let _launch_permit = self
-            .workspace_trust
-            .acquire_owned(owner_id, &manifest.workspace)
-            .await?;
+        self.validate_workspace(&manifest.workspace)?;
         let driver = self.registry.driver(manifest.provider)?;
         let catalog = tokio::time::timeout(driver.discovery_timeout(), async {
             if let Some(catalog) = driver.session_commands(&manifest.id).await? {
@@ -1235,6 +1195,16 @@ impl ConversationSupervisor {
         let manifest = self.get_owned(owner_id, conversation_id).await?;
         self.store.ensure_not_legacy(conversation_id).await?;
         Ok(manifest)
+    }
+
+    /// Rejects a conversation workspace that is no longer an existing
+    /// directory inside the configured (or scratch) workspace roots.
+    fn validate_workspace(&self, workspace: &Path) -> Result<(), AppError> {
+        crate::workspace_paths::validate_workspace_directory(
+            &self.config.workspace_access_roots(),
+            workspace,
+        )
+        .map(drop)
     }
 
     pub async fn update_metadata_owned(
@@ -1521,22 +1491,16 @@ impl ConversationSupervisor {
             conversation_id: conversation_id.to_owned(),
             agent_mcp: None,
         };
-        let launch_permit = self
-            .workspace_trust
-            .acquire_owned(owner_id, &source.workspace)
-            .await?;
+        self.validate_workspace(&source.workspace)?;
         let provider_state = self.store.provider_state(conversation_id).await?;
         let request = self.store.last_request(conversation_id).await?;
         let native_fork = driver
-            .fork_session(
-                DriverContext {
-                    manifest: source.clone(),
-                    provider_state,
-                    agent_mcp: None,
-                    handles: Default::default(),
-                },
-                launch_permit,
-            )
+            .fork_session(DriverContext {
+                manifest: source.clone(),
+                provider_state,
+                agent_mcp: None,
+                handles: Default::default(),
+            })
             .await?;
         let mut fork = ConversationManifest::new(
             source.provider,
@@ -1619,10 +1583,7 @@ impl ConversationSupervisor {
             conversation_id: conversation_id.to_owned(),
             agent_mcp: None,
         };
-        let launch_permit = self
-            .workspace_trust
-            .acquire_owned(owner_id, &manifest.workspace)
-            .await?;
+        self.validate_workspace(&manifest.workspace)?;
         let provider_state = self.store.provider_state(conversation_id).await?;
         if provider_state.native_session_id.is_none() {
             return Err(AppError::Unsupported(
@@ -1650,7 +1611,6 @@ impl ConversationSupervisor {
                         handles: Default::default(),
                     },
                     cancel_rx,
-                    launch_permit,
                 )
                 .await;
             let (event_type, payload) = match result {
@@ -1743,20 +1703,10 @@ impl ConversationSupervisor {
         if self.cli_execution_gate.try_read().is_err() {
             return Ok(Some("busy"));
         }
-        let launch_permit = match self
-            .workspace_trust
-            .try_acquire_owned(owner_id, &manifest.workspace)
-        {
-            Ok(Some(permit)) => permit,
-            Ok(None) => return Ok(Some("busy")),
-            Err(AppError::WorkspaceTrustRequired(_)) => {
-                return Ok(Some("untrusted_workspace"));
-            }
-            Err(error) => {
-                tracing::debug!(conversation_id, error = %error, "prewarm skipped: workspace unavailable");
-                return Ok(Some("workspace_unavailable"));
-            }
-        };
+        if let Err(error) = self.validate_workspace(&manifest.workspace) {
+            tracing::debug!(conversation_id, error = %error, "prewarm skipped: workspace unavailable");
+            return Ok(Some("workspace_unavailable"));
+        }
         let provider_state = self.store.provider_state(conversation_id).await?;
         let settings = self.warm_settings(&manifest).await?;
         let agent_mcp = self.turn_agent_mcp(&manifest).await;
@@ -1785,7 +1735,7 @@ impl ConversationSupervisor {
         }
         let warmed = tokio::time::timeout(
             PREWARM_TIMEOUT,
-            driver.prewarm(context, settings, sink.clone(), launch_permit),
+            driver.prewarm(context, settings, sink.clone()),
         )
         .await;
         // The conversation may have been deleted or expired, or the daemon
@@ -1881,9 +1831,7 @@ impl ConversationSupervisor {
         self.writable_owned(owner_id, conversation_id).await?;
         let guard = self.request_gate(conversation_id).lock_owned().await;
         let manifest = self.get_owned(owner_id, conversation_id).await?;
-        self.workspace_trust
-            .ensure_trusted(owner_id, &manifest.workspace)
-            .await?;
+        self.validate_workspace(&manifest.workspace)?;
         validate_provider_control(request_id, expected_turn_id, &control)?;
         let serialized = serde_json::to_value(&control)?;
         // The digest names the first request and newest outcome recorded
@@ -2111,9 +2059,7 @@ impl ConversationSupervisor {
         }
         let manifest = self.store.get(conversation_id).await?;
         ensure_owner(&manifest, owner_id)?;
-        self.workspace_trust
-            .ensure_trusted(owner_id, &manifest.workspace)
-            .await?;
+        self.validate_workspace(&manifest.workspace)?;
         if let Some(request_id) = client_request_id.as_deref() {
             // The digest names the first message recorded under this id and
             // any native queue/steer control that delivered its text; only
@@ -2262,9 +2208,7 @@ impl ConversationSupervisor {
                 sha256: sha256_hex(skill.content.as_bytes()),
             });
         }
-        let (turn_id, cancel_rx, launch_permit) = self
-            .begin_turn(owner_id, conversation_id, &manifest)
-            .await?;
+        let (turn_id, cancel_rx) = self.begin_turn(conversation_id, &manifest).await?;
 
         let sealed_key = fingerprint_key
             .as_deref()
@@ -2353,20 +2297,18 @@ impl ConversationSupervisor {
                 approval_policy,
             },
             cancel: cancel_rx,
-            launch_permit,
             adopt: None,
         });
         Ok(turn_id)
     }
 
-    /// Registers `conversation_id`'s new turn as running and takes its
-    /// workspace launch permit. Fails when a turn already runs there.
+    /// Registers `conversation_id`'s new turn as running once its workspace
+    /// is still accessible. Fails when a turn already runs there.
     async fn begin_turn(
         &self,
-        owner_id: &str,
         conversation_id: &str,
         manifest: &ConversationManifest,
-    ) -> Result<(String, watch::Receiver<bool>, WorkspaceTrustPermit), AppError> {
+    ) -> Result<(String, watch::Receiver<bool>), AppError> {
         let cli_start_permit = self.cli_execution_gate.read().await;
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let (cancel, cancel_rx) = watch::channel(false);
@@ -2387,18 +2329,11 @@ impl ConversationSupervisor {
             }
         }
         drop(cli_start_permit);
-
-        match self
-            .workspace_trust
-            .acquire_owned(owner_id, &manifest.workspace)
-            .await
-        {
-            Ok(permit) => Ok((turn_id, cancel_rx, permit)),
-            Err(error) => {
-                self.active.remove(conversation_id);
-                Err(error)
-            }
+        if let Err(error) = self.validate_workspace(&manifest.workspace) {
+            self.active.remove(conversation_id);
+            return Err(error);
         }
+        Ok((turn_id, cancel_rx))
     }
 
     /// Runs a journalled, registered turn's driver in the background and
@@ -2415,7 +2350,6 @@ impl ConversationSupervisor {
             driver,
             prompt: driver_prompt,
             cancel: cancel_rx,
-            launch_permit,
             adopt,
         } = turn;
         let conversation_id = manifest.id.clone();
@@ -2428,11 +2362,6 @@ impl ConversationSupervisor {
                 &effective_permissions.work_mode,
             );
         }
-        let trust_gate = TrustGate {
-            store: self.workspace_trust.clone(),
-            owner_id: owner_id.clone(),
-            workspace: manifest.workspace.clone(),
-        };
         let provider_work = {
             let supervisor = self.clone();
             let conversation_id = conversation_id.clone();
@@ -2481,7 +2410,6 @@ impl ConversationSupervisor {
                             agent_mcp,
                             conversation_id: conversation_id.clone(),
                         }),
-                    trust: Some(trust_gate),
                     provider_work: Some(provider_work),
                     adopt,
                 },
@@ -2490,13 +2418,7 @@ impl ConversationSupervisor {
             // JoinError here and still produces a terminal event.
             let mut driver_task = tokio::spawn(async move {
                 driver
-                    .run_turn(
-                        driver_context,
-                        driver_prompt,
-                        sink,
-                        cancel_rx,
-                        launch_permit,
-                    )
+                    .run_turn(driver_context, driver_prompt, sink, cancel_rx)
                     .await
             });
             let mut idle_timeout = None;
@@ -2532,7 +2454,7 @@ impl ConversationSupervisor {
     /// conversation's last turn ended: no user message, the last turn's
     /// launch settings, and `trigger: "provider"` on `turn.started`. Refused
     /// like a prompt when the conversation is busy, gone, read-only or its
-    /// workspace is no longer trusted; the driver then stops the work.
+    /// workspace is no longer accessible; the driver then stops the work.
     pub(crate) async fn start_provider_turn(
         &self,
         owner_id: &str,
@@ -2544,9 +2466,7 @@ impl ConversationSupervisor {
         self.store.ensure_not_legacy(conversation_id).await?;
         let manifest = self.store.get(conversation_id).await?;
         ensure_owner(&manifest, owner_id)?;
-        self.workspace_trust
-            .ensure_trusted(owner_id, &manifest.workspace)
-            .await?;
+        self.validate_workspace(&manifest.workspace)?;
         let ProviderWork {
             adoption,
             settings,
@@ -2563,9 +2483,7 @@ impl ConversationSupervisor {
         let driver = self.registry.driver(manifest.provider)?;
         let provider_state = self.store.provider_state(conversation_id).await?;
         let agent_mcp = self.turn_agent_mcp(&manifest).await;
-        let (turn_id, cancel_rx, launch_permit) = self
-            .begin_turn(owner_id, conversation_id, &manifest)
-            .await?;
+        let (turn_id, cancel_rx) = self.begin_turn(conversation_id, &manifest).await?;
         let started = json!({
             "turnId": turn_id, "clientRequestId": null, "provider": manifest.provider,
             "requestedPermissions": { "permissionMode": settings.permission_mode, "workMode": settings.work_mode, "profile": settings.permission_profile, "sandboxMode": settings.sandbox_mode, "approvalPolicy": settings.approval_policy },
@@ -2605,7 +2523,6 @@ impl ConversationSupervisor {
                 ..settings
             },
             cancel: cancel_rx,
-            launch_permit,
             adopt: Some(adoption),
         });
         Ok(())
@@ -2929,8 +2846,8 @@ impl ConversationSupervisor {
                     cancelled += 1;
                 }
             }
-            // Trust revocation and workspace deletion also stop resident
-            // extensions that are running between model turns.
+            // Workspace deletion also stops resident extensions that are
+            // running between model turns.
             self.registry
                 .driver(manifest.provider)?
                 .shutdown_session_with_reason(&manifest.id, "workspace_access_revoked")
@@ -2994,9 +2911,7 @@ impl ConversationSupervisor {
         resource_id: &str,
     ) -> Result<crate::catalog::McpServerDescriptor, AppError> {
         let manifest = self.get_owned(owner_id, conversation_id).await?;
-        self.workspace_trust
-            .ensure_trusted(owner_id, &manifest.workspace)
-            .await?;
+        self.validate_workspace(&manifest.workspace)?;
         let mut target = self
             .catalog
             .mcp_target(manifest.provider, manifest.workspace.clone(), resource_id)
@@ -3024,9 +2939,7 @@ impl ConversationSupervisor {
         arguments: Value,
     ) -> Result<Value, AppError> {
         let manifest = self.get_owned(owner_id, conversation_id).await?;
-        self.workspace_trust
-            .ensure_trusted(owner_id, &manifest.workspace)
-            .await?;
+        self.validate_workspace(&manifest.workspace)?;
         let target = self
             .catalog
             .mcp_target(manifest.provider, manifest.workspace.clone(), resource_id)
@@ -3590,21 +3503,6 @@ mod tests {
     use crate::config::{AcpProfileConfig, AgentConfig, PairingEncryption, SecurityConfig};
     use crate::conversation::{ConversationEvent, ConversationEventHub, ConversationStore};
 
-    async fn trust_store(
-        config: &Config,
-        owner_id: &str,
-        workspace: Option<&Path>,
-    ) -> WorkspaceTrustStore {
-        let trust =
-            WorkspaceTrustStore::new(config.data_dir.clone(), config.workspace_roots.clone())
-                .await
-                .unwrap();
-        if let Some(workspace) = workspace {
-            trust.set_owned(owner_id, workspace, true).await.unwrap();
-        }
-        trust
-    }
-
     async fn control_fixture(
         label: &str,
     ) -> (PathBuf, ConversationStore, ConversationSupervisor, PathBuf) {
@@ -3727,13 +3625,8 @@ mod tests {
         if let Some(keys) = keys {
             store = store.with_history_keys(keys);
         }
-        let trust = trust_store(&config, "local", Some(&workspace)).await;
-        let supervisor = ConversationSupervisor::new(
-            config,
-            store.clone(),
-            ConversationEventHub::default(),
-            trust,
-        );
+        let supervisor =
+            ConversationSupervisor::new(config, store.clone(), ConversationEventHub::default());
         (root, store, supervisor, workspace)
     }
 
@@ -4575,7 +4468,6 @@ mod tests {
         let workspace = workspace_root.join("project");
         fs::create_dir_all(&workspace).unwrap();
         let workspace_root = fs::canonicalize(workspace_root).unwrap();
-        let workspace = fs::canonicalize(workspace).unwrap();
         let managed_binary = write_provider_fixture(&root).to_string_lossy().to_string();
         let mut profiles = BTreeMap::new();
         for (name, command) in [
@@ -4635,9 +4527,8 @@ mod tests {
         let store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
-        let trust = trust_store(&config, "local", Some(&workspace)).await;
         let supervisor =
-            ConversationSupervisor::new(config, store, ConversationEventHub::default(), trust);
+            ConversationSupervisor::new(config, store, ConversationEventHub::default());
         for (id, provider, profile) in [
             ("conv-codex", ProviderKind::Codex, None),
             (
@@ -4803,9 +4694,8 @@ mod tests {
             context: DriverContext,
             settings: DriverPrompt,
             sink: DriverEventSink,
-            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
         ) -> Result<super::super::types::ProviderPrewarm, AppError> {
-            self.0.prewarm(context, settings, sink, launch_permit).await
+            self.0.prewarm(context, settings, sink).await
         }
 
         async fn run_turn(
@@ -4814,11 +4704,8 @@ mod tests {
             prompt: DriverPrompt,
             sink: DriverEventSink,
             cancel: watch::Receiver<bool>,
-            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
         ) -> Result<DriverTurnResult, AppError> {
-            self.0
-                .run_turn(context, prompt, sink, cancel, launch_permit)
-                .await
+            self.0.run_turn(context, prompt, sink, cancel).await
         }
     }
 
@@ -4939,25 +4826,23 @@ mod tests {
             Some("unsupported_provider")
         );
 
-        // An untrusted workspace never starts a process.
+        // A workspace that no longer exists never starts a process.
+        let gone = workspace.join("gone");
+        fs::create_dir_all(&gone).unwrap();
         let other = supervisor
             .create_owned(
                 "local",
                 ProviderKind::Acp,
-                workspace.clone(),
+                gone.clone(),
                 None,
                 Some("fixture".to_owned()),
             )
             .await
             .unwrap();
-        supervisor
-            .workspace_trust
-            .revoke_owned("local", &workspace)
-            .await
-            .unwrap();
+        fs::remove_dir(&gone).unwrap();
         assert_eq!(
             supervisor.warm_owned("local", &other.id).await.unwrap(),
-            Some("untrusted_workspace")
+            Some("workspace_unavailable")
         );
 
         // Disabled by configuration.
@@ -4967,7 +4852,6 @@ mod tests {
             Arc::new(config),
             store.clone(),
             ConversationEventHub::default(),
-            supervisor.workspace_trust.clone(),
         );
         assert_eq!(
             disabled.warm_owned("local", &other.id).await.unwrap(),
@@ -4992,14 +4876,13 @@ mod tests {
             context: DriverContext,
             settings: DriverPrompt,
             sink: DriverEventSink,
-            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
         ) -> Result<super::super::types::ProviderPrewarm, AppError> {
             sink.emit(
                 "provider.commands.updated",
                 json!({ "provider": "acp", "commands": [{ "name": "review" }] }),
             )
             .await?;
-            self.0.prewarm(context, settings, sink, launch_permit).await
+            self.0.prewarm(context, settings, sink).await
         }
 
         async fn run_turn(
@@ -5008,11 +4891,8 @@ mod tests {
             prompt: DriverPrompt,
             sink: DriverEventSink,
             cancel: watch::Receiver<bool>,
-            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
         ) -> Result<DriverTurnResult, AppError> {
-            self.0
-                .run_turn(context, prompt, sink, cancel, launch_permit)
-                .await
+            self.0.run_turn(context, prompt, sink, cancel).await
         }
     }
 
@@ -5102,7 +4982,6 @@ mod tests {
             _context: DriverContext,
             _settings: DriverPrompt,
             sink: DriverEventSink,
-            _launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
         ) -> Result<super::super::types::ProviderPrewarm, AppError> {
             sink.emit(
                 "provider.commands.updated",
@@ -5123,11 +5002,8 @@ mod tests {
             prompt: DriverPrompt,
             sink: DriverEventSink,
             cancel: watch::Receiver<bool>,
-            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
         ) -> Result<DriverTurnResult, AppError> {
-            self.real
-                .run_turn(context, prompt, sink, cancel, launch_permit)
-                .await
+            self.real.run_turn(context, prompt, sink, cancel).await
         }
     }
 
@@ -5232,14 +5108,10 @@ mod tests {
             context: DriverContext,
             settings: DriverPrompt,
             sink: DriverEventSink,
-            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
         ) -> Result<super::super::types::ProviderPrewarm, AppError> {
             self.started.notify_one();
             self.release.notified().await;
-            let outcome = self
-                .real
-                .prewarm(context, settings, sink, launch_permit)
-                .await;
+            let outcome = self.real.prewarm(context, settings, sink).await;
             self.log.lock().unwrap().push("prewarmed".to_owned());
             outcome
         }
@@ -5257,11 +5129,8 @@ mod tests {
             prompt: DriverPrompt,
             sink: DriverEventSink,
             cancel: watch::Receiver<bool>,
-            launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
         ) -> Result<DriverTurnResult, AppError> {
-            self.real
-                .run_turn(context, prompt, sink, cancel, launch_permit)
-                .await
+            self.real.run_turn(context, prompt, sink, cancel).await
         }
     }
 
@@ -5331,7 +5200,6 @@ mod tests {
             _prompt: DriverPrompt,
             _sink: DriverEventSink,
             _cancel: watch::Receiver<bool>,
-            _launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
         ) -> Result<DriverTurnResult, AppError> {
             panic!("fixture driver panic")
         }
@@ -5431,7 +5299,6 @@ mod tests {
             _prompt: DriverPrompt,
             sink: DriverEventSink,
             _cancel: watch::Receiver<bool>,
-            _launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
         ) -> Result<DriverTurnResult, AppError> {
             for index in 0..10 {
                 sleep(Duration::from_millis(50)).await;
@@ -5461,7 +5328,6 @@ mod tests {
             _prompt: DriverPrompt,
             sink: DriverEventSink,
             mut cancel: watch::Receiver<bool>,
-            _launch_permit: crate::workspace_trust::WorkspaceTrustPermit,
         ) -> Result<DriverTurnResult, AppError> {
             sink.request_permission(
                 "fixture-request".to_owned(),
@@ -5814,41 +5680,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[tokio::test]
-    async fn own_work_in_an_untrusted_workspace_opens_no_turn() {
-        let (root, store, supervisor, workspace) =
-            control_fixture("todex-claude-own-work-untrusted").await;
-        fs::write(root.join("own-work-after-idle"), "").unwrap();
-        let manifest = supervisor
-            .create(ProviderKind::ClaudeCode, workspace.clone(), None, None)
-            .await
-            .unwrap();
-        let user_turn = supervisor
-            .prompt(&manifest.id, "start it".to_owned(), None)
-            .await
-            .unwrap();
-        wait_for_journal_event(&store, &manifest.id, |event| {
-            event.event_type == "turn.completed" && event.payload["turnId"] == user_turn
-        })
-        .await;
-        supervisor
-            .workspace_trust
-            .set_owned("local", &workspace, false)
-            .await
-            .unwrap();
-        // Past the background task and the takeover deadline.
-        sleep(Duration::from_secs(2)).await;
-        let history = store.complete_history(&manifest.id).await.unwrap();
-        assert!(!history
-            .iter()
-            .any(|event| event.event_type == "turn.started"
-                && event.payload["trigger"] == "provider"));
-        assert!(!history
-            .iter()
-            .any(|event| event.payload.to_string().contains("background done")));
-        fs::remove_dir_all(root).unwrap();
-    }
-
     async fn supervisor_effective_permissions(
         store: &ConversationStore,
         conversation_id: &str,
@@ -5952,21 +5783,14 @@ mod tests {
             .unwrap();
 
         // A turn that cannot start records nothing.
-        supervisor
-            .workspace_trust
-            .set_owned("local", &workspace, false)
-            .await
-            .unwrap();
+        let moved = root.join("moved-workspace");
+        fs::rename(&workspace, &moved).unwrap();
         assert!(supervisor
             .prompt(&manifest.id, "hello".to_owned(), None)
             .await
             .is_err());
         assert_eq!(mode(&manifest.id), None);
-        supervisor
-            .workspace_trust
-            .set_owned("local", &workspace, true)
-            .await
-            .unwrap();
+        fs::rename(&moved, &workspace).unwrap();
 
         // Recorded while the turn runs (it waits on a permission here),
         // gone once it ends.
@@ -6350,13 +6174,8 @@ mod tests {
         let store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
-        let trust = trust_store(&config, "local", Some(&workspace)).await;
-        let supervisor = ConversationSupervisor::new(
-            config,
-            store.clone(),
-            ConversationEventHub::default(),
-            trust,
-        );
+        let supervisor =
+            ConversationSupervisor::new(config, store.clone(), ConversationEventHub::default());
         assert!(supervisor
             .providers()
             .iter()
@@ -6504,7 +6323,6 @@ mod tests {
             Arc::new(config),
             supervisor.store.clone(),
             ConversationEventHub::default(),
-            supervisor.workspace_trust.clone(),
         )
         .with_agent_mcp(agent_mcp);
 
@@ -6573,8 +6391,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pi_launches_only_after_workspace_trust_and_keeps_full_auto_argv() {
-        let root = temp_dir("todex-pi-trust-contract");
+    async fn pi_keeps_full_auto_argv_and_reopens_after_workspace_cancel() {
+        let root = temp_dir("todex-pi-launch-contract");
         let data_dir = root.join("data");
         let workspace_root = root.join("workspaces");
         let workspace = workspace_root.join("project");
@@ -6625,49 +6443,23 @@ mod tests {
         let store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
-        let trust = trust_store(&config, "local", None).await;
-        let supervisor = ConversationSupervisor::new(
-            config,
-            store.clone(),
-            ConversationEventHub::default(),
-            trust.clone(),
-        );
+        let supervisor =
+            ConversationSupervisor::new(config, store.clone(), ConversationEventHub::default());
         let manifest = supervisor
             .create(ProviderKind::Pi, workspace.clone(), None, None)
             .await
             .unwrap();
 
-        assert!(matches!(
-            supervisor
-                .models_live("local", ProviderKind::Pi, &workspace)
-                .await,
-            Err(AppError::WorkspaceTrustRequired(_))
-        ));
-        assert!(matches!(
-            supervisor
-                .commands_live("local", ProviderKind::Pi, &workspace)
-                .await,
-            Err(AppError::WorkspaceTrustRequired(_))
-        ));
-        assert!(matches!(
-            supervisor
-                .prompt(&manifest.id, "before trust".to_owned(), None)
-                .await,
-            Err(AppError::WorkspaceTrustRequired(_))
-        ));
-        assert!(!marker.exists(), "untrusted Pi must not be spawned");
-
-        trust.set_owned("local", &workspace, true).await.unwrap();
         supervisor
-            .models_live("local", ProviderKind::Pi, &workspace)
+            .models_live(ProviderKind::Pi, &workspace)
             .await
             .unwrap();
         supervisor
-            .commands_live("local", ProviderKind::Pi, &workspace)
+            .commands_live(ProviderKind::Pi, &workspace)
             .await
             .unwrap();
         supervisor
-            .prompt(&manifest.id, "after trust".to_owned(), None)
+            .prompt(&manifest.id, "start".to_owned(), None)
             .await
             .unwrap();
         let replay = tokio::time::timeout(Duration::from_secs(5), async {
@@ -6736,7 +6528,6 @@ mod tests {
                 .unwrap()["runtimeId"],
             catalog["runtimeId"]
         );
-        trust.set_owned("local", &workspace, false).await.unwrap();
         assert_eq!(
             supervisor
                 .cancel_workspace_owned("local", &workspace)
@@ -6751,13 +6542,6 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "provider.runtime"
                 && event.payload["reason"] == "workspace_access_revoked"));
-        assert!(matches!(
-            supervisor
-                .conversation_commands_owned("local", &manifest.id)
-                .await,
-            Err(AppError::WorkspaceTrustRequired(_))
-        ));
-        trust.set_owned("local", &workspace, true).await.unwrap();
         supervisor
             .prompt(&manifest.id, "reopen".to_owned(), None)
             .await
@@ -6855,9 +6639,8 @@ mod tests {
         let store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
-        let trust = trust_store(&config, "owner-a", None).await;
         let supervisor =
-            ConversationSupervisor::new(config, store, ConversationEventHub::default(), trust);
+            ConversationSupervisor::new(config, store, ConversationEventHub::default());
         let manifest = supervisor
             .create_owned("owner-a", ProviderKind::Codex, workspace, None, None)
             .await
@@ -6921,13 +6704,8 @@ mod tests {
             api: Default::default(),
         });
         let store = ConversationStore::new(data_dir.clone()).await.unwrap();
-        let trust = trust_store(&config, "local", Some(&workspace)).await;
-        let supervisor = ConversationSupervisor::new(
-            config,
-            store.clone(),
-            ConversationEventHub::default(),
-            trust,
-        );
+        let supervisor =
+            ConversationSupervisor::new(config, store.clone(), ConversationEventHub::default());
         let manifest = supervisor
             .create(ProviderKind::Codex, workspace, None, None)
             .await
@@ -7441,9 +7219,8 @@ done
         let store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
-        let trust = trust_store(&config, "owner-a", Some(&workspace)).await;
         let supervisor =
-            ConversationSupervisor::new(config, store, ConversationEventHub::default(), trust);
+            ConversationSupervisor::new(config, store, ConversationEventHub::default());
         let manifest = supervisor
             .create_owned("owner-a", ProviderKind::Codex, workspace, None, None)
             .await

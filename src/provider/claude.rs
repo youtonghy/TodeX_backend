@@ -12,7 +12,6 @@ use tokio::sync::{mpsc, watch, Mutex};
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::discovery::CatalogCache;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
@@ -574,7 +573,6 @@ impl ProviderDriver for ClaudeDriver {
     async fn fork_session(
         &self,
         context: DriverContext,
-        _launch_permit: WorkspaceTrustPermit,
     ) -> Result<crate::conversation::ProviderState, AppError> {
         let source = context
             .provider_state
@@ -608,7 +606,6 @@ impl ProviderDriver for ClaudeDriver {
         context: DriverContext,
         settings: DriverPrompt,
         _sink: DriverEventSink,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<super::types::ProviderPrewarm, AppError> {
         self.sessions
             .prewarm(
@@ -616,11 +613,7 @@ impl ProviderDriver for ClaudeDriver {
                     binary: self.binary.clone(),
                     catalogs: self.catalogs.clone(),
                 },
-                runtime::Warm {
-                    context,
-                    settings,
-                    permit: launch_permit,
-                },
+                runtime::Warm { context, settings },
             )
             .await
     }
@@ -631,7 +624,6 @@ impl ProviderDriver for ClaudeDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         self.sessions
             .run(
@@ -644,7 +636,6 @@ impl ProviderDriver for ClaudeDriver {
                     prompt,
                     sink,
                     cancel,
-                    permit: launch_permit,
                 },
             )
             .await
@@ -767,10 +758,9 @@ async fn spawn_claude(
     binary: &str,
     context: &DriverContext,
     prompt: &DriverPrompt,
-    permit: WorkspaceTrustPermit,
 ) -> Result<(JsonLineProcess, String), AppError> {
     let (spec, session_id) = claude_launch_spec(binary, context, prompt).await?;
-    let process = JsonLineProcess::spawn_trusted(&spec, permit).await?;
+    let process = JsonLineProcess::spawn(&spec).await?;
     Ok((process, session_id))
 }
 

@@ -9,7 +9,6 @@ use tokio::sync::watch;
 use crate::config::AgentConfig;
 use crate::conversation::{ProviderKind, ProviderState};
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{AcpQuirks, AcpRuntimeOptions, PromptUsage, PLAIN_ACP};
 use super::discovery::{DiscoveryCache, DiscoveryKey, DiscoverySnapshot};
@@ -386,11 +385,7 @@ impl ProviderDriver for OpencodeDriver {
         true
     }
 
-    async fn fork_session(
-        &self,
-        context: DriverContext,
-        launch_permit: WorkspaceTrustPermit,
-    ) -> Result<ProviderState, AppError> {
+    async fn fork_session(&self, context: DriverContext) -> Result<ProviderState, AppError> {
         let source = context
             .provider_state
             .native_session_id
@@ -398,11 +393,8 @@ impl ProviderDriver for OpencodeDriver {
             .ok_or_else(|| {
                 AppError::InvalidRequest("OpenCode session has not started".to_owned())
             })?;
-        let mut process = JsonLineProcess::spawn_trusted(
-            &self.command_spec(&context.manifest.workspace),
-            launch_permit,
-        )
-        .await?;
+        let mut process =
+            JsonLineProcess::spawn(&self.command_spec(&context.manifest.workspace)).await?;
         let result = async {
             let _initialize = initialize_process(&mut process).await?;
             let response = control_request(
@@ -456,10 +448,9 @@ impl ProviderDriver for OpencodeDriver {
         context: DriverContext,
         settings: DriverPrompt,
         sink: DriverEventSink,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<ProviderPrewarm, AppError> {
         self.sessions
-            .prewarm(context, settings, sink, launch_permit, |context, prompt| {
+            .prewarm(context, settings, sink, |context, prompt| {
                 self.resident_launch(context, prompt)
             })
             .await
@@ -471,17 +462,11 @@ impl ProviderDriver for OpencodeDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         self.sessions
-            .run_turn(
-                context,
-                prompt,
-                sink,
-                cancel,
-                launch_permit,
-                |context, prompt| self.resident_launch(context, prompt),
-            )
+            .run_turn(context, prompt, sink, cancel, |context, prompt| {
+                self.resident_launch(context, prompt)
+            })
             .await
     }
 }
@@ -561,7 +546,6 @@ mod tests {
         driver: std::sync::Arc<OpencodeDriver>,
         store: crate::conversation::ConversationStore,
         manifest: crate::conversation::ConversationManifest,
-        trust: crate::workspace_trust::WorkspaceTrustStore,
     }
 
     #[cfg(unix)]
@@ -597,19 +581,11 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let trust = crate::workspace_trust::WorkspaceTrustStore::new(
-                root.join("data"),
-                vec![root.clone()],
-            )
-            .await
-            .unwrap();
-            trust.set_owned("local", &root, true).await.unwrap();
             Self {
                 root,
                 driver,
                 store,
                 manifest,
-                trust,
             }
         }
 
@@ -662,14 +638,10 @@ mod tests {
                 &self.manifest.id,
             )
             .with_turn_id(turn_id);
-            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
             let driver = self.driver.clone();
             let (cancel, receiver) = watch::channel(false);
-            let task = tokio::spawn(async move {
-                driver
-                    .run_turn(context, prompt, sink, receiver, permit)
-                    .await
-            });
+            let task =
+                tokio::spawn(async move { driver.run_turn(context, prompt, sink, receiver).await });
             (cancel, task)
         }
 
@@ -1151,12 +1123,7 @@ mod tests {
             agent_mcp: None,
             handles: Default::default(),
         };
-        let permit = fixture
-            .trust
-            .acquire_owned("local", &fixture.root)
-            .await
-            .unwrap();
-        let state = fixture.driver.fork_session(context, permit).await.unwrap();
+        let state = fixture.driver.fork_session(context).await.unwrap();
         assert_eq!(state.native_session_id.as_deref(), Some("ses_forked"));
         assert!(fixture
             .requests()

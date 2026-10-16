@@ -9,7 +9,6 @@ use tokio::sync::watch;
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{
     declares_session_fork, select_auth_method, AcpQuirks, AcpRuntimeOptions, PromptUsage,
@@ -434,7 +433,6 @@ impl ProviderDriver for DevinDriver {
     async fn fork_session(
         &self,
         context: DriverContext,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<crate::conversation::ProviderState, AppError> {
         let source = context
             .provider_state
@@ -444,11 +442,8 @@ impl ProviderDriver for DevinDriver {
                 AppError::Unsupported("conversation has no native Devin session to fork".to_owned())
             })?
             .to_owned();
-        let mut process = JsonLineProcess::spawn_trusted(
-            &self.command_spec(&context.manifest.workspace),
-            launch_permit,
-        )
-        .await?;
+        let mut process =
+            JsonLineProcess::spawn(&self.command_spec(&context.manifest.workspace)).await?;
         let result = async {
             let initialize = initialize_process(&mut process).await?;
             let capable = declares_session_fork(&initialize);
@@ -541,10 +536,9 @@ impl ProviderDriver for DevinDriver {
         context: DriverContext,
         settings: DriverPrompt,
         sink: DriverEventSink,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<ProviderPrewarm, AppError> {
         self.sessions
-            .prewarm(context, settings, sink, launch_permit, |context, prompt| {
+            .prewarm(context, settings, sink, |context, prompt| {
                 self.resident_launch(context, prompt)
             })
             .await
@@ -556,17 +550,11 @@ impl ProviderDriver for DevinDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         self.sessions
-            .run_turn(
-                context,
-                prompt,
-                sink,
-                cancel,
-                launch_permit,
-                |context, prompt| self.resident_launch(context, prompt),
-            )
+            .run_turn(context, prompt, sink, cancel, |context, prompt| {
+                self.resident_launch(context, prompt)
+            })
             .await
     }
 }

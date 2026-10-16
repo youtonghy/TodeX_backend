@@ -19,7 +19,6 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{
     prewarm_acp_session, run_acp_turn_controlled, AcpConnectionState, AcpRuntimeOptions,
@@ -65,7 +64,6 @@ struct ResidentWarm {
     context: DriverContext,
     settings: DriverPrompt,
     sink: DriverEventSink,
-    launch_permit: WorkspaceTrustPermit,
     respond_to: oneshot::Sender<Result<(), AppError>>,
 }
 
@@ -95,7 +93,6 @@ struct ResidentTurn {
     prompt: DriverPrompt,
     sink: DriverEventSink,
     cancel: watch::Receiver<bool>,
-    launch_permit: WorkspaceTrustPermit,
     respond_to: oneshot::Sender<ResidentReply>,
     /// How a cold start would launch this turn; set for the first turn
     /// after a prewarm, which may need a process started with its flags.
@@ -156,7 +153,6 @@ impl ResidentSessions {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
         launch: impl Fn(&DriverContext, &DriverPrompt) -> Result<ResidentLaunch, AppError>,
     ) -> Result<DriverTurnResult, AppError> {
         let label = self.label;
@@ -166,7 +162,6 @@ impl ResidentSessions {
             prompt,
             sink,
             cancel,
-            launch_permit,
             respond_to: oneshot::channel().0,
             relaunch: None,
         };
@@ -271,7 +266,6 @@ impl ResidentSessions {
         context: DriverContext,
         settings: DriverPrompt,
         sink: DriverEventSink,
-        launch_permit: WorkspaceTrustPermit,
         launch: impl Fn(&DriverContext, &DriverPrompt) -> Result<ResidentLaunch, AppError>,
     ) -> Result<ProviderPrewarm, AppError> {
         let label = self.label;
@@ -300,7 +294,6 @@ impl ResidentSessions {
                     context,
                     settings,
                     sink,
-                    launch_permit,
                     respond_to,
                 }))
                 .is_err()
@@ -492,7 +485,6 @@ impl SessionActor {
                 prompt,
                 sink,
                 mut cancel,
-                launch_permit,
                 respond_to,
                 relaunch,
             } = match request {
@@ -502,19 +494,16 @@ impl SessionActor {
                         context,
                         settings,
                         sink,
-                        launch_permit,
                         respond_to,
                     } = warm;
                     if process.is_none() {
-                        match JsonLineProcess::spawn_trusted(&self.spec, launch_permit).await {
+                        match JsonLineProcess::spawn(&self.spec).await {
                             Ok(spawned) => process = Some(spawned),
                             Err(error) => {
                                 let _ = respond_to.send(Err(error));
                                 break;
                             }
                         }
-                    } else {
-                        drop(launch_permit);
                     }
                     let Some(running) = process.as_mut() else {
                         break;
@@ -560,15 +549,13 @@ impl SessionActor {
                 }
             }
             if process.is_none() {
-                match JsonLineProcess::spawn_trusted(&self.spec, launch_permit).await {
+                match JsonLineProcess::spawn(&self.spec).await {
                     Ok(spawned) => process = Some(spawned),
                     Err(error) => {
                         let _ = respond_to.send(ResidentReply::Finished(Err(error)));
                         break;
                     }
                 }
-            } else {
-                drop(launch_permit);
             }
             let mut options = self.runtime.clone();
             // A reused process cannot apply a new CLI fallback; require a

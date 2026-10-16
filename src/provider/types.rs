@@ -17,7 +17,6 @@ use crate::conversation::{
     DeltaFragment, ProviderKind, ProviderState,
 };
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::process::ProviderRead;
 
@@ -283,9 +282,6 @@ pub struct DriverContext {
 pub struct TurnHandles {
     /// The turn mode TodeX's own MCP tools follow; `None` without agent MCP.
     pub mode: Option<TurnModeHandle>,
-    /// Takes the workspace-trust launch permit again, for a driver that
-    /// releases it during a long wait before its launch.
-    pub trust: Option<TrustGate>,
     /// Opens a provider-initiated turn when the provider starts work of its
     /// own after this turn ended (a background task finished, a scheduled
     /// wakeup fired). `None` where no such turn can be opened.
@@ -304,7 +300,6 @@ impl std::fmt::Debug for TurnHandles {
                 "mode",
                 &self.mode.as_ref().map(|mode| &mode.conversation_id),
             )
-            .field("trust", &self.trust.as_ref().map(|trust| &trust.workspace))
             .field("provider_work", &self.provider_work.is_some())
             .field("adopt", &self.adopt)
             .finish()
@@ -342,23 +337,6 @@ impl ProviderWorkHandle {
     /// on its own.
     pub(crate) fn start(&self, work: ProviderWork) -> BoxFuture<'static, Result<(), AppError>> {
         (self.0)(work)
-    }
-}
-
-/// Re-acquires the launch permit of a turn's workspace, checking trust anew.
-#[derive(Clone)]
-pub struct TrustGate {
-    pub(crate) store: crate::workspace_trust::WorkspaceTrustStore,
-    pub(crate) owner_id: String,
-    pub(crate) workspace: PathBuf,
-}
-
-impl TrustGate {
-    /// Fails with `WorkspaceTrustRequired` once trust was revoked.
-    pub(crate) async fn acquire(&self) -> Result<WorkspaceTrustPermit, AppError> {
-        self.store
-            .acquire_owned(&self.owner_id, &self.workspace)
-            .await
     }
 }
 
@@ -1357,7 +1335,6 @@ pub trait ProviderDriver: Send + Sync {
         &self,
         _context: DriverContext,
         _cancel: watch::Receiver<bool>,
-        _launch_permit: WorkspaceTrustPermit,
     ) -> Result<(), AppError> {
         Err(AppError::Unsupported(
             "provider does not support native session compaction".to_owned(),
@@ -1368,11 +1345,7 @@ pub trait ProviderDriver: Send + Sync {
         false
     }
 
-    async fn fork_session(
-        &self,
-        _context: DriverContext,
-        _launch_permit: WorkspaceTrustPermit,
-    ) -> Result<ProviderState, AppError> {
+    async fn fork_session(&self, _context: DriverContext) -> Result<ProviderState, AppError> {
         Err(AppError::Unsupported(
             "provider does not support native session fork".to_owned(),
         ))
@@ -1420,7 +1393,6 @@ pub trait ProviderDriver: Send + Sync {
         _context: DriverContext,
         _settings: DriverPrompt,
         _sink: DriverEventSink,
-        _launch_permit: WorkspaceTrustPermit,
     ) -> Result<ProviderPrewarm, AppError> {
         Ok(ProviderPrewarm::Unsupported)
     }
@@ -1431,7 +1403,6 @@ pub trait ProviderDriver: Send + Sync {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError>;
 }
 

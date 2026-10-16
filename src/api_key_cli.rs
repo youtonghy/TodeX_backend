@@ -39,8 +39,8 @@ pub(crate) struct CreateArgs {
     /// Agents the key may use (repeatable); all when omitted.
     #[arg(long = "agent")]
     agents: Vec<String>,
-    /// Workspaces the key may use (repeatable); listing one also trusts it
-    /// for the key. All workspace roots when omitted.
+    /// Workspaces the key may use (repeatable). All workspace roots when
+    /// omitted.
     #[arg(long = "workspace")]
     workspaces: Vec<PathBuf>,
     /// ask (default), auto-approve or reject.

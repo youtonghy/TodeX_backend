@@ -1152,11 +1152,6 @@ mod tests {
                 .await
                 .unwrap()
             });
-            state
-                .workspace_trust
-                .set_owned("local", &workspace, true)
-                .await
-                .unwrap();
             let manifest = state
                 .conversations
                 .create_for_tests(ProviderKind::Antigravity, workspace.clone())

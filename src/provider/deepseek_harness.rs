@@ -17,7 +17,6 @@ use tokio::sync::watch;
 use crate::config::AgentConfig;
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::acp::{AcpQuirks, AcpRuntimeOptions, PLAIN_ACP};
 use super::discovery::{DiscoveryCache, DiscoveryKey, DiscoverySnapshot};
@@ -461,10 +460,9 @@ impl ProviderDriver for DeepseekHarnessDriver {
         context: DriverContext,
         settings: DriverPrompt,
         sink: DriverEventSink,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<ProviderPrewarm, AppError> {
         self.sessions
-            .prewarm(context, settings, sink, launch_permit, |context, prompt| {
+            .prewarm(context, settings, sink, |context, prompt| {
                 self.resident_launch(context, prompt)
             })
             .await
@@ -476,17 +474,11 @@ impl ProviderDriver for DeepseekHarnessDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         self.sessions
-            .run_turn(
-                context,
-                prompt,
-                sink,
-                cancel,
-                launch_permit,
-                |context, prompt| self.resident_launch(context, prompt),
-            )
+            .run_turn(context, prompt, sink, cancel, |context, prompt| {
+                self.resident_launch(context, prompt)
+            })
             .await
     }
 }
@@ -591,7 +583,6 @@ mod tests {
         driver: std::sync::Arc<DeepseekHarnessDriver>,
         store: crate::conversation::ConversationStore,
         manifest: crate::conversation::ConversationManifest,
-        trust: crate::workspace_trust::WorkspaceTrustStore,
     }
 
     #[cfg(unix)]
@@ -626,19 +617,11 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let trust = crate::workspace_trust::WorkspaceTrustStore::new(
-                root.join("data"),
-                vec![root.clone()],
-            )
-            .await
-            .unwrap();
-            trust.set_owned("local", &root, true).await.unwrap();
             Self {
                 root,
                 driver,
                 store,
                 manifest,
-                trust,
             }
         }
 
@@ -679,14 +662,10 @@ mod tests {
                 &self.manifest.id,
             )
             .with_turn_id(turn_id);
-            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
             let driver = self.driver.clone();
             let (cancel, receiver) = watch::channel(false);
-            let task = tokio::spawn(async move {
-                driver
-                    .run_turn(context, prompt, sink, receiver, permit)
-                    .await
-            });
+            let task =
+                tokio::spawn(async move { driver.run_turn(context, prompt, sink, receiver).await });
             (cancel, task)
         }
 

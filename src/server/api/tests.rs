@@ -13,6 +13,9 @@ use crate::api_keys::{ApiKeyScopes, NewApiKey};
 use crate::config::Config;
 use crate::conversation::e2e_support::{all_bytes, contains};
 
+/// Paired devices share this owner (`device_auth::verified_context`).
+const DEVICE_OWNER: &str = "local";
+
 struct Fixture {
     root: PathBuf,
     workspace: PathBuf,
@@ -78,7 +81,7 @@ impl Fixture {
         (record, key.to_string())
     }
 
-    /// A key that may use the fixture workspace (listing it grants trust).
+    /// A key that may use only the fixture workspace.
     fn workspace_key(&self) -> (crate::api_keys::ApiKeyRecord, String) {
         self.key(ApiKeyScopes {
             agents: None,
@@ -187,7 +190,7 @@ async fn keys_gate_every_route_but_health() {
 }
 
 #[tokio::test]
-async fn scopes_and_workspace_trust_limit_what_a_key_reaches() {
+async fn scopes_limit_what_a_key_reaches() {
     let fixture = fixture().await;
     let workspace = fixture.workspace.to_string_lossy().into_owned();
     let create = |agent: &str| json!({ "agent": agent, "workspace": workspace });
@@ -227,24 +230,21 @@ async fn scopes_and_workspace_trust_limit_what_a_key_reaches() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // An unscoped key may only use workspaces a paired device trusted.
+    // An unscoped key may use any workspace inside the roots, but nothing
+    // outside them.
     let (_, unscoped) = fixture.key(ApiKeyScopes::default());
+    let outside = fixture.root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
     let (status, body) = fixture
         .call(
             "POST",
             "/api/v1/conversations",
             Some(&unscoped),
-            Some(create("antigravity")),
+            Some(json!({ "agent": "antigravity", "workspace": outside })),
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["code"], "WORKSPACE_TRUST_REQUIRED");
-    fixture
-        .state
-        .workspace_trust
-        .set_owned(DEVICE_OWNER, &fixture.workspace, true)
-        .await
-        .unwrap();
+    assert_eq!(body["code"], "WORKSPACE_PATH_OUTSIDE_ROOT");
     let (status, body) = fixture
         .call(
             "POST",

@@ -11,7 +11,6 @@ use tokio::task::JoinSet;
 use crate::config::AgentConfig;
 use crate::conversation::{DeltaFragment, PendingDelta, ProviderKind};
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::discovery::CatalogCache;
 use super::process::{
@@ -160,11 +159,6 @@ struct PiTurnRequest {
     /// The turn's sink; a runtime a prewarm started journals through it
     /// from its first turn on.
     sink: Option<DriverEventSink>,
-    /// Still held when the turn targets an already running runtime, so a
-    /// turn handed back unstarted can reopen it. The worker drops it as soon
-    /// as the turn starts: holding the trust read lock for a whole turn
-    /// would queue trust writers and every later trust check behind them.
-    launch_permit: Option<WorkspaceTrustPermit>,
     result: oneshot::Sender<PiTurnReply>,
 }
 
@@ -174,7 +168,6 @@ enum PiTurnReply {
     /// the stop was requested, so the turn must not reopen the runtime.
     NotStarted {
         turn: Box<(DriverContext, DriverPrompt)>,
-        launch_permit: Option<WorkspaceTrustPermit>,
         retry: bool,
     },
 }
@@ -233,10 +226,9 @@ impl PiDriver {
         &self,
         conversation_id: &str,
         spec: &CommandSpec,
-        permit: WorkspaceTrustPermit,
         sink: &DriverEventSink,
     ) -> Result<PiSessionHandle, AppError> {
-        let process = JsonLineProcess::spawn_trusted(spec, permit).await?;
+        let process = JsonLineProcess::spawn(spec).await?;
         let (turns, turn_rx) = mpsc::channel(1);
         let (controls, control_rx) = mpsc::channel(32);
         let (requests, request_rx) = mpsc::channel(16);
@@ -329,11 +321,7 @@ impl PiDriver {
         }
         Some(handle.runtime_id)
     }
-    async fn open_existing(
-        &self,
-        context: &DriverContext,
-        permit: WorkspaceTrustPermit,
-    ) -> Result<JsonLineProcess, AppError> {
+    async fn open_existing(&self, context: &DriverContext) -> Result<JsonLineProcess, AppError> {
         let native = context
             .provider_state
             .native_session_id
@@ -349,7 +337,7 @@ impl PiDriver {
             native.to_owned(),
             "--approve".to_owned(),
         ];
-        JsonLineProcess::spawn_trusted(&spec, permit).await
+        JsonLineProcess::spawn(&spec).await
     }
 }
 
@@ -481,11 +469,10 @@ impl ProviderDriver for PiDriver {
         &self,
         context: DriverContext,
         mut cancel: watch::Receiver<bool>,
-        permit: WorkspaceTrustPermit,
     ) -> Result<(), AppError> {
         self.close_session(&context.manifest.id, "maintenance_compact")
             .await;
-        let mut process = self.open_existing(&context, permit).await?;
+        let mut process = self.open_existing(&context).await?;
         let result = async {
             let mut rpc = PiRpc::new(&mut process, None, cancel.clone());
             rpc.process.send(&json!({"id":"state","type":"get_state"})).await?;
@@ -508,11 +495,10 @@ impl ProviderDriver for PiDriver {
     async fn fork_session(
         &self,
         context: DriverContext,
-        permit: WorkspaceTrustPermit,
     ) -> Result<crate::conversation::ProviderState, AppError> {
         self.close_session(&context.manifest.id, "maintenance_clone")
             .await;
-        let mut process = self.open_existing(&context, permit).await?;
+        let mut process = self.open_existing(&context).await?;
         let result = async {
             let (_cancel, receiver) = watch::channel(false);
             let mut rpc = PiRpc::new(&mut process, None, receiver);
@@ -657,7 +643,6 @@ impl ProviderDriver for PiDriver {
         context: DriverContext,
         settings: DriverPrompt,
         sink: DriverEventSink,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<ProviderPrewarm, AppError> {
         let spec = self.launch(&context, &settings)?;
         let conversation_id = context.manifest.id.clone();
@@ -680,8 +665,7 @@ impl ProviderDriver for PiDriver {
             starting: &self.starting,
             conversation_id: &conversation_id,
         };
-        self.start_runtime(&conversation_id, &spec, launch_permit, &sink)
-            .await?;
+        self.start_runtime(&conversation_id, &spec, &sink).await?;
         Ok(ProviderPrewarm::Warmed)
     }
 
@@ -691,14 +675,13 @@ impl ProviderDriver for PiDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         let spec = self.launch(&context, &prompt)?;
 
         let conversation_id = context.manifest.id.clone();
         let mut context = context;
         let mut prompt = prompt;
-        let mut launch_permit = Some(launch_permit);
+        let mut spawned = false;
         let mut retried = false;
         loop {
             enum Slot {
@@ -754,17 +737,16 @@ impl ProviderDriver for PiDriver {
                         starting: &self.starting,
                         conversation_id: &conversation_id,
                     };
-                    // The permit authorizes one launch; a second one within
-                    // the same turn means the new process died immediately.
-                    let Some(permit) = launch_permit.take() else {
+                    // A second launch within the same turn means the new
+                    // process died immediately.
+                    if std::mem::replace(&mut spawned, true) {
                         return Err(pi_closing_error());
-                    };
+                    }
                     #[cfg(test)]
                     if let Some(gate) = &self.spawn_gate {
                         let _ = gate.acquire().await;
                     }
-                    self.start_runtime(&conversation_id, &spec, permit, &sink)
-                        .await?
+                    self.start_runtime(&conversation_id, &spec, &sink).await?
                 }
             };
             let (result, response) = oneshot::channel();
@@ -775,7 +757,6 @@ impl ProviderDriver for PiDriver {
                     prompt,
                     cancel: cancel.clone(),
                     sink: Some(sink.clone()),
-                    launch_permit: launch_permit.take(),
                     result,
                 })
                 .await
@@ -786,11 +767,7 @@ impl ProviderDriver for PiDriver {
                 })?;
             match response.await {
                 Ok(PiTurnReply::Finished(result)) => return result,
-                Ok(PiTurnReply::NotStarted {
-                    turn,
-                    launch_permit: returned_permit,
-                    retry,
-                }) => {
+                Ok(PiTurnReply::NotStarted { turn, retry }) => {
                     // The turn raced the worker's own stop and never reached
                     // Pi, so reopening the session once cannot repeat it.
                     if !retry || retried {
@@ -798,7 +775,6 @@ impl ProviderDriver for PiDriver {
                     }
                     retried = true;
                     (context, prompt) = *turn;
-                    launch_permit = returned_permit;
                 }
                 Err(_) => {
                     return Err(AppError::ProviderUnavailable(
@@ -1065,7 +1041,6 @@ async fn pi_session_worker(
                 .native_session_id
                 .clone()
                 .unwrap_or_else(|| turn.context.manifest.id.clone());
-            drop(turn.launch_permit);
             let prompt = turn.prompt.clone();
             let sink = session_sink.clone().with_turn_id(prompt.turn_id.clone());
             rpc.begin_turn(sink.clone(), turn.cancel.clone());
@@ -1191,7 +1166,6 @@ async fn pi_session_worker(
     while let Ok(turn) = turns.try_recv() {
         let _ = turn.result.send(PiTurnReply::NotStarted {
             turn: Box::new((turn.context, turn.prompt)),
-            launch_permit: turn.launch_permit,
             retry,
         });
     }
@@ -3191,7 +3165,6 @@ mod tests {
         driver: Arc<PiDriver>,
         store: crate::conversation::ConversationStore,
         manifest: crate::conversation::ConversationManifest,
-        trust: crate::workspace_trust::WorkspaceTrustStore,
         permissions: super::super::types::PermissionBroker,
     }
 
@@ -3199,7 +3172,6 @@ mod tests {
     impl Fixture {
         async fn new() -> Self {
             use crate::conversation::{ConversationManifest, ConversationStore};
-            use crate::workspace_trust::WorkspaceTrustStore;
             use std::os::unix::fs::PermissionsExt;
             let root = std::env::temp_dir().join(format!(
                 "todex-pi-contract-{}",
@@ -3233,10 +3205,6 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let trust = WorkspaceTrustStore::new(root.join("trust"), vec![root.clone()])
-                .await
-                .unwrap();
-            trust.set_owned("local", &root, true).await.unwrap();
             Self {
                 root,
                 driver: Arc::new(PiDriver {
@@ -3250,7 +3218,6 @@ mod tests {
                 }),
                 store,
                 manifest,
-                trust,
                 permissions: super::super::types::PermissionBroker::default(),
             }
         }
@@ -3304,14 +3271,11 @@ mod tests {
                 &self.manifest.id,
             )
             .with_turn_id(turn);
-            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
             let (cancel, receiver) = watch::channel(false);
             let keep_cancel = cancel.clone();
             let task = tokio::spawn(async move {
                 let _keep_cancel = keep_cancel;
-                driver
-                    .run_turn(context, prompt, sink, receiver, permit)
-                    .await
+                driver.run_turn(context, prompt, sink, receiver).await
             });
             (task, cancel)
         }
@@ -3355,12 +3319,10 @@ mod tests {
                 &self.manifest.id,
             )
             .with_turn_id(turn);
-            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
             let (_cancel, receiver) = watch::channel(false);
             tokio::time::timeout(
                 Duration::from_secs(10),
-                self.driver
-                    .run_turn(context, prompt, sink, receiver, permit),
+                self.driver.run_turn(context, prompt, sink, receiver),
             )
             .await
             .expect("Pi turn hung")
@@ -3428,15 +3390,10 @@ mod tests {
             &fixture.manifest.id,
         )
         .muted();
-        let permit = fixture
-            .trust
-            .acquire_owned("local", &fixture.root)
-            .await
-            .unwrap();
         assert_eq!(
             fixture
                 .driver
-                .prewarm(context, settings, sink, permit)
+                .prewarm(context, settings, sink)
                 .await
                 .unwrap(),
             ProviderPrewarm::Warmed
@@ -3488,15 +3445,10 @@ mod tests {
             &fixture.manifest.id,
         );
         let muted = sink.clone().muted();
-        let permit = fixture
-            .trust
-            .acquire_owned("local", &fixture.root)
-            .await
-            .unwrap();
         assert_eq!(
             fixture
                 .driver
-                .prewarm(context, settings, muted.clone(), permit)
+                .prewarm(context, settings, muted.clone())
                 .await
                 .unwrap(),
             ProviderPrewarm::Warmed
@@ -4047,29 +3999,10 @@ mod tests {
         let (_cancel, cancel) = watch::channel(false);
         fixture
             .driver
-            .compact_session(
-                context.clone(),
-                cancel,
-                fixture
-                    .trust
-                    .acquire_owned("local", &fixture.root)
-                    .await
-                    .unwrap(),
-            )
+            .compact_session(context.clone(), cancel)
             .await
             .unwrap();
-        let cloned = fixture
-            .driver
-            .fork_session(
-                context,
-                fixture
-                    .trust
-                    .acquire_owned("local", &fixture.root)
-                    .await
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let cloned = fixture.driver.fork_session(context).await.unwrap();
         assert_eq!(cloned.native_session_id.as_deref(), Some("cloned-session"));
         let mut missing = fixture
             .store
@@ -4503,33 +4436,6 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn a_turn_on_a_resident_runtime_does_not_hold_the_trust_lock() {
-        let fixture = Fixture::new().await;
-        // The first turn spawns the runtime; the second reuses it, which is
-        // where the launch permit used to outlive the spawn.
-        fixture.run("normal", "spawn").await.unwrap();
-        let (running, cancel) = fixture.start_cancellable("hold", "long").await;
-        fixture.running().await;
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            fixture.trust.set_owned("local", &fixture.root, true),
-        )
-        .await
-        .expect("a trust change waited for the running turn")
-        .unwrap();
-        cancel.send_replace(true);
-        let result = tokio::time::timeout(Duration::from_secs(3), running)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(result.cancelled);
-        assert_eq!(fixture.launches().await, 1);
-        fixture.finish().await;
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
     async fn rpc_confirmed_abort_rejected_commands_and_invalid_frames_keep_runtime() {
         let fixture = Fixture::new().await;
         let (running, cancel) = fixture.start_cancellable("hold", "abort-me").await;
@@ -4667,14 +4573,9 @@ mod tests {
         )
         .with_turn_id("over-capacity");
         let (_cancel, cancel) = watch::channel(false);
-        let permit = fixture
-            .trust
-            .acquire_owned("local", &fixture.root)
-            .await
-            .unwrap();
         let error = fixture
             .driver
-            .run_turn(context, prompt, sink, cancel, permit)
+            .run_turn(context, prompt, sink, cancel)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("32 live sessions"));
@@ -4734,7 +4635,6 @@ mod tests {
                 prompt,
                 cancel,
                 sink: None,
-                launch_permit: None,
                 result,
             })
             .await

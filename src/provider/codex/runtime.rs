@@ -18,7 +18,6 @@ pub(super) struct Run {
     pub prompt: DriverPrompt,
     pub sink: DriverEventSink,
     pub cancel: watch::Receiver<bool>,
-    pub permit: WorkspaceTrustPermit,
 }
 
 /// A prewarm: the worker starts its process and prepares the thread.
@@ -26,7 +25,6 @@ pub(super) struct Warm {
     pub context: DriverContext,
     pub settings: DriverPrompt,
     pub sink: DriverEventSink,
-    pub permit: WorkspaceTrustPermit,
 }
 
 enum Command {
@@ -228,22 +226,19 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                     prompt,
                     sink,
                     mut cancel,
-                    permit,
                 } = run;
                 if *cancel.borrow() {
                     let _ = respond.send(Err(AppError::TurnCancelled));
                     continue;
                 }
                 if process.is_none() {
-                    match spawn_app_server(&binary, &context, permit).await {
+                    match spawn_app_server(&binary, &context).await {
                         Ok(child) => process = Some(child),
                         Err(error) => {
                             let _ = respond.send(Err(error));
                             break;
                         }
                     }
-                } else {
-                    drop(permit);
                 }
                 let child = process.as_mut().expect("spawned process");
                 let result = async {
@@ -298,18 +293,15 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
                     context,
                     settings,
                     sink,
-                    permit,
                 } = warm;
                 if process.is_none() {
-                    match spawn_app_server(&binary, &context, permit).await {
+                    match spawn_app_server(&binary, &context).await {
                         Ok(child) => process = Some(child),
                         Err(error) => {
                             let _ = respond.send(Err(error));
                             break;
                         }
                     }
-                } else {
-                    drop(permit);
                 }
                 if native_thread.is_some() {
                     let _ = respond.send(Ok(()));
@@ -371,11 +363,10 @@ async fn worker(binary: String, mut commands: mpsc::Receiver<Command>) {
 async fn spawn_app_server(
     binary: &str,
     context: &DriverContext,
-    permit: WorkspaceTrustPermit,
 ) -> Result<JsonLineProcess, AppError> {
     let mut spec = CommandSpec::new(binary, &context.manifest.workspace);
     spec.args = vec!["app-server".into(), "--listen".into(), "stdio://".into()];
-    JsonLineProcess::spawn_trusted(&spec, permit).await
+    JsonLineProcess::spawn(&spec).await
 }
 
 struct Pending {
@@ -808,7 +799,6 @@ mod tests {
     #[cfg(unix)]
     use crate::provider::types::PermissionBroker;
     #[cfg(unix)]
-    use crate::workspace_trust::WorkspaceTrustStore;
     #[cfg(unix)]
     use std::sync::Arc;
 
@@ -880,10 +870,6 @@ done
             ))
             .await
             .unwrap();
-        let trust = WorkspaceTrustStore::new(root.join("trust"), vec![root.clone()])
-            .await
-            .unwrap();
-        trust.set_owned("local", &root, true).await.unwrap();
         let sink = |turn: &str| {
             DriverEventSink::new(
                 store.clone(),
@@ -918,7 +904,6 @@ done
             context: context(),
             settings: prompt("prewarm", ""),
             sink: sink("prewarm").muted(),
-            permit: trust.acquire_owned("local", &root).await.unwrap(),
         };
         assert_eq!(
             sessions.prewarm(&binary, warm).await.unwrap(),
@@ -946,7 +931,6 @@ done
                     },
                     sink: sink("turn-1"),
                     cancel,
-                    permit: trust.acquire_owned("local", &root).await.unwrap(),
                 },
             ),
         )
@@ -1122,10 +1106,6 @@ done
             manifest.id.clone(),
         )
         .with_turn_id("local-turn");
-        let trust = WorkspaceTrustStore::new(root.join("trust"), vec![root.clone()])
-            .await
-            .unwrap();
-        trust.set_owned("local", &root, true).await.unwrap();
         let driver = Arc::new(CodexDriver {
             binary: script.display().to_string(),
             sessions: Sessions::new(),
@@ -1152,16 +1132,13 @@ done
             agent_mcp: None,
             handles: Default::default(),
         };
-        let permit = trust.acquire_owned("local", &root).await.unwrap();
         let runner = {
             let driver = driver.clone();
             let context = context.clone();
             let prompt = prompt.clone();
             let sink = sink.clone();
             let cancel = cancel.clone();
-            tokio::spawn(
-                async move { driver.run_turn(context, prompt, sink, cancel, permit).await },
-            )
+            tokio::spawn(async move { driver.run_turn(context, prompt, sink, cancel).await })
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             while !root.join("ready").exists() {
@@ -1271,23 +1248,14 @@ done
             .unwrap();
         assert_eq!(result.stop_reason, "completed");
         driver
-            .run_turn(
-                context.clone(),
-                prompt.clone(),
-                sink.clone(),
-                cancel,
-                trust.acquire_owned("local", &root).await.unwrap(),
-            )
+            .run_turn(context.clone(), prompt.clone(), sink.clone(), cancel)
             .await
             .unwrap();
         tokio::fs::remove_file(root.join("ready")).await.unwrap();
         let (cancel_tx, cancel) = watch::channel(false);
-        let permit = trust.acquire_owned("local", &root).await.unwrap();
         let cancelling = {
             let driver = driver.clone();
-            tokio::spawn(
-                async move { driver.run_turn(context, prompt, sink, cancel, permit).await },
-            )
+            tokio::spawn(async move { driver.run_turn(context, prompt, sink, cancel).await })
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             while !root.join("ready").exists() {

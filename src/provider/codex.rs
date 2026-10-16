@@ -6,7 +6,6 @@ use tokio::sync::watch;
 use crate::config::AgentConfig;
 use crate::conversation::{ProviderKind, ProviderState};
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::discovery::CatalogCache;
 use super::process::{
@@ -183,7 +182,6 @@ impl ProviderDriver for CodexDriver {
         &self,
         context: DriverContext,
         mut cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<(), AppError> {
         self.sessions.stop(&context.manifest.id).await;
         let native = context
@@ -201,7 +199,7 @@ impl ProviderDriver for CodexDriver {
             "--listen".to_owned(),
             "stdio://".to_owned(),
         ];
-        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
+        let mut process = JsonLineProcess::spawn(&spec).await?;
         let result = async {
             if *cancel.borrow() { return Err(AppError::TurnCancelled); }
             process.send(&json!({ "id": "initialize", "method": "initialize", "params": { "clientInfo": { "name": "todex-agentd", "version": crate::version::APP_VERSION }, "capabilities": { "experimentalApi": true } } })).await?;
@@ -257,7 +255,6 @@ impl ProviderDriver for CodexDriver {
     async fn fork_session(
         &self,
         context: DriverContext,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<crate::conversation::ProviderState, AppError> {
         let original = context
             .provider_state
@@ -272,7 +269,7 @@ impl ProviderDriver for CodexDriver {
             "--listen".to_owned(),
             "stdio://".to_owned(),
         ];
-        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
+        let mut process = JsonLineProcess::spawn(&spec).await?;
         let result = async {
             process.send(&json!({ "id": "initialize", "method": "initialize", "params": { "clientInfo": { "name": "todex-agentd", "version": crate::version::APP_VERSION }, "capabilities": { "experimentalApi": true } } })).await?;
             read_rpc_response(&mut process, "initialize").await?;
@@ -460,7 +457,6 @@ impl ProviderDriver for CodexDriver {
         context: DriverContext,
         settings: DriverPrompt,
         sink: DriverEventSink,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<super::types::ProviderPrewarm, AppError> {
         self.sessions
             .prewarm(
@@ -469,7 +465,6 @@ impl ProviderDriver for CodexDriver {
                     context,
                     settings,
                     sink,
-                    permit: launch_permit,
                 },
             )
             .await
@@ -481,7 +476,6 @@ impl ProviderDriver for CodexDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         self.sessions
             .run(
@@ -491,7 +485,6 @@ impl ProviderDriver for CodexDriver {
                     prompt,
                     sink,
                     cancel,
-                    permit: launch_permit,
                 },
             )
             .await
@@ -2020,7 +2013,6 @@ done
             ConversationEventHub, ConversationManifest, ConversationStore, ProviderState,
         };
         use crate::provider::types::PermissionBroker;
-        use crate::workspace_trust::WorkspaceTrustStore;
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("todex-codex-wire-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&root).await.unwrap();
@@ -2062,10 +2054,6 @@ done
             PermissionBroker::default(),
             manifest.id.clone(),
         );
-        let trust = WorkspaceTrustStore::new(root.join("trust"), vec![root.clone()])
-            .await
-            .unwrap();
-        trust.set_owned("local", &root, true).await.unwrap();
         let driver = CodexDriver {
             binary: script.display().to_string(),
             sessions: runtime::Sessions::new(),
@@ -2103,7 +2091,6 @@ done
                     },
                     sink.clone(),
                     cancel_rx.clone(),
-                    trust.acquire_owned("local", &root).await.unwrap(),
                 )
                 .await
                 .unwrap();
@@ -2115,22 +2102,9 @@ done
             agent_mcp: None,
             handles: Default::default(),
         };
-        let fork = driver
-            .fork_session(
-                context.clone(),
-                trust.acquire_owned("local", &root).await.unwrap(),
-            )
-            .await
-            .unwrap();
+        let fork = driver.fork_session(context.clone()).await.unwrap();
         assert_eq!(fork.native_session_id.as_deref(), Some("forked"));
-        driver
-            .compact_session(
-                context,
-                cancel_rx,
-                trust.acquire_owned("local", &root).await.unwrap(),
-            )
-            .await
-            .unwrap();
+        driver.compact_session(context, cancel_rx).await.unwrap();
         let wire = tokio::fs::read_to_string(root.join("wire.jsonl"))
             .await
             .unwrap();

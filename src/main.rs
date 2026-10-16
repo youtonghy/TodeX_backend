@@ -42,7 +42,6 @@ mod update;
 mod version;
 mod workspace_paths;
 mod workspace_store;
-mod workspace_trust;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};

@@ -571,29 +571,6 @@ async fn dispatch(
                 }
             };
             if let Err(error) = state
-                .workspace_trust
-                .ensure_trusted(&payload.tenant_id, &cwd)
-                .await
-            {
-                publish_local_codex_error_after(
-                    state,
-                    &payload.codex_session_id,
-                    last_cursor,
-                    CodexLocalAdapterProcessError {
-                        payload: CodexLocalErrorPayload {
-                            code: CodexLocalErrorCode::PermissionDenied,
-                            message: error.to_string(),
-                            codex_session_id: payload.codex_session_id.clone(),
-                            request_id: Some(message.id.clone()),
-                            operation: Some("codex.local.start".to_owned()),
-                            upstream_request_id: None,
-                        },
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
-            if let Err(error) = state
                 .codex_local_adapters
                 .start(CodexLocalAdapterStartOptions::new(
                     payload.codex_session_id.clone(),
@@ -1024,8 +1001,8 @@ async fn dispatch(
             )
             .await?;
             // An SSH terminal only reaches a host from the inventory; it is
-            // not tied to a workspace, so workspace roots and trust do not
-            // apply. Local shells keep both checks.
+            // not tied to a workspace, so workspace roots do not apply.
+            // Local shells keep that check.
             let (cwd, command, askpass_secret) = match payload.ssh.as_mut() {
                 Some(target) => {
                     state.ssh.require_host(&target.host).await?;
@@ -1046,10 +1023,6 @@ async fn dispatch(
                         &state.config.workspace_access_roots(),
                         &payload.cwd,
                     )?;
-                    state
-                        .workspace_trust
-                        .ensure_trusted(&payload.tenant_id, &cwd)
-                        .await?;
                     (cwd.display().to_string(), None, None)
                 }
             };
@@ -2178,7 +2151,6 @@ mod tests {
         let root = unique_tmp_dir("todex-local-ws-lifecycle");
         let cwd = root.join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        trust_test_workspace(&state, &cwd).await;
         let binary = write_fake_codex_binary(&root).await;
         Arc::make_mut(&mut state.config).agent.codex_bin = binary.to_string_lossy().to_string();
         let mut events = state.events.subscribe();
@@ -2423,7 +2395,6 @@ mod tests {
         let root = unique_tmp_dir("todex-local-ws-turn");
         let cwd = root.join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        trust_test_workspace(&state, &cwd).await;
         let binary = write_fake_codex_binary(&root).await;
         Arc::make_mut(&mut state.config).agent.codex_bin = binary.to_string_lossy().to_string();
         let mut events = state.events.subscribe();
@@ -2546,7 +2517,6 @@ mod tests {
         let root = unique_tmp_dir("todex-local-ws-server-requests");
         let cwd = root.join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        trust_test_workspace(&state, &cwd).await;
         let binary = write_requesting_fake_codex_binary(&root).await;
         Arc::make_mut(&mut state.config).agent.codex_bin = binary.to_string_lossy().to_string();
         let mut events = state.events.subscribe();
@@ -2706,7 +2676,6 @@ mod tests {
         let root = unique_tmp_dir("todex-local-ws-turn-busy");
         let cwd = root.join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        trust_test_workspace(&state, &cwd).await;
         let binary = write_holding_fake_codex_binary(&root).await;
         Arc::make_mut(&mut state.config).agent.codex_bin = binary.to_string_lossy().to_string();
         let mut events = state.events.subscribe();
@@ -2816,7 +2785,6 @@ mod tests {
         let root = unique_tmp_dir("todex-local-ws-task-10-12");
         let cwd = root.join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        trust_test_workspace(&state, &cwd).await;
         let binary = write_fake_codex_binary(&root).await;
         Arc::make_mut(&mut state.config).agent.codex_bin = binary.to_string_lossy().to_string();
         let mut events = state.events.subscribe();
@@ -3939,15 +3907,6 @@ mod tests {
         })
         .await
         .expect("create app state")
-    }
-
-    #[cfg(unix)]
-    async fn trust_test_workspace(state: &AppState, workspace: &std::path::Path) {
-        state
-            .workspace_trust
-            .set_owned("local", workspace, true)
-            .await
-            .expect("trust test workspace");
     }
 
     fn codex_control_message(id: &str, codex_session_id: &str, tenant_id: &str) -> ClientMessage {

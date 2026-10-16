@@ -22,7 +22,6 @@ use tokio::sync::{mpsc, watch};
 use crate::config::{AcpProfileConfig, AgentConfig};
 use crate::conversation::ProviderKind;
 use crate::error::AppError;
-use crate::workspace_trust::WorkspaceTrustPermit;
 
 use super::discovery::DiscoveryCache;
 use super::process::{executable_available, provider_exit_error, CommandSpec, JsonLineProcess};
@@ -347,7 +346,6 @@ impl ProviderDriver for AcpDriver {
     async fn fork_session(
         &self,
         context: DriverContext,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<crate::conversation::ProviderState, AppError> {
         let profile_name = context.manifest.provider_profile.clone().ok_or_else(|| {
             AppError::InvalidRequest("ACP conversation requires a profile".to_owned())
@@ -362,7 +360,7 @@ impl ProviderDriver for AcpDriver {
             })?
             .to_owned();
         let spec = acp_command_spec(&profile, &context.manifest.workspace);
-        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
+        let mut process = JsonLineProcess::spawn(&spec).await?;
         let result = async {
             let request_id = send_request(
                 &mut process,
@@ -474,20 +472,15 @@ impl ProviderDriver for AcpDriver {
         context: DriverContext,
         settings: DriverPrompt,
         sink: DriverEventSink,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<ProviderPrewarm, AppError> {
         // A per-turn profile has nothing to keep between turns.
         if !self.profile(&context)?.resident {
             return Ok(ProviderPrewarm::Unsupported);
         }
         self.sessions
-            .prewarm(
-                context,
-                settings,
-                sink,
-                launch_permit,
-                |context, _prompt| self.resident_launch(context),
-            )
+            .prewarm(context, settings, sink, |context, _prompt| {
+                self.resident_launch(context)
+            })
             .await
     }
 
@@ -497,7 +490,6 @@ impl ProviderDriver for AcpDriver {
         prompt: DriverPrompt,
         sink: DriverEventSink,
         mut cancel: watch::Receiver<bool>,
-        launch_permit: WorkspaceTrustPermit,
     ) -> Result<DriverTurnResult, AppError> {
         let profile = self.profile(&context)?;
         if profile.resident {
@@ -505,18 +497,13 @@ impl ProviderDriver for AcpDriver {
             profile_runtime_options(profile)?;
             return self
                 .sessions
-                .run_turn(
-                    context,
-                    prompt,
-                    sink,
-                    cancel,
-                    launch_permit,
-                    |context, _prompt| self.resident_launch(context),
-                )
+                .run_turn(context, prompt, sink, cancel, |context, _prompt| {
+                    self.resident_launch(context)
+                })
                 .await;
         }
         let spec = acp_command_spec(profile, &context.manifest.workspace);
-        let mut process = JsonLineProcess::spawn_trusted(&spec, launch_permit).await?;
+        let mut process = JsonLineProcess::spawn(&spec).await?;
         let result = run_acp_turn(
             &mut process,
             context,
@@ -4435,7 +4422,6 @@ mod tests {
         driver: std::sync::Arc<AcpDriver>,
         store: crate::conversation::ConversationStore,
         manifest: crate::conversation::ConversationManifest,
-        trust: crate::workspace_trust::WorkspaceTrustStore,
     }
 
     #[cfg(unix)]
@@ -4483,19 +4469,11 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let trust = crate::workspace_trust::WorkspaceTrustStore::new(
-                root.join("data"),
-                vec![root.clone()],
-            )
-            .await
-            .unwrap();
-            trust.set_owned("local", &root, true).await.unwrap();
             Self {
                 root,
                 driver,
                 store,
                 manifest,
-                trust,
             }
         }
 
@@ -4534,14 +4512,10 @@ mod tests {
                 &self.manifest.id,
             )
             .with_turn_id(turn_id);
-            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
             let driver = self.driver.clone();
             let (cancel, receiver) = watch::channel(false);
-            let task = tokio::spawn(async move {
-                driver
-                    .run_turn(context, prompt, sink, receiver, permit)
-                    .await
-            });
+            let task =
+                tokio::spawn(async move { driver.run_turn(context, prompt, sink, receiver).await });
             (cancel, task)
         }
 
@@ -4639,10 +4613,9 @@ mod tests {
                 &self.manifest.id,
             )
             .muted();
-            let permit = self.trust.acquire_owned("local", &self.root).await.unwrap();
             tokio::time::timeout(
                 Duration::from_secs(10),
-                self.driver.prewarm(context, settings, sink, permit),
+                self.driver.prewarm(context, settings, sink),
             )
             .await
             .unwrap()

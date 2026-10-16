@@ -1,10 +1,6 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 use tokio::task::JoinHandle;
 
@@ -31,7 +27,6 @@ use crate::{
     ssh::SshService,
     transport_crypto::PairingKeyStore,
     workspace_store::WorkspaceStore,
-    workspace_trust::WorkspaceTrustStore,
 };
 
 #[derive(Clone)]
@@ -65,7 +60,6 @@ pub struct AppState {
     pub workspaces: WorkspaceStore,
     pub kanban_tasks: KanbanTaskStore,
     pub agent_providers: AgentProviderService,
-    pub workspace_trust: WorkspaceTrustStore,
     pub ssh: SshService,
     /// Newest plan-quota snapshot per provider (`quota.updated` events plus
     /// on-demand `/v2/providers/quota` refreshes).
@@ -119,25 +113,11 @@ impl AppState {
             events.clone(),
             cli_execution_gate.clone(),
         );
-        let workspace_trust =
-            WorkspaceTrustStore::new(config.data_dir.clone(), config.workspace_roots.clone())
-                .await?;
         let workspaces =
             WorkspaceStore::new(config.data_dir.clone(), config.workspace_roots.clone()).await?;
         let kanban_tasks = KanbanTaskStore::new(config.data_dir.clone()).await?;
         let agent_providers = AgentProviderService::new(config.data_dir.clone()).await?;
-        let mut workspace_paths_by_owner = HashMap::<String, Vec<PathBuf>>::new();
-        for workspace in workspaces.snapshot().await.workspaces {
-            workspace_paths_by_owner
-                .entry(workspace.tenant_id)
-                .or_default()
-                .push(PathBuf::from(workspace.path));
-        }
-        for (owner_id, workspace_paths) in workspace_paths_by_owner {
-            workspace_trust
-                .auto_trust_undecided_owned(&owner_id, &workspace_paths)
-                .await?;
-        }
+        remove_retired_workspace_trust(&config.data_dir).await;
         let ssh = SshService::new(&config.data_dir, config.agent.ssh_bin.clone()).await?;
         let agent_desktop = AgentDesktop::load(&config.data_dir).await?;
         let agent_mcp = AgentMcp::new(&config.data_dir, ssh.clone(), agent_desktop.clone()).await?;
@@ -169,7 +149,6 @@ impl AppState {
             config.clone(),
             conversation_store.clone(),
             conversation_hub.clone(),
-            workspace_trust.clone(),
             cli_execution_gate.clone(),
         )
         .with_quota(quota.clone())
@@ -220,7 +199,6 @@ impl AppState {
             workspaces,
             kanban_tasks,
             agent_providers,
-            workspace_trust,
             ssh,
             quota,
             agent_mcp,
@@ -302,6 +280,24 @@ impl AppState {
 #[cfg(test)]
 pub(crate) const TEST_HISTORY_RECIPIENT: u8 = 0xE2;
 
+/// Written by builds that gated execution on per-workspace trust.
+const RETIRED_WORKSPACE_TRUST_FILE: &str = "workspace-trust.json";
+
+/// Deletes the trust file older builds kept. Best effort: a failure only
+/// leaves an unused file behind.
+async fn remove_retired_workspace_trust(data_dir: &std::path::Path) {
+    let path = data_dir.join(RETIRED_WORKSPACE_TRUST_FILE);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => tracing::info!(path = %path.display(), "removed retired workspace trust file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "failed to remove retired workspace trust file"
+        ),
+    }
+}
+
 /// Makes an existing `tui-logs` directory 0700 and its files 0600. Best
 /// effort: a missing directory or a file that vanished is skipped.
 async fn restrict_saved_tui_logs(dir: &std::path::Path) {
@@ -340,7 +336,6 @@ async fn set_owner_only_directory(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace_store::WorkspaceRecord;
     use uuid::Uuid;
 
     /// Opt-in: the legacy plaintext scan over a COPY of a real data
@@ -351,8 +346,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "opt-in: scans a COPY of a real data directory (TODEX_REAL_DATA)"]
     async fn measure_legacy_scan_on_a_real_data_copy() {
-        let data_dir =
-            PathBuf::from(std::env::var("TODEX_REAL_DATA").expect("set TODEX_REAL_DATA"));
+        let data_dir = std::path::PathBuf::from(
+            std::env::var("TODEX_REAL_DATA").expect("set TODEX_REAL_DATA"),
+        );
         let workspace_root = data_dir.join("scan-workspaces");
         std::fs::create_dir_all(&workspace_root).unwrap();
         let state = AppState::new(Config {
@@ -421,61 +417,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_trusts_registered_workspaces_without_overriding_revocation() {
+    async fn startup_removes_the_retired_workspace_trust_file() {
         let root = std::env::temp_dir().join(format!(
-            "todex-app-state-workspace-trust-{}",
+            "todex-app-state-retired-trust-{}",
             Uuid::new_v4().simple()
         ));
-        let workspace_root = root.join("workspaces");
-        let automatic = workspace_root.join("automatic");
-        let revoked = workspace_root.join("revoked");
-        tokio::fs::create_dir_all(&automatic).await.unwrap();
-        tokio::fs::create_dir_all(&revoked).await.unwrap();
-
-        let workspaces = WorkspaceStore::new(root.clone(), vec![workspace_root.clone()])
-            .await
-            .unwrap();
-        workspaces
-            .merge_owned(
-                "local",
-                vec![
-                    workspace_record("automatic", &automatic),
-                    workspace_record("revoked", &revoked),
-                ],
-            )
-            .await
-            .unwrap();
-        WorkspaceTrustStore::new(root.clone(), vec![workspace_root.clone()])
-            .await
-            .unwrap()
-            .set_owned("local", &revoked, false)
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let retired = root.join(RETIRED_WORKSPACE_TRUST_FILE);
+        tokio::fs::write(&retired, r#"{"entries":[]}"#)
             .await
             .unwrap();
 
         let config = Config {
             data_dir: root.clone(),
-            workspace_roots: vec![workspace_root],
+            workspace_roots: vec![root.clone()],
             ..Config::default()
         };
-        let state = AppState::new(config).await.unwrap();
+        AppState::new(config).await.unwrap();
 
-        assert!(
-            state
-                .workspace_trust
-                .status_owned("local", &automatic)
-                .await
-                .unwrap()
-                .trusted
-        );
-        assert!(
-            !state
-                .workspace_trust
-                .status_owned("local", &revoked)
-                .await
-                .unwrap()
-                .trusted
-        );
-
+        assert!(!retired.exists());
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
@@ -536,32 +496,5 @@ mod tests {
         assert_eq!(mode(&tui_logs), 0o700);
         assert_eq!(mode(&saved), 0o600);
         let _ = tokio::fs::remove_dir_all(root).await;
-    }
-
-    fn workspace_record(name: &str, path: &std::path::Path) -> WorkspaceRecord {
-        WorkspaceRecord {
-            id: name.to_owned(),
-            name: name.to_owned(),
-            path: path.display().to_string(),
-            session_id: String::new(),
-            tenant_id: "local".to_owned(),
-            thread_id: String::new(),
-            model: "gpt-5.5".to_owned(),
-            reasoning_effort: Some("medium".to_owned()),
-            approval_policy: "on-request".to_owned(),
-            sandbox_mode: "workspace-write".to_owned(),
-            permission_profile: Some(":workspace".to_owned()),
-            approvals_reviewer: Some("user".to_owned()),
-            service_tier: None,
-            local_adapter_state: None,
-            icon: None,
-            icon_color: None,
-            ring_style: None,
-            created_at: 1,
-            updated_at: 1,
-            sort_order: None,
-            group_id: None,
-            group_name: None,
-        }
     }
 }

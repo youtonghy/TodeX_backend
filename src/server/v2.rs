@@ -360,10 +360,6 @@ fn authenticated_routes() -> Router<AppState> {
                 DefaultBodyLimit::max(4 * 1024 * 1024),
             ),
         )
-        .route(
-            "/v2/workspaces/{workspace_id}/trust",
-            get(workspace_trust).put(update_workspace_trust),
-        )
         .route("/v2/workspace/entries", get(workspace_entries))
         .route(
             "/v2/workspace/directories",
@@ -589,35 +585,6 @@ pub(super) async fn replace_workspaces(
             .into_iter()
             .filter(|item| seen_rejected.insert((item.id.clone(), item.path.clone()))),
     );
-    let workspace_paths = workspaces
-        .iter()
-        .map(|workspace| PathBuf::from(&workspace.path))
-        .collect::<Vec<_>>();
-    let trusted = state
-        .workspace_trust
-        .auto_trust_undecided_owned(&auth.tenant_id, &workspace_paths)
-        .await?;
-    if !trusted.is_empty() {
-        let audit = crate::event::EventRecord::new(
-            "workspace.trust.auto_granted",
-            None,
-            None,
-            None,
-            json!({
-                "principal_id": auth.principal_id,
-                "tenant_id": auth.tenant_id,
-                "token_id": auth.token_id,
-                "workspace_paths": trusted
-                    .iter()
-                    .map(|status| status.workspace_path.as_str())
-                    .collect::<Vec<_>>(),
-            }),
-        );
-        if let Err(error) = websocket::append_audit_event(&state, &audit).await {
-            warn!(error = %error, "failed to persist automatic workspace trust audit event");
-        }
-        state.events.publish(audit).await;
-    }
     Ok(Json(WorkspacesResponse {
         workspaces,
         updated_at: snapshot.updated_at,
@@ -636,12 +603,6 @@ pub(super) async fn delete_workspace(
         .get_owned(&auth.tenant_id, &workspace_id)
         .await?;
     let workspace_path = PathBuf::from(&workspace.path);
-    // Revocation tolerates a directory that is already gone so deleting a
-    // workspace whose path was removed on disk still works.
-    state
-        .workspace_trust
-        .revoke_owned(&auth.tenant_id, &workspace_path)
-        .await?;
     let cancelled = state
         .conversations
         .cancel_workspace_owned(&auth.tenant_id, &workspace_path)
@@ -653,7 +614,6 @@ pub(super) async fn delete_workspace(
     Ok(Json(json!({
         "workspaceId": workspace_id,
         "deleted": deleted,
-        "trustRevoked": true,
         "cancelledTurns": cancelled,
     })))
 }
@@ -686,70 +646,6 @@ pub(super) async fn replace_kanban_tasks(
         updated_at: snapshot.updated_at,
         time_zone: crate::kanban_scheduler::backend_time_zone(),
     }))
-}
-
-pub(super) async fn workspace_trust(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    AxumPath(workspace_id): AxumPath<String>,
-) -> Result<Json<crate::workspace_trust::WorkspaceTrustStatus>, AppError> {
-    let auth = require_auth(&state, &headers)?;
-    let workspace = state
-        .workspaces
-        .get_owned(&auth.tenant_id, &workspace_id)
-        .await?;
-    Ok(Json(
-        state
-            .workspace_trust
-            .status_owned(&auth.tenant_id, Path::new(&workspace.path))
-            .await?,
-    ))
-}
-
-pub(super) async fn update_workspace_trust(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    AxumPath(workspace_id): AxumPath<String>,
-    Json(request): Json<UpdateWorkspaceTrustRequest>,
-) -> Result<Json<crate::workspace_trust::WorkspaceTrustStatus>, AppError> {
-    let auth = require_auth(&state, &headers)?;
-    let workspace = state
-        .workspaces
-        .get_owned(&auth.tenant_id, &workspace_id)
-        .await?;
-    let workspace_path = PathBuf::from(&workspace.path);
-    let status = state
-        .workspace_trust
-        .set_owned(&auth.tenant_id, &workspace_path, request.trusted)
-        .await?;
-    let cancelled_turns = if request.trusted {
-        0
-    } else {
-        state
-            .conversations
-            .cancel_workspace_owned(&auth.tenant_id, &workspace_path)
-            .await?
-    };
-    let audit = crate::event::EventRecord::new(
-        "workspace.trust.changed",
-        None,
-        None,
-        None,
-        json!({
-            "principal_id": auth.principal_id,
-            "tenant_id": auth.tenant_id,
-            "token_id": auth.token_id,
-            "workspace_id": workspace_id,
-            "workspace_path": status.workspace_path,
-            "trusted": status.trusted,
-            "cancelled_turns": cancelled_turns,
-        }),
-    );
-    if let Err(error) = websocket::append_audit_event(&state, &audit).await {
-        warn!(error = %error, "failed to persist workspace trust audit event");
-    }
-    state.events.publish(audit).await;
-    Ok(Json(status))
 }
 
 pub(super) async fn workspace_entries(
@@ -1203,10 +1099,6 @@ pub(super) async fn git_run(
         &state.config.workspace_access_roots(),
         &request.workspace_path,
     )?;
-    state
-        .workspace_trust
-        .ensure_trusted(&auth.tenant_id, &workspace)
-        .await?;
     let result = git::run(
         &state.config.workspace_access_roots(),
         &state.config.data_dir,
@@ -1344,10 +1236,6 @@ pub(super) async fn git_operation(
         &state.config.workspace_access_roots(),
         &request.workspace_path,
     )?;
-    let _trust = state
-        .workspace_trust
-        .acquire_owned(&auth.tenant_id, &workspace)
-        .await?;
     // An active Agent may be writing files. Reject instead of changing its checkout
     // beneath it. This is a preflight guard, not a lock against external Git tools.
     let target = match &request.operation {
@@ -2303,7 +2191,7 @@ async fn provider_image_input(
     headers: HeaderMap,
     Query(query): Query<ProviderImageInputQuery>,
 ) -> Result<Json<crate::provider::types::ProviderImageInputCapability>, AppError> {
-    let auth = require_auth(&state, &headers)?;
+    require_auth(&state, &headers)?;
     let workspace = validate_workspace_directory_text(
         &state.config.workspace_access_roots(),
         &query.workspace,
@@ -2312,7 +2200,6 @@ async fn provider_image_input(
         state
             .conversations
             .image_input_live(
-                &auth.tenant_id,
                 query.provider,
                 &workspace,
                 query.profile.as_deref(),
@@ -2327,14 +2214,14 @@ async fn provider_models(
     headers: HeaderMap,
     Query(query): Query<ProviderModelsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let auth = require_auth(&state, &headers)?;
+    require_auth(&state, &headers)?;
     let workspace = validate_workspace_directory_text(
         &state.config.workspace_access_roots(),
         &query.workspace,
     )?;
     let models = state
         .conversations
-        .models_live(&auth.tenant_id, query.provider, &workspace)
+        .models_live(query.provider, &workspace)
         .await?;
     Ok(Json(
         json!({ "provider": query.provider, "models": models, "source": "provider-discovery", "fetchedAt": chrono::Utc::now().to_rfc3339() }),
@@ -2365,7 +2252,7 @@ async fn provider_commands(
         validate_workspace_directory_text(&state.config.workspace_access_roots(), &workspace_text)?;
     let commands = state
         .conversations
-        .commands_live(&auth.tenant_id, provider, &workspace)
+        .commands_live(provider, &workspace)
         .await?;
     Ok(Json(json!({
         "provider": provider,
@@ -4344,7 +4231,7 @@ pub(super) struct VersionPaths {
     workspace_root: String,
     workspace_roots: Vec<String>,
     /// Parent of the per-conversation folders of conversations started
-    /// without a workspace; trusted, usable for discovery before the first one.
+    /// without a workspace; usable for discovery before the first one.
     scratch_workspace_root: String,
 }
 
@@ -4376,12 +4263,6 @@ pub(super) struct KanbanTasksResponse {
     updated_at: u64,
     /// Zone task schedules' wall-clock `at` is interpreted in.
     time_zone: crate::kanban_scheduler::BackendTimeZone,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct UpdateWorkspaceTrustRequest {
-    trusted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4874,7 +4755,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn git_workspace_operations_require_auth_owner_trust_and_idle_agent() {
+    async fn git_workspace_operations_require_auth_and_idle_agent() {
         let root = std::env::temp_dir().join(format!("todex-v2-git-workspace-{}", Uuid::new_v4()));
         let workspace = root.join("workspaces/project");
         fs::create_dir_all(&workspace).unwrap();
@@ -4946,24 +4827,6 @@ mod tests {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
-        state
-            .workspace_trust
-            .set_owned("another-owner", &workspace, true)
-            .await
-            .unwrap();
-        assert_eq!(
-            app.clone()
-                .oneshot(request(auth, init.clone()))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::FORBIDDEN
-        );
-        state
-            .workspace_trust
-            .set_owned("local", &workspace, true)
-            .await
-            .unwrap();
         assert_eq!(
             app.clone()
                 .oneshot(request(auth, json!({"action":"init", "command":"unsafe"})))
@@ -5335,11 +5198,6 @@ mod tests {
             serde_json::from_slice(&to_bytes(create.into_body(), 1024 * 1024).await.unwrap())
                 .unwrap();
         assert_eq!(created.owner_id, "local");
-        state
-            .workspace_trust
-            .set_owned("local", &created.workspace, true)
-            .await
-            .unwrap();
         let commands = app.clone().oneshot(signed_request(
             &device,
             "GET",
@@ -5593,12 +5451,8 @@ mod tests {
             .await
             .unwrap();
         let hub = ConversationEventHub::default();
-        state.conversations = ConversationSupervisor::new(
-            state.config.clone(),
-            store.clone(),
-            hub.clone(),
-            state.workspace_trust.clone(),
-        );
+        state.conversations =
+            ConversationSupervisor::new(state.config.clone(), store.clone(), hub.clone());
         state.conversation_hub = hub.clone();
         let manifest = state
             .conversations
@@ -5759,12 +5613,8 @@ mod tests {
             .await
             .unwrap();
         let hub = ConversationEventHub::default();
-        state.conversations = ConversationSupervisor::new(
-            state.config.clone(),
-            store.clone(),
-            hub.clone(),
-            state.workspace_trust.clone(),
-        );
+        state.conversations =
+            ConversationSupervisor::new(state.config.clone(), store.clone(), hub.clone());
         state.conversation_hub = hub.clone();
         let manifest = state
             .conversations
@@ -6074,12 +5924,8 @@ mod tests {
             .await
             .unwrap();
         let hub = ConversationEventHub::default();
-        state.conversations = ConversationSupervisor::new(
-            state.config.clone(),
-            store.clone(),
-            hub.clone(),
-            state.workspace_trust.clone(),
-        );
+        state.conversations =
+            ConversationSupervisor::new(state.config.clone(), store.clone(), hub.clone());
         state.conversation_hub = hub.clone();
         let manifest = state
             .conversations
@@ -6439,12 +6285,8 @@ mod tests {
             .await
             .unwrap();
         let hub = ConversationEventHub::default();
-        state.conversations = ConversationSupervisor::new(
-            state.config.clone(),
-            store.clone(),
-            hub.clone(),
-            state.workspace_trust.clone(),
-        );
+        state.conversations =
+            ConversationSupervisor::new(state.config.clone(), store.clone(), hub.clone());
         state.conversation_hub = hub.clone();
         let manifest = state
             .conversations
@@ -6583,7 +6425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scratch_workspace_conversations_get_their_own_trusted_folder() {
+    async fn scratch_workspace_conversations_get_their_own_folder() {
         let root = std::env::temp_dir().join(format!("todex-v2-scratch-{}", Uuid::new_v4()));
         let workspace_root = root.join("projects");
         let project = workspace_root.join("app");
@@ -6672,19 +6514,9 @@ mod tests {
             assert!(created.scratch_workspace);
             assert_eq!(created.workspace, scratch_root.join(&created.id));
             assert!(created.workspace.is_dir());
-            state
-                .workspace_trust
-                .ensure_trusted("local", &created.workspace)
-                .await
-                .unwrap();
             folders.push(created.workspace);
         }
         assert_ne!(folders[0], folders[1]);
-        state
-            .workspace_trust
-            .ensure_trusted("local", &scratch_root)
-            .await
-            .unwrap();
 
         for body in [
             json!({ "provider": "codex", "scratchWorkspace": true, "workspace": project }),
@@ -6709,11 +6541,6 @@ mod tests {
             .await
             .unwrap();
         assert!(!regular.scratch_workspace);
-        assert!(state
-            .workspace_trust
-            .ensure_trusted("local", &project)
-            .await
-            .is_err());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7357,6 +7184,7 @@ mod tests {
         let replaced_json: Value = serde_json::from_slice(&replaced_body).unwrap();
         let workspace_id = replaced_json["workspaces"][0]["id"].as_str().unwrap();
 
+        // Workspaces carry no trust state any more.
         let trust = app
             .clone()
             .oneshot(
@@ -7371,95 +7199,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(trust.status(), StatusCode::OK);
-        let trust_body = to_bytes(trust.into_body(), 1024 * 1024).await.unwrap();
-        assert!(
-            serde_json::from_slice::<Value>(&trust_body).unwrap()["trusted"]
-                .as_bool()
-                .unwrap()
-        );
-
-        let revoked = app
-            .clone()
-            .oneshot(
-                resign(
-                    &device,
-                    Request::builder()
-                        .method("PUT")
-                        .uri(format!("/v2/workspaces/{workspace_id}/trust"))
-                        .header("content-type", "application/json")
-                        .body(Body::from(json!({ "trusted": false }).to_string()))
-                        .unwrap(),
-                )
-                .await,
-            )
-            .await
-            .unwrap();
-        assert_eq!(revoked.status(), StatusCode::OK);
-
-        let resynced = app
-            .clone()
-            .oneshot(
-                resign(
-                    &device,
-                    Request::builder()
-                        .method("PUT")
-                        .uri("/v2/workspaces")
-                        .header("content-type", "application/json")
-                        .body(Body::from(workspace_payload))
-                        .unwrap(),
-                )
-                .await,
-            )
-            .await
-            .unwrap();
-        assert_eq!(resynced.status(), StatusCode::OK);
-        let trust_after_resync = app
-            .clone()
-            .oneshot(
-                resign(
-                    &device,
-                    Request::builder()
-                        .uri(format!("/v2/workspaces/{workspace_id}/trust"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await,
-            )
-            .await
-            .unwrap();
-        let trust_after_resync_body = to_bytes(trust_after_resync.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        assert!(
-            !serde_json::from_slice::<Value>(&trust_after_resync_body).unwrap()["trusted"]
-                .as_bool()
-                .unwrap()
-        );
-
-        let trusted = app
-            .clone()
-            .oneshot(
-                resign(
-                    &device,
-                    Request::builder()
-                        .method("PUT")
-                        .uri(format!("/v2/workspaces/{workspace_id}/trust"))
-                        .header("content-type", "application/json")
-                        .body(Body::from(json!({ "trusted": true }).to_string()))
-                        .unwrap(),
-                )
-                .await,
-            )
-            .await
-            .unwrap();
-        assert_eq!(trusted.status(), StatusCode::OK);
-        let trusted_body = to_bytes(trusted.into_body(), 1024 * 1024).await.unwrap();
-        assert!(
-            serde_json::from_slice::<Value>(&trusted_body).unwrap()["trusted"]
-                .as_bool()
-                .unwrap()
-        );
+        assert_eq!(trust.status(), StatusCode::NOT_FOUND);
 
         let entries = app
             .clone()
@@ -8195,11 +7935,6 @@ mod tests {
         })
         .await
         .unwrap();
-        state
-            .workspace_trust
-            .set_owned("local", &workspace, true)
-            .await
-            .unwrap();
         let app = crate::server::loopback_test_router(state.clone());
         let device = enroll(&root.join("data"));
 
@@ -8330,11 +8065,6 @@ mod tests {
 
         let nested = workspace.join("nested");
         fs::create_dir_all(&nested).unwrap();
-        state
-            .workspace_trust
-            .set_owned("local", &nested, true)
-            .await
-            .unwrap();
         let nested_target = app
             .clone()
             .oneshot(
@@ -8367,11 +8097,6 @@ mod tests {
             .status()
             .unwrap();
         assert!(linked_status.success());
-        state
-            .workspace_trust
-            .set_owned("local", &linked_workspace, true)
-            .await
-            .unwrap();
         let external_metadata = app
             .clone()
             .oneshot(
@@ -8954,12 +8679,8 @@ mod tests {
             .await
             .unwrap();
         let hub = ConversationEventHub::default();
-        state.conversations = ConversationSupervisor::new(
-            state.config.clone(),
-            store.clone(),
-            hub.clone(),
-            state.workspace_trust.clone(),
-        );
+        state.conversations =
+            ConversationSupervisor::new(state.config.clone(), store.clone(), hub.clone());
         state.conversation_hub = hub.clone();
         let manifest = state
             .conversations
@@ -9690,15 +9411,18 @@ mod tests {
             "server.error"
         );
 
-        // The workspace is not trusted: skipped with a reason. Claude Code
-        // resolves to the test binary, so the driver is available even
+        // The workspace no longer exists: skipped with a reason. Claude
+        // Code resolves to the test binary, so the driver is available even
         // where no provider CLI is installed.
         let workspace = std::fs::canonicalize(root.join("workspaces/project")).unwrap();
+        let gone = workspace.join("gone");
+        fs::create_dir_all(&gone).unwrap();
         let manifest = state
             .conversations
-            .create_for_tests(ProviderKind::ClaudeCode, workspace.clone())
+            .create_for_tests(ProviderKind::ClaudeCode, gone.clone())
             .await
             .unwrap();
+        fs::remove_dir(&gone).unwrap();
         ws.send(send(json!({ "id": "w2", "type": "conversation.warm", "payload": { "conversationId": manifest.id } })))
             .await
             .unwrap();
@@ -9706,7 +9430,7 @@ mod tests {
         assert_eq!(warmed["type"], "server.result", "{warmed}");
         assert_eq!(
             warmed["payload"],
-            json!({ "conversationId": manifest.id, "warmed": false, "reason": "untrusted_workspace" })
+            json!({ "conversationId": manifest.id, "warmed": false, "reason": "workspace_unavailable" })
         );
 
         let response = app
@@ -9865,10 +9589,10 @@ mod tests {
     }
 
     /// A signed `/v2/ws` client on a daemon whose conversation `stuck`
-    /// cannot get past its workspace trust check until [`Self::release`]:
-    /// the trust permit is held with a trust change to `trusted_after`
-    /// queued behind it, and the store's lock is fair, so every later trust
-    /// check waits.
+    /// cannot start a turn until [`Self::release`]: the CLI execution gate
+    /// is held for writing, so a prompt waits for it. Without
+    /// `prompt_succeeds`, the workspace is moved away before the release, so
+    /// the waiting prompt then fails.
     struct StuckLane {
         root: PathBuf,
         state: AppState,
@@ -9876,14 +9600,12 @@ mod tests {
         device: TestDevice,
         ws: TestWs,
         stuck: ConversationManifest,
-        permit: Option<crate::workspace_trust::WorkspaceTrustPermit>,
-        writer: Option<
-            tokio::task::JoinHandle<Result<crate::workspace_trust::WorkspaceTrustStatus, AppError>>,
-        >,
+        prompt_succeeds: bool,
+        gate: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
     }
 
     impl StuckLane {
-        async fn new(name: &str, trusted_after: bool, claude_bin: Option<&Path>) -> Self {
+        async fn new(name: &str, prompt_succeeds: bool, claude_bin: Option<&Path>) -> Self {
             let root = std::env::temp_dir().join(format!("todex-v2-{name}-{}", Uuid::new_v4()));
             let mut config = auth_test_config(&root);
             if let Some(claude_bin) = claude_bin {
@@ -9901,25 +9623,10 @@ mod tests {
             let workspace = std::fs::canonicalize(root.join("workspaces/project")).unwrap();
             let stuck = state
                 .conversations
-                .create_for_tests(ProviderKind::ClaudeCode, workspace.clone())
+                .create_for_tests(ProviderKind::ClaudeCode, workspace)
                 .await
                 .unwrap();
-
-            let trust = state.workspace_trust.clone();
-            trust.set_owned("local", &workspace, true).await.unwrap();
-            let permit = trust.acquire_owned("local", &workspace).await.unwrap();
-            let writer = tokio::spawn({
-                let trust = trust.clone();
-                let workspace = workspace.clone();
-                async move { trust.set_owned("local", &workspace, trusted_after).await }
-            });
-            while trust
-                .try_acquire_owned("local", &workspace)
-                .unwrap()
-                .is_some()
-            {
-                tokio::task::yield_now().await;
-            }
+            let gate = state.cli_execution_gate.clone().write_owned().await;
             Self {
                 root,
                 state,
@@ -9927,8 +9634,8 @@ mod tests {
                 device,
                 ws,
                 stuck,
-                permit: Some(permit),
-                writer: Some(writer),
+                prompt_succeeds,
+                gate: Some(gate),
             }
         }
 
@@ -9956,8 +9663,11 @@ mod tests {
         }
 
         async fn release(&mut self) {
-            drop(self.permit.take());
-            self.writer.take().unwrap().await.unwrap().unwrap();
+            if !self.prompt_succeeds {
+                let workspace = &self.stuck.workspace;
+                fs::rename(workspace, workspace.with_extension("moved")).unwrap();
+            }
+            drop(self.gate.take());
         }
     }
 
@@ -10080,7 +9790,7 @@ mod tests {
             queued,
             "one conversation's commands ran out of order"
         );
-        // The prompt waited for the trust change and saw its outcome.
+        // The prompt waited for the gate and saw the workspace was gone.
         assert_eq!(answers[0].1["type"], "server.error", "{}", answers[0].1);
         for (id, answer) in &answers[1..] {
             assert_eq!(answer["type"], "server.result", "{id}: {answer}");
@@ -10123,6 +9833,8 @@ mod tests {
         // The prompt that had started finishes; the queued adds never start.
         lane.release().await;
         tokio::time::sleep(Duration::from_millis(500)).await;
+        let workspace = &lane.stuck.workspace;
+        fs::rename(workspace.with_extension("moved"), workspace).unwrap();
         let mut ws = StuckLane::connect(lane.addr, &lane.device).await;
         ws.send(lane.command("l0", "conversation.queue.list"))
             .await
@@ -10201,6 +9913,82 @@ mod tests {
         let terminal = terminal_turn_event(&lane.state, &lane.stuck.id, turn_id).await;
         assert_ended_by_cancel(&terminal);
         let _ = fs::remove_dir_all(scripts);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deleting_a_workspace_cancels_its_running_turns() {
+        let root = std::env::temp_dir().join(format!("todex-v2-delete-ws-{}", Uuid::new_v4()));
+        let claude = silent_claude(&root.join("bin"));
+        let mut config = auth_test_config(&root);
+        config.agent.claude_bin = claude.display().to_string();
+        let state = AppState::new_for_tests(config).await.unwrap();
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state.clone());
+        let workspace = std::fs::canonicalize(root.join("workspaces/project")).unwrap();
+        let payload = json!({
+            "workspaces": [{
+                "id": "client-project",
+                "name": "project",
+                "path": workspace.display().to_string(),
+                "sessionId": "session",
+                "tenantId": "local",
+                "threadId": "",
+                "model": "gpt-5",
+                "reasoningEffort": null,
+                "approvalPolicy": "on-request",
+                "sandboxMode": "workspace-write",
+                "serviceTier": null,
+                "localAdapterState": "idle",
+                "createdAt": 1,
+                "updatedAt": 1
+            }]
+        })
+        .to_string();
+        let synced = app
+            .clone()
+            .oneshot(signed_request(&device, "PUT", "/v2/workspaces", &payload))
+            .await
+            .unwrap();
+        assert_eq!(synced.status(), StatusCode::OK);
+        let synced: Value =
+            serde_json::from_slice(&to_bytes(synced.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        let workspace_id = synced["workspaces"][0]["id"].as_str().unwrap().to_owned();
+
+        // No trust step: a registered workspace runs at once.
+        let manifest = state
+            .conversations
+            .create_for_tests(ProviderKind::ClaudeCode, workspace)
+            .await
+            .unwrap();
+        let turn_id = state
+            .conversations
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+
+        let deleted = app
+            .clone()
+            .oneshot(signed_request(
+                &device,
+                "DELETE",
+                &format!("/v2/workspaces/{workspace_id}"),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted: Value =
+            serde_json::from_slice(&to_bytes(deleted.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            deleted,
+            json!({ "workspaceId": workspace_id, "deleted": true, "cancelledTurns": 1 })
+        );
+        let terminal = terminal_turn_event(&state, &manifest.id, &turn_id).await;
+        assert_ended_by_cancel(&terminal);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
