@@ -76,10 +76,12 @@ async fn decide_request(State(state): State<AppState>, request: Request) -> Resp
         Ok(conversation_id) => conversation_id,
         Err(response) => return *response,
     };
-    let native_auto = request
-        .headers()
-        .get(AGY_NATIVE_AUTO_HEADER)
-        .is_some_and(|value| value == "1");
+    let native_auto = native_auto_flag(
+        request
+            .headers()
+            .get(AGY_NATIVE_AUTO_HEADER)
+            .map(|value| value.as_bytes()),
+    );
     let decision = match axum::body::to_bytes(request.into_body(), MAX_PAYLOAD_BYTES).await {
         Ok(body) => match serde_json::from_slice::<Value>(&body) {
             Ok(payload) => decide(&state, &conversation_id, native_auto, &payload).await,
@@ -467,10 +469,42 @@ fn summary(name: &str, args: &Value) -> String {
     }
 }
 
+/// Whether a native-auto marker ([`AGY_NATIVE_AUTO_ENV`] or
+/// [`AGY_NATIVE_AUTO_HEADER`]) says agy runs its own Auto review: exactly
+/// `1`, nothing else.
+fn native_auto_flag(value: Option<&[u8]>) -> bool {
+    value == Some(b"1")
+}
+
+/// What the hook prints for the daemon's answer; `None` prints nothing,
+/// leaving the call to agy's own review. That is only right when this `agy`
+/// process runs agy's Auto (`native_auto`): elsewhere it runs with
+/// `--dangerously-skip-permissions`, so a `defer` there is denied.
+fn hook_output(native_auto: bool, answer: anyhow::Result<Value>) -> Option<Value> {
+    match answer {
+        Ok(decision) if decision["decision"] == "defer" => (!native_auto).then(|| {
+            Decision::Deny(
+                "TodeX was asked to leave this call to agy's Auto review, but this agy process \
+                 does not run it; start a new turn."
+                    .to_owned(),
+            )
+            .to_json()
+        }),
+        Ok(decision) => Some(decision),
+        Err(error) => Some(
+            Decision::Deny(format!(
+                "TodeX could not decide on this tool call ({error}); start a new turn if \
+                 todex-agentd restarted."
+            ))
+            .to_json(),
+        ),
+    }
+}
+
 /// `todex-agentd agy-hook`: reads the hook payload on stdin, asks the daemon
 /// and prints its decision. Started outside a TodeX turn, or told to defer to
-/// agy's Auto review, it prints nothing, which leaves agy's own permissions in
-/// charge; a failed exchange denies.
+/// agy's Auto review by a process that runs it, it prints nothing, which
+/// leaves agy's own permissions in charge; a failed exchange denies.
 pub(crate) async fn run_hook() -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
@@ -483,17 +517,16 @@ pub(crate) async fn run_hook() -> anyhow::Result<()> {
         .take(MAX_PAYLOAD_BYTES as u64 + 1)
         .read_to_end(&mut payload)
         .await?;
-    let native_auto = env(AGY_NATIVE_AUTO_ENV).is_some_and(|value| value == "1");
-    let decision = match ask_daemon(&endpoint, &token, native_auto, payload).await {
-        Ok(decision) if decision["decision"] == "defer" => return Ok(()),
-        Ok(decision) => decision,
-        Err(error) => Decision::Deny(format!(
-            "TodeX could not decide on this tool call ({error}); start a new turn if todex-agentd \
-             restarted."
-        ))
-        .to_json(),
-    };
-    println!("{decision}");
+    let native_auto = native_auto_flag(
+        std::env::var(AGY_NATIVE_AUTO_ENV)
+            .ok()
+            .as_deref()
+            .map(str::as_bytes),
+    );
+    let answer = ask_daemon(&endpoint, &token, native_auto, payload).await;
+    if let Some(decision) = hook_output(native_auto, answer) {
+        println!("{decision}");
+    }
     Ok(())
 }
 
@@ -531,6 +564,37 @@ async fn ask_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_exactly_1_marks_native_auto() {
+        assert!(native_auto_flag(Some(b"1")));
+        for value in [&b"true"[..], b"0", b" 1", b"1 ", b"", b"yes"] {
+            assert!(!native_auto_flag(Some(value)), "{value:?}");
+        }
+        assert!(!native_auto_flag(None));
+        // As the route reads the header.
+        let header = |value: &'static str| {
+            native_auto_flag(Some(axum::http::HeaderValue::from_static(value).as_bytes()))
+        };
+        assert!(header("1"));
+        assert!(!header("true"));
+        assert!(!header("0"));
+        assert!(!header(" 1"));
+    }
+
+    #[test]
+    fn a_defer_is_honoured_only_by_a_native_auto_process() {
+        let defer = || Ok(json!({ "decision": "defer" }));
+        assert_eq!(hook_output(true, defer()), None);
+        let denied = hook_output(false, defer()).unwrap();
+        assert_eq!(denied["decision"], "deny");
+        assert!(denied["reason"].as_str().unwrap().contains("Auto"));
+        let allow = json!({ "decision": "allow" });
+        assert_eq!(hook_output(false, Ok(allow.clone())), Some(allow.clone()));
+        assert_eq!(hook_output(true, Ok(allow.clone())), Some(allow));
+        let failed = hook_output(true, Err(anyhow::anyhow!("connection refused"))).unwrap();
+        assert_eq!(failed["decision"], "deny");
+    }
 
     #[test]
     fn tools_are_classified_by_what_they_can_do() {

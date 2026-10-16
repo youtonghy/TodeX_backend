@@ -634,7 +634,10 @@ impl SessionActor {
 
 /// The child environment of a resident ACP CLI: `defaults`, plus every
 /// allowlisted variable set in the daemon's environment. Invalid names and
-/// the daemon's own `TODEX_AGENTD_*` settings are never forwarded.
+/// every `TODEX_*` name are never forwarded: besides the daemon's own
+/// `TODEX_AGENTD_*` settings, that prefix carries what TodeX itself sets for
+/// a launch (agent MCP endpoints and tokens, `TODEX_AGY_NATIVE_AUTO`), which
+/// must not leak in from the daemon's environment.
 pub(super) fn allowlisted_environment(
     defaults: &[(&str, &str)],
     allowlist: &[String],
@@ -644,7 +647,7 @@ pub(super) fn allowlisted_environment(
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
         .collect();
     for key in allowlist {
-        if !valid_env_name(key) || key.starts_with("TODEX_AGENTD_") {
+        if !valid_env_name(key) || key.starts_with("TODEX_") {
             continue;
         }
         if let Ok(value) = std::env::var(key) {
@@ -713,6 +716,7 @@ mod tests {
             &[
                 "PATH".to_owned(),
                 "TODEX_AGENTD_PORT".to_owned(),
+                "TODEX_AGENT_MCP_TOKEN".to_owned(),
                 "BAD-NAME".to_owned(),
             ],
         );
@@ -720,6 +724,6 @@ mod tests {
         assert!(env.contains_key("PATH"));
         assert!(!env
             .keys()
-            .any(|key| key.starts_with("TODEX_AGENTD_") || key == "BAD-NAME"));
+            .any(|key| key.starts_with("TODEX_") || key == "BAD-NAME"));
     }
 }

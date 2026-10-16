@@ -410,6 +410,10 @@ impl ProviderDriver for AntigravityDriver {
             )
             .await?;
         }
+        // Only a native Auto launch may tell the hook to leave calls to agy.
+        if !native_auto {
+            spec.env.remove(AGY_NATIVE_AUTO_ENV);
+        }
         if controls.work_mode == "plan" {
             spec.args.extend(["--mode".to_owned(), "plan".to_owned()]);
         } else if native_auto {
@@ -1678,6 +1682,29 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
                 Some(("ask".to_owned(), "implement".to_owned()))
             );
             assert_eq!(fixture.auto_unavailable_events().await, 1);
+        }
+
+        #[tokio::test]
+        async fn an_allowlisted_native_auto_marker_never_reaches_a_fallback_launch() {
+            // Set in the daemon's environment and named by an operator's
+            // allowlist; only TodeX itself may set it, for native Auto.
+            std::env::set_var(AGY_NATIVE_AUTO_ENV, "1");
+            let mut fixture = Fixture::with_bridge().await;
+            fixture.driver.env_allowlist = vec![AGY_NATIVE_AUTO_ENV.to_owned()];
+            fixture.mark("auto-unavailable");
+            fixture
+                .run("turn-1", "hello", Some("auto"), None)
+                .await
+                .unwrap();
+            assert!(fixture.launches()[0].contains(&"--dangerously-skip-permissions".to_owned()));
+            assert_eq!(fixture.last_auto_hint(), "-");
+            fixture
+                .run("turn-2", "again", Some("ask"), None)
+                .await
+                .unwrap();
+            assert_eq!(fixture.last_auto_hint(), "-");
+            fixture.run("turn-3", "more", None, None).await.unwrap();
+            assert_eq!(fixture.last_auto_hint(), "-");
         }
 
         #[tokio::test]
