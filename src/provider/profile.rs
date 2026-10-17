@@ -187,12 +187,6 @@ impl ProviderProfile {
         self.mcp_injection != McpInjection::None
     }
 
-    /// Whether typed prompt images may be sent at all; profile-dependent
-    /// providers check the selected profile when the turn starts.
-    pub fn accepts_typed_images(&self) -> bool {
-        self.image_input || self.image_input_mode == ImageInputMode::Profile
-    }
-
     /// The static capability block of `/v2/providers`.
     pub fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {

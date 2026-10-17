@@ -1311,12 +1311,6 @@ fn pi_supported_thinking_levels(item: &Value) -> Vec<String> {
         .collect()
 }
 
-fn pi_model_supports_images(item: &Value) -> bool {
-    item.get("input")
-        .and_then(Value::as_array)
-        .is_some_and(|inputs| inputs.iter().any(|input| input.as_str() == Some("image")))
-}
-
 async fn run_pi_turn(
     rpc: &mut PiRpc<'_>,
     context: DriverContext,
@@ -1364,19 +1358,6 @@ async fn run_pi_turn(
     }
     sink.emit("turn.configuration", pi_configuration(&state, &prompt))
         .await?;
-    let has_images = prompt
-        .content
-        .iter()
-        .any(|content| matches!(content, super::types::DriverPromptContent::Image { .. }));
-    if has_images
-        && !state
-            .pointer("/data/model")
-            .is_some_and(pi_model_supports_images)
-    {
-        return Err(AppError::ImageInputUnsupported(
-            "the selected Pi model does not support image input".to_owned(),
-        ));
-    }
 
     let mut provider_state = context.provider_state;
     provider_state.native_session_id = Some(native_session_id.clone());

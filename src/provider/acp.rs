@@ -134,7 +134,6 @@ pub(super) struct AcpRuntimeOptions {
     pub allow_cli_config_fallback: bool,
     pub request_ask_mode: bool,
     pub legacy_model_state: bool,
-    pub allow_unadvertised_images: bool,
     pub snake_case_image_mime: bool,
 }
 
@@ -860,7 +859,6 @@ async fn run_acp_turn_steps(
     } = prepare_acp_session(
         process,
         &context,
-        &prompt,
         sink,
         cancel,
         &options,
@@ -1484,11 +1482,9 @@ struct PreparedAcpSession {
 /// Everything a turn does before applying its config and sending
 /// `session/prompt`: `initialize` (and `authenticate`) and the session
 /// new/resume/load, each skipped when `connection` already holds it.
-#[allow(clippy::too_many_arguments)]
 async fn prepare_acp_session(
     process: &mut JsonLineProcess,
     context: &DriverContext,
-    prompt: &DriverPrompt,
     sink: &DriverEventSink,
     cancel: &mut watch::Receiver<bool>,
     options: &AcpRuntimeOptions,
@@ -1523,13 +1519,6 @@ async fn prepare_acp_session(
             initialize.protocol_version
         )));
     }
-    ensure_acp_images_supported(
-        prompt,
-        initialize.agent_capabilities.prompt_capabilities.image,
-        options.allow_unadvertised_images,
-        context.manifest.provider,
-    )?;
-
     if connection.initialize.is_none() {
         authenticate_if_requested(
             process,
@@ -1713,7 +1702,6 @@ pub(super) async fn prewarm_acp_session(
     prepare_acp_session(
         process,
         context,
-        settings,
         sink,
         &mut cancel,
         options,
@@ -1978,26 +1966,6 @@ async fn drain_until_prompt_response(
             )
             .await?;
         }
-    }
-}
-
-fn ensure_acp_images_supported(
-    prompt: &DriverPrompt,
-    advertised: bool,
-    allow_unadvertised: bool,
-    provider: ProviderKind,
-) -> Result<(), AppError> {
-    let has_images = prompt
-        .content
-        .iter()
-        .any(|content| matches!(content, super::types::DriverPromptContent::Image { .. }));
-    if has_images && !advertised && !allow_unadvertised {
-        Err(AppError::ImageInputUnsupported(format!(
-            "{} does not advertise ACP image prompt support",
-            provider.as_str()
-        )))
-    } else {
-        Ok(())
     }
 }
 
@@ -3738,16 +3706,6 @@ mod tests {
         assert_eq!(value["prompt"][1]["data"], "aGVsbG8=");
         assert_eq!(value["prompt"][1]["mime_type"], "image/png");
         assert!(value["prompt"][1].get("mimeType").is_none());
-    }
-
-    #[test]
-    fn acp_rejects_unadvertised_images_except_for_vendor_override() {
-        let prompt = image_prompt();
-        assert!(matches!(
-            ensure_acp_images_supported(&prompt, false, false, ProviderKind::Acp),
-            Err(AppError::ImageInputUnsupported(_))
-        ));
-        assert!(ensure_acp_images_supported(&prompt, false, true, ProviderKind::GrokBuild).is_ok());
     }
 
     fn request(options: Value) -> RequestPermissionRequest {

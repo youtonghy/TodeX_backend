@@ -255,7 +255,6 @@ async fn supervisor_provider_branches_are_frozen() {
             "promptWithSkills": provider_prompt_text(provider, "do it", &skills),
             "attachedFileText": file_text,
             "attachedFileItems": file_content.len(),
-            "typedImages": ensure_image_provider(provider).map(|()| json!(true)).unwrap_or_else(error_text),
             "profileExplicit": profile_result(Some(ACP_PROFILE)),
             "profileOmitted": profile_result(None),
             "runsAcpProfileCli": turn_runs_cli(

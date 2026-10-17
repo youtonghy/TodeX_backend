@@ -3213,7 +3213,6 @@ async fn prepare_prompt_content_hashed(
                 }
             }
             PromptContentRef::LocalImage { path } => {
-                ensure_image_provider(provider)?;
                 let path = canonical_workspace_file(&workspace, path).await?;
                 let file_bytes =
                     usize::try_from(tokio::fs::metadata(&path).await?.len()).unwrap_or(usize::MAX);
@@ -3228,7 +3227,6 @@ async fn prepare_prompt_content_hashed(
                 });
             }
             PromptContentRef::Image { data, mime_type } => {
-                ensure_image_provider(provider)?;
                 let mime_type = mime_type.trim().to_ascii_lowercase();
                 if !matches!(
                     mime_type.as_str(),
@@ -3304,16 +3302,6 @@ async fn canonical_workspace_file(workspace: &Path, path: PathBuf) -> Result<Pat
         )));
     }
     Ok(canonical)
-}
-
-fn ensure_image_provider(provider: ProviderKind) -> Result<(), AppError> {
-    if profile(provider).accepts_typed_images() {
-        Ok(())
-    } else {
-        Err(AppError::Unsupported(format!(
-            "provider {provider:?} does not support typed prompt images"
-        )))
-    }
 }
 
 fn ensure_image_budget(bytes: usize) -> Result<(), AppError> {
@@ -7161,7 +7149,7 @@ done
                 }],
             )
             .await
-            .expect("declared image provider must accept typed image input");
+            .expect("typed image input passes through to every provider");
             assert!(matches!(
                 content.as_slice(),
                 [DriverPromptContent::Image { path: None, .. }]

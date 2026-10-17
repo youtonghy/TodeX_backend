@@ -4,7 +4,6 @@
     "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
     "attachedFileText": "Attached file: @notes.txt",
     "attachedFileItems": 1,
-    "typedImages": true,
     "profileExplicit": "golden",
     "profileOmitted": "golden",
     "runsAcpProfileCli": true,
@@ -16,7 +15,6 @@
     "promptWithSkills": "do it",
     "attachedFileText": "",
     "attachedFileItems": 1,
-    "typedImages": true,
     "profileExplicit": {
       "error": "invalid request: providerProfile is only valid for ACP conversations"
     },
@@ -30,7 +28,6 @@
     "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
     "attachedFileText": "Attached file: @notes.txt",
     "attachedFileItems": 1,
-    "typedImages": true,
     "profileExplicit": {
       "error": "invalid request: providerProfile is only valid for ACP conversations"
     },
@@ -44,7 +41,6 @@
     "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
     "attachedFileText": "Attached file: @notes.txt",
     "attachedFileItems": 1,
-    "typedImages": true,
     "profileExplicit": {
       "error": "invalid request: providerProfile is only valid for ACP conversations"
     },
@@ -58,7 +54,6 @@
     "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
     "attachedFileText": "Attached file: @notes.txt",
     "attachedFileItems": 1,
-    "typedImages": true,
     "profileExplicit": {
       "error": "invalid request: providerProfile is only valid for ACP conversations"
     },
@@ -72,7 +67,6 @@
     "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
     "attachedFileText": "Attached file: @notes.txt",
     "attachedFileItems": 1,
-    "typedImages": true,
     "profileExplicit": {
       "error": "invalid request: providerProfile is only valid for ACP conversations"
     },
@@ -86,7 +80,6 @@
     "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
     "attachedFileText": "Attached file: @notes.txt",
     "attachedFileItems": 1,
-    "typedImages": true,
     "profileExplicit": {
       "error": "invalid request: providerProfile is only valid for ACP conversations"
     },
@@ -100,7 +93,6 @@
     "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
     "attachedFileText": "Attached file: @notes.txt",
     "attachedFileItems": 1,
-    "typedImages": true,
     "profileExplicit": {
       "error": "invalid request: providerProfile is only valid for ACP conversations"
     },
@@ -114,7 +106,6 @@
     "promptWithSkills": "The following skills are attached to this request. Follow their instructions.\n\n<skill name=\"review\">\nReview carefully.\n</skill>\n\ndo it",
     "attachedFileText": "Attached file: @notes.txt",
     "attachedFileItems": 1,
-    "typedImages": true,
     "profileExplicit": {
       "error": "invalid request: providerProfile is only valid for ACP conversations"
     },

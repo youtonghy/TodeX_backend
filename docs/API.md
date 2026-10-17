@@ -183,7 +183,7 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 `skills` 可选。Backend 按 `resourceId` 读取 Skill；Codex 使用原生 `skill` input item，其他 Provider 使用受控文本注入，客户端不要拼接完整 Skill 文件。只带 Skill、不带 `text` 时允许发送。注入成功后会发出 `skill.injected` 事件；用户可见的 `message.created` 仍是原始输入。
 
-`content` 可选，最多 16 项，支持 `text`、`localImage`、内联 `image`（`data` + `mimeType`）和 `file`。本地路径可相对 workspace，也可使用 workspace 内绝对路径；规范化后越界、符号链接逃逸和非普通文件都会拒绝。图片仅对 Codex 和 Pi 开放，允许 PNG/JPEG/GIF/WebP，解码后合计最多 10 MiB；不支持图片的 Provider 返回明确的 `UNSUPPORTED`。Codex 把文件映射为原生 mention，其他 Provider 使用 workspace 相对 `@` 引用。
+`content` 可选，最多 16 项，支持 `text`、`localImage`、内联 `image`（`data` + `mimeType`）和 `file`。本地路径可相对 workspace，也可使用 workspace 内绝对路径；规范化后越界、符号链接逃逸和非普通文件都会拒绝。图片允许 PNG/JPEG/GIF/WebP，解码后合计最多 10 MiB。TodeX 不再按图片输入能力拦截提示：图片原样交给任何 Provider，所选 Agent 或模型不支持图片时由 Agent 自行报错（以 turn 失败或 Agent 消息呈现），daemon 不再返回 `UNSUPPORTED` 或 `IMAGE_INPUT_UNSUPPORTED`。`/v2/providers` 中的 `capabilities.imageInput` / `imageInputMode`、模型目录的 `imageInput` 以及 `/v2/providers/image-input` 仅供客户端提示参考（为兼容旧客户端保留），不影响请求是否被接受。Codex 把文件映射为原生 mention，其他 Provider 使用 workspace 相对 `@` 引用。
 
 每个 conversation 同时只允许一个 mutating turn；并发 `conversation.prompt` 返回 `409 CONFLICT`，不会排队。运行中要追加的消息改用后端追加队列（见下文 `conversation.queue.add`），它对所有 Provider 可用。daemon 重启按 journal（而非 manifest 状态）判断未完成 turn：仍打开的 turn 追加 `conversation.interrupted`（已知时携带该 turn 的 `turnId`），状态标记为 `interrupted`，不会通过重放 prompt 猜测恢复；journal 中已结束但 manifest 仍为 `running` 的会话只按 journal 修正状态，不追加事件。原生会话 ID 由 `provider-state.json` 保存，Provider 支持时下一 turn 使用原生 resume。
 
