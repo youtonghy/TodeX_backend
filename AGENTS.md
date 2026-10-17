@@ -56,5 +56,6 @@ When a task requires it — aligning the API contract in `docs/API.md` with clie
 - Group commits by change category or repository responsibility when the task includes unrelated changes.
 - Run the relevant validation commands before committing whenever practical, and mention any validation that could not be run.
 - Push the created commits to the current branch's upstream remote after committing.
+- After each push of new backend commits, make sure the [Backend checks](.github/workflows/checks.yml) workflow runs for the pushed commit (pushes to `main` trigger it; otherwise start it with `gh workflow run checks.yml --ref <branch>`), and monitor it with `gh run watch` until it finishes. The task is complete only when CI passes; if it fails, read the failing logs (`gh run view <run-id> --log-failed`), fix the cause, commit, push, and monitor again.
 - If committing or pushing is blocked, report the blocker explicitly and leave the working tree status clear in the final response.
 - Do not include unrelated local changes in a task commit. Preserve user changes unless the user explicitly asks to modify or discard them.
