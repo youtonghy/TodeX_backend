@@ -120,6 +120,10 @@ pub enum AppError {
     RemoteHostKeyUnverified(String),
     #[error("remote host is unreachable: {0}")]
     RemoteUnreachable(String),
+    /// `/v2/browser/proxy` could not get a response from the loopback
+    /// target (refused, timed out, reset). The message names `host:port`.
+    #[error("browser target is unreachable: {0}")]
+    BrowserTargetUnreachable(String),
     #[error("remote operation failed: {0}")]
     RemoteFailed(String),
     /// The remote server refused a file operation. Distinct from
@@ -178,6 +182,7 @@ impl AppError {
             Self::RemoteHostKeyUnverified(_) => "REMOTE_HOST_KEY_UNVERIFIED",
             Self::RemoteUnreachable(_) => "REMOTE_UNREACHABLE",
             Self::RemoteFailed(_) => "REMOTE_OPERATION_FAILED",
+            Self::BrowserTargetUnreachable(_) => "BROWSER_TARGET_UNREACHABLE",
             Self::RemotePermissionDenied(_) => "REMOTE_PERMISSION_DENIED",
             Self::StreamLagged(_) => "EVENT_STREAM_LAGGED",
             Self::StreamClosed => "EVENT_STREAM_CLOSED",
@@ -223,7 +228,9 @@ impl IntoResponse for AppError {
             Self::ProviderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             // Not 401: clients treat that as a failed device signature.
             Self::RemoteAuthFailed(_) | Self::RemoteHostKeyUnverified(_) => StatusCode::FORBIDDEN,
-            Self::RemoteUnreachable(_) => StatusCode::BAD_GATEWAY,
+            Self::RemoteUnreachable(_) | Self::BrowserTargetUnreachable(_) => {
+                StatusCode::BAD_GATEWAY
+            }
             Self::RemoteFailed(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RemotePermissionDenied(_) => StatusCode::FORBIDDEN,
             Self::StreamLagged(_) | Self::StreamClosed => StatusCode::SERVICE_UNAVAILABLE,

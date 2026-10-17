@@ -1051,6 +1051,27 @@ POST /v2/browser/fetch
 
 仅允许指向本后端 loopback 的 `http`/`https` URL；禁用系统代理，最多跟随 3 次且每一跳仍必须是 loopback。响应返回最终 `url`、实际 `status`、`contentType`、`body`（≤2 MiB）。
 
+```http
+POST /v2/browser/proxy
+Content-Type: application/json
+
+{"method": "GET", "url": "http://127.0.0.1:5241/src/main.tsx?t=1", "headers": [["cookie", "a=b"], ["accept", "*/*"]], "body": "<base64，可选>"}
+```
+
+桌面端浏览器预览把页面的每个 loopback 请求转发到这里（后端在远程主机时经 `/v2/sealed` 隧道），由后端在本机 loopback 上执行并把响应流式返回。认证与 `/v2/browser/fetch` 相同（设备签名）。因为隧道只转发内层请求的 `content-type`/`accept`，页面自己的请求头放在 body 的 `headers` 中。
+
+- `url` 与 `/v2/browser/fetch` 使用同一 loopback 规则（`localhost`、`127.0.0.1`、`[::1]`，无用户名密码），并且不能是 daemon 自己的端口；否则 400 `INVALID_REQUEST`。
+- `method` 为任意合法 HTTP token 方法（`GET`、`HEAD`、`POST`、`PUT`、`PATCH`、`DELETE`、`OPTIONS`…），`CONNECT` 与非法方法返回 400 `INVALID_REQUEST`。
+- `headers` 为 `[name, value]` 数组，可重复；丢弃 hop-by-hop 头（`connection`、`keep-alive`、`proxy-*`、`te`、`trailer`、`transfer-encoding`、`upgrade`）、`host`、`content-length` 与所有 `x-todex-*`，其余（`cookie`、`authorization`、`origin`、`referer`、`range`、`if-none-match` 等）原样转发。非法头名或头值返回 400。
+- `body` 为标准 base64（带 padding），解码后最多 16 MiB；本路由的请求体上限相应放宽到约 29 MiB。
+- 不使用系统代理、不跟随重定向（3xx 原样返回，由预览浏览器自己跟随）、连接超时 10 秒、无总超时、不自动解压（`content-encoding` 原样透传）。
+- 成功时内层 HTTP 状态恒为 `200`（与上游状态无关），并带：
+  - `x-todex-proxy-status`：上游状态码；
+  - `x-todex-proxy-headers`：上游响应头（去掉 hop-by-hop 头）组成的 `[[name, value], …]` JSON 数组的 base64url（无 padding）编码；重复头（如多个 `set-cookie`）保持为独立条目，值按 UTF-8 宽松解码。编码后超过 48 KiB 时返回 502 `BROWSER_TARGET_UNREACHABLE`；
+  - `content-type: application/octet-stream` 与 `cache-control: no-store`（只描述外层包装，上游的头都在 `x-todex-proxy-headers` 中）。
+  - body 为上游响应体，边收边转发（不受 2 MiB 限制）；上游中途断开时响应体随之中断。
+- 无法从上游得到响应（连接被拒、超时、DNS 失败、连接重置等）时返回 502 `BROWSER_TARGET_UNREACHABLE`，`message` 含目标 `host:port`。
+
 ## SSH 主机与远程连接
 
 管理**运行 todex-agentd 的机器**上的 SSH 主机、密钥与远程文件，并把选定主机开放给 Agent。所有 `/v2/ssh/*`、`/v2/ftp/*`、`/v2/remote/*` 接口都需要设备签名。TodeX 从不保存密码或密钥口令，从不写入 `~/.ssh/config`，私钥内容不会出现在任何响应或日志中。
@@ -1535,6 +1556,7 @@ TUI 配对二维码只携带后端地址（`{"kind":"todex-pairing-link","versio
 | `REMOTE_AUTH_FAILED` | SFTP/FTP 登录失败（HTTP 403）：提供密码，或先在终端登录以复用共享连接。 |
 | `REMOTE_HOST_KEY_UNVERIFIED` | 远程主机密钥未确认或已变化（HTTP 403）：先在 TodeX 终端中连接一次。 |
 | `REMOTE_UNREACHABLE` | 远程主机不可达或连接中断（HTTP 502），会话随之关闭。 |
+| `BROWSER_TARGET_UNREACHABLE` | `/v2/browser/proxy` 无法从 loopback 目标得到响应（连接被拒、超时、DNS 失败等，HTTP 502）；`message` 含目标 `host:port`。 |
 | `REMOTE_PERMISSION_DENIED` | 远程服务器拒绝该文件操作（HTTP 403）；与 TodeX 设备认证无关。 |
 | `REMOTE_OPERATION_FAILED` | 其他远程文件操作失败（HTTP 422）。 |
 | `PROTOCOL_UPGRADE_REQUIRED` | 请求使用了已停用的协议（HTTP 426）：非回环对端绕过 transport v2 直接访问、`/v2/ws` 的 `tv` 不是 `2` 或仍用 v1 `enc=`，配对 `create` 仍提交 `clientPublicKey`（配对 v2）或缺少 `transportBinding: 1` / `deviceNameBinding: 1`，或 `/v2/sealed` 缺少 `X-Todex-Sealed-Revision: 2`；需升级客户端。 |

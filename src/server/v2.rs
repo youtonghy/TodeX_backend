@@ -383,6 +383,7 @@ fn authenticated_routes() -> Router<AppState> {
         .route("/v2/git/diff", get(git_diff))
         .route("/v2/git/operation", post(git_operation))
         .route("/v2/browser/fetch", post(browser_fetch))
+        .merge(super::browser_proxy::routes())
         .route("/v2/providers", get(providers))
         .route("/v2/providers/versions", get(provider_versions))
         .route(
@@ -7660,6 +7661,272 @@ mod tests {
             .unwrap();
         assert_eq!(blocked_browser.status(), StatusCode::BAD_REQUEST);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A loopback upstream for `/v2/browser/proxy`: one request per
+    /// connection, answered by path. `/echo` returns the raw request it
+    /// received with two `Set-Cookie` headers; `/redirect` a 302; anything
+    /// else a 404.
+    async fn spawn_proxy_upstream() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    let head_end = loop {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map(|value| value.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    while request.len() < head_end + length {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        assert_ne!(read, 0, "request body ended early");
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    let response = if path.starts_with("/echo") {
+                        let mut response = format!(
+                            "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Encoding: identity\r\nSet-Cookie: a=1; Path=/\r\nSet-Cookie: b=2; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            request.len()
+                        )
+                        .into_bytes();
+                        response.extend_from_slice(&request);
+                        response
+                    } else if path.starts_with("/redirect") {
+                        b"HTTP/1.1 302 Found\r\nLocation: /echo\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                    } else {
+                        b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing".to_vec()
+                    };
+                    stream.write_all(&response).await.unwrap();
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (address, server)
+    }
+
+    fn proxied_headers(response: &axum::response::Response) -> Vec<(String, String)> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let encoded = response
+            .headers()
+            .get("x-todex-proxy-headers")
+            .expect("x-todex-proxy-headers")
+            .to_str()
+            .unwrap();
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap()
+    }
+
+    fn proxied_status(response: &axum::response::Response) -> &str {
+        response
+            .headers()
+            .get("x-todex-proxy-status")
+            .expect("x-todex-proxy-status")
+            .to_str()
+            .unwrap()
+    }
+
+    async fn error_code(response: axum::response::Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn v2_browser_proxy_forwards_loopback_requests_and_streams_the_answer() {
+        let root = std::env::temp_dir().join(format!("todex-v2-browser-proxy-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state);
+        let (upstream, server) = spawn_proxy_upstream().await;
+        let proxy = |payload: Value| {
+            signed_request(&device, "POST", "/v2/browser/proxy", &payload.to_string())
+        };
+
+        // GET: page headers pass through, connection/host/TodeX headers do
+        // not, and repeated response headers stay separate pairs.
+        let response = app
+            .clone()
+            .oneshot(proxy(json!({
+                "method": "GET",
+                "url": format!("http://{upstream}/echo?t=1"),
+                "headers": [
+                    ["cookie", "session=abc"],
+                    ["accept", "*/*"],
+                    ["if-none-match", "\"v1\""],
+                    ["origin", format!("http://{upstream}")],
+                    ["host", "evil.example"],
+                    ["connection", "x-secret"],
+                    ["x-todex-device-id", "spoofed"],
+                    ["content-length", "99"],
+                ],
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(proxied_status(&response), "201");
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let headers = proxied_headers(&response);
+        let set_cookies: Vec<&str> = headers
+            .iter()
+            .filter(|(name, _)| name == "set-cookie")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(set_cookies, ["a=1; Path=/", "b=2; Path=/"]);
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "content-encoding" && value == "identity"));
+        assert!(!headers.iter().any(|(name, _)| name == "connection"));
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let echoed = String::from_utf8_lossy(&body).to_ascii_lowercase();
+        assert!(echoed.starts_with("get /echo?t=1 http/1.1\r\n"), "{echoed}");
+        assert!(echoed.contains("\r\ncookie: session=abc\r\n"), "{echoed}");
+        assert!(echoed.contains("\r\nif-none-match: \"v1\"\r\n"), "{echoed}");
+        assert!(
+            echoed.contains(&format!("\r\nhost: {upstream}\r\n")),
+            "{echoed}"
+        );
+        assert!(!echoed.contains("evil.example"), "{echoed}");
+        assert!(!echoed.contains("x-secret"), "{echoed}");
+        assert!(!echoed.contains("x-todex"), "{echoed}");
+        assert!(!echoed.contains("content-length"), "{echoed}");
+
+        // POST: the base64 body arrives byte for byte.
+        let payload: Vec<u8> = (0..=255_u8).cycle().take(70_000).collect();
+        let response = app
+            .clone()
+            .oneshot(proxy(json!({
+                "method": "POST",
+                "url": format!("http://{upstream}/echo"),
+                "headers": [["content-type", "application/octet-stream"]],
+                "body": BASE64_STANDARD.encode(&payload),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(proxied_status(&response), "201");
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(body.starts_with(b"POST /echo HTTP/1.1\r\n"));
+        assert!(body.ends_with(&payload));
+        let head =
+            String::from_utf8_lossy(&body[..body.len() - payload.len()]).to_ascii_lowercase();
+        assert!(head.contains("\r\ncontent-length: 70000\r\n"), "{head}");
+
+        // 3xx comes back as-is for the preview browser to follow.
+        let response = app
+            .clone()
+            .oneshot(proxy(
+                json!({ "method": "GET", "url": format!("http://{upstream}/redirect") }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(proxied_status(&response), "302");
+        assert!(proxied_headers(&response)
+            .iter()
+            .any(|(name, value)| name == "location" && value == "/echo"));
+
+        // Upstream errors are answers too: wrapper 200, real status inside.
+        let response = app
+            .clone()
+            .oneshot(proxy(
+                json!({ "method": "GET", "url": format!("http://{upstream}/nope") }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(proxied_status(&response), "404");
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"missing");
+
+        // Only loopback targets.
+        let (status, error) = error_code(
+            app.clone()
+                .oneshot(proxy(
+                    json!({ "method": "GET", "url": "http://169.254.169.254/latest/meta-data" }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["code"], "INVALID_REQUEST");
+
+        // Invalid methods are refused.
+        for method in ["GE T", "", "CONNECT"] {
+            let (status, error) = error_code(
+                app.clone()
+                    .oneshot(proxy(
+                        json!({ "method": method, "url": format!("http://{upstream}/echo") }),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method:?}");
+            assert_eq!(error["code"], "INVALID_REQUEST");
+        }
+
+        // A closed port is a distinct, named failure.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_address = closed.local_addr().unwrap();
+        drop(closed);
+        let (status, error) = error_code(
+            app.clone()
+                .oneshot(proxy(
+                    json!({ "method": "GET", "url": format!("http://{closed_address}/") }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error["code"], "BROWSER_TARGET_UNREACHABLE");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains(&closed_address.to_string()),
+            "{error}"
+        );
+
+        // Without a device signature nothing is forwarded.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/browser/proxy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "method": "GET", "url": format!("http://{upstream}/echo") })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        server.abort();
         let _ = fs::remove_dir_all(root);
     }
 

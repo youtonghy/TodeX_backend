@@ -1424,3 +1424,63 @@ async fn expect_outer_failure_response(response: Response) {
         json!({"code": "TRANSPORT_CRYPTO_FAILED", "message": "transport crypto failure"})
     );
 }
+
+/// The desktop reaches `/v2/browser/proxy` through the tunnel: the upstream
+/// status and its repeated headers survive the sealed inner head, which
+/// joins repeated header values.
+#[tokio::test]
+async fn sealed_tunnel_carries_browser_proxy_answers() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).await.unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 404 Not Found\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Type: text/html\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngone",
+            )
+            .await
+            .unwrap();
+    });
+
+    let server = TestServer::start(PairingEncryption::X25519).await;
+    let keys = server.state.pairing_keys.current().unwrap();
+    let device = TestDevice::new(33);
+    device.enroll(&server.root.join("data"));
+    let body = json!({
+        "method": "GET",
+        "url": format!("http://{upstream_address}/missing"),
+        "headers": [["cookie", "s=1"]],
+    })
+    .to_string();
+    let inner = signed_inner(&device, "POST", "/v2/browser/proxy", body.as_bytes());
+    let opened = seal_request(&keys, EncryptionProtocol::X25519, &inner)
+        .send_and_open(server.address)
+        .await;
+    upstream_task.await.unwrap();
+    assert_eq!(
+        opened.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&opened.body)
+    );
+    assert_eq!(opened.headers["x-todex-proxy-status"], "404");
+    let pairs: Vec<(String, String)> = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(opened.headers["x-todex-proxy-headers"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let cookies: Vec<&str> = pairs
+        .iter()
+        .filter(|(name, _)| name == "set-cookie")
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(cookies, ["a=1", "b=2"]);
+    assert_eq!(opened.body, b"gone");
+}
