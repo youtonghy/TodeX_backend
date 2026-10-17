@@ -43,6 +43,9 @@ const OPENSSH_HEADER: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
 const OPENSSH_FOOTER: &str = "-----END OPENSSH PRIVATE KEY-----";
 /// Base64 line width `ssh-key` requires; OpenSSH writes 70 but reads any.
 const OPENSSH_LINE_WIDTH: usize = 70;
+const OPENSSH_MAGIC: &[u8] = b"openssh-key-v1\0";
+/// Padding block of an unencrypted key; every cipher block is a multiple.
+const OPENSSH_PADDING_BLOCK: usize = 8;
 /// Legacy PEM private keys: PKCS#1 RSA/DSA, SEC1 EC, PKCS#8 (plain/encrypted).
 const PEM_HEADERS: &[(&str, &str)] = &[
     ("-----BEGIN RSA PRIVATE KEY-----", "ssh-rsa"),
@@ -453,59 +456,106 @@ fn normalize_openssh(text: &str) -> zeroize::Zeroizing<String> {
     out
 }
 
-/// Shortens the `1, 2, 3, …` padding of an unencrypted key to less than one
-/// block. OpenSSH only checks the byte sequence, so some tools (Termius) pad
-/// a whole extra block, which `ssh-key` rejects.
-fn trim_excess_padding(blob: &mut Vec<u8>) {
-    const MAGIC: &[u8] = b"openssh-key-v1\0";
-    const BLOCK: usize = 8;
-    fn u32_at(blob: &[u8], at: usize) -> Option<usize> {
-        let bytes = blob.get(at..at.checked_add(4)?)?;
-        Some(u32::from_be_bytes(bytes.try_into().ok()?) as usize)
+fn u32_at(blob: &[u8], at: usize) -> Option<usize> {
+    let bytes = blob.get(at..at.checked_add(4)?)?;
+    Some(u32::from_be_bytes(bytes.try_into().ok()?) as usize)
+}
+
+/// An SSH `string` at `at`: its bytes and the offset just past it.
+fn string_at(blob: &[u8], at: usize) -> Option<(&[u8], usize)> {
+    let len = u32_at(blob, at)?;
+    let end = (at + 4).checked_add(len)?;
+    Some((blob.get(at + 4..end)?, end))
+}
+
+fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend((bytes.len() as u32).to_be_bytes());
+    out.extend(bytes);
+}
+
+/// Cipher name and offset of the private section `string` in a decoded
+/// OpenSSH private key.
+fn private_section_at(blob: &[u8]) -> Option<(&[u8], usize)> {
+    let at = blob
+        .starts_with(OPENSSH_MAGIC)
+        .then_some(OPENSSH_MAGIC.len())?;
+    let (cipher, at) = string_at(blob, at)?;
+    let (_kdf, at) = string_at(blob, at)?;
+    let (_kdf_options, at) = string_at(blob, at)?;
+    let count = u32_at(blob, at)?;
+    let mut at = at + 4;
+    for _ in 0..count {
+        at = string_at(blob, at)?.1;
     }
-    fn string_at(blob: &[u8], at: usize) -> Option<(&[u8], usize)> {
-        let len = u32_at(blob, at)?;
-        let end = (at + 4).checked_add(len)?;
-        Some((blob.get(at + 4..end)?, end))
-    }
-    let Some(private_at) = (|| {
-        if !blob.starts_with(MAGIC) {
-            return None;
-        }
-        let (cipher, at) = string_at(blob, MAGIC.len())?;
-        if cipher != b"none" {
-            return None;
-        }
-        let (_kdf, at) = string_at(blob, at)?;
-        let (_kdf_options, at) = string_at(blob, at)?;
-        let count = u32_at(blob, at)?;
-        let mut at = at + 4;
-        for _ in 0..count {
-            at = string_at(blob, at)?.1;
-        }
-        Some(at)
-    })() else {
-        return;
-    };
-    let Some((private, end)) = string_at(blob, private_at) else {
-        return;
-    };
-    let padding = usize::from(*private.last().unwrap_or(&0));
-    if end != blob.len()
-        || padding < BLOCK
-        || padding > private.len()
-        || !private[private.len() - padding..]
+    Some((cipher, at))
+}
+
+/// Shortens a private section's `1, 2, 3, …` padding to less than
+/// [`OPENSSH_PADDING_BLOCK`] bytes, keeping its length aligned. OpenSSH only
+/// checks the byte sequence, so some tools (Termius) pad a whole extra block;
+/// `ssh-key` requires less than one. Returns whether anything changed.
+fn trim_padding(section: &mut Vec<u8>) -> bool {
+    let padding = usize::from(section.last().copied().unwrap_or(0));
+    if padding < OPENSSH_PADDING_BLOCK
+        || padding > section.len()
+        || !section[section.len() - padding..]
             .iter()
             .zip(1..)
             .all(|(&byte, expected)| byte == expected)
     {
-        return;
+        return false;
     }
-    let kept = padding % BLOCK;
-    let new_len = private.len() - padding + kept;
-    blob.truncate(end - padding);
-    blob.extend(1..=kept as u8);
-    blob[private_at..private_at + 4].copy_from_slice(&(new_len as u32).to_be_bytes());
+    let kept = padding % OPENSSH_PADDING_BLOCK;
+    section.truncate(section.len() - padding);
+    section.extend(1..=kept as u8);
+    true
+}
+
+/// [`trim_padding`] for an unencrypted key; encrypted sections are handled
+/// by [`decrypt_lenient`] once the passphrase is known.
+fn trim_excess_padding(blob: &mut Vec<u8>) {
+    let Some((b"none", at)) = private_section_at(blob) else {
+        return;
+    };
+    let Some((section, end)) = string_at(blob, at) else {
+        return;
+    };
+    let mut section = zeroize::Zeroizing::new(section.to_vec());
+    if end == blob.len() && trim_padding(&mut section) {
+        blob.truncate(at);
+        put_string(blob, &section);
+    }
+}
+
+/// [`PrivateKey::decrypt`] that also accepts the over-long padding
+/// [`trim_padding`] fixes. `ssh-key` keeps AEAD tags private, so only
+/// non-AEAD ciphers (OpenSSH's default `aes256-ctr` among them) get the
+/// fallback.
+fn decrypt_lenient(private: &PrivateKey, passphrase: &str) -> Result<PrivateKey, ssh_key::Error> {
+    let error = match private.decrypt(passphrase) {
+        Ok(key) => return Ok(key),
+        Err(error) => error,
+    };
+    let cipher = private.cipher();
+    let Some(ciphertext) = private.key_data().encrypted().filter(|_| !cipher.has_tag()) else {
+        return Err(error);
+    };
+    let (key, iv) = private.kdf().derive_key_and_iv(cipher, passphrase)?;
+    let mut section = zeroize::Zeroizing::new(ciphertext.to_vec());
+    cipher.decrypt(&key, &iv, &mut section, None)?;
+    if !trim_padding(&mut section) {
+        return Err(error);
+    }
+    // Reparse as an unencrypted key so `ssh-key` still checks the checkints
+    // (a wrong passphrase) and that the private half matches the public one.
+    let mut blob = zeroize::Zeroizing::new(OPENSSH_MAGIC.to_vec());
+    for field in [&b"none"[..], b"none", b""] {
+        put_string(&mut blob, field);
+    }
+    blob.extend(1u32.to_be_bytes());
+    put_string(&mut blob, &private.public_key().to_bytes()?);
+    put_string(&mut blob, &section);
+    PrivateKey::from_bytes(&blob)
 }
 
 /// Reads a candidate key file: regular files (or symlinks to files inside
@@ -669,8 +719,7 @@ fn prepare_import(
         if let Some(passphrase) = checked_passphrase(request.passphrase.as_deref())? {
             // Only checks the passphrase and recovers the comment; the file
             // is written still encrypted.
-            let decrypted = private
-                .decrypt(passphrase)
+            let decrypted = decrypt_lenient(&private, passphrase)
                 .map_err(|_| invalid("passphrase does not decrypt privateKey"))?;
             comment = decrypted.comment().to_owned();
         }
@@ -1094,42 +1143,62 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("locked")).unwrap(), *locked);
     }
 
-    #[test]
-    fn parses_keys_padded_past_one_block() {
-        // Termius pads the private section with a whole extra block.
-        let (private, public) = generate_pair(KeyKind::Ed25519, "termius", None).unwrap();
+    /// Re-pads `private` the way Termius does: one whole extra block.
+    fn pad_extra_block(private: &str, passphrase: Option<&str>) -> String {
+        let key = PrivateKey::from_openssh(private).unwrap();
+        let cipher = key.cipher();
         let body: String = private
             .lines()
-            .filter(|l| !l.starts_with("-----"))
+            .filter(|line| !line.starts_with("-----"))
             .collect();
         let mut blob = STANDARD.decode(body).unwrap();
-        let padding = usize::from(*blob.last().unwrap());
-        let private_len_at = blob.len()
-            - (padding..)
-                .find(|&n| {
-                    let at = blob.len() - n - 4;
-                    u32::from_be_bytes(blob[at..at + 4].try_into().unwrap()) as usize == n
-                })
-                .unwrap()
-            - 4;
-        blob.truncate(blob.len() - padding);
-        blob.extend(1..=(padding + 8) as u8);
-        let new_len = (blob.len() - private_len_at - 4) as u32;
-        blob[private_len_at..private_len_at + 4].copy_from_slice(&new_len.to_be_bytes());
-        let padded = format!(
+        let (_, at) = private_section_at(&blob).unwrap();
+        let mut section = string_at(&blob, at).unwrap().0.to_vec();
+        let secret = passphrase.map(|p| key.kdf().derive_key_and_iv(cipher, p).unwrap());
+        if let Some((key, iv)) = &secret {
+            cipher.decrypt(key, iv, &mut section, None).unwrap();
+        }
+        let last = *section.last().unwrap();
+        let padding = if section.ends_with(&(1..=last).collect::<Vec<_>>()) {
+            usize::from(last)
+        } else {
+            0
+        };
+        section.truncate(section.len() - padding);
+        section.extend(1..=(padding + cipher.block_size()) as u8);
+        if let Some((key, iv)) = &secret {
+            cipher.encrypt(key, iv, &mut section).unwrap();
+        }
+        blob.truncate(at);
+        put_string(&mut blob, &section);
+        format!(
             "{OPENSSH_HEADER}\n{}\n{OPENSSH_FOOTER}\n",
             STANDARD.encode(&blob)
-        );
+        )
+    }
+
+    #[test]
+    fn accepts_keys_padded_past_one_block() {
+        let (private, public) = generate_pair(KeyKind::Ed25519, "termius", None).unwrap();
+        let padded = pad_extra_block(&private, None);
         assert!(
             PrivateKey::from_openssh(&padded).is_err(),
             "ssh-key rejects it as is"
         );
-
         let Some(PrivateContent::OpenSsh(key)) = classify_private(&padded) else {
             panic!("padded key not parsed");
         };
         assert_eq!(key.public_key().to_openssh().unwrap(), public);
         assert_eq!(key.to_openssh(LineEnding::LF).unwrap(), private);
+
+        let (locked, _) = generate_pair(KeyKind::Ed25519, "termius", Some("pw")).unwrap();
+        let padded = pad_extra_block(&locked, Some("pw"));
+        let Some(PrivateContent::OpenSsh(key)) = classify_private(&padded) else {
+            panic!("padded encrypted key not parsed");
+        };
+        assert!(key.decrypt("pw").is_err(), "ssh-key rejects it as is");
+        assert_eq!(decrypt_lenient(&key, "pw").unwrap().comment(), "termius");
+        assert!(decrypt_lenient(&key, "nope").is_err());
     }
 
     /// Seconds in dev builds thanks to the `rsa`/`num-bigint-dig` opt-level
