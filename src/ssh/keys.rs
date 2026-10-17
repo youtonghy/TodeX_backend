@@ -39,6 +39,9 @@ const AGENT_LIMITS: CommandLimits = CommandLimits {
 const RESERVED_PREFIXES: &[&str] = &["config", "known_hosts", "authorized_keys", "environment"];
 
 const OPENSSH_HEADER: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
+const OPENSSH_FOOTER: &str = "-----END OPENSSH PRIVATE KEY-----";
+/// Base64 line width `ssh-key` requires; OpenSSH writes 70 but reads any.
+const OPENSSH_LINE_WIDTH: usize = 70;
 /// Legacy PEM private keys: PKCS#1 RSA/DSA, SEC1 EC, PKCS#8 (plain/encrypted).
 const PEM_HEADERS: &[(&str, &str)] = &[
     ("-----BEGIN RSA PRIVATE KEY-----", "ssh-rsa"),
@@ -402,7 +405,7 @@ enum PrivateContent {
 fn classify_private(text: &str) -> Option<PrivateContent> {
     let text = text.trim();
     if text.starts_with(OPENSSH_HEADER) {
-        return Some(match PrivateKey::from_openssh(text) {
+        return Some(match PrivateKey::from_openssh(&*rewrap_openssh(text)) {
             Ok(key) => PrivateContent::OpenSsh(Box::new(key)),
             Err(_) => PrivateContent::OpenSshInvalid,
         });
@@ -414,6 +417,33 @@ fn classify_private(text: &str) -> Option<PrivateContent> {
             algorithm,
             encrypted: header.contains("ENCRYPTED") || text.contains("Proc-Type: 4,ENCRYPTED"),
         })
+}
+
+/// Re-wraps an OpenSSH private key body at [`OPENSSH_LINE_WIDTH`] columns.
+/// OpenSSH ignores line width and stray whitespace, so keys written by other
+/// tools (wrapped at 64 columns, or with trailing spaces from a paste) are
+/// valid there; `ssh-key` rejects anything but its own layout.
+fn rewrap_openssh(text: &str) -> zeroize::Zeroizing<String> {
+    let body = text
+        .strip_prefix(OPENSSH_HEADER)
+        .and_then(|rest| rest.split_once(OPENSSH_FOOTER))
+        .map_or("", |(body, _)| body);
+    let body = zeroize::Zeroizing::new(
+        body.bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<u8>>(),
+    );
+    let mut out = zeroize::Zeroizing::new(String::with_capacity(text.len()));
+    out.push_str(OPENSSH_HEADER);
+    out.push('\n');
+    for line in body.chunks(OPENSSH_LINE_WIDTH) {
+        // Non-ASCII bytes were never valid base64; let the parser reject them.
+        out.push_str(&String::from_utf8_lossy(line));
+        out.push('\n');
+    }
+    out.push_str(OPENSSH_FOOTER);
+    out.push('\n');
+    out
 }
 
 /// Reads a candidate key file: regular files (or symlinks to files inside
@@ -949,8 +979,20 @@ mod tests {
         ));
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "only config");
 
-        let crlf = private.replace('\n', "\r\n");
-        let key = service.import_key(import("laptop", &crlf)).await.unwrap();
+        // Other tools wrap at 64 columns; pastes add CRLF and stray spaces.
+        let lines: Vec<&str> = private.lines().collect();
+        let body = lines[1..lines.len() - 1].concat();
+        let mut rewrapped = vec![lines[0].to_owned()];
+        rewrapped.extend(
+            body.as_bytes()
+                .chunks(64)
+                .map(|c| format!("  {} ", std::str::from_utf8(c).unwrap())),
+        );
+        rewrapped.push(lines[lines.len() - 1].to_owned());
+        let key = service
+            .import_key(import("laptop", &rewrapped.join("\r\n")))
+            .await
+            .unwrap();
         assert_eq!(key.comment.as_deref(), Some("me@laptop"));
         assert_eq!(key.public_key.as_deref(), Some(public.as_str()));
         assert_eq!(fs::read_to_string(dir.join("laptop")).unwrap(), *private);
