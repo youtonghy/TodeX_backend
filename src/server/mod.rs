@@ -147,20 +147,28 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        // Another test thread may have registered these callsites while no
-        // subscriber wanted them; recompute so this one sees its spans.
-        tracing::callsite::rebuild_interest_cache();
         let app = Router::new()
             .route("/v2/events", get(|| async { "ok" }))
             .layer(TraceLayer::new_for_http().make_span_with(request_span::<Body>));
-        app.oneshot(
-            Request::get("/v2/events?auth_sig=SECRET-SIG&auth_nonce=SECRET-NONCE")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let mut logged = String::new();
+        // Another test thread may register these callsites while no
+        // subscriber wants them, racing this one's registration and leaving
+        // them cached as disabled; recompute and retry until they log.
+        for _ in 0..5 {
+            tracing::callsite::rebuild_interest_cache();
+            app.clone()
+                .oneshot(
+                    Request::get("/v2/events?auth_sig=SECRET-SIG&auth_nonce=SECRET-NONCE")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            if logged.contains("path=") {
+                break;
+            }
+        }
         assert!(logged.contains("path=/v2/events"), "{logged}");
         assert!(!logged.contains("SECRET"), "{logged}");
     }
