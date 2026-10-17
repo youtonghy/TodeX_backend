@@ -50,7 +50,10 @@ impl CliSettingsTarget {
     }
 
     pub(crate) fn file(self) -> SettingsFile {
-        let dirs = crate::agent_providers::AgentDirs::detect();
+        self.file_in(&crate::agent_providers::AgentDirs::detect())
+    }
+
+    pub(crate) fn file_in(self, dirs: &crate::agent_providers::AgentDirs) -> SettingsFile {
         match self {
             Self::ClaudeCode => SettingsFile::json(dirs.claude_dir().join("settings.json")),
             Self::Codex => SettingsFile {
@@ -60,7 +63,7 @@ impl CliSettingsTarget {
             },
             Self::Pi => SettingsFile {
                 pi_lock: true,
-                ..SettingsFile::json(crate::agent_providers::pi::settings_path(&dirs))
+                ..SettingsFile::json(crate::agent_providers::pi::settings_path(dirs))
             },
         }
     }
@@ -77,7 +80,7 @@ pub(crate) struct SettingsFile {
 }
 
 impl SettingsFile {
-    fn json(path: PathBuf) -> Self {
+    pub(crate) fn json(path: PathBuf) -> Self {
         Self {
             path,
             format: SettingsFormat::Json,
@@ -182,6 +185,36 @@ pub(crate) fn apply_patch(
             text.into_bytes()
         }
     };
+    write(file, &bytes)
+}
+
+/// Rewrites a JSON settings file through `edit`, under the same revision
+/// check and locks as [`apply_patch`]; for edits a merge patch cannot
+/// express, such as changing one entry of an array.
+pub(crate) fn modify(
+    file: &SettingsFile,
+    expected_revision: &str,
+    edit: impl FnOnce(&mut Map<String, Value>) -> Result<(), AppError>,
+) -> Result<SettingsDocument, AppError> {
+    if file.format != SettingsFormat::Json {
+        return Err(AppError::Unsupported(
+            "only JSON settings can be modified in place".to_owned(),
+        ));
+    }
+    let _guard = WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_lock = PiLock::acquire(file)?;
+    let current = checked(file, expected_revision)?;
+    let Some(mut settings) = current.settings else {
+        return Err(AppError::Conflict(format!(
+            "{} does not parse; fix it in the raw editor first",
+            current.path
+        )));
+    };
+    edit(&mut settings)?;
+    let mut bytes = serde_json::to_vec_pretty(&Value::Object(settings))?;
+    bytes.push(b'\n');
     write(file, &bytes)
 }
 
@@ -405,7 +438,7 @@ fn merge_patch_toml(
     Ok(())
 }
 
-fn merge_patch(target: &mut Value, patch: &Value) {
+pub(crate) fn merge_patch(target: &mut Value, patch: &Value) {
     let Value::Object(patch) = patch else {
         *target = patch.clone();
         return;

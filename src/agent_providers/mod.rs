@@ -164,6 +164,20 @@ impl AgentDirs {
         }
     }
 
+    /// Every directory under `pi_dir`'s parent, for tests of Pi files.
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_pi_dir(pi_dir: PathBuf) -> Self {
+        let root = pi_dir.join("other-agents");
+        Self {
+            codex_home: root.join("codex"),
+            claude_dir: root.join("claude"),
+            grok_home: root.join("grok"),
+            grok_auth_path: root.join("grok").join("auth.json"),
+            opencode_dir: root.join("opencode"),
+            pi_dir,
+        }
+    }
+
     /// Pi's agent directory (`$PI_CODING_AGENT_DIR` or `~/.pi/agent`).
     pub(crate) fn pi_dir(&self) -> &std::path::Path {
         &self.pi_dir
