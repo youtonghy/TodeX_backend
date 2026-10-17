@@ -9710,14 +9710,16 @@ mod tests {
 
     /// The turn ended because it was cancelled. A cancel that lands while
     /// Claude Code is still in its startup handshake is journalled by the
-    /// driver as a failed initialization rather than `turn.cancelled`.
+    /// driver as a failed initialization rather than `turn.cancelled`, and a
+    /// session stopped before its queued turn started fails that turn.
     #[cfg(unix)]
     fn assert_ended_by_cancel(terminal: &crate::conversation::ConversationEvent) {
         let cancelled = terminal.event_type == "turn.cancelled"
             || (terminal.event_type == "turn.failed"
-                && terminal.payload["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("initialization cancelled")));
+                && terminal.payload["message"].as_str().is_some_and(|message| {
+                    message.contains("initialization cancelled")
+                        || message.contains("session closed before the turn started")
+                }));
         assert!(cancelled, "{terminal:?}");
     }
 
