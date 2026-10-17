@@ -1,10 +1,11 @@
 //! SSH key inventory, import and generation in the backend user's `~/.ssh`.
 //!
-//! Keys are parsed in-process with the RustCrypto `ssh-key` crate, so
-//! passphrases never appear in a child's argv. Only OpenSSH-format private
-//! keys are fully understood; legacy PEM keys (PKCS#1/PKCS#8/SEC1) are listed
-//! with whatever their `.pub` provides and cannot be imported. Responses carry
-//! public material only.
+//! Imports are validated by the system `ssh-keygen`, so a key is accepted
+//! exactly when the `ssh` TodeX connects with can load it; a passphrase
+//! reaches it through the askpass helper, never argv or the environment.
+//! Listing and generation use the RustCrypto `ssh-key` crate in-process; keys
+//! it cannot read (legacy PEM, or layouts only OpenSSH tolerates) are listed
+//! with whatever their `.pub` provides. Responses carry public material only.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -14,16 +15,16 @@ use std::{
     time::Duration,
 };
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use ssh_key::{public::KeyData, Algorithm, EcdsaCurve, HashAlg, LineEnding, PrivateKey, PublicKey};
 use zeroize::Zeroize;
 
-use super::SshService;
+use super::{SshService, ASKPASS_DIR};
 use crate::{
     error::AppError,
-    external_command::{self, prepare_captured, CommandLimits},
+    external_command::{self, prepare_captured, CommandLimits, ExternalCommandError},
+    remote_fs::askpass::{self, AskpassSecret},
     secure_fs,
 };
 
@@ -36,16 +37,15 @@ const AGENT_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_secs(5),
     output_limit: 256 * 1024,
 };
+/// Generous: bcrypt-pbkdf with many rounds takes seconds on slow machines.
+const KEYGEN_LIMITS: CommandLimits = CommandLimits {
+    timeout: Duration::from_secs(30),
+    output_limit: 64 * 1024,
+};
 /// Files OpenSSH gives a meaning other than "key"; never listed or created.
 const RESERVED_PREFIXES: &[&str] = &["config", "known_hosts", "authorized_keys", "environment"];
 
 const OPENSSH_HEADER: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
-const OPENSSH_FOOTER: &str = "-----END OPENSSH PRIVATE KEY-----";
-/// Base64 line width `ssh-key` requires; OpenSSH writes 70 but reads any.
-const OPENSSH_LINE_WIDTH: usize = 70;
-const OPENSSH_MAGIC: &[u8] = b"openssh-key-v1\0";
-/// Padding block of an unencrypted key; every cipher block is a multiple.
-const OPENSSH_PADDING_BLOCK: usize = 8;
 /// Legacy PEM private keys: PKCS#1 RSA/DSA, SEC1 EC, PKCS#8 (plain/encrypted).
 const PEM_HEADERS: &[(&str, &str)] = &[
     ("-----BEGIN RSA PRIVATE KEY-----", "ssh-rsa"),
@@ -223,7 +223,8 @@ impl SshService {
         if cfg!(unix) && std::env::var_os("SSH_AUTH_SOCK").is_none_or(|sock| sock.is_empty()) {
             return None;
         }
-        let mut command = external_command::secure_command(ssh_add_program(&self.inner.ssh_bin));
+        let mut command =
+            external_command::secure_command(ssh_tool(&self.inner.ssh_bin, "ssh-add"));
         command.arg("-L");
         prepare_captured(&mut command, false);
         match external_command::run(command, None, AGENT_LIMITS).await {
@@ -242,14 +243,147 @@ impl SshService {
     pub async fn import_key(&self, request: KeyImportRequest) -> Result<SshKeyView, AppError> {
         valid_key_name(&request.name)?;
         let dir = self.ssh_dir()?;
+        let (private, public) = self.prepare_import(&request).await?;
         let name = request.name.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-            let (private, public) = prepare_import(&request)?;
-            write_key_pair(&dir, &request.name, &private, &public)
+        drop(request);
+        let file_name = name.clone();
+        tokio::task::spawn_blocking(move || write_key_pair(&dir, &file_name, &private, &public))
+            .await
+            .map_err(|error| AppError::Anyhow(error.into()))??;
+        self.key_view(&name).await
+    }
+
+    /// Validates an import with the system `ssh-keygen` and returns the
+    /// private key file as submitted (LF line endings, still encrypted if it
+    /// was) and the public key line.
+    async fn prepare_import(
+        &self,
+        request: &KeyImportRequest,
+    ) -> Result<(zeroize::Zeroizing<String>, String), AppError> {
+        let invalid = |message: &str| AppError::InvalidRequest(message.to_owned());
+        if request.private_key.len() as u64 > MAX_KEY_FILE_BYTES {
+            return Err(invalid("privateKey is too large"));
+        }
+        let passphrase = checked_passphrase(request.passphrase.as_deref())?;
+        let supplied = request
+            .public_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                PublicKey::from_openssh(line)
+                    .map_err(|_| invalid("publicKey is not a valid OpenSSH public key"))
+            })
+            .transpose()?;
+        let mut private =
+            zeroize::Zeroizing::new(request.private_key.replace("\r\n", "\n").trim().to_owned());
+        private.push('\n');
+
+        let derived = match self.keygen(&["-y"], &private, passphrase).await? {
+            Ok(stdout) => stdout,
+            Err(stderr) if !is_wrong_passphrase(&stderr) => {
+                return Err(AppError::InvalidRequest(format!(
+                    "privateKey cannot be loaded by ssh-keygen: {}",
+                    keygen_reason(&stderr)
+                )))
+            }
+            Err(_) if passphrase.is_some() => {
+                return Err(invalid("passphrase does not decrypt privateKey"))
+            }
+            Err(_) => {
+                // Without the passphrase only the public half is readable
+                // (OpenSSH format keeps it in clear); it must match publicKey.
+                let Some(supplied) = supplied else {
+                    return Err(invalid(
+                        "privateKey is encrypted; enter its passphrase (or send its publicKey) to import it",
+                    ));
+                };
+                let listed = self
+                    .keygen(&["-l", "-E", "sha256"], &private, None)
+                    .await?
+                    .map_err(|_| invalid("privateKey is encrypted; provide its passphrase"))?;
+                if listed.split_whitespace().nth(1)
+                    != Some(sha256_fingerprint(supplied.key_data()).as_str())
+                {
+                    return Err(invalid("publicKey does not match privateKey"));
+                }
+                let public = supplied.to_openssh().map_err(encoding_error)?;
+                return Ok((private, public));
+            }
+        };
+        let derived = derived.lines().next().unwrap_or_default().trim();
+        if derived.split_whitespace().count() < 2 {
+            return Err(AppError::Anyhow(anyhow::anyhow!(
+                "ssh-keygen printed no public key"
+            )));
+        }
+        let public = match supplied {
+            Some(supplied) => {
+                // Type and key, without the comment.
+                fn key_of(line: &str) -> Vec<&str> {
+                    line.split_whitespace().take(2).collect()
+                }
+                let supplied = supplied.to_openssh().map_err(encoding_error)?;
+                if key_of(&supplied) != key_of(derived) {
+                    return Err(invalid("publicKey does not match privateKey"));
+                }
+                supplied
+            }
+            None => derived.to_owned(),
+        };
+        Ok((private, public))
+    }
+
+    /// Runs `ssh-keygen <args> -f <copy>` on a one-shot owner-only copy of
+    /// `private`. A passphrase prompt is answered by the askpass helper from
+    /// a one-shot file (refused without `passphrase`), so the passphrase is in
+    /// neither argv nor the environment. Returns stdout on success, stderr on
+    /// failure.
+    async fn keygen(
+        &self,
+        args: &[&str],
+        private: &str,
+        passphrase: Option<&str>,
+    ) -> Result<Result<String, String>, AppError> {
+        // Both files live with the askpass secrets: owner-only, deleted when
+        // the guards drop, purged at startup after a crash.
+        let dir = self.inner.dir.join(ASKPASS_DIR);
+        let private = zeroize::Zeroizing::new(private.to_owned());
+        let passphrase = zeroize::Zeroizing::new(passphrase.unwrap_or_default().to_owned());
+        let (key_file, secret) = tokio::task::spawn_blocking(move || {
+            // An empty secret makes the helper refuse the prompt.
+            Ok::<_, io::Error>((
+                AskpassSecret::create(&dir, &private)?,
+                AskpassSecret::create(&dir, &passphrase)?,
+            ))
         })
         .await
         .map_err(|error| AppError::Anyhow(error.into()))??;
-        self.key_view(&name).await
+        let mut command =
+            external_command::secure_command(ssh_tool(&self.inner.ssh_bin, "ssh-keygen"));
+        command
+            .args(args)
+            .arg("-f")
+            .arg(key_file.path())
+            .env("SSH_ASKPASS", keygen_askpass()?)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env(askpass::FILE_ENV, secret.path());
+        prepare_captured(&mut command, false);
+        let output = external_command::run(command, None, KEYGEN_LIMITS)
+            .await
+            .map_err(|error| match error {
+                ExternalCommandError::NotFound => {
+                    AppError::Unsupported("ssh-keygen executable not found".to_owned())
+                }
+                error => AppError::Anyhow(anyhow::anyhow!("ssh-keygen failed: {error}")),
+            })?;
+        let path = key_file.path().display().to_string();
+        drop((key_file, secret));
+        Ok(if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).replace(&path, "privateKey"))
+        })
     }
 
     pub async fn generate_key(&self, request: KeyGenerateRequest) -> Result<SshKeyView, AppError> {
@@ -327,19 +461,20 @@ fn checked_passphrase(passphrase: Option<&str>) -> Result<Option<&str>, AppError
     }
 }
 
-/// `ssh-add` from `PATH` for a bare `ssh_bin`, otherwise its sibling file.
-fn ssh_add_program(ssh_bin: &str) -> PathBuf {
+/// An OpenSSH tool (`ssh-add`, `ssh-keygen`) from `PATH` for a bare
+/// `ssh_bin`, otherwise its sibling file.
+fn ssh_tool(ssh_bin: &str, tool: &str) -> PathBuf {
     let ssh = Path::new(ssh_bin);
     match ssh.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
-            let mut name = std::ffi::OsString::from("ssh-add");
+            let mut name = std::ffi::OsString::from(tool);
             if let Some(extension) = ssh.extension() {
                 name.push(".");
                 name.push(extension);
             }
             parent.join(name)
         }
-        _ => PathBuf::from("ssh-add"),
+        _ => PathBuf::from(tool),
     }
 }
 
@@ -409,7 +544,7 @@ enum PrivateContent {
 fn classify_private(text: &str) -> Option<PrivateContent> {
     let text = text.trim();
     if text.starts_with(OPENSSH_HEADER) {
-        return Some(match PrivateKey::from_openssh(&*normalize_openssh(text)) {
+        return Some(match PrivateKey::from_openssh(text) {
             Ok(key) => PrivateContent::OpenSsh(Box::new(key)),
             Err(_) => PrivateContent::OpenSshInvalid,
         });
@@ -421,141 +556,6 @@ fn classify_private(text: &str) -> Option<PrivateContent> {
             algorithm,
             encrypted: header.contains("ENCRYPTED") || text.contains("Proc-Type: 4,ENCRYPTED"),
         })
-}
-
-/// Rewrites an OpenSSH private key into the exact layout `ssh-key` parses.
-/// OpenSSH ignores line width and stray whitespace, so keys written by other
-/// tools (wrapped at 64 columns, or with trailing spaces from a paste) are
-/// valid there; `ssh-key` rejects anything but 70-column armor. Undecodable
-/// input is returned unchanged for the parser to reject.
-fn normalize_openssh(text: &str) -> zeroize::Zeroizing<String> {
-    let body = text
-        .strip_prefix(OPENSSH_HEADER)
-        .and_then(|rest| rest.split_once(OPENSSH_FOOTER))
-        .map_or("", |(body, _)| body);
-    let body = zeroize::Zeroizing::new(
-        body.bytes()
-            .filter(|byte| !byte.is_ascii_whitespace())
-            .collect::<Vec<u8>>(),
-    );
-    let Ok(blob) = STANDARD.decode(&*body) else {
-        return zeroize::Zeroizing::new(text.to_owned());
-    };
-    let mut blob = zeroize::Zeroizing::new(blob);
-    trim_excess_padding(&mut blob);
-    let body = zeroize::Zeroizing::new(STANDARD.encode(&*blob));
-    let mut out = zeroize::Zeroizing::new(String::with_capacity(text.len()));
-    out.push_str(OPENSSH_HEADER);
-    out.push('\n');
-    for line in body.as_bytes().chunks(OPENSSH_LINE_WIDTH) {
-        out.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
-        out.push('\n');
-    }
-    out.push_str(OPENSSH_FOOTER);
-    out.push('\n');
-    out
-}
-
-fn u32_at(blob: &[u8], at: usize) -> Option<usize> {
-    let bytes = blob.get(at..at.checked_add(4)?)?;
-    Some(u32::from_be_bytes(bytes.try_into().ok()?) as usize)
-}
-
-/// An SSH `string` at `at`: its bytes and the offset just past it.
-fn string_at(blob: &[u8], at: usize) -> Option<(&[u8], usize)> {
-    let len = u32_at(blob, at)?;
-    let end = (at + 4).checked_add(len)?;
-    Some((blob.get(at + 4..end)?, end))
-}
-
-fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend((bytes.len() as u32).to_be_bytes());
-    out.extend(bytes);
-}
-
-/// Cipher name and offset of the private section `string` in a decoded
-/// OpenSSH private key.
-fn private_section_at(blob: &[u8]) -> Option<(&[u8], usize)> {
-    let at = blob
-        .starts_with(OPENSSH_MAGIC)
-        .then_some(OPENSSH_MAGIC.len())?;
-    let (cipher, at) = string_at(blob, at)?;
-    let (_kdf, at) = string_at(blob, at)?;
-    let (_kdf_options, at) = string_at(blob, at)?;
-    let count = u32_at(blob, at)?;
-    let mut at = at + 4;
-    for _ in 0..count {
-        at = string_at(blob, at)?.1;
-    }
-    Some((cipher, at))
-}
-
-/// Shortens a private section's `1, 2, 3, …` padding to less than
-/// [`OPENSSH_PADDING_BLOCK`] bytes, keeping its length aligned. OpenSSH only
-/// checks the byte sequence, so some tools (Termius) pad a whole extra block;
-/// `ssh-key` requires less than one. Returns whether anything changed.
-fn trim_padding(section: &mut Vec<u8>) -> bool {
-    let padding = usize::from(section.last().copied().unwrap_or(0));
-    if padding < OPENSSH_PADDING_BLOCK
-        || padding > section.len()
-        || !section[section.len() - padding..]
-            .iter()
-            .zip(1..)
-            .all(|(&byte, expected)| byte == expected)
-    {
-        return false;
-    }
-    let kept = padding % OPENSSH_PADDING_BLOCK;
-    section.truncate(section.len() - padding);
-    section.extend(1..=kept as u8);
-    true
-}
-
-/// [`trim_padding`] for an unencrypted key; encrypted sections are handled
-/// by [`decrypt_lenient`] once the passphrase is known.
-fn trim_excess_padding(blob: &mut Vec<u8>) {
-    let Some((b"none", at)) = private_section_at(blob) else {
-        return;
-    };
-    let Some((section, end)) = string_at(blob, at) else {
-        return;
-    };
-    let mut section = zeroize::Zeroizing::new(section.to_vec());
-    if end == blob.len() && trim_padding(&mut section) {
-        blob.truncate(at);
-        put_string(blob, &section);
-    }
-}
-
-/// [`PrivateKey::decrypt`] that also accepts the over-long padding
-/// [`trim_padding`] fixes. `ssh-key` keeps AEAD tags private, so only
-/// non-AEAD ciphers (OpenSSH's default `aes256-ctr` among them) get the
-/// fallback.
-fn decrypt_lenient(private: &PrivateKey, passphrase: &str) -> Result<PrivateKey, ssh_key::Error> {
-    let error = match private.decrypt(passphrase) {
-        Ok(key) => return Ok(key),
-        Err(error) => error,
-    };
-    let cipher = private.cipher();
-    let Some(ciphertext) = private.key_data().encrypted().filter(|_| !cipher.has_tag()) else {
-        return Err(error);
-    };
-    let (key, iv) = private.kdf().derive_key_and_iv(cipher, passphrase)?;
-    let mut section = zeroize::Zeroizing::new(ciphertext.to_vec());
-    cipher.decrypt(&key, &iv, &mut section, None)?;
-    if !trim_padding(&mut section) {
-        return Err(error);
-    }
-    // Reparse as an unencrypted key so `ssh-key` still checks the checkints
-    // (a wrong passphrase) and that the private half matches the public one.
-    let mut blob = zeroize::Zeroizing::new(OPENSSH_MAGIC.to_vec());
-    for field in [&b"none"[..], b"none", b""] {
-        put_string(&mut blob, field);
-    }
-    blob.extend(1u32.to_be_bytes());
-    put_string(&mut blob, &private.public_key().to_bytes()?);
-    put_string(&mut blob, &section);
-    PrivateKey::from_bytes(&blob)
 }
 
 /// Reads a candidate key file: regular files (or symlinks to files inside
@@ -694,56 +694,31 @@ fn key_view(name: String, pair: ScannedPair) -> SshKeyView {
     }
 }
 
-/// Validates an import and returns the canonical private key file (LF line
-/// endings, still encrypted if it was) and the public key line.
-fn prepare_import(
-    request: &KeyImportRequest,
-) -> Result<(zeroize::Zeroizing<String>, String), AppError> {
-    let invalid = |message: &str| AppError::InvalidRequest(message.to_owned());
-    if request.private_key.len() as u64 > MAX_KEY_FILE_BYTES {
-        return Err(invalid("privateKey is too large"));
-    }
-    let normalized = zeroize::Zeroizing::new(request.private_key.replace("\r\n", "\n"));
-    let private = match classify_private(&normalized) {
-        Some(PrivateContent::OpenSsh(private)) => private,
-        Some(PrivateContent::Pem { .. }) => {
-            return Err(invalid(
-                "only OpenSSH-format private keys can be imported; convert a PEM key with \
-                 `ssh-keygen -p -f <file>` first",
-            ))
-        }
-        _ => return Err(invalid("privateKey is not a valid OpenSSH private key")),
-    };
-    let mut comment = private.comment().to_owned();
-    if private.is_encrypted() {
-        if let Some(passphrase) = checked_passphrase(request.passphrase.as_deref())? {
-            // Only checks the passphrase and recovers the comment; the file
-            // is written still encrypted.
-            let decrypted = decrypt_lenient(&private, passphrase)
-                .map_err(|_| invalid("passphrase does not decrypt privateKey"))?;
-            comment = decrypted.comment().to_owned();
-        }
-    }
-    let mut public = private.public_key().clone();
-    match request
-        .public_key
-        .as_deref()
+/// `ssh-keygen` reports a key it could not decrypt, with or without a
+/// passphrase, this way (OpenSSH's `SSH_ERR_KEY_WRONG_PASSPHRASE`).
+fn is_wrong_passphrase(stderr: &str) -> bool {
+    stderr.contains("incorrect passphrase")
+}
+
+/// The reason in `ssh-keygen`'s last error line, e.g. `invalid format` from
+/// `Load key "privateKey": invalid format`.
+fn keygen_reason(stderr: &str) -> String {
+    let line = stderr
+        .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        Some(line) => {
-            let supplied = PublicKey::from_openssh(line)
-                .map_err(|_| invalid("publicKey is not a valid OpenSSH public key"))?;
-            if supplied.key_data() != public.key_data() {
-                return Err(invalid("publicKey does not match privateKey"));
-            }
-            public = supplied;
-        }
-        None => public.set_comment(comment),
-    }
-    let private_file = private.to_openssh(LineEnding::LF).map_err(encoding_error)?;
-    let public_line = public.to_openssh().map_err(encoding_error)?;
-    Ok((private_file, public_line))
+        .rfind(|line| !line.is_empty())
+        .unwrap_or("unknown error");
+    let reason = line.rsplit_once("\": ").map_or(line, |(_, reason)| reason);
+    reason.chars().take(200).collect()
+}
+
+/// The askpass program for `ssh-keygen`: the daemon itself, or in tests a
+/// script answering like it.
+fn keygen_askpass() -> Result<PathBuf, AppError> {
+    #[cfg(all(test, unix))]
+    return Ok(tests::askpass_script());
+    #[cfg(not(all(test, unix)))]
+    super::askpass_program()
 }
 
 fn generate_pair(
@@ -832,14 +807,14 @@ mod pure_tests {
     use super::*;
 
     #[test]
-    fn resolves_ssh_add_next_to_ssh() {
-        assert_eq!(ssh_add_program("ssh"), PathBuf::from("ssh-add"));
+    fn resolves_ssh_tools_next_to_ssh() {
+        assert_eq!(ssh_tool("ssh", "ssh-add"), PathBuf::from("ssh-add"));
         assert_eq!(
-            ssh_add_program("/opt/ssh/bin/ssh"),
-            PathBuf::from("/opt/ssh/bin/ssh-add")
+            ssh_tool("/opt/ssh/bin/ssh", "ssh-keygen"),
+            PathBuf::from("/opt/ssh/bin/ssh-keygen")
         );
         assert_eq!(
-            ssh_add_program("tools/ssh.exe"),
+            ssh_tool("tools/ssh.exe", "ssh-add"),
             PathBuf::from("tools/ssh-add.exe")
         );
     }
@@ -918,7 +893,7 @@ mod pure_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::ssh::tests::{fixture, Fixture};
+    use crate::ssh::tests::{askpass_files, fixture, Fixture};
     use std::os::unix::fs::PermissionsExt;
 
     fn ssh_dir(fixture: &Fixture) -> PathBuf {
@@ -945,6 +920,43 @@ mod tests {
             public_key: None,
             passphrase: None,
         }
+    }
+
+    /// A stand-in for the daemon's askpass helper: answers with the secret
+    /// file's content and refuses when it is empty.
+    pub(super) fn askpass_script() -> PathBuf {
+        static SCRIPT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        SCRIPT
+            .get_or_init(|| {
+                let path = std::env::temp_dir().join(format!(
+                    "todex-test-askpass-{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                fs::write(
+                    &path,
+                    "#!/bin/sh\n[ -s \"$TODEX_SSH_ASKPASS_FILE\" ] || exit 1\n\
+                     cat \"$TODEX_SSH_ASKPASS_FILE\"; echo\n",
+                )
+                .unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+                path
+            })
+            .clone()
+    }
+
+    /// The real `ssh-keygen` from `PATH`.
+    fn system_keygen() -> PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join("ssh-keygen"))
+            .find(|path| path.is_file())
+            .expect("ssh-keygen on PATH")
+    }
+
+    /// [`fixture`] with the real `ssh-keygen` next to its fake `ssh`.
+    async fn keygen_fixture() -> Fixture {
+        let fixture = fixture("").await;
+        std::os::unix::fs::symlink(system_keygen(), fixture.root.join("ssh-keygen")).unwrap();
+        fixture
     }
 
     #[tokio::test]
@@ -1063,7 +1075,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_validates_and_never_overwrites() {
-        let fixture = fixture("").await;
+        let fixture = keygen_fixture().await;
         let service = &fixture.service;
         let dir = ssh_dir(&fixture);
         let (private, public) = generate_pair(KeyKind::Ed25519, "me@laptop", None).unwrap();
@@ -1106,7 +1118,11 @@ mod tests {
             .unwrap();
         assert_eq!(key.comment.as_deref(), Some("me@laptop"));
         assert_eq!(key.public_key.as_deref(), Some(public.as_str()));
-        assert_eq!(fs::read_to_string(dir.join("laptop")).unwrap(), *private);
+        // Stored as submitted, minus the CRLF: OpenSSH reads it as is.
+        assert_eq!(
+            fs::read_to_string(dir.join("laptop")).unwrap(),
+            rewrapped.join("\n") + "\n"
+        );
         assert_eq!(mode(&dir.join("laptop")), 0o600);
         assert_eq!(mode(&dir.join("laptop.pub")), 0o644);
         assert!(matches!(
@@ -1143,62 +1159,94 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("locked")).unwrap(), *locked);
     }
 
-    /// Re-pads `private` the way Termius does: one whole extra block.
-    fn pad_extra_block(private: &str, passphrase: Option<&str>) -> String {
-        let key = PrivateKey::from_openssh(private).unwrap();
-        let cipher = key.cipher();
+    /// Pads an unencrypted key's private section with a whole extra block,
+    /// as Termius does. OpenSSH accepts it; `ssh-key` 0.6 does not.
+    fn pad_extra_block(private: &str) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
         let body: String = private
             .lines()
             .filter(|line| !line.starts_with("-----"))
             .collect();
         let mut blob = STANDARD.decode(body).unwrap();
-        let (_, at) = private_section_at(&blob).unwrap();
-        let mut section = string_at(&blob, at).unwrap().0.to_vec();
-        let secret = passphrase.map(|p| key.kdf().derive_key_and_iv(cipher, p).unwrap());
-        if let Some((key, iv)) = &secret {
-            cipher.decrypt(key, iv, &mut section, None).unwrap();
-        }
-        let last = *section.last().unwrap();
-        let padding = if section.ends_with(&(1..=last).collect::<Vec<_>>()) {
-            usize::from(last)
+        // The private section is the blob's last string.
+        let len_at = (0..blob.len() - 4)
+            .rev()
+            .find(|&at| {
+                u32::from_be_bytes(blob[at..at + 4].try_into().unwrap()) as usize
+                    == blob.len() - at - 4
+            })
+            .unwrap();
+        let last = *blob.last().unwrap();
+        let padding = if blob.ends_with(&(1..=last).collect::<Vec<_>>()) {
+            last
         } else {
             0
         };
-        section.truncate(section.len() - padding);
-        section.extend(1..=(padding + cipher.block_size()) as u8);
-        if let Some((key, iv)) = &secret {
-            cipher.encrypt(key, iv, &mut section).unwrap();
-        }
-        blob.truncate(at);
-        put_string(&mut blob, &section);
+        blob.extend(padding + 1..=padding + 8);
+        let len = (blob.len() - len_at - 4) as u32;
+        blob[len_at..len_at + 4].copy_from_slice(&len.to_be_bytes());
+        let lines: Vec<String> = STANDARD
+            .encode(&blob)
+            .as_bytes()
+            .chunks(70)
+            .map(|chunk| String::from_utf8(chunk.to_vec()).unwrap())
+            .collect();
         format!(
-            "{OPENSSH_HEADER}\n{}\n{OPENSSH_FOOTER}\n",
-            STANDARD.encode(&blob)
+            "{OPENSSH_HEADER}\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+            lines.join("\n")
         )
     }
 
-    #[test]
-    fn accepts_keys_padded_past_one_block() {
-        let (private, public) = generate_pair(KeyKind::Ed25519, "termius", None).unwrap();
-        let padded = pad_extra_block(&private, None);
-        assert!(
-            PrivateKey::from_openssh(&padded).is_err(),
-            "ssh-key rejects it as is"
-        );
-        let Some(PrivateContent::OpenSsh(key)) = classify_private(&padded) else {
-            panic!("padded key not parsed");
-        };
-        assert_eq!(key.public_key().to_openssh().unwrap(), public);
-        assert_eq!(key.to_openssh(LineEnding::LF).unwrap(), private);
+    #[tokio::test]
+    async fn import_accepts_what_openssh_accepts() {
+        let fixture = keygen_fixture().await;
+        let service = &fixture.service;
 
-        let (locked, _) = generate_pair(KeyKind::Ed25519, "termius", Some("pw")).unwrap();
-        let padded = pad_extra_block(&locked, Some("pw"));
-        let Some(PrivateContent::OpenSsh(key)) = classify_private(&padded) else {
-            panic!("padded encrypted key not parsed");
-        };
-        assert!(key.decrypt("pw").is_err(), "ssh-key rejects it as is");
-        assert_eq!(decrypt_lenient(&key, "pw").unwrap().comment(), "termius");
-        assert!(decrypt_lenient(&key, "nope").is_err());
+        let (private, public) = generate_pair(KeyKind::Ed25519, "termius", None).unwrap();
+        let padded = pad_extra_block(&private);
+        assert!(PrivateKey::from_openssh(&padded).is_err());
+        let key = service
+            .import_key(import("termius", &padded))
+            .await
+            .unwrap();
+        assert_eq!(key.public_key.as_deref(), Some(public.as_str()));
+
+        // Legacy PEM, which ssh loads but `ssh-key` cannot.
+        let pem = fixture.root.join("pem");
+        let status = std::process::Command::new(system_keygen())
+            .args(["-q", "-t", "rsa", "-b", "2048", "-m", "PEM", "-N", ""])
+            .arg("-f")
+            .arg(&pem)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let key = service
+            .import_key(import("legacy", &fs::read_to_string(&pem).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(key.algorithm, "ssh-rsa");
+        assert!(
+            key.fingerprint.is_some(),
+            "listed from the .pub ssh-keygen derived"
+        );
+
+        // Without its passphrase an encrypted key needs a matching publicKey.
+        let (locked, locked_public) =
+            generate_pair(KeyKind::Ed25519, "locked@host", Some("pw")).unwrap();
+        let (_, other_public) = generate_pair(KeyKind::Ed25519, "", None).unwrap();
+        for public_key in [None, Some(other_public)] {
+            let mut request = import("locked", &locked);
+            request.public_key = public_key;
+            assert!(matches!(
+                service.import_key(request).await.unwrap_err(),
+                AppError::InvalidRequest(_)
+            ));
+        }
+        let mut request = import("locked", &locked);
+        request.public_key = Some(locked_public.clone());
+        let key = service.import_key(request).await.unwrap();
+        assert_eq!(key.public_key.as_deref(), Some(locked_public.as_str()));
+        assert!(askpass_files(&fixture).is_empty());
     }
 
     /// Seconds in dev builds thanks to the `rsa`/`num-bigint-dig` opt-level

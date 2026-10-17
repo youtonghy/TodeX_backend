@@ -1082,7 +1082,7 @@ POST /v2/browser/fetch
   - 按内容识别私钥（OpenSSH / PEM），`<name>` 与 `<name>.pub` 配对；跳过 `config`、`known_hosts*`、`authorized_keys*`、目录、socket、超过 64 KiB 的文件及指向 `~/.ssh` 之外的符号链接。
   - `SshKey`：`name`、`privateKeyPath?`、`publicKeyPath?`、`algorithm`（如 `ssh-ed25519`）、`bits?`、`fingerprint?`（`SHA256:…`；仅无 `.pub` 的旧式 PEM 私钥缺省）、`comment?`、`encrypted?`、`loadedInAgent`、`publicKey?`（完整 OpenSSH 公钥行）、`usedBy`（`IdentityFile` 指向该密钥的主机别名）。
   - `agentAvailable`：Unix 上未设置 `SSH_AUTH_SOCK` 或 `ssh-add -L` 失败时为 `false`。
-- `POST /v2/ssh/keys/import` `{ name, privateKey, publicKey?, passphrase? }` → `{ key }`。仅支持 OpenSSH 格式私钥（PEM 需先 `ssh-keygen -p -f <file>` 转换）；`publicKey` 若提供必须匹配；`passphrase` 只用于临时校验加密私钥，不会保存。
+- `POST /v2/ssh/keys/import` `{ name, privateKey, publicKey?, passphrase? }` → `{ key }`。由系统 `ssh-keygen -y` 校验（系统 ssh 能加载的格式都可导入，含 OpenSSH 与传统 PEM），私钥按提交内容（CRLF 转为 LF）写入，公钥取 `ssh-keygen` 推导结果；`publicKey` 若提供必须匹配。加密私钥需提供 `passphrase`，或提供 `publicKey`（以 `ssh-keygen -l` 指纹比对）。`passphrase` 经 askpass 一次性 owner-only 文件传给 `ssh-keygen`，不进入 argv/环境变量，也不会保存；系统找不到 `ssh-keygen` 时返回 `UNSUPPORTED`。
 - `POST /v2/ssh/keys/generate` `{ name, algorithm?, comment?, passphrase? }` → `{ key }`。`algorithm`：`ed25519`（默认）、`rsa`（4096 位）、`ecdsa`（P-256）。
 - 名称为 `[A-Za-z0-9._-]{1,64}`，不得以 `.`/`-` 开头、以 `.pub` 结尾或与 OpenSSH 文件同名。写入 `~/.ssh/<name>`（0600）与 `<name>.pub`（0644），`~/.ssh` 不存在时以 0700 创建；任一文件已存在返回 409，从不覆盖。请求体上限 64 KiB。
 
