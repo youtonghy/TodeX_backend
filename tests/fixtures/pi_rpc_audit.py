@@ -106,6 +106,37 @@ def stream_with_tool():
          'result': {'content': [{'type': 'text', 'text': output}]}, 'isError': False})
     finish()
 
+def subagent_runs():
+    # @tintinweb/pi-subagents: a foreground Agent call reports progress in
+    # partialResult.details; a background one returns at once and settles
+    # between turns through a session record and a completion notification.
+    def details(status, **extra):
+        return {'displayName': 'Explore', 'description': 'Find auth', 'subagentType': 'Explore',
+                'toolUses': 2, 'tokens': '1.2k token', 'durationMs': 900, 'status': status, **extra}
+    args = {'prompt': 'Find the auth code', 'description': 'Find auth', 'subagent_type': 'Explore', 'run_in_background': False}
+    out({'type': 'tool_execution_start', 'toolCallId': 'agent-call', 'toolName': 'Agent', 'args': args})
+    out({'type': 'tool_execution_update', 'toolCallId': 'agent-call', 'toolName': 'Agent', 'args': args,
+         'partialResult': {'content': [{'type': 'text', 'text': '2 tool uses...'}], 'details': details('running', activity='reading')}})
+    out({'type': 'tool_execution_end', 'toolCallId': 'agent-call', 'toolName': 'Agent', 'isError': False,
+         'result': {'content': [{'type': 'text', 'text': 'Agent completed.\n\nFound it.'}], 'details': details('completed', agentId='fg-agent')}})
+    background = {**args, 'description': 'Scan tests', 'run_in_background': True}
+    out({'type': 'tool_execution_start', 'toolCallId': 'bg-call', 'toolName': 'Agent', 'args': background})
+    out({'type': 'tool_execution_end', 'toolCallId': 'bg-call', 'toolName': 'Agent', 'isError': False,
+         'result': {'content': [{'type': 'text', 'text': 'Agent started in background.\nAgent ID: bg-agent\nOutput file: /tmp/bg-agent.output'}],
+                    'details': details('background', agentId='bg-agent', description='Scan tests')}})
+    finish()
+    def settle():
+        time.sleep(0.08)
+        out({'type': 'entry_appended', 'entry': {'type': 'custom', 'id': 'e1', 'customType': 'subagents:record',
+             'data': {'id': 'bg-agent', 'type': 'Explore', 'description': 'Scan tests', 'status': 'completed', 'result': 'All tests found.'}}})
+        message = {'role': 'custom', 'customType': 'subagent-notification', 'display': True,
+                   'content': '<task-notification>...</task-notification>',
+                   'details': {'id': 'bg-agent', 'description': 'Scan tests', 'status': 'completed', 'totalTokens': 4321,
+                               'outputFile': '/tmp/bg-agent.output', 'resultPreview': 'All tests'}}
+        out({'type': 'message_start', 'message': message})
+        out({'type': 'message_end', 'message': message})
+    threading.Thread(target=settle, daemon=True).start()
+
 def update_queue():
     out({'type': 'queue_update', 'steering': steering[:], 'followUp': queue[:]})
 
@@ -138,6 +169,8 @@ for line in sys.stdin:
                 out({'type': 'agent_settled'})
             elif scenario == 'stream':
                 stream_with_tool()
+            elif scenario == 'subagents':
+                subagent_runs()
             elif scenario == 'dialog':
                 out({'type': 'extension_ui_request', 'id': 'dialog-a', 'method': 'confirm', 'title': 'Expires', 'timeout': 20})
                 out({'type': 'extension_ui_request', 'id': 'dialog-b', 'method': 'confirm', 'title': 'Concurrent', 'timeout': 30})

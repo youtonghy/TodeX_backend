@@ -27,6 +27,8 @@ use super::types::{
     ProviderPrewarm, ProviderSessionCommands,
 };
 
+mod subagents;
+
 const MAX_PI_SESSIONS: usize = PROFILE.process_model.max_sessions().unwrap();
 /// A resident Pi process with no turn, query, background event or open
 /// dialog for this long is stopped; the next turn resumes its session file.
@@ -1624,11 +1626,8 @@ async fn run_pi_turn(
             }
             Some("tool_execution_start") => {
                 cache_pi_tool_args(&mut rpc.tool_args, &message);
-                sink.emit(
-                    "tool.started",
-                    pi_tool_payload(&message, &prompt.turn_id, "started", &rpc.tool_args),
-                )
-                .await?;
+                let payload = pi_tool_payload(&message, &prompt.turn_id, "started", &rpc.tool_args);
+                rpc.emit_tool(sink, "tool.started", payload).await?;
             }
             Some("tool_execution_update") => {
                 cache_pi_tool_args(&mut rpc.tool_args, &message);
@@ -1642,9 +1641,10 @@ async fn run_pi_turn(
                     rpc.tool_args.remove(id);
                 }
                 rpc.finish_tool_updates(&payload).await?;
-                sink.emit("tool.completed", payload).await?;
+                rpc.emit_tool(sink, "tool.completed", payload).await?;
             }
             Some("response" | "agent_start" | "agent_end" | "turn_start" | "turn_end") => {}
+            Some("entry_appended") if rpc.emit_subagent_record(sink, &message).await? => {}
             Some(event_type) => {
                 sink.emit(
                     "provider.event",
@@ -1975,6 +1975,8 @@ struct PiRpc<'a> {
     /// answer lists them in `block.supersedes` so clients drop the progress
     /// copy instead of showing the answer twice.
     streamed_text_blocks: Vec<String>,
+    /// `@tintinweb/pi-subagents` runs, mapped onto `subagent.*` events.
+    subagents: subagents::PiSubagents,
 }
 
 /// Clients append `delta.delta` per block, so a merged fragment renders
@@ -2033,6 +2035,7 @@ impl<'a> PiRpc<'a> {
             tool_pending: HashMap::new(),
             tool_emitted_at: HashMap::new(),
             streamed_text_blocks: Vec::new(),
+            subagents: subagents::PiSubagents::default(),
         }
     }
 
@@ -2074,6 +2077,37 @@ impl<'a> PiRpc<'a> {
         self.flush_tool_updates(true).await
     }
 
+    /// A `tool.*` event, followed by the `subagent.*` event it implies.
+    async fn emit_tool(
+        &mut self,
+        sink: &DriverEventSink,
+        kind: &'static str,
+        payload: Value,
+    ) -> Result<(), AppError> {
+        let subagent = self.subagents.tool_event(kind, &payload);
+        sink.emit(kind, payload).await?;
+        if let Some((kind, payload)) = subagent {
+            sink.emit(kind, payload).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether an `entry_appended` frame was a subagent session record; those
+    /// become `subagent.*` events instead of a raw `provider.event`.
+    async fn emit_subagent_record(
+        &mut self,
+        sink: &DriverEventSink,
+        message: &Value,
+    ) -> Result<bool, AppError> {
+        let Some(events) = self.subagents.record_entry(message) else {
+            return Ok(false);
+        };
+        for (kind, payload) in events {
+            sink.emit(kind, payload).await?;
+        }
+        Ok(true)
+    }
+
     /// `tool.updated` for an execution in progress; within
     /// [`PI_TOOL_UPDATE_INTERVAL`] of the block's previous one only the newest
     /// snapshot is kept, journalled by the read loop's timer or a flush.
@@ -2083,7 +2117,7 @@ impl<'a> PiRpc<'a> {
         payload: Value,
     ) -> Result<(), AppError> {
         let Some(id) = payload.pointer("/block/id").and_then(Value::as_str) else {
-            return sink.emit("tool.updated", payload).await.map(|_| ());
+            return self.emit_tool(sink, "tool.updated", payload).await;
         };
         let id = id.to_owned();
         let now = tokio::time::Instant::now();
@@ -2096,7 +2130,7 @@ impl<'a> PiRpc<'a> {
             return Ok(());
         }
         self.tool_pending.remove(&id);
-        sink.emit("tool.updated", payload).await?;
+        self.emit_tool(sink, "tool.updated", payload).await?;
         self.tool_emitted_at.insert(id, now);
         Ok(())
     }
@@ -2109,7 +2143,7 @@ impl<'a> PiRpc<'a> {
         };
         self.tool_emitted_at.remove(id);
         if let Some((sink, payload)) = self.tool_pending.remove(id) {
-            sink.emit("tool.updated", payload).await?;
+            self.emit_tool(&sink, "tool.updated", payload).await?;
         }
         Ok(())
     }
@@ -2141,7 +2175,7 @@ impl<'a> PiRpc<'a> {
         }
         for id in due {
             if let Some((sink, payload)) = self.tool_pending.remove(&id) {
-                sink.emit("tool.updated", payload).await?;
+                self.emit_tool(&sink, "tool.updated", payload).await?;
                 self.tool_emitted_at.insert(id, now);
             }
         }
@@ -2341,6 +2375,9 @@ impl<'a> PiRpc<'a> {
                         )
                     });
                     sink.emit("extension.message", json!({"provider":"pi","messageId":message_id,"message":message.get("message")})).await?;
+                    for (kind, payload) in self.subagents.notification(message.get("message")) {
+                        sink.emit(kind, payload).await?;
+                    }
                 }
                 continue;
             }
@@ -2796,7 +2833,7 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                     rpc.tool_args.remove(id);
                 }
                 rpc.finish_tool_updates(&payload).await?;
-                sink.emit(kind, payload).await?;
+                rpc.emit_tool(&sink, kind, payload).await?;
             } else {
                 cache_pi_tool_args(&mut rpc.tool_args, &message);
                 let mut payload = pi_tool_payload(
@@ -2809,7 +2846,7 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
                 if phase == "delta" {
                     rpc.queue_tool_update(&sink, payload).await?;
                 } else {
-                    sink.emit(kind, payload).await?;
+                    rpc.emit_tool(&sink, kind, payload).await?;
                 }
             }
         }
@@ -2829,6 +2866,7 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
             sink.emit(kind, json!({"provider":"pi","source":"provider","reason":message.get("reason"),"result":message.get("result"),"error":message.get("errorMessage")})).await?;
         }
         Some("response") | None => {}
+        Some("entry_appended") if rpc.emit_subagent_record(&sink, &message).await? => {}
         Some(kind) => {
             sink.emit(
                 "provider.event",
@@ -4393,6 +4431,89 @@ mod tests {
         assert_eq!(usage.payload["scope"], "message");
         assert_eq!(usage.payload["messageId"], message.payload["messageId"]);
         assert!(usage.payload.get("turnId").is_none());
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn rpc_plugin_subagents_surface_as_subagent_runs_across_turn_boundaries() {
+        let fixture = Fixture::new().await;
+        fixture.run("subagents", "subagent-turn").await.unwrap();
+        let background = fixture
+            .wait_event(|event| {
+                event.event_type == "subagent.completed" && event.payload["subagentId"] == "bg-call"
+            })
+            .await;
+        // The launch's tool call identifies the run that settles between turns.
+        assert_eq!(background.payload["agentId"], "bg-agent");
+        assert_eq!(background.payload["result"], "All tests found.");
+        let enriched = fixture
+            .wait_event(|event| {
+                event.event_type == "subagent.updated"
+                    && event.payload["subagentId"] == "bg-call"
+                    && event.payload.pointer("/usage/total_tokens").is_some()
+            })
+            .await;
+        assert!(enriched.payload.get("status").is_none());
+        let events = fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap();
+        let runs: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type.starts_with("subagent."))
+            .map(|event| {
+                (
+                    event.event_type.as_str(),
+                    event.payload["subagentId"].as_str().unwrap_or(""),
+                    event.payload["status"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                ("subagent.started", "agent-call", "running"),
+                ("subagent.updated", "agent-call", "running"),
+                ("subagent.completed", "agent-call", "completed"),
+                ("subagent.started", "bg-call", "running"),
+                ("subagent.updated", "bg-call", "running"),
+                ("subagent.completed", "bg-call", "completed"),
+                ("subagent.updated", "bg-call", ""),
+            ]
+        );
+        let started = events
+            .iter()
+            .find(|event| event.event_type == "subagent.started")
+            .unwrap();
+        assert_eq!(started.payload["turnId"], "subagent-turn");
+        assert_eq!(started.payload["title"], "Find auth");
+        let launched = events
+            .iter()
+            .find(|event| {
+                event.event_type == "subagent.updated" && event.payload["subagentId"] == "bg-call"
+            })
+            .unwrap();
+        assert_eq!(launched.payload["outputFile"], "/tmp/bg-agent.output");
+        // The record became subagent events; the notification stays visible.
+        assert!(!events.iter().any(|event| {
+            event.event_type == "provider.event"
+                && event.payload["providerMethod"] == "entry_appended"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "extension.message"
+                && event.payload.pointer("/message/customType")
+                    == Some(&json!("subagent-notification"))
+        }));
+        // The Agent calls still render as tool cards.
+        let agent_cards = events
+            .iter()
+            .filter(|event| {
+                event.event_type == "tool.completed" && event.payload["toolName"] == "Agent"
+            })
+            .count();
+        assert_eq!(agent_cards, 2);
         fixture.finish().await;
     }
 
