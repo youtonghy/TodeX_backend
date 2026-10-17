@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use ssh_key::{public::KeyData, Algorithm, EcdsaCurve, HashAlg, LineEnding, PrivateKey, PublicKey};
@@ -405,7 +406,7 @@ enum PrivateContent {
 fn classify_private(text: &str) -> Option<PrivateContent> {
     let text = text.trim();
     if text.starts_with(OPENSSH_HEADER) {
-        return Some(match PrivateKey::from_openssh(&*rewrap_openssh(text)) {
+        return Some(match PrivateKey::from_openssh(&*normalize_openssh(text)) {
             Ok(key) => PrivateContent::OpenSsh(Box::new(key)),
             Err(_) => PrivateContent::OpenSshInvalid,
         });
@@ -419,11 +420,12 @@ fn classify_private(text: &str) -> Option<PrivateContent> {
         })
 }
 
-/// Re-wraps an OpenSSH private key body at [`OPENSSH_LINE_WIDTH`] columns.
+/// Rewrites an OpenSSH private key into the exact layout `ssh-key` parses.
 /// OpenSSH ignores line width and stray whitespace, so keys written by other
 /// tools (wrapped at 64 columns, or with trailing spaces from a paste) are
-/// valid there; `ssh-key` rejects anything but its own layout.
-fn rewrap_openssh(text: &str) -> zeroize::Zeroizing<String> {
+/// valid there; `ssh-key` rejects anything but 70-column armor. Undecodable
+/// input is returned unchanged for the parser to reject.
+fn normalize_openssh(text: &str) -> zeroize::Zeroizing<String> {
     let body = text
         .strip_prefix(OPENSSH_HEADER)
         .and_then(|rest| rest.split_once(OPENSSH_FOOTER))
@@ -433,17 +435,77 @@ fn rewrap_openssh(text: &str) -> zeroize::Zeroizing<String> {
             .filter(|byte| !byte.is_ascii_whitespace())
             .collect::<Vec<u8>>(),
     );
+    let Ok(blob) = STANDARD.decode(&*body) else {
+        return zeroize::Zeroizing::new(text.to_owned());
+    };
+    let mut blob = zeroize::Zeroizing::new(blob);
+    trim_excess_padding(&mut blob);
+    let body = zeroize::Zeroizing::new(STANDARD.encode(&*blob));
     let mut out = zeroize::Zeroizing::new(String::with_capacity(text.len()));
     out.push_str(OPENSSH_HEADER);
     out.push('\n');
-    for line in body.chunks(OPENSSH_LINE_WIDTH) {
-        // Non-ASCII bytes were never valid base64; let the parser reject them.
-        out.push_str(&String::from_utf8_lossy(line));
+    for line in body.as_bytes().chunks(OPENSSH_LINE_WIDTH) {
+        out.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
         out.push('\n');
     }
     out.push_str(OPENSSH_FOOTER);
     out.push('\n');
     out
+}
+
+/// Shortens the `1, 2, 3, …` padding of an unencrypted key to less than one
+/// block. OpenSSH only checks the byte sequence, so some tools (Termius) pad
+/// a whole extra block, which `ssh-key` rejects.
+fn trim_excess_padding(blob: &mut Vec<u8>) {
+    const MAGIC: &[u8] = b"openssh-key-v1\0";
+    const BLOCK: usize = 8;
+    fn u32_at(blob: &[u8], at: usize) -> Option<usize> {
+        let bytes = blob.get(at..at.checked_add(4)?)?;
+        Some(u32::from_be_bytes(bytes.try_into().ok()?) as usize)
+    }
+    fn string_at(blob: &[u8], at: usize) -> Option<(&[u8], usize)> {
+        let len = u32_at(blob, at)?;
+        let end = (at + 4).checked_add(len)?;
+        Some((blob.get(at + 4..end)?, end))
+    }
+    let Some(private_at) = (|| {
+        if !blob.starts_with(MAGIC) {
+            return None;
+        }
+        let (cipher, at) = string_at(blob, MAGIC.len())?;
+        if cipher != b"none" {
+            return None;
+        }
+        let (_kdf, at) = string_at(blob, at)?;
+        let (_kdf_options, at) = string_at(blob, at)?;
+        let count = u32_at(blob, at)?;
+        let mut at = at + 4;
+        for _ in 0..count {
+            at = string_at(blob, at)?.1;
+        }
+        Some(at)
+    })() else {
+        return;
+    };
+    let Some((private, end)) = string_at(blob, private_at) else {
+        return;
+    };
+    let padding = usize::from(*private.last().unwrap_or(&0));
+    if end != blob.len()
+        || padding < BLOCK
+        || padding > private.len()
+        || !private[private.len() - padding..]
+            .iter()
+            .zip(1..)
+            .all(|(&byte, expected)| byte == expected)
+    {
+        return;
+    }
+    let kept = padding % BLOCK;
+    let new_len = private.len() - padding + kept;
+    blob.truncate(end - padding);
+    blob.extend(1..=kept as u8);
+    blob[private_at..private_at + 4].copy_from_slice(&(new_len as u32).to_be_bytes());
 }
 
 /// Reads a candidate key file: regular files (or symlinks to files inside
@@ -1030,6 +1092,44 @@ mod tests {
         assert_eq!(key.encrypted, Some(true));
         assert_eq!(key.comment.as_deref(), Some("locked@host"));
         assert_eq!(fs::read_to_string(dir.join("locked")).unwrap(), *locked);
+    }
+
+    #[test]
+    fn parses_keys_padded_past_one_block() {
+        // Termius pads the private section with a whole extra block.
+        let (private, public) = generate_pair(KeyKind::Ed25519, "termius", None).unwrap();
+        let body: String = private
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        let mut blob = STANDARD.decode(body).unwrap();
+        let padding = usize::from(*blob.last().unwrap());
+        let private_len_at = blob.len()
+            - (padding..)
+                .find(|&n| {
+                    let at = blob.len() - n - 4;
+                    u32::from_be_bytes(blob[at..at + 4].try_into().unwrap()) as usize == n
+                })
+                .unwrap()
+            - 4;
+        blob.truncate(blob.len() - padding);
+        blob.extend(1..=(padding + 8) as u8);
+        let new_len = (blob.len() - private_len_at - 4) as u32;
+        blob[private_len_at..private_len_at + 4].copy_from_slice(&new_len.to_be_bytes());
+        let padded = format!(
+            "{OPENSSH_HEADER}\n{}\n{OPENSSH_FOOTER}\n",
+            STANDARD.encode(&blob)
+        );
+        assert!(
+            PrivateKey::from_openssh(&padded).is_err(),
+            "ssh-key rejects it as is"
+        );
+
+        let Some(PrivateContent::OpenSsh(key)) = classify_private(&padded) else {
+            panic!("padded key not parsed");
+        };
+        assert_eq!(key.public_key().to_openssh().unwrap(), public);
+        assert_eq!(key.to_openssh(LineEnding::LF).unwrap(), private);
     }
 
     /// Seconds in dev builds thanks to the `rsa`/`num-bigint-dig` opt-level
