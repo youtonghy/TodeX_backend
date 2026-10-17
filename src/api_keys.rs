@@ -666,7 +666,9 @@ pub(crate) mod tests {
 
         // The file holds neither the secret nor the derived seed.
         let raw = fs::read_to_string(root.join(FILE_NAME)).unwrap();
-        let secret = text.rsplit('_').next().unwrap();
+        // base64url secrets may contain `_`, so strip the prefix, not split.
+        let secret = text.strip_prefix(&format!("tdx_{}_", record.id)).unwrap();
+        assert_eq!(secret.len(), SECRET_TEXT_LEN);
         assert!(!raw.contains(secret));
         assert!(!raw.contains(&URL_SAFE_NO_PAD.encode(*authenticated.seed)));
         let _ = fs::remove_dir_all(&root);
