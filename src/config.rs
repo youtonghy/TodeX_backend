@@ -561,15 +561,24 @@ impl Config {
         Ok(())
     }
 
-    /// Saves the TUI's API listener settings into `[api]`.
-    pub fn save_api_settings(data_dir: PathBuf, enabled: bool, port: u16) -> anyhow::Result<()> {
+    /// Saves the external API listener's `[api]` `enabled` and `port`,
+    /// each only when given; the rest of the file is kept.
+    pub fn save_api_settings(
+        data_dir: PathBuf,
+        enabled: Option<bool>,
+        port: Option<u16>,
+    ) -> anyhow::Result<()> {
         let data_dir = expand_home(data_dir);
         let mut document = load_config_document(&data_dir)?;
         if !document.get("api").is_some_and(Item::is_table) {
             document.insert("api", Item::Table(Table::new()));
         }
-        document["api"]["enabled"] = value(enabled);
-        document["api"]["port"] = value(i64::from(port));
+        if let Some(enabled) = enabled {
+            document["api"]["enabled"] = value(enabled);
+        }
+        if let Some(port) = port {
+            document["api"]["port"] = value(i64::from(port));
+        }
         write_config_document(&data_dir, &document)
     }
 
@@ -1427,7 +1436,7 @@ mod tests {
         assert_eq!(config.api.port, super::DEFAULT_API_PORT);
         config.ensure_api_listener_is_valid().unwrap();
 
-        Config::save_api_settings(root.clone(), true, 9001).unwrap();
+        Config::save_api_settings(root.clone(), Some(true), Some(9001)).unwrap();
         let config = load(ServeArgs::default());
         assert!(config.api.enabled);
         assert_eq!(config.api.port, 9001);

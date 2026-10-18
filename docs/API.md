@@ -624,6 +624,7 @@ daemon 按文件修改时间重新加载 key，修改无需重启就会生效。
 - `scope.models`：Agent id → 允许的模型 id 数组（非空）。不在表中的 Agent 可以使用它的全部模型。空数组会被拒绝（400）。
 - `mcp.enabled` / `mcp.approval`：MCP 入口的开关与审批策略，`approval` 取值与 API key 相同（`ask`、`auto-approve`、`reject`），用于 Agent 调用产生的子会话。
 - 文件不存在时即为上面的默认值（全部 Agent、全部模型、MCP 关闭），已有的外部 API 用法不受影响；默认值不会写入文件，直到客户端保存。
+- 启动时宽松读取：忽略未知字段，丢弃未知的 Agent id（`scope.agents` 中的项与 `scope.models` 的键），未知的 `mcp.approval` 按 `ask` 处理，因此较新版本写入的文件仍可读取。文件无法使用（无法读取、超过 1 MiB、不是合法 JSON、字段类型不对或范围无效）时不会阻止后端启动：记录一条不含文件内容的警告，按上面的默认值运行（MCP 入口关闭）；内容有问题的文件改名为 `agent-calling.json.invalid-<Unix 秒>` 保留，不会被之后的保存覆盖。客户端的 `PUT` 仍严格校验（见下文）。
 
 外部 API 的有效范围是全局范围与 key 自身 `scopes` 的交集：
 - Agent 必须同时在全局 `scope.agents` 与 key 的 `scopes.agents` 内，否则 403 `UNAUTHORIZED`。`GET /api/v1/agents` 只列出两者都允许的 Agent，每项的 `models` 也只含全局允许的模型；`GET /api/v1/agents/{agent}/models` 同样按全局范围过滤。
@@ -650,7 +651,7 @@ daemon 按文件修改时间重新加载 key，修改无需重启就会生效。
 
   `mcp.injected` 表示按当前设置会注入 MCP 服务（`mcp.enabled` 且至少允许一个 Agent）。`apiListener.listening` 与 `baseUrl` 描述本进程实际运行的监听（未监听时 `baseUrl` 为 `null`）；`enabled`、`port` 是已保存的配置；`pendingRestart` 表示已保存的配置与正在运行的监听不同，需重启后端生效。`limits` 是 MCP 入口的限制：每个父会话最多同时运行的子调用数，以及等待时间的上限与默认值（秒）。
 - `PUT /v2/agent-calling`（需要设备签名，未开启设备认证的本地部署返回 403）：请求体为 `{"scope"?: {"agents"?, "models"?}, "mcp"?: {"enabled"?, "approval"?}}`。给出 `scope` 时整体替换范围（其中省略的字段取默认值）；`mcp` 中省略的字段保持不变。未知字段、未知 Agent id、空模型数组返回 400 `INVALID_REQUEST`。返回与 GET 相同的结构。
-- `PUT /v2/agent-calling/api-listener`（需要设备签名）：请求体为 `{"enabled"?: bool, "port"?: number}`，写入 `config.toml` 的 `[api]`，下次启动后端时生效。`port` 必须在 1–65535 之间且不能等于主端口；开启后的配置还须能通过启动检查（例如非回环 `host` 需要 `allow_plaintext_remote`）；否则返回 400 `INVALID_REQUEST`。返回与 GET 相同的结构。
+- `PUT /v2/agent-calling/api-listener`（需要设备签名）：请求体为 `{"enabled"?: bool, "port"?: number}`，写入 `config.toml` 的 `[api]`，下次启动后端时生效。只写入请求中给出的字段：未给出的字段（其当前值可能来自 `--enable-api`、`TODEX_AGENTD_API_ENABLED`/`TODEX_AGENTD_API_PORT` 等命令行或环境变量覆盖）不会写入 `config.toml`；`pendingRestart` 仍与正在运行的监听比较。`port` 必须在 1–65535 之间且不能等于主端口；开启后的配置还须能通过启动检查（例如非回环 `host` 需要 `allow_plaintext_remote`）；否则返回 400 `INVALID_REQUEST`。返回与 GET 相同的结构。
 
 修改设置会写一条审计事件 `agent_calling.settings.audit`。
 

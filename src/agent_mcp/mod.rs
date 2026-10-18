@@ -682,8 +682,7 @@ pub(crate) mod tests {
             &fixture.root.join("data"),
             &Default::default(),
         )
-        .await
-        .unwrap();
+        .await;
         mcp.set_agent_calling(store.clone());
         // Off by default.
         assert!(mcp.launch_for("conv_a", false).await.is_none());

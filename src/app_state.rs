@@ -135,7 +135,7 @@ impl AppState {
         )?;
         let api_keys = ApiKeyStore::load(&config.data_dir)?;
         let agent_calling =
-            crate::agent_calls::AgentCallingStore::load(&config.data_dir, &config.api).await?;
+            crate::agent_calls::AgentCallingStore::load(&config.data_dir, &config.api).await;
         agent_mcp.set_agent_calling(agent_calling.clone());
         let history_cleanup = crate::history_cleanup::HistoryCleanup::load(&config.data_dir);
         let native_history = crate::native_history::NativeHistory::new(
