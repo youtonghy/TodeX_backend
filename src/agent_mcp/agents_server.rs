@@ -5,11 +5,14 @@
 //!
 //! Each call starts or continues a child conversation of the calling one
 //! (`parentConversationId`), owned by the same owner, in the same
-//! workspace, run in the calling turn's permission mode (never above it).
-//! Children cannot call agents themselves: the server is not injected into
-//! them and refuses them. The global agent scope from `agent-calling.json`
-//! bounds which agents and models may be called; `mcp.approval` answers the
-//! children's permission requests.
+//! workspace, in a permission mode that never exceeds the calling turn's.
+//! Permission requests the child raises in that mode are answered per
+//! `mcp.approval` (`ask`: the user; `auto-approve`: approved; `reject`:
+//! rejected), so with `auto-approve` a child of an `ask` turn gets its
+//! requests approved: that is the user's explicit setting. Children cannot
+//! call agents themselves: the server is not injected into them and
+//! refuses them. The global agent scope from `agent-calling.json` bounds
+//! which agents and models may be called.
 
 use std::{sync::Arc, time::Duration};
 
@@ -34,7 +37,7 @@ use super::{
     AgentMcp, AGENTS_ROUTE as ROUTE, AGENTS_SERVER as SERVER_NAME,
 };
 use crate::{
-    agent_calls::{self, AgentToolCaller, CallResult, RunInput, TurnInput, LIMITS},
+    agent_calls::{self, AgentToolCaller, CallResult, RunInput, StartRefusal, TurnInput, LIMITS},
     app_state::AppState,
     conversation::{ConversationManifest, ProviderKind},
     error::AppError,
@@ -46,6 +49,9 @@ const MAX_TEXT_BYTES: usize = 256 * 1024;
 /// Prompt text shown in an approval (ask mode).
 const APPROVAL_TEXT_BYTES: usize = 4096;
 const MAX_TITLE_CHARS: usize = 200;
+/// How long a call whose parent turn was stopped while it started waits for
+/// its cancelled child turn to end.
+const STOPPED_CALL_WAIT: Duration = Duration::from_secs(30);
 /// Permission modes from least to most permissive.
 const MODE_ORDER: [&str; 3] = ["ask", "auto", "full-access"];
 
@@ -335,8 +341,10 @@ fn registry_of_tools() -> ToolRegistry<AgentsTools, AgentsCall> {
             tool: Tool::new(
                 "agent_run",
                 "Start another TodeX agent on a task in a new conversation in this workspace and \
-                 wait for its answer. It runs with this conversation's permission mode (never \
-                 more). Returns conversationId, turnId, status (running, completed, failed, \
+                 wait for its answer. Its permission mode never exceeds this conversation's \
+                 current one; permission requests it raises are answered per the Agent Calling \
+                 approval setting (ask: the user decides; auto-approve: approved; reject: \
+                 rejected). Returns conversationId, turnId, status (running, completed, failed, \
                  cancelled, interrupted), output (the agent's reply text) and error. Continue the \
                  same conversation with agent_turn. At most 4 calls of this conversation run at \
                  once. Unavailable in Plan mode.",
@@ -368,8 +376,9 @@ fn registry_of_tools() -> ToolRegistry<AgentsTools, AgentsCall> {
             tool: Tool::new(
                 "agent_turn",
                 "Send a follow-up to a conversation you started with agent_run and wait for the \
-                 answer. Same result as agent_run. Fails with CONFLICT while that conversation \
-                 is still running a turn (use agent_wait first). Unavailable in Plan mode.",
+                 answer. Same result, permission mode and approval handling as agent_run. Fails \
+                 with CONFLICT while that conversation is still running or starting a turn (use \
+                 agent_wait first). Unavailable in Plan mode.",
                 schema(json!({
                     "type": "object",
                     "properties": {
@@ -642,14 +651,55 @@ impl AgentsTools {
         Ok(manifest)
     }
 
-    fn reserve(&self, parent_id: &str) -> Result<agent_calls::Reservation, String> {
-        self.state.agent_calls.reserve(parent_id).ok_or_else(|| {
-            format!(
-                "AGENT_CALL_LIMIT: at most {} agent calls of this conversation run at once; \
-                 wait for one with agent_wait or stop one with agent_cancel",
-                LIMITS.max_concurrent_calls
-            )
-        })
+    /// Starts a call of the caller, continuing `child_id` if given.
+    fn reserve(
+        &self,
+        parent_id: &str,
+        child_id: Option<&str>,
+    ) -> Result<agent_calls::Reservation, String> {
+        self.state
+            .agent_calls
+            .reserve(parent_id, child_id)
+            .map_err(|refusal| match refusal {
+                StartRefusal::Limit => format!(
+                    "AGENT_CALL_LIMIT: at most {} agent calls of this conversation run at once; \
+                     wait for one with agent_wait or stop one with agent_cancel",
+                    LIMITS.max_concurrent_calls
+                ),
+                StartRefusal::Busy(turn_id) => {
+                    let child_id = child_id.unwrap_or_default();
+                    let running = match turn_id {
+                        Some(turn_id) => format!("is still running turn {turn_id}"),
+                        None => "is starting a turn for another call".to_owned(),
+                    };
+                    format!(
+                        "CONFLICT: conversation {child_id} {running}; wait for it with \
+                         agent_wait or stop it with agent_cancel"
+                    )
+                }
+            })
+    }
+
+    /// The result of a started call: waited for up to `wait`, or, when the
+    /// parent's turn was stopped while the call started (its child turn is
+    /// cancelled then), until that cancellation settles.
+    async fn result_of(
+        &self,
+        invocation: &Invocation<'_>,
+        child_id: &str,
+        turn_id: &str,
+        stopped: bool,
+        wait: Duration,
+    ) -> Result<Value, String> {
+        if !stopped {
+            return self.wait(invocation, child_id, Some(turn_id), wait).await;
+        }
+        self.state
+            .agent_calls
+            .wait(child_id, Some(turn_id), STOPPED_CALL_WAIT)
+            .await
+            .map(|result| result.to_json())
+            .map_err(failure)
     }
 
     /// Waits for the turn unless the tool call itself is cancelled.
@@ -697,7 +747,7 @@ impl AgentsTools {
 
     async fn run_call(&self, invocation: &Invocation<'_>, call: RunCall) -> Result<Value, String> {
         let caller = self.caller(invocation).await?;
-        let reservation = self.reserve(&caller.parent.id)?;
+        let reservation = self.reserve(&caller.parent.id, None)?;
         let turn = self.turn_input(
             &caller,
             call.agent,
@@ -724,7 +774,8 @@ impl AgentsTools {
         .map_err(failure)?;
         let child_id = started.manifest.id.clone();
         let turn_id = started.turn_id.clone();
-        self.state
+        let stopped = self
+            .state
             .agent_calls
             .track(
                 reservation,
@@ -734,7 +785,7 @@ impl AgentsTools {
                 Some(&title),
             )
             .await;
-        self.wait(invocation, &child_id, Some(&turn_id), call.wait)
+        self.result_of(invocation, &child_id, &turn_id, stopped, call.wait)
             .await
     }
 
@@ -745,19 +796,9 @@ impl AgentsTools {
     ) -> Result<Value, String> {
         let caller = self.caller(invocation).await?;
         let child = self.child(&caller, &call.conversation_id).await?;
-        if let Some(turn_id) = self
-            .state
-            .agent_calls
-            .running_turn(&child.id)
-            .or_else(|| self.state.conversations.active_turn_id(&child.id))
-        {
-            return Err(format!(
-                "CONFLICT: conversation {} is still running turn {turn_id}; wait for it with \
-                 agent_wait or stop it with agent_cancel",
-                child.id
-            ));
-        }
-        let reservation = self.reserve(&caller.parent.id)?;
+        // Claims the child until the turn is tracked: a second agent_turn
+        // of it meanwhile gets CONFLICT.
+        let reservation = self.reserve(&caller.parent.id, Some(&child.id))?;
         let turn = self.turn_input(
             &caller,
             child.provider,
@@ -769,11 +810,12 @@ impl AgentsTools {
             .await
             .map_err(failure)?;
         let turn_id = started.turn_id.clone();
-        self.state
+        let stopped = self
+            .state
             .agent_calls
             .track(reservation, &caller.parent, started, &call.text, None)
             .await;
-        self.wait(invocation, &child.id, Some(&turn_id), call.wait)
+        self.result_of(invocation, &child.id, &turn_id, stopped, call.wait)
             .await
     }
 
@@ -1512,7 +1554,8 @@ mod tests {
         let state = &harness.state;
         let mut tap = state
             .conversations
-            .live_tap(&harness.parent, crate::agent_calls::tap_projection);
+            .live_tap(&harness.parent, crate::agent_calls::tap_projection)
+            .unwrap();
         let marker = "tap-marker-6f1c2a";
         state
             .conversations
@@ -1542,5 +1585,284 @@ mod tests {
             .await
             .unwrap();
         assert!(tap.recv_batch().await.is_none());
+    }
+
+    /// An Antigravity parent really running a `HANG` turn in full-access
+    /// mode.
+    async fn running_parent(harness: &Harness) -> String {
+        let state = &harness.state;
+        let parent = state
+            .conversations
+            .create_owned(
+                "local",
+                ProviderKind::Antigravity,
+                harness.workspace.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .id;
+        let prompt = crate::provider::ConversationPrompt {
+            client_request_id: None,
+            text: "HANG".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            skills: Vec::new(),
+            content: Vec::new(),
+            permission_mode: Some("full-access".to_owned()),
+            work_mode: None,
+            permission_profile: None,
+            sandbox_mode: None,
+            approval_policy: None,
+        };
+        state
+            .conversations
+            .prompt_owned("local", &parent, prompt)
+            .await
+            .unwrap();
+        parent
+    }
+
+    async fn until_idle(state: &AppState, conversation_id: &str) {
+        for _ in 0..200 {
+            if state
+                .conversations
+                .active_turn_id(conversation_id)
+                .is_none()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{conversation_id} is still running");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_one_of_two_racing_turns_of_a_child_starts() {
+        let harness = harness().await;
+        let state = &harness.state;
+        // A child is claimed by the call starting it.
+        let first = state
+            .agent_calls
+            .reserve(&harness.parent, Some("child-x"))
+            .unwrap();
+        assert_eq!(
+            state
+                .agent_calls
+                .reserve(&harness.parent, Some("child-x"))
+                .err(),
+            Some(agent_calls::StartRefusal::Busy(None))
+        );
+        drop(first);
+        drop(
+            state
+                .agent_calls
+                .reserve(&harness.parent, Some("child-x"))
+                .unwrap(),
+        );
+
+        let client = connect(state, &harness.parent).await;
+        let run = ok(&call(
+            &client,
+            "agent_run",
+            json!({ "agent": "antigravity", "text": "hello" }),
+        )
+        .await);
+        assert_eq!(run["status"], "completed", "{run}");
+        let child_id = run["conversationId"].as_str().unwrap().to_owned();
+        let turn = || {
+            call(
+                &client,
+                "agent_turn",
+                json!({ "conversationId": child_id, "text": "SLOW 2", "waitSecs": 1 }),
+            )
+        };
+        let (first, second) = tokio::join!(turn(), turn());
+        let (started, conflicts): (Vec<_>, Vec<_>) = [first, second]
+            .into_iter()
+            .partition(|result| result.is_error == Some(false));
+        assert_eq!((started.len(), conflicts.len()), (1, 1));
+        let conflict = refused(&conflicts[0]);
+        assert!(conflict.contains("CONFLICT"), "{conflict}");
+        // The turn that started is still followed to its end.
+        let started = ok(&started[0]);
+        let waited = ok(&call(
+            &client,
+            "agent_wait",
+            json!({ "conversationId": child_id, "turnId": started["turnId"], "waitSecs": 60 }),
+        )
+        .await);
+        assert_eq!(waited["status"], "completed", "{waited}");
+        assert_eq!(waited["output"], "Hi there");
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_call_still_starting_when_its_parent_turn_stops_is_cancelled() {
+        let harness = harness().await;
+        let state = &harness.state;
+        let parent = running_parent(&harness).await;
+        let client = connect(state, &parent).await;
+        // Child turns wait at the CLI start gate.
+        let gate = state.cli_execution_gate.clone().write_owned().await;
+        let run = call(
+            &client,
+            "agent_run",
+            json!({ "agent": "antigravity", "text": "HANG", "waitSecs": 60 }),
+        );
+        let stop_parent = async {
+            let child = 'created: loop {
+                let children = state.conversations.list().await.unwrap();
+                if let Some(child) = children
+                    .into_iter()
+                    .find(|manifest| manifest.parent_conversation_id.as_deref() == Some(&parent))
+                {
+                    break 'created child.id;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            state
+                .conversations
+                .cancel_owned("local", &parent, None)
+                .await
+                .unwrap();
+            until_idle(state, &parent).await;
+            drop(gate);
+            child
+        };
+        let (run, child_id) = tokio::join!(run, stop_parent);
+        let run = ok(&run);
+        assert_eq!(run["conversationId"], child_id.as_str());
+        assert_eq!(run["status"], "cancelled", "{run}");
+        wait_for_events(state, &parent, "agent.call.cancelled", 1).await;
+        until_idle(state, &child_id).await;
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_call_whose_end_never_reaches_it_still_finishes() {
+        let harness = harness().await;
+        let state = &harness.state;
+        let client = connect(state, &harness.parent).await;
+        let run = ok(&call(
+            &client,
+            "agent_run",
+            json!({ "agent": "antigravity", "text": "HANG", "waitSecs": 1 }),
+        )
+        .await);
+        assert_eq!(run["status"], "running", "{run}");
+        let child_id = run["conversationId"].as_str().unwrap().to_owned();
+        state.conversation_store().mute_taps_for_tests(&child_id);
+        state
+            .conversations
+            .cancel_owned("local", &child_id, None)
+            .await
+            .unwrap();
+        let waited = ok(&call(
+            &client,
+            "agent_wait",
+            json!({ "conversationId": child_id, "waitSecs": 60 }),
+        )
+        .await);
+        // How it ended comes from the child's journal.
+        assert_eq!(waited["status"], "cancelled", "{waited}");
+        assert_eq!(waited["error"]["code"], "TURN_END_UNOBSERVED");
+        wait_for_events(state, &harness.parent, "agent.call.cancelled", 1).await;
+        assert!(!harness.root.join("data/agent-calls.json").exists());
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_calls_a_shutdown_stops_are_left_for_the_restart() {
+        let harness = harness().await;
+        let state = &harness.state;
+        let client = connect(state, &harness.parent).await;
+        let mut children = Vec::new();
+        for text in ["SLOW 2", "HANG"] {
+            let run = ok(&call(
+                &client,
+                "agent_run",
+                json!({ "agent": "antigravity", "text": text, "waitSecs": 1 }),
+            )
+            .await);
+            assert_eq!(run["status"], "running", "{run}");
+            children.push(run["conversationId"].as_str().unwrap().to_owned());
+        }
+        state.conversations.set_shutting_down_for_tests(true);
+        // Completing on its own while the daemon stops: recorded as usual.
+        let completed = ok(&call(
+            &client,
+            "agent_wait",
+            json!({ "conversationId": children[0], "waitSecs": 60 }),
+        )
+        .await);
+        assert_eq!(completed["status"], "completed", "{completed}");
+        wait_for_events(state, &harness.parent, "agent.call.completed", 1).await;
+        // Stopped by the shutdown: left listed for the next start.
+        state
+            .conversations
+            .cancel_owned("local", &children[1], None)
+            .await
+            .unwrap();
+        let cancelled = ok(&call(
+            &client,
+            "agent_wait",
+            json!({ "conversationId": children[1], "waitSecs": 60 }),
+        )
+        .await);
+        assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!call_events(state, &harness.parent)
+            .await
+            .iter()
+            .any(|(kind, _)| kind == "agent.call.cancelled"));
+        let saved: Value = serde_json::from_slice(
+            &std::fs::read(harness.root.join("data/agent-calls.json")).unwrap(),
+        )
+        .unwrap();
+        let listed: Vec<_> = saved["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| call["childConversationId"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, [children[1].as_str()]);
+        state.conversations.set_shutting_down_for_tests(false);
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_child_whose_first_prompt_fails_is_removed() {
+        let harness = harness().await;
+        let state = &harness.state;
+        let caller = AgentToolCaller {
+            parent: state.conversations.get(&harness.parent).await.unwrap(),
+        };
+        // Refused by the prompt itself, after the child was created.
+        let input = RunInput {
+            agent: ProviderKind::Antigravity,
+            workspace: None,
+            title: None,
+            profile: None,
+            turn: TurnInput {
+                text: "hello".to_owned(),
+                client_request_id: Some(String::new()),
+                permission_mode: Some("full-access".to_owned()),
+                ..TurnInput::default()
+            },
+        };
+        let Err(error) = agent_calls::run(state, &caller, input).await else {
+            panic!("the prompt is refused");
+        };
+        assert_eq!(error.code(), "INVALID_REQUEST");
+        assert!(!state
+            .conversations
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|manifest| manifest.parent_conversation_id.as_deref()
+                == Some(harness.parent.as_str())));
     }
 }

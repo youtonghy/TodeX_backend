@@ -23,7 +23,7 @@ use crate::provider::types::{ProviderModelDescriptor, ProviderSnapshot};
 use crate::provider::{CancelOutcome, ConversationPrompt, PermissionDecision, PromptSkillRef};
 
 pub(crate) use caller::{AgentToolCaller, ApiKeyCaller, Caller};
-pub(crate) use calls::{AgentCalls, CallResult, Reservation};
+pub(crate) use calls::{AgentCalls, CallResult, Reservation, StartRefusal};
 #[cfg(test)]
 pub(crate) use events::tap_projection;
 pub(crate) use events::{assistant_text, ends_turn, EventPump, TurnEvents};
@@ -324,13 +324,31 @@ pub(crate) async fn run<C: Caller + ?Sized>(
     let owner = caller.owner_id();
     let manifest =
         create_conversation(state, caller, agent, workspace, input.title, input.profile).await?;
-    let events = caller
-        .subscribe(state, &manifest.id, manifest.last_sequence)
-        .await?;
-    let turn_id = state
-        .conversations
-        .prompt_owned(&owner, &manifest.id, prompt)
-        .await?;
+    let started = async {
+        let events = caller
+            .subscribe(state, &manifest.id, manifest.last_sequence)
+            .await?;
+        let turn_id = state
+            .conversations
+            .prompt_owned(&owner, &manifest.id, prompt)
+            .await?;
+        Ok::<_, AppError>((events, turn_id))
+    }
+    .await;
+    let (events, turn_id) = match started {
+        Ok(started) => started,
+        Err(error) => {
+            // An agent call's child is hidden from the conversation list:
+            // one that never got its turn would be left behind unseen.
+            // External API conversations are listed and stay.
+            if caller.parent_conversation_id().is_some() {
+                if let Err(cleanup) = state.conversations.delete_owned(&owner, &manifest.id).await {
+                    tracing::warn!(conversation = %manifest.id, error = %cleanup, "cannot remove an agent call that failed to start");
+                }
+            }
+            return Err(error);
+        }
+    };
     Ok(StartedTurn {
         manifest,
         turn_id,

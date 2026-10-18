@@ -611,13 +611,31 @@ impl ConversationSupervisor {
     }
 
     /// Taps `conversation_id`'s committed events in plaintext, in memory
-    /// only; see [`crate::conversation::LiveTap`].
+    /// only; see [`crate::conversation::LiveTap`]. `CONFLICT` while another
+    /// tap of it is live.
     pub(crate) fn live_tap(
         &self,
         conversation_id: &str,
         project: crate::conversation::TapProjection,
-    ) -> crate::conversation::LiveTap {
+    ) -> Result<crate::conversation::LiveTap, AppError> {
         self.store.live_tap(conversation_id, project)
+    }
+
+    /// The terminal event `turn_id` of `conversation_id` journalled
+    /// (`turn.completed`, ...), if any, from the journal digest.
+    pub(crate) async fn turn_terminal(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<&'static str>, AppError> {
+        self.store
+            .digest(conversation_id, |digest| {
+                crate::conversation::TURN_TERMINAL_EVENTS
+                    .iter()
+                    .copied()
+                    .find(|terminal| digest.has_turn_terminal(turn_id, terminal) == Some(true))
+            })
+            .await
     }
 
     /// The conversation's running turn, if any.

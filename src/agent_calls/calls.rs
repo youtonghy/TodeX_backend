@@ -10,6 +10,13 @@
 //! finished turn's result until the child's next turn starts or
 //! [`RESULT_TTL`] after the turn ended, when the output is dropped.
 //!
+//! A call being started holds a [`Reservation`] from before its child is
+//! created or prompted until [`AgentCalls::track`] follows the turn: it
+//! counts against the parent's limit, claims the child (a second
+//! `agent_turn` of the same child is refused), and learns about the
+//! parent's turn being stopped meanwhile, so that call's child turn is
+//! cancelled as soon as it exists.
+//!
 //! Lifecycle: a parent turn that is cancelled or interrupted cancels its
 //! running children; a deleted parent takes its children with it (running
 //! ones are cancelled first); running calls are listed in
@@ -31,7 +38,9 @@ use tokio::sync::watch;
 
 use super::events::{assistant_text, ends_turn, TurnEvents};
 use super::{StartedTurn, LIMITS};
-use crate::conversation::{ConversationEvent, ConversationManifest, LiveTap, ProviderKind};
+use crate::conversation::{
+    ConversationEvent, ConversationManifest, ConversationStatus, LiveTap, ProviderKind,
+};
 use crate::error::AppError;
 use crate::provider::{ConversationHooks, ConversationSupervisor};
 use crate::secure_fs;
@@ -48,6 +57,21 @@ pub(crate) const RESULT_TTL: Duration = Duration::from_secs(30 * 60);
 /// How long deleting a parent waits for a cancelled child turn to stop.
 const CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const TRUNCATED_NOTE: &str = "\n[output truncated]";
+/// How long a child turn's events may stay quiet before its monitor checks
+/// that the turn is still running.
+#[cfg(not(test))]
+const QUIET_CHECK: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const QUIET_CHECK: Duration = Duration::from_millis(300);
+/// How long a monitor still waits for the end of a turn that no longer
+/// runs before it settles the call without it.
+#[cfg(not(test))]
+const END_GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const END_GRACE: Duration = Duration::from_millis(300);
+/// `error.code` of a call whose turn ended without its end reaching the
+/// monitor.
+const TURN_END_UNOBSERVED: &str = "TURN_END_UNOBSERVED";
 
 /// The state of one agent-call turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -201,17 +225,32 @@ struct ChildCall {
     turn: Option<Arc<CallTurn>>,
 }
 
+/// A call being started (see [`Reservation`]).
+struct Starting {
+    parent_id: String,
+    /// The child an `agent_turn` continues; `None` for `agent_run`, whose
+    /// child does not exist yet.
+    child_id: Option<String>,
+    /// The parent's turn that made the call, when one was running.
+    parent_turn: Option<String>,
+    /// That turn was cancelled or interrupted meanwhile.
+    stopped: bool,
+}
+
 #[derive(Default)]
 struct State {
     /// child conversation id → its call.
     children: HashMap<String, ChildCall>,
-    /// parent conversation id → calls being started.
-    reservations: HashMap<String, usize>,
+    /// Calls being started, by reservation id.
+    starting: HashMap<u64, Starting>,
+    next_start: u64,
 }
 
 impl State {
+    /// Running and starting calls of `parent_id`.
     fn running(&self, parent_id: &str) -> usize {
-        self.children
+        let running = self
+            .children
             .values()
             .filter(|child| {
                 child.parent_id == parent_id
@@ -220,8 +259,29 @@ impl State {
                         .as_ref()
                         .is_some_and(|turn| turn.status().is_running())
             })
-            .count()
+            .count();
+        let starting = self
+            .starting
+            .values()
+            .filter(|starting| starting.parent_id == parent_id)
+            .count();
+        running + starting
     }
+
+    /// The turn an agent call is running in `child_id`, if any.
+    fn running_turn(&self, child_id: &str) -> Option<String> {
+        let turn = self.children.get(child_id)?.turn.as_ref()?;
+        turn.status().is_running().then(|| turn.turn_id.clone())
+    }
+}
+
+/// Why a call cannot start now.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartRefusal {
+    /// The parent runs [`LIMITS`]`.max_concurrent_calls` calls already.
+    Limit,
+    /// The child runs a turn (`Some`), or another call is starting one.
+    Busy(Option<String>),
 }
 
 /// A running call as `agent-calls.json` lists it.
@@ -260,22 +320,18 @@ struct Inner {
     write: tokio::sync::Mutex<()>,
 }
 
-/// A slot for a call being started, counted against the parent's limit
-/// until [`AgentCalls::track`] takes it or it is dropped.
+/// A call being started, from before its child is created or prompted
+/// until [`AgentCalls::track`] takes it (or it is dropped): counted against
+/// the parent's limit, holding its child (if it continues one), and marked
+/// when the parent's turn is stopped meanwhile.
 pub(crate) struct Reservation {
     inner: Arc<Inner>,
-    parent_id: String,
+    id: u64,
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let mut state = self.inner.lock();
-        if let Some(count) = state.reservations.get_mut(&self.parent_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.reservations.remove(&self.parent_id);
-            }
-        }
+        self.inner.lock().starting.remove(&self.id);
     }
 }
 
@@ -374,30 +430,57 @@ impl AgentCalls {
         }
     }
 
-    /// A slot for one more running call of `parent_id`, or `None` at the
-    /// limit ([`LIMITS`]).
-    pub(crate) fn reserve(&self, parent_id: &str) -> Option<Reservation> {
+    /// Starts a call of `parent_id`, continuing `child_id` if given:
+    /// refused at the parent's limit ([`LIMITS`]) and while the child runs
+    /// a turn or another call is starting one. Checked and claimed in one
+    /// step, so of two calls racing for one child only one starts.
+    pub(crate) fn reserve(
+        &self,
+        parent_id: &str,
+        child_id: Option<&str>,
+    ) -> Result<Reservation, StartRefusal> {
+        let supervisor = &self.inner.supervisor;
         let mut state = self.inner.lock();
-        let reserved = state.reservations.get(parent_id).copied().unwrap_or(0);
-        if state.running(parent_id) + reserved >= LIMITS.max_concurrent_calls {
-            return None;
+        if let Some(child_id) = child_id {
+            if state
+                .starting
+                .values()
+                .any(|starting| starting.child_id.as_deref() == Some(child_id))
+            {
+                return Err(StartRefusal::Busy(None));
+            }
+            if let Some(turn_id) = state
+                .running_turn(child_id)
+                .or_else(|| supervisor.active_turn_id(child_id))
+            {
+                return Err(StartRefusal::Busy(Some(turn_id)));
+            }
         }
-        *state.reservations.entry(parent_id.to_owned()).or_default() += 1;
-        Some(Reservation {
+        if state.running(parent_id) >= LIMITS.max_concurrent_calls {
+            return Err(StartRefusal::Limit);
+        }
+        let id = state.next_start;
+        state.next_start += 1;
+        state.starting.insert(
+            id,
+            Starting {
+                parent_id: parent_id.to_owned(),
+                child_id: child_id.map(ToOwned::to_owned),
+                parent_turn: supervisor.active_turn_id(parent_id),
+                stopped: false,
+            },
+        );
+        Ok(Reservation {
             inner: self.inner.clone(),
-            parent_id: parent_id.to_owned(),
+            id,
         })
-    }
-
-    /// The turn an agent call is running in `child_id`, if any.
-    pub(crate) fn running_turn(&self, child_id: &str) -> Option<String> {
-        let state = self.inner.lock();
-        let turn = state.children.get(child_id)?.turn.as_ref()?;
-        turn.status().is_running().then(|| turn.turn_id.clone())
     }
 
     /// Records a started child turn, tells the parent
     /// (`agent.call.started`) and follows the turn in the background.
+    /// When the parent's turn that made the call was stopped while the call
+    /// was starting, the child turn is cancelled right away and this
+    /// returns `true`.
     pub(crate) async fn track(
         &self,
         reservation: Reservation,
@@ -405,7 +488,7 @@ impl AgentCalls {
         started: StartedTurn<LiveTap>,
         text: &str,
         title: Option<&str>,
-    ) {
+    ) -> bool {
         let StartedTurn {
             manifest: child,
             turn_id,
@@ -425,8 +508,9 @@ impl AgentCalls {
             started: Instant::now(),
         });
         let started_at = Utc::now();
-        {
+        let stopped = {
             let mut state = self.inner.lock();
+            let starting = state.starting.remove(&reservation.id);
             state.children.insert(
                 child.id.clone(),
                 ChildCall {
@@ -435,7 +519,17 @@ impl AgentCalls {
                     turn: Some(turn.clone()),
                 },
             );
-        }
+            // From here on stopping the parent's turn cancels this child
+            // (`cancel_children`); whatever stopped it before is caught
+            // here: the mark, or the turn no longer running.
+            starting.is_some_and(|starting| {
+                starting.stopped
+                    || starting.parent_turn.is_some_and(|parent_turn| {
+                        self.inner.supervisor.active_turn_id(&parent.id).as_deref()
+                            != Some(parent_turn.as_str())
+                    })
+            })
+        };
         drop(reservation);
         self.inner
             .persist_running(RunningCall {
@@ -466,12 +560,23 @@ impl AgentCalls {
         self.inner
             .record(&parent.id, "agent.call.started", payload)
             .await;
-        let Some(events) = events else {
-            return;
-        };
-        let inner = self.inner.clone();
-        let parent_id = parent.id.clone();
-        tokio::spawn(async move { inner.monitor(parent_id, child.id, turn, events).await });
+        if let Some(events) = events {
+            let inner = self.inner.clone();
+            let parent_id = parent.id.clone();
+            let child_id = child.id.clone();
+            tokio::spawn(async move { inner.monitor(parent_id, child_id, turn, events).await });
+        }
+        if stopped {
+            if let Err(error) = self
+                .inner
+                .supervisor
+                .cancel_owned(&child.owner_id, &child.id, Some(&turn_id))
+                .await
+            {
+                tracing::warn!(child = %child.id, %error, "cannot cancel an agent call of a stopped turn");
+            }
+        }
+        stopped
     }
 
     /// Waits up to `wait` for the child's latest agent-call turn (only
@@ -547,9 +652,23 @@ impl Inner {
     ) {
         let mut pending_permissions = HashSet::new();
         let ended = 'follow: loop {
-            let batch = match events.next_batch().await {
-                Ok(batch) => batch,
-                Err(_) => break 'follow None,
+            let next = match tokio::time::timeout(QUIET_CHECK, events.next_batch()).await {
+                Ok(next) => next,
+                Err(_)
+                    if self.supervisor.active_turn_id(&child_id).as_deref()
+                        == Some(turn.turn_id.as_str()) =>
+                {
+                    continue
+                }
+                // The turn no longer runs, yet its end was not seen: it is
+                // about to arrive, or it never will.
+                Err(_) => match tokio::time::timeout(END_GRACE, events.next_batch()).await {
+                    Ok(next) => next,
+                    Err(_) => break 'follow Ended::Unobserved,
+                },
+            };
+            let Ok(batch) = next else {
+                break 'follow Ended::Closed;
             };
             for event in batch {
                 if self
@@ -562,26 +681,27 @@ impl Inner {
                     )
                     .await
                 {
-                    break 'follow Some(event);
+                    break 'follow Ended::Terminal(Box::new(event));
                 }
             }
         };
         // Nothing more is read for this turn: stop tapping.
         drop(events);
         let (status, error) = match &ended {
-            Some(event) => {
+            Ended::Terminal(event) => {
                 let status = CallStatus::from_terminal(&event.event_type);
                 let error = (status != CallStatus::Completed)
                     .then(|| CallError::from_terminal(&event.payload));
                 (status, error)
             }
-            None => (
+            Ended::Closed => (
                 CallStatus::Failed,
                 Some(CallError {
                     code: Some(AppError::StreamClosed.code().to_owned()),
                     message: "the called agent's conversation went away".to_owned(),
                 }),
             ),
+            Ended::Unobserved => self.unobserved_end(&child_id, &turn.turn_id).await,
         };
         // Taken with the status change, so the event reports exactly what
         // waiters see once the turn ended.
@@ -592,8 +712,11 @@ impl Inner {
             output = bounded(&state.output, MAX_EVENT_OUTPUT_BYTES);
         });
         // Stopped by a daemon shutdown: left listed, so the next start
-        // reports it to the parent as cut off by the restart.
-        if self.supervisor.is_shutting_down() {
+        // reports it to the parent as cut off by the restart. A turn that
+        // completed or failed on its own is recorded as usual.
+        let cut_off = matches!(ended, Ended::Closed | Ended::Unobserved)
+            || matches!(status, CallStatus::Cancelled | CallStatus::Interrupted);
+        if cut_off && self.supervisor.is_shutting_down() {
             return;
         }
         self.forget_running(&turn.turn_id).await;
@@ -618,6 +741,38 @@ impl Inner {
         self.record(&parent_id, event_type, payload).await;
         // A result does not stay in memory for good.
         drop_output_after(&turn, RESULT_TTL);
+    }
+
+    /// How a turn whose end its monitor did not see ended: the terminal
+    /// event the child's journal holds for it, else the child's status.
+    async fn unobserved_end(
+        &self,
+        child_id: &str,
+        turn_id: &str,
+    ) -> (CallStatus, Option<CallError>) {
+        let terminal = match self.supervisor.turn_terminal(child_id, turn_id).await {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                tracing::warn!(child = %child_id, %error, "cannot read how an agent call ended");
+                None
+            }
+        };
+        let status = match terminal {
+            Some(terminal) => CallStatus::from_terminal(terminal),
+            None => match self.supervisor.get(child_id).await {
+                Ok(manifest) if manifest.status == ConversationStatus::Interrupted => {
+                    CallStatus::Interrupted
+                }
+                _ => CallStatus::Failed,
+            },
+        };
+        let error = (status != CallStatus::Completed).then(|| CallError {
+            code: Some(TURN_END_UNOBSERVED.to_owned()),
+            message: "the called agent's turn ended, but how was not observed; open its \
+                      conversation for details"
+                .to_owned(),
+        });
+        (status, error)
     }
 
     /// Applies one tapped event of the child to the turn; `true` once it
@@ -736,10 +891,16 @@ impl Inner {
         }
     }
 
-    /// Cancels the running agent-call turns of `parent_id`'s children.
+    /// Cancels the running agent-call turns of `parent_id`'s children, and
+    /// marks its calls being started so they cancel theirs once started.
     fn cancel_children(&self, parent_id: &str) {
         let running = {
-            let state = self.lock();
+            let mut state = self.lock();
+            for starting in state.starting.values_mut() {
+                if starting.parent_id == parent_id {
+                    starting.stopped = true;
+                }
+            }
             state
                 .children
                 .iter()
@@ -812,6 +973,16 @@ impl Inner {
             }
         }
     }
+}
+
+/// How following a child turn ended.
+enum Ended {
+    /// Its terminal event.
+    Terminal(Box<ConversationEvent>),
+    /// The tap closed (the child conversation was removed).
+    Closed,
+    /// The turn stopped running without its end reaching the tap.
+    Unobserved,
 }
 
 /// Drops a finished turn's output `after` it ended; the status and error

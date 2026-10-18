@@ -14,10 +14,11 @@ use std::sync::{
     Arc,
 };
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use tokio::sync::mpsc;
 
 use super::ConversationEvent;
+use crate::error::AppError;
 
 /// What a tap keeps of an event: `None` skips it.
 pub type TapProjection = fn(&ConversationEvent) -> Option<ConversationEvent>;
@@ -33,28 +34,47 @@ struct Slot {
 pub struct LiveTaps {
     slots: Arc<DashMap<String, Slot>>,
     next_id: Arc<AtomicU64>,
+    /// Test hook: conversations whose deliveries are lost.
+    #[cfg(test)]
+    muted: Arc<DashMap<String, ()>>,
 }
 
 impl LiveTaps {
-    /// Taps `conversation_id` from its next committed event on, replacing
-    /// an earlier tap of it (whose receiver then ends).
-    pub fn register(&self, conversation_id: &str, project: TapProjection) -> LiveTap {
+    /// Taps `conversation_id` from its next committed event on. A
+    /// conversation has one reader at a time: while another tap of it is
+    /// live this is refused (`CONFLICT`) rather than cutting that reader
+    /// off; a tap whose reader is gone is replaced.
+    pub fn register(
+        &self,
+        conversation_id: &str,
+        project: TapProjection,
+    ) -> Result<LiveTap, AppError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::unbounded_channel();
-        self.slots.insert(
-            conversation_id.to_owned(),
-            Slot {
-                id,
-                project,
-                sender,
-            },
-        );
-        LiveTap {
+        let slot = Slot {
+            id,
+            project,
+            sender,
+        };
+        match self.slots.entry(conversation_id.to_owned()) {
+            Entry::Occupied(mut entry) if entry.get().sender.is_closed() => {
+                entry.insert(slot);
+            }
+            Entry::Occupied(_) => {
+                return Err(AppError::Conflict(format!(
+                    "conversation {conversation_id} is already being followed"
+                )));
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(slot);
+            }
+        }
+        Ok(LiveTap {
             taps: self.clone(),
             conversation_id: conversation_id.to_owned(),
             id,
             receiver,
-        }
+        })
     }
 
     /// The projection of `events` for the conversation's tap, or `None`
@@ -74,6 +94,10 @@ impl LiveTaps {
         if events.is_empty() {
             return;
         }
+        #[cfg(test)]
+        if self.muted.contains_key(conversation_id) {
+            return;
+        }
         let closed = match self.slots.get(conversation_id) {
             Some(slot) => events
                 .into_iter()
@@ -89,6 +113,12 @@ impl LiveTaps {
     /// Ends the conversation's tap (the conversation was removed).
     pub(super) fn remove(&self, conversation_id: &str) {
         self.slots.remove(conversation_id);
+    }
+
+    /// Loses every later delivery for `conversation_id`.
+    #[cfg(test)]
+    pub(crate) fn mute(&self, conversation_id: &str) {
+        self.muted.insert(conversation_id.to_owned(), ());
     }
 
     #[cfg(test)]
@@ -108,7 +138,7 @@ pub struct LiveTap {
 
 impl LiveTap {
     /// The events delivered since the last call, waiting for one when there
-    /// are none; `None` once the tap was replaced or removed. Cancel-safe.
+    /// are none; `None` once the tap was removed. Cancel-safe.
     pub async fn recv_batch(&mut self) -> Option<Vec<ConversationEvent>> {
         let first = self.receiver.recv().await?;
         let mut batch = vec![first];
@@ -145,18 +175,24 @@ mod tests {
             ConversationEvent::new("c1", 2, "tool.started", json!({})),
         ];
         assert!(taps.project("c1", &events).is_none());
-        let mut tap = taps.register("c1", keep_deltas);
+        let mut tap = taps.register("c1", keep_deltas).unwrap();
         let projected = taps.project("c1", &events).unwrap();
         assert_eq!(projected.len(), 1);
         taps.deliver("c1", projected);
         let batch = tap.recv_batch().await.unwrap();
         assert_eq!(batch[0].payload["delta"], "a");
 
-        // A newer tap replaces the old one, whose receiver ends; dropping
-        // the old one leaves the new one registered.
-        let replacement = taps.register("c1", keep_deltas);
-        assert!(tap.recv_batch().await.is_none());
+        // A live tap is never cut off by another reader.
+        assert!(matches!(
+            taps.register("c1", keep_deltas),
+            Err(AppError::Conflict(_))
+        ));
+        taps.deliver("c1", taps.project("c1", &events).unwrap());
+        assert_eq!(tap.recv_batch().await.unwrap().len(), 1);
+        // Once it is dropped the next reader gets the conversation.
         drop(tap);
+        assert!(!taps.is_tapped("c1"));
+        let replacement = taps.register("c1", keep_deltas).unwrap();
         assert!(taps.is_tapped("c1"));
         drop(replacement);
         assert!(!taps.is_tapped("c1"));

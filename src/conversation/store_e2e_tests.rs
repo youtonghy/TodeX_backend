@@ -1781,3 +1781,31 @@ async fn saving_a_request_seals_an_expired_key_without_deadlocking() {
     assert_ne!(keys.deks().current_key(&id).await.unwrap().0, old_kid);
     e2e.cleanup();
 }
+
+#[tokio::test]
+async fn a_tap_gets_committed_events_even_when_the_manifest_write_fails() {
+    fn keep_all(event: &ConversationEvent) -> Option<ConversationEvent> {
+        Some(event.clone())
+    }
+    let e2e = E2e::new("todex-e2e-tap-manifest", true).await;
+    let id = e2e.create(None).await.id;
+    let mut tap = e2e.store.live_tap(&id, keep_all).unwrap();
+    // `turn.started` changes the status, so its manifest is written at
+    // once, after the journal commit.
+    e2e.store.fail_next_manifest_write();
+    e2e.store
+        .append(&id, "turn.started", json!({"turnId": "t"}))
+        .await
+        .unwrap_err();
+    let (events, _) = history(&e2e.store, &id, ReplayDetail::Full).await;
+    assert_eq!(events.last().unwrap().event_type, "turn.started");
+    // Committed, so the reader got it in plaintext.
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(5), tap.recv_batch())
+        .await
+        .expect("delivered")
+        .unwrap();
+    assert_eq!(batch[0].event_type, "turn.started");
+    assert_eq!(batch[0].payload["turnId"], "t");
+    drop(tap);
+    e2e.cleanup();
+}

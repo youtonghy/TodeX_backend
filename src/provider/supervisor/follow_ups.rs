@@ -856,6 +856,13 @@ impl ConversationSupervisor {
         self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Marks the daemon as shutting down (or not) without stopping anything.
+    #[cfg(test)]
+    pub(crate) fn set_shutting_down_for_tests(&self, shutting_down: bool) {
+        self.shutting_down
+            .store(shutting_down, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn spawn_rate_limit_timer(&self, conversation_id: &str, until: DateTime<Utc>) {
         let supervisor = self.clone();
         let conversation_id = conversation_id.to_owned();

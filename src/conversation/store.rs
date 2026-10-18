@@ -205,6 +205,10 @@ pub struct ConversationStore {
     /// and then fails (see [`Self::fail_next_journal_write`]).
     #[cfg(test)]
     journal_write_fault: Arc<std::sync::Mutex<Option<usize>>>,
+    /// Test hook: the next status-changing manifest write fails (see
+    /// [`Self::fail_next_manifest_write`]).
+    #[cfg(test)]
+    manifest_write_fault: Arc<std::sync::atomic::AtomicBool>,
     /// Open streaming-text merge window per conversation. Opened, replaced
     /// and flushed only while the conversation lock is held, so any other
     /// write flushes it first and journal order matches emission order;
@@ -573,6 +577,8 @@ impl ConversationStore {
             journal_writes_started: Arc::default(),
             #[cfg(test)]
             journal_write_fault: Arc::default(),
+            #[cfg(test)]
+            manifest_write_fault: Arc::default(),
         })
     }
 
@@ -1821,6 +1827,13 @@ impl ConversationStore {
             },
         );
 
+        // Committed: taps get their projection now, before the fallible
+        // manifest write below, so a reader waiting for a terminal event
+        // never misses one that is in the journal.
+        if let Some(tapped) = tapped {
+            self.taps.deliver(conversation_id, tapped);
+        }
+
         // The synced journal line above is the commit point. The manifest only
         // mirrors it: status changes are written now (recovery and clients
         // key off them), everything else is flushed by the debounce timer.
@@ -1839,19 +1852,17 @@ impl ConversationStore {
                 hub.publish(event.clone());
             }
         }
-        if let Some(tapped) = tapped {
-            self.taps.deliver(conversation_id, tapped);
-        }
         Ok(events)
     }
 
     /// Taps `conversation_id`'s committed events in plaintext, reduced by
-    /// `project`; see [`super::tap`].
+    /// `project`; see [`super::tap`]. `CONFLICT` while another tap of it is
+    /// live.
     pub fn live_tap(
         &self,
         conversation_id: &str,
         project: super::tap::TapProjection,
-    ) -> super::tap::LiveTap {
+    ) -> Result<super::tap::LiveTap, AppError> {
         self.taps.register(conversation_id, project)
     }
 
@@ -2917,6 +2928,12 @@ impl ConversationStore {
     ) -> Result<(), AppError> {
         let directory = self.directory(&manifest.id)?;
         let written = async {
+            #[cfg(test)]
+            if self.manifest_write_fault.swap(false, Ordering::SeqCst) {
+                return Err(AppError::from(std::io::Error::other(
+                    "injected manifest write failure",
+                )));
+            }
             write_atomic_json(&directory.join(MANIFEST_FILE), manifest).await?;
             write_atomic_json(
                 &directory.join(SNAPSHOT_FILE),
@@ -3747,6 +3764,18 @@ impl ConversationStore {
             .journal_write_fault
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stored);
+    }
+
+    /// Lose every later tap delivery of `conversation_id`.
+    #[cfg(test)]
+    pub(crate) fn mute_taps_for_tests(&self, conversation_id: &str) {
+        self.taps.mute(conversation_id);
+    }
+
+    /// Make the next manifest write fail, as a full disk would.
+    #[cfg(test)]
+    pub(super) fn fail_next_manifest_write(&self) {
+        self.manifest_write_fault.store(true, Ordering::SeqCst);
     }
 
     /// Stop segment commits after `step`, simulating a crash.

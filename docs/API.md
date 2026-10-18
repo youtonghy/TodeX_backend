@@ -628,7 +628,7 @@ daemon 按文件修改时间重新加载 key，修改无需重启就会生效。
 外部 API 的有效范围是全局范围与 key 自身 `scopes` 的交集：
 - Agent 必须同时在全局 `scope.agents` 与 key 的 `scopes.agents` 内，否则 403 `UNAUTHORIZED`。`GET /api/v1/agents` 只列出两者都允许的 Agent，每项的 `models` 也只含全局允许的模型；`GET /api/v1/agents/{agent}/models` 同样按全局范围过滤。
 - turn 指定的 `model` 必须在该 Agent 的允许列表内，否则 403 `UNAUTHORIZED`（`runs` 在创建会话前检查，被拒时不会留下会话）。
-- turn 未指定模型时：该 Agent 不受模型限制则由 Agent 使用默认模型；受限制时使用实时模型目录中的默认模型（若被允许），否则使用允许列表中的第一个模型。
+- turn 未指定模型时：该 Agent 不受模型限制则由 Agent 使用默认模型；受限制时使用实时模型目录中的默认模型（若被允许），否则使用允许列表中的第一个模型。受限制时解析出的模型会随该 turn 明确发出，所以在已有会话中不指定 `model` 的 turn 会切换到这个默认/第一个允许的模型，即使会话之前使用的是另一个（同样允许的）模型；要保持模型不变，请每个 turn 都指定 `model`。
 - 给出 `reasoningEffort` 时，它必须在所选模型（未指定则为默认模型）的 `supportedReasoningEfforts` 内（该列表非空时），否则 403 `UNAUTHORIZED`。检查需要实时读取模型目录；读取失败时不做该检查，交给 Agent 处理。
 
 设备路由（端口 7345）：
@@ -1254,9 +1254,9 @@ Computer Use 由 daemon 在**自己所在的主机**上执行（`src/computer`�
   - `agent_run` / `agent_turn` / `agent_wait` → `{ conversationId, turnId, status, output, error }`。`status` 为 `running`、`completed`、`failed`、`cancelled`、`interrupted` 之一（等待权限时仍报 `running`）；`output` 是被调用 Agent 主代理的回复文本（不含子代理与工具输出，最多 256 KiB，超出截断并附 `[output truncated]`）；`error` 在未完成时为 `{ code?, message }`，否则为 `null`。
   - `agent_cancel` → `{ conversationId, cancelled, turnId }`：`cancelled` 表示是否向正在运行的轮次发出了停止（没有运行中的轮次或 `turnId` 不是运行中的轮次时为 `false`）。
 - 等待语义：`waitSecs` 默认 300，取值限制在 1–1200。到时轮次仍在运行则返回 `status: "running"` 与目前的输出，子会话**继续运行、不会被取消**；之后用 `agent_wait` 取结果（不给 `turnId` 时等最近一次调用的轮次）。已结束轮次的结果（`status`、`output`、`error`）可被 `agent_wait` 重复读取，直到该子会话开始下一轮或轮次结束 30 分钟后 `output` 从内存中丢弃，之后的 `agent_wait` 只返回状态与空 `output`（父会话事件中仍有记录）。Agent 的工具调用被取消时停止等待，子会话不受影响。
-- 限制与错误（工具错误文本为 `CODE: message`）：每个父会话最多 4 个同时运行的调用（`AGENT_CALL_LIMIT`）；Agent、模型不在全局范围内或 `reasoningEffort` 不在模型的 `supportedReasoningEfforts` 中返回 `UNAUTHORIZED`；`agent_turn`/`agent_wait`/`agent_cancel` 只接受调用者自己的子会话，其他会话（包括不存在的）一律 `NOT_FOUND`；子会话仍在运行轮次时 `agent_turn` 返回 `CONFLICT`；Plan 模式下 `agent_run`/`agent_turn` 返回 `PLAN_MODE`；创建与 Provider 错误按原错误码透传（如 `PROVIDER_UNAVAILABLE`）。
-- 子会话：`agent_run` 以父会话的 owner、父会话的工作区创建新会话（标题为给定的 `title`，缺省 `Agent call · <Agent 显示名>`），manifest 带 `parentConversationId: <父会话 id>`。模型未指定时取 Provider 默认模型（若允许），否则取第一个允许的模型。
-- 权限继承：子轮次以父会话当前轮次的权限模式运行，但不超过它：取被调用 Agent 支持的、不高于父模式（`ask` < `auto` < `full-access`）的最高模式（例如 Devin 在父模式 `auto` 下以 `ask` 运行）；没有这样的模式时（如 Pi 只支持 `full-access`，而父模式更低）返回 `UNAUTHORIZED`。`workMode` 为 `implement`。`agent_run`/`agent_turn` 本身是有副作用的工具：父会话为 `ask` 时每次调用先发出 `permission.requested`（`input` 带 Agent、模型、标题与任务文本的前 4 KiB）。子会话自己的权限请求按 `agent-calling.json` 的 `mcp.approval` 处理：`auto-approve` 自动批准（设备绑定的请求除外，一律拒绝）、`reject` 自动拒绝、`ask` 照常发给已配对设备（在子会话中作答）。
+- 限制与错误（工具错误文本为 `CODE: message`）：每个父会话最多 4 个同时运行的调用（`AGENT_CALL_LIMIT`）；Agent、模型不在全局范围内或 `reasoningEffort` 不在模型的 `supportedReasoningEfforts` 中返回 `UNAUTHORIZED`；`agent_turn`/`agent_wait`/`agent_cancel` 只接受调用者自己的子会话，其他会话（包括不存在的）一律 `NOT_FOUND`；子会话仍在运行轮次、或另一调用正在为它启动轮次时 `agent_turn` 返回 `CONFLICT`（同一子会话同时到达的两个 `agent_turn` 只有一个启动）；Plan 模式下 `agent_run`/`agent_turn` 返回 `PLAN_MODE`；创建与 Provider 错误按原错误码透传（如 `PROVIDER_UNAVAILABLE`）。
+- 子会话：`agent_run` 以父会话的 owner、父会话的工作区创建新会话（标题为给定的 `title`，缺省 `Agent call · <Agent 显示名>`），manifest 带 `parentConversationId: <父会话 id>`。模型解析同外部 API：该 Agent 受 `scope.models` 限制时，未指定 `model` 的调用取 Provider 默认模型（若允许），否则取第一个允许的模型，并明确发给 Agent——对已有子会话的 `agent_turn` 也一样，可能在会话中途切换模型；不受限制时由 Agent 使用自己的默认模型。子会话首个 prompt 失败时（例如 Provider 报错），刚创建的子会话随即删除，不留下隐藏会话（外部 API `runs` 的行为不变）。
+- 权限继承：子轮次的权限模式不超过父会话当前轮次的模式：取被调用 Agent 支持的、不高于父模式（`ask` < `auto` < `full-access`）的最高模式（例如 Devin 在父模式 `auto` 下以 `ask` 运行）；没有这样的模式时（如 Pi 只支持 `full-access`，而父模式更低）返回 `UNAUTHORIZED`。`workMode` 为 `implement`。`agent_run`/`agent_turn` 本身是有副作用的工具：父会话为 `ask` 时每次调用先发出 `permission.requested`（`input` 带 Agent、模型、标题与任务文本的前 4 KiB）。子会话在该模式下发出的权限请求再按 `agent-calling.json` 的 `mcp.approval` 处理：`ask` 照常交给用户（已配对设备，在子会话中作答）、`auto-approve` 自动批准（设备绑定的请求除外，一律拒绝）、`reject` 自动拒绝。因此设为 `auto-approve` 时，即使父会话处于 `ask` 模式，子会话的权限请求也会被自动批准——这是用户在设置中的明确选择。
 - 父会话事件（写入**父会话**的事件记录，照常加密；`turnId` 由后端填为父会话当时运行中的轮次，子会话一律用 `childConversationId`/`childTurnId`）：
   - `agent.call.started { childConversationId, childTurnId, agent, model?, reasoningEffort?, text, title?, status: "running", startedAt }`（`text` 最多 16 KiB；`title` 只在 `agent_run` 时给出）。
   - `agent.call.updated { childConversationId, childTurnId, status: "running" | "waiting_permission" }`：子轮次发出权限请求时为 `waiting_permission`，请求全部答复后回到 `running`。
@@ -1265,7 +1265,7 @@ Computer Use 由 daemon 在**自己所在的主机**上执行（`src/computer`�
   - `agent.call.cancelled { childConversationId, childTurnId, status: "cancelled", output?, durationMs? }`。
   - 事件中的 `output` 最多 64 KiB。
 - 子会话可见性：`GET /v2/conversations` 默认不列出子会话，加 `?includeChildren=true` 才包含；按 id 读取、订阅、回放、发送 prompt 与删除子会话照常可用（客户端可从父会话的 `agent.call.*` 事件打开子会话）。
-- 生命周期：父会话的轮次被取消或中断时，取消它所有运行中的子轮次（随后父会话收到 `agent.call.cancelled`）；父轮次正常结束时子会话继续运行，下一轮可用 `agent_wait` 取结果。删除父会话（包括过期与历史清理）时先取消运行中的子轮次，再删除它的全部子会话。运行中的调用记录在 `$DATA_DIR/agent-calls.json`（0600，原子替换，只含会话与轮次 id、Agent 与开始时间）；daemon 重启后，对其中残留的每个调用向父会话追加 `agent.call.failed`，`error.code = "DAEMON_RESTARTED"`，然后清空该文件。
+- 生命周期：父会话的轮次被取消或中断时，取消它所有运行中的子轮次（随后父会话收到 `agent.call.cancelled`）；调用仍在启动时（创建子会话、等待 CLI 启动）父轮次被取消或中断（或已结束），子轮次一启动就被取消，该调用返回 `status: "cancelled"`；父轮次正常结束时子会话继续运行，下一轮可用 `agent_wait` 取结果。删除父会话（包括过期与历史清理）时先取消运行中的子轮次，再删除它的全部子会话。运行中的调用记录在 `$DATA_DIR/agent-calls.json`（0600，原子替换，只含会话与轮次 id、Agent 与开始时间）；daemon 重启后，对其中残留的每个调用向父会话追加 `agent.call.failed`，`error.code = "DAEMON_RESTARTED"`，然后清空该文件。只有被关闭停止的调用（取消、中断，或关闭时未能读到结束）才留待下次启动报告；关闭期间自行完成或失败的调用照常记录并移出该文件。若子轮次已不在运行却没有收到它的结束事件，调用不会一直停在运行中：按子会话日志里该轮次的结束事件（没有时按子会话状态，否则为 `failed`）结束，`error.code = "TURN_END_UNOBSERVED"`。
 - 明文：后端读取子会话的回复时不解密历史，而是在事件加密写入前，在内存中取得所需的最少内容（主代理文本、轮次结束与错误、权限请求 id）；这些内容不写盘、不进日志，轮次结束后即不再读取。
 
 ## WebSocket 协议

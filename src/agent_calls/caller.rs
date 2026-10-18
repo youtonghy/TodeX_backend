@@ -191,9 +191,11 @@ impl Caller for AgentToolCaller {
                 "conversation {conversation_id} is not an agent call of this conversation"
             )));
         }
-        Ok(state
+        // Refused while another call follows the child, which is never cut
+        // off.
+        state
             .conversations
-            .live_tap(conversation_id, tap_projection))
+            .live_tap(conversation_id, tap_projection)
     }
 
     fn parent_conversation_id(&self) -> Option<&str> {
