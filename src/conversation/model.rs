@@ -133,6 +133,12 @@ pub struct ConversationManifest {
     /// is held until `at`. Omitted while unscheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ConversationSchedule>,
+    /// Set on a conversation another agent started through the
+    /// `todex_agents` MCP server (an agent-call child): the calling
+    /// conversation. Children are left out of `GET /v2/conversations`
+    /// unless `includeChildren=true`. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_conversation_id: Option<String>,
 }
 
 /// `manifest.schedule`. The held prompts live in daemon memory only, so a
@@ -190,6 +196,7 @@ impl ConversationManifest {
             history_encrypted_at: None,
             legacy_plaintext: false,
             schedule: None,
+            parent_conversation_id: None,
         }
     }
 }

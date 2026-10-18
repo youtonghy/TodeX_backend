@@ -177,6 +177,8 @@ POST /v2/conversations/{conversationId}/permissions/{permissionId}
 
 不指定工作区（客户端的「None」选项）时省略 `workspace`，改传 `"scratchWorkspace": true`：后端为该对话创建 `$TODEX_AGENTD_DATA_DIR/workspace/<conversationId>` 并把它作为 workspace，返回的 manifest 带 `"scratchWorkspace": true`（为 `false` 时省略），`workspace` 是新目录的规范路径，`workspaceId` 照常按路径生成，因此每个对话各不相同，不会出现在 `/v2/workspaces` 中。`scratchWorkspace` 与 `workspace` 同时提供或都不提供时返回 `400 INVALID_REQUEST`。删除对话不会删除该目录。
 
+`GET /v2/conversations` 不列出 Agent 调用产生的子会话（manifest 带 `parentConversationId`，见 [Agent 调用（MCP `todex_agents`）](#agent-调用mcp-todex_agents)），除非加 `?includeChildren=true`；按 id 访问子会话不受影响。
+
 发送 prompt：
 
 ```json
@@ -1178,10 +1180,10 @@ Content-Type: application/json
 
 ### Agent SSH 工具（MCP）
 
-只要至少一台 SSH 主机开启了 Agent access，TodeX 就会在会话启动时为 Codex、Claude Code、ACP 系列（OpenCode/Devin/Grok/自定义 ACP）与 Antigravity（全局静态条目，见上文）注入名为 `todex_ssh` 的 stdio MCP 服务器（`todex-agentd agent-mcp-bridge`，旧名 `ssh-mcp-bridge` 仍可用；环境变量 `TODEX_AGENT_MCP_URL`、`TODEX_AGENT_MCP_TOKEN`，桥也接受旧名 `TODEX_SSH_MCP_*`）；Claude Code 的配置写入 `$DATA_DIR/agent-mcp/` 下的 0600 文件，令牌不出现在命令行。同一会话注入多个 TodeX MCP 服务器时，它们共用一个会话令牌，各自走自己的端点；Codex 每个服务器一个 `mcp_servers.<name>` 覆盖，Claude Code 写入同一个配置文件（每个服务器带 `timeout`）并以逗号分隔列在 `--allowedTools`，ACP 列在同一个 `mcpServers` 数组。没有开启的主机时，Provider 启动参数与以前完全一致；Pi 与旧 codex_gateway 不注入。已运行的 Codex/ACP 进程要到下一次会话启动才会看到新开启的工具；关闭 Agent access 立即生效。
+只要至少一台 SSH 主机开启了 Agent access，TodeX 就会在会话启动时为 Codex、Claude Code、ACP 系列（OpenCode/Devin/Grok/自定义 ACP）、Pi 与 Antigravity（全局静态条目，见上文）注入名为 `todex_ssh` 的 stdio MCP 服务器（`todex-agentd agent-mcp-bridge`，旧名 `ssh-mcp-bridge` 仍可用；环境变量 `TODEX_AGENT_MCP_URL`、`TODEX_AGENT_MCP_TOKEN`，桥也接受旧名 `TODEX_SSH_MCP_*`）；Claude Code 的配置写入 `$DATA_DIR/agent-mcp/` 下的 0600 文件，令牌不出现在命令行。同一会话注入多个 TodeX MCP 服务器时，它们共用一个会话令牌，各自走自己的端点；Codex 每个服务器一个 `mcp_servers.<name>` 覆盖，Claude Code 写入同一个配置文件（每个服务器带 `timeout`）并以逗号分隔列在 `--allowedTools`，ACP 列在同一个 `mcpServers` 数组。Pi 通过 `-e $DATA_DIR/agent-mcp/todex-pi-mcp.mjs` 扩展注入：扩展从环境变量 `TODEX_AGENT_MCP_PI_SERVERS`（启动后即从 `process.env` 删除）读取启用的服务器，为每个服务器启动同一个桥，并把其工具直接注册为 Pi 工具（不依赖 Pi 自身的 MCP 适配器）。没有开启的主机时，Provider 启动参数与以前完全一致；旧 codex_gateway 不注入。已运行的 Codex/ACP 进程要到下一次会话启动才会看到新开启的工具；关闭 Agent access 立即生效。
 
 - 端点：`/internal/agent-mcp/ssh`（MCP Streamable HTTP）。不走设备签名，只接受回环地址、不带 `Origin` 头、携带会话级 `Authorization: Bearer <token>` 的请求；非回环或带 `Origin` 返回 403，令牌缺失或无效返回 401。令牌只存在内存，删除会话或重启 daemon 后失效。Claude Code 的配置文件在该会话再没有打开的 MCP 会话（桥正常退出时发出 `DELETE`）且没有更新的启动等待读取时删除；桥被强杀时留到会话删除。按会话的令牌与授权只用于区分会话、避免 Agent 未经询问就行动，**不是**同一 OS 用户下的安全边界：以同一用户运行的程序可以从 Provider 进程环境或配置文件读到令牌。
-- 协议细节（`todex_ssh` 与 `todex_desktop` 相同）：调用不存在的工具返回 JSON-RPC 错误 `-32602`（`Unknown tool: <name>`）；参数无效、功能关闭、拒绝、超时等都是 `isError: true` 的工具结果（文本以 `CODE: ` 开头）。服务器不声明 prompts/resources；客户端仍调用 `prompts/list`、`resources/list`、`resources/templates/list` 时返回带 `ttlMs: 0`、`cacheScope: "private"` 的空列表。
+- 协议细节（`todex_ssh`、`todex_desktop` 与 `todex_agents` 相同）：调用不存在的工具返回 JSON-RPC 错误 `-32602`（`Unknown tool: <name>`）；参数无效、功能关闭、拒绝、超时等都是 `isError: true` 的工具结果（文本以 `CODE: ` 开头）。服务器不声明 prompts/resources；客户端仍调用 `prompts/list`、`resources/list`、`resources/templates/list` 时返回带 `ttlMs: 0`、`cacheScope: "private"` 的空列表。
 - 权限模式：有副作用的工具（`ssh_exec`、`browser_open`、`browser_navigate`、`browser_act`、`computer_act`）跟随会话当前轮次的有效权限模式（每轮 `turn.started` 的 `effectivePermissions`，在调用时读取；轮次成功开始后才生效，轮次结束——完成、失败或取消——后清除，此时没有运行中的轮次，按 `ask` 处理）：`workMode: "plan"` 时一律拒绝（`PLAN_MODE: …`，只读工具照常可用）；`permissionMode: "ask"` 时每次调用发出与 Provider 工具审批相同的 `permission.requested { kind: "tool", details: { tool_name: "mcp__<server>__<tool>", server, tool, summary, input } }`（任意已配对设备可答；`input` 不含输入的文字；`ssh_exec` 的 `input` 带 `stdinBytes` 与 `stdinPreview`——stdin 前 4 KiB 的预览，PEM 块（`-----BEGIN …-----` 至 `-----END …-----`）、键名像密钥的 `KEY=value` / `key: value` 行（键名含 password、passwd、secret、token、api_key/apikey、private_key、credential、auth）以及已知格式的令牌已脱敏，超出时以 `… (truncated, N bytes)` 标明；`summary` 中的命令最多 200 个字符，被截断时以 `… (truncated, N chars)` 标明总长），选项 `allow_once`、`allow_always`（本会话内该工具不再询问）、`reject_once`；`auto`、`full-access` 不额外审批（Antigravity 的 `auto` turn 在账号不提供 `agy` 的 Auto 时改按 `ask` 审批，以 `auto_mode_unavailable` 事件为准，见上文）。只支持 `ask` 的 Provider（Grok Build、自定义 ACP）因此总是逐次审批；Grok Build 在轮次中批准计划后，本轮剩余部分仍按计划模式处理，下一轮才放开。
 - 防刷屏：任何 TodeX 工具的提示（首次授权、按应用批准、敏感确认、ask 模式审批）被拒绝或超时后，同一会话的同一提示 30 秒内不再弹出，直接返回 `DECLINED`（说明不会再问）。工具调用被取消时等待立即结束；主机原生对话框无法撤回，会留在屏幕上，下一次相同提示等待这同一个对话框而不是再弹一个，若在无人等待时被回答，60 秒内的下一次相同提示直接采用该回答。只放行一次的确认（敏感操作、无法识别目标应用的 Computer Use 操作）例外：提示按动作内容（工具与参数的摘要）区分，30 秒退避也只对同一动作生效；它们的回答从不与其他调用共享，也不留给之后的调用——同一动作的旧对话框还在屏幕上时，新调用先等它被回答，再弹出自己的对话框。
 - `ssh_list_hosts {}` → `{ hosts: [{ alias, hostName?, user?, port? }] }`，只列出开启了 Agent access 的主机。
@@ -1231,6 +1233,40 @@ Computer Use 由 daemon 在**自己所在的主机**上执行（`src/computer`�
 - 受控主机（daemon 所在电脑，`GET /v2/agent-desktop` 返回的 `computer { supported, available, reason, platform, permissions }` 反映这些条件）：macOS 14+（需屏幕录制与辅助功能授权；浮条 + ⌘⇧⎋ 停止）；Windows 需在已登录用户的交互式桌面运行（作为服务在 session 0 或桌面锁定时不可用；无需授权；置顶状态窗 + Ctrl+Alt+Shift+Esc 停止；坐标为物理像素，进程按 Per-Monitor-V2 DPI 感知；应用标识为小写可执行文件名，如 `notepad.exe`）；Linux 支持 X11 会话与 KDE Plasma 6.6+ 的 Wayland 会话（其他 Wayland 桌面及更早的 Plasma 返回 `supported: false` 并说明原因；辅助功能指 AT-SPI 的 `org.a11y.Status.IsEnabled`，请求授权时由 daemon 打开；状态与授权确认用桌面通知的“停止”/“允许”/“拒绝”按钮，无通知服务时退回 `kdialog`/`zenity`；X11 没有全局停止快捷键；应用标识为小写可执行文件名；daemon 不链接 libxkbcommon 等图形库，无图形环境的服务器也能正常启动）。Windows 与 Linux 上无元素的 `type` 与 `key` 会先把目标应用切到前台再模拟按键。
 - KDE Plasma Wayland（`src/computer/platform/kde_wayland.rs`）：输入走 RemoteDesktop 门户（首次由 KDE 弹窗征得主机同意，恢复令牌存于 `$XDG_STATE_HOME/todex/remote-desktop.token`，0600；会话随屏幕租约打开与关闭），截图走 KWin `ScreenShot2`（daemon 安装隐藏的 `~/.local/share/applications/com.unbaked0692.todex.agentd.desktop` 声明授权，未授权时退回 Screenshot 门户整屏截取），窗口、显示器与激活靠临时 KWin 脚本，空闲时间来自 `ext-idle-notify-v1`（2 秒粒度）。Wayland 原生窗口的 AT-SPI 坐标是窗口内坐标，daemon 按 KWin 窗口位置换算为全局逻辑坐标。Plasma 6.8 之前，向已知非密码框输入非 ASCII 文字或向 Chromium 系应用输入时，改用 Klipper 剪贴板 + Ctrl+V（约 400ms 后恢复原文字剪贴板，Klipper 历史会留下该文字）。停止快捷键 Ctrl+Alt+Shift+Esc 经 KGlobalAccel 注册（冲突时没有快捷键）。`POST .../computer/permissions` 安装截图授权并提前弹出远程控制同意框（`permission: "screen"`）、打开 AT-SPI（`permission: "accessibility"`）；省略则两者都做。daemon 不会写 KDE 的权限库来跳过同意框（只有 CI 的隔离总线这样做）。
 - KDE Wayland 真机验证清单（CI 任务 `kde-wayland` 只在无头 KWin 中跑过逻辑，以下需在 Plasma 6.6、6.7、6.8 实机逐项确认）：首次远程控制同意框出现且重启后靠恢复令牌免弹窗；6.6/6.7 上 `ScreenShot2` 授权生效（不再退回门户）；多显示器（含不同缩放）上按坐标与按 ref 点击落点正确；Firefox、Chromium、GTK4 应用的元素坐标与截图对齐；滚动方向（`deltaY` 为正向下）；fcitx5 下中日韩文字输入；Ctrl+Alt+Shift+Esc 停止会话；通知“停止”/“允许”/“拒绝”可用。
+
+### Agent 调用（MCP `todex_agents`）
+
+“Agent 调用”的 MCP 入口：在 TodeX 中运行的 Agent 调用另一个 TodeX Agent（例如 Claude Code 把一项子任务交给 Codex）。与外部 API（CLI 入口，见 [外部 API（API Key）](#外部-apiapi-key)）共用同一调用层和 `agent-calling.json` 中的全局范围（允许的 Agent 与模型）。
+
+- 注入：`agent-calling.json` 的 `mcp.enabled` 为 `true` 且全局范围至少允许一个 Agent（即 `GET /v2/agent-calling` 的 `mcp.injected`）时，与 `todex_ssh` 一样注入名为 `todex_agents` 的服务器（端点 `/internal/agent-mcp/agents`，同样的回环 + 会话令牌守卫；Claude Code 的 `--allowedTools` 带 `mcp__todex_agents`；Antigravity 的全局静态配置也有 `todex_agents` 条目，只在本轮启用时提供工具；Pi 经同一扩展加载）。Provider 的单次工具超时为 1500 秒（ask 模式审批最多 300 秒 + 最长等待 1200 秒）。以下会话不注入：API key 会话（与其他 TodeX MCP 服务器相同）以及 Agent 调用产生的子会话（只允许一层调用）；它们即使拿到令牌调用，也返回 `UNAUTHORIZED`。关闭开关后，已注入的服务器在每次调用时检查设置并返回 `AGENT_CALLING_DISABLED`。
+- 工具（字段与 `/api/v1` 对应）：
+
+| 工具 | 对应 `/api/v1` | 输入 | 有副作用 |
+|---|---|---|---|
+| `agents_list` | `GET /agents`（含模型） | `{}` | 否 |
+| `agent_run` | `POST /runs` | `{ agent, text, model?, reasoningEffort?, title?, waitSecs? }` | 是 |
+| `agent_turn` | `POST /conversations/{id}/turns` | `{ conversationId, text, model?, reasoningEffort?, waitSecs? }` | 是 |
+| `agent_wait` | — | `{ conversationId, turnId?, waitSecs? }` | 否 |
+| `agent_cancel` | `POST /conversations/{id}/cancel` | `{ conversationId, turnId? }` | 否（只停止自己的子会话） |
+
+- 结果（结构化 JSON）：
+  - `agents_list` → `{ agents: [{ agent, displayName, available, models: [{ id, displayName, isDefault, supportedReasoningEfforts, defaultReasoningEffort? }] }], limits: { maxConcurrentCalls, maxWaitSecs, defaultWaitSecs } }`，按全局范围过滤 Agent 与模型（模型来自 Provider 快照目录）。
+  - `agent_run` / `agent_turn` / `agent_wait` → `{ conversationId, turnId, status, output, error }`。`status` 为 `running`、`completed`、`failed`、`cancelled`、`interrupted` 之一（等待权限时仍报 `running`）；`output` 是被调用 Agent 主代理的回复文本（不含子代理与工具输出，最多 256 KiB，超出截断并附 `[output truncated]`）；`error` 在未完成时为 `{ code?, message }`，否则为 `null`。
+  - `agent_cancel` → `{ conversationId, cancelled, turnId }`：`cancelled` 表示是否向正在运行的轮次发出了停止（没有运行中的轮次或 `turnId` 不是运行中的轮次时为 `false`）。
+- 等待语义：`waitSecs` 默认 300，取值限制在 1–1200。到时轮次仍在运行则返回 `status: "running"` 与目前的输出，子会话**继续运行、不会被取消**；之后用 `agent_wait` 取结果（不给 `turnId` 时等最近一次调用的轮次）。已结束轮次的 `output` 只交付一次：交付后、该子会话开始下一轮时或结束 30 分钟后从内存中丢弃，之后的 `agent_wait` 只返回状态与空 `output`（父会话事件中仍有记录）。Agent 的工具调用被取消时停止等待，子会话不受影响。
+- 限制与错误（工具错误文本为 `CODE: message`）：每个父会话最多 4 个同时运行的调用（`AGENT_CALL_LIMIT`）；Agent、模型不在全局范围内或 `reasoningEffort` 不在模型的 `supportedReasoningEfforts` 中返回 `UNAUTHORIZED`；`agent_turn`/`agent_wait`/`agent_cancel` 只接受调用者自己的子会话，其他会话（包括不存在的）一律 `NOT_FOUND`；子会话仍在运行轮次时 `agent_turn` 返回 `CONFLICT`；Plan 模式下 `agent_run`/`agent_turn` 返回 `PLAN_MODE`；创建与 Provider 错误按原错误码透传（如 `PROVIDER_UNAVAILABLE`）。
+- 子会话：`agent_run` 以父会话的 owner、父会话的工作区创建新会话（标题为给定的 `title`，缺省 `Agent call · <Agent 显示名>`），manifest 带 `parentConversationId: <父会话 id>`。模型未指定时取 Provider 默认模型（若允许），否则取第一个允许的模型。
+- 权限继承：子轮次以父会话当前轮次的权限模式运行，但不超过它：取被调用 Agent 支持的、不高于父模式（`ask` < `auto` < `full-access`）的最高模式（例如 Devin 在父模式 `auto` 下以 `ask` 运行）；没有这样的模式时（如 Pi 只支持 `full-access`，而父模式更低）返回 `UNAUTHORIZED`。`workMode` 为 `implement`。`agent_run`/`agent_turn` 本身是有副作用的工具：父会话为 `ask` 时每次调用先发出 `permission.requested`（`input` 带 Agent、模型、标题与任务文本的前 4 KiB）。子会话自己的权限请求按 `agent-calling.json` 的 `mcp.approval` 处理：`auto-approve` 自动批准（设备绑定的请求除外，一律拒绝）、`reject` 自动拒绝、`ask` 照常发给已配对设备（在子会话中作答）。
+- 父会话事件（写入**父会话**的事件记录，照常加密；`turnId` 由后端填为父会话当时运行中的轮次，子会话一律用 `childConversationId`/`childTurnId`）：
+  - `agent.call.started { childConversationId, childTurnId, agent, model?, reasoningEffort?, text, title?, status: "running", startedAt }`（`text` 最多 16 KiB；`title` 只在 `agent_run` 时给出）。
+  - `agent.call.updated { childConversationId, childTurnId, status: "running" | "waiting_permission" }`：子轮次发出权限请求时为 `waiting_permission`，请求全部答复后回到 `running`。
+  - `agent.call.completed { childConversationId, childTurnId, status: "completed", output, durationMs }`。
+  - `agent.call.failed { childConversationId, childTurnId, status: "failed" | "interrupted", error: { code?, message }, output?, durationMs? }`。
+  - `agent.call.cancelled { childConversationId, childTurnId, status: "cancelled", output?, durationMs? }`。
+  - 事件中的 `output` 最多 64 KiB。
+- 子会话可见性：`GET /v2/conversations` 默认不列出子会话，加 `?includeChildren=true` 才包含；按 id 读取、订阅、回放、发送 prompt 与删除子会话照常可用（客户端可从父会话的 `agent.call.*` 事件打开子会话）。
+- 生命周期：父会话的轮次被取消或中断时，取消它所有运行中的子轮次（随后父会话收到 `agent.call.cancelled`）；父轮次正常结束时子会话继续运行，下一轮可用 `agent_wait` 取结果。删除父会话（包括过期与历史清理）时先取消运行中的子轮次，再删除它的全部子会话。运行中的调用记录在 `$DATA_DIR/agent-calls.json`（0600，原子替换，只含会话与轮次 id、Agent 与开始时间）；daemon 重启后，对其中残留的每个调用向父会话追加 `agent.call.failed`，`error.code = "DAEMON_RESTARTED"`，然后清空该文件。
+- 明文：后端读取子会话的回复时不解密历史，而是在事件加密写入前，在内存中取得所需的最少内容（主代理文本、轮次结束与错误、权限请求 id）；这些内容不写盘、不进日志，轮次结束后即不再读取。
 
 ## WebSocket 协议
 

@@ -238,6 +238,9 @@ pub struct ConversationStore {
     pub(super) history: Option<HistoryKeys>,
     /// Test override for the free-space probe (`u64::MAX`: none).
     free_space_override: Arc<AtomicU64>,
+    /// In-memory plaintext taps (see [`super::tap`]); each gets the
+    /// projection of its conversation's committed events before sealing.
+    taps: super::tap::LiveTaps,
     /// Crash-injection point for segment commits in tests.
     #[cfg(test)]
     commit_stop: Arc<std::sync::Mutex<Option<CommitStep>>>,
@@ -561,6 +564,7 @@ impl ConversationStore {
             maintenance: Arc::new(MaintenanceQueue::default()),
             history,
             free_space_override: Arc::new(AtomicU64::new(u64::MAX)),
+            taps: super::tap::LiveTaps::default(),
             #[cfg(test)]
             commit_stop: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -1233,6 +1237,7 @@ impl ConversationStore {
     /// (its keyring went with its directory). Callers hold the
     /// conversation lock.
     fn forget_locked(&self, conversation_id: &str) {
+        self.taps.remove(conversation_id);
         if let Some(keys) = &self.history {
             keys.deks().forget(conversation_id);
         }
@@ -1683,6 +1688,9 @@ impl ConversationStore {
         // folded into the digest.
         // Large payloads are sealed and encoded on the blocking pool; the
         // conversation lock is still held, so journal order is unchanged.
+        // A tap gets its projection of the plaintext, delivered once the
+        // records are committed; it never reaches the journal or the hub.
+        let tapped = self.taps.project(conversation_id, &events);
         let encode = move || {
             events
                 .into_iter()
@@ -1831,7 +1839,20 @@ impl ConversationStore {
                 hub.publish(event.clone());
             }
         }
+        if let Some(tapped) = tapped {
+            self.taps.deliver(conversation_id, tapped);
+        }
         Ok(events)
+    }
+
+    /// Taps `conversation_id`'s committed events in plaintext, reduced by
+    /// `project`; see [`super::tap`].
+    pub fn live_tap(
+        &self,
+        conversation_id: &str,
+        project: super::tap::TapProjection,
+    ) -> super::tap::LiveTap {
+        self.taps.register(conversation_id, project)
     }
 
     pub async fn save_request(

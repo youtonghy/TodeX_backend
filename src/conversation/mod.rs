@@ -12,6 +12,7 @@ mod segment;
 pub(crate) mod server_decrypt;
 mod store;
 mod summary;
+mod tap;
 
 pub use coalesce::{DeltaFragment, PendingDelta};
 pub use digest::{ControlOutcome, CONVERSATION_TERMINAL_EVENTS, TURN_TERMINAL_EVENTS};
@@ -27,3 +28,4 @@ pub use store::{seal_request_snapshot, ConversationStore, ReplayDetail};
 pub use summary::{
     event_frames, full_presentation_changes, present_event, summarize_event, RETRY_REQUEST_KEY,
 };
+pub use tap::{LiveTap, TapProjection};

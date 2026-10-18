@@ -5,7 +5,7 @@
 //! static entries there and points them at a conversation through the
 //! environment of the `agy` process it starts (see `agent_mcp`):
 //!
-//! - `mcp_config.json`: `todex_ssh` / `todex_desktop` run
+//! - `mcp_config.json`: `todex_ssh` / `todex_desktop` / `todex_agents` run
 //!   `todex-agentd agent-mcp-bridge --route <route>`; outside a TodeX turn
 //!   they serve no tools.
 //! - `hooks.json`: `todex-approval`, a `PreToolUse` hook for every tool,
@@ -23,8 +23,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::agent_mcp::{
-    AGY_HOOK_SUBCOMMAND, BRIDGE_SUBCOMMAND, DESKTOP_ROUTE, DESKTOP_SERVER, ENDPOINT_ENV, ROUTE_ARG,
-    SSH_ROUTE, SSH_SERVER,
+    AGY_HOOK_SUBCOMMAND, ALL_SERVERS, BRIDGE_SUBCOMMAND, ENDPOINT_ENV, ROUTE_ARG,
 };
 use crate::agent_providers::files::{
     atomic_write_private, modify_json5_file, read_json5, read_text, remove_file_if_exists,
@@ -64,7 +63,7 @@ pub(crate) fn ensure(dir: &Path, daemon: &Path) -> Result<(), AppError> {
         hook_entry(),
     )?;
     let daemon = daemon.to_string_lossy();
-    for (name, route) in [(SSH_SERVER, SSH_ROUTE), (DESKTOP_SERVER, DESKTOP_ROUTE)] {
+    for (name, route) in ALL_SERVERS {
         upsert(
             &dir.join("mcp_config.json"),
             "Antigravity MCP config",
@@ -87,7 +86,7 @@ pub(crate) fn remove(dir: &Path) -> Result<bool, AppError> {
     if removed && read_json5(&hooks, "Antigravity hooks")? == Some(json!({})) {
         remove_file_if_exists(&hooks)?;
     }
-    for name in [SSH_SERVER, DESKTOP_SERVER] {
+    for (name, _) in ALL_SERVERS {
         removed |= remove_key(
             &dir.join("mcp_config.json"),
             "Antigravity MCP config",
@@ -194,6 +193,7 @@ fn not_object(file: &Path, label: &str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_mcp::{AGENTS_ROUTE, AGENTS_SERVER, DESKTOP_SERVER, SSH_ROUTE, SSH_SERVER};
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("todex-agy-config-{}", uuid::Uuid::new_v4()));
@@ -229,6 +229,10 @@ mod tests {
             mcp["mcpServers"][DESKTOP_SERVER]["command"],
             "/opt/todex/todex-agentd"
         );
+        assert_eq!(
+            mcp["mcpServers"][AGENTS_SERVER]["args"],
+            json!([BRIDGE_SUBCOMMAND, ROUTE_ARG, AGENTS_ROUTE])
+        );
         let hooks: Value =
             serde_json::from_slice(&std::fs::read(dir.join("hooks.json")).unwrap()).unwrap();
         assert!(hooks["lint"].is_object());
@@ -255,6 +259,7 @@ mod tests {
         let mcp: Value =
             serde_json::from_slice(&std::fs::read(dir.join("mcp_config.json")).unwrap()).unwrap();
         assert!(mcp["mcpServers"].get(SSH_SERVER).is_none());
+        assert!(mcp["mcpServers"].get(AGENTS_SERVER).is_none());
         assert_eq!(mcp["mcpServers"]["mine"]["command"], "x");
         let hooks: Value =
             serde_json::from_slice(&std::fs::read(dir.join("hooks.json")).unwrap()).unwrap();

@@ -2,8 +2,8 @@
 //! may reach on top of the global [`super::AgentScope`], and where it
 //! reads events from.
 //!
-//! [`ApiKeyCaller`] is the external API. An agent calling another agent
-//! (the `todex_agents` MCP server) is a second implementation: it owns its
+//! [`ApiKeyCaller`] is the external API. [`AgentToolCaller`] is an agent
+//! calling another agent (the `todex_agents` MCP server): it owns its
 //! children as the parent conversation's owner, is fixed to the parent's
 //! workspace, and reads a plaintext tap instead of decrypting.
 
@@ -12,13 +12,13 @@ use std::{path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use zeroize::Zeroizing;
 
-use super::events::{EventPump, TurnEvents};
+use super::events::{tap_projection, EventPump, TurnEvents};
 use crate::api_keys::ApiKeyRecord;
 use crate::app_state::AppState;
 use crate::conversation::server_decrypt::HistoryReader;
-use crate::conversation::ProviderKind;
+use crate::conversation::{ConversationManifest, LiveTap, ProviderKind};
 use crate::error::AppError;
-use crate::workspace_paths::validate_workspace_directory_text;
+use crate::workspace_paths::{validate_workspace_directory, validate_workspace_directory_text};
 
 #[async_trait]
 pub(crate) trait Caller: Send + Sync {
@@ -49,6 +49,12 @@ pub(crate) trait Caller: Send + Sync {
         conversation_id: &str,
         after: u64,
     ) -> Result<Self::Events, AppError>;
+
+    /// The conversation this caller's conversations are children of (an
+    /// agent calling agents); `None` for top-level conversations.
+    fn parent_conversation_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The key a request authenticated with, and the history recipient seed
@@ -119,5 +125,78 @@ impl Caller for ApiKeyCaller {
         after: u64,
     ) -> Result<EventPump, AppError> {
         EventPump::new(state, self, conversation_id, after).await
+    }
+}
+
+/// An agent calling other agents through `todex_agents`: the conversation
+/// it runs in (the parent). Its calls create children of that
+/// conversation, owned by the same owner, in the same workspace, and follow
+/// them through a [`LiveTap`].
+#[derive(Clone)]
+pub(crate) struct AgentToolCaller {
+    pub parent: ConversationManifest,
+}
+
+#[async_trait]
+impl Caller for AgentToolCaller {
+    type Events = LiveTap;
+
+    fn owner_id(&self) -> String {
+        self.parent.owner_id.clone()
+    }
+
+    /// Only the global scope applies.
+    fn check_agent(&self, _agent: ProviderKind) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    /// Always the parent's workspace, which must still be accessible.
+    fn authorize_workspace(
+        &self,
+        state: &AppState,
+        requested: Option<&str>,
+    ) -> Result<PathBuf, AppError> {
+        let workspace = validate_workspace_directory(
+            &state.config.workspace_access_roots(),
+            &self.parent.workspace,
+        )?;
+        if let Some(requested) = requested {
+            let requested = validate_workspace_directory_text(
+                &state.config.workspace_access_roots(),
+                requested,
+            )?;
+            if requested != workspace {
+                return Err(AppError::Unauthorized(
+                    "agent calls run in the calling conversation's workspace".to_owned(),
+                ));
+            }
+        }
+        Ok(workspace)
+    }
+
+    /// Taps the child from its next event on. `after` is implied: nothing
+    /// before the tap is delivered.
+    async fn subscribe(
+        &self,
+        state: &AppState,
+        conversation_id: &str,
+        _after: u64,
+    ) -> Result<LiveTap, AppError> {
+        let manifest = state
+            .conversations
+            .get_owned(&self.owner_id(), conversation_id)
+            .await?;
+        if manifest.parent_conversation_id.as_deref() != Some(self.parent.id.as_str()) {
+            return Err(AppError::NotFound(format!(
+                "conversation {conversation_id} is not an agent call of this conversation"
+            )));
+        }
+        Ok(state
+            .conversations
+            .live_tap(conversation_id, tap_projection))
+    }
+
+    fn parent_conversation_id(&self) -> Option<&str> {
+        Some(&self.parent.id)
     }
 }

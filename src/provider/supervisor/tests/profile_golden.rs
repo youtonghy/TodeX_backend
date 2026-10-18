@@ -182,7 +182,9 @@ async fn agent_mcp_injection_matrix_is_frozen() {
     ssh.service.set_agent_access("web", true).await.unwrap();
     let supervisor = supervisor.with_agent_mcp(agent_mcp);
     for (provider, format) in MCP_INJECTION {
-        let launch = supervisor.agent_mcp_for(provider, "conv_golden").await;
+        let launch = supervisor
+            .agent_mcp_for(provider, "conv_golden", false)
+            .await;
         assert_eq!(launch.is_some(), format.is_some(), "{provider:?}");
         let declared = match profile(provider).mcp_injection {
             McpInjection::None => None,

@@ -630,6 +630,9 @@ impl ConversationSupervisor {
     /// failed on an exhausted plan window waits for its reset; other turn
     /// endings pause it.
     async fn after_turn(&self, conversation_id: &str, turn_id: Option<&str>, terminal: &str) {
+        if let Some(hooks) = self.hooks() {
+            hooks.turn_ended(conversation_id, terminal);
+        }
         let exhausted_until = turn_id.and_then(|turn_id| self.quota.take_turn_exhaustion(turn_id));
         if matches!(terminal, "turn.completed" | "compaction.finished") {
             if terminal == "turn.completed" {

@@ -7,6 +7,7 @@ next to itself, answers `agy models` and the
 chosen by the prompt text:
   FAIL <message>  a failing `result`
   HANG            init, then waits until it is killed
+  SLOW <seconds>  like anything else, after waiting that long
   anything else   text deltas, one tool step and a successful `result`
 Like agy, it exits only once stdin closes after the turn. With
 `--mode auto` it warns that Auto is unavailable when an `auto-unavailable`
@@ -96,6 +97,8 @@ elif text.startswith("FAIL "):
     emit({"event": "result", "result": {"conversation_id": conversation, "status": "ERROR",
                                         "response": "", "error": text[5:], "usage": usage}})
 else:
+    if text.startswith("SLOW "):
+        time.sleep(float(text[5:]))
     step(1, "ACTIVE", "agent_response", text_delta="Hi")
     step(1, "DONE", "agent_response", text_delta=" there", usage=usage)
     step(2, "ACTIVE", "tool", tool_name="run_command",

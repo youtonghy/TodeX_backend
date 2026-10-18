@@ -1,6 +1,6 @@
 // Managed by TodeX (`crate::agent_mcp`). Loaded into `pi` via `-e` when one or
-// more TodeX MCP servers (`todex_ssh`, `todex_desktop`) are enabled for the
-// conversation. Registers tools directly with `pi.registerTool` so they remain
+// more TodeX MCP servers (`todex_ssh`, `todex_desktop`, `todex_agents`) are
+// enabled for the conversation. Registers tools directly with `pi.registerTool` so they remain
 // exposed as first-class model tools even when third-party MCP adapters
 // (e.g. `pi-mcp-adapter`) disable `builtin:mcp` or strip `exposure: "direct"`.
 

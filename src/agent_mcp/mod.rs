@@ -11,8 +11,9 @@
 //!
 //! Each server is injected only while its feature is enabled (`todex_ssh`:
 //! at least one SSH host has agent access; `todex_desktop`: desktop tools
-//! are switched on), so provider arguments stay unchanged for everyone who
-//! never enables one.
+//! are switched on; `todex_agents`: MCP agent calling is on and at least
+//! one agent is allowed, and never into an agent-call child), so provider
+//! arguments stay unchanged for everyone who never enables one.
 //!
 //! Tools are declared in a [`registry`]; every prompt they raise goes
 //! through the [`authorizer`], which also applies the conversation's
@@ -21,6 +22,7 @@
 //! the provider's environment, so per-conversation grants are a guard
 //! against agents acting unasked, not a security boundary.
 
+mod agents_server;
 mod agy_hook;
 mod authorizer;
 mod bridge;
@@ -57,6 +59,7 @@ pub(crate) fn routes(
 ) -> axum::Router<crate::app_state::AppState> {
     server::routes(state)
         .merge(desktop_server::routes(state))
+        .merge(agents_server::routes(state))
         .merge(agy_hook::routes())
 }
 
@@ -95,6 +98,18 @@ pub(crate) const AGY_NATIVE_AUTO_ENV: &str = "TODEX_AGY_NATIVE_AUTO";
 pub(crate) const AGY_NATIVE_AUTO_HEADER: &str = "x-todex-agy-native-auto";
 pub(crate) const DESKTOP_SERVER: &str = "todex_desktop";
 pub(crate) const DESKTOP_ROUTE: &str = "/internal/agent-mcp/desktop";
+pub(crate) const AGENTS_SERVER: &str = "todex_agents";
+pub(crate) const AGENTS_ROUTE: &str = "/internal/agent-mcp/agents";
+/// Every TodeX MCP server and its route, for static provider configs.
+pub(crate) const ALL_SERVERS: [(&str, &str); 3] = [
+    (SSH_SERVER, SSH_ROUTE),
+    (DESKTOP_SERVER, DESKTOP_ROUTE),
+    (AGENTS_SERVER, AGENTS_ROUTE),
+];
+/// An agent call may wait for an approval (ask mode) and then for the
+/// called agent's turn for up to the longest wait.
+const AGENTS_TOOL_TIMEOUT_SECONDS: u64 =
+    authorizer::CONFIRM_TIMEOUT.as_secs() + crate::agent_calls::LIMITS.max_wait_secs;
 /// JSON array of TodeX MCP bridge servers passed to `todex-pi-mcp.mjs` in the
 /// `pi` process environment (deleted from `process.env` at extension startup).
 pub(crate) const PI_SERVERS_ENV: &str = "TODEX_AGENT_MCP_PI_SERVERS";
@@ -125,6 +140,8 @@ struct Inner {
     /// The bridge binary; `None` disables injection.
     bridge_command: Option<PathBuf>,
     state_dir: PathBuf,
+    /// Agent calling settings, for `todex_agents`; unset leaves it out.
+    agent_calling: OnceLock<crate::agent_calls::AgentCallingStore>,
 }
 
 impl AgentMcp {
@@ -180,8 +197,16 @@ impl AgentMcp {
                 endpoint: OnceLock::new(),
                 bridge_command,
                 state_dir,
+                agent_calling: OnceLock::new(),
             }),
         })
+    }
+
+    /// Lets `todex_agents` follow the agent calling settings.
+    pub(crate) fn set_agent_calling(&self, store: crate::agent_calls::AgentCallingStore) {
+        if self.inner.agent_calling.set(store).is_err() {
+            tracing::warn!("agent calling settings were already attached to agent MCP");
+        }
     }
 
     pub(crate) fn ssh(&self) -> &SshService {
@@ -283,6 +308,12 @@ impl AgentMcp {
         &self.inner.authorizer
     }
 
+    /// The conversation's token without an injection (no endpoint needed).
+    #[cfg(test)]
+    pub(crate) fn token_for_tests(&self, conversation_id: &str) -> String {
+        self.token_for(conversation_id)
+    }
+
     fn claude_config_path(&self, conversation_id: &str) -> PathBuf {
         self.inner
             .state_dir
@@ -352,8 +383,19 @@ impl AgentMcp {
 
     /// The MCP servers to inject for `conversation_id`, or `None` when no
     /// server is enabled (or the endpoint is unavailable).
+    #[cfg(test)]
     pub(crate) async fn launch(&self, conversation_id: &str) -> Option<AgentMcpLaunch> {
-        let enabled = self.enabled_servers().await;
+        self.launch_for(conversation_id, false).await
+    }
+
+    /// [`Self::launch`]; `child`: the conversation is an agent-call child,
+    /// which never gets `todex_agents`.
+    pub(crate) async fn launch_for(
+        &self,
+        conversation_id: &str,
+        child: bool,
+    ) -> Option<AgentMcpLaunch> {
+        let enabled = self.enabled_servers(child).await;
         if enabled.is_empty() {
             return None;
         }
@@ -364,8 +406,18 @@ impl AgentMcp {
     /// global config: the enabled servers (possibly none) plus the variables
     /// that point the static entries at this conversation. `None` only when
     /// the endpoint or the daemon executable is unavailable.
+    #[cfg(test)]
     pub(crate) async fn launch_global(&self, conversation_id: &str) -> Option<AgentMcpLaunch> {
-        let enabled = self.enabled_servers().await;
+        self.launch_global_for(conversation_id, false).await
+    }
+
+    /// [`Self::launch_global`]; `child` as in [`Self::launch_for`].
+    pub(crate) async fn launch_global_for(
+        &self,
+        conversation_id: &str,
+        child: bool,
+    ) -> Option<AgentMcpLaunch> {
+        let enabled = self.enabled_servers(child).await;
         let mut launch = self.launch_servers(conversation_id, enabled)?;
         let endpoint = self.inner.endpoint.get()?.clone();
         let routes = launch
@@ -385,7 +437,7 @@ impl AgentMcp {
         Some(launch)
     }
 
-    async fn enabled_servers(&self) -> Vec<(&'static str, &'static str, u64)> {
+    async fn enabled_servers(&self, child: bool) -> Vec<(&'static str, &'static str, u64)> {
         let mut enabled = Vec::new();
         if self.inner.ssh.has_agent_hosts().await {
             enabled.push((SSH_SERVER, SSH_ROUTE, SSH_TOOL_TIMEOUT_SECONDS));
@@ -396,6 +448,15 @@ impl AgentMcp {
                 DESKTOP_ROUTE,
                 desktop_server::PROVIDER_TOOL_TIMEOUT_SECONDS,
             ));
+        }
+        if !child
+            && self
+                .inner
+                .agent_calling
+                .get()
+                .is_some_and(|store| store.settings().mcp_injected())
+        {
+            enabled.push((AGENTS_SERVER, AGENTS_ROUTE, AGENTS_TOOL_TIMEOUT_SECONDS));
         }
         enabled
     }
@@ -610,6 +671,71 @@ pub(crate) mod tests {
         assert_eq!(mcp.authenticate(&token_a), None);
         assert!(!config_path.exists());
         assert!(mcp.authenticate(&b.servers[0].env[1].1).is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn todex_agents_follows_the_setting_and_skips_children() {
+        let fixture = crate::ssh::tests::fixture("Host web\n").await;
+        let mcp = registry(fixture.service.clone(), &fixture.root).await;
+        let store = crate::agent_calls::AgentCallingStore::load(
+            &fixture.root.join("data"),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        mcp.set_agent_calling(store.clone());
+        // Off by default.
+        assert!(mcp.launch_for("conv_a", false).await.is_none());
+        let enable = |enabled: bool, agents: serde_json::Value| {
+            serde_json::from_value::<crate::agent_calls::AgentCallingUpdate>(serde_json::json!({
+                "mcp": { "enabled": enabled },
+                "scope": { "agents": agents },
+            }))
+            .unwrap()
+        };
+        store
+            .update(enable(true, serde_json::json!([])))
+            .await
+            .unwrap();
+        // No agent allowed: nothing to call.
+        assert!(mcp.launch_for("conv_a", false).await.is_none());
+        store
+            .update(enable(true, serde_json::Value::Null))
+            .await
+            .unwrap();
+        let launch = mcp.launch_for("conv_a", false).await.unwrap();
+        assert_eq!(launch.servers.len(), 1);
+        let server = &launch.servers[0];
+        assert_eq!(server.name, AGENTS_SERVER);
+        assert_eq!(server.tool_timeout_seconds, 1500);
+        assert_eq!(
+            server.env[0].1,
+            "http://127.0.0.1:7345/internal/agent-mcp/agents"
+        );
+        let args = crate::provider::mcp_injection::claude_args(&launch)
+            .await
+            .unwrap();
+        assert_eq!(args[1], "--allowedTools=mcp__todex_agents");
+        // Agent-call children get every other server, never this one.
+        assert!(mcp.launch_for("conv_child", true).await.is_none());
+        fixture.service.set_agent_access("web", true).await.unwrap();
+        let child = mcp.launch_for("conv_child", true).await.unwrap();
+        assert_eq!(
+            child
+                .servers
+                .iter()
+                .map(|server| server.name)
+                .collect::<Vec<_>>(),
+            [SSH_SERVER]
+        );
+        let global = mcp.launch_global_for("conv_child", true).await.unwrap();
+        let routes = global.global.unwrap().env;
+        assert!(routes
+            .iter()
+            .any(|(name, value)| name == ROUTES_ENV && value == SSH_ROUTE));
+        mcp.revoke("conv_a").await;
+        mcp.revoke("conv_child").await;
     }
 
     #[tokio::test]

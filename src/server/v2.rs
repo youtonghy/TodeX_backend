@@ -2302,14 +2302,25 @@ fn warm_result(conversation_id: &str, skipped: Option<&str>) -> Value {
     result
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListConversationsQuery {
+    /// Also list agent-call children (`parentConversationId` set).
+    #[serde(default)]
+    include_children: bool,
+}
+
 async fn list_conversations(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ListConversationsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&state, &headers)?;
-    Ok(Json(
-        json!({ "conversations": state.conversations.list_owned(&auth.tenant_id).await? }),
-    ))
+    let mut conversations = state.conversations.list_owned(&auth.tenant_id).await?;
+    if !query.include_children {
+        conversations.retain(|manifest| manifest.parent_conversation_id.is_none());
+    }
+    Ok(Json(json!({ "conversations": conversations })))
 }
 
 async fn create_conversation(
@@ -4729,6 +4740,82 @@ mod tests {
         let device = TestDevice::new(11);
         device.enroll(data_dir);
         device
+    }
+
+    #[tokio::test]
+    async fn conversation_list_leaves_agent_call_children_out_unless_asked() {
+        let root = std::env::temp_dir().join(format!("todex-v2-children-{}", Uuid::new_v4()));
+        let workspace = root.join("workspaces").join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let mut config = Config {
+            data_dir: root.join("data"),
+            workspace_roots: vec![fs::canonicalize(root.join("workspaces")).unwrap()],
+            ..Config::default()
+        };
+        config.security.enable_auth = true;
+        let state = AppState::new_for_tests(config).await.unwrap();
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state.clone());
+        let parent = state
+            .conversations
+            .create_owned("local", ProviderKind::Codex, workspace.clone(), None, None)
+            .await
+            .unwrap();
+        let child = state
+            .conversations
+            .create_child_owned(
+                "local",
+                ProviderKind::Codex,
+                workspace,
+                None,
+                None,
+                &parent.id,
+            )
+            .await
+            .unwrap();
+        let get = |uri: String| {
+            let app = app.clone();
+            let request = signed_request(&device, "GET", &uri, "");
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: Value =
+                    serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap())
+                        .unwrap();
+                body
+            }
+        };
+        let ids = |body: &Value| {
+            body["conversations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|manifest| manifest["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let listed = get("/v2/conversations".to_owned()).await;
+        assert_eq!(ids(&listed), std::slice::from_ref(&parent.id));
+        assert!(listed["conversations"][0]
+            .get("parentConversationId")
+            .is_none());
+        let all = get("/v2/conversations?includeChildren=true".to_owned()).await;
+        let mut all_ids = ids(&all);
+        all_ids.sort();
+        let mut expected = vec![parent.id.clone(), child.id.clone()];
+        expected.sort();
+        assert_eq!(all_ids, expected);
+        let listed_child = all["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|manifest| manifest["id"] == child.id.as_str())
+            .unwrap();
+        assert_eq!(listed_child["parentConversationId"], parent.id.as_str());
+        // A child is still reachable by id.
+        let fetched = get(format!("/v2/conversations/{}", child.id)).await;
+        assert_eq!(fetched["parentConversationId"], parent.id.as_str());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn signed_request(device: &TestDevice, method: &str, uri: &str, body: &str) -> Request<Body> {

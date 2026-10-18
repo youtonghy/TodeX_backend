@@ -2,8 +2,9 @@
 //! end and assistant text are recognized in them.
 //!
 //! [`EventPump`] decrypts the journal and the live hub for an API key. A
-//! caller that cannot decrypt (an agent calling another agent) supplies its
-//! own [`TurnEvents`] source instead.
+//! caller that cannot decrypt (an agent calling another agent) reads a
+//! [`LiveTap`] instead: the plaintext of the events it needs, taken in
+//! memory right before they are sealed (see [`tap_projection`]).
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -13,8 +14,8 @@ use super::ApiKeyCaller;
 use crate::app_state::AppState;
 use crate::conversation::server_decrypt::HistoryReader;
 use crate::conversation::{
-    ConversationEvent, ConversationSubscription, ReplayDetail, CONVERSATION_TERMINAL_EVENTS,
-    TURN_TERMINAL_EVENTS,
+    ConversationEvent, ConversationSubscription, LiveTap, ReplayDetail,
+    CONVERSATION_TERMINAL_EVENTS, TURN_TERMINAL_EVENTS,
 };
 use crate::error::AppError;
 
@@ -144,6 +145,55 @@ impl TurnEvents for EventPump {
     }
 }
 
+#[async_trait]
+impl TurnEvents for LiveTap {
+    async fn next_batch(&mut self) -> Result<Vec<ConversationEvent>, AppError> {
+        self.recv_batch().await.ok_or(AppError::StreamClosed)
+    }
+}
+
+/// What an agent call keeps of a tapped child event: the main agent's text
+/// (`message.delta` reduced to `{turnId, delta}`), the end of a turn (its
+/// type with `turnId` and the error fields), and permission requests and
+/// answers (`{turnId, permissionId}`), so the caller can follow the turn and
+/// report its state. Everything else, tool input and output included, is
+/// dropped before it leaves the store.
+pub(crate) fn tap_projection(event: &ConversationEvent) -> Option<ConversationEvent> {
+    const ERROR_FIELDS: [&str; 4] = ["turnId", "code", "message", "error"];
+    const PERMISSION_FIELDS: [&str; 2] = ["turnId", "permissionId"];
+    let keep = |fields: &[&str]| {
+        let mut payload = serde_json::Map::new();
+        for field in fields {
+            if let Some(value) = event.payload.get(*field) {
+                payload.insert((*field).to_owned(), value.clone());
+            }
+        }
+        Value::Object(payload)
+    };
+    let payload = if let Some(text) = assistant_text(event) {
+        let mut payload = keep(&["turnId"]);
+        payload["delta"] = Value::String(text.to_owned());
+        payload
+    } else if ends_turn(event, None) {
+        keep(&ERROR_FIELDS)
+    } else if matches!(
+        event.event_type.as_str(),
+        "permission.requested" | "permission.resolved"
+    ) {
+        keep(&PERMISSION_FIELDS)
+    } else {
+        return None;
+    };
+    let mut projected = ConversationEvent::new(
+        &event.conversation_id,
+        event.sequence,
+        event.event_type.clone(),
+        payload,
+    );
+    projected.time = event.time;
+    Some(projected)
+}
+
 /// Whether `event` ends `turn_id` (or, without one, any turn).
 pub(crate) fn ends_turn(event: &ConversationEvent, turn_id: Option<&str>) -> bool {
     if CONVERSATION_TERMINAL_EVENTS.contains(&event.event_type.as_str()) {
@@ -179,4 +229,44 @@ pub(crate) fn assistant_text(event: &ConversationEvent) -> Option<&str> {
         return payload.pointer("/content/text").and_then(Value::as_str);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_tap_keeps_only_text_turn_ends_and_permission_ids() {
+        let event = |kind: &str, payload: Value| ConversationEvent::new("c", 3, kind, payload);
+        let text = tap_projection(&event(
+            "message.delta",
+            json!({ "turnId": "t", "delta": { "type": "text_delta", "text": "hi" }, "extra": 1 }),
+        ))
+        .unwrap();
+        assert_eq!(text.payload, json!({ "turnId": "t", "delta": "hi" }));
+        assert_eq!(text.sequence, 3);
+        assert_eq!(assistant_text(&text), Some("hi"));
+        assert!(tap_projection(&event(
+            "message.delta",
+            json!({ "turnId": "t", "delta": "sub", "subagentId": "s" })
+        ))
+        .is_none());
+        assert!(tap_projection(&event("tool.output", json!({ "output": "secret" }))).is_none());
+        let failed = tap_projection(&event(
+            "turn.failed",
+            json!({ "turnId": "t", "code": "X", "message": "boom", "stopReason": "s" }),
+        ))
+        .unwrap();
+        assert_eq!(
+            failed.payload,
+            json!({ "turnId": "t", "code": "X", "message": "boom" })
+        );
+        let asked = tap_projection(&event(
+            "permission.requested",
+            json!({ "turnId": "t", "permissionId": "p", "details": { "command": "rm" } }),
+        ))
+        .unwrap();
+        assert_eq!(asked.payload, json!({ "turnId": "t", "permissionId": "p" }));
+    }
 }

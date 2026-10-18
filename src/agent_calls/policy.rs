@@ -114,14 +114,8 @@ impl PermissionPolicy for AgentCallPermissionPolicy {
 
 /// Whether `manifest` is a conversation another agent started through the
 /// `todex_agents` MCP server.
-///
-/// Hook: no conversation is one yet. Once `ConversationManifest` carries
-/// `parentConversationId`, this becomes
-/// `manifest.parent_conversation_id.is_some()`, and
-/// [`AgentCallPermissionPolicy`] answers those conversations.
 pub(crate) fn is_agent_call_child(manifest: &ConversationManifest) -> bool {
-    let _ = manifest;
-    false
+    manifest.parent_conversation_id.is_some()
 }
 
 /// The option `approval` picks among `options`, or `None` to leave the

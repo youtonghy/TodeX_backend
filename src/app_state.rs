@@ -55,6 +55,9 @@ pub struct AppState {
     /// Agent calling scope, MCP entry and API listener status; see
     /// [`crate::agent_calls`].
     pub(crate) agent_calling: crate::agent_calls::AgentCallingStore,
+    /// Calls agents make to other agents through `todex_agents`; see
+    /// [`crate::agent_calls::AgentCalls`].
+    pub(crate) agent_calls: crate::agent_calls::AgentCalls,
     /// Saved history cleanup policies; see [`crate::history_cleanup`].
     pub(crate) history_cleanup: crate::history_cleanup::HistoryCleanup,
     /// Claude Code and Pi native sessions; see [`crate::native_history`].
@@ -133,6 +136,7 @@ impl AppState {
         let api_keys = ApiKeyStore::load(&config.data_dir)?;
         let agent_calling =
             crate::agent_calls::AgentCallingStore::load(&config.data_dir, &config.api).await?;
+        agent_mcp.set_agent_calling(agent_calling.clone());
         let history_cleanup = crate::history_cleanup::HistoryCleanup::load(&config.data_dir);
         let native_history = crate::native_history::NativeHistory::new(
             &config.data_dir,
@@ -165,7 +169,10 @@ impl AppState {
                 agent_calling.clone(),
             ),
         ));
+        let agent_calls =
+            crate::agent_calls::AgentCalls::new(&config.data_dir, conversations.clone());
         conversations.recover_all().await?;
+        agent_calls.start().await;
         let local_terminals = LocalTerminalManager::new(events.clone());
         let cli_manager = CliManager::default();
         let pairing_keys = PairingKeyStore::load(&config.data_dir).await?;
@@ -200,6 +207,7 @@ impl AppState {
             history_keys,
             api_keys,
             agent_calling,
+            agent_calls,
             history_cleanup,
             native_history,
             api_auth_failures: Default::default(),

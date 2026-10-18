@@ -410,6 +410,20 @@ pub struct ConversationSupervisor {
     /// [`DriverEventSink::hand_over`]): the events the provider sent while no
     /// turn ran are journalled with that turn, and later ones go to it.
     prewarm_sinks: Arc<dashmap::DashMap<String, DriverEventSink>>,
+    /// Observer of turn ends and conversation removals; see
+    /// [`ConversationHooks`].
+    hooks: Arc<std::sync::RwLock<Option<Arc<dyn ConversationHooks>>>>,
+}
+
+/// Told about conversation lifecycle events the supervisor itself does not
+/// act on (agent calls cancel and delete a parent's children). Called
+/// inline: implementations spawn anything that waits.
+pub(crate) trait ConversationHooks: Send + Sync {
+    /// A turn or operation of `conversation_id` ended with `terminal` (the
+    /// terminal event type, e.g. `turn.cancelled`) and released it.
+    fn turn_ended(&self, conversation_id: &str, terminal: &str);
+    /// `manifest`'s conversation was removed (deleted, expired, cleaned up).
+    fn conversation_removed(&self, manifest: &ConversationManifest);
 }
 
 /// Completed control results kept for retried requests.
@@ -521,6 +535,7 @@ impl ConversationSupervisor {
             rate_limit_retry_floor: follow_ups::RATE_LIMIT_RETRY_FLOOR,
             prewarms: Arc::new(tokio::sync::Semaphore::new(MAX_PREWARMS)),
             prewarm_sinks: Arc::default(),
+            hooks: Arc::default(),
         }
     }
 
@@ -559,29 +574,72 @@ impl ConversationSupervisor {
     }
 
     /// TodeX's MCP servers for a turn, when any is enabled and the provider
-    /// can load MCP servers TodeX supplies.
+    /// can load MCP servers TodeX supplies. `child`: the conversation is an
+    /// agent-call child, which gets no `todex_agents` (agents call agents
+    /// one level deep).
     async fn agent_mcp_for(
         &self,
         provider: ProviderKind,
         conversation_id: &str,
+        child: bool,
     ) -> Option<AgentMcpLaunch> {
         let agent_mcp = self.agent_mcp.as_ref()?;
         match profile(provider).mcp_injection {
             McpInjection::None => None,
-            McpInjection::GlobalConfigEnv => agent_mcp.launch_global(conversation_id).await,
-            _ => agent_mcp.launch(conversation_id).await,
+            McpInjection::GlobalConfigEnv => {
+                agent_mcp.launch_global_for(conversation_id, child).await
+            }
+            _ => agent_mcp.launch_for(conversation_id, child).await,
         }
     }
 
     /// TodeX's MCP servers for a turn of `manifest`. API key conversations
     /// get the provider's own tools only: TodeX's SSH, desktop and browser
-    /// tools reach past the key's scope.
+    /// tools reach past the key's scope. Agent-call children get every
+    /// server but `todex_agents`.
     async fn turn_agent_mcp(&self, manifest: &ConversationManifest) -> Option<AgentMcpLaunch> {
         if manifest.owner_id.starts_with(crate::api_keys::OWNER_PREFIX) {
             None
         } else {
-            self.agent_mcp_for(manifest.provider, &manifest.id).await
+            self.agent_mcp_for(
+                manifest.provider,
+                &manifest.id,
+                manifest.parent_conversation_id.is_some(),
+            )
+            .await
         }
+    }
+
+    /// Taps `conversation_id`'s committed events in plaintext, in memory
+    /// only; see [`crate::conversation::LiveTap`].
+    pub(crate) fn live_tap(
+        &self,
+        conversation_id: &str,
+        project: crate::conversation::TapProjection,
+    ) -> crate::conversation::LiveTap {
+        self.store.live_tap(conversation_id, project)
+    }
+
+    /// The conversation's running turn, if any.
+    pub(crate) fn active_turn_id(&self, conversation_id: &str) -> Option<String> {
+        self.active
+            .get(conversation_id)
+            .map(|turn| turn.turn_id.clone())
+    }
+
+    /// Installs the observer of turn ends and removals (agent calls).
+    pub(crate) fn set_hooks(&self, hooks: Arc<dyn ConversationHooks>) {
+        *self
+            .hooks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hooks);
+    }
+
+    fn hooks(&self) -> Option<Arc<dyn ConversationHooks>> {
+        self.hooks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     async fn revoke_agent_mcp(&self, conversation_id: &str) {
@@ -1069,8 +1127,37 @@ impl ConversationSupervisor {
         title: Option<String>,
         provider_profile: Option<String>,
     ) -> Result<ConversationManifest, AppError> {
-        self.create_inner(owner_id, provider, Some(workspace), title, provider_profile)
-            .await
+        self.create_inner(
+            owner_id,
+            provider,
+            Some(workspace),
+            title,
+            provider_profile,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create_owned`] for an agent-call child of `parent_id`
+    /// (`manifest.parentConversationId`).
+    pub(crate) async fn create_child_owned(
+        &self,
+        owner_id: &str,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        title: Option<String>,
+        provider_profile: Option<String>,
+        parent_id: &str,
+    ) -> Result<ConversationManifest, AppError> {
+        self.create_inner(
+            owner_id,
+            provider,
+            Some(workspace),
+            title,
+            provider_profile,
+            Some(parent_id.to_owned()),
+        )
+        .await
     }
 
     /// Creates a conversation without a user workspace: the daemon makes
@@ -1082,7 +1169,7 @@ impl ConversationSupervisor {
         title: Option<String>,
         provider_profile: Option<String>,
     ) -> Result<ConversationManifest, AppError> {
-        self.create_inner(owner_id, provider, None, title, provider_profile)
+        self.create_inner(owner_id, provider, None, title, provider_profile, None)
             .await
     }
 
@@ -1093,6 +1180,7 @@ impl ConversationSupervisor {
         workspace: Option<PathBuf>,
         title: Option<String>,
         provider_profile: Option<String>,
+        parent_conversation_id: Option<String>,
     ) -> Result<ConversationManifest, AppError> {
         validate_owner_id(owner_id)?;
         let validate = |workspace: &Path| {
@@ -1129,6 +1217,7 @@ impl ConversationSupervisor {
             manifest.scratch_workspace = true;
         }
         manifest.owner_id = owner_id.to_owned();
+        manifest.parent_conversation_id = parent_conversation_id;
         manifest.workspace_id = Some(stable_workspace_id(&manifest.workspace));
         let scratch_folder = manifest
             .scratch_workspace
@@ -1289,6 +1378,9 @@ impl ConversationSupervisor {
         self.follow_up_queues.remove(&manifest.id);
         self.prewarm_sinks.remove(&manifest.id);
         self.revoke_agent_mcp(&manifest.id).await;
+        if let Some(hooks) = self.hooks() {
+            hooks.conversation_removed(manifest);
+        }
         // Close the broadcast channel so live websocket subscriptions exit
         // instead of holding their per-connection slot forever.
         self.hub.remove(&manifest.id);

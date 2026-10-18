@@ -6,6 +6,7 @@
 //! `agent-calling.json` applies to every caller.
 
 mod caller;
+mod calls;
 mod events;
 mod policy;
 mod settings;
@@ -21,7 +22,10 @@ use crate::error::AppError;
 use crate::provider::types::{ProviderModelDescriptor, ProviderSnapshot};
 use crate::provider::{CancelOutcome, ConversationPrompt, PermissionDecision, PromptSkillRef};
 
-pub(crate) use caller::{ApiKeyCaller, Caller};
+pub(crate) use caller::{AgentToolCaller, ApiKeyCaller, Caller};
+pub(crate) use calls::{AgentCalls, CallResult, Reservation};
+#[cfg(test)]
+pub(crate) use events::tap_projection;
 pub(crate) use events::{assistant_text, ends_turn, EventPump, TurnEvents};
 #[allow(unused_imports)]
 pub(crate) use policy::{
@@ -93,6 +97,9 @@ pub(crate) struct StartedTurn<E> {
     pub manifest: ConversationManifest,
     pub turn_id: String,
     pub events: Option<E>,
+    /// The model the turn was sent with (resolved within the scope).
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 /// How waiting for a turn ended.
@@ -175,10 +182,34 @@ pub(crate) async fn create<C: Caller + ?Sized>(
 ) -> Result<ConversationManifest, AppError> {
     ensure_agent(state, caller, agent)?;
     let workspace = caller.authorize_workspace(state, workspace)?;
-    state
-        .conversations
-        .create_owned(&caller.owner_id(), agent, workspace, title, profile)
-        .await
+    create_conversation(state, caller, agent, workspace, title, profile).await
+}
+
+/// Creates `caller`'s conversation; an agent caller's is a child of its
+/// conversation.
+async fn create_conversation<C: Caller + ?Sized>(
+    state: &AppState,
+    caller: &C,
+    agent: ProviderKind,
+    workspace: std::path::PathBuf,
+    title: Option<String>,
+    profile: Option<String>,
+) -> Result<ConversationManifest, AppError> {
+    let owner = caller.owner_id();
+    match caller.parent_conversation_id() {
+        Some(parent) => {
+            state
+                .conversations
+                .create_child_owned(&owner, agent, workspace, title, profile, parent)
+                .await
+        }
+        None => {
+            state
+                .conversations
+                .create_owned(&owner, agent, workspace, title, profile)
+                .await
+        }
+    }
 }
 
 /// The prompt a turn of `agent` in `workspace` sends: the model resolved
@@ -253,6 +284,7 @@ pub(crate) async fn start_turn<C: Caller + ?Sized>(
         .await?;
     ensure_agent(state, caller, manifest.provider)?;
     let prompt = prepare_prompt(state, manifest.provider, &manifest.workspace, input).await?;
+    let (model, reasoning_effort) = (prompt.model.clone(), prompt.reasoning_effort.clone());
     let events = if follow {
         Some(
             caller
@@ -270,6 +302,8 @@ pub(crate) async fn start_turn<C: Caller + ?Sized>(
         manifest,
         turn_id,
         events,
+        model,
+        reasoning_effort,
     })
 }
 
@@ -286,11 +320,10 @@ pub(crate) async fn run<C: Caller + ?Sized>(
     let workspace = caller.authorize_workspace(state, input.workspace.as_deref())?;
     // Before the conversation exists, so a refused model leaves nothing.
     let prompt = prepare_prompt(state, agent, &workspace, input.turn).await?;
+    let (model, reasoning_effort) = (prompt.model.clone(), prompt.reasoning_effort.clone());
     let owner = caller.owner_id();
-    let manifest = state
-        .conversations
-        .create_owned(&owner, agent, workspace, input.title, input.profile)
-        .await?;
+    let manifest =
+        create_conversation(state, caller, agent, workspace, input.title, input.profile).await?;
     let events = caller
         .subscribe(state, &manifest.id, manifest.last_sequence)
         .await?;
@@ -302,6 +335,8 @@ pub(crate) async fn run<C: Caller + ?Sized>(
         manifest,
         turn_id,
         events: Some(events),
+        model,
+        reasoning_effort,
     })
 }
 
