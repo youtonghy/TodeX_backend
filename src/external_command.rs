@@ -156,6 +156,14 @@ pub(crate) async fn run(
 
 /// Like [`run`], but output beyond the limit is dropped instead of failing
 /// the run: the process keeps running until it exits or times out.
+pub(crate) async fn run_truncated(
+    command: Command,
+    stdin: Option<Vec<u8>>,
+    limits: CommandLimits,
+) -> Result<TruncatedOutput, ExternalCommandError> {
+    run_with(command, stdin, limits, Overflow::Truncate, None).await
+}
+
 /// Which pipe an [`OutputChunk`] came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputStream {

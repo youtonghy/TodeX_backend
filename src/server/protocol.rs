@@ -75,7 +75,9 @@ fn default_git_log_limit() -> u32 {
 #[serde(rename_all = "camelCase")]
 pub struct GitDiffQuery {
     pub workspace_path: String,
-    pub path: String,
+    /// One repository-relative file; absent for the whole-repository diff.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -86,6 +88,23 @@ pub struct GitDiffResponse {
     pub diff: String,
     pub truncated: bool,
     pub untracked: bool,
+    /// Whole-repository diff only: the commit (or empty tree) compared against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Whole-repository diff only: where [`Self::base`] came from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<GitDiffBaseRef>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GitDiffBaseRef {
+    /// `git merge-base HEAD @{upstream}`: includes commits not yet pushed.
+    Upstream,
+    /// `HEAD`, when the branch has no upstream (or shares no history with it).
+    Head,
+    /// The empty tree, before the first commit.
+    Empty,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

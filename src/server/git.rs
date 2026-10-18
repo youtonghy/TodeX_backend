@@ -78,6 +78,37 @@ async fn run_git_command(cwd: &Path, args: &[String], operation: &str) -> Result
     run_external_command(command, operation).await
 }
 
+/// Like [`run_git_command`], but stdout beyond `limit` bytes is dropped and
+/// reported through `truncated` instead of failing the command.
+async fn run_git_command_truncated(
+    cwd: &Path,
+    args: &[String],
+    operation: &str,
+    limit: usize,
+) -> Result<external_command::TruncatedOutput> {
+    let mut command = secure_git_command();
+    command
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    prepare_captured(&mut command, false);
+    let limits = CommandLimits {
+        timeout: GIT_COMMAND_TIMEOUT,
+        output_limit: limit,
+    };
+    external_command::run_truncated(command, None, limits)
+        .await
+        .map_err(|error| match error {
+            ExternalCommandError::NotFound => AppError::GitUnavailable,
+            ExternalCommandError::TimedOut => AppError::GitCommandTimedOut(operation.to_owned()),
+            ExternalCommandError::OutputLimit(limit) => AppError::GitOutputLimitExceeded(limit),
+            ExternalCommandError::Spawn(error) | ExternalCommandError::Io(error) => {
+                AppError::GitProcess(error.to_string())
+            }
+        })
+}
+
 async fn run_external_command(command: Command, operation: &str) -> Result<GitCommandOutput> {
     let limits = CommandLimits {
         timeout: GIT_COMMAND_TIMEOUT,

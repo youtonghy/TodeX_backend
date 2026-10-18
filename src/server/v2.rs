@@ -1198,12 +1198,11 @@ pub(super) async fn git_diff(
         &state.config.workspace_access_roots(),
         &query.workspace_path,
     )?;
-    git::diff::file(
-        &state.config.workspace_access_roots(),
-        &workspace,
-        &query.path,
-    )
-    .await
+    let roots = state.config.workspace_access_roots();
+    match query.path.as_deref() {
+        Some(path) => git::diff::file(&roots, &workspace, path).await,
+        None => git::diff::repository(&roots, &workspace).await,
+    }
     .map(Json)
 }
 

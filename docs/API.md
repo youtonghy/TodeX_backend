@@ -1013,6 +1013,26 @@ GET /v2/git/diff?workspacePath=/home/user/projects/demo&path=src/main.rs
 
 `path` 为仓库相对路径，禁止绝对路径和 `..`。响应对照 `HEAD`（无首个提交时为空树）返回 `repositoryPath`、`path`、统一格式的 `diff` 文本与 `truncated`；未跟踪文件与 `/dev/null` 对比返回新增内容并标记 `untracked: true`，未变更的已跟踪文件返回空 `diff`。响应文本最多 1 MiB，超出时 `truncated` 为真。
 
+省略 `path` 时返回整个仓库工作区的 diff：
+
+```http
+GET /v2/git/diff?workspacePath=/home/user/projects/demo
+```
+
+```json
+{
+  "repositoryPath": "/home/user/projects/demo",
+  "path": "",
+  "diff": "diff --git a/src/main.rs b/src/main.rs\n…",
+  "truncated": false,
+  "untracked": false,
+  "base": "3f2a…（完整 40 或 64 位）",
+  "baseRef": "upstream"
+}
+```
+
+对比基准 `base` 按以下顺序确定，`baseRef` 标明来源：当前分支有上游时为 `git merge-base HEAD @{upstream}`（`"upstream"`，因此包含尚未推送的本地提交）；没有上游、分离 HEAD 或与上游没有共同祖先时为 `HEAD`（`"head"`）；尚无首个提交时为空树（`"empty"`，`base` 为空树 id）。`diff` 包含已跟踪文件的已暂存与未暂存改动（`--find-renames`），随后是未跟踪且未被忽略的文件（按新增文件与 `/dev/null` 对比，文件名为仓库相对路径；超过 4 MiB 的文件按二进制文件显示，不读取内容；符号链接和仓库外的路径跳过）。同样禁用 external diff/textconv 与颜色，执行只读接口的配置检查；文本最多 1 MiB，超出或未跟踪文件超过 2,000 个时 `truncated` 为真。整仓 diff 单次请求超过 30 秒返回 `GIT_COMMAND_TIMED_OUT`。`base`/`baseRef` 只在整仓模式下出现；`path` 为空字符串，`untracked` 恒为 `false`。
+
 当前仓库的轻量状态摘要（客户端轮询用）：
 
 ```http
