@@ -43,7 +43,7 @@ async fn read_inner(roots: &[PathBuf], workspace: &Path) -> Result<GitStatusResp
     // Reject external/symlinked metadata and executable local filters before
     // status or diff can cause Git to evaluate file contents.
     let metadata = repository_metadata_roots(&roots, &repository).await?;
-    validate_mutation_execution_config(&repository).await?;
+    validate_read_execution_config(&repository).await?;
     result.repository_path = repository.display().to_string();
     result.initialized = true;
     result.worktree_kind = Some(if metadata.len() > 1 {

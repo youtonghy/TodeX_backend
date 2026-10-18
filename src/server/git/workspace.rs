@@ -32,7 +32,7 @@ async fn text_command(cwd: &Path, args: &[&str]) -> Result<String> {
 }
 
 async fn is_dirty(cwd: &Path) -> Result<bool> {
-    validate_mutation_execution_config(cwd).await?;
+    validate_read_execution_config(cwd).await?;
     Ok(!text_command(
         cwd,
         &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
@@ -44,7 +44,7 @@ async fn is_dirty(cwd: &Path) -> Result<bool> {
 // Removing a worktree also deletes ignored files. Include them in its safety
 // status (while normal repository dirty state follows ordinary Git semantics).
 async fn is_removal_dirty(cwd: &Path) -> Result<bool> {
-    validate_mutation_execution_config(cwd).await?;
+    validate_read_execution_config(cwd).await?;
     Ok(!text_command(
         cwd,
         &[
@@ -488,39 +488,161 @@ async fn operate_locked(
                 "--recurse-submodules=no",
                 "--no-force",
                 "--no-follow-tags",
+                "--porcelain",
                 "--",
                 remote,
                 &format!("HEAD:{reference}"),
             ])
         }
     };
-    let mut output = String::new();
-    run_step(
-        workspace,
-        mutation_git_args_owned(
-            &hooks,
-            [git_args(&["-c", "submodule.recurse=false"]), args].concat(),
-        ),
-        operation.action(),
-        &mut output,
-    )
-    .await
-    .map_err(|error| AppError::GitPartialSuccess {
-        repository_path: workspace.display().to_string(),
-        operation: operation.action().to_owned(),
-        detail: format!(
-            "Git may have changed repository or remote state; refresh before retrying. {}",
-            truncate_text(&error.to_string(), GIT_ERROR_DETAIL_LIMIT)
-        ),
-    })?;
-    if output.is_empty() {
-        output = "Operation completed".to_owned();
-    }
+    let args = mutation_git_args_owned(
+        &hooks,
+        [git_args(&["-c", "submodule.recurse=false"]), args].concat(),
+    );
+    let output = run_operation(workspace, args, operation).await?;
     Ok(GitOperationResponse {
         repository_path: workspace.display().to_string(),
         action: operation.action().to_owned(),
         output,
     })
+}
+
+/// Runs the final Git command of an operation and classifies a failure.
+///
+/// A non-zero exit of a local command (init, branch, switch, worktree) or a
+/// push that certainly updated no remote ref is an ordinary
+/// [`AppError::GitCommandFailed`]. Only outcomes that may have changed state
+/// (a killed or timed-out process, or a push whose result cannot be read)
+/// are reported as [`AppError::GitPartialSuccess`].
+async fn run_operation(
+    workspace: &Path,
+    args: Vec<String>,
+    operation: &GitOperation,
+) -> Result<String> {
+    let action = operation.action();
+    let partial = |detail: String| AppError::GitPartialSuccess {
+        repository_path: workspace.display().to_string(),
+        operation: action.to_owned(),
+        detail: format!(
+            "Git may have changed repository or remote state; refresh before retrying. {}",
+            truncate_text(&detail, GIT_ERROR_DETAIL_LIMIT)
+        ),
+    };
+    let command_output = match run_git_command(workspace, &args, action).await {
+        Ok(output) => output,
+        // Git never started, so nothing changed.
+        Err(error @ (AppError::GitUnavailable | AppError::GitProcess(_))) => return Err(error),
+        Err(error) => return Err(partial(error.to_string())),
+    };
+    let mut output = String::new();
+    if command_output.status.success() {
+        append_output(&mut output, &command_output.stdout);
+        append_output(&mut output, &command_output.stderr);
+        // An empty string lets clients show their localized confirmation.
+        return Ok(output);
+    }
+    if command_output.status.code().is_none() {
+        return Err(partial(
+            command_failure(action, &command_output).to_string(),
+        ));
+    }
+    if !matches!(operation, GitOperation::Push {}) {
+        return Err(command_failure(action, &command_output));
+    }
+    match classify_push_failure(&command_output.stdout, &command_output.stderr) {
+        PushFailure::NothingUpdated(detail) => Err(AppError::GitCommandFailed {
+            operation: action.to_owned(),
+            detail,
+        }),
+        PushFailure::Uncertain => Err(partial(
+            command_failure(action, &command_output).to_string(),
+        )),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PushFailure {
+    /// No remote ref changed; the detail explains why.
+    NothingUpdated(String),
+    /// Some ref may have been updated, or the output could not be read.
+    Uncertain,
+}
+
+/// Errors Git reports before it negotiates any ref with the remote.
+const PUSH_PRE_HANDSHAKE_ERRORS: &[&str] = &[
+    "host key verification failed",
+    "permission denied (publickey",
+    "could not resolve hostname",
+    "connection refused",
+    "connection timed out",
+    "could not read username",
+    "authentication failed",
+    "repository not found",
+    "unable to access",
+    "could not read from remote repository",
+];
+
+const HOST_KEY_HINT: &str = "Connect to the host once in a terminal to confirm its host key.";
+
+/// Reads `git push --porcelain` output after a failed push. Ref lines are
+/// `<flag>\t<from>:<to>\t<summary>`; flags ` `, `+`, `-` and `*` mean the
+/// ref was updated, `!` rejected and `=` already up to date.
+fn classify_push_failure(stdout: &[u8], stderr: &[u8]) -> PushFailure {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr_text = bounded_text(stderr, GIT_ERROR_DETAIL_LIMIT);
+    let stderr_text = stderr_text.trim();
+    let mut rejected = Vec::new();
+    let mut ref_lines = 0_usize;
+    for line in stdout.lines() {
+        if line.trim().is_empty() || line == "Done" || line.starts_with("To ") {
+            continue;
+        }
+        let mut fields = line.splitn(3, '\t');
+        let (Some(flag), Some(refs), Some(summary)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return PushFailure::Uncertain;
+        };
+        if !refs.contains(':') {
+            return PushFailure::Uncertain;
+        }
+        ref_lines += 1;
+        match flag {
+            "!" => rejected.push(format!(
+                "{}: {}",
+                refs.rsplit(':').next().unwrap_or(refs),
+                summary.trim()
+            )),
+            "=" => {}
+            _ => return PushFailure::Uncertain,
+        }
+    }
+    let lower = stderr_text.to_ascii_lowercase();
+    // Without ref lines, only an error raised before the remote saw any ref
+    // proves nothing changed: a connection lost after the pack was sent may
+    // still have let the remote update.
+    if ref_lines == 0
+        && !PUSH_PRE_HANDSHAKE_ERRORS
+            .iter()
+            .any(|pattern| lower.contains(pattern))
+    {
+        return PushFailure::Uncertain;
+    }
+    let mut detail = if rejected.is_empty() {
+        String::new()
+    } else {
+        format!("rejected {}", rejected.join("; "))
+    };
+    if !stderr_text.is_empty() {
+        if !detail.is_empty() {
+            detail.push_str(". ");
+        }
+        detail.push_str(stderr_text);
+    }
+    if lower.contains("host key verification failed") {
+        detail.push(' ');
+        detail.push_str(HOST_KEY_HINT);
+    }
+    PushFailure::NothingUpdated(truncate_text(detail.trim(), GIT_ERROR_DETAIL_LIMIT * 2))
 }
 
 #[cfg(all(test, unix))]
@@ -727,8 +849,8 @@ mod tests {
             })
             .await;
         assert!(
-            matches!(duplicate_branch, Err(AppError::GitPartialSuccess { .. })),
-            "Executed mutation failures must require refresh before another attempt"
+            matches!(duplicate_branch, Err(AppError::GitCommandFailed { .. })),
+            "A local Git command that exits non-zero is an ordinary failure: {duplicate_branch:?}"
         );
         assert!(!tree.exists());
     }
@@ -1078,13 +1200,159 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(fixture.action(GitOperation::Push {}).await.is_err());
+        let rejected = fixture.action(GitOperation::Push {}).await;
+        assert!(
+            matches!(&rejected, Err(AppError::GitCommandFailed { detail, .. })
+                if detail.contains("rejected refs/heads/upstream")),
+            "a rejected push changed nothing and is not a partial success: {rejected:?}"
+        );
         assert_eq!(
             text_command(&bare, &["rev-parse", "refs/heads/upstream"])
                 .await
                 .unwrap(),
             remote_head
         );
+    }
+
+    /// Points the current branch at `origin/main` with the given URL.
+    async fn set_upstream(fixture: &Fixture, url: &str) {
+        let branch = text_command(&fixture.repo, &["branch", "--show-current"])
+            .await
+            .unwrap();
+        for (key, value) in [
+            ("remote.origin.url".to_owned(), url),
+            (
+                "remote.origin.fetch".to_owned(),
+                "+refs/heads/*:refs/remotes/origin/*",
+            ),
+            (format!("branch.{}.remote", branch.trim()), "origin"),
+            (format!("branch.{}.merge", branch.trim()), "refs/heads/main"),
+        ] {
+            text_command(&fixture.repo, &["config", &key, value])
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_path_remotes_allow_reads_and_refuse_pushes_clearly() {
+        let fixture = Fixture::new();
+        fixture.seed().await;
+        let bare = fixture.root.join("origin.git");
+        for url in [
+            bare.display().to_string(),
+            format!("file://{}", bare.display()),
+        ] {
+            set_upstream(&fixture, &url).await;
+            let snapshot = snapshot(std::slice::from_ref(&fixture.root), &fixture.repo)
+                .await
+                .unwrap();
+            assert!(snapshot.initialized && !snapshot.dirty);
+            let error = fixture.action(GitOperation::Push {}).await.unwrap_err();
+            assert!(
+                matches!(&error, AppError::InvalidRequest(message)
+                    if message.contains("remote 'origin' points to a local path")),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unreachable_push_remote_is_an_ordinary_failure() {
+        let has_ssh = std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|directory| directory.join("ssh").is_file())
+        });
+        if !has_ssh {
+            eprintln!("skipping: no ssh client in PATH");
+            return;
+        }
+        let fixture = Fixture::new();
+        fixture.seed().await;
+        // Port 1 on loopback refuses the connection before any ref exchange.
+        set_upstream(&fixture, "ssh://nobody@127.0.0.1:1/x.git").await;
+        let error = fixture.action(GitOperation::Push {}).await.unwrap_err();
+        assert!(
+            matches!(&error, AppError::GitCommandFailed { operation, .. } if operation == "push"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_quiet_operations_return_empty_output() {
+        let fixture = Fixture::new();
+        fixture.seed().await;
+        let response = fixture
+            .action(GitOperation::CreateBranch {
+                branch_name: "quiet".into(),
+                start_point: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.output, "");
+    }
+
+    #[test]
+    fn push_failures_are_classified_from_porcelain_output() {
+        let rejected = classify_push_failure(
+            b"To git://example.invalid/r.git\n!\tHEAD:refs/heads/main\t[rejected] (fetch first)\nDone\n",
+            b"error: failed to push some refs to 'git://example.invalid/r.git'\n",
+        );
+        assert!(
+            matches!(&rejected, PushFailure::NothingUpdated(detail)
+                if detail.starts_with("rejected refs/heads/main: [rejected] (fetch first)")
+                    && detail.contains("failed to push some refs")),
+            "{rejected:?}"
+        );
+        assert!(matches!(
+            classify_push_failure(
+                b"To r\n=\tHEAD:refs/heads/main\t[up to date]\n!\tHEAD:refs/heads/x\t[remote rejected] (hook declined)\nDone\n",
+                b""
+            ),
+            PushFailure::NothingUpdated(_)
+        ));
+        let host_key = classify_push_failure(
+            b"",
+            b"Host key verification failed.\nfatal: Could not read from remote repository.\n",
+        );
+        assert!(
+            matches!(&host_key, PushFailure::NothingUpdated(detail)
+                if detail.contains("Host key verification failed") && detail.ends_with(HOST_KEY_HINT)),
+            "{host_key:?}"
+        );
+        for stderr in [
+            &b"git@example.com: Permission denied (publickey).\n"[..],
+            b"ssh: Could not resolve hostname nowhere: Name or service not known\n",
+            b"fatal: unable to access 'https://example.invalid/': Could not resolve host\n",
+            b"remote: Repository not found.\n",
+        ] {
+            assert!(
+                matches!(
+                    classify_push_failure(b"", stderr),
+                    PushFailure::NothingUpdated(_)
+                ),
+                "{}",
+                String::from_utf8_lossy(stderr)
+            );
+        }
+        // Any updated ref, an unknown line, or a mid-transfer disconnect may
+        // have changed the remote.
+        for (stdout, stderr) in [
+            (
+                &b"To r\n*\tHEAD:refs/heads/new\t[new branch]\n!\tHEAD:refs/heads/x\t[rejected]\nDone\n"[..],
+                &b""[..],
+            ),
+            (b"To r\n \tHEAD:refs/heads/main\tabc..def\nDone\n", b""),
+            (b"garbage\n", b""),
+            (b"", b"fatal: the remote end hung up unexpectedly\n"),
+            (b"", b""),
+        ] {
+            assert_eq!(
+                classify_push_failure(stdout, stderr),
+                PushFailure::Uncertain,
+                "{}",
+                String::from_utf8_lossy(stdout)
+            );
+        }
     }
 
     #[test]

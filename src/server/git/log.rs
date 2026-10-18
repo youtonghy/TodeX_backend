@@ -169,7 +169,7 @@ async fn read_inner(
     // Same metadata and config checks as the status summary before Git reads
     // anything from this repository.
     repository_metadata_roots(&roots, &repository).await?;
-    validate_mutation_execution_config(&repository).await?;
+    validate_read_execution_config(&repository).await?;
     result.repository_path = repository.display().to_string();
     result.initialized = true;
     if !head_is_born(&repository).await? {
@@ -333,13 +333,9 @@ mod tests {
             self.git(&["remote", "add", "origin", remote.to_str().unwrap()])
                 .await;
         }
-        /// Pushes through the local bare repository, then points `origin` at a
-        /// network URL: reads reject local-path remotes, and the remote-tracking
-        /// refs that ahead/behind compare against stay in place.
+        /// Pushes through the local bare repository; reads accept local-path
+        /// remotes, so `origin` keeps pointing at it.
         async fn push(&self) {
-            let remote = self.root.join("origin.git");
-            self.git(&["remote", "set-url", "origin", remote.to_str().unwrap()])
-                .await;
             self.git(&[
                 "-c",
                 "core.hooksPath=/dev/null",
@@ -348,13 +344,6 @@ mod tests {
                 "-u",
                 "origin",
                 "main",
-            ])
-            .await;
-            self.git(&[
-                "remote",
-                "set-url",
-                "origin",
-                "https://example.invalid/origin.git",
             ])
             .await;
         }

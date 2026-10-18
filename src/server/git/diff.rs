@@ -29,7 +29,7 @@ async fn file_inner(roots: &[PathBuf], workspace: &Path, path: &str) -> Result<G
         .await?
         .ok_or_else(|| AppError::InvalidRequest("工作区不是 Git 仓库".to_owned()))?;
     repository_metadata_roots(&roots, &repository).await?;
-    validate_mutation_execution_config(&repository).await?;
+    validate_read_execution_config(&repository).await?;
 
     // Match the status summary: an unborn HEAD diffs against the empty tree so
     // staged files still appear before the first commit.

@@ -386,9 +386,7 @@ async fn run_locked(
         }
     }
 
-    if output.is_empty() {
-        output.push_str("Operation completed");
-    }
+    // Git printed nothing: clients show their own localized confirmation.
     Ok(GitRunResponse {
         repository_path: repository.display().to_string(),
         action: request.action.clone(),
@@ -469,9 +467,23 @@ async fn prepare_disabled_hooks_directory(data_dir: &Path) -> Result<PathBuf> {
     Ok(canonical_hooks_path)
 }
 
+/// Full config check before any Git write (`/v2/git/run`, `/v2/git/operation`,
+/// push): everything [`validate_read_execution_config`] refuses, plus remote
+/// URLs and URL rewrites that could select a custom or local transport.
 async fn validate_mutation_execution_config(repository: &Path) -> Result<()> {
     for listing in repository_config_listings(repository).await? {
         validate_executable_config_entries(&listing)?;
+    }
+    Ok(())
+}
+
+/// Config check before read-only Git commands (status, log, diff, workspace
+/// snapshots, scans). Reads never contact a remote, so remote URLs and URL
+/// rewrites are accepted; only config that can run a program while Git reads
+/// the repository (filters and helper programs) is refused.
+async fn validate_read_execution_config(repository: &Path) -> Result<()> {
+    for listing in repository_config_listings(repository).await? {
+        validate_read_config_entries(&listing)?;
     }
     Ok(())
 }
@@ -556,7 +568,21 @@ async fn worktree_config_exists(repository: &Path) -> Result<bool> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigCheck {
+    Read,
+    Mutation,
+}
+
 fn validate_executable_config_entries(output: &[u8]) -> Result<()> {
+    validate_config_entries(output, ConfigCheck::Mutation)
+}
+
+fn validate_read_config_entries(output: &[u8]) -> Result<()> {
+    validate_config_entries(output, ConfigCheck::Read)
+}
+
+fn validate_config_entries(output: &[u8], check: ConfigCheck) -> Result<()> {
     for entry in output.split(|byte| *byte == 0) {
         if entry.is_empty() {
             continue;
@@ -565,17 +591,14 @@ fn validate_executable_config_entries(output: &[u8]) -> Result<()> {
             .iter()
             .position(|byte| matches!(*byte, b'\n' | b'='))
             .unwrap_or(entry.len());
-        let key = String::from_utf8_lossy(&entry[..key_end]).to_ascii_lowercase();
+        let original_key = String::from_utf8_lossy(&entry[..key_end]);
+        let key = original_key.to_ascii_lowercase();
         let value = entry
             .get(key_end.saturating_add(1)..)
             .map(String::from_utf8_lossy)
             .unwrap_or_default();
         let executable_filter = key.starts_with("filter.")
             && (key.ends_with(".clean") || key.ends_with(".process") || key.ends_with(".smudge"));
-        let remote_url =
-            key.starts_with("remote.") && (key.ends_with(".url") || key.ends_with(".pushurl"));
-        let remote_url_rewrite = key.starts_with("url.")
-            && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof"));
         let executable_helper = key == "core.sshcommand"
             || key == "core.gitproxy"
             || key == "core.askpass"
@@ -584,17 +607,56 @@ fn validate_executable_config_entries(output: &[u8]) -> Result<()> {
             || key == "gpg.program"
             || (key.starts_with("gpg.") && key.ends_with(".program"))
             || (key.starts_with("remote.") && key.ends_with(".vcs"));
-        if executable_filter
-            || executable_helper
-            || remote_url_rewrite
-            || (remote_url && !is_supported_remote_url(&value))
-        {
+        if executable_filter || executable_helper {
+            return Err(AppError::InvalidRequest(format!(
+                "repository-local executable Git config is not supported: {key}"
+            )));
+        }
+        if check == ConfigCheck::Read {
+            continue;
+        }
+        let remote_url =
+            key.starts_with("remote.") && (key.ends_with(".url") || key.ends_with(".pushurl"));
+        let remote_url_rewrite = key.starts_with("url.")
+            && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof"));
+        if remote_url && is_local_path_remote_url(&value) {
+            // `remote.<name>.url`: the name keeps its original case.
+            let name = original_key
+                .get("remote.".len()..original_key.rfind('.').unwrap_or(original_key.len()))
+                .unwrap_or_default();
+            return Err(AppError::InvalidRequest(format!(
+                "remote '{name}' points to a local path; TodeX does not push to local-path \
+                 remotes, and Git write actions stay disabled while one is configured \
+                 (use a terminal, or point the remote at an http(s), ssh or git URL)"
+            )));
+        }
+        if remote_url_rewrite || (remote_url && !is_supported_remote_url(&value)) {
             return Err(AppError::InvalidRequest(format!(
                 "repository-local executable Git config is not supported: {key}"
             )));
         }
     }
     Ok(())
+}
+
+/// A remote that Git would reach through the local `file` transport: a
+/// `file://` URL, or a value with neither a URL scheme nor an scp-style
+/// `host:path` prefix (Git reads those as filesystem paths).
+fn is_local_path_remote_url(value: &str) -> bool {
+    let value = value.trim();
+    if value.to_ascii_lowercase().starts_with("file://") {
+        return true;
+    }
+    if value.is_empty() || value.contains("://") || value.contains("::") {
+        return false;
+    }
+    if value.starts_with(['/', '.', '\\', '~']) {
+        return true;
+    }
+    match value.split_once(':') {
+        Some((host, _)) => host.is_empty() || host.contains(['/', '\\']),
+        None => true,
+    }
 }
 
 /// A push runs with submodule recursion off (see [`PUSH_ARGS`]), which
@@ -1047,6 +1109,8 @@ async fn summarize_repository(
 ) -> Result<GitRepositorySummary> {
     let repository = validate_workspace_directory(configured_roots, repository)?;
     validate_repository_metadata(configured_roots, &repository).await?;
+    // Status and diff below may evaluate file contents through filters.
+    validate_read_execution_config(&repository).await?;
     let branch_output = run_git_command(
         &repository,
         &git_args(&["branch", "--show-current"]),
@@ -1384,6 +1448,68 @@ mod tests {
             validate_executable_config_entries(b"url.custom::.insteadof\nhttps://example.com/\0"),
             Err(AppError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn read_check_accepts_any_remote_but_still_rejects_executable_config() {
+        for listing in [
+            &b"remote.origin.url\n/tmp/origin.git\0"[..],
+            b"remote.origin.url\nfile:///tmp/origin.git\0",
+            b"remote.origin.pushurl\n../sibling.git\0",
+            b"url.https://mirror.example/.insteadof\nhttps://example.com/\0",
+        ] {
+            assert!(
+                validate_read_config_entries(listing).is_ok(),
+                "{}",
+                String::from_utf8_lossy(listing)
+            );
+            assert!(validate_executable_config_entries(listing).is_err());
+        }
+        for listing in [
+            &b"filter.lfs.smudge\ngit-lfs smudge %f\0"[..],
+            b"filter.x.process\nrun\0",
+            b"core.sshcommand\nssh -i key\0",
+            b"credential.helper\nstore\0",
+            b"gpg.ssh.program\nsign\0",
+            b"remote.origin.vcs\ncustom\0",
+        ] {
+            assert!(
+                matches!(
+                    validate_read_config_entries(listing),
+                    Err(AppError::InvalidRequest(_))
+                ),
+                "{}",
+                String::from_utf8_lossy(listing)
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_check_names_local_path_remotes() {
+        for url in [
+            "/tmp/origin.git",
+            "file:///tmp/origin.git",
+            "../origin.git",
+            "origin.git",
+        ] {
+            assert!(is_local_path_remote_url(url), "{url}");
+            let listing = format!("remote.Upstream.url\n{url}\0");
+            let error = validate_executable_config_entries(listing.as_bytes())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("remote 'Upstream' points to a local path"),
+                "{error}"
+            );
+        }
+        for url in [
+            "https://example.com/r.git",
+            "git@example.com:r.git",
+            "custom::payload",
+            "custom://example.com/r",
+        ] {
+            assert!(!is_local_path_remote_url(url), "{url}");
+        }
     }
 
     #[test]
