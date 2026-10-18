@@ -24,7 +24,7 @@ use crate::conversation::{ConversationManifest, ProviderKind};
 use crate::error::AppError;
 use crate::workspace_paths::validate_workspace_directory_text;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::{
     agent_calls::ApiKeyPermissionPolicy, api_keys::ApprovalPolicy, provider::PermissionPolicy,
 };

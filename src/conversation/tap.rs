@@ -116,7 +116,7 @@ impl LiveTaps {
     }
 
     /// Loses every later delivery for `conversation_id`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn mute(&self, conversation_id: &str) {
         self.muted.insert(conversation_id.to_owned(), ());
     }

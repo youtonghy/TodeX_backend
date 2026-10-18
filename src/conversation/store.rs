@@ -3767,7 +3767,7 @@ impl ConversationStore {
     }
 
     /// Lose every later tap delivery of `conversation_id`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn mute_taps_for_tests(&self, conversation_id: &str) {
         self.taps.mute(conversation_id);
     }

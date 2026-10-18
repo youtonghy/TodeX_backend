@@ -4753,6 +4753,10 @@ mod tests {
             ..Config::default()
         };
         config.security.enable_auth = true;
+        config.agent.codex_bin = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let state = AppState::new_for_tests(config).await.unwrap();
         let device = enroll(&root.join("data"));
         let app = crate::server::loopback_test_router(state.clone());

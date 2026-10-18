@@ -857,7 +857,7 @@ impl ConversationSupervisor {
     }
 
     /// Marks the daemon as shutting down (or not) without stopping anything.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_shutting_down_for_tests(&self, shutting_down: bool) {
         self.shutting_down
             .store(shutting_down, std::sync::atomic::Ordering::SeqCst);

@@ -309,7 +309,7 @@ impl AgentMcp {
     }
 
     /// The conversation's token without an injection (no endpoint needed).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn token_for_tests(&self, conversation_id: &str) -> String {
         self.token_for(conversation_id)
     }

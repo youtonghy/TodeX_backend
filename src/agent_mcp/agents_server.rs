@@ -910,6 +910,11 @@ mod tests {
             ..Config::default()
         };
         config.agent.antigravity_bin = agy.to_string_lossy().into_owned();
+        // The Codex parent never runs a turn; it only needs an executable.
+        config.agent.codex_bin = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         config.agent.provider_idle_timeout_minutes = 0;
         let state = AppState::new_for_tests(config).await.unwrap();
         update(&state, json!({ "mcp": { "enabled": true } })).await;

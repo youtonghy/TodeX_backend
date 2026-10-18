@@ -24,7 +24,7 @@ use crate::provider::{CancelOutcome, ConversationPrompt, PermissionDecision, Pro
 
 pub(crate) use caller::{AgentToolCaller, ApiKeyCaller, Caller};
 pub(crate) use calls::{AgentCalls, CallResult, Reservation, StartRefusal};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use events::tap_projection;
 pub(crate) use events::{assistant_text, ends_turn, EventPump, TurnEvents};
 #[allow(unused_imports)]
