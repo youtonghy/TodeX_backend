@@ -397,8 +397,8 @@ fn registry_of_tools() -> ToolRegistry<AgentsTools, AgentsCall> {
             tool: Tool::new(
                 "agent_wait",
                 "Wait for the latest turn of a conversation you started with agent_run (or the \
-                 given turnId) to finish. Same result as agent_run; the output of a finished \
-                 turn is returned once.",
+                 given turnId) to finish. Same result as agent_run; a finished turn's result \
+                 can be read again for 30 minutes.",
                 schema(json!({
                     "type": "object",
                     "properties": {
@@ -1028,15 +1028,18 @@ mod tests {
             "full-access"
         );
 
-        // The result was handed out: a later wait has the status only.
-        let again = ok(&call(
-            &client,
-            "agent_wait",
-            json!({ "conversationId": child_id, "waitSecs": 1 }),
-        )
-        .await);
-        assert_eq!(again["status"], "completed");
-        assert_eq!(again["output"], "");
+        // A finished result stays readable: later waits get it again.
+        for _ in 0..2 {
+            let again = ok(&call(
+                &client,
+                "agent_wait",
+                json!({ "conversationId": child_id, "waitSecs": 1 }),
+            )
+            .await);
+            assert_eq!(again["status"], "completed");
+            assert_eq!(again["output"], run["output"]);
+            assert_eq!(again["turnId"], run["turnId"]);
+        }
 
         let turn = ok(&call(
             &client,

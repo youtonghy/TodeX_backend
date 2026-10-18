@@ -6,9 +6,9 @@
 //! child's [`LiveTap`] until the turn ends, whether or not the tool call
 //! that started it is still waiting, so a later `agent_wait` can pick up
 //! the result and the parent learns about the end. Results (the child's
-//! assistant text) live in memory only: dropped once a tool returned them,
-//! when the child's next turn starts, or [`RESULT_TTL`] after the turn
-//! ended.
+//! assistant text) live in memory only: every `agent_wait` can read a
+//! finished turn's result until the child's next turn starts or
+//! [`RESULT_TTL`] after the turn ended, when the output is dropped.
 //!
 //! Lifecycle: a parent turn that is cancelled or interrupted cancels its
 //! running children; a deleted parent takes its children with it (running
@@ -43,7 +43,7 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_EVENT_OUTPUT_BYTES: usize = 64 * 1024;
 /// Prompt text recorded in a parent's `agent.call.started` event.
 const MAX_EVENT_TEXT_BYTES: usize = 16 * 1024;
-/// How long an unread result is kept after its turn ended.
+/// How long a finished turn's output is kept after the turn ended.
 pub(crate) const RESULT_TTL: Duration = Duration::from_secs(30 * 60);
 /// How long deleting a parent waits for a cancelled child turn to stop.
 const CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -475,8 +475,8 @@ impl AgentCalls {
     }
 
     /// Waits up to `wait` for the child's latest agent-call turn (only
-    /// `turn_id`, if given) to end. A finished result's output is handed
-    /// out once.
+    /// `turn_id`, if given) to end. A finished result stays readable by
+    /// later waits until its output expires ([`RESULT_TTL`]).
     pub(crate) async fn wait(
         &self,
         child_id: &str,
@@ -500,9 +500,6 @@ impl AgentCalls {
         let _ =
             tokio::time::timeout(wait, receiver.wait_for(|state| !state.status.is_running())).await;
         let snapshot = turn.state.borrow().clone();
-        if !snapshot.status.is_running() {
-            turn.state.send_modify(|state| state.output = String::new());
-        }
         Ok(CallResult {
             conversation_id: child_id.to_owned(),
             turn_id: turn.turn_id.clone(),
@@ -586,8 +583,8 @@ impl Inner {
                 }),
             ),
         };
-        // Taken with the status change: a waiter may hand the output out
-        // (and drop it) as soon as it sees the turn ended.
+        // Taken with the status change, so the event reports exactly what
+        // waiters see once the turn ended.
         let mut output = String::new();
         turn.state.send_modify(|state| {
             state.status = status;
@@ -619,14 +616,8 @@ impl Inner {
             payload["error"] = json!(error);
         }
         self.record(&parent_id, event_type, payload).await;
-        // An unread result does not stay in memory for good.
-        let expiring = Arc::downgrade(&turn);
-        tokio::spawn(async move {
-            tokio::time::sleep(RESULT_TTL).await;
-            if let Some(turn) = expiring.upgrade() {
-                turn.state.send_modify(|state| state.output = String::new());
-            }
-        });
+        // A result does not stay in memory for good.
+        drop_output_after(&turn, RESULT_TTL);
     }
 
     /// Applies one tapped event of the child to the turn; `true` once it
@@ -823,6 +814,19 @@ impl Inner {
     }
 }
 
+/// Drops a finished turn's output `after` it ended; the status and error
+/// stay. A turn that is gone by then (replaced by the child's next turn, or
+/// its child removed) is left alone.
+fn drop_output_after(turn: &Arc<CallTurn>, after: Duration) {
+    let expiring = Arc::downgrade(turn);
+    tokio::spawn(async move {
+        tokio::time::sleep(after).await;
+        if let Some(turn) = expiring.upgrade() {
+            turn.state.send_modify(|state| state.output = String::new());
+        }
+    });
+}
+
 /// Applies the agent call lifecycle to supervisor events. Weak, so the
 /// supervisor does not keep the calls alive.
 struct Hooks(Weak<Inner>);
@@ -901,6 +905,32 @@ mod tests {
         state.push_output("more");
         assert!(!state.output.ends_with("more"));
         assert_eq!(bounded("abc", 2), format!("ab{TRUNCATED_NOTE}"));
+    }
+
+    #[tokio::test]
+    async fn a_finished_output_is_dropped_when_it_expires() {
+        let (state, _) = watch::channel(TurnState {
+            status: CallStatus::Completed,
+            output: "PONG".to_owned(),
+            truncated: false,
+            error: None,
+        });
+        let turn = Arc::new(CallTurn {
+            turn_id: "turn".to_owned(),
+            state,
+            started: Instant::now(),
+        });
+        let mut changes = turn.state.subscribe();
+        drop_output_after(&turn, Duration::from_millis(10));
+        assert_eq!(turn.state.borrow().output, "PONG");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            changes.wait_for(|state| state.output.is_empty()),
+        )
+        .await
+        .expect("the output expires")
+        .unwrap();
+        assert_eq!(turn.state.borrow().status, CallStatus::Completed);
     }
 
     #[test]
