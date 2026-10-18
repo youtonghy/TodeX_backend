@@ -321,6 +321,10 @@ async fn run_locked(
     if repository.join(".git").exists() {
         validate_mutation_repository_metadata(&configured_roots, &repository).await?;
         validate_mutation_execution_config(&repository).await?;
+        // Refuse a push the remote cannot get before commit-push commits.
+        if request.action.is_push() {
+            validate_remote_execution_config(&repository).await?;
+        }
     }
     if request.action == GitAction::Initial {
         let head = run_git_command(
@@ -498,12 +502,25 @@ async fn prepare_disabled_hooks_directory(data_dir: &Path) -> Result<PathBuf> {
     Ok(canonical_hooks_path)
 }
 
-/// Full config check before any Git write (`/v2/git/run`, `/v2/git/operation`,
-/// push): everything [`validate_read_execution_config`] refuses, plus remote
-/// URLs and URL rewrites that could select a custom or local transport.
+/// Config check before any Git write (`/v2/git/run`, `/v2/git/operation`):
+/// everything [`validate_read_execution_config`] refuses, plus URL rewrites
+/// and remote URLs that select a custom transport (`<helper>::`, unknown
+/// schemes). Local-path remotes are allowed here; see
+/// [`validate_remote_execution_config`].
 async fn validate_mutation_execution_config(repository: &Path) -> Result<()> {
     for listing in repository_config_listings(repository).await? {
         validate_executable_config_entries(&listing)?;
+    }
+    Ok(())
+}
+
+/// Additional check before an operation that contacts a remote (push, and
+/// the push of commit-push before anything is committed): every remote must
+/// use an http(s), ssh, git or scp-like URL, so local-path and `file://`
+/// remotes are refused with a clear message.
+async fn validate_remote_execution_config(repository: &Path) -> Result<()> {
+    for listing in repository_config_listings(repository).await? {
+        validate_config_entries(&listing, ConfigCheck::Remote)?;
     }
     Ok(())
 }
@@ -601,8 +618,12 @@ async fn worktree_config_exists(repository: &Path) -> Result<bool> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConfigCheck {
+    /// Read-only commands: filters and helper programs only.
     Read,
+    /// Local writes: also URL rewrites and custom-transport remote URLs.
     Mutation,
+    /// Operations that contact a remote: also local-path remotes.
+    Remote,
 }
 
 fn validate_executable_config_entries(output: &[u8]) -> Result<()> {
@@ -651,14 +672,17 @@ fn validate_config_entries(output: &[u8], check: ConfigCheck) -> Result<()> {
         let remote_url_rewrite = key.starts_with("url.")
             && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof"));
         if remote_url && is_local_path_remote_url(&value) {
+            if check == ConfigCheck::Mutation {
+                // Local writes never contact the remote.
+                continue;
+            }
             // `remote.<name>.url`: the name keeps its original case.
             let name = original_key
                 .get("remote.".len()..original_key.rfind('.').unwrap_or(original_key.len()))
                 .unwrap_or_default();
             return Err(AppError::InvalidRequest(format!(
                 "remote '{name}' points to a local path; TodeX does not push to local-path \
-                 remotes, and Git write actions stay disabled while one is configured \
-                 (use a terminal, or point the remote at an http(s), ssh or git URL)"
+                 remotes (push from a terminal, or point the remote at an http(s), ssh or git URL)"
             )));
         }
         if remote_url_rewrite || (remote_url && !is_supported_remote_url(&value)) {
@@ -1487,13 +1511,26 @@ mod tests {
             &b"remote.origin.url\n/tmp/origin.git\0"[..],
             b"remote.origin.url\nfile:///tmp/origin.git\0",
             b"remote.origin.pushurl\n../sibling.git\0",
-            b"url.https://mirror.example/.insteadof\nhttps://example.com/\0",
         ] {
             assert!(
                 validate_read_config_entries(listing).is_ok(),
                 "{}",
                 String::from_utf8_lossy(listing)
             );
+            // Local writes allow local-path remotes; pushes do not.
+            assert!(validate_executable_config_entries(listing).is_ok());
+            assert!(validate_config_entries(listing, ConfigCheck::Remote).is_err());
+        }
+        let rewrite = b"url.https://mirror.example/.insteadof\nhttps://example.com/\0";
+        assert!(validate_read_config_entries(rewrite).is_ok());
+        assert!(validate_executable_config_entries(rewrite).is_err());
+        // Custom transports stay refused for every write.
+        for listing in [
+            &b"remote.origin.url\ncustom::payload\0"[..],
+            b"remote.origin.url\next::sh -c evil\0",
+            b"remote.origin.url\ncustom://example.com/r\0",
+        ] {
+            assert!(validate_read_config_entries(listing).is_ok());
             assert!(validate_executable_config_entries(listing).is_err());
         }
         for listing in [
@@ -1516,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_check_names_local_path_remotes() {
+    fn remote_check_names_local_path_remotes() {
         for url in [
             "/tmp/origin.git",
             "file:///tmp/origin.git",
@@ -1525,7 +1562,7 @@ mod tests {
         ] {
             assert!(is_local_path_remote_url(url), "{url}");
             let listing = format!("remote.Upstream.url\n{url}\0");
-            let error = validate_executable_config_entries(listing.as_bytes())
+            let error = validate_config_entries(listing.as_bytes(), ConfigCheck::Remote)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -1605,6 +1642,73 @@ mod tests {
         assert!(validate_mutation_execution_config(&repository)
             .await
             .is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_path_remote_allows_commit_and_refuses_commit_push_before_committing() {
+        let root = fs::canonicalize(temp_dir("todex-git-local-remote")).expect("root");
+        let repository = root.join("repository");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&repository).expect("repository");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "--template="]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        let bare = root.join("origin.git");
+        git(&["init", "--bare", "--template=", bare.to_str().unwrap()]);
+        git(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        let roots = [root.clone()];
+        let request = |action: GitAction, message: Option<&str>| GitRunRequest {
+            workspace_path: repository.display().to_string(),
+            action,
+            message: message.map(str::to_owned),
+            include_unstaged: true,
+        };
+        fs::write(repository.join("a.txt"), "one\n").unwrap();
+        run(
+            &roots,
+            &data_dir,
+            &repository,
+            &request(GitAction::Initial, Some("Initial")),
+        )
+        .await
+        .expect("initial commit with a local-path remote");
+        fs::write(repository.join("a.txt"), "two\n").unwrap();
+        run(
+            &roots,
+            &data_dir,
+            &repository,
+            &request(GitAction::Commit, Some("Change")),
+        )
+        .await
+        .expect("commit with a local-path remote");
+        let head = git(&["rev-parse", "HEAD"]);
+        fs::write(repository.join("a.txt"), "three\n").unwrap();
+        for (action, message) in [
+            (GitAction::CommitPush, Some("Change")),
+            (GitAction::Push, None),
+        ] {
+            let error = run(&roots, &data_dir, &repository, &request(action, message))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, AppError::InvalidRequest(message)
+                    if message.contains("remote 'origin' points to a local path")),
+                "{error:?}"
+            );
+        }
+        assert_eq!(git(&["rev-parse", "HEAD"]), head, "nothing was committed");
         let _ = fs::remove_dir_all(root);
     }
 

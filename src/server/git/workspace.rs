@@ -479,6 +479,7 @@ async fn operate_locked(
                 ));
             }
             validate_push_execution_config(workspace).await?;
+            validate_remote_execution_config(workspace).await?;
             // Explicit refspec bypasses push.default and remote.*.push (including
             // force refspecs). No force, tags, mirror, upstream setup, or hooks.
             git_args(&[
@@ -1235,7 +1236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_path_remotes_allow_reads_and_refuse_pushes_clearly() {
+    async fn local_path_remotes_allow_reads_and_local_writes_but_refuse_pushes() {
         let fixture = Fixture::new();
         fixture.seed().await;
         let bare = fixture.root.join("origin.git");
@@ -1254,7 +1255,35 @@ mod tests {
                     if message.contains("remote 'origin' points to a local path")),
                 "{error:?}"
             );
-        }
+        } // Operations that never contact the remote still work.
+        fixture
+            .action(GitOperation::CreateBranch {
+                branch_name: "local-only".into(),
+                start_point: None,
+            })
+            .await
+            .unwrap();
+        fixture
+            .action(GitOperation::SwitchBranch {
+                branch_name: "local-only".into(),
+            })
+            .await
+            .unwrap();
+        let tree = fixture.root.join("linked");
+        fixture
+            .action(GitOperation::CreateWorktree {
+                path: tree.display().to_string(),
+                branch_name: "linked".into(),
+                start_point: None,
+            })
+            .await
+            .unwrap();
+        fixture
+            .action(GitOperation::RemoveWorktree {
+                path: tree.display().to_string(),
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
