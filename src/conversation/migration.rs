@@ -27,12 +27,22 @@ pub struct LegacyMigrationReport {
     pub imported: usize,
     pub already_imported: usize,
     pub skipped: usize,
+    /// Sources deliberately left alone: new after the cutover, without any
+    /// Codex thread, or imported and later deleted by the user.
+    pub ignored: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MigrationMap {
     schema_version: u32,
+    /// RFC 3339 time of the first finished migration run. Session
+    /// directories that are not in `entries` by then are never imported: the
+    /// legacy gateway still writes sessions, and those are not history to
+    /// migrate. A map written before the cutover existed gets one when it is
+    /// next loaded, before any source is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cutover_at: Option<String>,
     entries: BTreeMap<String, MigrationEntry>,
 }
 
@@ -40,6 +50,7 @@ impl Default for MigrationMap {
     fn default() -> Self {
         Self {
             schema_version: MIGRATION_SCHEMA_VERSION,
+            cutover_at: None,
             entries: BTreeMap::new(),
         }
     }
@@ -52,6 +63,9 @@ struct MigrationEntry {
     complete: bool,
     #[serde(default)]
     source_hash: Option<String>,
+    /// The imported conversation was deleted; it is never recreated.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    deleted: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -96,6 +110,9 @@ struct LegacySource {
     source_hash: String,
     session_id: String,
     records: Vec<LegacyEventRecord>,
+    /// The session's state lists no Codex thread or turn and no event names
+    /// one (for example a session that only served Git diffs).
+    without_conversation: bool,
 }
 
 pub async fn migrate_legacy_codex_sessions(
@@ -107,6 +124,14 @@ pub async fn migrate_legacy_codex_sessions(
     let metadata = match tokio::fs::symlink_metadata(&legacy_root).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Nothing to migrate on this install: anything the legacy gateway
+            // writes from now on is new, not history.
+            let mapping_path = data_dir.join("migrations/codex-gateway-v1.json");
+            let mut mapping = load_mapping(&mapping_path).await?;
+            if mapping.cutover_at.is_none() {
+                mapping.cutover_at = Some(chrono::Utc::now().to_rfc3339());
+                write_mapping(&mapping_path, &mapping).await?;
+            }
             return Ok(LegacyMigrationReport::default());
         }
         Err(error) => return Err(error.into()),
@@ -120,7 +145,14 @@ pub async fn migrate_legacy_codex_sessions(
     }
 
     let mapping_path = data_dir.join("migrations/codex-gateway-v1.json");
+    let map_existed = tokio::fs::try_exists(&mapping_path).await?;
     let mut mapping = load_mapping(&mapping_path).await?;
+    if map_existed && mapping.cutover_at.is_none() {
+        // Written by a daemon that imported every session directory on each
+        // start: all history is already listed, so the cutover is now.
+        mapping.cutover_at = Some(chrono::Utc::now().to_rfc3339());
+        write_mapping(&mapping_path, &mapping).await?;
+    }
     let legacy_workspaces = load_legacy_workspaces(&data_dir.join("workspaces.json")).await;
     let mut entries = tokio::fs::read_dir(&legacy_root).await?;
     let mut paths = Vec::new();
@@ -154,6 +186,42 @@ pub async fn migrate_legacy_codex_sessions(
         };
 
         let existing = mapping.entries.get(&source.source_key).cloned();
+        match &existing {
+            Some(entry) if entry.deleted => {
+                report.ignored += 1;
+                continue;
+            }
+            Some(entry) if entry.complete => {
+                if matches!(
+                    store.get(&entry.conversation_id).await,
+                    Err(AppError::NotFound(_))
+                ) {
+                    // The user deleted the imported conversation: remember
+                    // that instead of importing it again on every start.
+                    if let Some(entry) = mapping.entries.get_mut(&source.source_key) {
+                        entry.deleted = true;
+                    }
+                    write_mapping(&mapping_path, &mapping).await?;
+                    report.ignored += 1;
+                    continue;
+                }
+            }
+            Some(_) => {}
+            None if mapping.cutover_at.is_some() => {
+                report.ignored += 1;
+                continue;
+            }
+            None if source.without_conversation
+                && !legacy_workspaces.workspaces.iter().any(|workspace| {
+                    workspace.session_id == source.session_id
+                        && !workspace.thread_id.trim().is_empty()
+                }) =>
+            {
+                report.ignored += 1;
+                continue;
+            }
+            None => {}
+        }
         if let Some(entry) = &existing {
             if entry.complete
                 && entry.source_hash.as_deref() == Some(source.source_hash.as_str())
@@ -187,6 +255,7 @@ pub async fn migrate_legacy_codex_sessions(
                 conversation_id: conversation_id.clone(),
                 complete: false,
                 source_hash: Some(source.source_hash.clone()),
+                deleted: false,
             },
         );
         write_mapping(&mapping_path, &mapping).await?;
@@ -215,6 +284,11 @@ pub async fn migrate_legacy_codex_sessions(
                 tracing::warn!(conversation_id, error = %error, "legacy Codex session migration is incomplete and will be retried");
             }
         }
+    }
+    if mapping.cutover_at.is_none() {
+        // Sources that failed above are already in the map and keep retrying.
+        mapping.cutover_at = Some(chrono::Utc::now().to_rfc3339());
+        write_mapping(&mapping_path, &mapping).await?;
     }
     Ok(report)
 }
@@ -487,6 +561,20 @@ fn read_legacy_source_blocking(path: &Path) -> Result<Option<LegacySource>, AppE
     }
 
     let state = state_bytes.and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+    let empty_map = |key: &str| {
+        state
+            .as_ref()
+            .and_then(|state| state.get(key))
+            .is_none_or(|value| {
+                value.as_object().is_some_and(serde_json::Map::is_empty) || value.is_null()
+            })
+    };
+    let without_conversation = state.is_some()
+        && empty_map("threads")
+        && empty_map("turns")
+        && records
+            .iter()
+            .all(|record| record.codex_thread_id.is_none() && record.codex_turn_id.is_none());
     let session_id = records
         .first()
         .map(|record| record.session_id.trim().to_owned())
@@ -516,6 +604,7 @@ fn read_legacy_source_blocking(path: &Path) -> Result<Option<LegacySource>, AppE
         source_hash,
         session_id,
         records,
+        without_conversation,
     }))
 }
 
@@ -822,6 +911,149 @@ mod tests {
         let replay = store.replay(&conversation_id, 0, 10).await.unwrap();
         assert_eq!(replay.events.len(), 4);
         assert_eq!(replay.events[3].event_type, "message.created");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_session(root: &Path, name: &str, records: &[Value], state: Option<Value>) {
+        let directory = root.join("codex_gateway/sessions").join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("events.jsonl"),
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        if let Some(state) = state {
+            fs::write(directory.join("state.json"), state.to_string()).unwrap();
+        }
+    }
+
+    fn thread_event(session: &str, cursor: u64) -> Value {
+        json!({
+            "session_id": session,
+            "event_id": format!("{session}-{cursor}"),
+            "cursor": cursor,
+            "type": "codex.item.agentMessage.delta",
+            "codex_thread_id": format!("thread-{session}"),
+            "payload": { "delta": "hello" },
+        })
+    }
+
+    fn read_map(root: &Path) -> Value {
+        serde_json::from_slice(&fs::read(root.join("migrations/codex-gateway-v1.json")).unwrap())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sessions_created_after_the_cutover_are_not_imported() {
+        let root = temp_dir("todex-legacy-cutover");
+        let workspace_root = root.join("workspaces");
+        fs::create_dir_all(&workspace_root).unwrap();
+        write_session(&root, "old", &[thread_event("old", 1)], None);
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let roots = [workspace_root.clone()];
+        let first = migrate_legacy_codex_sessions(&root, &roots, &store)
+            .await
+            .unwrap();
+        assert_eq!(first.imported, 1);
+        assert!(read_map(&root)["cutoverAt"].is_string());
+
+        write_session(&root, "new", &[thread_event("new", 1)], None);
+        let second = migrate_legacy_codex_sessions(&root, &roots, &store)
+            .await
+            .unwrap();
+        assert_eq!((second.imported, second.ignored), (0, 1));
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn old_maps_and_fresh_installs_are_cut_over_before_new_sessions_appear() {
+        let root = temp_dir("todex-legacy-backfill");
+        let workspace_root = root.join("workspaces");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let roots = [workspace_root.clone()];
+        // No legacy sessions at all: later gateway sessions are never history.
+        migrate_legacy_codex_sessions(&root, &roots, &store)
+            .await
+            .unwrap();
+        assert!(read_map(&root)["cutoverAt"].is_string());
+        write_session(&root, "later", &[thread_event("later", 1)], None);
+        let report = migrate_legacy_codex_sessions(&root, &roots, &store)
+            .await
+            .unwrap();
+        assert_eq!((report.imported, report.ignored), (0, 1));
+
+        // A map written by an older daemon already lists all history, so it
+        // is cut over before unlisted sources are read.
+        fs::write(
+            root.join("migrations/codex-gateway-v1.json"),
+            r#"{"schemaVersion":1,"entries":{}}"#,
+        )
+        .unwrap();
+        let report = migrate_legacy_codex_sessions(&root, &roots, &store)
+            .await
+            .unwrap();
+        assert_eq!((report.imported, report.ignored), (0, 1));
+        assert!(read_map(&root)["cutoverAt"].is_string());
+        assert!(store.list().await.unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sessions_without_a_codex_thread_are_not_imported() {
+        let root = temp_dir("todex-legacy-empty");
+        let workspace_root = root.join("workspaces");
+        fs::create_dir_all(&workspace_root).unwrap();
+        write_session(
+            &root,
+            "git-diff",
+            &[json!({
+                "session_id": "git-diff",
+                "event_id": "diff-1",
+                "cursor": 1,
+                "type": "codex.local.gitDiff",
+                "payload": { "path": "src/main.rs" },
+            })],
+            Some(json!({ "session_id": "git-diff", "last_cursor": 1, "threads": {}, "turns": {} })),
+        );
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let report =
+            migrate_legacy_codex_sessions(&root, std::slice::from_ref(&workspace_root), &store)
+                .await
+                .unwrap();
+        assert_eq!((report.imported, report.ignored), (0, 1));
+        assert!(store.list().await.unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn deleted_imports_are_tombstoned_and_never_recreated() {
+        let root = temp_dir("todex-legacy-tombstone");
+        let workspace_root = root.join("workspaces");
+        fs::create_dir_all(&workspace_root).unwrap();
+        write_session(&root, "old", &[thread_event("old", 1)], None);
+        let store = ConversationStore::new(root.clone()).await.unwrap();
+        let roots = [workspace_root.clone()];
+        migrate_legacy_codex_sessions(&root, &roots, &store)
+            .await
+            .unwrap();
+        let id = store.list().await.unwrap()[0].id.clone();
+        store.delete(&id).await.unwrap();
+        for _ in 0..2 {
+            let report = migrate_legacy_codex_sessions(&root, &roots, &store)
+                .await
+                .unwrap();
+            assert_eq!((report.imported, report.ignored), (0, 1));
+            assert!(store.list().await.unwrap().is_empty());
+        }
+        let map = read_map(&root);
+        let entry = map["entries"].as_object().unwrap().values().next().unwrap();
+        assert_eq!(entry["deleted"], json!(true));
+        assert_eq!(entry["conversationId"], json!(id));
         let _ = fs::remove_dir_all(root);
     }
 

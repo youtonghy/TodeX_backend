@@ -180,7 +180,7 @@ $TODEX_AGENTD_DATA_DIR/conversations/<conversation-id>/
   provider-state.json
 ```
 
-旧 `$DATA_DIR/codex_gateway/sessions` 会在 daemon 就绪后于后台复制迁移到该结构，源文件保持不变；迁移映射保存在 `$DATA_DIR/migrations/codex-gateway-v1.json`。迁移失败会写入 daemon 日志并在下次启动时重试，不会阻止服务监听。
+旧 `$DATA_DIR/codex_gateway/sessions` 会在 daemon 就绪后于后台复制迁移到该结构，源文件保持不变；迁移映射保存在 `$DATA_DIR/migrations/codex-gateway-v1.json`。首次迁移运行结束后映射写入 `cutoverAt`（RFC 3339；全新数据目录在首次启动时、旧版本写下的映射在本版本首次读取时立即写入），此后只更新映射中已有的来源，新出现的会话目录（旧 `codex.local` 网关仍会写入）不再导入；没有任何 Codex thread/turn（`state.json` 的 `threads`、`turns` 为空且事件不带 `codex_thread_id`/`codex_turn_id`，例如只用于 Git diff 的会话）的会话从不导入；已导入后被用户删除的会话在映射中标记 `deleted: true`，不再重建。映射的新字段对旧版 daemon 无害（它们忽略未知字段），但旧版 daemon 重写映射时会丢弃 `cutoverAt`/`deleted`，降级后被删除的导入会话可能重新出现。迁移失败会写入 daemon 日志并在下次启动时重试，不会阻止服务监听。
 
 ## 如何编译
 
@@ -300,7 +300,7 @@ macOS 可使用 launchd 的 `ProgramArguments` 指向同一 `serve` 命令；Win
 - 监控 `/health`、进程重启次数、数据目录剩余空间和 Provider CLI 退出率。
 - 备份前停止写入或使用文件系统快照，备份后做一次临时目录恢复和事件 replay 校验。
 
-升级前先停止 daemon，复制整个数据目录到带时间戳的备份目录，再升级 binary 并启动。后台迁移是幂等的：旧 `codex_gateway/sessions` 只读复制到 `conversations/`，不会删除或覆盖源文件。升级失败时停止新 binary，恢复备份目录和旧 binary；不要手工编辑 `events.jsonl` 或 `provider-state.json`。
+升级前先停止 daemon，复制整个数据目录到带时间戳的备份目录，再升级 binary 并启动。后台迁移是幂等的：旧 `codex_gateway/sessions` 只读复制到 `conversations/`，不会删除或覆盖源文件。迁移只在首次运行时导入全部旧会话，之后只同步映射中已有的会话（见上文 `cutoverAt`）。升级失败时停止新 binary，恢复备份目录和旧 binary；不要手工编辑 `events.jsonl` 或 `provider-state.json`。
 
 ### 默认运行
 

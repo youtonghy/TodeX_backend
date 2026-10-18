@@ -255,6 +255,7 @@ impl AppState {
                         imported = migration.imported,
                         already_imported = migration.already_imported,
                         skipped = migration.skipped,
+                        ignored = migration.ignored,
                         "legacy Codex conversation migration finished"
                     );
                 }
