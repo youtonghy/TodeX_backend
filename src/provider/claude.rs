@@ -945,6 +945,27 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
 
+    #[test]
+    fn only_auto_reported_as_default_falls_back_to_ask() {
+        use super::auto_mode_fell_back;
+        assert!(auto_mode_fell_back(Some("auto"), "default"));
+        for (expected, actual) in [
+            (Some("auto"), "plan"),
+            (Some("bypassPermissions"), "default"),
+            (Some("default"), "auto"),
+            (None, "default"),
+            (Some("auto"), "auto"),
+        ] {
+            assert!(
+                !auto_mode_fell_back(expected, actual),
+                "{expected:?} {actual}"
+            );
+        }
+        let event = super::auto_mode_unavailable_event(None);
+        assert_eq!(event["providerMethod"], "auto_mode_unavailable");
+        assert!(event["metadata"]["model"].is_null());
+    }
+
     use super::{
         claude_command_catalog, claude_discovery_url, claude_frame_limit_reset,
         claude_model_aliases, claude_model_family, claude_permission_details,
@@ -2355,15 +2376,15 @@ async fn run_claude_turn(
 ) -> Result<DriverTurnResult, AppError> {
     work.begin_turn();
     let adopt = start == TurnStart::Adopt;
-    let expected_mode = super::types::resolve_execution_config(
+    let execution = super::types::resolve_execution_config(
         context.manifest.provider,
         prompt.permission_mode.as_deref(),
         prompt.work_mode.as_deref(),
         prompt.permission_profile.as_deref(),
         prompt.sandbox_mode.as_deref(),
         prompt.approval_policy.as_deref(),
-    )?
-    .provider_mode;
+    )?;
+    let expected_mode = execution.provider_mode;
     let user_message = json!({
         "type": "user",
         "session_id": requested_session_id,
@@ -2661,7 +2682,20 @@ async fn run_claude_turn(
                         }
                     }
                     if let Some(actual) = message.get("permissionMode").and_then(Value::as_str) {
-                        if expected_mode.as_deref() != Some(actual) {
+                        if auto_mode_fell_back(expected_mode.as_deref(), actual) {
+                            // Claude Code quietly runs in `default` when the
+                            // model or account has no auto mode. It then
+                            // asks through `can_use_tool`, i.e. TodeX's own
+                            // approval, so the turn continues as `ask`.
+                            if let Some(mode) = &context.handles.mode {
+                                mode.downgrade_to_ask(&execution.work_mode);
+                            }
+                            sink.emit(
+                                "provider.event",
+                                auto_mode_unavailable_event(message.get("model")),
+                            )
+                            .await?;
+                        } else if expected_mode.as_deref() != Some(actual) {
                             return Err(AppError::ProviderUnavailable(format!(
                                 "Claude Code did not activate requested permission mode '{}'; reported '{}'. Check model, account and organization permissions.",
                                 expected_mode.as_deref().unwrap_or("default"), actual
@@ -3658,6 +3692,28 @@ async fn handle_stream_event(
         }
     }
     Ok(())
+}
+
+/// Claude Code reports `default` instead of the requested `auto` when the
+/// model (for example Haiku through a non-first-party API) or the account
+/// does not offer auto mode.
+fn auto_mode_fell_back(expected: Option<&str>, actual: &str) -> bool {
+    expected == Some("auto") && actual == "default"
+}
+
+/// The `provider.event` recorded when [`auto_mode_fell_back`]; same shape as
+/// Antigravity's `auto_mode_unavailable`.
+fn auto_mode_unavailable_event(model: Option<&Value>) -> Value {
+    json!({
+        "provider": "claude-code",
+        "providerMethod": "auto_mode_unavailable",
+        "metadata": {
+            "requestedMode": "auto",
+            "activeMode": "ask",
+            "model": model.and_then(Value::as_str),
+            "reason": "Claude Code did not enable auto mode for this model or account",
+        },
+    })
 }
 
 /// Answers a control request from a detached task so the read loop keeps

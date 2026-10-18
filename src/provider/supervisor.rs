@@ -5672,6 +5672,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_without_auto_mode_continues_as_ask_and_reports_it() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-auto-unavailable").await;
+        fs::write(root.join("auto-unavailable"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        // Claude's default permission mode is `auto`.
+        let turn_id = supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+        let request = wait_for_journal_event(&store, &manifest.id, |event| {
+            event.event_type == "permission.requested"
+        })
+        .await;
+        supervisor
+            .resolve_permission(
+                &manifest.id,
+                request.payload["permissionId"].as_str().unwrap(),
+                PermissionDecision {
+                    outcome: PermissionOutcome::AllowOnce,
+                    option_id: Some("allow_once".to_owned()),
+                    data: None,
+                },
+            )
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        let event = history
+            .iter()
+            .find(|event| {
+                event.event_type == "provider.event"
+                    && event.payload["providerMethod"] == "auto_mode_unavailable"
+            })
+            .unwrap_or_else(|| panic!("{history:?}"));
+        assert_eq!(
+            event.payload,
+            json!({
+                "provider": "claude-code",
+                "providerMethod": "auto_mode_unavailable",
+                "metadata": {
+                    "requestedMode": "auto",
+                    "activeMode": "ask",
+                    "model": "claude-haiku-fixture",
+                    "reason": "Claude Code did not enable auto mode for this model or account",
+                },
+                "turnId": turn_id,
+            })
+        );
+        assert!(
+            history
+                .iter()
+                .any(|event| event.event_type == "turn.completed"
+                    && event.payload["turnId"] == turn_id),
+            "{history:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn claude_reporting_another_permission_mode_fails_the_turn() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-claude-mode-mismatch").await;
+        fs::write(root.join("mode-mismatch"), "").unwrap();
+        let manifest = supervisor
+            .create(ProviderKind::ClaudeCode, workspace, None, None)
+            .await
+            .unwrap();
+        supervisor
+            .prompt(&manifest.id, "hello".to_owned(), None)
+            .await
+            .unwrap();
+        wait_until_idle(&supervisor).await;
+        let history = store.complete_history(&manifest.id).await.unwrap();
+        assert!(
+            history.iter().any(|event| event.event_type == "turn.failed"
+                && event
+                    .payload
+                    .to_string()
+                    .contains("did not activate requested permission mode")),
+            "{history:?}"
+        );
+        assert!(!history
+            .iter()
+            .any(|event| event.payload["providerMethod"] == "auto_mode_unavailable"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_late_task_notification_keeps_the_claude_turn_open() {
         let (root, store, supervisor, workspace) =
             control_fixture("todex-claude-late-notification").await;
@@ -7090,6 +7183,28 @@ else
       printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_big","is_error":false,"content":[{"type":"text","text":"'
       head -c 2097152 /dev/zero | tr '\0' y
       printf '"}]}]}}\n'
+    fi
+    if [ -f "$(dirname "$0")/mode-mismatch" ]; then
+      printf '{"type":"system","subtype":"init","permissionMode":"plan","model":"claude-fixture"}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-native","result":"ok"}\n'
+      continue
+    fi
+    if [ -f "$(dirname "$0")/auto-unavailable" ]; then
+      # Claude Code without auto mode for the model: it reports `default`
+      # and asks for every tool through can_use_tool.
+      printf '{"type":"system","subtype":"init","permissionMode":"default","model":"claude-haiku-fixture"}\n'
+      printf '{"type":"control_request","request_id":"perm-auto","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}\n'
+      IFS= read -r reply
+      case "$reply" in
+        *'"request_id":"perm-auto"'*'"behavior":"allow"'*)
+          printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"claude fixture"}}}\n'
+          printf '{"type":"result","subtype":"success","is_error":false,"session_id":"claude-native","result":"allowed"}\n'
+          ;;
+        *)
+          printf '{"type":"result","subtype":"success","is_error":true,"session_id":"claude-native","result":"not allowed"}\n'
+          ;;
+      esac
+      continue
     fi
     if [ -f "$(dirname "$0")/permission-drain" ]; then
       printf '{"type":"control_request","request_id":"perm-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}\n'
