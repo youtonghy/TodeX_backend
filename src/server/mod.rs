@@ -1,3 +1,4 @@
+mod agent_calling;
 mod agent_desktop;
 mod agent_providers;
 pub(crate) mod api;

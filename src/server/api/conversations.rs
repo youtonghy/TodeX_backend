@@ -12,13 +12,12 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::stream::{assistant_text, ends_turn, sse, EventPump};
-use super::{authorize_workspace, parse_agent, present_manifest, ApiKeyContext};
+use super::stream::sse;
+use super::{parse_agent, present_manifest};
+use crate::agent_calls::{self, ApiKeyCaller, EventPump, RunInput, TurnInput, TurnOutcome};
 use crate::app_state::AppState;
-use crate::conversation::server_decrypt::HistoryReader;
-use crate::conversation::ProviderKind;
 use crate::error::AppError;
-use crate::provider::{CancelOutcome, ConversationPrompt, PermissionDecision, PromptSkillRef};
+use crate::provider::{CancelOutcome, PermissionDecision, PromptSkillRef};
 
 const DEFAULT_EVENT_PAGE: usize = 200;
 const MAX_EVENT_PAGE: usize = 1000;
@@ -49,22 +48,14 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/api/v1/runs", post(run))
 }
 
-fn reader(state: &AppState, key: &ApiKeyContext, conversation_id: &str) -> HistoryReader {
-    HistoryReader::new(
-        state.history_keys.clone(),
-        conversation_id,
-        key.seed.clone(),
-    )
-}
-
 async fn list_conversations(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
 ) -> Result<Json<Value>, AppError> {
     let manifests = state.conversations.list_owned(&key.owner_id()).await?;
     let mut conversations = Vec::with_capacity(manifests.len());
     for manifest in manifests {
-        let mut reader = reader(&state, &key, &manifest.id);
+        let mut reader = key.reader(&state, &manifest.id);
         conversations.push(present_manifest(&mut reader, manifest).await);
     }
     Ok(Json(json!({ "conversations": conversations })))
@@ -81,38 +72,22 @@ struct CreateConversationRequest {
     profile: Option<String>,
 }
 
-async fn create(
-    state: &AppState,
-    key: &ApiKeyContext,
-    agent: ProviderKind,
-    workspace: &str,
-    title: Option<String>,
-    profile: Option<String>,
-) -> Result<crate::conversation::ConversationManifest, AppError> {
-    key.ensure_agent(agent)?;
-    let workspace = authorize_workspace(state, key, workspace).await?;
-    state
-        .conversations
-        .create_owned(&key.owner_id(), agent, workspace, title, profile)
-        .await
-}
-
 async fn create_conversation(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
     Json(request): Json<CreateConversationRequest>,
 ) -> Result<Response, AppError> {
     let agent = parse_agent(&request.agent)?;
-    let manifest = create(
+    let manifest = agent_calls::create(
         &state,
         &key,
         agent,
-        &request.workspace,
+        Some(&request.workspace),
         request.title,
         request.profile,
     )
     .await?;
-    let mut reader = reader(&state, &key, &manifest.id);
+    let mut reader = key.reader(&state, &manifest.id);
     Ok((
         StatusCode::CREATED,
         Json(present_manifest(&mut reader, manifest).await),
@@ -122,20 +97,20 @@ async fn create_conversation(
 
 async fn get_conversation(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
     AxumPath(conversation_id): AxumPath<String>,
 ) -> Result<Json<Value>, AppError> {
     let manifest = state
         .conversations
         .get_owned(&key.owner_id(), &conversation_id)
         .await?;
-    let mut reader = reader(&state, &key, &conversation_id);
+    let mut reader = key.reader(&state, &conversation_id);
     Ok(Json(present_manifest(&mut reader, manifest).await))
 }
 
 async fn delete_conversation(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
     AxumPath(conversation_id): AxumPath<String>,
 ) -> Result<Json<Value>, AppError> {
     let manifest = state
@@ -172,14 +147,8 @@ struct TurnRequest {
 }
 
 impl TurnRequest {
-    fn prompt(self) -> Result<ConversationPrompt, AppError> {
-        if self.text.trim().is_empty() {
-            return Err(AppError::InvalidRequest("text is required".to_owned()));
-        }
-        Ok(ConversationPrompt {
-            permission_mode: None,
-            work_mode: None,
-            client_request_id: self.client_request_id,
+    fn input(self) -> TurnInput {
+        TurnInput {
             text: self.text,
             model: self.model,
             reasoning_effort: self.reasoning_effort,
@@ -191,11 +160,10 @@ impl TurnRequest {
                     name: skill.name,
                 })
                 .collect(),
-            content: Vec::new(),
-            permission_profile: None,
-            sandbox_mode: None,
-            approval_policy: None,
-        })
+            client_request_id: self.client_request_id,
+            permission_mode: None,
+            work_mode: None,
+        }
     }
 }
 
@@ -210,37 +178,27 @@ fn wants_event_stream(headers: &HeaderMap) -> bool {
 /// the turn's events until it ends; otherwise it is `202` with the ids.
 async fn create_turn(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
     AxumPath(conversation_id): AxumPath<String>,
     headers: HeaderMap,
     Json(request): Json<TurnRequest>,
 ) -> Result<Response, AppError> {
-    let prompt = request.prompt()?;
-    let owner = key.owner_id();
-    let manifest = state
-        .conversations
-        .get_owned(&owner, &conversation_id)
-        .await?;
-    key.ensure_agent(manifest.provider)?;
-    if !wants_event_stream(&headers) {
-        let turn_id = state
-            .conversations
-            .prompt_owned(&owner, &conversation_id, prompt)
-            .await?;
-        return Ok((
+    let started = agent_calls::start_turn(
+        &state,
+        &key,
+        &conversation_id,
+        request.input(),
+        wants_event_stream(&headers),
+    )
+    .await?;
+    Ok(match started.events {
+        Some(pump) => turn_stream_response(pump, &conversation_id, started.turn_id),
+        None => (
             StatusCode::ACCEPTED,
-            Json(json!({ "conversationId": conversation_id, "turnId": turn_id })),
+            Json(json!({ "conversationId": conversation_id, "turnId": started.turn_id })),
         )
-            .into_response());
-    }
-    // Subscribed before the prompt, from the last event before it, so the
-    // stream starts with the turn's first event.
-    let pump = EventPump::new(&state, &key, &conversation_id, manifest.last_sequence).await?;
-    let turn_id = state
-        .conversations
-        .prompt_owned(&owner, &conversation_id, prompt)
-        .await?;
-    Ok(turn_stream_response(pump, &conversation_id, turn_id))
+            .into_response(),
+    })
 }
 
 fn turn_stream_response(pump: EventPump, conversation_id: &str, turn_id: String) -> Response {
@@ -266,7 +224,7 @@ struct EventsQuery {
 
 async fn events(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
     AxumPath(conversation_id): AxumPath<String>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<Value>, AppError> {
@@ -284,7 +242,7 @@ async fn events(
             crate::conversation::ReplayDetail::Full,
         )
         .await?;
-    let mut reader = reader(&state, &key, &conversation_id);
+    let mut reader = key.reader(&state, &conversation_id);
     let mut events = Vec::with_capacity(replay.events.len());
     for event in replay.events {
         events.push(reader.present(event, &replay.frames).await);
@@ -307,7 +265,7 @@ struct StreamQuery {
 /// SSE of every event after `after` (or `Last-Event-ID`), then live ones.
 async fn events_stream(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
     AxumPath(conversation_id): AxumPath<String>,
     Query(query): Query<StreamQuery>,
     headers: HeaderMap,
@@ -330,7 +288,7 @@ struct CancelRequest {
 
 async fn cancel(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
     AxumPath(conversation_id): AxumPath<String>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, AppError> {
@@ -340,14 +298,8 @@ async fn cancel(
         serde_json::from_slice(&body)
             .map_err(|error| AppError::InvalidRequest(format!("invalid cancel request: {error}")))?
     };
-    let outcome = state
-        .conversations
-        .cancel_owned(
-            &key.owner_id(),
-            &conversation_id,
-            request.turn_id.as_deref(),
-        )
-        .await?;
+    let outcome =
+        agent_calls::cancel(&state, &key, &conversation_id, request.turn_id.as_deref()).await?;
     Ok(Json(match outcome {
         CancelOutcome::Signalled => json!({
             "conversationId": conversation_id,
@@ -365,14 +317,11 @@ async fn cancel(
 
 async fn resolve_permission(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
     AxumPath((conversation_id, permission_id)): AxumPath<(String, String)>,
     Json(decision): Json<PermissionDecision>,
 ) -> Result<Json<Value>, AppError> {
-    let owner = key.owner_id();
-    state
-        .conversations
-        .resolve_permission_owned(&owner, &owner, &conversation_id, &permission_id, decision)
+    agent_calls::resolve_permission(&state, &key, &conversation_id, &permission_id, decision)
         .await?;
     Ok(Json(json!({
         "conversationId": conversation_id,
@@ -405,7 +354,7 @@ struct RunRequest {
 /// once the turn ends, its status and assistant text.
 async fn run(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
     Json(request): Json<RunRequest>,
 ) -> Result<Response, AppError> {
     let agent = parse_agent(&request.agent)?;
@@ -415,60 +364,49 @@ async fn run(
             .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS)
             .clamp(1, MAX_RUN_TIMEOUT_SECS),
     );
-    let prompt = TurnRequest {
-        text: request.text,
-        model: request.model,
-        reasoning_effort: request.reasoning_effort,
-        skills: Vec::new(),
-        client_request_id: None,
-    }
-    .prompt()?;
-    let manifest = create(
+    let started = agent_calls::run(
         &state,
         &key,
-        agent,
-        &request.workspace,
-        request.title,
-        request.profile,
+        RunInput {
+            agent,
+            workspace: Some(request.workspace),
+            title: request.title,
+            profile: request.profile,
+            turn: TurnInput {
+                text: request.text,
+                model: request.model,
+                reasoning_effort: request.reasoning_effort,
+                ..TurnInput::default()
+            },
+        },
     )
     .await?;
-    let conversation_id = manifest.id.clone();
-    let mut pump = EventPump::new(&state, &key, &conversation_id, manifest.last_sequence).await?;
-    let owner = key.owner_id();
-    let turn_id = state
-        .conversations
-        .prompt_owned(&owner, &conversation_id, prompt)
-        .await?;
+    let conversation_id = started.manifest.id;
+    let turn_id = started.turn_id;
+    let Some(mut pump) = started.events else {
+        return Err(AppError::StreamClosed);
+    };
     if request.stream {
         return Ok(turn_stream_response(pump, &conversation_id, turn_id));
     }
 
     let mut output = String::new();
-    let collected = tokio::time::timeout(timeout, async {
-        loop {
-            for event in pump.next_batch().await? {
-                let ours =
-                    event.payload.get("turnId").and_then(Value::as_str) == Some(turn_id.as_str());
-                if ours {
-                    if let Some(text) = assistant_text(&event) {
-                        output.push_str(text);
-                    }
-                }
-                if ends_turn(&event, Some(&turn_id)) {
-                    return Ok::<_, AppError>(event);
-                }
-            }
-        }
-    })
-    .await;
-    let terminal = match collected {
-        Ok(result) => result?,
-        Err(_) => {
-            let _ = state
-                .conversations
-                .cancel_owned(&owner, &conversation_id, Some(&turn_id))
-                .await;
-            return Ok((
+    match agent_calls::await_turn(&mut pump, &turn_id, timeout, &mut output).await? {
+        TurnOutcome::Finished {
+            status,
+            output,
+            error,
+        } => Ok(Json(json!({
+            "conversationId": conversation_id,
+            "turnId": turn_id,
+            "status": status,
+            "output": output,
+            "error": error,
+        }))
+        .into_response()),
+        TurnOutcome::Pending { output } => {
+            let _ = agent_calls::cancel(&state, &key, &conversation_id, Some(&turn_id)).await;
+            Ok((
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(json!({
                     "code": "RUN_TIMEOUT",
@@ -478,27 +416,7 @@ async fn run(
                     "output": output,
                 })),
             )
-                .into_response());
+                .into_response())
         }
-    };
-    let status = terminal
-        .event_type
-        .strip_prefix("turn.")
-        .or_else(|| terminal.event_type.strip_prefix("conversation."))
-        .unwrap_or(&terminal.event_type)
-        .to_owned();
-    let error = terminal
-        .payload
-        .get("error")
-        .or_else(|| terminal.payload.get("message"))
-        .filter(|_| status != "completed")
-        .cloned();
-    Ok(Json(json!({
-        "conversationId": conversation_id,
-        "turnId": turn_id,
-        "status": status,
-        "output": output,
-        "error": error,
-    }))
-    .into_response())
+    }
 }

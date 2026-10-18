@@ -181,6 +181,7 @@ impl ManagedServer {
                     );
                 }
                 info!(addr = %api_addr, "todex-agentd API listening");
+                state.agent_calling.set_running_api_listener(Some(api_addr));
                 let app = server::api_router(state.clone());
                 let (api_shutdown_tx, api_shutdown_rx) = oneshot::channel();
                 let handle = tokio::spawn(async move {

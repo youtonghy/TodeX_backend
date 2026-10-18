@@ -555,11 +555,13 @@ Codex 的原生 `thread/tokenUsage/updated` 通知会在 Provider 边界规范�
 
 ## 外部 API（API Key）
 
-除了设备端口 7345，daemon 还可以在另一个端口提供面向脚本、CI 和其他服务的 REST + SSE 接口。这个端口用后端签发的 API key 鉴权，不需要设备配对，也不使用 transport v2，可以调用所有已接入的 Agent。它与设备端口共用同一个会话管理器，但用 key 创建的会话与设备会话互相隔离。
+除了设备端口 7345，daemon 还可以在另一个端口提供面向脚本、CI 和其他服务的 REST + SSE 接口。这个端口用后端签发的 API key 鉴权，不需要设备配对，也不使用 transport v2，可以调用全局范围内已接入的 Agent。它与设备端口共用同一个会话管理器，但用 key 创建的会话与设备会话互相隔离。
+
+外部 API 是“Agent 调用”功能的 CLI 入口。它的管理入口在桌面端/Web 端的 设置 → “Agent 调用”：开关监听与端口、签发和管理 API key、设置全局允许的 Agent 与模型，分别通过 `/v2/agent-calling*` 与 `/v2/api-keys` 设备路由完成（见下文）。后端 TUI 只显示 API 监听状态，不再提供管理功能，也没有 `api-key` 命令行子命令。
 
 ### 开启与配置
 
-外部 API 默认关闭。开启方式有三种：在 `config.toml` 中设置 `[api] enabled = true`，启动时加 `--enable-api`，或设置环境变量 `TODEX_AGENTD_API_ENABLED=true`。TUI 设置页也可以开关它并修改端口，保存后在下次（重新）启动服务时生效。
+外部 API 默认关闭。开启方式有四种：在 设置 → “Agent 调用” 中打开（`PUT /v2/agent-calling/api-listener`，写入 `config.toml` 的 `[api] enabled`/`port`），在 `config.toml` 中设置 `[api] enabled = true`，启动时加 `--enable-api`，或设置环境变量 `TODEX_AGENTD_API_ENABLED=true`。监听配置在下次（重新）启动服务时生效；设置页只能修改开关和端口，`host` 与 `allow_plaintext_remote` 只能在配置文件或命令行中修改。
 
 | 配置 | 命令行参数 | 环境变量 | 默认值 |
 | --- | --- | --- | --- |
@@ -587,7 +589,7 @@ daemon 运行时，`daemon status` 会多输出一行 `API listening: http://<ho
 
 key 的格式是 `tdx_<16 位十六进制 id>_<43 字符 base64url secret>`，只在创建时完整显示一次。`<data_dir>/api-keys.json`（0600）只保存 secret 的哈希，以及由 secret 派生的历史接收方公钥（见 [history-encryption.md §3.5](history-encryption.md)），文件本身不足以鉴权或解密。
 
-daemon 按文件修改时间重新加载 key，CLI 和 TUI 的修改无需重启就会生效。每把 key 的属性如下：
+daemon 按文件修改时间重新加载 key，修改无需重启就会生效。每把 key 的属性如下：
 
 - `scopes.agents`：允许使用的 Agent 列表，省略表示全部。
 - `scopes.workspaces`：允许使用的 workspace 绝对路径列表（包含子目录），省略表示全部 workspace 根目录。
@@ -596,25 +598,59 @@ daemon 按文件修改时间重新加载 key，CLI 和 TUI 的修改无需重启
 
 最多可以有 256 把有效 key。被吊销的 key 仍保留在列表中，状态显示为 `revoked`。吊销或过期后，这把 key 的请求立即返回 401，已打开的 SSE 流在几秒内以 `error` 事件结束，正在运行的 turn 在约 10 秒内被取消。会话历史会保留。
 
-**管理入口：**
+**管理入口**：桌面端/Web 端 设置 → “Agent 调用”，通过以下设备端 REST（端口 7345，需要设备签名）：
 
-- **CLI**（直接读写 `api-keys.json`）：
 
-  ```bash
-  todex-agentd api-key create --name ci --agent codex --workspace ~/projects/app --approval ask [--expires-days 30]
-  todex-agentd api-key list
-  todex-agentd api-key update <id> [--name …] [--agent …|--all-agents] [--workspace …|--all-workspaces] [--approval …] [--expires-days N|--no-expiry]
-  todex-agentd api-key revoke <id>
-  ```
-
-- **TUI**：使用 “API Keys” 面板。
-
-- **设备端 REST**（端口 7345，需要设备签名）：
   - `GET /v2/api-keys`：返回 `{"keys":[…]}`。每项包含 `id`、`name`、`prefix`、`status`、`scopes`、`approval`、`createdAt`、`expiresAt`、`lastUsedAt`、`revokedAt`，不含任何哈希或密钥。
   - `POST /v2/api-keys`：请求体为 `{"name","scopes"?,"approval"?,"expiresAt"?}`。返回 201，响应中的 `key` 字段是完整 key，只返回这一次。
   - `PATCH /v2/api-keys/{id}`：请求体为 `{"name"?,"scopes"?,"approval"?,"expiresAt"?}`，其中 `expiresAt: null` 表示取消过期时间。
   - `DELETE /v2/api-keys/{id}`：吊销。返回 `{"id","revoked"}`；不存在的 id 返回 404。
-  - `GET /v2/api-keys/listener`：返回 `{"enabled","host","port"}`。
+  - `GET /v2/api-keys/listener`：返回 `{"enabled","host","port"}`（进程启动时的配置）。监听的完整状态见 `GET /v2/agent-calling` 的 `apiListener`。
+
+### 全局范围与 Agent 调用设置
+
+`$DATA_DIR/agent-calling.json`（0600，原子替换）保存“Agent 调用”的全局设置，CLI 入口（外部 API）与 MCP 入口（`todex_agents`）共用：
+
+```json
+{
+  "scope": { "agents": null, "models": {} },
+  "mcp": { "enabled": false, "approval": "ask" }
+}
+```
+
+- `scope.agents`：`null` 表示全部 Agent；数组（Agent id，如 `"codex"`、`"claude-code"`）表示只允许这些，可以为空。
+- `scope.models`：Agent id → 允许的模型 id 数组（非空）。不在表中的 Agent 可以使用它的全部模型。空数组会被拒绝（400）。
+- `mcp.enabled` / `mcp.approval`：MCP 入口的开关与审批策略，`approval` 取值与 API key 相同（`ask`、`auto-approve`、`reject`），用于 Agent 调用产生的子会话。
+- 文件不存在时即为上面的默认值（全部 Agent、全部模型、MCP 关闭），已有的外部 API 用法不受影响；默认值不会写入文件，直到客户端保存。
+
+外部 API 的有效范围是全局范围与 key 自身 `scopes` 的交集：
+- Agent 必须同时在全局 `scope.agents` 与 key 的 `scopes.agents` 内，否则 403 `UNAUTHORIZED`。`GET /api/v1/agents` 只列出两者都允许的 Agent，每项的 `models` 也只含全局允许的模型；`GET /api/v1/agents/{agent}/models` 同样按全局范围过滤。
+- turn 指定的 `model` 必须在该 Agent 的允许列表内，否则 403 `UNAUTHORIZED`（`runs` 在创建会话前检查，被拒时不会留下会话）。
+- turn 未指定模型时：该 Agent 不受模型限制则由 Agent 使用默认模型；受限制时使用实时模型目录中的默认模型（若被允许），否则使用允许列表中的第一个模型。
+- 给出 `reasoningEffort` 时，它必须在所选模型（未指定则为默认模型）的 `supportedReasoningEfforts` 内（该列表非空时），否则 403 `UNAUTHORIZED`。检查需要实时读取模型目录；读取失败时不做该检查，交给 Agent 处理。
+
+设备路由（端口 7345）：
+
+- `GET /v2/agent-calling`（需要设备认证）返回：
+
+  ```json
+  {
+    "scope": { "agents": null, "models": {} },
+    "mcp": { "enabled": false, "approval": "ask", "injected": false },
+    "apiListener": {
+      "enabled": true, "host": "127.0.0.1", "port": 7346,
+      "listening": true, "baseUrl": "http://127.0.0.1:7346/api/v1",
+      "pendingRestart": false
+    },
+    "limits": { "maxConcurrentCalls": 4, "maxWaitSecs": 1200, "defaultWaitSecs": 300 }
+  }
+  ```
+
+  `mcp.injected` 表示按当前设置会注入 MCP 服务（`mcp.enabled` 且至少允许一个 Agent）。`apiListener.listening` 与 `baseUrl` 描述本进程实际运行的监听（未监听时 `baseUrl` 为 `null`）；`enabled`、`port` 是已保存的配置；`pendingRestart` 表示已保存的配置与正在运行的监听不同，需重启后端生效。`limits` 是 MCP 入口的限制：每个父会话最多同时运行的子调用数，以及等待时间的上限与默认值（秒）。
+- `PUT /v2/agent-calling`（需要设备签名，未开启设备认证的本地部署返回 403）：请求体为 `{"scope"?: {"agents"?, "models"?}, "mcp"?: {"enabled"?, "approval"?}}`。给出 `scope` 时整体替换范围（其中省略的字段取默认值）；`mcp` 中省略的字段保持不变。未知字段、未知 Agent id、空模型数组返回 400 `INVALID_REQUEST`。返回与 GET 相同的结构。
+- `PUT /v2/agent-calling/api-listener`（需要设备签名）：请求体为 `{"enabled"?: bool, "port"?: number}`，写入 `config.toml` 的 `[api]`，下次启动后端时生效。`port` 必须在 1–65535 之间且不能等于主端口；开启后的配置还须能通过启动检查（例如非回环 `host` 需要 `allow_plaintext_remote`）；否则返回 400 `INVALID_REQUEST`。返回与 GET 相同的结构。
+
+修改设置会写一条审计事件 `agent_calling.settings.audit`。
 
 ### 鉴权、隔离与 workspace 范围
 
@@ -629,6 +665,7 @@ daemon 按文件修改时间重新加载 key，CLI 和 TUI 的修改无需重启
 **scope：**
 - workspace 必须是位于 `workspace_roots` 内的已有目录，否则返回 403 `WORKSPACE_PATH_OUTSIDE_ROOT` 或 404 `WORKSPACE_PATH_NOT_FOUND`。
 - Agent 或 workspace 超出 scope 时返回 403 `UNAUTHORIZED`。`scopes.workspaces` 省略时（scope 为全部），key 可使用 `workspace_roots` 内的任意目录。
+- 全局范围（见上文）与 key 的 scope 同时生效：Agent、模型或思考强度不被允许时同样返回 403 `UNAUTHORIZED`。
 
 **能力限制：**
 - API 会话不注入 TodeX 自带的 agent 工具（SSH、桌面/Computer Use、agent 浏览器），只使用 Agent 的原生能力。
@@ -651,8 +688,8 @@ daemon 按文件修改时间重新加载 key，CLI 和 TUI 的修改无需重启
 | --- | --- | --- |
 | GET | `/api/v1/health` | 无需鉴权，返回 `{"ok":true,"version"}` |
 | GET | `/api/v1/me` | 当前 key 的摘要，字段与 `/v2/api-keys` 的列表项相同 |
-| GET | `/api/v1/agents` | 按 scope 过滤后的 Agent 快照，返回 `{"agents":[…]}`，每项结构同 `/v2/providers` |
-| GET | `/api/v1/agents/{agent}/models?workspace=` | 实时模型列表，返回 `{"agent","models"}` |
+| GET | `/api/v1/agents` | 按全局范围与 key 的 scope 过滤后的 Agent 快照，返回 `{"agents":[…]}`，每项结构同 `/v2/providers`，`models` 只含全局允许的模型 |
+| GET | `/api/v1/agents/{agent}/models?workspace=` | 实时模型列表（只含全局允许的模型），返回 `{"agent","models"}` |
 | GET | `/api/v1/workspaces` | 可用的 workspace，返回 `{"workspaces":[{"path","scope":"root"\|"key"}]}` |
 | POST | `/api/v1/conversations` | 请求体为 `{"agent","workspace","title"?,"profile"?}`，返回 201 和会话 |
 | GET | `/api/v1/conversations` | 返回 `{"conversations":[…]}` |
@@ -695,7 +732,7 @@ daemon 按文件修改时间重新加载 key，CLI 和 TUI 的修改无需重启
 | --- | --- |
 | 400 | 参数错误 |
 | 401 | 鉴权失败 |
-| 403 | 超出 scope，或 workspace 位于 `workspace_roots` 之外 |
+| 403 | 超出 scope（全局范围或 key 的 scope，包括模型与思考强度），或 workspace 位于 `workspace_roots` 之外 |
 | 404 | 会话不存在或不属于该 key |
 | 409 | 已有 turn 在运行 |
 | 422 | 请求体包含不允许的字段 |
@@ -703,10 +740,10 @@ daemon 按文件修改时间重新加载 key，CLI 和 TUI 的修改无需重启
 | 503 | Agent 不可用 |
 | 504 | `runs` 超时 |
 
-**示例：**
+**示例**（key 在 设置 → “Agent 调用” 中创建，完整 key 只显示一次，保存到环境变量 `TODEX_API_KEY`）：
 
 ```bash
-KEY=$(todex-agentd api-key create --name demo --workspace ~/projects/app | tail -1)
+KEY=$TODEX_API_KEY
 curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"agent":"codex","workspace":"'"$HOME"'/projects/app","text":"总结 README"}' \
   http://127.0.0.1:7346/api/v1/runs

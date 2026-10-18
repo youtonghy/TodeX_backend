@@ -240,8 +240,9 @@ args = ["--stdio"]
 enable_auth = true
 enable_tls = false
 
-# External API for scripts and services, authenticated with API keys
-# (`todex-agentd api-key create`); off by default. See docs/API.md.
+# External API for scripts and services, authenticated with API keys; off by
+# default. Keys and this listener are managed in Desktop/Web Settings ->
+# "Agent 调用" (Agent Calling). See docs/API.md.
 [api]
 enabled = false
 host = "127.0.0.1"
@@ -257,7 +258,7 @@ port = 7346
 
 ### External API (`/api/v1`, API keys)
 
-With `[api] enabled = true` (or `--enable-api`) the daemon also serves REST + SSE on port `7346`, authenticated with `Authorization: Bearer tdx_…` keys issued by `todex-agentd api-key create`, the TUI, or `/v2/api-keys`. Each key reaches only its own conversations, scoped agents and workspaces; `POST /api/v1/runs` runs one prompt end to end. Events come back decrypted for the key while history on disk stays end-to-end encrypted. See the "外部 API（API Key）" chapter of [docs/API.md](docs/API.md).
+When the external API listener is enabled, the daemon also serves REST + SSE on port `7346`, authenticated with `Authorization: Bearer tdx_…` keys. API keys and the listener (on/off and port) are managed in the Desktop or Web client under Settings → "Agent 调用" (Agent Calling); the TUI only shows the listener status. `[api] enabled = true` (or `--enable-api`) still turns the listener on from the config file. Each key reaches only its own conversations, and only the agents, models and workspaces both its own scope and the global Agent Calling scope allow; `POST /api/v1/runs` runs one prompt end to end. Events come back decrypted for the key while history on disk stays end-to-end encrypted. See the "外部 API（API Key）" chapter of [docs/API.md](docs/API.md).
 
 ### HTTP Endpoints (`/v2`)
 

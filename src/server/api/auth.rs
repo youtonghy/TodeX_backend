@@ -14,7 +14,7 @@ use axum::{
     response::Response,
 };
 
-use super::ApiKeyContext;
+use crate::agent_calls::ApiKeyCaller;
 use crate::app_state::AppState;
 use crate::error::AppError;
 
@@ -120,7 +120,7 @@ pub(super) async fn require_api_key(
             });
         }
     };
-    request.extensions_mut().insert(ApiKeyContext {
+    request.extensions_mut().insert(ApiKeyCaller {
         record: key.record,
         seed: Arc::new(key.seed),
     });

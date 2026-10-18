@@ -231,7 +231,7 @@ args = ["--stdio"]
 enable_auth = true
 enable_tls = false
 
-# 面向脚本与服务的外部 API，使用 API key 鉴权（`todex-agentd api-key create`），默认关闭，见 docs/API.md
+# 面向脚本与服务的外部 API，使用 API key 鉴权，默认关闭；key 与监听在桌面端/网页端“设置 → Agent 调用”中管理，见 docs/API.md
 [api]
 enabled = false
 host = "127.0.0.1"
@@ -247,7 +247,7 @@ port = 7346
 
 ### 外部 API（`/api/v1`，API key）
 
-设置 `[api] enabled = true`（或使用 `--enable-api`）后，daemon 会在 `7346` 端口额外提供 REST + SSE 接口，使用 `Authorization: Bearer tdx_…` 鉴权。key 可以通过 `todex-agentd api-key create`、TUI 或 `/v2/api-keys` 签发。每把 key 只能访问自己的会话，以及 scope 内的 Agent 和 workspace；`POST /api/v1/runs` 可以一次完成一个 prompt。返回给调用方的事件已用该 key 解密，磁盘上的历史仍是端到端加密的。详见 [docs/API.md](docs/API.md) 中的“外部 API（API Key）”一章。
+开启外部 API 监听后，daemon 会在 `7346` 端口额外提供 REST + SSE 接口，使用 `Authorization: Bearer tdx_…` 鉴权。API key 与监听（开关和端口）都在桌面端或网页端的“设置 → Agent 调用”中管理；TUI 只显示监听状态。也可以在配置文件中设置 `[api] enabled = true`（或使用 `--enable-api`）开启监听。每把 key 只能访问自己的会话，以及 key 的 scope 与全局“Agent 调用”范围同时允许的 Agent、模型和 workspace；`POST /api/v1/runs` 可以一次完成一个 prompt。返回给调用方的事件已用该 key 解密，磁盘上的历史仍是端到端加密的。详见 [docs/API.md](docs/API.md) 中的“外部 API（API Key）”一章。
 
 ### HTTP 接口 (`/v2`)
 

@@ -407,6 +407,7 @@ fn authenticated_routes() -> Router<AppState> {
         .route("/v2/providers/commands", get(provider_commands))
         .merge(agent_providers::routes())
         .merge(super::api_keys::routes())
+        .merge(super::agent_calling::routes())
         .merge(super::quota::routes())
         .merge(super::history_cleanup::routes())
         .merge(super::native_history::routes())
@@ -12166,6 +12167,165 @@ mod tests {
         ))
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn agent_calling_settings_are_read_by_devices_and_changed_by_signed_ones() {
+        let root = std::env::temp_dir().join(format!("todex-v2-agent-calling-{}", Uuid::new_v4()));
+        let state = auth_test_state(&root).await;
+        let app = crate::server::loopback_test_router(state.clone());
+        let device = enroll(&root.join("data"));
+        let call = |request: Request<Body>| {
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+                )
+            }
+        };
+
+        for (method, uri) in [
+            ("GET", "/v2/agent-calling"),
+            ("PUT", "/v2/agent-calling"),
+            ("PUT", "/v2/agent-calling/api-listener"),
+        ] {
+            let (status, _) = call(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+
+        // Without a settings file: everything allowed, MCP off.
+        let (status, settings) =
+            call(signed_request(&device, "GET", "/v2/agent-calling", "")).await;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+        assert_eq!(
+            settings,
+            json!({
+                "scope": { "agents": null, "models": {} },
+                "mcp": { "enabled": false, "approval": "ask", "injected": false },
+                "apiListener": {
+                    "enabled": false,
+                    "host": "127.0.0.1",
+                    "port": crate::config::DEFAULT_API_PORT,
+                    "listening": false,
+                    "baseUrl": null,
+                    "pendingRestart": false,
+                },
+                "limits": { "maxConcurrentCalls": 4, "maxWaitSecs": 1200, "defaultWaitSecs": 300 },
+            })
+        );
+
+        for body in [
+            json!({ "scope": { "models": { "codex": [] } } }),
+            json!({ "scope": { "agents": ["no-such-agent"] } }),
+            json!({ "mcp": { "approval": "maybe" } }),
+            json!({ "other": true }),
+        ] {
+            let (status, error) = call(signed_request(
+                &device,
+                "PUT",
+                "/v2/agent-calling",
+                &body.to_string(),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {error}");
+            assert_eq!(error["code"], "INVALID_REQUEST");
+        }
+        let body = json!({
+            "scope": { "agents": ["claude-code"], "models": { "claude-code": ["opus"] } },
+            "mcp": { "enabled": true, "approval": "auto-approve" },
+        })
+        .to_string();
+        let (status, saved) =
+            call(signed_request(&device, "PUT", "/v2/agent-calling", &body)).await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["scope"]["agents"], json!(["claude-code"]));
+        assert_eq!(saved["scope"]["models"]["claude-code"], json!(["opus"]));
+        assert_eq!(
+            saved["mcp"],
+            json!({ "enabled": true, "approval": "auto-approve", "injected": true })
+        );
+        assert!(root.join("data/agent-calling.json").exists());
+        let (_, partial) = call(signed_request(
+            &device,
+            "PUT",
+            "/v2/agent-calling",
+            &json!({ "mcp": { "enabled": false } }).to_string(),
+        ))
+        .await;
+        assert_eq!(partial["mcp"]["approval"], "auto-approve");
+        assert_eq!(partial["scope"], saved["scope"]);
+
+        for body in [
+            json!({ "port": 0 }),
+            json!({ "port": 70000 }),
+            json!({ "port": -1 }),
+            json!({ "port": "7400" }),
+            json!({ "host": "0.0.0.0" }),
+        ] {
+            let (status, error) = call(signed_request(
+                &device,
+                "PUT",
+                "/v2/agent-calling/api-listener",
+                &body.to_string(),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {error}");
+            assert_eq!(error["code"], "INVALID_REQUEST");
+        }
+        let (status, saved) = call(signed_request(
+            &device,
+            "PUT",
+            "/v2/agent-calling/api-listener",
+            &json!({ "enabled": true, "port": 7400 }).to_string(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["apiListener"]["enabled"], true);
+        assert_eq!(saved["apiListener"]["port"], 7400);
+        assert_eq!(saved["apiListener"]["listening"], false);
+        assert_eq!(saved["apiListener"]["pendingRestart"], true);
+        let config = fs::read_to_string(root.join("data/config.toml")).unwrap();
+        assert!(
+            config.contains("enabled = true") && config.contains("port = 7400"),
+            "{config}"
+        );
+
+        // Without device authentication, settings can be read but not changed.
+        let mut anonymous = state.clone();
+        Arc::make_mut(&mut anonymous.config).security.enable_auth = false;
+        let app = crate::server::loopback_test_router(anonymous);
+        let request = |method: &str, uri: &str| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("host", "127.0.0.1:7345")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/v2/agent-calling"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        for uri in ["/v2/agent-calling", "/v2/agent-calling/api-listener"] {
+            let response = app.clone().oneshot(request("PUT", uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
         let _ = fs::remove_dir_all(&root);
     }
 }

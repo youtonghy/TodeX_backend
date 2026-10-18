@@ -6,7 +6,7 @@
 //! ([`history_crypto::api_key_recipient_seed`]), so the file never holds
 //! anything that authenticates or decrypts. Like `devices.json` the file is
 //! owner-only, replaced atomically and reloaded when its [`FileStamp`]
-//! changes, so the CLI and the TUI manage keys while the daemon runs. Every
+//! changes, so keys stay current across processes while the daemon runs. Every
 //! read-modify-write, in any process, holds the cross-process
 //! `api-keys.json.lock`, so a revocation is never overwritten.
 use std::{
@@ -60,25 +60,6 @@ pub(crate) enum ApprovalPolicy {
     AutoApprove,
     /// Answered `reject_once` at once.
     Reject,
-}
-
-impl ApprovalPolicy {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "ask" => Some(Self::Ask),
-            "auto-approve" => Some(Self::AutoApprove),
-            "reject" => Some(Self::Reject),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Ask => "ask",
-            Self::AutoApprove => "auto-approve",
-            Self::Reject => "reject",
-        }
-    }
 }
 
 /// What a key may reach. `None` means every agent / every workspace root.

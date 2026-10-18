@@ -1,7 +1,9 @@
-//! The external API end to end against the real binary: a key issued with
-//! `todex-agentd api-key create` runs an Agent (the Antigravity stream-json
-//! fixture) through `/api/v1/runs`, reads plaintext back while the history on
-//! disk stays encrypted, and stops working once revoked.
+//! The external API end to end against the real binary: a key issued through
+//! `/v2/api-keys` (what Settings → Agent 调用 uses; device authentication is
+//! off here, so loopback requests need no signature) runs an Agent (the
+//! Antigravity stream-json fixture) through `/api/v1/runs`, reads plaintext
+//! back while the history on disk stays encrypted, and stops working once
+//! revoked.
 #![cfg(unix)]
 
 use std::{
@@ -36,22 +38,6 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
-}
-
-fn api_key(data_dir: &Path, args: &[&str]) -> String {
-    let output = Command::new(BIN)
-        .arg("api-key")
-        .args(args)
-        .arg("--data-dir")
-        .arg(data_dir)
-        .output()
-        .expect("run api-key");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap()
 }
 
 fn contains_bytes(directory: &Path, needle: &[u8]) -> bool {
@@ -90,6 +76,7 @@ async fn api_key_runs_an_agent_and_revocation_locks_it_out() {
         .arg("--workspace-root")
         .arg(root.join("workspaces"))
         .env("TODEX_AGENTD_ANTIGRAVITY_BIN", &agy)
+        .env("TODEX_AGENTD_ENABLE_AUTH", "false")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -109,19 +96,31 @@ async fn api_key_runs_an_agent_and_revocation_locks_it_out() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let created = api_key(
-        &data_dir,
-        &[
-            "create",
-            "--name",
-            "e2e",
-            "--workspace",
-            workspace.to_str().unwrap(),
-        ],
-    );
-    let key = created.lines().last().unwrap().trim().to_owned();
+    let device_base = format!("http://127.0.0.1:{port}/v2");
+    let created: Value = client
+        .post(format!("{device_base}/api-keys"))
+        .json(&json!({ "name": "e2e", "scopes": { "workspaces": [workspace] } }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let key = created["key"].as_str().unwrap_or_default().to_owned();
+    // The settings report the listener this daemon runs.
+    let calling: Value = client
+        .get(format!("{device_base}/agent-calling"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(calling["apiListener"]["listening"], true, "{calling}");
+    assert_eq!(calling["apiListener"]["baseUrl"], base);
+    assert_eq!(calling["apiListener"]["pendingRestart"], false);
     assert!(key.starts_with("tdx_"), "{created}");
-    let id = key[4..20].to_owned();
+    let id = created["id"].as_str().unwrap().to_owned();
 
     let unauthenticated = client.get(format!("{base}/me")).send().await.unwrap();
     assert_eq!(unauthenticated.status(), 401);
@@ -164,7 +163,12 @@ async fn api_key_runs_an_agent_and_revocation_locks_it_out() {
     assert!(body.contains("Hi there"));
     assert!(!body.contains("$enc"));
 
-    api_key(&data_dir, &["revoke", &id]);
+    let revoke = client
+        .delete(format!("{device_base}/api-keys/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(revoke.status().is_success(), "{}", revoke.status());
     let revoked = client
         .get(format!("{base}/me"))
         .bearer_auth(&key)

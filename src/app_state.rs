@@ -52,6 +52,9 @@ pub struct AppState {
     pub(crate) history_keys: HistoryKeys,
     /// Keys of the external API listener; see [`crate::api_keys`].
     pub(crate) api_keys: ApiKeyStore,
+    /// Agent calling scope, MCP entry and API listener status; see
+    /// [`crate::agent_calls`].
+    pub(crate) agent_calling: crate::agent_calls::AgentCallingStore,
     /// Saved history cleanup policies; see [`crate::history_cleanup`].
     pub(crate) history_cleanup: crate::history_cleanup::HistoryCleanup,
     /// Claude Code and Pi native sessions; see [`crate::native_history`].
@@ -128,6 +131,8 @@ impl AppState {
             config.security.enable_auth.then(|| devices.clone()),
         )?;
         let api_keys = ApiKeyStore::load(&config.data_dir)?;
+        let agent_calling =
+            crate::agent_calls::AgentCallingStore::load(&config.data_dir, &config.api).await?;
         let history_cleanup = crate::history_cleanup::HistoryCleanup::load(&config.data_dir);
         let native_history = crate::native_history::NativeHistory::new(
             &config.data_dir,
@@ -154,10 +159,11 @@ impl AppState {
         .with_quota(quota.clone())
         .with_agent_mcp(agent_mcp.clone());
         conversations.set_permission_policy(std::sync::Arc::new(
-            crate::server::api::ApiKeyPermissionPolicy {
-                state_conversations: conversation_store.clone(),
-                keys: api_keys.clone(),
-            },
+            crate::agent_calls::CompositePermissionPolicy::for_daemon(
+                conversation_store.clone(),
+                api_keys.clone(),
+                agent_calling.clone(),
+            ),
         ));
         conversations.recover_all().await?;
         let local_terminals = LocalTerminalManager::new(events.clone());
@@ -193,6 +199,7 @@ impl AppState {
             device_pairing,
             history_keys,
             api_keys,
+            agent_calling,
             history_cleanup,
             native_history,
             api_auth_failures: Default::default(),

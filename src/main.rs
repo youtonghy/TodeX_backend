@@ -1,8 +1,8 @@
 mod agent_browser;
+mod agent_calls;
 mod agent_desktop;
 mod agent_mcp;
 mod agent_providers;
-mod api_key_cli;
 mod api_keys;
 mod app_state;
 mod autostart;
@@ -90,11 +90,6 @@ enum Command {
     Browser {
         #[command(subcommand)]
         command: BrowserCommand,
-    },
-    #[command(about = "Manage API keys of the external API listener ([api])")]
-    ApiKey {
-        #[command(subcommand)]
-        command: api_key_cli::ApiKeyCommand,
     },
     #[command(name = "daemon-run", hide = true)]
     DaemonRun(ServeArgs),
@@ -222,7 +217,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             daemon_command(command).await
         }
         Command::Doctor { command } => doctor_command(command).await,
-        Command::ApiKey { command } => api_key_cli::run(command),
         Command::Browser {
             command: BrowserCommand::Install { data_dir },
         } => {

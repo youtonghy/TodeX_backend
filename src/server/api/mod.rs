@@ -2,12 +2,12 @@
 //! authenticated with API keys (`Authorization: Bearer tdx_…`). It shares
 //! the daemon's `AppState` with the device listener, so conversations run
 //! on the same supervisor; each key owns its conversations as
-//! `apikey:<id>`. See docs/API.md ("外部 API").
+//! `apikey:<id>`. The handlers are thin adapters over the shared call layer
+//! [`crate::agent_calls`], which also applies the global agent scope. See
+//! docs/API.md ("外部 API").
 mod auth;
 mod conversations;
 mod stream;
-
-use std::sync::Arc;
 
 use axum::{
     extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
@@ -17,44 +17,21 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::trace::TraceLayer;
-use zeroize::Zeroizing;
 
-use crate::api_keys::{ApiKeyRecord, ApprovalPolicy};
+use crate::agent_calls::{self, ApiKeyCaller};
 use crate::app_state::AppState;
 use crate::conversation::{ConversationManifest, ProviderKind};
 use crate::error::AppError;
-use crate::provider::{PermissionDecision, PermissionOutcome, PermissionPolicy};
 use crate::workspace_paths::validate_workspace_directory_text;
 
+#[cfg(test)]
+use crate::{
+    agent_calls::ApiKeyPermissionPolicy, api_keys::ApprovalPolicy, provider::PermissionPolicy,
+};
 pub(crate) use auth::AuthFailures;
 
 /// Request bodies are prompt text and small JSON objects.
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
-
-/// The key a request authenticated with, and the history recipient seed
-/// its secret derives; see [`crate::conversation::server_decrypt`].
-#[derive(Clone)]
-pub(crate) struct ApiKeyContext {
-    pub record: ApiKeyRecord,
-    pub seed: Arc<Zeroizing<[u8; 32]>>,
-}
-
-impl ApiKeyContext {
-    pub(crate) fn owner_id(&self) -> String {
-        self.record.owner_id()
-    }
-
-    fn ensure_agent(&self, agent: ProviderKind) -> Result<(), AppError> {
-        if self.record.scopes.allows_agent(agent) {
-            Ok(())
-        } else {
-            Err(AppError::Unauthorized(format!(
-                "agent {} is outside this API key's scope",
-                agent.as_str()
-            )))
-        }
-    }
-}
 
 pub(crate) fn api_router(state: AppState) -> Router {
     let authenticated = Router::new()
@@ -79,21 +56,15 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "version": crate::version::APP_VERSION }))
 }
 
-async fn me(Extension(key): Extension<ApiKeyContext>) -> Json<Value> {
+async fn me(Extension(key): Extension<ApiKeyCaller>) -> Json<Value> {
     Json(key.record.summary())
 }
 
 async fn agents(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
 ) -> Json<Value> {
-    let agents = state
-        .conversations
-        .providers_snapshot()
-        .await
-        .into_iter()
-        .filter(|snapshot| key.record.scopes.allows_agent(snapshot.id))
-        .collect::<Vec<_>>();
+    let agents = agent_calls::list_agents(&state, &key).await;
     Json(json!({ "agents": agents }))
 }
 
@@ -104,21 +75,19 @@ struct WorkspaceQuery {
 
 async fn agent_models(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
     AxumPath(agent): AxumPath<String>,
     Query(query): Query<WorkspaceQuery>,
 ) -> Result<Json<Value>, AppError> {
     let agent = parse_agent(&agent)?;
-    key.ensure_agent(agent)?;
-    let workspace = authorize_workspace(&state, &key, &query.workspace).await?;
-    let models = state.conversations.models_live(agent, &workspace).await?;
+    let models = agent_calls::models(&state, &key, agent, Some(&query.workspace)).await?;
     Ok(Json(json!({ "agent": agent, "models": models })))
 }
 
 /// The configured roots narrowed by the key's workspace scope.
 async fn workspaces(
     State(state): State<AppState>,
-    Extension(key): Extension<ApiKeyContext>,
+    Extension(key): Extension<ApiKeyCaller>,
 ) -> Json<Value> {
     let roots = &state.config.workspace_roots;
     let workspaces = match &key.record.scopes.workspaces {
@@ -139,22 +108,6 @@ async fn workspaces(
 
 fn parse_agent(agent: &str) -> Result<ProviderKind, AppError> {
     agent.parse().map_err(AppError::InvalidRequest)
-}
-
-/// The canonical `workspace` if this key may run agents in it: the path
-/// must be inside a workspace root and the key's scope.
-async fn authorize_workspace(
-    state: &AppState,
-    key: &ApiKeyContext,
-    workspace: &str,
-) -> Result<std::path::PathBuf, AppError> {
-    let workspace = validate_workspace_directory_text(&state.config.workspace_roots, workspace)?;
-    if !key.record.scopes.allows_workspace(&workspace) {
-        return Err(AppError::Unauthorized(
-            "workspace is outside this API key's scope".to_owned(),
-        ));
-    }
-    Ok(workspace)
 }
 
 /// A manifest as the API returns it: the title decrypted for the key.
@@ -207,8 +160,8 @@ pub(crate) async fn cancel_inactive_key_turns(state: &AppState) {
     }
 }
 
-/// Every few seconds: revocations made by the CLI or TUI reach the daemon
-/// only through `api-keys.json`.
+/// Every few seconds: keys that expire, or are revoked by another process,
+/// reach the daemon only through `api-keys.json`.
 pub(crate) fn spawn_revocation_watch(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -219,62 +172,8 @@ pub(crate) fn spawn_revocation_watch(state: AppState) -> tokio::task::JoinHandle
     })
 }
 
-/// Answers permission requests of API key conversations whose key is set
-/// to `auto-approve` or `reject`.
-pub(crate) struct ApiKeyPermissionPolicy {
-    pub state_conversations: crate::conversation::ConversationStore,
-    pub keys: crate::api_keys::ApiKeyStore,
-}
-
-#[async_trait::async_trait]
-impl PermissionPolicy for ApiKeyPermissionPolicy {
-    async fn decide(
-        &self,
-        conversation_id: &str,
-        options: &Value,
-        device_bound: bool,
-    ) -> Option<(PermissionDecision, String)> {
-        let manifest = self.state_conversations.get(conversation_id).await.ok()?;
-        let id = manifest
-            .owner_id
-            .strip_prefix(crate::api_keys::OWNER_PREFIX)?;
-        let record = self.keys.get(id).ok().flatten()?;
-        let wanted: &[PermissionOutcome] = match (record.approval, device_bound) {
-            (ApprovalPolicy::Ask, _) => return None,
-            // A device-bound request is never approved on a key's behalf.
-            (ApprovalPolicy::AutoApprove, false) => &[PermissionOutcome::AllowOnce],
-            (ApprovalPolicy::AutoApprove, true) | (ApprovalPolicy::Reject, _) => &[
-                PermissionOutcome::RejectOnce,
-                PermissionOutcome::RejectAlways,
-                PermissionOutcome::AbortTurn,
-            ],
-        };
-        let options = options.as_array()?;
-        let (outcome, option_id) = wanted.iter().find_map(|outcome| {
-            options
-                .iter()
-                .find(|option| option.get("kind").and_then(Value::as_str) == Some(outcome.as_str()))
-                .map(|option| {
-                    (
-                        *outcome,
-                        option
-                            .get("optionId")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned),
-                    )
-                })
-        })?;
-        Some((
-            PermissionDecision {
-                outcome,
-                option_id,
-                data: None,
-            },
-            format!("apikey-policy:{id}"),
-        ))
-    }
-}
-
 // The fixture runs a Python script as the provider executable.
+#[cfg(all(test, unix))]
+mod scope_tests;
 #[cfg(all(test, unix))]
 mod tests;
