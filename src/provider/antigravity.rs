@@ -433,6 +433,9 @@ impl ProviderDriver for AntigravityDriver {
             spec.push_flag_value("--add-dir", &staged.to_string_lossy())?;
             prompt.text = image_prompt(&prompt.text, &images);
         }
+        if let Some(uploads) = crate::prompt_uploads::readable_root().await {
+            spec.push_flag_value("--add-dir", &uploads.to_string_lossy())?;
+        }
         // `-p` takes a value and would swallow the next flag; the prompt
         // arrives on stdin, so the flag closes the argument list empty.
         spec.args.push("-p=".to_owned());

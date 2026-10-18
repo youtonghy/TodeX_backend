@@ -3324,6 +3324,14 @@ async fn prepare_prompt_content_hashed(
             }
             PromptContentRef::LocalImage { path } => {
                 let path = canonical_workspace_file(&workspace, path).await?;
+                // An uploaded image is also named by its path, so the agent
+                // can work with the file and not only look at it; agy names
+                // every image itself.
+                if provider != ProviderKind::Antigravity
+                    && crate::prompt_uploads::contains(&path).await
+                {
+                    text.push(format!("Attached image: {}", path.display()));
+                }
                 let file_bytes =
                     usize::try_from(tokio::fs::metadata(&path).await?.len()).unwrap_or(usize::MAX);
                 ensure_image_budget(image_bytes.saturating_add(file_bytes))?;
@@ -3388,6 +3396,8 @@ async fn prepare_prompt_content_hashed(
     Ok((text.join("\n\n"), driver_content, hashes))
 }
 
+/// `path` canonicalized, when it is a regular file inside `workspace` or
+/// the prompt upload directory.
 async fn canonical_workspace_file(workspace: &Path, path: PathBuf) -> Result<PathBuf, AppError> {
     let candidate = if path.is_absolute() {
         path
@@ -3400,7 +3410,9 @@ async fn canonical_workspace_file(workspace: &Path, path: PathBuf) -> Result<Pat
             candidate.display()
         ))
     })?;
-    if !canonical.starts_with(workspace) {
+    // Files uploaded with the prompt live outside the workspace, in the
+    // upload directory the drivers let the agents read.
+    if !canonical.starts_with(workspace) && !crate::prompt_uploads::contains(&canonical).await {
         return Err(AppError::InvalidRequest(
             "prompt files must stay inside the trusted workspace".to_owned(),
         ));
@@ -7351,6 +7363,70 @@ done
         .await
         .expect_err("files outside the trusted workspace must be rejected");
         assert!(error.to_string().contains("trusted workspace"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn prompt_content_may_name_uploaded_files() {
+        let root = temp_dir("todex-prompt-uploads");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let uploads = crate::prompt_uploads::upload_root();
+        let file = crate::prompt_uploads::write_chunk(&uploads, None, "notes.md", 0, b"# notes")
+            .await
+            .unwrap();
+        let image = crate::prompt_uploads::write_chunk(&uploads, None, "shot.png", 0, b"png")
+            .await
+            .unwrap();
+
+        let (text, content) = prepare_prompt_content(
+            ProviderKind::ClaudeCode,
+            &workspace,
+            vec![
+                PromptContentRef::File {
+                    path: file.path.clone(),
+                    name: None,
+                },
+                PromptContentRef::LocalImage {
+                    path: image.path.clone(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        let file_path = fs::canonicalize(&file.path).unwrap();
+        let image_path = fs::canonicalize(&image.path).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "Attached file: @{}\n\nAttached image: {}",
+                file_path.display(),
+                image_path.display()
+            )
+        );
+        assert!(matches!(
+            content.as_slice(),
+            [
+                DriverPromptContent::File { .. },
+                DriverPromptContent::Image { path: Some(_), .. }
+            ]
+        ));
+
+        // A path that climbs back out of the upload directory is refused.
+        let error = prepare_prompt_content(
+            ProviderKind::Codex,
+            &workspace,
+            vec![PromptContentRef::File {
+                path: uploads.join(&file.upload_id).join("..").join(".."),
+                name: None,
+            }],
+        )
+        .await
+        .expect_err("paths that leave the upload directory must be rejected");
+        assert!(error.to_string().contains("trusted workspace"));
+
+        let _ = fs::remove_dir_all(uploads.join(&file.upload_id));
+        let _ = fs::remove_dir_all(uploads.join(&image.upload_id));
         let _ = fs::remove_dir_all(root);
     }
 

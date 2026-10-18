@@ -749,6 +749,11 @@ async fn claude_launch_spec(
         spec.args
             .extend(super::mcp_injection::claude_args(launch).await?);
     }
+    // Files uploaded with a prompt sit outside the workspace; without this
+    // Claude asks before every read of them.
+    if let Some(uploads) = crate::prompt_uploads::readable_root().await {
+        spec.push_flag_value("--add-dir", &uploads.to_string_lossy())?;
+    }
     Ok((spec, requested_session_id))
 }
 

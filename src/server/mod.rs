@@ -21,6 +21,7 @@ mod sealed;
 mod ssh;
 #[cfg(test)]
 mod transport_v2_tests;
+mod uploads;
 mod v2;
 pub(crate) mod websocket;
 mod ws;

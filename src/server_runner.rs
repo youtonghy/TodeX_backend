@@ -23,6 +23,8 @@ pub struct ManagedServer {
     retention_task: Option<JoinHandle<()>>,
     /// Applies the tenants' saved history cleanup policies.
     history_cleanup_task: Option<JoinHandle<()>>,
+    /// Removes expired prompt uploads.
+    upload_cleanup_task: Option<JoinHandle<()>>,
     /// Runs due kanban task schedules.
     kanban_schedule_task: Option<JoinHandle<()>>,
     migration_task: Option<JoinHandle<()>>,
@@ -124,6 +126,7 @@ impl ManagedServer {
             })
         });
         let history_cleanup_task = Some(crate::history_cleanup::spawn(state.clone()));
+        let upload_cleanup_task = Some(crate::prompt_uploads::spawn_cleanup());
         let app = server::router(state.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -219,6 +222,7 @@ impl ManagedServer {
             exited,
             retention_task,
             history_cleanup_task,
+            upload_cleanup_task,
             kanban_schedule_task,
             migration_task,
             maintenance_task,
@@ -293,6 +297,9 @@ impl ManagedServer {
         if let Some(task) = self.history_cleanup_task.take() {
             task.abort();
         }
+        if let Some(task) = self.upload_cleanup_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.kanban_schedule_task.take() {
             task.abort();
         }
@@ -318,6 +325,9 @@ impl ManagedServer {
             task.abort();
         }
         if let Some(task) = self.history_cleanup_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.upload_cleanup_task.take() {
             task.abort();
         }
         if let Some(task) = self.kanban_schedule_task.take() {

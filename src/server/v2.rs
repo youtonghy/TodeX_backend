@@ -417,6 +417,7 @@ fn authenticated_routes() -> Router<AppState> {
         .merge(super::ssh::routes())
         .merge(super::agent_desktop::routes())
         .merge(super::remote::routes())
+        .merge(super::uploads::routes())
         .route(
             "/v2/conversations/{conversation_id}/runtime/stop",
             post(stop_provider_runtime),

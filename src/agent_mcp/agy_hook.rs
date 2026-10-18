@@ -255,11 +255,15 @@ async fn decide(
 const PATH_READ_TOOLS: &[&str] = &["view_file", "list_dir", "grep_search", "find_by_name"];
 
 /// Where reads need no prompt: the conversation's workspace, the images
-/// TodeX staged for it (`attachments`), agy's bundled docs
+/// TodeX staged for it (`attachments`), the prompt uploads, agy's bundled docs
 /// (`~/.gemini/antigravity-cli/builtin`), and this conversation's artifact
 /// directory when it lies under agy's `brain` directory.
 fn read_roots(workspace: &Path, attachments: PathBuf, payload: &Value) -> Vec<PathBuf> {
-    let mut roots = vec![workspace.to_path_buf(), attachments];
+    let mut roots = vec![
+        workspace.to_path_buf(),
+        attachments,
+        crate::prompt_uploads::upload_root(),
+    ];
     if let Some(gemini) = crate::provider::antigravity::integration_dir().parent() {
         let cli = gemini.join("antigravity-cli");
         roots.push(cli.join("builtin"));
