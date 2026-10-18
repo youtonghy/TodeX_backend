@@ -69,6 +69,9 @@ const QUIET_CHECK: Duration = Duration::from_millis(300);
 const END_GRACE: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const END_GRACE: Duration = Duration::from_millis(300);
+/// How long a monitor waits, after a turn's end, for the supervisor to
+/// release the child before it settles the call anyway.
+const RELEASE_WAIT: Duration = Duration::from_secs(5);
 /// `error.code` of a call whose turn ended without its end reaching the
 /// monitor.
 const TURN_END_UNOBSERVED: &str = "TURN_END_UNOBSERVED";
@@ -687,6 +690,15 @@ impl Inner {
         };
         // Nothing more is read for this turn: stop tapping.
         drop(events);
+        // The supervisor journals the end before it releases the child, so
+        // a result read in between would be refused a follow-up turn
+        // (CONFLICT). Settle the call once the child is free.
+        let release_by = tokio::time::Instant::now() + RELEASE_WAIT;
+        while self.supervisor.active_turn_id(&child_id).as_deref() == Some(turn.turn_id.as_str())
+            && tokio::time::Instant::now() < release_by
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let (status, error) = match &ended {
             Ended::Terminal(event) => {
                 let status = CallStatus::from_terminal(&event.event_type);
