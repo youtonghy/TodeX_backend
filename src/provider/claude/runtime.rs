@@ -1141,6 +1141,8 @@ while IFS= read -r line; do
         rm -f "$dir/finish-bg"
         printf '{"type":"system","subtype":"task_notification","task_id":"bg-1","status":"completed","task_type":"local_bash","summary":"Background command x completed (exit code 0)"}\n'
         printf '{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n'
+        # Claude dequeues the notification a moment later.
+        sleep 0.1
         printf '{"type":"system","subtype":"session_state_changed","state":"running"}\n'
         printf '{"type":"system","subtype":"init"}\n'
         printf '{"type":"assistant","message":{"content":[{"type":"text","text":"own work done"}]}}\n'

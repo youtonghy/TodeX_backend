@@ -17,6 +17,10 @@ use tokio::time::{Duration, Instant};
 const WAKEUP_GRACE: Duration = Duration::from_secs(2 * 60);
 /// A wakeup this close to due counts as the trigger of new work.
 const WAKEUP_DUE_WINDOW: Duration = Duration::from_secs(2 * 60);
+/// How long a finished task keeps the process for the invocation Claude
+/// starts on it: Claude dequeues the notification moments later, by which
+/// time the keepalive may long have passed.
+const FOLLOW_UP_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
 pub(super) struct SessionWork {
@@ -29,6 +33,8 @@ pub(super) struct SessionWork {
     cron: bool,
     /// Tasks that finished since the last turn, as `triggerDetail` parts.
     finished: Vec<Value>,
+    /// When the last of `finished` did.
+    finished_at: Option<Instant>,
     /// `ScheduleWakeup` calls awaiting their result: tool use id → the
     /// requested delay, or `None` for a `stop`.
     scheduling: HashMap<String, Option<u64>>,
@@ -75,6 +81,7 @@ impl SessionWork {
                     "status": text("status"),
                     "summary": text("summary"),
                 }));
+                self.finished_at = Some(Instant::now());
             }
             Some("background_tasks_changed") => {
                 // Every live background task after the change.
@@ -151,10 +158,18 @@ impl SessionWork {
         if !self.live.is_empty() || self.cron {
             return Some(cap);
         }
+        // A finished task's follow-up has not started yet.
+        let follow_up = self
+            .finished_at
+            .filter(|_| !self.finished.is_empty())
+            .map(|at| at + FOLLOW_UP_GRACE)
+            .filter(|until| *until > now);
         self.wakeups
             .iter()
+            .map(|due| *due + WAKEUP_GRACE)
+            .chain(follow_up)
             .max()
-            .map(|due| (*due + WAKEUP_GRACE).min(cap))
+            .map(|until| until.min(cap))
     }
 
     /// Whether anything keeps the process beyond the keepalive.
@@ -257,7 +272,10 @@ mod tests {
         ));
         work.apply_system(&system("background_tasks_changed", json!({ "tasks": [] })));
         assert!(!work.pending());
-        assert_eq!(work.hold_until(now, cap), None);
+        // Held just long enough for the follow-up Claude starts on it.
+        let finished = work.finished_at.unwrap();
+        assert_eq!(work.hold_until(now, cap), Some(finished + FOLLOW_UP_GRACE));
+        assert_eq!(work.hold_until(finished + FOLLOW_UP_GRACE, cap), None);
         assert_eq!(
             work.trigger(now),
             json!({ "kind": "background_task", "taskIds": ["b74"], "taskType": "local_bash",
