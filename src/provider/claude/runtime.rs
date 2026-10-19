@@ -25,8 +25,8 @@ use crate::error::AppError;
 
 use super::super::process::JsonLineProcess;
 use super::super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ProviderPrewarm, ProviderWork,
-    ProviderWorkHandle,
+    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, LostWork, ProviderPrewarm,
+    ProviderWork, ProviderWorkHandle,
 };
 use super::session_work::SessionWork;
 use super::{Catalogs, TurnStart};
@@ -46,6 +46,9 @@ const ADOPT_TIMEOUT: Duration = if cfg!(test) {
 /// The longest background work keeps a process past its keepalive, counted
 /// from the end of its last turn: a backgrounded server never finishes.
 const MAX_BACKGROUND_HOLD: Duration = Duration::from_secs(6 * 3600);
+/// How long a stopping worker waits for the loss of its background work to
+/// be journalled.
+const REPORT_LOST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Everything a turn needs to start Claude.
 #[derive(Clone)]
@@ -108,6 +111,14 @@ impl Stop {
     /// session on a new one.
     fn retry(self) -> bool {
         self != Self::Stopped
+    }
+
+    /// The [`LostWork`] reason when this stop takes background work along.
+    fn lost_reason(self) -> &'static str {
+        match self {
+            Self::Evicted => "evicted",
+            Self::Running | Self::Stopped => "stopped",
+        }
     }
 }
 
@@ -538,22 +549,51 @@ impl Live {
     }
 
     /// Asks the supervisor for a turn to take over the invocation Claude
-    /// just started; returns the adoption token, or `None` when no turn can
-    /// be opened.
-    fn offer_work(&mut self) -> Option<String> {
+    /// just started; returns the adoption token and the background tasks
+    /// that invocation hands back, or `None` when no turn can be opened.
+    fn offer_work(&mut self) -> Option<(String, Vec<String>)> {
         let (handle, settings) = self.provider_work.clone()?;
         let adoption = uuid::Uuid::new_v4().simple().to_string();
+        let trigger = self.work.trigger(Instant::now());
+        let tasks = trigger
+            .get("taskIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
         let work = ProviderWork {
             adoption: adoption.clone(),
             settings,
-            trigger: self.work.trigger(Instant::now()),
+            trigger,
         };
         tokio::spawn(async move {
             if let Err(error) = handle.start(work).await {
                 tracing::warn!(%error, "could not open a turn for Claude Code's own work");
             }
         });
-        Some(adoption)
+        Some((adoption, tasks))
+    }
+
+    /// Stops the process and journals the background work it took along
+    /// (plus `handed_back`, tasks whose follow-up nobody took over yet).
+    async fn terminate(mut self, handed_back: Vec<String>, reason: &'static str) {
+        let mut task_ids = self.work.task_ids();
+        task_ids.extend(handed_back);
+        task_ids.sort();
+        task_ids.dedup();
+        self.process.terminate().await;
+        let Some((handle, _)) = self.provider_work.filter(|_| !task_ids.is_empty()) else {
+            return;
+        };
+        let lost = handle.lost(LostWork { task_ids, reason });
+        if tokio::time::timeout(REPORT_LOST_TIMEOUT, lost)
+            .await
+            .is_err()
+        {
+            tracing::warn!("journalling Claude Code's lost background work timed out");
+        }
     }
 }
 
@@ -630,14 +670,20 @@ async fn worker(
     let mut turn_ended = Instant::now();
     let mut idle_at = turn_ended + idle_timeout;
     // Work Claude started on its own, waiting for the supervisor's turn: the
-    // adoption token and when to give up. Its frames stay unread meanwhile.
-    let mut awaiting: Option<(String, Instant)> = None;
+    // adoption token, when to give up, and the tasks it hands back. Its
+    // frames stay unread meanwhile.
+    let mut awaiting: Option<(String, Instant, Vec<String>)> = None;
+    // Why the loop ended, should background work go with the process.
+    let mut reason = "stopped";
     loop {
         // Biased: a requested stop wins, then a waiting turn; the deadlines
         // only fire when nothing else is ready.
         let next = tokio::select! {
             biased;
-            _ = shutdown.changed() => Next::Stop,
+            _ = shutdown.changed() => {
+                reason = shutdown.borrow().lost_reason();
+                Next::Stop
+            }
             turn = turns.recv() => match turn { Some(turn) => Next::Request(turn), None => Next::Stop },
             between = async {
                 match (live.as_mut(), &awaiting) {
@@ -647,12 +693,16 @@ async fn worker(
             } => Next::Between(between),
             _ = async {
                 match &awaiting {
-                    Some((_, deadline)) => tokio::time::sleep_until(*deadline).await,
+                    Some((_, deadline, _)) => tokio::time::sleep_until(*deadline).await,
                     None => tokio::time::sleep_until(idle_at).await,
                 }
             } => {
                 if awaiting.is_some() {
                     tracing::warn!("no turn took over Claude Code's own work; restarting its process");
+                    reason = "not_adopted";
+                } else {
+                    // Work still held at the idle deadline outlived its cap.
+                    reason = "expired";
                 }
                 Next::Stop
             }
@@ -660,7 +710,10 @@ async fn worker(
         let turn = match next {
             Next::Stop => break,
             Next::Request(request) => request,
-            Next::Between(Ended::Retire) => break,
+            Next::Between(Ended::Retire) => {
+                reason = "process_ended";
+                break;
+            }
             Next::Between(Ended::Reusable) => {
                 // A background task may have started or ended.
                 if let Some(live) = live.as_mut() {
@@ -671,14 +724,15 @@ async fn worker(
             }
             Next::Between(Ended::Unsolicited) => {
                 let offered = live.as_mut().and_then(Live::offer_work);
-                let Some(adoption) = offered else {
+                let Some((adoption, tasks)) = offered else {
                     tracing::warn!(
                         "Claude Code started work between turns; restarting its process"
                     );
+                    reason = "not_adopted";
                     break;
                 };
                 mark_background(&activity, true);
-                awaiting = Some((adoption, Instant::now() + ADOPT_TIMEOUT));
+                awaiting = Some((adoption, Instant::now() + ADOPT_TIMEOUT, tasks));
                 continue;
             }
         };
@@ -716,6 +770,7 @@ async fn worker(
                     } => started,
                     _ = shutdown.changed() => {
                         let _ = reply.send(Err(AppError::TurnCancelled));
+                        reason = shutdown.borrow().lost_reason();
                         break;
                     }
                 };
@@ -740,7 +795,7 @@ async fn worker(
             mut cancel,
         } = run;
         let mut start = match (&context.handles.adopt, &awaiting) {
-            (Some(token), Some((expected, _))) if token == expected && live.is_some() => {
+            (Some(token), Some((expected, _, _))) if token == expected && live.is_some() => {
                 TurnStart::Adopt
             }
             // The work it was opened for is gone (the process restarted or
@@ -756,7 +811,12 @@ async fn worker(
             (None, None) => TurnStart::Prompt,
         };
         let adopt = start == TurnStart::Adopt;
-        awaiting = None;
+        // Tasks Claude was about to report on: this turn reads that report,
+        // unless the process goes first.
+        let handed_back = awaiting
+            .take()
+            .map(|(_, _, tasks)| tasks)
+            .unwrap_or_default();
         // Cancelled while it waited in the queue: it never reaches Claude.
         if *cancel.borrow() {
             let session_id = super::claude_session_id(&context);
@@ -772,10 +832,10 @@ async fn worker(
             }
         };
         // An adopted invocation runs on the process that started it.
-        if let Some(mut stale) = live.take_if(|live| !adopt && live.key != key) {
+        if let Some(stale) = live.take_if(|live| !adopt && live.key != key) {
             // Never two processes on one transcript: the old one is gone
             // before the new one resumes it, Claude's own work with it.
-            stale.process.terminate().await;
+            stale.terminate(handed_back, "settings_changed").await;
             start = TurnStart::Prompt;
         }
         let session_id = live.as_ref().filter(|_| adopt).map_or_else(
@@ -839,10 +899,14 @@ async fn worker(
             _ = reply.closed() => None,
             _ = shutdown.changed() => {
                 let _ = reply.send(Reply::Finished(Err(AppError::TurnCancelled)));
+                reason = shutdown.borrow().lost_reason();
                 break;
             }
         };
-        let Some(outcome) = outcome else { break };
+        let Some(outcome) = outcome else {
+            reason = "turn_ended";
+            break;
+        };
         let (outcome, ended) = match outcome {
             // Cancelled before its prompt was sent: the process is idle.
             Ok(None) => (Ok(cancelled_before_start(session_id)), Ended::Reusable),
@@ -858,13 +922,17 @@ async fn worker(
             (Ended::Retire, Some(live)) if cancelled => {
                 tokio::select! {
                     biased;
-                    _ = shutdown.changed() => break,
+                    _ = shutdown.changed() => {
+                        reason = shutdown.borrow().lost_reason();
+                        break;
+                    }
                     ended = interrupt(&mut live.process) => ended,
                 }
             }
             (ended, _) => ended,
         };
         if matches!(ended, Ended::Retire) {
+            reason = "turn_ended";
             break;
         }
         // Done with the turn, interrupt included: the worker may be idle.
@@ -877,8 +945,9 @@ async fn worker(
         drop(pending);
     }
     turns.close();
-    if let Some(mut live) = live {
-        live.process.terminate().await;
+    if let Some(live) = live {
+        let handed_back = awaiting.map(|(_, _, tasks)| tasks).unwrap_or_default();
+        live.terminate(handed_back, reason).await;
     }
     // A turn queued before the close never reached Claude: hand it back,
     // after the process is gone, so the caller can reopen the session
@@ -1530,6 +1599,18 @@ done
         (handle, received)
     }
 
+    /// `handle`, recording the background work it is told was lost.
+    fn recording_losses(
+        handle: ProviderWorkHandle,
+    ) -> (ProviderWorkHandle, mpsc::UnboundedReceiver<LostWork>) {
+        let (losses, received) = mpsc::unbounded_channel();
+        let handle = handle.with_lost(move |lost| {
+            let _ = losses.send(lost);
+            Box::pin(async {})
+        });
+        (handle, received)
+    }
+
     fn offering(handle: &ProviderWorkHandle) -> TurnHandles {
         TurnHandles {
             provider_work: Some(handle.clone()),
@@ -1645,6 +1726,77 @@ done
                 .is_ok_and(|table| table.workers.values().all(Worker::stopping))
         })
         .await;
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn work_a_restart_takes_along_is_reported_lost() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let (handle, _offers) = recorded_offers();
+        let (handle, mut losses) = recording_losses(handle);
+        fixture
+            .turn_with(&sessions, &manifest, "background", offering(&handle))
+            .await;
+        // A new model needs a new process, which ends the running task.
+        let (_cancel, cancel) = watch::channel(false);
+        fixture
+            .run_with(
+                &sessions,
+                &manifest,
+                "plain",
+                Some("haiku"),
+                cancel,
+                offering(&handle),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            losses.try_recv().unwrap(),
+            LostWork {
+                task_ids: vec!["bg-1".to_owned()],
+                reason: "settings_changed"
+            }
+        );
+
+        // The new process holds no work: stopping it loses nothing.
+        sessions.stop(&manifest.id).await;
+        assert!(losses.try_recv().is_err());
+
+        fixture
+            .turn_with(&sessions, &manifest, "background", offering(&handle))
+            .await;
+        sessions.stop(&manifest.id).await;
+        assert_eq!(
+            losses.try_recv().unwrap(),
+            LostWork {
+                task_ids: vec!["bg-1".to_owned()],
+                reason: "stopped"
+            }
+        );
+        sessions.stop_all().await;
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn work_handed_back_is_not_reported_lost() {
+        let fixture = Fixture::new().await;
+        let sessions = sessions(16);
+        let manifest = fixture.conversation().await;
+        let (handle, mut offers) = recorded_offers();
+        let (handle, mut losses) = recording_losses(handle);
+        fixture
+            .turn_with(&sessions, &manifest, "background", offering(&handle))
+            .await;
+        fixture.finish_background();
+        let work = next_offer(&mut offers).await;
+        fixture
+            .turn_with(&sessions, &manifest, "unused", adopting(&work.adoption))
+            .await;
+        sessions.stop(&manifest.id).await;
+        assert!(losses.try_recv().is_err());
         sessions.stop_all().await;
         cleanup(&fixture.root);
     }

@@ -110,6 +110,9 @@ pub struct RecoveryFacts {
     pub resident_runtimes: Vec<String>,
     /// Permission dialogs requested and never resolved, by id.
     pub pending_permissions: Vec<(String, PermissionContext)>,
+    /// A turn ended leaving background tasks clients wait on, and nothing
+    /// since started a turn or reported them gone.
+    pub background_pending: bool,
 }
 
 /// The status fold as a function of the status the range starts from, so
@@ -246,6 +249,30 @@ pub struct JournalDigest {
     /// Last state per permission id: `Some` requested, `None` resolved.
     /// Resolved ids stay as tombstones so a later range can be merged in.
     permissions: BTreeMap<String, Option<PermissionContext>>,
+    /// Whether the newest `background_tasks_pending` notice still stands;
+    /// `None` when the range holds neither a notice nor an event that
+    /// settles one (see [`background_pending_after`]).
+    #[serde(default)]
+    background_pending: Option<bool>,
+}
+
+/// How `event` changes whether background tasks a turn left behind are
+/// still awaited: a `background_tasks_pending` notice sets it; a new turn,
+/// a `background_tasks_ended` notice, or a turn or conversation ending in
+/// anything but `turn.completed` clears it (clients drop the tasks there).
+fn background_pending_after(event: &ConversationEvent) -> Option<bool> {
+    let event_type = event.event_type.as_str();
+    match (event_type, event.raw_type.as_deref()) {
+        ("provider.event", Some("background_tasks_pending")) => Some(true),
+        ("provider.event", Some("background_tasks_ended")) | ("turn.started", _) => Some(false),
+        ("turn.completed", _) => None,
+        _ if TURN_TERMINAL_EVENTS.contains(&event_type)
+            || CONVERSATION_TERMINAL_EVENTS.contains(&event_type) =>
+        {
+            Some(false)
+        }
+        _ => None,
+    }
 }
 
 impl JournalDigest {
@@ -268,6 +295,9 @@ impl JournalDigest {
         self.last_time = Some(event.time);
         self.status.apply(event);
         self.open_turn.apply(event_type, turn_id);
+        if let Some(pending) = background_pending_after(event) {
+            self.background_pending = Some(pending);
+        }
         match event_type {
             "message.created" => {
                 if text("role") == Some("user") {
@@ -394,6 +424,7 @@ impl JournalDigest {
         self.open_turn.merge(later.open_turn);
         self.runtimes.extend(later.runtimes);
         self.permissions.extend(later.permissions);
+        self.background_pending = later.background_pending.or(self.background_pending);
     }
 
     pub fn last_sequence(&self) -> u64 {
@@ -462,6 +493,7 @@ impl JournalDigest {
                 .iter()
                 .filter_map(|(id, context)| Some((id.clone(), context.clone()?)))
                 .collect(),
+            background_pending: self.background_pending == Some(true),
         }
     }
 }
@@ -526,6 +558,34 @@ pub(crate) mod tests {
             }
         }
         (expired, resident_runtimes)
+    }
+
+    /// Whether the last `background_tasks_pending` came after every new
+    /// turn, `background_tasks_ended` and non-completed ending.
+    fn reference_background_pending(history: &[ConversationEvent]) -> bool {
+        let method = |event: &ConversationEvent| {
+            event
+                .payload
+                .get("providerMethod")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let settles = |event: &ConversationEvent| {
+            let kind = event.event_type.as_str();
+            kind == "turn.started"
+                || (kind == "provider.event"
+                    && method(event).as_deref() == Some("background_tasks_ended"))
+                || (kind != "turn.completed"
+                    && (TURN_TERMINAL_EVENTS.contains(&kind)
+                        || CONVERSATION_TERMINAL_EVENTS.contains(&kind)))
+        };
+        history
+            .iter()
+            .rposition(|event| {
+                event.event_type == "provider.event"
+                    && method(event).as_deref() == Some("background_tasks_pending")
+            })
+            .is_some_and(|notice| !history[notice + 1..].iter().any(settles))
     }
 
     fn reference_prompt_previous(history: &[ConversationEvent], id: &str) -> Option<u64> {
@@ -640,6 +700,10 @@ pub(crate) mod tests {
         }
         assert_eq!(digest.open_turn(), reference_open_turn(history).as_deref());
         let recovery = digest.recovery();
+        assert_eq!(
+            recovery.background_pending,
+            reference_background_pending(history)
+        );
         let (expired, resident) = reference_recovery(history);
         assert_eq!(
             recovery.resident_runtimes,
@@ -775,6 +839,12 @@ pub(crate) mod tests {
                         "conversation.forked",
                     ]),
                     json!({}),
+                ),
+                13 => (
+                    "provider.event",
+                    json!({ "turnId": turn, "providerMethod": rng.pick(&[
+                        "background_tasks_pending", "background_tasks_ended", "task_progress",
+                    ]) }),
                 ),
                 // A permissionId on an unrelated event must not count.
                 12 => (

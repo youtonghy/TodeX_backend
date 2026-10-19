@@ -319,24 +319,59 @@ pub struct ProviderWork {
     pub trigger: Value,
 }
 
+/// Background work a provider process took with it when it stopped before
+/// the work was done or handed back, to be journalled so clients stop
+/// waiting for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LostWork {
+    pub task_ids: Vec<String>,
+    /// `settings_changed`, `evicted`, `stopped`, `expired`, `not_adopted`,
+    /// `process_ended` or `turn_ended`.
+    pub reason: &'static str,
+}
+
 type StartProviderWork =
     dyn Fn(ProviderWork) -> BoxFuture<'static, Result<(), AppError>> + Send + Sync;
+type ReportLostWork = dyn Fn(LostWork) -> BoxFuture<'static, ()> + Send + Sync;
 
-/// Asks the supervisor to open a turn for [`ProviderWork`].
+/// Asks the supervisor to open a turn for [`ProviderWork`], and tells it
+/// about [`LostWork`].
 #[derive(Clone)]
-pub struct ProviderWorkHandle(Arc<StartProviderWork>);
+pub struct ProviderWorkHandle {
+    start: Arc<StartProviderWork>,
+    lost: Option<Arc<ReportLostWork>>,
+}
 
 impl ProviderWorkHandle {
     pub(crate) fn new(
         start: impl Fn(ProviderWork) -> BoxFuture<'static, Result<(), AppError>> + Send + Sync + 'static,
     ) -> Self {
-        Self(Arc::new(start))
+        Self {
+            start: Arc::new(start),
+            lost: None,
+        }
+    }
+
+    pub(crate) fn with_lost(
+        mut self,
+        lost: impl Fn(LostWork) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) -> Self {
+        self.lost = Some(Arc::new(lost));
+        self
     }
 
     /// Resolves once the turn was opened or refused; the turn itself runs
     /// on its own.
     pub(crate) fn start(&self, work: ProviderWork) -> BoxFuture<'static, Result<(), AppError>> {
-        (self.0)(work)
+        (self.start)(work)
+    }
+
+    /// Resolves once the loss was journalled (or could not be).
+    pub(crate) fn lost(&self, work: LostWork) -> BoxFuture<'static, ()> {
+        match &self.lost {
+            Some(lost) => lost(work),
+            None => Box::pin(async {}),
+        }
     }
 }
 

@@ -177,6 +177,20 @@ impl SessionWork {
         !self.live.is_empty() || self.cron || !self.wakeups.is_empty()
     }
 
+    /// Background tasks that are running or whose follow-up has not started:
+    /// lost if the process stops now.
+    pub(super) fn task_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.live.keys().cloned().collect();
+        ids.extend(
+            self.finished
+                .iter()
+                .filter_map(|task| task.get("taskId").and_then(Value::as_str))
+                .map(str::to_owned),
+        );
+        ids.sort();
+        ids
+    }
+
     /// `triggerDetail` for work Claude just started on its own.
     pub(super) fn trigger(&mut self, now: Instant) -> Value {
         if !self.finished.is_empty() {
@@ -264,6 +278,7 @@ mod tests {
         ));
         assert!(work.pending());
         assert_eq!(work.hold_until(now, cap), Some(cap));
+        assert_eq!(work.task_ids(), ["b74"]);
 
         work.apply_system(&system(
             "task_notification",
@@ -283,6 +298,7 @@ mod tests {
         );
         // Taken by that trigger.
         assert_eq!(work.trigger(now)["kind"], "unknown");
+        assert!(work.task_ids().is_empty());
     }
 
     #[test]

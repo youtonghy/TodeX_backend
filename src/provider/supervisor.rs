@@ -181,6 +181,9 @@ const MAX_PROMPT_BYTES: usize = 512 * 1024;
 const MAX_PROMPT_CONTENT_ITEMS: usize = 16;
 const MAX_PROMPT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long after its last event a conversation may still hold background
+/// work in a provider process: Claude Code keeps it up to 6 h past a turn.
+const BACKGROUND_WORK_HORIZON_HOURS: i64 = 7;
 /// How often an idle turn with a pending permission dialog is rechecked.
 const IDLE_WATCHDOG_RECHECK: Duration = Duration::from_secs(5);
 /// How long an idle-stopped driver may take to honor cancellation.
@@ -684,6 +687,28 @@ impl ConversationSupervisor {
         self.emit(conversation_id, event_type, payload).await
     }
 
+    /// Journals that background work clients wait on (the tasks of a
+    /// `background_tasks_pending` notice) is gone with its provider process.
+    async fn journal_lost_work(
+        &self,
+        conversation_id: &str,
+        provider: ProviderKind,
+        task_ids: &[String],
+        reason: &str,
+    ) {
+        let payload = json!({
+            "provider": provider,
+            "providerMethod": "background_tasks_ended",
+            "metadata": { "taskIds": task_ids, "reason": reason },
+        });
+        if let Err(error) = self
+            .append_agent_event(conversation_id, "provider.event", payload)
+            .await
+        {
+            tracing::warn!(%conversation_id, %error, "could not journal lost background work");
+        }
+    }
+
     /// Asks the user from inside an agent tool call (outside any provider
     /// stream), tagged with the running turn. `allowed_devices` restricts who
     /// may answer. The turn's cancellation, or `cancel`, ends the request.
@@ -807,6 +832,7 @@ impl ConversationSupervisor {
             // daemon from starting; recover the rest and report the failures.
             if self.recovery_is_settled(&manifest).await {
                 settled += 1;
+                self.recover_lost_background_work(&manifest).await;
             } else if let Err(error) = self.recover_conversation(&manifest).await {
                 failed += 1;
                 tracing::error!(
@@ -881,6 +907,34 @@ impl ConversationSupervisor {
         }
     }
 
+    /// A settled journal whose last turn left background tasks waiting:
+    /// the provider process went down with the daemon, so they are lost.
+    /// Only recent Claude Code journals can hold such work (its processes
+    /// keep work at most 6 h past a turn), which
+    /// keeps the digest reads off most conversations.
+    async fn recover_lost_background_work(&self, manifest: &ConversationManifest) {
+        if manifest.provider != ProviderKind::ClaudeCode
+            || manifest.updated_at
+                < Utc::now() - chrono::Duration::hours(BACKGROUND_WORK_HORIZON_HOURS)
+        {
+            return;
+        }
+        match self
+            .store
+            .digest(&manifest.id, |digest| digest.recovery().background_pending)
+            .await
+        {
+            Ok(true) => {
+                self.journal_lost_work(&manifest.id, manifest.provider, &[], "daemon_restarted")
+                    .await;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::debug!(conversation_id = %manifest.id, %error, "could not check for lost background work");
+            }
+        }
+    }
+
     async fn recover_conversation(&self, manifest: &ConversationManifest) -> Result<(), AppError> {
         let recovered = self.store.recover(&manifest.id).await?;
         // Whether work was in flight comes from the journal, not the manifest:
@@ -917,6 +971,10 @@ impl ConversationSupervisor {
             .await?;
         }
 
+        if facts.background_pending && !was_active {
+            self.journal_lost_work(&manifest.id, manifest.provider, &[], "daemon_restarted")
+                .await;
+        }
         if was_active {
             let mut payload = json!({
                 "reason": "daemon_restarted",
@@ -2477,6 +2535,11 @@ impl ConversationSupervisor {
         let provider_work = {
             let supervisor = self.clone();
             let conversation_id = conversation_id.clone();
+            let lost = (
+                supervisor.clone(),
+                conversation_id.clone(),
+                manifest.provider,
+            );
             ProviderWorkHandle::new(move |work| {
                 let supervisor = supervisor.clone();
                 let owner_id = owner_id.clone();
@@ -2485,6 +2548,14 @@ impl ConversationSupervisor {
                     supervisor
                         .start_provider_turn(&owner_id, &conversation_id, work)
                         .await
+                })
+            })
+            .with_lost(move |work| {
+                let (supervisor, conversation_id, provider) = lost.clone();
+                Box::pin(async move {
+                    supervisor
+                        .journal_lost_work(&conversation_id, provider, &work.task_ids, work.reason)
+                        .await;
                 })
             })
         };
@@ -4771,6 +4842,84 @@ mod tests {
             store.complete_history(&manifest.id).await.unwrap().len(),
             count
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_reports_background_work_a_finished_turn_left_running() {
+        let (root, store, supervisor, workspace) =
+            control_fixture("todex-recover-background").await;
+        let mut waiting = Vec::new();
+        for left_waiting in [true, false] {
+            let manifest = store
+                .create(ConversationManifest::new(
+                    ProviderKind::ClaudeCode,
+                    workspace.clone(),
+                    None,
+                    None,
+                ))
+                .await
+                .unwrap();
+            store
+                .append(&manifest.id, "turn.started", json!({ "turnId": "t" }))
+                .await
+                .unwrap();
+            store
+                .append(
+                    &manifest.id,
+                    "provider.event",
+                    json!({ "provider": "claude-code",
+                "providerMethod": "background_tasks_pending", "turnId": "t",
+                "metadata": { "taskIds": ["b1"] } }),
+                )
+                .await
+                .unwrap();
+            store
+                .append(&manifest.id, "turn.completed", json!({ "turnId": "t" }))
+                .await
+                .unwrap();
+            if !left_waiting {
+                // Claude took the finished task up in a turn of its own.
+                store
+                    .append(
+                        &manifest.id,
+                        "turn.started",
+                        json!({ "turnId": "u", "trigger": "provider" }),
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .append(&manifest.id, "turn.completed", json!({ "turnId": "u" }))
+                    .await
+                    .unwrap();
+            }
+            waiting.push((manifest.id, left_waiting));
+        }
+        let ended = |history: &[ConversationEvent]| {
+            history
+                .iter()
+                .filter(|event| event.payload["providerMethod"] == "background_tasks_ended")
+                .map(|event| event.payload["metadata"]["reason"].clone())
+                .collect::<Vec<_>>()
+        };
+        supervisor.recover_all().await.unwrap();
+        for (id, left_waiting) in &waiting {
+            let history = store.complete_history(id).await.unwrap();
+            let expected = if *left_waiting {
+                vec![json!("daemon_restarted")]
+            } else {
+                vec![]
+            };
+            assert_eq!(ended(&history), expected);
+            assert_eq!(
+                store.get(id).await.unwrap().status,
+                ConversationStatus::Idle
+            );
+        }
+        // Reported once.
+        supervisor.recover_all().await.unwrap();
+        let history = store.complete_history(&waiting[0].0).await.unwrap();
+        assert_eq!(ended(&history).len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 
