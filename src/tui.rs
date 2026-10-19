@@ -42,6 +42,8 @@ const DAEMON_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const CONNECT_ADDRESSES_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_OP_RETRY_BASE: Duration = Duration::from_millis(500);
 const DAEMON_OP_RETRY_MAX: Duration = Duration::from_secs(8);
+/// Background release checks; matches the running daemon's interval.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 mod positioned_backend;
 use positioned_backend::PositionedBackend;
@@ -78,6 +80,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         while let Ok(info) = app.about_rx.try_recv() {
             app.apply_about_result(info);
         }
+        app.refresh_update_check();
         app.run_pending_daemon_op();
         terminal.draw(|frame| app.render(frame))?;
 
@@ -204,11 +207,16 @@ enum DaemonOpKind {
     Start,
     Stop,
     Restart,
+    /// Stop the daemon, install the latest release, then start it again.
+    Update,
 }
 
 struct DaemonOpResult {
     kind: DaemonOpKind,
     process: Result<Option<DaemonProcess>, String>,
+    /// For `Update`: the installed version (`None` when already current), or
+    /// why installing failed. `None` when the install step did not run.
+    install: Option<Result<Option<String>, String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -417,6 +425,12 @@ struct TuiApp {
     about: Option<AboutPopup>,
     about_tx: mpsc::UnboundedSender<update::About>,
     about_rx: mpsc::UnboundedReceiver<update::About>,
+    /// Newer release found by the last successful check.
+    update_available: Option<String>,
+    /// Release installed by this TUI. The TUI itself still runs the old
+    /// version, so checks keep reporting it as new until the TUI is reopened.
+    update_installed: Option<String>,
+    update_checked_at: Option<Instant>,
     language: TuiLanguage,
 }
 
@@ -475,6 +489,9 @@ impl TuiApp {
             about: None,
             about_tx,
             about_rx,
+            update_available: None,
+            update_installed: None,
+            update_checked_at: None,
             language,
         }
     }
@@ -695,11 +712,70 @@ impl TuiApp {
         });
     }
 
-    fn apply_about_result(&mut self, info: update::About) {
+    /// Periodic background release check, so the action list can announce an
+    /// update without the about panel being opened.
+    fn refresh_update_check(&mut self) {
+        if !update::enabled()
+            || self
+                .update_checked_at
+                .is_some_and(|time| time.elapsed() < UPDATE_CHECK_INTERVAL)
+        {
+            return;
+        }
+        self.update_checked_at = Some(Instant::now());
+        let tx = self.about_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(update::about().await);
+        });
+    }
+
+    fn apply_about_result(&mut self, mut info: update::About) {
+        if info.update_available && info.latest_version == self.update_installed {
+            info.update_available = false;
+        }
+        if info.check_error.is_none() {
+            let found = info
+                .latest_version
+                .clone()
+                .filter(|_| info.update_available);
+            if found.is_some() && found != self.update_available {
+                let line = match self.language {
+                    TuiLanguage::English => format!(
+                        "Backend update {} is available; open [u] About & updates to install it.",
+                        found.as_deref().unwrap_or_default()
+                    ),
+                    TuiLanguage::Chinese => format!(
+                        "后端有新版本 {}，可在 [u] 关于与更新 中一键更新。",
+                        found.as_deref().unwrap_or_default()
+                    ),
+                };
+                self.push_log(line);
+            }
+            self.update_available = found;
+        }
         if let Some(about) = self.about.as_mut() {
             about.info = info;
             about.checking = false;
         }
+    }
+
+    /// Stops the daemon, installs the release found by the last check, and
+    /// starts the daemon again.
+    fn start_one_click_update(&mut self) {
+        if self.update_available.is_none() {
+            self.notice = self
+                .text(
+                    "No update to install; press u to check again.",
+                    "当前没有可安装的更新，可按 u 重新检查。",
+                )
+                .to_owned();
+            return;
+        }
+        if self.daemon_op == Some(DaemonOpKind::Update) {
+            return;
+        }
+        self.about = None;
+        self.queue_daemon_op(DaemonOpKind::Update);
     }
 
     fn close_about(&mut self) {
@@ -1381,6 +1457,7 @@ impl TuiApp {
         if self.about.is_some() {
             match key.code {
                 KeyCode::Char('u') | KeyCode::Enter => self.refresh_about(),
+                KeyCode::Char('i') => self.start_one_click_update(),
                 KeyCode::Esc | KeyCode::Char('q') => self.close_about(),
                 _ => {}
             }
@@ -1669,6 +1746,10 @@ impl TuiApp {
             DaemonOpKind::Start => self.text("Starting daemon...", "正在启动 daemon..."),
             DaemonOpKind::Stop => self.text("Stopping daemon...", "正在停止 daemon..."),
             DaemonOpKind::Restart => self.text("Restarting daemon...", "正在重启 daemon..."),
+            DaemonOpKind::Update => self.text(
+                "Updating: stopping the daemon, installing the release, starting the daemon...",
+                "正在一键更新：停止 daemon → 安装新版本 → 启动 daemon...",
+            ),
         }
         .to_owned();
         self.push_log(self.notice.clone());
@@ -1677,19 +1758,49 @@ impl TuiApp {
         config.host = config.host.trim().to_owned();
         let tx = self.daemon_op_tx.clone();
         tokio::spawn(async move {
+            let mut install = None;
             let process = match kind {
                 DaemonOpKind::Start => daemon::start(config).await.map(Some),
                 DaemonOpKind::Stop => daemon::stop(&config).await,
                 DaemonOpKind::Restart => daemon::restart(config).await.map(Some),
+                DaemonOpKind::Update => match daemon::stop(&config).await {
+                    // The daemon is started again even when installing fails,
+                    // so a failed update never leaves it offline.
+                    Ok(_) => {
+                        install = Some(
+                            update::install_latest()
+                                .await
+                                .map_err(|error| format!("{error:#}")),
+                        );
+                        daemon::start(config).await.map(Some)
+                    }
+                    Err(error) => Err(error),
+                },
             }
             .map_err(|error| error.to_string());
-            let _ = tx.send(DaemonOpResult { kind, process });
+            let _ = tx.send(DaemonOpResult {
+                kind,
+                process,
+                install,
+            });
         });
     }
 
     fn apply_daemon_op_result(&mut self, result: DaemonOpResult) {
         self.daemon_op = None;
         let failed = result.process.is_err();
+        let installed = match &result.install {
+            Some(Ok(Some(version))) => Some(version.clone()),
+            _ => None,
+        };
+        if installed.is_some() {
+            self.update_installed = installed.clone();
+            self.update_available = None;
+        }
+        let install_error = match &result.install {
+            Some(Err(error)) => Some(error.clone()),
+            _ => None,
+        };
         match result.process {
             Ok(process) => {
                 self.daemon_op_failures = 0;
@@ -1718,6 +1829,34 @@ impl TuiApp {
                             process.pid
                         ),
                     },
+                    (DaemonOpKind::Update, Some(process)) => match (&installed, self.language) {
+                        (Some(version), TuiLanguage::English) => format!(
+                            "Updated to {version}; daemon started on {} with pid {}. Reopen the TUI to use the new version here too.",
+                            process.listen_addr(),
+                            process.pid
+                        ),
+                        (Some(version), TuiLanguage::Chinese) => format!(
+                            "已更新到 {version}，daemon 已在 {} 启动，PID 为 {}；重新打开 TUI 以使用新版界面。",
+                            process.listen_addr(),
+                            process.pid
+                        ),
+                        (None, TuiLanguage::English) if install_error.is_some() => format!(
+                            "Update failed to install; daemon started again on the current version (pid {}).",
+                            process.pid
+                        ),
+                        (None, TuiLanguage::Chinese) if install_error.is_some() => format!(
+                            "更新安装失败，daemon 已以当前版本重新启动（PID {}）。",
+                            process.pid
+                        ),
+                        (None, TuiLanguage::English) => format!(
+                            "Already up to date; daemon started again (pid {}).",
+                            process.pid
+                        ),
+                        (None, TuiLanguage::Chinese) => format!(
+                            "已是最新版本，daemon 已重新启动（PID {}）。",
+                            process.pid
+                        ),
+                    },
                     (DaemonOpKind::Stop, Some(process)) => match self.language {
                         TuiLanguage::English => {
                             format!("Daemon stopped (pid {}).", process.pid)
@@ -1730,8 +1869,11 @@ impl TuiApp {
                         .text("Daemon is already stopped.", "Daemon 已经停止。")
                         .to_owned(),
                 };
-                self.last_error = None;
+                self.last_error = install_error;
                 self.push_log(self.notice.clone());
+                if let Some(error) = &self.last_error {
+                    self.push_log(error.clone());
+                }
                 self.daemon = process;
             }
             Err(error) => {
@@ -1743,8 +1885,17 @@ impl TuiApp {
                     DaemonOpKind::Restart => {
                         self.text("Daemon restart failed.", "Daemon 重启失败。")
                     }
+                    DaemonOpKind::Update if installed.is_some() => self.text(
+                        "Update installed, but the daemon failed to start.",
+                        "更新已安装，但 daemon 启动失败。",
+                    ),
+                    DaemonOpKind::Update => self.text("Update failed.", "一键更新失败。"),
                 }
                 .to_owned();
+                let error = match install_error {
+                    Some(install) => format!("{error}; install: {install}"),
+                    None => error,
+                };
                 self.last_error = Some(error.clone());
                 self.push_log(format!("{} {}", self.notice.clone(), error));
                 self.daemon_op_failures = self.daemon_op_failures.saturating_add(1);
@@ -2572,6 +2723,7 @@ impl TuiApp {
                     DaemonOpKind::Start => self.text("Starting...", "正在启动..."),
                     DaemonOpKind::Stop => self.text("Stopping...", "正在停止..."),
                     DaemonOpKind::Restart => self.text("Restarting...", "正在重启..."),
+                    DaemonOpKind::Update => self.text("Updating...", "正在更新..."),
                 },
                 Style::default().fg(Color::Cyan),
             )
@@ -2830,6 +2982,11 @@ impl TuiApp {
         } else {
             self.text("Restart daemon", "重启 daemon")
         };
+        let about = match (&self.update_available, self.language) {
+            (Some(version), TuiLanguage::English) => format!("About & updates (update {version})"),
+            (Some(version), TuiLanguage::Chinese) => format!("关于与更新（有更新 {version}）"),
+            (None, _) => self.text("About & updates", "关于与更新").to_owned(),
+        };
         let actions = [
             start_stop,
             restart,
@@ -2843,7 +3000,7 @@ impl TuiApp {
             self.text("Credentials & copy", "凭据与复制"),
             self.text("Language: English", "语言：中文"),
             self.text("Device verification", "设备验证"),
-            self.text("About & updates", "关于与更新"),
+            about.as_str(),
             self.text("Quit", "退出"),
         ];
         let shortcuts = [
@@ -2862,7 +3019,9 @@ impl TuiApp {
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
-                } else if idx == 1 && restart_recommended {
+                } else if (idx == 1 && restart_recommended)
+                    || (idx == 12 && self.update_available.is_some())
+                {
                     Style::default().fg(Color::Yellow)
                 } else {
                     Style::default()
@@ -2939,7 +3098,7 @@ impl TuiApp {
         } else {
             self.text("unavailable (not a release build)", "不可用（非发布构建）")
         };
-        Paragraph::new(vec![
+        let mut lines = vec![
             Line::from(Span::styled(
                 self.text("TodeX Backend — todex-agentd", "TodeX 后端 — todex-agentd")
                     .to_owned(),
@@ -2967,17 +3126,33 @@ impl TuiApp {
                 "{}: {auto_update}",
                 self.text("Auto-update", "自动更新")
             )),
-            Line::from(""),
-            Line::from(
+        ];
+        if let Some(version) = &self.update_installed {
+            lines.push(Line::from(match self.language {
+                TuiLanguage::English => {
+                    format!("Installed {version}; reopen the TUI to run it here too.")
+                }
+                TuiLanguage::Chinese => {
+                    format!("已安装 {version}，重新打开 TUI 后界面也会使用新版本。")
+                }
+            }));
+        }
+        lines.push(Line::from(""));
+        if self.update_available.is_some() {
+            lines.push(Line::from(Span::styled(
                 self.text(
-                    "u re-check · Esc/q close · `todex-agentd update` installs a release",
-                    "u 重新检查 · Esc/q 关闭 · `todex-agentd update` 安装新版本",
+                    "i update now: stop daemon → install → start daemon (running Agent turns are interrupted)",
+                    "i 一键更新：停止 daemon → 安装 → 启动 daemon（会中断正在运行的 Agent）",
                 )
                 .to_owned(),
-            ),
-        ])
-        .wrap(Wrap { trim: true })
-        .block(
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        lines.push(Line::from(
+            self.text("u re-check · Esc/q close", "u 重新检查 · Esc/q 关闭")
+                .to_owned(),
+        ));
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
             panel_block()
                 .title(self.text("About", "关于"))
                 .borders(Borders::ALL),
@@ -4859,6 +5034,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
+    #[test]
+    fn update_check_marks_about_action_until_installed() {
+        let mut app = super::TuiApp::new(crate::config::Config::default());
+        let mut about = crate::update::about_static();
+        about.latest_version = Some("9.9.9".to_owned());
+        about.update_available = true;
+        app.apply_about_result(about.clone());
+        assert_eq!(app.update_available.as_deref(), Some("9.9.9"));
+
+        // A failed lookup keeps the last known result.
+        let mut failed = crate::update::about_static();
+        failed.check_error = Some("offline".to_owned());
+        app.apply_about_result(failed);
+        assert_eq!(app.update_available.as_deref(), Some("9.9.9"));
+
+        app.apply_daemon_op_result(super::DaemonOpResult {
+            kind: super::DaemonOpKind::Update,
+            process: Ok(None),
+            install: Some(Ok(Some("9.9.9".to_owned()))),
+        });
+        assert!(app.update_available.is_none());
+        assert_eq!(app.update_installed.as_deref(), Some("9.9.9"));
+
+        // This TUI still runs the old build, so later checks report the
+        // installed release as new; it must not be offered again.
+        app.apply_about_result(about);
+        assert!(app.update_available.is_none());
+    }
+
+    #[test]
+    fn one_click_update_needs_a_found_release_and_reports_install_errors() {
+        let mut app = super::TuiApp::new(crate::config::Config::default());
+        app.start_one_click_update();
+        assert!(app.daemon_op.is_none());
+
+        app.update_available = Some("9.9.9".to_owned());
+        app.apply_daemon_op_result(super::DaemonOpResult {
+            kind: super::DaemonOpKind::Update,
+            process: Err("start failed".to_owned()),
+            install: Some(Err("checksum mismatch".to_owned())),
+        });
+        let error = app.last_error.as_deref().unwrap();
+        assert!(error.contains("start failed") && error.contains("checksum mismatch"));
+        assert_eq!(app.update_available.as_deref(), Some("9.9.9"));
+    }
+
     #[tokio::test]
     async fn daemon_operations_apply_results_and_drain_pending() {
         let data_dir = std::env::temp_dir().join(format!(
@@ -4878,6 +5099,7 @@ mod tests {
         app.apply_daemon_op_result(super::DaemonOpResult {
             kind: super::DaemonOpKind::Restart,
             process: Err("boom".to_owned()),
+            install: None,
         });
         assert!(app.last_error.is_some());
         // A failed operation defers the queued op instead of dispatching it

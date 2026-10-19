@@ -311,6 +311,19 @@ pub async fn about() -> About {
     about
 }
 
+/// The installed executable path. After an in-place update Linux reports the
+/// running binary as `<path> (deleted)`, while the path holds the new binary.
+pub fn installed_executable() -> std::io::Result<PathBuf> {
+    let path = std::env::current_exe()?;
+    Ok(strip_deleted_suffix(&path).unwrap_or(path))
+}
+
+fn strip_deleted_suffix(path: &Path) -> Option<PathBuf> {
+    path.to_str()
+        .and_then(|raw| raw.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+}
+
 pub async fn run(check_only: bool) -> Result<UpdateStatus> {
     let mut status = UpdateStatus {
         enabled: enabled(),
@@ -342,7 +355,7 @@ pub async fn run(check_only: bool) -> Result<UpdateStatus> {
     let manifest = download(&client, checksums_url, 1024 * 1024).await?;
     let bytes = download(&client, url, MAX_BINARY).await?;
     verify_checksum(std::str::from_utf8(&manifest)?, &name, &bytes)?;
-    let executable = std::env::current_exe()?;
+    let executable = installed_executable()?;
     let backup = install(&executable, &bytes, Some(&version)).await?;
     eprintln!(
         "Installed backend {version}; previous executable: {}",
@@ -352,6 +365,14 @@ pub async fn run(check_only: bool) -> Result<UpdateStatus> {
     status.backup = Some(backup);
     status.installed = true;
     Ok(status)
+}
+
+/// Manual install of the latest release, as `update` does; the caller stops
+/// the daemon first. Returns the installed version, or `None` when already
+/// current.
+pub async fn install_latest() -> Result<Option<String>> {
+    let status = run(false).await?;
+    Ok(status.latest_version.filter(|_| status.installed))
 }
 
 fn restore_backup(backup: &Path, executable: &Path) -> Result<()> {
@@ -431,7 +452,7 @@ pub fn prune_backups() {
     if !enabled() {
         return;
     }
-    let result = std::env::current_exe()
+    let result = installed_executable()
         .context("cannot resolve the current executable")
         .and_then(|executable| prune_backups_in(&executable, SystemTime::now()));
     if let Err(error) = result {
@@ -554,6 +575,15 @@ mod tests {
         assert!(platform_for("linux", "aarch64", false).is_none());
         assert!(platform_for("macos", "x86_64", false).is_none());
         assert!(platform_for("freebsd", "x86_64", false).is_none());
+    }
+
+    #[test]
+    fn replaced_executable_resolves_to_installed_path() {
+        assert_eq!(
+            strip_deleted_suffix(Path::new("/opt/todex-agentd (deleted)")),
+            Some(PathBuf::from("/opt/todex-agentd"))
+        );
+        assert_eq!(strip_deleted_suffix(Path::new("/opt/todex-agentd")), None);
     }
 
     #[test]

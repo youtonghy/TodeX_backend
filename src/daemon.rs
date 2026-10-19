@@ -94,7 +94,8 @@ pub async fn start(config: Config) -> Result<DaemonProcess> {
     set_owner_only_directory(&log_dir(&config.data_dir))?;
 
     let log_path = log_file_path(&config.data_dir);
-    let executable = std::env::current_exe().context("failed to resolve current executable")?;
+    let executable =
+        update::installed_executable().context("failed to resolve current executable")?;
     let mut command = Command::new(&executable);
     command.arg("daemon-run");
     detach_with_config(&mut command, &config)?;
@@ -487,7 +488,8 @@ async fn watch_for_updates(available: watch::Sender<Option<String>>) {
 /// Starts the replacement through `daemon start`, which installs the update
 /// before launching it. Startup failures land in the daemon log.
 fn spawn_update_restart(config: &Config, version: &str) -> Result<()> {
-    let executable = std::env::current_exe().context("failed to resolve current executable")?;
+    let executable =
+        update::installed_executable().context("failed to resolve current executable")?;
     let mut command = Command::new(&executable);
     command.arg("daemon").arg("start");
     detach_with_config(&mut command, config)?;
