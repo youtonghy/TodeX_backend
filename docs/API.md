@@ -1178,6 +1178,52 @@ Content-Type: application/json
 | `GET` / `PUT /v2/ssh/settings` | 连接设置 `{ serverAliveEnabled, serverAliveInterval, serverAliveCountMax }`，默认 `{ false, 15, 3 }`；`PUT` 需提供全部字段（间隔 5–600 秒、次数 1–10，越界返回 400），返回保存后的设置。开启时渲染为 `defaults.conf` 中的 `Host *` 块，位于 `~/.ssh/config` 之后，因此用户为某主机写的 `ServerAlive*` 优先。只影响之后启动的 ssh 进程；已建立的共享 master 保持原参数，直到断开或空闲关闭。保存时（主机、Agent access 与 FTP 站点的修改相同）先写 `store.json`，再写 `hosts.conf`、`defaults.conf` 与 `-F` 包装配置；任一写入失败则恢复原有文件与内存中的状态并返回错误，因此 `GET` 与 ssh 实际读取的配置一致。 |
 | `POST /v2/ftp/sites`、`PUT` / `DELETE /v2/ftp/sites/{id}` | FTP 站点 `{ name, protocol: "ftp"|"ftps", host, port?（默认 21）, user?, initialDirectory? }`，不含密码。 |
 
+### 端口转发
+
+手动端口转发（`ssh -L` / `-R` / `-D`）在**运行 todex-agentd 的机器**上运行。配置保存在 `store.json` 顶层可选字段 `forwards`（缺失为空；旧版本 daemon 忽略该字段照常启动，加载时逐条校验，无效条目只记警告并丢弃），运行状态只在内存中：转发从不自动启动（daemon 重启后也一样），daemon 退出时全部停止。
+
+- 每个运行中的转发是一个独立的 ssh 进程：`-F` 包装配置、`-N`、`ExitOnForwardFailure=yes`、`ControlMaster=no`、`ControlPath=none`（既不复用也不成为共享 master，停止转发不影响其他会话）、`StrictHostKeyChecking=yes`、`ConnectTimeout=15`；无密码时 BatchMode，带密码时只应答一次密码提示（askpass 一次性密码文件，见「主机清单」；ProxyJump/ProxyCommand 主机返回 400）。ssh 运行在独立进程组中，停止时连同 ProxyCommand 一起结束。
+- 就绪判定：ssh 以 `LogLevel=DEBUG1` 运行（日志不含密码），本地/动态转发以监听成功的日志行为准（日志措辞不同的 OpenSSH 版本在登录 2 秒后探测本地监听端口），远程转发以服务器确认（`remote forward success`）为准；20 秒内已登录但没有确认时也按 `running` 处理。启动前先检查本地监听地址是否已被占用，被占用时不登录直接失败。之后 ssh 进程退出（网络断开、服务器关闭连接等）时状态变为 `failed` 并带原因。
+- `SshForwardInput`：`{ alias, kind: "local"|"remote"|"dynamic", bindAddress?, bindPort, targetHost?, targetPort?, label? }`。`alias` 必须在主机清单中（无效别名 400，不存在 404）。`local`/`dynamic` 的 `bindAddress` **只能**是 `127.0.0.1`、`::1` 或 `localhost`（默认 `127.0.0.1`，保存为显式值），不会监听其他网卡；`remote` 的 `bindAddress` 是服务器上的地址（主机名/IP 字符或 `*`），省略时由服务器决定（通常是服务器的回环地址，受其 `GatewayPorts` 约束）。`bindPort`、`targetPort` 为 1–65535；`local`/`remote` 必须提供 `targetHost`（字母、数字与 `.-_:%`，不以 `-` 开头，≤ 253 字符；IPv6 地址自动加方括号）与 `targetPort`，`dynamic` 不得提供二者；`label` ≤ 80 个字符且不含控制字符。校验失败返回 400，最多保存 256 条。
+- `SshForward` = 输入字段 + `id`、`status`（`stopped`/`starting`/`running`/`failed`）、`failure?`（同连接测试的 `failure`）、`error?`（ssh 错误输出摘要，不含密码）、`startedAt?`（RFC 3339）。
+- 回环监听不是用户隔离：同一台机器上的其他本地用户也能连接 `127.0.0.1`/`::1` 上的转发端口（SOCKS 代理同理）。
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /v2/ssh/forwards` | `{ forwards: SshForward[] }`。 |
+| `POST /v2/ssh/forwards` | 请求体 `SshForwardInput`，返回 `{ forward }`（`status: "stopped"`）。 |
+| `PUT /v2/ssh/forwards/{id}` | 请求体 `SshForwardInput`，返回 `{ forward }`；`starting`/`running` 时返回 409，需先停止。 |
+| `DELETE /v2/ssh/forwards/{id}` | 先停止再删除，返回 `{ deleted: true }`。 |
+| `POST /v2/ssh/forwards/{id}/start` | 可选请求体 `{ password? }`（解析规则同 `/hosts/{alias}/test`），等待就绪或失败（最多约 20 秒）后返回 `{ forward }`。登录失败、主机密钥问题、端口被占用、服务器拒绝远程转发等运行时失败返回 200，`status: "failed"` 并带 `failure`、`error`。已有 32 个转发在运行，或另一个运行中的转发（或 TodeX 自身的监听端口）占用了相同的本地地址与端口时返回 409。已在运行时直接返回当前状态。 |
+| `POST /v2/ssh/forwards/{id}/stop` | 停止并返回 `{ forward }`。 |
+
+删除自管主机时会先停止并删除它的转发；主机改名时转发跟随新别名。
+
+### 内部 IP 池（按需转发）
+
+给主机分配一个独立的回环地址（如 `127.77.0.2`），本机程序连接 `该地址:端口` 即被转发到该主机上的 `127.0.0.1:端口`，无需逐个配置端口转发。仅 Unix（Linux、macOS）支持；其他平台 `supported: false`，启用时返回 501。配置保存在 `store.json` 顶层可选字段 `ipPool`（缺失取默认值；读取时宽松处理：无效的 `cidr` 回退默认值，`idleMinutes` 收敛到 1–1440，无效或冲突的分配丢弃并记警告；旧版本 daemon 忽略该字段），运行状态只在内存中。
+
+- `SshIpPoolConfig`：`{ enabled, cidr, idleMinutes }`，默认 `{ false, "127.77.0.0/24", 15 }`。`cidr` 必须在 `127.0.0.0/8` 内、前缀长度 16–30、主机位为 0，且不得包含 `127.0.0.1`；网络地址与广播地址不可分配。`idleMinutes` 为 1–1440。
+- 端口模式：`auto` 使用内置的常用端口表（`autoPorts`：`80, 443, 1433, 3000-3010, 3306, 4000, 4200, 5000-5010, 5173, 5432, 5601, 6379, 8000-8100, 8443, 8888, 9000-9100, 9200, 11434, 15672, 27017`，共 240 个）；`manual` 使用 `ports`（`"8080"` 或 `"7000-7010"`，去重后保存规范形式，每个地址最多 4096 个端口，不能为空）。`auto` 模式下请求中的 `ports` 被忽略，保存为 `[]`。所有分配的监听总数上限 200 000，超出返回 409。
+- 监听：启用后，每个分配在 `ip:端口` 上为端口集合中的每个端口监听（只在回环地址上；daemon 重启后若已启用会自动恢复）。端口已被占用或无权限（例如 Linux 上未放开的 1024 以下端口）时跳过并记入 `skippedPorts`（最多列出 100 个，`skippedPortCount` 为总数），修改端口或重新应用配置时重试。地址不可用（`EADDRNOTAVAIL`）时停止该地址的监听并报告 `bindError: { kind: "addressUnavailable", message }`：**macOS** 只有 `127.0.0.1` 默认可用，需先执行 `sudo ifconfig lo0 alias <ip>`（重启后失效）；Linux 上整个 `127.0.0.0/8` 默认可用。其他监听错误为 `kind: "other"`。修改端口、模式、启用状态或 `cidr` 时增量增删监听，已建立的连接不受影响。daemon 启动时把打开文件数的软限制提高到硬限制。
+- 连接：第一个连接到来时为该分配启动一个专用 master（`ssh -N -o ControlMaster=yes -o ControlPersist=no -o ControlPath=<控制套接字> -o ClearAllForwardings=yes`，BatchMode、严格主机密钥校验；控制套接字在 `$DATA_DIR/ssh/pool/<ip>`，路径过长时改用临时目录下的按用户、按数据目录区分的目录，daemon 启动时清理残留套接字），master 启动期间到达的连接排队等待同一个 master；之后每个连接运行一个 `ssh -S <控制套接字> -o ControlMaster=no -W 127.0.0.1:<端口> -- <alias>` 复用该登录（找不到 master 时不会另行登录）。`activeConnections` 为 0 持续 `idleMinutes` 后以 `ssh -O exit` 关闭 master，状态回到 `idle`；下一个连接重新登录。
+- 密码主机（`authMethod: "password"`）从不自动登录：没有 master 时新连接直接关闭，状态为 `needsLogin`，需要调用 `connect` 并提供密码（ProxyJump/ProxyCommand 主机不支持密码，返回 400）。密钥主机自动登录失败时：认证失败为 `needsLogin`，其他为 `failed`，15 秒内的新连接直接关闭而不重复尝试。
+- `SshIpAssignment`：`{ ip, alias, portMode, ports, listeningPorts, skippedPorts, skippedPortCount, bindError?, state, activeConnections, connectedAt?, lastUsedAt?, failure?, error? }`，`state` 为 `disabled`（池未启用）、`idle`、`connecting`、`connected`、`needsLogin`、`failed`。
+- `SshIpPool` = `SshIpPoolConfig` + `supported`、`unsupportedReason?`、`autoPorts`、`manualPortLimit`（4096）、`assignments`。
+- 与端口转发相同，回环监听对同一台机器上的其他本地用户同样可达。
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /v2/ssh/ip-pool` | 返回 `SshIpPool`。 |
+| `PUT /v2/ssh/ip-pool` | 请求体为完整的 `SshIpPoolConfig`，返回 `SshIpPool`。新的 `cidr` 不再包含某个已有分配（或使其成为网络/广播地址）时返回 409；不支持的平台启用时返回 501。停用时关闭所有监听与 master。 |
+| `POST /v2/ssh/ip-pool/assignments` | 请求体 `{ ip?, alias, portMode, ports? }`，返回 `{ assignment }`。省略 `ip` 时取 `cidr` 中第一个空闲地址；每台主机一个地址、每个地址一台主机，重复返回 409；`alias` 必须在主机清单中。 |
+| `PUT /v2/ssh/ip-pool/assignments/{ip}` | 请求体 `{ portMode, ports? }`，返回 `{ assignment }`；监听增量增删，已有连接继续。 |
+| `DELETE /v2/ssh/ip-pool/assignments/{ip}` | 关闭监听与 master 后删除，返回 `{ deleted: true }`。 |
+| `POST /v2/ssh/ip-pool/assignments/{ip}/connect` | 可选请求体 `{ password? }`（解析规则同 `/hosts/{alias}/test`），立即建立专用 master（密码主机必须如此），返回 `{ assignment }`；登录失败返回 200，`state` 为 `needsLogin`/`failed` 并带 `failure`、`error`。池未启用时返回 409。 |
+| `POST /v2/ssh/ip-pool/assignments/{ip}/disconnect` | 关闭 master（监听保留），返回 `{ assignment }`。 |
+
+不存在的或格式错误的 `{ip}` 返回 404。删除自管主机时先关闭并删除它的分配；主机改名时分配跟随新别名，并关闭旧 master。
+
 ### SSH 密钥
 
 管理后端用户 `~/.ssh` 下的密钥。密钥解析、生成与加密均在进程内完成（不调用 `ssh-keygen`，口令不会出现在进程参数中）。
