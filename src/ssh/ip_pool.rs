@@ -1536,7 +1536,7 @@ fn fits_socket_budget(dir: &Path) -> bool {
 /// Every candidate must be a real directory (not a symlink), owned by this
 /// user, mode 0700; otherwise the pool is refused with the reason.
 #[cfg(unix)]
-fn choose_control_dir(ssh_dir: &Path) -> Result<PathBuf, String> {
+pub(super) fn choose_control_dir(ssh_dir: &Path) -> Result<PathBuf, String> {
     let preferred = ssh_dir.join("pool");
     if fits_socket_budget(&preferred) {
         return secure_dir(&preferred).map(|()| preferred);
@@ -2051,7 +2051,13 @@ mod tests {
         let ssh_dir = root.join("ssh");
         std::fs::create_dir_all(&ssh_dir).unwrap();
         let chosen = choose_control_dir(&ssh_dir).unwrap();
-        assert_eq!(chosen, ssh_dir.join("pool"));
+        if fits_socket_budget(&ssh_dir.join("pool")) {
+            assert_eq!(chosen, ssh_dir.join("pool"));
+        } else {
+            // macOS: the temporary directory itself is already too long.
+            assert!(fits_socket_budget(&chosen), "{}", chosen.display());
+            let _ = std::fs::remove_dir(&chosen);
+        }
         // A long data dir gets another directory whose socket names fit.
         let long = root.join("y".repeat(120));
         let other = choose_control_dir(&long).unwrap();

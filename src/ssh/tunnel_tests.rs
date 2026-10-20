@@ -1000,7 +1000,9 @@ async fn startup_ends_what_a_killed_daemon_left() {
         .unwrap();
     enable_pool(&fixture.service).await;
     fixture.service.shutdown().await;
-    let pool_dir = fixture.root.join("data/ssh/pool");
+    // The directory the pool used: `data/ssh/pool`, or a shorter one where
+    // the temporary directory is too long for socket paths (macOS).
+    let pool_dir = super::ip_pool::choose_control_dir(&fixture.root.join("data/ssh")).unwrap();
     let stale = pool_dir.join("127.77.0.9");
     let _socket = std::os::unix::net::UnixListener::bind(&stale).unwrap();
 
@@ -1071,6 +1073,8 @@ async fn startup_ends_what_a_killed_daemon_left() {
     assert!(bystander.try_wait().unwrap().is_none());
     let _ = bystander.kill();
     let _ = bystander.wait();
+    // Only empty directories go, so a real daemon's is never touched.
+    let _ = std::fs::remove_dir(&pool_dir);
 }
 
 /// A pool directory that is not private (here a symlink) disables the pool
