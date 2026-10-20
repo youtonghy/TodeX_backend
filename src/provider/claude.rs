@@ -1553,6 +1553,45 @@ mod tests {
     }
 
     #[test]
+    fn foreground_tasks_moved_to_background_preserve_metadata_and_track_main() {
+        let mut tasks = BackgroundTasks::default();
+        tasks.apply(&json!({
+            "subtype": "task_started",
+            "task_id": "sh-fg",
+            "task_type": "local_bash",
+            "description": "Run long CI",
+            "tool_use_id": "toolu_ci",
+            "is_backgrounded": false
+        }));
+        assert!(tasks.ids().is_empty());
+        assert!(!tasks.pending());
+
+        // Moved to background via background_tasks_changed
+        tasks.apply(&json!({
+            "subtype": "background_tasks_changed",
+            "tasks": [{ "task_id": "sh-fg", "description": "Still running CI" }]
+        }));
+        assert_eq!(tasks.ids(), [json!("sh-fg")]);
+        assert!(tasks.pending());
+        let listed = tasks.tasks();
+        assert_eq!(listed[0]["taskId"], "sh-fg");
+        assert_eq!(listed[0]["toolUseId"], "toolu_ci");
+        assert_eq!(listed[0]["taskType"], "local_bash");
+        assert_eq!(listed[0]["description"], "Still running CI");
+        assert!(listed[0].get("startedAt").is_some());
+
+        // Completing it owes a follow-up because it was main session
+        tasks.apply(&json!({
+            "subtype": "task_notification",
+            "task_id": "sh-fg",
+            "status": "completed"
+        }));
+        tasks.apply(&json!({ "subtype": "background_tasks_changed", "tasks": [] }));
+        assert!(tasks.ids().is_empty());
+        assert!(tasks.pending(), "owes follow-up because main-session foreground was backgrounded");
+    }
+
+    #[test]
     fn a_notification_owes_a_result_from_the_next_invocation() {
         let mut tasks = BackgroundTasks::default();
         assert!(!tasks.pending());
@@ -3125,6 +3164,9 @@ struct BackgroundTasks {
     /// Live background tasks by task_id, with what clients show while the
     /// turn only waits on them.
     live: HashMap<String, BackgroundTaskInfo>,
+    /// Known task metadata seen this turn (foreground or background):
+    /// task_id -> info.
+    known: HashMap<String, BackgroundTaskInfo>,
     /// Main-session background tasks seen this turn. Tasks a subagent owns
     /// notify that subagent, not the main session, so they owe no follow-up.
     main: HashSet<String>,
@@ -3134,7 +3176,7 @@ struct BackgroundTasks {
 }
 
 /// Display details from the frame that announced a background task.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct BackgroundTaskInfo {
     description: Option<String>,
     task_type: Option<String>,
@@ -3178,15 +3220,32 @@ impl BackgroundTasks {
             // queued notifications.
             Some("init") => self.owed.clear(),
             Some("task_started") => {
-                if message.get("is_backgrounded").and_then(Value::as_bool) == Some(false) {
+                let Some(id) = message.get("task_id").and_then(Value::as_str) else {
                     return;
+                };
+                let is_subagent = message.get("owned_by_subagent").and_then(Value::as_bool) == Some(true)
+                    || message.get("parent_task_id").and_then(Value::as_str).is_some();
+                let info =
+                    BackgroundTaskInfo::from_frame(message, Some(Utc::now().to_rfc3339()));
+                self.known.entry(id.to_owned()).or_default().merge(info.clone());
+                if !is_subagent {
+                    self.main.insert(id.to_owned());
+                    if message.get("is_backgrounded").and_then(Value::as_bool) != Some(false) {
+                        self.live.entry(id.to_owned()).or_default().merge(info);
+                    }
                 }
-                if let Some(id) = message.get("task_id").and_then(Value::as_str) {
-                    let info =
-                        BackgroundTaskInfo::from_frame(message, Some(Utc::now().to_rfc3339()));
-                    self.live.entry(id.to_owned()).or_default().merge(info);
-                    if message.get("owned_by_subagent").and_then(Value::as_bool) != Some(true) {
-                        self.main.insert(id.to_owned());
+            }
+            Some("task_updated") => {
+                let Some(id) = message.get("task_id").and_then(Value::as_str) else {
+                    return;
+                };
+                if let Some(bg) = message.pointer("/patch/is_backgrounded").and_then(Value::as_bool) {
+                    if bg && self.main.contains(id) {
+                        let mut info = self.known.get(id).cloned().unwrap_or_default();
+                        info.merge(BackgroundTaskInfo::from_frame(message, None));
+                        self.live.insert(id.to_owned(), info);
+                    } else if !bg {
+                        self.live.remove(id);
                     }
                 }
             }
@@ -3200,12 +3259,14 @@ impl BackgroundTasks {
                 }
             }
             Some("task_progress") => {
-                if let Some(info) = message
-                    .get("task_id")
-                    .and_then(Value::as_str)
-                    .and_then(|id| self.live.get_mut(id))
-                {
-                    info.merge(BackgroundTaskInfo::from_frame(message, None));
+                if let Some(id) = message.get("task_id").and_then(Value::as_str) {
+                    let update = BackgroundTaskInfo::from_frame(message, None);
+                    if let Some(info) = self.known.get_mut(id) {
+                        info.merge(update.clone());
+                    }
+                    if let Some(info) = self.live.get_mut(id) {
+                        info.merge(update);
+                    }
                 }
             }
             Some("background_tasks_changed") => {
@@ -3215,7 +3276,17 @@ impl BackgroundTasks {
                         let Some(id) = task.get("task_id").and_then(Value::as_str) else {
                             continue;
                         };
-                        let mut info = previous.remove(id).unwrap_or_default();
+                        let is_subagent = task.get("owned_by_subagent").and_then(Value::as_bool) == Some(true)
+                            || task.get("parent_task_id").and_then(Value::as_str).is_some()
+                            || !self.main.contains(id) && self.known.contains_key(id);
+                        if is_subagent {
+                            continue;
+                        }
+                        self.main.insert(id.to_owned());
+                        let mut info = previous
+                            .remove(id)
+                            .or_else(|| self.known.get(id).cloned())
+                            .unwrap_or_default();
                         info.merge(BackgroundTaskInfo::from_frame(task, None));
                         self.live.insert(id.to_owned(), info);
                     }

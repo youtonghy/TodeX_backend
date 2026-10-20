@@ -24,9 +24,14 @@ const FOLLOW_UP_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
 pub(super) struct SessionWork {
-    /// Live background tasks of the main session: task id → its type,
-    /// which only `task_started` carries.
+    /// Live background tasks of the main session: task id → its type.
     live: HashMap<String, Option<String>>,
+    /// Known tasks of the session (including foreground tasks):
+    /// task id → (task_type, is_subagent).
+    known: HashMap<String, (Option<String>, bool)>,
+    /// Background tasks that recently left `live` via `background_tasks_changed`,
+    /// retained briefly in case `task_notification` arrives slightly after.
+    recently_left: HashMap<String, (Option<String>, Instant)>,
     /// When scheduled wakeups are due.
     wakeups: Vec<Instant>,
     /// A recurring `CronCreate` job exists; it has no end Claude reports.
@@ -46,6 +51,7 @@ impl SessionWork {
     /// A turn starts: what finished before it is its own business now.
     pub(super) fn begin_turn(&mut self) {
         self.finished.clear();
+        self.recently_left.clear();
     }
 
     /// Tracks a `system` frame, in or between turns.
@@ -53,20 +59,37 @@ impl SessionWork {
         let task_id = message.get("task_id").and_then(Value::as_str);
         match message.get("subtype").and_then(Value::as_str) {
             Some("task_started") => {
-                if message.get("is_backgrounded").and_then(Value::as_bool) == Some(false)
-                    || message.get("owned_by_subagent").and_then(Value::as_bool) == Some(true)
-                {
-                    return;
+                let Some(id) = task_id else { return };
+                let is_subagent = message.get("owned_by_subagent").and_then(Value::as_bool) == Some(true)
+                    || message.get("parent_task_id").and_then(Value::as_str).is_some();
+                let task_type = message.get("task_type").and_then(Value::as_str).map(str::to_owned);
+                self.known.insert(id.to_owned(), (task_type.clone(), is_subagent));
+                if !is_subagent && message.get("is_backgrounded").and_then(Value::as_bool) != Some(false) {
+                    self.live.insert(id.to_owned(), task_type);
                 }
-                if let Some(id) = task_id {
-                    let task_type = message.get("task_type").and_then(Value::as_str);
-                    self.live
-                        .insert(id.to_owned(), task_type.map(str::to_owned));
+            }
+            Some("task_updated") => {
+                let Some(id) = task_id else { return };
+                if let Some(bg) = message.pointer("/patch/is_backgrounded").and_then(Value::as_bool) {
+                    let (task_type, is_subagent) = self.known.get(id).cloned().unwrap_or((None, false));
+                    if !is_subagent {
+                        if bg {
+                            self.live.insert(id.to_owned(), task_type);
+                        } else {
+                            self.live.remove(id);
+                        }
+                    }
                 }
             }
             Some("task_notification") => {
                 let Some(id) = task_id else { return };
-                let Some(started_type) = self.live.remove(id) else {
+                let started_type = self.live.remove(id).or_else(|| {
+                    self.recently_left
+                        .remove(id)
+                        .filter(|(_, at)| at.elapsed() < Duration::from_secs(10))
+                        .map(|(t, _)| t)
+                });
+                let Some(started_type) = started_type else {
                     return;
                 };
                 let text = |key: &str| {
@@ -84,15 +107,34 @@ impl SessionWork {
                 self.finished_at = Some(Instant::now());
             }
             Some("background_tasks_changed") => {
-                // Every live background task after the change.
-                let current: HashSet<&str> = message
-                    .get("tasks")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|task| task.get("task_id").and_then(Value::as_str))
-                    .collect();
-                self.live.retain(|id, _| current.contains(id.as_str()));
+                let mut current_main = HashSet::new();
+                if let Some(tasks) = message.get("tasks").and_then(Value::as_array) {
+                    for task in tasks {
+                        let Some(id) = task.get("task_id").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let is_subagent = task.get("owned_by_subagent").and_then(Value::as_bool) == Some(true)
+                            || task.get("parent_task_id").and_then(Value::as_str).is_some()
+                            || self.known.get(id).is_some_and(|(_, sub)| *sub);
+                        if !is_subagent {
+                            current_main.insert(id.to_owned());
+                            let task_type = task
+                                .get("task_type")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .or_else(|| self.known.get(id).and_then(|(t, _)| t.clone()));
+                            self.live.entry(id.to_owned()).or_insert(task_type);
+                        }
+                    }
+                }
+                let now = Instant::now();
+                self.live.retain(|id, task_type| {
+                    let keep = current_main.contains(id);
+                    if !keep {
+                        self.recently_left.insert(id.clone(), (task_type.clone(), now));
+                    }
+                    keep
+                });
             }
             _ => {}
         }
@@ -313,6 +355,62 @@ mod tests {
             json!({ "task_id": "sub", "owned_by_subagent": true }),
         ));
         assert!(!work.pending());
+    }
+
+    #[test]
+    fn a_foreground_task_moved_to_background_holds_and_triggers() {
+        let now = Instant::now();
+        let cap = now + Duration::from_secs(3600);
+        let mut work = SessionWork::default();
+        work.apply_system(&system(
+            "task_started",
+            json!({ "task_id": "b01", "is_backgrounded": false, "task_type": "local_bash" }),
+        ));
+        assert!(!work.pending());
+
+        // Claude Code timed out on foreground execution and backgrounded the command.
+        work.apply_system(&system(
+            "background_tasks_changed",
+            json!({ "tasks": [{ "task_id": "b01", "task_type": "local_bash" }] }),
+        ));
+        assert!(work.pending());
+        assert_eq!(work.hold_until(now, cap), Some(cap));
+        assert_eq!(work.task_ids(), ["b01"]);
+
+        work.apply_system(&system(
+            "task_notification",
+            json!({ "task_id": "b01", "status": "completed",
+                "summary": "Background command finished" }),
+        ));
+        work.apply_system(&system("background_tasks_changed", json!({ "tasks": [] })));
+        assert!(!work.pending());
+        let finished = work.finished_at.unwrap();
+        assert_eq!(work.hold_until(now, cap), Some(finished + FOLLOW_UP_GRACE));
+        assert_eq!(
+            work.trigger(now),
+            json!({ "kind": "background_task", "taskIds": ["b01"], "taskType": "local_bash",
+                "summary": "Background command finished" })
+        );
+    }
+
+    #[test]
+    fn a_foreground_task_updated_to_background_holds() {
+        let now = Instant::now();
+        let cap = now + Duration::from_secs(3600);
+        let mut work = SessionWork::default();
+        work.apply_system(&system(
+            "task_started",
+            json!({ "task_id": "b02", "is_backgrounded": false, "task_type": "local_bash" }),
+        ));
+        assert!(!work.pending());
+
+        work.apply_system(&system(
+            "task_updated",
+            json!({ "task_id": "b02", "patch": { "is_backgrounded": true } }),
+        ));
+        assert!(work.pending());
+        assert_eq!(work.hold_until(now, cap), Some(cap));
+        assert_eq!(work.task_ids(), ["b02"]);
     }
 
     #[test]
