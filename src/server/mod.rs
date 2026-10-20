@@ -12,6 +12,7 @@ mod git;
 mod history_cleanup;
 mod history_keys;
 mod native_history;
+mod pi_mcp;
 mod pi_plugins;
 pub mod protocol;
 mod quota;

@@ -413,6 +413,7 @@ fn authenticated_routes() -> Router<AppState> {
         .merge(super::native_history::routes())
         .merge(super::cli_settings::routes())
         .merge(super::pi_plugins::routes())
+        .merge(super::pi_mcp::routes())
         .merge(super::cli_instructions::routes())
         .merge(super::ssh::routes())
         .merge(super::agent_desktop::routes())
