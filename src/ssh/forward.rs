@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use super::{
     classify_failure,
-    tunnel::{self, GroupChild, StderrTail},
+    tunnel::{self, ChildRegistry, GroupChild, StderrTail},
     SshFailureKind,
 };
 use crate::{error::AppError, remote_fs::askpass::AskpassSecret};
@@ -41,8 +41,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// authenticated (other OpenSSH versions may word their log differently).
 const PROBE_AFTER_AUTH: Duration = Duration::from_secs(2);
 
-const LOCAL_READY: &str = "local forwarding listening on";
-const REMOTE_READY: &str = "remote forward success for:";
+const LOCAL_READY: &str = "local forwarding listening on ";
+const REMOTE_READY: &str = "remote forward success for: listen ";
 const AUTHENTICATED: &str = "authenticated to ";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -341,6 +341,8 @@ struct State {
 pub(crate) struct ForwardRuntime {
     state: Arc<Mutex<State>>,
     reserved: Arc<Mutex<Vec<ReservedListener>>>,
+    /// Set by [`Self::stop_all`]: no forward starts afterwards.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn active(run: &ForwardRunInfo) -> bool {
@@ -371,6 +373,11 @@ impl ForwardRuntime {
     /// when it is already starting or running.
     pub(crate) fn begin(&self, spec: &ForwardSpec) -> Result<Option<u64>, AppError> {
         let mut state = self.state.lock().unwrap();
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AppError::Conflict(
+                "the backend is shutting down".to_owned(),
+            ));
+        }
         if state.entries.get(&spec.id).is_some_and(|e| active(&e.run)) {
             return Ok(None);
         }
@@ -442,6 +449,17 @@ impl ForwardRuntime {
         });
     }
 
+    /// Whether `generation` is still the run of `id` (not stopped, deleted
+    /// or replaced).
+    fn is_current(&self, id: &str, generation: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .get(id)
+            .is_some_and(|entry| entry.generation == generation)
+    }
+
     fn update(&self, id: &str, generation: u64, change: impl FnOnce(&mut ForwardRunInfo)) {
         let mut state = self.state.lock().unwrap();
         if let Some(entry) = state.entries.get_mut(id) {
@@ -462,13 +480,17 @@ impl ForwardRuntime {
         generation: u64,
         mut command: Command,
         secret: Option<AskpassSecret>,
+        children: Arc<ChildRegistry>,
     ) -> ForwardRunInfo {
         if let Some(error) = local_port_in_use(spec).await {
             self.fail(&spec.id, generation, SshFailureKind::Other, error);
             return self.info(&spec.id);
         }
+        if !self.is_current(&spec.id, generation) {
+            return self.info(&spec.id);
+        }
         tunnel::piped_stderr(&mut command);
-        let mut child = match GroupChild::spawn(&mut command) {
+        let mut child = match GroupChild::spawn_tracked(&mut command, Some(children)) {
             Ok(child) => child,
             Err(error) => {
                 let message = if error.kind() == std::io::ErrorKind::NotFound {
@@ -491,7 +513,7 @@ impl ForwardRuntime {
             runtime: self.clone(),
             id: spec.id.clone(),
             generation,
-            kind: spec.kind,
+            spec: spec.clone(),
             probe: local_addresses(spec)
                 .first()
                 .map(|ip| SocketAddr::new(*ip, spec.bind_port)),
@@ -551,6 +573,7 @@ impl ForwardRuntime {
     }
 
     pub(crate) async fn stop_all(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         let ids: Vec<String> = self.state.lock().unwrap().entries.keys().cloned().collect();
         futures_util::future::join_all(ids.iter().map(|id| self.stop(id))).await;
     }
@@ -579,11 +602,55 @@ async fn local_port_in_use(spec: &ForwardSpec) -> Option<String> {
     None
 }
 
+/// Whether ssh's (lowercased) log line reports this forward as ready: the
+/// listener on its own address and port, or the server's confirmation for
+/// its own port and target. Forwards from ssh_config are refused before
+/// start, but the match stays specific all the same.
+fn is_ready_line(spec: &ForwardSpec, lower: &str) -> bool {
+    match spec.kind {
+        ForwardKind::Local | ForwardKind::Dynamic => {
+            let Some((_, rest)) = lower.split_once(LOCAL_READY) else {
+                return false;
+            };
+            let mut words = rest.split_whitespace();
+            let (Some(address), Some("port"), Some(port)) =
+                (words.next(), words.next(), words.next())
+            else {
+                return false;
+            };
+            address
+                .trim_matches(['[', ']'])
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| local_addresses(spec).contains(&ip))
+                && port.trim_end_matches('.') == spec.bind_port.to_string()
+        }
+        ForwardKind::Remote => {
+            let Some((_, rest)) = lower.split_once(REMOTE_READY) else {
+                return false;
+            };
+            let Some((listen, connect)) = rest.split_once(", connect ") else {
+                return false;
+            };
+            let port = spec.bind_port.to_string();
+            let target = format!(
+                "{}:{}",
+                spec.target_host
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                spec.target_port.unwrap_or_default()
+            );
+            (listen == port || listen.ends_with(&format!(":{port}")))
+                && connect.trim_end() == target
+        }
+    }
+}
+
 struct Supervision {
     runtime: ForwardRuntime,
     id: String,
     generation: u64,
-    kind: ForwardKind,
+    spec: ForwardSpec,
     probe: Option<SocketAddr>,
     child: GroupChild,
     tail: StderrTail,
@@ -624,11 +691,7 @@ async fn supervise(mut s: Supervision) {
                 if lower.contains(AUTHENTICATED) && authenticated_at.is_none() {
                     authenticated_at = Some(tokio::time::Instant::now());
                 }
-                let is_ready = match s.kind {
-                    ForwardKind::Local | ForwardKind::Dynamic => lower.contains(LOCAL_READY),
-                    ForwardKind::Remote => lower.contains(REMOTE_READY),
-                };
-                if is_ready {
+                if is_ready_line(&s.spec, &lower) {
                     ready = true;
                     mark_ready(&mut s);
                 }
@@ -907,6 +970,53 @@ mod tests {
             forward_args(&dynamic),
             ["-D".to_owned(), "127.0.0.1:8080".to_owned()]
         );
+    }
+
+    #[test]
+    fn readiness_lines_must_name_this_forward() {
+        let local = normalize(None, input(ForwardKind::Local)).unwrap();
+        let line = |text: &str| text.to_ascii_lowercase();
+        assert!(is_ready_line(
+            &local,
+            &line("debug1: Local forwarding listening on 127.0.0.1 port 8080.")
+        ));
+        for other in [
+            "debug1: Local forwarding listening on 127.0.0.1 port 8081.",
+            "debug1: Local forwarding listening on ::1 port 8080.",
+            "debug1: Local forwarding listening on 0.0.0.0 port 8080.",
+            "debug1: Local forwarding listening on path /tmp/x.",
+        ] {
+            assert!(!is_ready_line(&local, &line(other)), "{other}");
+        }
+        let both = normalize(
+            None,
+            ForwardInput {
+                bind_address: Some("localhost".into()),
+                ..input(ForwardKind::Local)
+            },
+        )
+        .unwrap();
+        assert!(is_ready_line(
+            &both,
+            &line("debug1: Local forwarding listening on ::1 port 8080.")
+        ));
+        let remote = normalize(None, input(ForwardKind::Remote)).unwrap();
+        assert!(is_ready_line(
+            &remote,
+            &line("debug1: remote forward success for: listen 8080, connect localhost:80")
+        ));
+        assert!(is_ready_line(
+            &remote,
+            &line("debug1: remote forward success for: listen 0.0.0.0:8080, connect localhost:80")
+        ));
+        for other in [
+            "debug1: remote forward success for: listen 8081, connect localhost:80",
+            "debug1: remote forward success for: listen 8080, connect localhost:81",
+            "debug1: remote forward success for: listen 18080, connect localhost:80",
+            "debug1: remote forward failure for: listen 8080, connect localhost:80",
+        ] {
+            assert!(!is_ready_line(&remote, &line(other)), "{other}");
+        }
     }
 
     #[test]

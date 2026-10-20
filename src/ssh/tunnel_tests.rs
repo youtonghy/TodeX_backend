@@ -64,17 +64,28 @@ fn free_port(ip: std::net::IpAddr) -> u16 {
         .port()
 }
 
-/// Reports a listener like OpenSSH at LogLevel=DEBUG1, then stays up.
-const READY_SSH: &str = r#"echo "debug1: Authenticated to x ([10.0.0.5]:22) using \"publickey\"." >&2
-echo "debug1: Local forwarding listening on 127.0.0.1 port 1." >&2
-echo "debug1: remote forward success for: listen 8080, connect localhost:80" >&2
-exec sleep 30
+/// Reports each forward of its arguments as ready, like OpenSSH at
+/// LogLevel=DEBUG1 (IPv4 binds and `-R port:host:port` only).
+const READY_LINES: &str = r#"echo "debug1: Authenticated to x ([10.0.0.5]:22) using \"publickey\"." >&2
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    -L|-D) echo "debug1: Local forwarding listening on $(echo "$a" | cut -d: -f1) port $(echo "$a" | cut -d: -f2)." >&2;;
+    -R) echo "debug1: remote forward success for: listen ${a%%:*}, connect ${a#*:}" >&2;;
+  esac
+  prev="$a"
+done
 "#;
+
+/// [`READY_LINES`], then stays up.
+fn ready_ssh() -> String {
+    format!("{READY_LINES}exec sleep 30\n")
+}
 
 #[tokio::test]
 async fn forwards_run_a_dedicated_ssh_and_stop_it() {
     let fixture = fixture("Host good\n").await;
-    fake_ssh(&fixture, READY_SSH);
+    fake_ssh(&fixture, &ready_ssh());
     let port = free_port(std::net::Ipv4Addr::LOCALHOST.into());
     let forward = fixture
         .service
@@ -195,7 +206,8 @@ async fn forward_failures_are_reported_in_the_state() {
         .create_forward(local_forward("good", taken.local_addr().unwrap().port()))
         .await
         .unwrap();
-    let runs_before = log(&fixture).lines().count();
+    let ssh_runs = |fixture: &Fixture| log(fixture).matches(" -L ").count();
+    let runs_before = ssh_runs(&fixture);
     let failed = fixture
         .service
         .start_forward(&busy.spec.id, None)
@@ -211,13 +223,14 @@ async fn forward_failures_are_reported_in_the_state() {
             .contains("cannot listen"),
         "{failed:?}"
     );
-    assert_eq!(log(&fixture).lines().count(), runs_before);
+    assert_eq!(ssh_runs(&fixture), runs_before);
 
     // A forward that dies later turns failed with its reason.
     fake_ssh(
         &fixture,
-        r#"echo "debug1: Local forwarding listening on 127.0.0.1 port 1." >&2
-sleep 0.3; echo "Connection to x closed by remote host." >&2; exit 255"#,
+        &format!(
+            "{READY_LINES}sleep 0.3; echo \"Connection to x closed by remote host.\" >&2; exit 255"
+        ),
     );
     let running = fixture
         .service
@@ -241,7 +254,7 @@ sleep 0.3; echo "Connection to x closed by remote host." >&2; exit 255"#,
 #[tokio::test]
 async fn password_forwards_use_askpass_on_their_own_connection() {
     let fixture = fixture("Host good\n").await;
-    fake_ssh(&fixture, READY_SSH);
+    fake_ssh(&fixture, &ready_ssh());
     let port = free_port(std::net::Ipv4Addr::LOCALHOST.into());
     let forward = fixture
         .service
@@ -271,7 +284,7 @@ async fn password_forwards_use_askpass_on_their_own_connection() {
 #[tokio::test]
 async fn deleting_a_host_removes_its_forwards_and_address() {
     let fixture = fixture("").await;
-    fake_ssh(&fixture, READY_SSH);
+    fake_ssh(&fixture, &ready_ssh());
     fixture.service.create_host(managed("db")).await.unwrap();
     fixture.service.create_host(managed("web")).await.unwrap();
     let port = free_port(std::net::Ipv4Addr::LOCALHOST.into());
@@ -857,4 +870,297 @@ async fn real_ssh_forwards_and_pool() {
     assert!(get(format!("{ip}:{http}")).await.contains("hello-e2e"));
     service.shutdown().await;
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn forwards_refuse_hosts_with_config_forwards() {
+    let fixture = fixture("Host good\n").await;
+    fake_ssh(&fixture, &ready_ssh());
+    // `ssh -G` reporting a LocalForward from ssh_config.
+    let path = fixture.root.join("fake-ssh");
+    let script = std::fs::read_to_string(&path).unwrap().replace(
+        "printf 'hostname x.example\\nuser ops\\nport 22\\n'",
+        "printf 'hostname x.example\\nuser ops\\nport 22\\nlocalforward 127.0.0.1:5000 db:5432\\n'",
+    );
+    std::fs::write(&path, script).unwrap();
+    let forward = fixture
+        .service
+        .create_forward(local_forward(
+            "good",
+            free_port(std::net::Ipv4Addr::LOCALHOST.into()),
+        ))
+        .await
+        .unwrap();
+    let started = fixture
+        .service
+        .start_forward(&forward.spec.id, None)
+        .await
+        .unwrap();
+    assert_eq!(started.run.status, ForwardStatus::Failed);
+    assert_eq!(started.run.failure, Some(SshFailureKind::Other));
+    let error = started.run.error.unwrap();
+    assert!(
+        error.contains("LocalForward") && error.contains("IP pool"),
+        "{error}"
+    );
+    assert!(!log(&fixture).contains(" -L "));
+}
+
+#[tokio::test]
+async fn readiness_needs_the_forwards_own_listener() {
+    let fixture = fixture("Host good\n").await;
+    // Another listener's line, then the process stays up without ours.
+    fake_ssh(
+        &fixture,
+        r#"echo "debug1: Local forwarding listening on 127.0.0.1 port 1." >&2
+exec sleep 30"#,
+    );
+    let port = free_port(std::net::Ipv4Addr::LOCALHOST.into());
+    let forward = fixture
+        .service
+        .create_forward(local_forward("good", port))
+        .await
+        .unwrap();
+    let service = fixture.service.clone();
+    let id = forward.spec.id.clone();
+    let start = tokio::spawn(async move { service.start_forward(&id, None).await });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        fixture.service.list_forwards().await[0].run.status,
+        ForwardStatus::Starting
+    );
+    fixture
+        .service
+        .stop_forward(&forward.spec.id)
+        .await
+        .unwrap();
+    let stopped = start.await.unwrap().unwrap();
+    assert_eq!(stopped.run.status, ForwardStatus::Stopped);
+}
+
+#[tokio::test]
+async fn no_forward_starts_after_shutdown() {
+    let fixture = fixture("Host good\n").await;
+    fake_ssh(&fixture, &ready_ssh());
+    let forward = fixture
+        .service
+        .create_forward(local_forward(
+            "good",
+            free_port(std::net::Ipv4Addr::LOCALHOST.into()),
+        ))
+        .await
+        .unwrap();
+    fixture.service.shutdown().await;
+    assert!(matches!(
+        fixture.service.start_forward(&forward.spec.id, None).await,
+        Err(AppError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn stores_with_odd_forwards_still_load() {
+    for forwards in ["null", "5", r#""x""#, r#"{"a":1}"#] {
+        let root = std::env::temp_dir().join(format!("todex-ssh-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(root.join("data/ssh")).unwrap();
+        std::fs::write(
+            root.join("data/ssh/store.json"),
+            format!(r#"{{"managedHosts":[],"forwards":{forwards},"ipPool":null}}"#),
+        )
+        .unwrap();
+        let service = SshService::with_home(&root.join("data"), "ssh".into(), None)
+            .await
+            .unwrap_or_else(|error| panic!("{forwards}: {error}"));
+        assert!(service.list_forwards().await.is_empty());
+        assert!(!service.ip_pool().await.enabled);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// A killed daemon's pool masters are asked to exit through their stale
+/// control sockets, and its recorded children are ended at the next start.
+#[tokio::test]
+async fn startup_ends_what_a_killed_daemon_left() {
+    let fixture = fixture("").await;
+    pool_ssh(&fixture);
+    // The control directory is prepared once the pool runs.
+    fixture.service.create_host(managed("db")).await.unwrap();
+    fixture
+        .service
+        .create_ip_assignment(AssignmentInput {
+            ip: Some("127.77.0.8".into()),
+            alias: "db".into(),
+            port_mode: PortMode::Manual,
+            ports: Some(vec!["1".into()]),
+        })
+        .await
+        .unwrap();
+    enable_pool(&fixture.service).await;
+    fixture.service.shutdown().await;
+    let pool_dir = fixture.root.join("data/ssh/pool");
+    let stale = pool_dir.join("127.77.0.9");
+    let _socket = std::os::unix::net::UnixListener::bind(&stale).unwrap();
+
+    // A recorded ssh child that still runs with TodeX's arguments.
+    let wrapper = fixture.root.join("data/ssh/ssh_config");
+    let mut orphan = match std::process::Command::new("ssh")
+        .arg("-F")
+        .arg(&wrapper)
+        .args([
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ProxyCommand=sleep 60",
+            "-o",
+            "ConnectTimeout=60",
+            "-N",
+            "orphan-host",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => Some(child),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("ssh: {error}"),
+    };
+    // An unrelated process under a recorded pid is left alone.
+    let mut bystander = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut pids = vec![serde_json::json!({ "pid": bystander.id() })];
+    if let Some(orphan) = &orphan {
+        pids.push(serde_json::json!({ "pid": orphan.id() }));
+    }
+    std::fs::write(
+        fixture.root.join("data/ssh/children.json"),
+        serde_json::to_vec(&pids).unwrap(),
+    )
+    .unwrap();
+
+    let _reloaded = SshService::with_home(
+        &fixture.root.join("data"),
+        fixture.root.join("fake-ssh").display().to_string(),
+        Some(fixture.root.join("home")),
+    )
+    .await
+    .unwrap();
+    assert!(!stale.exists());
+    let log_text = log(&fixture);
+    assert!(
+        log_text.contains(&format!("ControlPath={} -O exit", stale.display())),
+        "{log_text}"
+    );
+    if let Some(orphan) = &mut orphan {
+        let mut ended = false;
+        for _ in 0..30 {
+            if orphan.try_wait().unwrap().is_some() {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ended, "the orphaned ssh was not ended");
+    }
+    assert!(bystander.try_wait().unwrap().is_none());
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+}
+
+/// A pool directory that is not private (here a symlink) disables the pool
+/// with a clear error instead of being used.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn unsafe_pool_directory_is_refused() {
+    let fixture = fixture("").await;
+    fixture.service.create_host(managed("db")).await.unwrap();
+    let pool_dir = fixture.root.join("data/ssh/pool");
+    let _ = std::fs::remove_dir_all(&pool_dir);
+    let elsewhere = fixture.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &pool_dir).unwrap();
+    let service = SshService::with_home(
+        &fixture.root.join("data"),
+        fixture.root.join("fake-ssh").display().to_string(),
+        Some(fixture.root.join("home")),
+    )
+    .await
+    .unwrap();
+    service
+        .create_ip_assignment(AssignmentInput {
+            ip: Some("127.77.0.31".into()),
+            alias: "db".into(),
+            port_mode: PortMode::Manual,
+            ports: Some(vec![free_port("127.77.0.31".parse().unwrap()).to_string()]),
+        })
+        .await
+        .unwrap();
+    enable_pool(&service).await;
+    let view = service.ip_pool().await.assignments[0].clone();
+    assert_eq!(view.listening_ports, 0);
+    let bind_error = view.bind_error.unwrap();
+    assert_eq!(bind_error.kind, ip_pool::BindErrorKind::Other);
+    assert!(
+        bind_error.message.contains("unsafe"),
+        "{}",
+        bind_error.message
+    );
+    let view = service
+        .connect_ip_assignment("127.77.0.31".parse().unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(view.state, AssignmentState::Failed);
+    service.shutdown().await;
+}
+
+/// ssh exits while the client keeps its socket open (and a helper keeps
+/// ssh's stdout open): the connection still ends and is no longer counted.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn connections_end_when_ssh_exits() {
+    let fixture = fixture("").await;
+    pool_ssh(&fixture);
+    // `-W` clients answer, leave a helper holding stdout, and exit.
+    let path = fixture.root.join("fake-ssh");
+    let script = std::fs::read_to_string(&path).unwrap().replace(
+        r#"echo "via $target"; cat > /dev/null; exit 0"#,
+        r#"echo "via $target"; (sleep 30) & exit 0"#,
+    );
+    std::fs::write(&path, script).unwrap();
+    fixture.service.create_host(managed("db")).await.unwrap();
+    let ip: std::net::Ipv4Addr = "127.77.0.25".parse().unwrap();
+    let port = free_port(ip.into());
+    fixture
+        .service
+        .create_ip_assignment(AssignmentInput {
+            ip: Some(ip.to_string()),
+            alias: "db".into(),
+            port_mode: PortMode::Manual,
+            ports: Some(vec![port.to_string()]),
+        })
+        .await
+        .unwrap();
+    enable_pool(&fixture.service).await;
+    let mut stream = tokio::net::TcpStream::connect((ip, port)).await.unwrap();
+    assert_eq!(
+        read_line(&mut stream).await,
+        format!("via 127.0.0.1:{port}\n")
+    );
+    // The client neither writes nor closes; the daemon closes the stream.
+    let mut rest = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest)).await;
+    assert!(read.is_ok(), "the connection was not closed");
+    let mut counted = true;
+    for _ in 0..40 {
+        if fixture.service.ip_pool().await.assignments[0].active_connections == 0 {
+            counted = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!counted, "the connection is still counted");
+    drop(stream);
+    fixture.service.shutdown().await;
 }

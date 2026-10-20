@@ -53,6 +53,8 @@ const MANAGED_HOSTS_FILE: &str = "hosts.conf";
 const DEFAULTS_FILE: &str = "defaults.conf";
 const WRAPPER_FILE: &str = "ssh_config";
 const CONTROL_DIR: &str = "cm";
+/// Pids of running forwards and pool masters (see [`tunnel::ChildRegistry`]).
+const CHILDREN_FILE: &str = "children.json";
 /// One-shot password files for the askpass helper.
 const ASKPASS_DIR: &str = "askpass";
 /// How long a terminal's password file may wait for ssh's prompt. The
@@ -143,9 +145,10 @@ struct PersistedStore {
     auth_methods: BTreeMap<String, String>,
     #[serde(default)]
     connection: Option<config_file::StoredConnection>,
-    /// Read entry by entry so one invalid forward does not drop the rest.
+    /// Read entry by entry so one invalid forward does not drop the rest;
+    /// anything but an array (also `null`) counts as no forwards.
     #[serde(default)]
-    forwards: Vec<serde_json::Value>,
+    forwards: Option<serde_json::Value>,
     #[serde(default)]
     ip_pool: Option<serde_json::Value>,
 }
@@ -198,13 +201,17 @@ impl SshStore {
             ftp_sites: persisted.ftp_sites,
             agent_access: persisted.agent_access,
             connection: persisted.connection.map(Into::into).unwrap_or_default(),
-            forwards: dedup_forwards(
-                persisted
-                    .forwards
+            forwards: dedup_forwards(match persisted.forwards {
+                Some(serde_json::Value::Array(entries)) => entries
                     .into_iter()
                     .filter_map(forward::from_stored)
                     .collect(),
-            ),
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(_) => {
+                    tracing::warn!("ignoring stored ssh forwards that are not a list");
+                    Vec::new()
+                }
+            }),
             ip_pool: persisted
                 .ip_pool
                 .map(StoredIpPool::from_stored)
@@ -260,6 +267,10 @@ pub(crate) struct ResolvedHost {
     #[serde(skip)]
     pub proxy_command: Option<String>,
     pub identity_files: Vec<String>,
+    /// Internal only: `LocalForward`/`RemoteForward`/`DynamicForward` set
+    /// in the config; ssh would add them to a manual forward's process.
+    #[serde(skip)]
+    pub config_forwards: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -378,6 +389,8 @@ struct Inner {
 pub(crate) struct Launcher {
     ssh_bin: String,
     wrapper: PathBuf,
+    /// Long-running children, recorded so a later daemon can end orphans.
+    children: Arc<tunnel::ChildRegistry>,
 }
 
 impl Launcher {
@@ -433,6 +446,11 @@ impl SshService {
             tokio::task::spawn_blocking(move || {
                 secure_fs::ensure_owner_only_dir(&dir)?;
                 secure_fs::ensure_owner_only_dir(&control_dir)?;
+                // Forwards and pool masters of a daemon that was killed.
+                tunnel::ChildRegistry::reap_stale(
+                    &dir.join(CHILDREN_FILE),
+                    &dir.join(WRAPPER_FILE),
+                );
                 askpass::purge(&dir.join(ASKPASS_DIR))
             })
             .await
@@ -447,6 +465,9 @@ impl SshService {
         let launcher = Launcher {
             ssh_bin: ssh_bin.clone(),
             wrapper: dir.join(WRAPPER_FILE),
+            children: Arc::new(tunnel::ChildRegistry::new(
+                cfg!(unix).then(|| dir.join(CHILDREN_FILE)),
+            )),
         };
         let pool = {
             let launcher = launcher.clone();
@@ -1040,6 +1061,13 @@ impl SshService {
         next.ip_pool.assignments.retain(|a| a.alias != alias);
         let result = self.save(&mut store, next).await;
         drop(store);
+        if result.is_ok() {
+            // A start that slipped in before the save cannot find the
+            // forwards any more, but may have begun: end it.
+            for id in &forward_ids {
+                self.inner.forwards.forget(id).await;
+            }
+        }
         // Restores the assignment if the write failed.
         self.sync_pool().await;
         result
@@ -1322,7 +1350,12 @@ impl SshService {
         if next.forwards.len() == store.forwards.len() {
             return Err(AppError::NotFound(format!("ssh forward {id}")));
         }
-        self.save(&mut store, next).await
+        self.save(&mut store, next).await?;
+        drop(store);
+        // Starts begin under the store read lock and re-check the spec, so
+        // none can begin after the save; one that began before it ends here.
+        self.inner.forwards.forget(id).await;
+        Ok(())
     }
 
     /// Starts a forward and waits until it is ready or failed. Runtime
@@ -1337,9 +1370,42 @@ impl SshService {
         if let Some(password) = password {
             validate_password(password)?;
         }
-        let Some(generation) = self.inner.forwards.begin(&spec)? else {
+        // Begun under the store lock with the spec as stored right now, so
+        // a concurrent update (which refuses active forwards) or delete
+        // cannot leave a run of an outdated or deleted spec.
+        let generation = {
+            let store = self.inner.store.read().await;
+            match store.forwards.iter().find(|f| f.id == id) {
+                Some(current) if *current == spec => self.inner.forwards.begin(&spec)?,
+                Some(_) => {
+                    return Err(AppError::Conflict(
+                        "the forward changed while starting; try again".to_owned(),
+                    ))
+                }
+                None => return Err(AppError::NotFound(format!("ssh forward {id}"))),
+            }
+        };
+        let Some(generation) = generation else {
             return Ok(self.forward_view(&spec));
         };
+        // ssh adds forwards from ssh_config to every connection to the
+        // host; `ClearAllForwardings` would drop this forward too.
+        if let Ok(resolved) = self.resolve_with(&spec.alias, false).await {
+            if resolved.config_forwards {
+                self.inner.forwards.fail(
+                    id,
+                    generation,
+                    SshFailureKind::Other,
+                    format!(
+                        "{} defines LocalForward, RemoteForward or DynamicForward in ssh_config, \
+                         which ssh would also open with this forward; remove them from the \
+                         host's config or use the IP pool for this host",
+                        spec.alias
+                    ),
+                );
+                return Ok(self.forward_view(&spec));
+            }
+        }
         let (command, secret) = match self.forward_command(&spec, password).await {
             Ok(built) => built,
             Err(error) => {
@@ -1349,7 +1415,13 @@ impl SshService {
         };
         self.inner
             .forwards
-            .run(&spec, generation, command, secret)
+            .run(
+                &spec,
+                generation,
+                command,
+                secret,
+                self.inner.launcher.children.clone(),
+            )
             .await;
         Ok(self.forward_view(&spec))
     }
@@ -1637,6 +1709,7 @@ fn parse_resolved(output: &str) -> ResolvedHost {
             "proxyjump" if value != "none" => resolved.proxy_jump = Some(value.to_owned()),
             "proxycommand" if value != "none" => resolved.proxy_command = Some(value.to_owned()),
             "identityfile" => resolved.identity_files.push(value.to_owned()),
+            "localforward" | "remoteforward" | "dynamicforward" => resolved.config_forwards = true,
             _ => {}
         }
     }
