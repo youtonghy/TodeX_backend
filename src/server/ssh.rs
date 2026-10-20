@@ -9,10 +9,13 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::Ipv4Addr;
 use zeroize::Zeroizing;
 
 use crate::app_state::AppState;
 use crate::error::AppError;
+use crate::ssh::forward::ForwardInput;
+use crate::ssh::ip_pool::{AssignmentInput, AssignmentUpdate, PoolConfigInput};
 use crate::ssh::keys::{KeyGenerateRequest, KeyImportRequest};
 use crate::ssh::login::LoginAnswer;
 use crate::ssh::{ConnectionSettings, FtpSiteInput, ManagedHost};
@@ -85,6 +88,27 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/v2/ssh/keys/generate",
             post(generate_key).layer(DefaultBodyLimit::max(MAX_KEY_BODY_BYTES)),
+        )
+        .route("/v2/ssh/forwards", get(list_forwards).post(create_forward))
+        .route(
+            "/v2/ssh/forwards/{id}",
+            put(update_forward).delete(delete_forward),
+        )
+        .route("/v2/ssh/forwards/{id}/start", post(start_forward))
+        .route("/v2/ssh/forwards/{id}/stop", post(stop_forward))
+        .route("/v2/ssh/ip-pool", get(get_ip_pool).put(set_ip_pool))
+        .route("/v2/ssh/ip-pool/assignments", post(create_ip_assignment))
+        .route(
+            "/v2/ssh/ip-pool/assignments/{ip}",
+            put(update_ip_assignment).delete(delete_ip_assignment),
+        )
+        .route(
+            "/v2/ssh/ip-pool/assignments/{ip}/connect",
+            post(connect_ip_assignment),
+        )
+        .route(
+            "/v2/ssh/ip-pool/assignments/{ip}/disconnect",
+            post(disconnect_ip_assignment),
         )
         .route("/v2/ftp/sites", post(create_ftp_site))
         .route(
@@ -190,11 +214,172 @@ fn parse_test_request(body: &[u8]) -> Result<TestRequest, AppError> {
             _ => "not valid JSON",
         };
         AppError::InvalidRequest(format!(
-            "invalid test request body at line {} column {}: {problem}",
+            "invalid request body at line {} column {}: {problem}",
             error.line(),
             error.column()
         ))
     })
+}
+
+/// The optional `{ password?: string }` body of start/connect requests;
+/// blank or empty passwords mean none.
+fn optional_password(body: &[u8]) -> Result<Option<Zeroizing<String>>, AppError> {
+    Ok(parse_test_request(body)?
+        .password
+        .map(Zeroizing::new)
+        .filter(|password| !password.is_empty()))
+}
+
+async fn list_forwards(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    Ok(Json(json!({ "forwards": state.ssh.list_forwards().await })))
+}
+
+async fn create_forward(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ForwardInput>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let forward = state.ssh.create_forward(input).await?;
+    Ok(Json(json!({ "forward": forward })))
+}
+
+async fn update_forward(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(input): Json<ForwardInput>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let forward = state.ssh.update_forward(&id, input).await?;
+    Ok(Json(json!({ "forward": forward })))
+}
+
+async fn delete_forward(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    state.ssh.delete_forward(&id).await?;
+    Ok(Json(json!({ "deleted": true })))
+}
+
+async fn start_forward(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let password = optional_password(&body)?;
+    let forward = state
+        .ssh
+        .start_forward(&id, password.as_deref().map(String::as_str))
+        .await?;
+    Ok(Json(json!({ "forward": forward })))
+}
+
+async fn stop_forward(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let forward = state.ssh.stop_forward(&id).await?;
+    Ok(Json(json!({ "forward": forward })))
+}
+
+/// An unknown or malformed address is simply not assigned.
+fn assignment_ip(raw: &str) -> Result<Ipv4Addr, AppError> {
+    raw.parse()
+        .map_err(|_| AppError::NotFound(format!("ip pool assignment {raw}")))
+}
+
+async fn get_ip_pool(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    Ok(Json(serde_json::to_value(state.ssh.ip_pool().await)?))
+}
+
+async fn set_ip_pool(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<PoolConfigInput>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    Ok(Json(serde_json::to_value(
+        state.ssh.set_ip_pool(input).await?,
+    )?))
+}
+
+async fn create_ip_assignment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<AssignmentInput>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let assignment = state.ssh.create_ip_assignment(input).await?;
+    Ok(Json(json!({ "assignment": assignment })))
+}
+
+async fn update_ip_assignment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(ip): AxumPath<String>,
+    Json(input): Json<AssignmentUpdate>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let assignment = state
+        .ssh
+        .update_ip_assignment(assignment_ip(&ip)?, input)
+        .await?;
+    Ok(Json(json!({ "assignment": assignment })))
+}
+
+async fn delete_ip_assignment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(ip): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    state.ssh.delete_ip_assignment(assignment_ip(&ip)?).await?;
+    Ok(Json(json!({ "deleted": true })))
+}
+
+async fn connect_ip_assignment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(ip): AxumPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let ip = assignment_ip(&ip)?;
+    let password = optional_password(&body)?;
+    let assignment = state
+        .ssh
+        .connect_ip_assignment(ip, password.as_deref().map(String::as_str))
+        .await?;
+    Ok(Json(json!({ "assignment": assignment })))
+}
+
+async fn disconnect_ip_assignment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(ip): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let assignment = state
+        .ssh
+        .disconnect_ip_assignment(assignment_ip(&ip)?)
+        .await?;
+    Ok(Json(json!({ "assignment": assignment })))
 }
 
 async fn disconnect_host(
@@ -489,5 +674,123 @@ mod tests {
             crate::ssh::login::LoginOutcome::Connected
         );
         assert!(resolution.saved_password);
+    }
+
+    /// The forward and IP pool routes speak the documented JSON and error
+    /// shapes.
+    #[tokio::test]
+    async fn forward_and_pool_routes() {
+        let fake = crate::ssh::tests::fixture("").await;
+        let root = fake.root.join("app");
+        let mut config = Config {
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..Config::default()
+        };
+        config.agent.ssh_bin = fake.root.join("fake-ssh").display().to_string();
+        let state = AppState::new_for_tests(config).await.unwrap();
+        state
+            .ssh
+            .create_host(ManagedHost {
+                alias: "fwd-host".into(),
+                host_name: "10.0.0.5".into(),
+                ..ManagedHost::default()
+            })
+            .await
+            .unwrap();
+        let app = crate::server::loopback_test_router(state);
+        let device = TestDevice::new(38);
+        device.enroll(&root.join("data"));
+        let send = |method: &'static str, uri: String, body: String| {
+            let mut builder = Request::builder().method(method).uri(&uri);
+            builder = builder.header("content-type", "application/json");
+            for (name, value) in device.sign(method, &uri, body.as_bytes()) {
+                builder = builder.header(name, value);
+            }
+            let request = builder.body(Body::from(body)).unwrap();
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+                )
+            }
+        };
+        let (status, value) = send(
+            "POST",
+            "/v2/ssh/forwards".into(),
+            json!({"alias": "fwd-host", "kind": "dynamic", "bindPort": 1080}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["forward"]["status"], "stopped");
+        assert_eq!(value["forward"]["bindAddress"], "127.0.0.1");
+        let id = value["forward"]["id"].as_str().unwrap().to_owned();
+        let (status, value) = send(
+            "POST",
+            "/v2/ssh/forwards".into(),
+            json!({"alias": "fwd-host", "kind": "local", "bindAddress": "0.0.0.0",
+                "bindPort": 8080, "targetHost": "db", "targetPort": 5432})
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_REQUEST");
+        let (status, value) = send("GET", "/v2/ssh/forwards".into(), String::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["forwards"].as_array().unwrap().len(), 1);
+        let (status, value) = send(
+            "POST",
+            format!("/v2/ssh/forwards/{id}/start"),
+            r#"{"password":"hunter2","x":1}"#.into(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!value["message"].as_str().unwrap().contains("hunter2"));
+        let (status, _) = send("POST", "/v2/ssh/forwards/nope/stop".into(), String::new()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, value) = send("DELETE", format!("/v2/ssh/forwards/{id}"), String::new()).await;
+        assert_eq!((status, value), (StatusCode::OK, json!({"deleted": true})));
+
+        let (status, value) = send("GET", "/v2/ssh/ip-pool".into(), String::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["cidr"], "127.77.0.0/24");
+        assert_eq!(value["manualPortLimit"], 4096);
+        let (status, value) = send(
+            "POST",
+            "/v2/ssh/ip-pool/assignments".into(),
+            json!({"alias": "fwd-host", "portMode": "auto"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["assignment"]["ip"], "127.77.0.1");
+        assert_eq!(value["assignment"]["state"], "disabled");
+        assert_eq!(value["assignment"]["ports"], json!([]));
+        let (status, _) = send(
+            "POST",
+            "/v2/ssh/ip-pool/assignments/not-an-ip/disconnect".into(),
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, value) = send(
+            "PUT",
+            "/v2/ssh/ip-pool".into(),
+            json!({"enabled": false, "cidr": "127.0.0.0/16", "idleMinutes": 15}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        let (status, _) = send(
+            "DELETE",
+            "/v2/ssh/ip-pool/assignments/127.77.0.1".into(),
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

@@ -125,6 +125,7 @@ impl AppState {
         let agent_providers = AgentProviderService::new(config.data_dir.clone()).await?;
         remove_retired_workspace_trust(&config.data_dir).await;
         let ssh = SshService::new(&config.data_dir, config.agent.ssh_bin.clone()).await?;
+        ssh.set_reserved_listeners(reserved_listeners(&config));
         let agent_desktop = AgentDesktop::load(&config.data_dir).await?;
         let agent_mcp = AgentMcp::new(&config.data_dir, ssh.clone(), agent_desktop.clone()).await?;
         let devices = DeviceRegistry::load(&config.data_dir)?;
@@ -347,6 +348,24 @@ async fn set_owner_only_directory(path: &std::path::Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+/// The daemon's own listeners, which port forwards must not take over.
+fn reserved_listeners(config: &Config) -> Vec<crate::ssh::forward::ReservedListener> {
+    let listener = |host: &str, port: u16| crate::ssh::forward::ReservedListener {
+        // Unparsable hosts (names) are treated like a wildcard: the safe side.
+        address: host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .filter(|address| !address.is_unspecified()),
+        port,
+    };
+    let mut listeners = vec![listener(&config.host, config.port)];
+    if config.api.enabled {
+        listeners.push(listener(&config.api.host, config.api.port));
+    }
+    listeners
 }
 
 #[cfg(test)]

@@ -9,12 +9,18 @@
 //! a one-shot file (see [`askpass`]).
 
 pub(crate) mod config_file;
+pub(crate) mod forward;
+pub(crate) mod ip_pool;
 pub(crate) mod keys;
 pub(crate) mod login;
+mod tunnel;
+#[cfg(all(test, unix))]
+mod tunnel_tests;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsString,
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -36,6 +42,11 @@ use crate::{
 };
 
 pub(crate) use config_file::{ConnectionSettings, ManagedHost, SnippetImport, SshAuthMethod};
+use forward::{ForwardInput, ForwardRuntime, ForwardSpec, ForwardView};
+use ip_pool::{
+    AssignmentInput, AssignmentUpdate, AssignmentView, HostTraits, PoolConfigInput, PoolRuntime,
+    PoolView, StoredIpPool,
+};
 
 const STORE_FILE: &str = "store.json";
 const MANAGED_HOSTS_FILE: &str = "hosts.conf";
@@ -110,6 +121,9 @@ struct SshStore {
     /// Aliases agents may use. Empty by default: access is opt-in per host.
     agent_access: BTreeSet<String>,
     connection: ConnectionSettings,
+    /// Manual port forwards (configuration only; never auto-started).
+    forwards: Vec<ForwardSpec>,
+    ip_pool: StoredIpPool,
 }
 
 /// `store.json`. Older daemons ignore unknown top-level fields but reject
@@ -129,6 +143,11 @@ struct PersistedStore {
     auth_methods: BTreeMap<String, String>,
     #[serde(default)]
     connection: Option<config_file::StoredConnection>,
+    /// Read entry by entry so one invalid forward does not drop the rest.
+    #[serde(default)]
+    forwards: Vec<serde_json::Value>,
+    #[serde(default)]
+    ip_pool: Option<serde_json::Value>,
 }
 
 /// The written form of [`SshStore`], read back as [`PersistedStore`].
@@ -141,6 +160,10 @@ struct PersistedStoreRef<'a> {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     auth_methods: BTreeMap<&'a str, &'static str>,
     connection: &'a ConnectionSettings,
+    #[serde(skip_serializing_if = "<[ForwardSpec]>::is_empty")]
+    forwards: &'a [ForwardSpec],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip_pool: Option<&'a StoredIpPool>,
 }
 
 impl SshStore {
@@ -175,6 +198,17 @@ impl SshStore {
             ftp_sites: persisted.ftp_sites,
             agent_access: persisted.agent_access,
             connection: persisted.connection.map(Into::into).unwrap_or_default(),
+            forwards: dedup_forwards(
+                persisted
+                    .forwards
+                    .into_iter()
+                    .filter_map(forward::from_stored)
+                    .collect(),
+            ),
+            ip_pool: persisted
+                .ip_pool
+                .map(StoredIpPool::from_stored)
+                .unwrap_or_default(),
         })
     }
 
@@ -196,6 +230,8 @@ impl SshStore {
                 .map(|host| (host.alias.as_str(), host.auth_method.as_str()))
                 .collect(),
             connection: &self.connection,
+            forwards: &self.forwards,
+            ip_pool: (!self.ip_pool.is_default()).then_some(&self.ip_pool),
         };
         Ok(serde_json::to_vec_pretty(&persisted)?)
     }
@@ -329,6 +365,49 @@ struct Inner {
     user_aliases: Arc<config_file::AliasCache>,
     /// Logins agents wait on (see [`login`]).
     logins: login::LoginBroker,
+    launcher: Launcher,
+    forwards: ForwardRuntime,
+    pool: PoolRuntime,
+    /// Serializes pool reconciliation, so the latest store always wins.
+    pool_sync: Mutex<()>,
+}
+
+/// Builds ssh commands that read only TodeX's wrapper config. Cheap to
+/// clone, so long-running forward tasks need no handle on the service.
+#[derive(Clone)]
+pub(crate) struct Launcher {
+    ssh_bin: String,
+    wrapper: PathBuf,
+}
+
+impl Launcher {
+    /// `ssh -F <wrapper> <control> <mode options>`; callers append the rest.
+    pub(crate) fn command(&self, mode: SshMode, control: Vec<OsString>) -> Command {
+        let mut command = external_command::secure_command(&self.ssh_bin);
+        command.args(self.options(mode, control));
+        if mode == SshMode::Askpass {
+            // Use SSH_ASKPASS even without a display or with a tty.
+            command.env("SSH_ASKPASS_REQUIRE", "force");
+        }
+        command
+    }
+
+    /// `control` comes right after `-F`, before any other `-o`: for options
+    /// given more than once, OpenSSH uses the first value.
+    fn options(&self, mode: SshMode, control: Vec<OsString>) -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec!["-F".into(), self.wrapper.clone().into()];
+        args.extend(control);
+        let mode_options: &[&str] = match mode {
+            SshMode::Batch => &["-o", "BatchMode=yes"],
+            SshMode::Askpass => &["-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1"],
+            SshMode::Interactive => return args,
+        };
+        args.extend(mode_options.iter().map(OsString::from));
+        args.extend(
+            ["-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15"].map(OsString::from),
+        );
+        args
+    }
 }
 
 impl SshService {
@@ -365,6 +444,17 @@ impl SshService {
             Err(error) => return Err(error.into()),
         };
         let multiplex = cfg!(unix) && control_dir.as_os_str().len() <= MAX_CONTROL_DIR_LEN;
+        let launcher = Launcher {
+            ssh_bin: ssh_bin.clone(),
+            wrapper: dir.join(WRAPPER_FILE),
+        };
+        let pool = {
+            let launcher = launcher.clone();
+            let dir = dir.clone();
+            tokio::task::spawn_blocking(move || PoolRuntime::new(launcher, &dir))
+                .await
+                .map_err(|error| AppError::Anyhow(error.into()))?
+        };
         let service = Self {
             inner: Arc::new(Inner {
                 dir,
@@ -375,6 +465,10 @@ impl SshService {
                 resolve_cache: Mutex::new(HashMap::new()),
                 user_aliases: Arc::default(),
                 logins: login::LoginBroker::default(),
+                launcher,
+                forwards: ForwardRuntime::default(),
+                pool,
+                pool_sync: Mutex::new(()),
             }),
         };
         {
@@ -386,6 +480,8 @@ impl SshService {
                 tracing::warn!(%error, "cannot rewrite ssh store");
             }
         }
+        // Listeners of an enabled pool come back after a restart.
+        service.sync_pool().await;
         Ok(service)
     }
 
@@ -482,13 +578,7 @@ impl SshService {
     }
 
     fn command_with(&self, mode: SshMode, control: Vec<OsString>) -> Command {
-        let mut command = external_command::secure_command(&self.inner.ssh_bin);
-        command.args(self.options_with(mode, control));
-        if mode == SshMode::Askpass {
-            // Use SSH_ASKPASS even without a display or with a tty.
-            command.env("SSH_ASKPASS_REQUIRE", "force");
-        }
-        command
+        self.inner.launcher.command(mode, control)
     }
 
     /// `ssh -tt <alias>` for a PTY, with the same sanitized environment as
@@ -606,18 +696,7 @@ impl SshService {
     /// `control` comes right after `-F`, before any other `-o`: for options
     /// given more than once, OpenSSH uses the first value.
     fn options_with(&self, mode: SshMode, control: Vec<OsString>) -> Vec<OsString> {
-        let mut args: Vec<OsString> = vec!["-F".into(), self.wrapper_path().into()];
-        args.extend(control);
-        let mode_options: &[&str] = match mode {
-            SshMode::Batch => &["-o", "BatchMode=yes"],
-            SshMode::Askpass => &["-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1"],
-            SshMode::Interactive => return args,
-        };
-        args.extend(mode_options.iter().map(OsString::from));
-        args.extend(
-            ["-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15"].map(OsString::from),
-        );
-        args
+        self.inner.launcher.options(mode, control)
     }
 
     fn control_options(&self, mode: SshMode) -> Vec<OsString> {
@@ -899,11 +978,57 @@ impl SshService {
         if host.alias != alias && next.agent_access.remove(alias) {
             next.agent_access.insert(host.alias.clone());
         }
+        if host.alias != alias {
+            // Forwards and the pool address follow a renamed host.
+            for forward in next.forwards.iter_mut().filter(|f| f.alias == alias) {
+                forward.alias = host.alias.clone();
+            }
+            for assignment in next
+                .ip_pool
+                .assignments
+                .iter_mut()
+                .filter(|a| a.alias == alias)
+            {
+                assignment.alias = host.alias.clone();
+            }
+        }
         self.save(&mut store, next).await?;
+        drop(store);
+        // A new name or sign-in method gets a fresh pool master.
+        self.sync_pool().await;
         Ok(host)
     }
 
+    /// Deletes a managed host with its forwards and pool address (stopped
+    /// and closed first).
     pub async fn delete_host(&self, alias: &str) -> Result<(), AppError> {
+        let (forward_ids, pool_ips) = {
+            let store = self.inner.store.read().await;
+            if !store.managed_hosts.iter().any(|h| h.alias == alias) {
+                return Err(AppError::NotFound(format!("managed ssh host {alias}")));
+            }
+            (
+                store
+                    .forwards
+                    .iter()
+                    .filter(|f| f.alias == alias)
+                    .map(|f| f.id.clone())
+                    .collect::<Vec<_>>(),
+                store
+                    .ip_pool
+                    .assignments
+                    .iter()
+                    .filter(|a| a.alias == alias)
+                    .map(|a| a.ip)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for id in &forward_ids {
+            self.inner.forwards.forget(id).await;
+        }
+        for ip in pool_ips {
+            self.inner.pool.remove(ip).await;
+        }
         let mut store = self.inner.store.write().await;
         let mut next = store.clone();
         next.managed_hosts.retain(|h| h.alias != alias);
@@ -911,7 +1036,13 @@ impl SshService {
             return Err(AppError::NotFound(format!("managed ssh host {alias}")));
         }
         next.agent_access.remove(alias);
-        self.save(&mut store, next).await
+        next.forwards.retain(|f| f.alias != alias);
+        next.ip_pool.assignments.retain(|a| a.alias != alias);
+        let result = self.save(&mut store, next).await;
+        drop(store);
+        // Restores the assignment if the write failed.
+        self.sync_pool().await;
+        result
     }
 
     /// Imports every valid host of a pasted snippet; per-host problems are
@@ -1100,6 +1231,308 @@ impl SshService {
         }
         self.save(&mut store, next).await
     }
+
+    /// Stops every forward and closes the IP pool (daemon shutdown).
+    pub async fn shutdown(&self) {
+        tokio::join!(self.inner.forwards.stop_all(), self.inner.pool.shutdown());
+    }
+
+    /// Listeners of the daemon itself that forwards must not take.
+    pub(crate) fn set_reserved_listeners(&self, listeners: Vec<forward::ReservedListener>) {
+        self.inner.forwards.set_reserved(listeners);
+    }
+
+    // ------------------------------------------------------------ forwards
+
+    fn forward_view(&self, spec: &ForwardSpec) -> ForwardView {
+        ForwardView {
+            spec: spec.clone(),
+            run: self.inner.forwards.info(&spec.id),
+        }
+    }
+
+    async fn forward_spec(&self, id: &str) -> Result<ForwardSpec, AppError> {
+        self.inner
+            .store
+            .read()
+            .await
+            .forwards
+            .iter()
+            .find(|f| f.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("ssh forward {id}")))
+    }
+
+    pub(crate) async fn list_forwards(&self) -> Vec<ForwardView> {
+        let store = self.inner.store.read().await;
+        store
+            .forwards
+            .iter()
+            .map(|f| self.forward_view(f))
+            .collect()
+    }
+
+    pub(crate) async fn create_forward(
+        &self,
+        input: ForwardInput,
+    ) -> Result<ForwardView, AppError> {
+        let spec = forward::normalize(None, input)?;
+        self.require_host(&spec.alias).await?;
+        let mut store = self.inner.store.write().await;
+        if store.forwards.len() >= forward::MAX_FORWARDS {
+            return Err(AppError::Conflict(format!(
+                "at most {} forwards can be saved",
+                forward::MAX_FORWARDS
+            )));
+        }
+        let mut next = store.clone();
+        next.forwards.push(spec.clone());
+        self.save(&mut store, next).await?;
+        Ok(self.forward_view(&spec))
+    }
+
+    pub(crate) async fn update_forward(
+        &self,
+        id: &str,
+        input: ForwardInput,
+    ) -> Result<ForwardView, AppError> {
+        let spec = forward::normalize(Some(id.to_owned()), input)?;
+        self.require_host(&spec.alias).await?;
+        let mut store = self.inner.store.write().await;
+        let mut next = store.clone();
+        let Some(slot) = next.forwards.iter_mut().find(|f| f.id == id) else {
+            return Err(AppError::NotFound(format!("ssh forward {id}")));
+        };
+        if self.inner.forwards.is_active(id) {
+            return Err(AppError::Conflict(
+                "stop the forward before changing it".to_owned(),
+            ));
+        }
+        *slot = spec.clone();
+        self.save(&mut store, next).await?;
+        Ok(self.forward_view(&spec))
+    }
+
+    pub(crate) async fn delete_forward(&self, id: &str) -> Result<(), AppError> {
+        self.forward_spec(id).await?;
+        self.inner.forwards.forget(id).await;
+        let mut store = self.inner.store.write().await;
+        let mut next = store.clone();
+        next.forwards.retain(|f| f.id != id);
+        if next.forwards.len() == store.forwards.len() {
+            return Err(AppError::NotFound(format!("ssh forward {id}")));
+        }
+        self.save(&mut store, next).await
+    }
+
+    /// Starts a forward and waits until it is ready or failed. Runtime
+    /// failures are reported in the returned state, not as errors.
+    pub(crate) async fn start_forward(
+        &self,
+        id: &str,
+        password: Option<&str>,
+    ) -> Result<ForwardView, AppError> {
+        let spec = self.forward_spec(id).await?;
+        self.require_host(&spec.alias).await?;
+        if let Some(password) = password {
+            validate_password(password)?;
+        }
+        let Some(generation) = self.inner.forwards.begin(&spec)? else {
+            return Ok(self.forward_view(&spec));
+        };
+        let (command, secret) = match self.forward_command(&spec, password).await {
+            Ok(built) => built,
+            Err(error) => {
+                self.inner.forwards.stop(id).await;
+                return Err(error);
+            }
+        };
+        self.inner
+            .forwards
+            .run(&spec, generation, command, secret)
+            .await;
+        Ok(self.forward_view(&spec))
+    }
+
+    /// The dedicated ssh process of a forward: no shared master either way.
+    async fn forward_command(
+        &self,
+        spec: &ForwardSpec,
+        password: Option<&str>,
+    ) -> Result<(Command, Option<AskpassSecret>), AppError> {
+        let (mut command, secret) = match password {
+            Some(password) => {
+                let (vars, secret) = self.askpass_env(&spec.alias, password).await?;
+                let mut command = self.unshared_command(SshMode::Askpass);
+                command.envs(vars);
+                (command, Some(secret))
+            }
+            None => (self.unshared_command(SshMode::Batch), None),
+        };
+        // Debug logging reports when the listener or the server-side
+        // forward is ready; it never contains the password.
+        command.args([
+            "-N",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "LogLevel=DEBUG1",
+        ]);
+        command.args(forward::forward_args(spec));
+        command.arg("--").arg(&spec.alias);
+        Ok((command, secret))
+    }
+
+    pub(crate) async fn stop_forward(&self, id: &str) -> Result<ForwardView, AppError> {
+        let spec = self.forward_spec(id).await?;
+        self.inner.forwards.stop(id).await;
+        Ok(self.forward_view(&spec))
+    }
+
+    // ------------------------------------------------------------- IP pool
+
+    /// Applies the stored pool to the runtime.
+    async fn sync_pool(&self) {
+        let _guard = self.inner.pool_sync.lock().await;
+        let (pool, hosts) = {
+            let store = self.inner.store.read().await;
+            let hosts: HashMap<String, HostTraits> = store
+                .managed_hosts
+                .iter()
+                .map(|host| {
+                    (
+                        host.alias.clone(),
+                        HostTraits {
+                            password: host.auth_method == SshAuthMethod::Password,
+                        },
+                    )
+                })
+                .collect();
+            (store.ip_pool.clone(), hosts)
+        };
+        self.inner.pool.reconcile(&pool, &hosts).await;
+    }
+
+    pub(crate) async fn ip_pool(&self) -> PoolView {
+        let store = self.inner.store.read().await;
+        self.inner.pool.view(&store.ip_pool)
+    }
+
+    pub(crate) async fn set_ip_pool(&self, input: PoolConfigInput) -> Result<PoolView, AppError> {
+        {
+            let mut store = self.inner.store.write().await;
+            let pool = ip_pool::apply_config(&store.ip_pool, input)?;
+            if pool != store.ip_pool {
+                let next = SshStore {
+                    ip_pool: pool,
+                    ..store.clone()
+                };
+                self.save(&mut store, next).await?;
+            }
+        }
+        self.sync_pool().await;
+        Ok(self.ip_pool().await)
+    }
+
+    async fn assignment_view(&self, ip: Ipv4Addr) -> Result<AssignmentView, AppError> {
+        let store = self.inner.store.read().await;
+        let stored = store.ip_pool.assignment(ip)?;
+        Ok(self.inner.pool.assignment_view(&store.ip_pool, stored))
+    }
+
+    pub(crate) async fn create_ip_assignment(
+        &self,
+        input: AssignmentInput,
+    ) -> Result<AssignmentView, AppError> {
+        self.require_host(input.alias.trim()).await?;
+        let ip = {
+            let mut store = self.inner.store.write().await;
+            let assignment = ip_pool::new_assignment(&store.ip_pool, input)?;
+            let ip = assignment.ip;
+            let mut next = store.clone();
+            next.ip_pool.assignments.push(assignment);
+            self.save(&mut store, next).await?;
+            ip
+        };
+        self.sync_pool().await;
+        self.assignment_view(ip).await
+    }
+
+    pub(crate) async fn update_ip_assignment(
+        &self,
+        ip: Ipv4Addr,
+        input: AssignmentUpdate,
+    ) -> Result<AssignmentView, AppError> {
+        {
+            let mut store = self.inner.store.write().await;
+            let updated = ip_pool::update_assignment(&store.ip_pool, ip, input)?;
+            let mut next = store.clone();
+            if let Some(slot) = next.ip_pool.assignments.iter_mut().find(|a| a.ip == ip) {
+                *slot = updated;
+            }
+            if next.ip_pool != store.ip_pool {
+                self.save(&mut store, next).await?;
+            }
+        }
+        self.sync_pool().await;
+        self.assignment_view(ip).await
+    }
+
+    pub(crate) async fn delete_ip_assignment(&self, ip: Ipv4Addr) -> Result<(), AppError> {
+        self.assignment_view(ip).await?;
+        self.inner.pool.remove(ip).await;
+        let result = {
+            let mut store = self.inner.store.write().await;
+            let mut next = store.clone();
+            next.ip_pool.assignments.retain(|a| a.ip != ip);
+            self.save(&mut store, next).await
+        };
+        self.sync_pool().await;
+        result
+    }
+
+    /// Starts the assignment's master now; with a password for password
+    /// hosts. Sign-in failures are reported in the returned state.
+    pub(crate) async fn connect_ip_assignment(
+        &self,
+        ip: Ipv4Addr,
+        password: Option<&str>,
+    ) -> Result<AssignmentView, AppError> {
+        let (alias, enabled) = {
+            let store = self.inner.store.read().await;
+            let stored = store.ip_pool.assignment(ip)?;
+            (stored.alias.clone(), store.ip_pool.enabled)
+        };
+        if !enabled || !ip_pool::SUPPORTED {
+            return Err(AppError::Conflict("the IP pool is disabled".to_owned()));
+        }
+        self.require_host(&alias).await?;
+        let askpass = match password {
+            Some(password) => Some(self.askpass_env(&alias, password).await?),
+            None => None,
+        };
+        self.inner.pool.connect(ip, askpass).await;
+        self.assignment_view(ip).await
+    }
+
+    pub(crate) async fn disconnect_ip_assignment(
+        &self,
+        ip: Ipv4Addr,
+    ) -> Result<AssignmentView, AppError> {
+        self.assignment_view(ip).await?;
+        self.inner.pool.disconnect(ip).await;
+        self.assignment_view(ip).await
+    }
+}
+
+/// Keeps the first forward of each id.
+fn dedup_forwards(forwards: Vec<ForwardSpec>) -> Vec<ForwardSpec> {
+    let mut seen = std::collections::HashSet::new();
+    forwards
+        .into_iter()
+        .filter(|forward| seen.insert(forward.id.clone()))
+        .take(forward::MAX_FORWARDS)
+        .collect()
 }
 
 /// Longest password accepted for askpass; far above real passwords.

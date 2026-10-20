@@ -308,6 +308,8 @@ impl ManagedServer {
         }
         self.state.conversations.shutdown_all().await;
         self.state.codex_local_adapters.shutdown_all().await;
+        // Port forwards and IP pool masters never outlive the daemon.
+        self.state.ssh.shutdown().await;
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -319,6 +321,7 @@ impl ManagedServer {
 
     pub async fn wait(mut self) -> Result<()> {
         let result = self.handle.await.context("server task join failed");
+        self.state.ssh.shutdown().await;
         // The periodic tasks run for as long as the server does; aborting
         // them before the await stopped them at startup in `serve` mode.
         if let Some(task) = self.retention_task.take() {
