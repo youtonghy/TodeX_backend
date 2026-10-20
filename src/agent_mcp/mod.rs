@@ -77,10 +77,12 @@ pub(crate) const TOKEN_ENV: &str = "TODEX_AGENT_MCP_TOKEN";
 pub(crate) const LEGACY_URL_ENV: &str = "TODEX_SSH_MCP_URL";
 pub(crate) const LEGACY_TOKEN_ENV: &str = "TODEX_SSH_MCP_TOKEN";
 /// Codex and Claude stop waiting for a tool call after their own timeout;
-/// leave room for an approval (ask mode), the longest `ssh_exec` and
-/// connection setup.
-const SSH_TOOL_TIMEOUT_SECONDS: u64 =
-    authorizer::CONFIRM_TIMEOUT.as_secs() + server::MAX_TIMEOUT_SECONDS + 60;
+/// leave room for an approval (ask mode), a login the call waits on, the
+/// longest `ssh_exec` and connection setup.
+const SSH_TOOL_TIMEOUT_SECONDS: u64 = authorizer::CONFIRM_TIMEOUT.as_secs()
+    + crate::ssh::login::LOGIN_TIMEOUT.as_secs()
+    + server::MAX_TIMEOUT_SECONDS
+    + 60;
 /// For providers whose MCP servers and hooks come from one static global
 /// config (Antigravity): the daemon's base URL and the routes enabled for
 /// the turn, passed in the provider's environment; each static entry names

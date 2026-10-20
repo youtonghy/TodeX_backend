@@ -10,6 +10,7 @@
 
 pub(crate) mod config_file;
 pub(crate) mod keys;
+pub(crate) mod login;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -326,6 +327,8 @@ struct Inner {
     /// Aliases from the user's `~/.ssh/config`, re-read only when it or a
     /// file it includes changed.
     user_aliases: Arc<config_file::AliasCache>,
+    /// Logins agents wait on (see [`login`]).
+    logins: login::LoginBroker,
 }
 
 impl SshService {
@@ -371,6 +374,7 @@ impl SshService {
                 store: RwLock::new(store),
                 resolve_cache: Mutex::new(HashMap::new()),
                 user_aliases: Arc::default(),
+                logins: login::LoginBroker::default(),
             }),
         };
         {
@@ -617,7 +621,6 @@ impl SshService {
     }
 
     fn control_options(&self, mode: SshMode) -> Vec<OsString> {
-        let control_path = self.inner.dir.join(CONTROL_DIR).join("%C");
         // An askpass process may use an existing master but must not become
         // a long-lived one that outlives the request.
         let master = if mode == SshMode::Askpass {
@@ -625,6 +628,11 @@ impl SshService {
         } else {
             "auto"
         };
+        self.control_options_with(master)
+    }
+
+    fn control_options_with(&self, master: &str) -> Vec<OsString> {
+        let control_path = self.inner.dir.join(CONTROL_DIR).join("%C");
         vec![
             "-o".into(),
             format!("ControlMaster={master}").into(),
@@ -656,6 +664,67 @@ impl SshService {
             }
             Err(error) => Err(AppError::Anyhow(anyhow::anyhow!("ssh -O exit: {error}"))),
         }
+    }
+
+    /// Whether a shared master for `alias` is up (`ssh -O check`, which
+    /// only talks to the local control socket).
+    pub(crate) async fn master_alive(&self, alias: &str) -> bool {
+        if !self.inner.multiplex {
+            return false;
+        }
+        let mut command = external_command::secure_command(&self.inner.ssh_bin);
+        command
+            .arg("-F")
+            .arg(self.wrapper_path())
+            .args(self.control_options(SshMode::Batch))
+            .args(["-O", "check", "--", alias]);
+        prepare_captured(&mut command, false);
+        matches!(
+            external_command::run(command, None, RESOLVE_LIMITS).await,
+            Ok(output) if output.status.success()
+        )
+    }
+
+    /// Whether a password can open a shared master for `alias`: connection
+    /// sharing works here and the host is not behind a jump host or proxy
+    /// program (see [`Self::askpass_env`]).
+    pub(crate) async fn password_login_supported(&self, alias: &str) -> bool {
+        self.inner.multiplex
+            && matches!(
+                self.resolve_with(alias, false).await,
+                Ok(resolved) if resolved.proxy_jump.is_none() && resolved.proxy_command.is_none()
+            )
+    }
+
+    /// Logs in to `alias` with `password` and leaves the connection as the
+    /// shared master, so later terminal, SFTP and agent commands reuse it
+    /// until it has been idle for [`CONTROL_PERSIST_SECONDS`]. An existing
+    /// master is reused instead (the password then goes unused).
+    pub(crate) async fn connect_shared(
+        &self,
+        alias: &str,
+        password: &str,
+    ) -> Result<ConnectionTestResult, AppError> {
+        if !self.inner.multiplex {
+            return Err(AppError::Unsupported(
+                "shared SSH connections are not available on this system".to_owned(),
+            ));
+        }
+        // The password file lives until ssh exited; the master it leaves
+        // behind has authenticated by then.
+        let (vars, _secret) = self.askpass_env(alias, password).await?;
+        let mut command = self.command_with(SshMode::Askpass, self.control_options_with("auto"));
+        command.envs(vars);
+        command.arg("--").arg(alias).arg("exit 0");
+        prepare_captured(&mut command, false);
+        let started = Instant::now();
+        let outcome = external_command::run(command, None, TEST_LIMITS).await;
+        test_result(outcome, started.elapsed())
+    }
+
+    /// The login broker agents and clients meet at.
+    pub(crate) fn logins(&self) -> &login::LoginBroker {
+        &self.inner.logins
     }
 
     pub async fn list_hosts(&self) -> Result<Vec<SshHostView>, AppError> {
@@ -979,41 +1048,7 @@ impl SshService {
         prepare_captured(&mut command, false);
         let started = Instant::now();
         let outcome = external_command::run(command, None, TEST_LIMITS).await;
-        let duration_ms = started.elapsed().as_millis() as u64;
-        Ok(match outcome {
-            Ok(output) if output.status.success() => ConnectionTestResult {
-                ok: true,
-                duration_ms,
-                failure: None,
-                detail: None,
-            },
-            Ok(output) => {
-                let detail = bounded_text(&output.stderr, ERROR_DETAIL_LIMIT)
-                    .trim()
-                    .to_owned();
-                ConnectionTestResult {
-                    ok: false,
-                    duration_ms,
-                    failure: Some(classify_failure(&detail)),
-                    detail: Some(detail),
-                }
-            }
-            Err(ExternalCommandError::NotFound) => {
-                return Err(AppError::Unsupported("ssh executable not found".to_owned()))
-            }
-            Err(ExternalCommandError::TimedOut) => ConnectionTestResult {
-                ok: false,
-                duration_ms,
-                failure: Some(SshFailureKind::TimedOut),
-                detail: None,
-            },
-            Err(error) => ConnectionTestResult {
-                ok: false,
-                duration_ms,
-                failure: Some(SshFailureKind::Other),
-                detail: Some(error.to_string()),
-            },
-        })
+        test_result(outcome, started.elapsed())
     }
 
     pub async fn ftp_sites(&self) -> Vec<FtpSite> {
@@ -1175,6 +1210,48 @@ fn parse_resolved(output: &str) -> ResolvedHost {
     resolved
 }
 
+/// What a `exit 0` run of ssh came to.
+fn test_result(
+    outcome: Result<external_command::CommandOutput, ExternalCommandError>,
+    elapsed: Duration,
+) -> Result<ConnectionTestResult, AppError> {
+    let duration_ms = elapsed.as_millis() as u64;
+    Ok(match outcome {
+        Ok(output) if output.status.success() => ConnectionTestResult {
+            ok: true,
+            duration_ms,
+            failure: None,
+            detail: None,
+        },
+        Ok(output) => {
+            let detail = bounded_text(&output.stderr, ERROR_DETAIL_LIMIT)
+                .trim()
+                .to_owned();
+            ConnectionTestResult {
+                ok: false,
+                duration_ms,
+                failure: Some(classify_failure(&detail)),
+                detail: Some(detail),
+            }
+        }
+        Err(ExternalCommandError::NotFound) => {
+            return Err(AppError::Unsupported("ssh executable not found".to_owned()))
+        }
+        Err(ExternalCommandError::TimedOut) => ConnectionTestResult {
+            ok: false,
+            duration_ms,
+            failure: Some(SshFailureKind::TimedOut),
+            detail: None,
+        },
+        Err(error) => ConnectionTestResult {
+            ok: false,
+            duration_ms,
+            failure: Some(SshFailureKind::Other),
+            detail: Some(error.to_string()),
+        },
+    })
+}
+
 pub(crate) fn classify_failure(stderr: &str) -> SshFailureKind {
     let text = stderr.to_ascii_lowercase();
     if text.contains("remote host identification has changed") {
@@ -1234,7 +1311,8 @@ pub(crate) mod tests {
     }
 
     /// A fake `ssh` that answers `-G` like OpenSSH and logs every argv; hosts
-    /// named `bad*` fail authentication. With an askpass file it also logs
+    /// named `bad*` fail authentication, and `-O check <alias>` succeeds
+    /// only while `<root>/master-<alias>` exists. With an askpass file it also logs
     /// its environment and whether the file existed to `askpass.log`.
     pub(crate) async fn fixture(user_config: &str) -> Fixture {
         let root = std::env::temp_dir().join(format!("todex-ssh-{}", Uuid::new_v4().simple()));
@@ -1254,6 +1332,7 @@ fi
 last=""; for arg in "$@"; do prev="$last"; last="$arg"; done
 case " $* " in
   *" -G "*) printf 'hostname %s.example\nuser ops\nport 22\nidentityfile ~/.ssh/id_ed25519\n' "$last"; exit 0;;
+  *" -O check "*) [ -f "{root}/master-$last" ] && exit 0; exit 255;;
 esac
 case "$prev" in
   bad*) echo "ops@$prev: Permission denied (publickey)." >&2; exit 255;;
@@ -1262,6 +1341,7 @@ exit 0
 "#,
                 log = root.join("ssh.log").display(),
                 askpass_log = root.join("askpass.log").display(),
+                root = root.display(),
             ),
         )
         .unwrap();
@@ -1555,6 +1635,54 @@ exit 0
         if fixture.service.inner.multiplex {
             assert!(line.contains("ControlPersist=300"), "{line}");
         }
+    }
+
+    /// A login for agents becomes the shared master; its password still
+    /// reaches ssh only through the askpass file.
+    #[tokio::test]
+    async fn shared_login_becomes_the_master() {
+        let fixture = fixture("Host good\n").await;
+        if !fixture.service.inner.multiplex {
+            return;
+        }
+        assert!(!fixture.service.master_alive("good").await);
+        std::fs::write(fixture.root.join("master-good"), "").unwrap();
+        assert!(fixture.service.master_alive("good").await);
+
+        let result = fixture
+            .service
+            .connect_shared("good", "hunter2")
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let log = std::fs::read_to_string(fixture.root.join("ssh.log")).unwrap();
+        let line = log.lines().find(|l| l.ends_with("good exit 0")).unwrap();
+        let rest = line
+            .split_once(&format!("{} ", fixture.service.wrapper_path().display()))
+            .unwrap()
+            .1;
+        assert!(
+            rest.starts_with("-o ControlMaster=auto -o ControlPath="),
+            "{line}"
+        );
+        assert!(
+            line.contains("ControlPersist=300 -o BatchMode=no"),
+            "{line}"
+        );
+        assert!(!line.contains("hunter2"), "{line}");
+        let env = std::fs::read_to_string(fixture.root.join("askpass.log")).unwrap();
+        assert!(env.contains("askpass-file-present"));
+        assert!(!env.contains("hunter2"));
+        assert!(askpass_files(&fixture).is_empty());
+
+        assert!(
+            fixture
+                .service
+                .connect_shared("nope", "hunter2")
+                .await
+                .is_err(),
+            "unknown hosts are refused"
+        );
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 use crate::app_state::AppState;
 use crate::error::AppError;
 use crate::ssh::keys::{KeyGenerateRequest, KeyImportRequest};
+use crate::ssh::login::LoginAnswer;
 use crate::ssh::{ConnectionSettings, FtpSiteInput, ManagedHost};
 
 use super::v2::require_auth;
@@ -43,6 +44,20 @@ struct TestRequest {
     password: Option<String>,
 }
 
+/// Body of `POST /v2/ssh/hosts/{alias}/login`. No `Debug`: it carries a
+/// password.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LoginRequest {
+    request_id: String,
+    /// Absent (or empty) declines the request.
+    #[serde(default)]
+    password: Option<String>,
+    /// The password came from the client's saved passwords.
+    #[serde(default)]
+    saved: bool,
+}
+
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v2/ssh/hosts", get(list_hosts).post(create_host))
@@ -57,6 +72,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/v2/ssh/hosts/{alias}/agent-access", put(set_agent_access))
         .route("/v2/ssh/hosts/{alias}/test", post(test_host))
         .route("/v2/ssh/hosts/{alias}/disconnect", post(disconnect_host))
+        .route("/v2/ssh/hosts/{alias}/login", post(answer_login))
         .route(
             "/v2/ssh/settings",
             get(get_connection_settings).put(set_connection_settings),
@@ -189,6 +205,48 @@ async fn disconnect_host(
     require_auth(&state, &headers)?;
     let disconnected = state.ssh.disconnect(&alias).await?;
     Ok(Json(json!({ "disconnected": disconnected })))
+}
+
+/// Answers an agent's `ssh.login.requested`.
+async fn answer_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(alias): AxumPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    require_auth(&state, &headers)?;
+    let request: LoginRequest = serde_json::from_slice(&body).map_err(|error| {
+        // serde's messages may quote the rejected value, the password.
+        let problem = match error.classify() {
+            serde_json::error::Category::Data => {
+                "expected { requestId: string, password?: string, saved?: boolean }"
+            }
+            _ => "not valid JSON",
+        };
+        AppError::InvalidRequest(format!("invalid login request: {problem}"))
+    })?;
+    let password = request
+        .password
+        .map(Zeroizing::new)
+        .filter(|password| !password.is_empty());
+    let answer = state
+        .ssh
+        .answer_login(
+            &alias,
+            &request.request_id,
+            password.as_deref().map(String::as_str),
+            request.saved,
+        )
+        .await?;
+    Ok(Json(match answer {
+        LoginAnswer::Connected => json!({ "status": "connected" }),
+        LoginAnswer::Declined => json!({ "status": "declined" }),
+        LoginAnswer::Failed(result) => json!({
+            "status": "failed",
+            "failure": result.failure,
+            "detail": result.detail,
+        }),
+    }))
 }
 
 async fn get_connection_settings(
@@ -362,5 +420,74 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// A client answers an agent's login request; stale ids are 404 and
+    /// malformed bodies never echo the password.
+    #[tokio::test]
+    async fn login_endpoint_answers_open_requests_only() {
+        let fake = crate::ssh::tests::fixture("Host web\n").await;
+        let root = fake.root.join("app");
+        let mut config = Config {
+            data_dir: root.join("data"),
+            workspace_roots: vec![root.join("workspaces")],
+            ..Config::default()
+        };
+        config.agent.ssh_bin = fake.root.join("fake-ssh").display().to_string();
+        let mut state = AppState::new_for_tests(config).await.unwrap();
+        // The fixture's home holds the `web` alias.
+        state.ssh = fake.service.clone();
+        let app = crate::server::loopback_test_router(state.clone());
+        let device = TestDevice::new(38);
+        device.enroll(&root.join("data"));
+        let uri = "/v2/ssh/hosts/web/login";
+        let send = |body: String| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json");
+            for (name, value) in device.sign("POST", uri, body.as_bytes()) {
+                builder = builder.header(name, value);
+            }
+            let request = builder.body(Body::from(body)).unwrap();
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+
+        let (status, value) = send(json!({ "requestId": "sshl_gone" }).to_string()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+        for body in [
+            r#"{"password":"hunter2"}"#,
+            r#"{"requestId":"x","password":"hunter2","extra":1}"#,
+            r#"{"requestId":"x","password":"hunter2"#,
+        ] {
+            let (status, value) = send(body.to_owned()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {value}");
+            assert!(!value.to_string().contains("hunter2"), "{value}");
+        }
+
+        let crate::ssh::login::LoginAsk::New(request) = state.ssh.ask_login("c1", "web") else {
+            panic!("expected a new request");
+        };
+        let id = request.id().to_owned();
+        let waiting = tokio::spawn(request.wait());
+        let (status, value) =
+            send(json!({ "requestId": id, "password": "hunter2", "saved": true }).to_string())
+                .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value, json!({ "status": "connected" }));
+        let resolution = waiting.await.unwrap();
+        assert_eq!(
+            resolution.outcome,
+            crate::ssh::login::LoginOutcome::Connected
+        );
+        assert!(resolution.saved_password);
     }
 }

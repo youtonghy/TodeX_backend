@@ -48,7 +48,11 @@ use crate::{
     },
     local_terminal::decode_terminal_output,
     provider::{process::redact_sensitive_text, ConversationSupervisor},
-    ssh::{classify_failure, SshFailureKind, SshMode},
+    ssh::{
+        classify_failure,
+        login::{LoginAsk, LoginOutcome, LoginResolution, LOGIN_TIMEOUT},
+        SshFailureKind, SshMode,
+    },
 };
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
@@ -535,7 +539,7 @@ impl SshTools {
         let (tap, chunks) = mpsc::unbounded_channel();
         let run = async {
             tokio::select! {
-                outcome = self.run(&request, tap) => outcome,
+                outcome = self.run_logged_in(&caller.conversation_id, &exec_id, &request, tap) => outcome,
                 // Dropping the run kills ssh and its process group; it also
                 // drops the tap, which ends the recorder below.
                 () = context.ct.cancelled() => ExecOutcome::Cancelled,
@@ -563,6 +567,93 @@ impl SshTools {
             );
         }
         result
+    }
+
+    /// [`Self::run`]; when ssh cannot authenticate on its own, asks the
+    /// conversation's clients for a login (see [`crate::ssh::login`]) and
+    /// runs the command once more on the connection it opened.
+    async fn run_logged_in(
+        &self,
+        conversation_id: &str,
+        exec_id: &str,
+        request: &ExecRequest,
+        tap: mpsc::UnboundedSender<OutputChunk>,
+    ) -> ExecOutcome {
+        let outcome = self.run(request, tap.clone()).await;
+        let ExecOutcome::Finished(output) = &outcome else {
+            return outcome;
+        };
+        let auth_failed = output.status.code() == Some(SSH_ERROR_STATUS)
+            && classify_failure(&String::from_utf8_lossy(&output.stderr))
+                == SshFailureKind::AuthenticationFailed;
+        if !auth_failed || !self.mcp.ssh().password_login_supported(&request.host).await {
+            return outcome;
+        }
+        match self.log_in(conversation_id, exec_id, &request.host).await {
+            Ok(()) => self.run(request, tap).await,
+            Err(hint) => match outcome {
+                ExecOutcome::Finished(output) => ExecOutcome::LoginFailed(output, hint),
+                other => other,
+            },
+        }
+    }
+
+    /// Waits for a login to `host`; the error is the hint for the agent.
+    async fn log_in(&self, conversation_id: &str, exec_id: &str, host: &str) -> Result<(), String> {
+        let resolution = match self.mcp.ssh().ask_login(conversation_id, host) {
+            LoginAsk::BackedOff => {
+                return Err(format!(
+                    "The user declined or did not answer a login to {host} moments ago. Ask them \
+                     to log in from the TodeX Terminal view, then retry."
+                ))
+            }
+            LoginAsk::Joined(waiter) => waiter.wait().await,
+            LoginAsk::New(request) => {
+                let request_id = request.id().to_owned();
+                let expires_at = chrono::Utc::now()
+                    + chrono::Duration::from_std(LOGIN_TIMEOUT).unwrap_or_default();
+                if let Err(error) = self
+                    .conversations
+                    .append_agent_event(
+                        conversation_id,
+                        "ssh.login.requested",
+                        json!({
+                            "requestId": request_id,
+                            "host": host,
+                            "execId": exec_id,
+                            "expiresAt": expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        }),
+                    )
+                    .await
+                {
+                    return Err(format!("cannot record the login request: {error}"));
+                }
+                // Dropped when the tool call is cancelled: the request then
+                // ends for its clients too.
+                let mut resolved = ResolvedEvent {
+                    conversations: self.conversations.clone(),
+                    conversation_id: conversation_id.to_owned(),
+                    request_id,
+                    host: host.to_owned(),
+                    resolution: None,
+                };
+                let resolution = request.wait().await;
+                resolved.resolution = Some(resolution);
+                resolution
+            }
+        };
+        match resolution.outcome {
+            LoginOutcome::Connected => Ok(()),
+            LoginOutcome::Declined => Err(format!(
+                "The user declined to log in to {host}. Do not retry unless they ask you to."
+            )),
+            LoginOutcome::TimedOut => Err(format!(
+                "Nobody answered the login request for {host} within {}s. Ask the user to log in \
+                 from the TodeX Terminal view, then retry.",
+                LOGIN_TIMEOUT.as_secs()
+            )),
+            LoginOutcome::Cancelled => Err("The login request was cancelled.".to_owned()),
+        }
     }
 
     async fn run(
@@ -595,6 +686,45 @@ impl SshTools {
             }
             Err(error) => ExecOutcome::NotStarted(error.to_string()),
         }
+    }
+}
+
+/// Records `ssh.login.resolved` for a login request once it ended, also
+/// when the waiting tool call is cancelled (dropped) first.
+struct ResolvedEvent {
+    conversations: ConversationSupervisor,
+    conversation_id: String,
+    request_id: String,
+    host: String,
+    resolution: Option<LoginResolution>,
+}
+
+impl Drop for ResolvedEvent {
+    fn drop(&mut self) {
+        let resolution = self.resolution.unwrap_or(LoginResolution {
+            outcome: LoginOutcome::Cancelled,
+            saved_password: false,
+        });
+        let conversations = self.conversations.clone();
+        let conversation_id = std::mem::take(&mut self.conversation_id);
+        let payload = json!({
+            "requestId": self.request_id,
+            "host": self.host,
+            "outcome": resolution.outcome,
+            // Not `savedPassword`: journaled keys naming a password are redacted.
+            "remembered": resolution.saved_password,
+        });
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            if let Err(error) = conversations
+                .append_agent_event(&conversation_id, "ssh.login.resolved", payload)
+                .await
+            {
+                tracing::warn!(conversation_id, %error, "failed to record an SSH login result");
+            }
+        });
     }
 }
 
@@ -778,6 +908,8 @@ fn shell_quote(value: &str) -> String {
 
 enum ExecOutcome {
     Finished(external_command::TruncatedOutput),
+    /// An authentication failure no login fixed; the hint says why.
+    LoginFailed(external_command::TruncatedOutput, String),
     TimedOut(Duration),
     NotStarted(String),
     Cancelled,
@@ -792,45 +924,10 @@ impl ExecOutcome {
         let mut completed = json!({ "host": host, "durationMs": duration_ms, "truncated": false });
         let result = match self {
             Self::Finished(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                let exit_code = output.status.code();
-                completed["exitCode"] = json!(exit_code);
-                completed["truncated"] = json!(output.truncated);
-                match exit_code {
-                    Some(code) if code != SSH_ERROR_STATUS => CallToolResult::structured(json!({
-                        "stdout": stdout,
-                        "stderr": stderr,
-                        "exitCode": code,
-                        "truncated": output.truncated,
-                        "durationMs": duration_ms,
-                    })),
-                    _ => {
-                        let failure = if exit_code.is_some() {
-                            classify_failure(&stderr)
-                        } else {
-                            SshFailureKind::Other
-                        };
-                        completed["failure"] = json!(failure);
-                        let message = match exit_code {
-                            Some(_) => format!("ssh to {host} failed"),
-                            None => format!("ssh to {host} was terminated by a signal"),
-                        };
-                        let mut error = json!({
-                            "failure": failure,
-                            "message": message,
-                            "stdout": stdout,
-                            "stderr": bounded_text(stderr.as_bytes(), ERROR_DETAIL_LIMIT),
-                            "exitCode": exit_code,
-                            "truncated": output.truncated,
-                            "durationMs": duration_ms,
-                        });
-                        if let Some(hint) = failure_hint(failure) {
-                            error["hint"] = json!(hint);
-                        }
-                        CallToolResult::structured_error(error)
-                    }
-                }
+                finished_result(output, None, host, duration_ms, &mut completed)
+            }
+            Self::LoginFailed(output, hint) => {
+                finished_result(output, Some(hint), host, duration_ms, &mut completed)
             }
             Self::TimedOut(timeout) => {
                 completed["failure"] = json!(SshFailureKind::TimedOut);
@@ -857,6 +954,56 @@ impl ExecOutcome {
     }
 }
 
+/// The result of an ssh run that exited; `login_hint` replaces the usual
+/// hint when a login was tried and did not happen.
+fn finished_result(
+    output: external_command::TruncatedOutput,
+    login_hint: Option<String>,
+    host: &str,
+    duration_ms: u64,
+    completed: &mut Value,
+) -> CallToolResult {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_code = output.status.code();
+    completed["exitCode"] = json!(exit_code);
+    completed["truncated"] = json!(output.truncated);
+    match exit_code {
+        Some(code) if code != SSH_ERROR_STATUS => CallToolResult::structured(json!({
+            "stdout": stdout,
+            "stderr": stderr,
+            "exitCode": code,
+            "truncated": output.truncated,
+            "durationMs": duration_ms,
+        })),
+        _ => {
+            let failure = if exit_code.is_some() {
+                classify_failure(&stderr)
+            } else {
+                SshFailureKind::Other
+            };
+            completed["failure"] = json!(failure);
+            let message = match exit_code {
+                Some(_) => format!("ssh to {host} failed"),
+                None => format!("ssh to {host} was terminated by a signal"),
+            };
+            let mut error = json!({
+                "failure": failure,
+                "message": message,
+                "stdout": stdout,
+                "stderr": bounded_text(stderr.as_bytes(), ERROR_DETAIL_LIMIT),
+                "exitCode": exit_code,
+                "truncated": output.truncated,
+                "durationMs": duration_ms,
+            });
+            if let Some(hint) = login_hint.or_else(|| failure_hint(failure).map(str::to_owned)) {
+                error["hint"] = json!(hint);
+            }
+            CallToolResult::structured_error(error)
+        }
+    }
+}
+
 /// What the agent (and the user reading along) should do about a failure.
 fn failure_hint(failure: SshFailureKind) -> Option<&'static str> {
     match failure {
@@ -867,7 +1014,7 @@ fn failure_hint(failure: SshFailureKind) -> Option<&'static str> {
             "The host key changed since it was trusted (reinstalled host or an attack). Ask the user to verify it; do not retry.",
         ),
         SshFailureKind::AuthenticationFailed => Some(
-            "Key/agent authentication failed. For password-only hosts, ask the user to log in from the TodeX Terminal view; that connection is reused for about 5 minutes.",
+            "Key/agent authentication failed and no login was possible from here. For password-only hosts, ask the user to log in from the TodeX Terminal view; that connection is reused until it has been idle for 5 minutes.",
         ),
         SshFailureKind::Unreachable => Some("The host could not be reached from the TodeX machine."),
         SshFailureKind::TimedOut => Some("Connecting to the host timed out."),
@@ -954,14 +1101,21 @@ mod tests {
 
     /// A daemon state whose `ssh` is a fake that answers `-G`, logs argv and
     /// stdin, and runs nothing remotely. Hosts `bad*` fail host-key checks;
-    /// `slow*` hang; `big*` print 300 KiB; others echo their command line.
+    /// `slow*` hang; `big*` print 300 KiB; `pw*` refuse BatchMode logins
+    /// until a password login made `<root>/master-<alias>`; others echo
+    /// their command line.
     async fn harness() -> Harness {
-        let root = std::env::temp_dir().join(format!("todex-ssh-mcp-{}", uuid::Uuid::new_v4()));
+        // Short enough for connection sharing (see `MAX_CONTROL_DIR_LEN`).
+        let root = std::env::temp_dir().join(format!("tsm-{}", uuid::Uuid::new_v4().simple()));
         let home = root.join("home");
         let workspace = root.join("workspaces/project");
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(home.join(".ssh/config"), "Host web bad1 slow1 big1 off\n").unwrap();
+        std::fs::write(
+            home.join(".ssh/config"),
+            "Host web bad1 slow1 big1 off pw1\n",
+        )
+        .unwrap();
         let fake = root.join("fake-ssh");
         std::fs::write(
             &fake,
@@ -971,9 +1125,13 @@ printf '%s\n' "$*" >> "{log}"
 last=""; for arg in "$@"; do prev="$last"; last="$arg"; done
 case " $* " in
   *" -G "*) printf 'hostname %s.example\nuser ops\nport 2222\nidentityfile ~/.ssh/id_ed25519\n' "$last"; exit 0;;
+  *" -O check "*) [ -f "{root}/master-$last" ] && exit 0; exit 255;;
 esac
 case "$prev" in
   bad*) echo "Host key verification failed." >&2; exit 255;;
+  pw*)
+    if [ -n "$TODEX_SSH_ASKPASS_FILE" ]; then : > "{root}/master-$prev"; exit 0; fi
+    [ -f "{root}/master-$prev" ] || {{ echo "ops@$prev: Permission denied (password)." >&2; exit 255; }};;
   slow*) sleep 30; exit 0;;
   big*) head -c 300000 /dev/zero | tr '\0' x; exit 0;;
 esac
@@ -982,7 +1140,8 @@ if [ ! -t 0 ]; then cat; fi
 echo warn >&2
 exit 3
 "#,
-                log = root.join("ssh.log").display()
+                log = root.join("ssh.log").display(),
+                root = root.display(),
             ),
         )
         .unwrap();
@@ -1375,6 +1534,132 @@ exit 3
         assert_eq!(completed[3]["failure"], "timedOut");
 
         client.cancel().await.unwrap();
+    }
+
+    /// The id of the conversation's open `ssh.login.requested`, waiting for
+    /// one to be recorded.
+    async fn login_request(harness: &Harness, seen: usize) -> String {
+        for _ in 0..200 {
+            let history = harness
+                .state
+                .conversations
+                .history_for_tests(&harness.conversation_id)
+                .await;
+            let requests: Vec<_> = history
+                .iter()
+                .filter(|event| event.event_type == "ssh.login.requested")
+                .collect();
+            if requests.len() > seen {
+                let payload = &requests[seen].payload;
+                assert_eq!(payload["host"], "pw1", "{payload}");
+                assert!(payload["execId"].as_str().unwrap().starts_with("sshx_"));
+                assert!(payload["expiresAt"].as_str().is_some(), "{payload}");
+                return payload["requestId"].as_str().unwrap().to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no login request was recorded");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exec_waits_for_a_login_when_ssh_cannot_authenticate() {
+        let harness = harness().await;
+        harness
+            .state
+            .ssh
+            .set_agent_access("pw1", true)
+            .await
+            .unwrap();
+        let client = bridged_client(&harness).await;
+        let exec = || {
+            call(
+                &client,
+                "ssh_exec",
+                json!({ "host": "pw1", "command": "ls" }),
+            )
+        };
+
+        // Declined: the original failure, with a hint saying so.
+        let answer = async {
+            let id = login_request(&harness, 0).await;
+            harness
+                .state
+                .ssh
+                .answer_login("pw1", &id, None, false)
+                .await
+                .unwrap();
+        };
+        let (declined, ()) = tokio::join!(exec(), answer);
+        assert_eq!(declined.is_error, Some(true));
+        assert_eq!(structured(&declined)["failure"], "authenticationFailed");
+        assert!(structured(&declined)["hint"]
+            .as_str()
+            .unwrap()
+            .contains("declined"));
+        // Asked again only after the backoff.
+        let backed_off = exec().await;
+        assert!(structured(&backed_off)["hint"]
+            .as_str()
+            .unwrap()
+            .contains("moments ago"));
+        harness
+            .state
+            .ssh
+            .logins()
+            .clear_backoff_for_tests(&harness.conversation_id, "pw1");
+
+        // Answered with a password: the command runs on the new master.
+        let answer = async {
+            let id = login_request(&harness, 1).await;
+            harness
+                .state
+                .ssh
+                .answer_login("pw1", &id, Some("hunter2"), true)
+                .await
+                .unwrap();
+        };
+        let (ran, ()) = tokio::join!(exec(), answer);
+        assert_eq!(ran.is_error, Some(false), "{ran:?}");
+        assert_eq!(structured(&ran)["stdout"], "ran:ls\n");
+        // Later commands reuse it without asking.
+        let again = exec().await;
+        assert_eq!(again.is_error, Some(false));
+
+        let history = harness
+            .state
+            .conversations
+            .history_for_tests(&harness.conversation_id)
+            .await;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.event_type == "ssh.login.requested")
+                .count(),
+            2
+        );
+        let mut resolved = Vec::new();
+        for _ in 0..200 {
+            resolved = harness
+                .state
+                .conversations
+                .history_for_tests(&harness.conversation_id)
+                .await
+                .into_iter()
+                .filter(|event| event.event_type == "ssh.login.resolved")
+                .map(|event| event.payload)
+                .collect();
+            if resolved.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(resolved.len(), 2, "{resolved:?}");
+        assert_eq!(resolved[0]["outcome"], "declined");
+        assert_eq!(resolved[1]["outcome"], "connected");
+        assert_eq!(resolved[1]["remembered"], true);
+        assert!(!resolved
+            .iter()
+            .any(|event| event.to_string().contains("hunter2")));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
