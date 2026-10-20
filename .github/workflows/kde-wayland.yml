@@ -34,6 +34,16 @@ jobs:
     steps:
       - name: Install KDE, portals and toolchain
         run: |
+          # KWin 6.8.0 crashes at startup without a GPU render node: its QPA
+          # dereferences a null primary render device (fixed upstream in
+          # "qpa: Fix crash without a render device", Plasma/6.8 e749ee8).
+          # Until Arch ships a KWin with that fix, install everything from
+          # the last archive snapshot before 6.8.0 (Plasma 6.7.5).
+          pacman -Sy --noconfirm
+          if pacman -Si kwin | grep -Eq '^Version +: 6\.8\.0-'; then
+            echo 'Server = https://archive.archlinux.org/repos/2026/10/13/$repo/os/$arch' > /etc/pacman.d/mirrorlist
+            pacman -Syyuu --noconfirm
+          fi
           pacman -Syu --noconfirm --needed git base-devel rustup dbus kwin kservice \
             xdg-desktop-portal xdg-desktop-portal-kde pipewire wireplumber \
             at-spi2-core python pyside6 ttf-dejavu libcap
