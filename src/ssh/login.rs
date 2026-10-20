@@ -156,7 +156,7 @@ impl LoginBroker {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn clear_backoff_for_tests(&self, conversation_id: &str, alias: &str) {
         self.state()
             .backoff
@@ -325,6 +325,11 @@ mod tests {
     async fn one_request_per_conversation_and_host() {
         let fixture = fixture("Host web\n").await;
         let service = &fixture.service;
+        // Password logins need connection sharing, which is off where the
+        // test's data directory is too long for a control socket (macOS).
+        if !service.password_login_supported("web").await {
+            return;
+        }
         let LoginAsk::New(first) = service.ask_login("c1", "web") else {
             panic!("expected a new request");
         };
@@ -402,6 +407,11 @@ mod tests {
     async fn a_wrong_password_keeps_the_request_open() {
         let fixture = fixture("Host bad\n").await;
         let service = &fixture.service;
+        // Password logins need connection sharing, which is off where the
+        // test's data directory is too long for a control socket (macOS).
+        if !service.password_login_supported("bad").await {
+            return;
+        }
         let LoginAsk::New(request) = service.ask_login("c1", "bad") else {
             panic!("expected a new request");
         };

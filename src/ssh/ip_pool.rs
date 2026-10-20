@@ -77,10 +77,12 @@ const MASTER_READY_TIMEOUT: Duration = Duration::from_secs(25);
 const AUTO_RETRY_AFTER: Duration = Duration::from_secs(15);
 /// Longest unix socket path: sun_path is 104 bytes on macOS (108 on
 /// Linux), including the terminating NUL.
+#[cfg(unix)]
 const MAX_SOCKET_PATH_LEN: usize = 103;
 /// What a control socket adds to its directory: `/<ip>` (at most 16
 /// characters), and OpenSSH first binds `<path>.<16 random characters>`
 /// before renaming it into place (17 more).
+#[cfg(unix)]
 const SOCKET_NAME_BUDGET: usize = 16 + 17;
 /// `ssh -W` children running at the same time; further connections are
 /// closed right away.
@@ -694,7 +696,7 @@ impl PoolRuntime {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn set_idle_override(&self, idle: Duration) {
         *self.shared.idle_override.lock().unwrap() = Some(idle);
     }
@@ -1523,6 +1525,7 @@ fn bind(address: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     socket.listen(128)
 }
 
+#[cfg(unix)]
 fn fits_socket_budget(dir: &Path) -> bool {
     dir.as_os_str().len() + SOCKET_NAME_BUDGET <= MAX_SOCKET_PATH_LEN
 }

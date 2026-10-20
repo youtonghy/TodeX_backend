@@ -1,12 +1,15 @@
 //! Port forwards and the IP pool against fake `ssh` scripts.
 
-use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::{os::unix::fs::PermissionsExt, time::Duration};
 
+#[cfg(target_os = "linux")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{
     forward::{ForwardInput, ForwardKind, ForwardStatus},
-    ip_pool::{AssignmentInput, AssignmentState, AssignmentUpdate, PoolConfigInput, PortMode},
+    ip_pool::{AssignmentInput, AssignmentState, PoolConfigInput, PortMode},
     tests::{fixture, Fixture},
     *,
 };
@@ -413,6 +416,7 @@ exit 1
     );
 }
 
+#[cfg(target_os = "linux")]
 async fn read_line(stream: &mut tokio::net::TcpStream) -> String {
     let mut buffer = vec![0u8; 128];
     let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buffer))
@@ -536,7 +540,7 @@ async fn pool_starts_a_master_on_demand_and_closes_it_when_idle() {
         .service
         .update_ip_assignment(
             ip,
-            AssignmentUpdate {
+            super::ip_pool::AssignmentUpdate {
                 port_mode: PortMode::Manual,
                 ports: Some(vec![
                     port.to_string(),
@@ -850,7 +854,7 @@ async fn real_ssh_forwards_and_pool() {
     service
         .update_ip_assignment(
             ip,
-            AssignmentUpdate {
+            super::ip_pool::AssignmentUpdate {
                 port_mode: PortMode::Manual,
                 ports: Some(vec![http.to_string()]),
             },

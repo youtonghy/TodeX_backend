@@ -1625,6 +1625,11 @@ exit 3
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn exec_waits_for_a_login_when_ssh_cannot_authenticate() {
         let harness = harness().await;
+        // Password logins need connection sharing, which is off where the
+        // test's data directory is too long for a control socket (macOS).
+        if !harness.state.ssh.password_login_supported("pw1").await {
+            return;
+        }
         harness
             .state
             .ssh

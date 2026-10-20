@@ -28,6 +28,7 @@ pub(crate) const MAX_ERROR_LEN: usize = 400;
 
 /// Arguments that only TodeX's long-running children carry: forwards
 /// (`ExitOnForwardFailure=yes`) and pool masters (`ControlMaster=yes`).
+#[cfg(unix)]
 pub(crate) const TRACKED_MARKERS: &[&str] = &["ExitOnForwardFailure=yes", "ControlMaster=yes"];
 
 /// One recorded child.

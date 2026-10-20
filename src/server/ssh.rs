@@ -641,6 +641,11 @@ mod tests {
     #[tokio::test]
     async fn login_endpoint_answers_open_requests_only() {
         let fake = crate::ssh::tests::fixture("Host web\n").await;
+        // Password logins need connection sharing, which is off where the
+        // test's data directory is too long for a control socket (macOS).
+        if !fake.service.password_login_supported("web").await {
+            return;
+        }
         let root = fake.root.join("app");
         let mut config = Config {
             data_dir: root.join("data"),
