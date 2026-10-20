@@ -37,6 +37,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     external_command::{self, bounded_text, prepare_captured, CommandLimits, ExternalCommandError},
+    privacy_filter::AgentOutputFilter,
     remote_fs::askpass::{self, AskpassSecret},
     secure_fs,
 };
@@ -126,6 +127,8 @@ struct SshStore {
     /// Manual port forwards (configuration only; never auto-started).
     forwards: Vec<ForwardSpec>,
     ip_pool: StoredIpPool,
+    /// Redaction of `ssh_exec` output before agents read it.
+    agent_output_filter: AgentOutputFilter,
 }
 
 /// `store.json`. Older daemons ignore unknown top-level fields but reject
@@ -151,6 +154,8 @@ struct PersistedStore {
     forwards: Option<serde_json::Value>,
     #[serde(default)]
     ip_pool: Option<serde_json::Value>,
+    #[serde(default)]
+    agent_output_filter: Option<serde_json::Value>,
 }
 
 /// The written form of [`SshStore`], read back as [`PersistedStore`].
@@ -167,6 +172,7 @@ struct PersistedStoreRef<'a> {
     forwards: &'a [ForwardSpec],
     #[serde(skip_serializing_if = "Option::is_none")]
     ip_pool: Option<&'a StoredIpPool>,
+    agent_output_filter: &'a AgentOutputFilter,
 }
 
 impl SshStore {
@@ -216,6 +222,10 @@ impl SshStore {
                 .ip_pool
                 .map(StoredIpPool::from_stored)
                 .unwrap_or_default(),
+            agent_output_filter: persisted
+                .agent_output_filter
+                .map(AgentOutputFilter::from_stored)
+                .unwrap_or_default(),
         })
     }
 
@@ -239,6 +249,7 @@ impl SshStore {
             connection: &self.connection,
             forwards: &self.forwards,
             ip_pool: (!self.ip_pool.is_default()).then_some(&self.ip_pool),
+            agent_output_filter: &self.agent_output_filter,
         };
         Ok(serde_json::to_vec_pretty(&persisted)?)
     }
@@ -1146,6 +1157,26 @@ impl SshService {
             self.save(&mut store, next).await?;
         }
         Ok(store.connection.clone())
+    }
+
+    pub async fn agent_output_filter(&self) -> AgentOutputFilter {
+        self.inner.store.read().await.agent_output_filter
+    }
+
+    /// Applies from the next `ssh_exec` result on.
+    pub async fn set_agent_output_filter(
+        &self,
+        filter: AgentOutputFilter,
+    ) -> Result<AgentOutputFilter, AppError> {
+        let mut store = self.inner.store.write().await;
+        if store.agent_output_filter != filter {
+            let next = SshStore {
+                agent_output_filter: filter,
+                ..store.clone()
+            };
+            self.save(&mut store, next).await?;
+        }
+        Ok(store.agent_output_filter)
     }
 
     /// Agent-enabled hosts that still exist, with resolved parameters.

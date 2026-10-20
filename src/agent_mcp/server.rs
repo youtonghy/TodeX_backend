@@ -47,7 +47,8 @@ use crate::{
         OutputStream,
     },
     local_terminal::decode_terminal_output,
-    provider::{process::redact_sensitive_text, ConversationSupervisor},
+    privacy_filter::{self, Categories},
+    provider::ConversationSupervisor,
     ssh::{
         classify_failure,
         login::{LoginAsk, LoginOutcome, LoginResolution, LOGIN_TIMEOUT},
@@ -232,77 +233,17 @@ fn prepare_exec(arguments: Value) -> Result<Prepared<SshCall>, String> {
 }
 
 /// Standard input as shown to the approver and journaled with the prompt:
-/// PEM blocks, `KEY=value` / `key: value` lines with a secret-looking key,
-/// and known token formats are redacted.
+/// keys and credentials are redacted (whatever the agent output filter is
+/// set to, as the preview is stored with the conversation).
 fn redact_stdin_preview(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut in_pem = false;
-    for line in text.split_inclusive('\n') {
-        let content = line.trim_end_matches(['\r', '\n']);
-        let ending = &line[content.len()..];
-        if in_pem {
-            // A block cut by the preview limit stays redacted to the end.
-            if content.contains("-----END ") {
-                in_pem = false;
-                output.push_str("[REDACTED PEM BLOCK]");
-                output.push_str(ending);
-            }
-            continue;
-        }
-        if let Some(start) = content.find("-----BEGIN ") {
-            output.push_str(&content[..start]);
-            if content[start..].contains("-----END ") {
-                output.push_str("[REDACTED PEM BLOCK]");
-                output.push_str(ending);
-            } else {
-                in_pem = true;
-            }
-            continue;
-        }
-        output.push_str(&redact_secret_assignment(content));
-        output.push_str(ending);
-    }
-    if in_pem {
-        output.push_str("[REDACTED PEM BLOCK]");
-    }
-    redact_sensitive_text(&output)
-}
-
-/// Replaces the value of a `KEY=value` / `key: value` line (optionally
-/// indented, `export`ed or with a quoted key) whose key names a secret.
-fn redact_secret_assignment(line: &str) -> std::borrow::Cow<'_, str> {
-    const SECRET_KEY_PARTS: &[&str] = &[
-        "password",
-        "passwd",
-        "secret",
-        "token",
-        "apikey",
-        "privatekey",
-        "credential",
-        "auth",
-    ];
-    let body = line.trim_start();
-    let body = body.strip_prefix("export ").unwrap_or(body);
-    let key_len = body
-        .find(|ch: char| {
-            !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '"' | '\''))
-        })
-        .unwrap_or(body.len());
-    let rest = body[key_len..].trim_start();
-    let Some(separator) = rest.chars().next().filter(|ch| matches!(ch, '=' | ':')) else {
-        return line.into();
+    const PREVIEW: Categories = Categories {
+        private_key: true,
+        public_key: false,
+        credential: true,
+        bank_card: false,
+        id_card: false,
     };
-    let value = rest[separator.len_utf8()..].trim();
-    let key: String = body[..key_len]
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect();
-    if value.is_empty() || !SECRET_KEY_PARTS.iter().any(|part| key.contains(part)) {
-        return line.into();
-    }
-    let value_start = line.len() - rest.len() + separator.len_utf8();
-    format!("{} [REDACTED]", &line[..value_start]).into()
+    privacy_filter::redact(text, &PREVIEW).text
 }
 
 /// Why `ssh_exec` is refused before asking: in ask mode the user approves
@@ -365,7 +306,9 @@ fn registry_of_tools() -> ToolRegistry<SshTools, SshCall> {
                  Returns stdout, stderr and the exit code; a non-zero exit code is a normal result. \
                  stdout and stderr are each capped at 256 KiB (truncated=true when cut). Unavailable \
                  in Plan mode; in ask mode the user approves each call and command and stdin are each limited \
-                 to 4096 bytes (upload a longer script to the host as a file first, then run it).",
+                 to 4096 bytes (upload a longer script to the host as a file first, then run it). \
+                 The user's privacy filter may replace keys, passwords, tokens, card and ID numbers in the \
+                 output with [REDACTED:<kind>] placeholders (redacted=true).",
                 schema(json!({
                     "type": "object",
                     "properties": {
@@ -535,6 +478,8 @@ impl SshTools {
             return tool_error(format!("cannot record the SSH command: {error}"));
         }
 
+        // Read per call, so a changed setting applies to the next command.
+        let filter = self.mcp.ssh().agent_output_filter().await;
         let begun = Instant::now();
         let (tap, chunks) = mpsc::unbounded_channel();
         let run = async {
@@ -552,7 +497,8 @@ impl SshTools {
         };
         let (outcome, output_truncated) = tokio::join!(run, recorder.record(chunks));
         let duration_ms = u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let (result, mut completed) = outcome.into_result(&request.host, duration_ms);
+        let (result, mut completed) =
+            outcome.into_result(&request.host, duration_ms, filter.active());
         completed["execId"] = json!(exec_id);
         completed["outputTruncated"] = json!(output_truncated);
         if let Err(error) = self
@@ -920,15 +866,26 @@ const SSH_ERROR_STATUS: i32 = 255;
 
 impl ExecOutcome {
     /// The tool result and the `ssh.exec.completed` payload.
-    fn into_result(self, host: &str, duration_ms: u64) -> (CallToolResult, Value) {
+    /// `filter`: the categories redacted from output the agent receives.
+    fn into_result(
+        self,
+        host: &str,
+        duration_ms: u64,
+        filter: Option<&Categories>,
+    ) -> (CallToolResult, Value) {
         let mut completed = json!({ "host": host, "durationMs": duration_ms, "truncated": false });
         let result = match self {
             Self::Finished(output) => {
-                finished_result(output, None, host, duration_ms, &mut completed)
+                finished_result(output, None, host, duration_ms, filter, &mut completed)
             }
-            Self::LoginFailed(output, hint) => {
-                finished_result(output, Some(hint), host, duration_ms, &mut completed)
-            }
+            Self::LoginFailed(output, hint) => finished_result(
+                output,
+                Some(hint),
+                host,
+                duration_ms,
+                filter,
+                &mut completed,
+            ),
             Self::TimedOut(timeout) => {
                 completed["failure"] = json!(SshFailureKind::TimedOut);
                 CallToolResult::structured_error(json!({
@@ -955,30 +912,48 @@ impl ExecOutcome {
 }
 
 /// The result of an ssh run that exited; `login_hint` replaces the usual
-/// hint when a login was tried and did not happen.
+/// hint when a login was tried and did not happen. Output is redacted with
+/// `filter` before the agent sees it; the counts go to `completed`.
 fn finished_result(
     output: external_command::TruncatedOutput,
     login_hint: Option<String>,
     host: &str,
     duration_ms: u64,
+    filter: Option<&Categories>,
     completed: &mut Value,
 ) -> CallToolResult {
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let raw_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_code = output.status.code();
     completed["exitCode"] = json!(exit_code);
     completed["truncated"] = json!(output.truncated);
-    match exit_code {
-        Some(code) if code != SSH_ERROR_STATUS => CallToolResult::structured(json!({
-            "stdout": stdout,
-            "stderr": stderr,
-            "exitCode": code,
-            "truncated": output.truncated,
-            "durationMs": duration_ms,
-        })),
+    let mut redactions = std::collections::BTreeMap::<_, usize>::new();
+    let mut filtered = |text: String| match filter {
+        Some(categories) => {
+            let redacted = privacy_filter::redact(&text, categories);
+            for (category, count) in redacted.counts {
+                *redactions.entry(category).or_default() += count;
+            }
+            redacted.text
+        }
+        None => text,
+    };
+    let stdout = filtered(String::from_utf8_lossy(&output.stdout).into_owned());
+    let stderr = filtered(raw_stderr.clone());
+    let (mut body, failed) = match exit_code {
+        Some(code) if code != SSH_ERROR_STATUS => (
+            json!({
+                "stdout": stdout,
+                "stderr": stderr,
+                "exitCode": code,
+                "truncated": output.truncated,
+                "durationMs": duration_ms,
+            }),
+            false,
+        ),
         _ => {
+            // Classified from what ssh printed, before redaction.
             let failure = if exit_code.is_some() {
-                classify_failure(&stderr)
+                classify_failure(&raw_stderr)
             } else {
                 SshFailureKind::Other
             };
@@ -999,10 +974,26 @@ fn finished_result(
             if let Some(hint) = login_hint.or_else(|| failure_hint(failure).map(str::to_owned)) {
                 error["hint"] = json!(hint);
             }
-            CallToolResult::structured_error(error)
+            (error, true)
         }
+    };
+    if !redactions.is_empty() {
+        body["redacted"] = json!(true);
+        body["note"] = json!(REDACTION_NOTE);
+        completed["redactions"] = json!(redactions);
+    }
+    if failed {
+        CallToolResult::structured_error(body)
+    } else {
+        CallToolResult::structured(body)
     }
 }
+
+/// Tells the agent what the placeholders in a redacted result are.
+const REDACTION_NOTE: &str = "The user's TodeX privacy filter replaced sensitive values in this \
+    output (keys, passwords, tokens, card or ID numbers) with [REDACTED:<kind>] placeholders. \
+    They are not the real content. Do not try to recover or work around them; if the task needs \
+    such a value, ask the user to handle that step.";
 
 /// What the agent (and the user reading along) should do about a failure.
 fn failure_hint(failure: SshFailureKind) -> Option<&'static str> {
@@ -1028,6 +1019,7 @@ mod tests {
     use crate::app_state::AppState;
     use crate::config::Config;
     use crate::conversation::ProviderKind;
+    use crate::privacy_filter::AgentOutputFilter;
     use axum::body::Body;
     use rmcp::model::CacheScope;
     use std::os::unix::fs::PermissionsExt;
@@ -1536,6 +1528,75 @@ exit 3
         client.cancel().await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exec_output_reaches_the_agent_redacted() {
+        let harness = harness().await;
+        let client = bridged_client(&harness).await;
+        let stdin = "DB_PASSWORD=Zq8x7Lk9w\ncard 4111 1111 1111 1111\n";
+
+        let result = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "web", "command": "cat", "stdin": stdin }),
+        )
+        .await;
+        let output = structured(&result);
+        assert_eq!(
+            output["stdout"],
+            "ran:cat\nDB_PASSWORD=[REDACTED:credential]\ncard [REDACTED:bank_card ****1111]\n"
+        );
+        assert_eq!(output["redacted"], true);
+        assert!(output["note"].as_str().unwrap().contains("privacy filter"));
+
+        // Off: the agent gets the output as printed.
+        harness
+            .state
+            .ssh
+            .set_agent_output_filter(AgentOutputFilter {
+                enabled: false,
+                ..AgentOutputFilter::default()
+            })
+            .await
+            .unwrap();
+        let raw = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "web", "command": "cat", "stdin": stdin }),
+        )
+        .await;
+        assert_eq!(structured(&raw)["stdout"], format!("ran:cat\n{stdin}"));
+        assert!(structured(&raw).get("redacted").is_none());
+
+        // The user's live view keeps the original; completion reports counts.
+        let history = harness
+            .state
+            .conversations
+            .history_for_tests(&harness.conversation_id)
+            .await;
+        let completed: Vec<_> = history
+            .iter()
+            .filter(|event| event.event_type == "ssh.exec.completed")
+            .map(|event| event.payload.clone())
+            .collect();
+        assert_eq!(
+            completed[0]["redactions"],
+            json!({ "credential": 1, "bankCard": 1 })
+        );
+        assert!(completed[1].get("redactions").is_none());
+        let first = &completed[0]["execId"];
+        let live: String = history
+            .iter()
+            .filter(|event| event.event_type == "ssh.exec.output")
+            .filter(|event| {
+                &event.payload["execId"] == first && event.payload["stream"] == "stdout"
+            })
+            .map(|event| event.payload["data"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(live, format!("ran:cat\n{stdin}"));
+
+        client.cancel().await.unwrap();
+    }
+
     /// The id of the conversation's open `ssh.login.requested`, waiting for
     /// one to be recorded.
     async fn login_request(harness: &Harness, seen: usize) -> String {
@@ -1813,7 +1874,7 @@ exit 3
             assert!(!preview.contains(secret), "{secret} leaked: {preview}");
         }
         assert!(
-            preview.contains("export DB_PASSWORD= [REDACTED]"),
+            preview.contains("export DB_PASSWORD=[REDACTED:credential]"),
             "{preview}"
         );
         assert!(preview.contains("USER=alice"), "{preview}");
@@ -1822,7 +1883,7 @@ exit 3
             "{preview}"
         );
         assert_eq!(
-            preview.matches("[REDACTED PEM BLOCK]").count(),
+            preview.matches("[REDACTED:private_key]").count(),
             2,
             "{preview}"
         );
@@ -1833,7 +1894,10 @@ exit 3
             "stdin": "TOKEN=plain-value\n",
         }))
         .unwrap();
-        assert_eq!(prepared.input["stdinPreview"], json!("TOKEN= [REDACTED]\n"));
+        assert_eq!(
+            prepared.input["stdinPreview"],
+            json!("TOKEN=[REDACTED:credential]\n")
+        );
     }
 
     async fn open_session(harness: &Harness) -> String {

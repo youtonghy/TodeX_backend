@@ -5163,6 +5163,8 @@ mod tests {
             ("PUT", "/v2/ssh/hosts/web/agent-access"),
             ("GET", "/v2/ssh/settings"),
             ("PUT", "/v2/ssh/settings"),
+            ("GET", "/v2/ssh/agent-output-filter"),
+            ("PUT", "/v2/ssh/agent-output-filter"),
             ("POST", "/v2/ftp/sites"),
         ] {
             let response = app
@@ -5213,6 +5215,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let filter = app
+            .clone()
+            .oneshot(signed_request(
+                &device,
+                "GET",
+                "/v2/ssh/agent-output-filter",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(filter.status(), StatusCode::OK);
+        let all_on = json!({
+            "enabled": true,
+            "categories": {
+                "privateKey": true, "publicKey": true, "credential": true,
+                "bankCard": true, "idCard": true,
+            },
+        });
+        assert_eq!(
+            serde_json::from_slice::<Value>(&to_bytes(filter.into_body(), 1024).await.unwrap())
+                .unwrap(),
+            all_on
+        );
+        let mut changed = all_on.clone();
+        changed["categories"]["publicKey"] = json!(false);
+        let saved = app
+            .clone()
+            .oneshot(signed_request(
+                &device,
+                "PUT",
+                "/v2/ssh/agent-output-filter",
+                &changed.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let store: Value =
+            serde_json::from_slice(&std::fs::read(root.join("data/ssh/store.json")).unwrap())
+                .unwrap();
+        assert_eq!(store["agentOutputFilter"], changed);
+        for invalid in [
+            r#"{"enabled":true}"#.to_owned(),
+            json!({ "enabled": true, "categories": all_on["categories"], "extra": 1 }).to_string(),
+        ] {
+            let rejected = app
+                .clone()
+                .oneshot(signed_request(
+                    &device,
+                    "PUT",
+                    "/v2/ssh/agent-output-filter",
+                    &invalid,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST, "{invalid}");
+        }
 
         let providers = app
             .clone()

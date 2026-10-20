@@ -31,6 +31,7 @@ mod mcp;
 mod native_history;
 mod pi_mcp;
 mod pi_plugins;
+mod privacy_filter;
 mod prompt_uploads;
 mod provider;
 mod quota_store;
