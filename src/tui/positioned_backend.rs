@@ -16,6 +16,8 @@ impl<W: Write> PositionedBackend<W> {
 }
 
 impl<W: Write> Backend for PositionedBackend<W> {
+    type Error = io::Error;
+
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,

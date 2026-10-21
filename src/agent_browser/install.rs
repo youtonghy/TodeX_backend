@@ -493,6 +493,36 @@ mod tests {
         assert_eq!(hashes.len(), PACKAGES.len());
     }
 
+    /// A package entry must not reach outside the install directory through
+    /// a symlink (RUSTSEC-2026-0368). macOS unpacks with `ditto` instead.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unpacking_keeps_symlinks_inside_the_destination() {
+        use std::io::Write;
+
+        let root = temp_data_dir();
+        let outside = root.join("outside");
+        let destination = root.join("unpacked");
+        std::fs::create_dir_all(&outside).unwrap();
+        let archive = root.join("evil.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        writer
+            .add_symlink("link", outside.to_str().unwrap(), options)
+            .unwrap();
+        writer.start_file("link/escaped.txt", options).unwrap();
+        writer.write_all(b"escaped").unwrap();
+        writer.finish().unwrap();
+
+        // Refusing the archive is fine; writing outside the destination is not.
+        let _ = unpack(&archive, &destination);
+        assert!(!outside.join("escaped.txt").exists());
+        if let Ok(target) = std::fs::canonicalize(destination.join("link")) {
+            assert!(target.starts_with(std::fs::canonicalize(&destination).unwrap()));
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn platforms_map_to_packages() {
         for (os, arch, platform) in [
