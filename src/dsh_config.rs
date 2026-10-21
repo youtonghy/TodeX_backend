@@ -990,7 +990,9 @@ mod tests {
             edit_profile_patch(&paths, Some(MISSING_REVISION), |_| Ok(())),
             Err(AppError::Conflict(_))
         ));
-        // A lock left by an exited process is taken over.
+        // A lock left by an exited process is taken over (only Unix can tell
+        // that its holder exited; see `holder_exited`).
+        #[cfg(unix)]
         fs::write(root.join("profiles/acp/package.json.lock"), "999999999\n").unwrap();
         let second = edit_profile_patch(&paths, Some(&first.revision), |layout| {
             layout.set_patch_key("web", "disabled", None)

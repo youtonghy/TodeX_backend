@@ -2355,7 +2355,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let patch = home.join(".dsh/profiles/acp/cordis.patch.yml");
+        let patch = home
+            .join(".dsh")
+            .join("profiles")
+            .join("acp")
+            .join("cordis.patch.yml");
         assert_eq!(created.path, patch.to_string_lossy());
         assert_eq!(created.format, McpConfigFormat::DshPatch);
         assert_eq!(
