@@ -6,13 +6,23 @@
 //!
 //! The plugin's `details` shapes are not a stable contract: a frame that does
 //! not look like the plugin's stays a plain tool card.
+//!
+//! Background runs (and `SubagentWorkflow` runs, always in the background)
+//! outlive the turn that launched them and die with the Pi process, while
+//! writing nothing to stdout until they settle. They are tracked here so the
+//! resident process is kept until they settle and Pi has reported on them.
 
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use tokio::time::Instant;
 
 const AGENT_TOOL: &str = "Agent";
+const WORKFLOW_TOOL: &str = "SubagentWorkflow";
 const RECORD_ENTRY: &str = "subagents:record";
 const NOTIFICATION_MESSAGE: &str = "subagent-notification";
+/// The plugin's status line key; its text counts running and queued agents
+/// ("2 running, 1 queued agents") and is cleared once none are left.
+pub(super) const STATUS_KEY: &str = "subagents";
 
 pub(super) type SubagentEvent = (&'static str, Value);
 
@@ -25,12 +35,35 @@ pub(super) struct PiSubagents {
     by_agent: HashMap<String, String>,
     /// subagentIds that already emitted a terminal event.
     finished: HashSet<String>,
+    /// Background runs that have not settled, by plugin agent (or workflow
+    /// run) id.
+    background: BTreeMap<String, BackgroundRun>,
+    /// Background runs that settled since the last turn began, as
+    /// `triggerDetail` parts for the run Pi starts to report on them.
+    settled: Vec<Value>,
+    /// When the last of `settled` did.
+    settled_at: Option<Instant>,
+    /// The plugin's status line reports running agents, including ones no
+    /// `Agent` result introduced.
+    status_busy: bool,
+}
+
+/// A background run as clients see it while the agent waits on it.
+struct BackgroundRun {
+    title: Option<String>,
+    /// The `Agent`/`SubagentWorkflow` call that launched it.
+    tool_call_id: String,
+    started_at: String,
 }
 
 impl PiSubagents {
     /// The `subagent.*` event implied by a `tool.*` event (`kind`) whose
     /// payload came from `pi_tool_payload`.
     pub(super) fn tool_event(&mut self, kind: &str, payload: &Value) -> Option<SubagentEvent> {
+        if payload.get("toolName").and_then(Value::as_str) == Some(WORKFLOW_TOOL) {
+            self.workflow_launched(kind, payload);
+            return None;
+        }
         if payload.get("toolName").and_then(Value::as_str) != Some(AGENT_TOOL) {
             return None;
         }
@@ -93,6 +126,13 @@ impl PiSubagents {
             // session record or completion notification.
             if let Some(file) = text.as_deref().and_then(output_file) {
                 fields.insert("outputFile".into(), json!(file));
+            }
+            if let Some(agent_id) = fields.get("agentId").and_then(Value::as_str) {
+                let title = fields
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.launch_background(agent_id.to_owned(), title, id);
             }
             fields.insert("status".into(), json!("running"));
             return Some(("subagent.updated", event(id, Some(payload), fields)));
@@ -187,6 +227,124 @@ impl PiSubagents {
             .collect()
     }
 
+    /// A `SubagentWorkflow` call returns its run id at once; the run settles
+    /// through a completion notification for that id.
+    fn workflow_launched(&mut self, kind: &str, payload: &Value) {
+        if kind != "tool.completed" || payload.get("isError").and_then(Value::as_bool) == Some(true)
+        {
+            return;
+        }
+        let (Some(id), Some(run_id)) = (
+            payload.get("toolCallId").and_then(Value::as_str),
+            payload
+                .pointer("/result/details/taskId")
+                .and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        let title = payload
+            .pointer("/arguments/title")
+            .or_else(|| payload.pointer("/arguments/name"))
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned);
+        self.launch_background(run_id.to_owned(), title, id);
+    }
+
+    fn launch_background(&mut self, agent_id: String, title: Option<String>, tool_call_id: &str) {
+        self.background
+            .entry(agent_id)
+            .or_insert_with(|| BackgroundRun {
+                title,
+                tool_call_id: tool_call_id.to_owned(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            });
+    }
+
+    /// A turn starts: runs that settled before it are its own business now.
+    pub(super) fn begin_turn(&mut self) {
+        self.settled.clear();
+        self.settled_at = None;
+    }
+
+    /// The plugin's status line changed (`None` clears it).
+    pub(super) fn set_status(&mut self, text: Option<&str>) {
+        self.status_busy = text.is_some_and(|text| !text.trim().is_empty());
+    }
+
+    /// Whether background runs are still going.
+    pub(super) fn running(&self) -> bool {
+        !self.background.is_empty() || self.status_busy
+    }
+
+    /// Runs settled since the last turn whose report Pi has not started yet
+    /// keep the process until `grace` after the last of them settled.
+    pub(super) fn report_due_until(&self, grace: std::time::Duration) -> Option<Instant> {
+        self.settled_at
+            .filter(|_| !self.settled.is_empty())
+            .map(|at| at + grace)
+    }
+
+    /// The `tasks` of a `background_tasks_pending` notice.
+    pub(super) fn background_tasks(&self) -> Vec<Value> {
+        self.background
+            .iter()
+            .map(|(agent_id, run)| {
+                let mut task = json!({
+                    "taskId": agent_id,
+                    "taskType": "subagent",
+                    "toolUseId": run.tool_call_id,
+                    "startedAt": run.started_at,
+                });
+                if let Some(title) = &run.title {
+                    task["description"] = json!(title);
+                }
+                task
+            })
+            .collect()
+    }
+
+    /// Runs lost if the process stops now: still running, or settled with
+    /// the report Pi starts on them still due (within `grace`).
+    pub(super) fn lost_task_ids(&self, grace: std::time::Duration) -> Vec<String> {
+        let mut ids: Vec<String> = self.background.keys().cloned().collect();
+        let report_due = self
+            .report_due_until(grace)
+            .is_some_and(|until| until > Instant::now());
+        ids.extend(
+            self.settled
+                .iter()
+                .filter(|_| report_due)
+                .filter_map(|task| task.get("taskId").and_then(Value::as_str))
+                .map(str::to_owned),
+        );
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// `triggerDetail` for a run Pi just started on its own; takes the
+    /// settled runs it reports on.
+    pub(super) fn take_trigger(&mut self) -> Value {
+        let settled = std::mem::take(&mut self.settled);
+        self.settled_at = None;
+        if settled.is_empty() {
+            return json!({ "kind": "unknown" });
+        }
+        let text = |key: &str| {
+            settled
+                .iter()
+                .find_map(|task| task.get(key).and_then(Value::as_str))
+                .map(str::to_owned)
+        };
+        json!({
+            "kind": "background_task",
+            "taskIds": settled.iter().filter_map(|task| task.get("taskId")).collect::<Vec<_>>(),
+            "taskType": "subagent",
+            "summary": text("summary"),
+        })
+    }
+
     fn subagent_id(&self, agent_id: &str) -> String {
         self.by_agent
             .get(agent_id)
@@ -204,6 +362,17 @@ impl PiSubagents {
         self.known.insert(id.clone());
         self.by_agent.insert(agent_id.to_owned(), id.clone());
         fields.insert("agentId".into(), json!(agent_id));
+        if terminal_status(status).is_some() {
+            if let Some(run) = self.background.remove(agent_id) {
+                self.settled.push(json!({
+                    "taskId": agent_id,
+                    "summary": run.title.or_else(|| {
+                        fields.get("title").and_then(Value::as_str).map(str::to_owned)
+                    }),
+                }));
+                self.settled_at = Some(Instant::now());
+            }
+        }
         let Some((kind, status)) =
             terminal_status(status).filter(|_| self.finished.insert(id.clone()))
         else {
@@ -501,6 +670,80 @@ mod tests {
         assert!(runs
             .notification(Some(&json!({ "customType": "other", "details": {} })))
             .is_empty());
+    }
+
+    #[test]
+    fn background_runs_are_awaited_until_they_settle_and_name_the_report() {
+        let mut runs = PiSubagents::default();
+        runs.tool_event("tool.started", &tool("started", "call-1", json!({})));
+        runs.tool_event(
+            "tool.completed",
+            &tool(
+                "completed",
+                "call-1",
+                json!({ "result": { "content": text("Agent started in background."),
+                    "details": details("background", json!({ "agentId": "agent-1" })) } }),
+            ),
+        );
+        // `SubagentWorkflow` runs are always in the background.
+        runs.tool_event(
+            "tool.completed",
+            &json!({ "toolCallId": "call-2", "toolName": "SubagentWorkflow",
+                "arguments": { "title": "Audit" },
+                "result": { "content": text("Workflow started"), "details": { "taskId": "wf-1" } } }),
+        );
+        assert!(runs.running());
+        let tasks = runs.background_tasks();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["taskId"], "agent-1");
+        assert_eq!(tasks[0]["toolUseId"], "call-1");
+        assert_eq!(tasks[0]["description"], "Find auth");
+        assert_eq!(tasks[1]["taskId"], "wf-1");
+        assert_eq!(tasks[1]["description"], "Audit");
+        assert_eq!(
+            runs.lost_task_ids(std::time::Duration::from_secs(60)),
+            ["agent-1", "wf-1"]
+        );
+
+        let record = json!({ "type": "entry_appended", "entry": { "type": "custom", "customType": "subagents:record",
+            "data": { "id": "agent-1", "status": "completed", "result": "Found it." } } });
+        runs.record_entry(&record);
+        let workflow = json!({ "role": "custom", "customType": "subagent-notification",
+            "details": { "id": "wf-1", "description": "Workflow audit", "status": "stopped" } });
+        runs.notification(Some(&workflow));
+        assert!(!runs.running());
+        // Their report keeps the process a little longer.
+        assert!(runs
+            .report_due_until(std::time::Duration::from_secs(60))
+            .is_some());
+        assert_eq!(
+            runs.lost_task_ids(std::time::Duration::from_secs(60)),
+            ["agent-1", "wf-1"]
+        );
+        assert_eq!(
+            runs.take_trigger(),
+            json!({ "kind": "background_task", "taskIds": ["agent-1", "wf-1"],
+                "taskType": "subagent", "summary": "Find auth" })
+        );
+        assert!(runs
+            .report_due_until(std::time::Duration::from_secs(60))
+            .is_none());
+        assert!(runs
+            .lost_task_ids(std::time::Duration::from_secs(60))
+            .is_empty());
+    }
+
+    #[test]
+    fn the_plugin_status_line_counts_as_running_work() {
+        let mut runs = PiSubagents::default();
+        runs.set_status(Some("2 running, 1 queued agents"));
+        assert!(runs.running());
+        // Nothing to show: the runs are unknown beyond the count.
+        assert!(runs.background_tasks().is_empty());
+        runs.set_status(None);
+        assert!(!runs.running());
+        runs.begin_turn();
+        assert_eq!(runs.take_trigger()["kind"], "unknown");
     }
 
     #[test]

@@ -909,13 +909,15 @@ impl ConversationSupervisor {
 
     /// A settled journal whose last turn left background tasks waiting:
     /// the provider process went down with the daemon, so they are lost.
-    /// Only recent Claude Code journals can hold such work (its processes
-    /// keep work at most 6 h past a turn), which
+    /// Only recent Claude Code and Pi journals can hold such work (their
+    /// processes keep work at most 6 h past a turn), which
     /// keeps the digest reads off most conversations.
     async fn recover_lost_background_work(&self, manifest: &ConversationManifest) {
-        if manifest.provider != ProviderKind::ClaudeCode
-            || manifest.updated_at
-                < Utc::now() - chrono::Duration::hours(BACKGROUND_WORK_HORIZON_HOURS)
+        if !matches!(
+            manifest.provider,
+            ProviderKind::ClaudeCode | ProviderKind::Pi
+        ) || manifest.updated_at
+            < Utc::now() - chrono::Duration::hours(BACKGROUND_WORK_HORIZON_HOURS)
         {
             return;
         }
@@ -4850,10 +4852,15 @@ mod tests {
         let (root, store, supervisor, workspace) =
             control_fixture("todex-recover-background").await;
         let mut waiting = Vec::new();
-        for left_waiting in [true, false] {
+        for (provider, left_waiting) in [
+            (ProviderKind::ClaudeCode, true),
+            (ProviderKind::ClaudeCode, false),
+            // Pi holds background subagents the same way.
+            (ProviderKind::Pi, true),
+        ] {
             let manifest = store
                 .create(ConversationManifest::new(
-                    ProviderKind::ClaudeCode,
+                    provider,
                     workspace.clone(),
                     None,
                     None,
@@ -4868,7 +4875,7 @@ mod tests {
                 .append(
                     &manifest.id,
                     "provider.event",
-                    json!({ "provider": "claude-code",
+                    json!({ "provider": provider,
                 "providerMethod": "background_tasks_pending", "turnId": "t",
                 "metadata": { "taskIds": ["b1"] } }),
                 )

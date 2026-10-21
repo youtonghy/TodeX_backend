@@ -21,10 +21,10 @@ use super::profile::{
     ProviderProfile, SkillInjection, UserConfigFile,
 };
 use super::types::{
-    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode,
+    DriverContext, DriverEventSink, DriverPrompt, DriverTurnResult, ImageInputMode, LostWork,
     PendingProviderControl, PermissionConfigCapabilities, PermissionOutcome,
     ProviderCommandDescriptor, ProviderControl, ProviderDescriptor, ProviderDriver,
-    ProviderPrewarm, ProviderSessionCommands,
+    ProviderPrewarm, ProviderSessionCommands, ProviderWork, ProviderWorkHandle,
 };
 
 mod subagents;
@@ -38,6 +38,34 @@ const SESSION_IDLE_TIMEOUT: Duration = PROFILE.process_model.idle_timeout().unwr
 /// How long a turn waits for a stopping resident process (flush, dialog
 /// closure and graceful termination) before reopening the session.
 const PI_STOP_WAIT: Duration = Duration::from_secs(10);
+/// The longest background subagents keep a process past its keepalive,
+/// counted from the end of the last turn, as for Claude Code.
+const MAX_BACKGROUND_HOLD: Duration = Duration::from_secs(6 * 3600);
+/// How long settled background runs keep the process for the report Pi
+/// starts on them: pi-subagents holds a group's notification up to 30 s.
+const REPORT_GRACE: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(60)
+};
+/// While background work holds the process, how often the hold is
+/// re-evaluated: the plugin's status line can clear without a frame that
+/// reaches the worker loop.
+const HOLD_RECHECK: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(30)
+};
+/// How long a run Pi started on its own waits for the turn that takes it
+/// over before it is journalled without one.
+const ADOPT_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
+/// How long a stopping worker waits for the loss of its background work to
+/// be journalled.
+const REPORT_LOST_TIMEOUT: Duration = Duration::from_secs(2);
 const PI_UI_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// Pi streams thinking/text a few characters at a time; fragments of one block
 /// are merged (shared window and size limits) so the journal does not store
@@ -98,6 +126,8 @@ pub struct PiDriver {
     starting: std::sync::Mutex<HashMap<String, PendingStart>>,
     /// How long a resident process may sit without activity.
     idle_timeout: Duration,
+    /// How long background subagents may keep it past the last turn.
+    background_hold: Duration,
     /// Holds spawns until released, so tests can act while one is in flight.
     #[cfg(test)]
     spawn_gate: Option<Arc<tokio::sync::Semaphore>>,
@@ -114,6 +144,9 @@ struct PiSessionHandle {
     /// Set by the worker once it has decided to stop on its own (idle,
     /// process exit, protocol error). New turns wait for it to finish.
     stopping: Arc<AtomicBool>,
+    /// Set by the worker while background subagents (or a run Pi started on
+    /// its own) live in the process: restarting it would lose them.
+    background: Arc<AtomicBool>,
     runtime_id: String,
     /// The TodeX MCP servers the resident process was spawned with; a turn
     /// whose [`DriverContext::agent_mcp`] differs reopens the runtime so newly
@@ -246,6 +279,7 @@ impl PiDriver {
         let (requests, request_rx) = mpsc::channel(16);
         let (shutdown, shutdown_rx) = watch::channel(None);
         let stopping = Arc::new(AtomicBool::new(false));
+        let background = Arc::new(AtomicBool::new(false));
         let runtime_id = format!("pi-runtime-{}", uuid::Uuid::new_v4().simple());
         let session_sink = sink.clone().for_runtime(runtime_id.clone());
         let handle = PiSessionHandle {
@@ -254,6 +288,7 @@ impl PiDriver {
             requests,
             shutdown,
             stopping: stopping.clone(),
+            background: background.clone(),
             runtime_id,
             agent_mcp,
         };
@@ -265,7 +300,9 @@ impl PiDriver {
             request_rx,
             shutdown_rx,
             stopping,
+            background,
             self.idle_timeout,
+            self.background_hold,
         ));
         let mut sessions = self.sessions.lock().await;
         // A close that arrived during the spawn found only the
@@ -293,11 +330,26 @@ impl PiDriver {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             starting: std::sync::Mutex::new(HashMap::new()),
             idle_timeout: config.provider_keepalive(),
+            background_hold: MAX_BACKGROUND_HOLD,
             #[cfg(test)]
             spawn_gate: None,
             models: CatalogCache::new(PROFILE.discovery_cache_ttl),
             commands: CatalogCache::new(PROFILE.discovery_cache_ttl),
         }
+    }
+
+    /// Maintenance restarts the resident process; refused while that would
+    /// take background subagents along.
+    async fn ensure_no_background(&self, conversation_id: &str) -> Result<(), AppError> {
+        let sessions = self.sessions.lock().await;
+        if sessions.get(conversation_id).is_some_and(|handle| {
+            !handle.turns.is_closed() && handle.background.load(Ordering::Acquire)
+        }) {
+            return Err(AppError::Conflict(
+                "Pi background subagents are still running; wait for them to finish or stop the background run first".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     async fn close_session(&self, conversation_id: &str, reason: &str) -> Option<String> {
@@ -483,6 +535,7 @@ impl ProviderDriver for PiDriver {
         context: DriverContext,
         mut cancel: watch::Receiver<bool>,
     ) -> Result<(), AppError> {
+        self.ensure_no_background(&context.manifest.id).await?;
         self.close_session(&context.manifest.id, "maintenance_compact")
             .await;
         let mut process = self.open_existing(&context).await?;
@@ -509,6 +562,7 @@ impl ProviderDriver for PiDriver {
         &self,
         context: DriverContext,
     ) -> Result<crate::conversation::ProviderState, AppError> {
+        self.ensure_no_background(&context.manifest.id).await?;
         self.close_session(&context.manifest.id, "maintenance_clone")
             .await;
         let mut process = self.open_existing(&context).await?;
@@ -693,6 +747,9 @@ impl ProviderDriver for PiDriver {
         let spec = self.launch(&context, &prompt)?;
 
         let conversation_id = context.manifest.id.clone();
+        // A provider-initiated turn takes over a run of the live process;
+        // without one there is nothing to take over.
+        let adopt = context.handles.adopt.is_some();
         let mut context = context;
         let mut prompt = prompt;
         let mut spawned = false;
@@ -707,6 +764,12 @@ impl ProviderDriver for PiDriver {
                 let mut sessions = self.sessions.lock().await;
                 sessions.retain(|_, handle| !handle.turns.is_closed());
                 if let Some(handle) = sessions.get(&conversation_id) {
+                    if adopt
+                        && (handle.shutdown.borrow().is_some()
+                            || handle.stopping.load(Ordering::Acquire))
+                    {
+                        return Ok(nothing_to_adopt(pi_native_session(&context)));
+                    }
                     if handle.shutdown.borrow().is_some() {
                         return Err(pi_closing_error());
                     }
@@ -715,6 +778,8 @@ impl ProviderDriver for PiDriver {
                     } else {
                         Slot::Running(handle.clone())
                     }
+                } else if adopt {
+                    return Ok(nothing_to_adopt(pi_native_session(&context)));
                 } else {
                     let mut starting = self
                         .starting
@@ -733,7 +798,14 @@ impl ProviderDriver for PiDriver {
                 }
             };
             let handle = match slot {
-                Slot::Running(handle) if handle.agent_mcp != context.agent_mcp => {
+                // Restarting would lose its background subagents (and an
+                // adopted run belongs to this process): the new set of TodeX
+                // MCP servers waits for the next restart.
+                Slot::Running(handle)
+                    if handle.agent_mcp != context.agent_mcp
+                        && !adopt
+                        && !handle.background.load(Ordering::Acquire) =>
+                {
                     // The set of enabled TodeX MCP servers changed since this
                     // resident process was spawned (for example an SSH host
                     // was granted agent access after prewarm). Close it so the
@@ -952,6 +1024,20 @@ async fn pi_package_declares_resource(package: &Value, package_root: &Path, sour
     false
 }
 
+/// Launch settings of the last prompted turn and how to open a turn for a
+/// run Pi starts on its own, as [`ProviderWork`] needs them.
+type PiProviderWork = (ProviderWorkHandle, DriverPrompt);
+
+/// A run Pi started on its own between turns, offered to the supervisor.
+struct AwaitedRun {
+    adoption: String,
+    deadline: tokio::time::Instant,
+    /// Its `agent_start`, replayed into the turn that takes it over.
+    start: Value,
+    /// Settled background runs it reports on.
+    tasks: Vec<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn pi_session_worker(
     mut process: JsonLineProcess,
@@ -961,7 +1047,9 @@ async fn pi_session_worker(
     mut requests: mpsc::Receiver<PiSessionRequest>,
     mut shutdown: watch::Receiver<Option<String>>,
     stopping: Arc<AtomicBool>,
+    background: Arc<AtomicBool>,
     idle_timeout: Duration,
+    background_hold: Duration,
 ) {
     let (_idle_cancel, idle_cancel) = watch::channel(false);
     let mut rpc = PiRpc::new(&mut process, Some(session_sink.clone()), idle_cancel);
@@ -983,6 +1071,12 @@ async fn pi_session_worker(
     };
     let mut reason = "process_exited".to_owned();
     let mut idle_deadline = tokio::time::Instant::now() + idle_timeout;
+    // Background subagents are held at most this long past the last turn.
+    let mut hold_cap = tokio::time::Instant::now() + background_hold;
+    let mut provider_work: Option<PiProviderWork> = None;
+    let mut awaiting: Option<AwaitedRun> = None;
+    // Pi runs on its own between turns and no turn took the run over.
+    let mut own_run = false;
     if ready.is_ok() {
         loop {
             if let Some(requested) = shutdown.borrow().clone() {
@@ -990,6 +1084,25 @@ async fn pi_session_worker(
                 break;
             }
             let can_idle_stop = rpc.dialogs.is_empty() && rpc.session_dialogs.is_empty();
+            let now = tokio::time::Instant::now();
+            let held = own_run || rpc.subagents.running();
+            let hold = if held {
+                Some(hold_cap)
+            } else {
+                rpc.subagents
+                    .report_due_until(REPORT_GRACE)
+                    .map(|until| until.min(hold_cap))
+            };
+            background.store(held || awaiting.is_some(), Ordering::Release);
+            let stop_at = match &awaiting {
+                Some(run) => run.deadline,
+                None => hold.map_or(idle_deadline, |until| until.max(idle_deadline)),
+            };
+            let wake_at = if held {
+                stop_at.min(now + HOLD_RECHECK)
+            } else {
+                stop_at
+            };
             // Biased: a requested shutdown wins, then a waiting turn, and the
             // idle deadline only when nothing else is ready.
             let turn = tokio::select! {
@@ -1014,11 +1127,30 @@ async fn pi_session_worker(
                     }
                     continue;
                 }
-                frame = rpc.next_event() => {
+                // A run offered to the supervisor stays unread until its turn
+                // takes it over.
+                frame = rpc.next_event(), if awaiting.is_none() => {
                     idle_deadline = tokio::time::Instant::now() + idle_timeout;
                     match frame {
                         Ok(frame) => {
-                            if let Err(error) = emit_pi_idle_frame(&mut rpc, frame).await {
+                            match frame.get("type").and_then(Value::as_str) {
+                                Some("agent_start") if !own_run => {
+                                    if let Some(run) = offer_pi_run(&mut rpc, provider_work.as_ref(), &frame) {
+                                        awaiting = Some(run);
+                                        continue;
+                                    }
+                                    own_run = true;
+                                }
+                                Some("agent_settled") => own_run = false,
+                                _ => {}
+                            }
+                            let settled = frame.get("type").and_then(Value::as_str) == Some("agent_settled");
+                            let emitted = match emit_pi_idle_frame(&mut rpc, frame).await {
+                                // The run reported; what still runs is awaited again.
+                                Ok(()) if settled => emit_pi_background_pending(&mut rpc, &session_sink).await,
+                                result => result,
+                            };
+                            if let Err(error) = emitted {
                                 tracing::warn!(error = %error, "Pi background event failed");
                                 reason = "protocol_error".to_owned();
                                 break;
@@ -1032,7 +1164,21 @@ async fn pi_session_worker(
                     }
                     continue;
                 }
-                _ = tokio::time::sleep_until(idle_deadline), if can_idle_stop => {
+                _ = tokio::time::sleep_until(wake_at), if can_idle_stop || awaiting.is_some() => {
+                    if let Some(run) = awaiting.take_if(|run| run.deadline <= tokio::time::Instant::now()) {
+                        // No turn took the run over: journal it without one.
+                        tracing::warn!("no turn took over Pi's own run; journalling it between turns");
+                        own_run = true;
+                        if let Err(error) = emit_pi_idle_frame(&mut rpc, run.start).await {
+                            tracing::warn!(error = %error, "Pi background event failed");
+                            reason = "protocol_error".to_owned();
+                            break;
+                        }
+                        continue;
+                    }
+                    if awaiting.is_some() || tokio::time::Instant::now() < stop_at {
+                        continue;
+                    }
                     reason = "idle_timeout".to_owned();
                     break;
                 }
@@ -1058,18 +1204,47 @@ async fn pi_session_worker(
                     }
                 }
             }
-            let native = turn
-                .context
-                .provider_state
-                .native_session_id
-                .clone()
-                .unwrap_or_else(|| turn.context.manifest.id.clone());
+            let native = pi_native_session(&turn.context);
+            let adopt = match (&turn.context.handles.adopt, &awaiting) {
+                (Some(token), Some(run)) if *token == run.adoption => true,
+                // The run it was opened for is gone (another turn read it,
+                // or it was journalled without one): nothing to take over.
+                (Some(_), _) => {
+                    let _ = turn
+                        .result
+                        .send(PiTurnReply::Finished(Ok(nothing_to_adopt(native))));
+                    continue;
+                }
+                (None, _) => false,
+            };
+            // The offered run is read by this turn: adopted, or followed by
+            // this prompt.
+            if let Some(run) = awaiting.take() {
+                rpc.push_front_buffered(run.start);
+            }
+            if !adopt {
+                rpc.subagents.begin_turn();
+                // The settings a later provider-initiated turn reports.
+                let settings = DriverPrompt {
+                    text: String::new(),
+                    content: Vec::new(),
+                    skills: Vec::new(),
+                    ..turn.prompt.clone()
+                };
+                provider_work = turn
+                    .context
+                    .handles
+                    .provider_work
+                    .clone()
+                    .map(|handle| (handle, settings))
+                    .or(provider_work.take());
+            }
             let prompt = turn.prompt.clone();
             let sink = session_sink.clone().with_turn_id(prompt.turn_id.clone());
             rpc.begin_turn(sink.clone(), turn.cancel.clone());
             let mut queue = Vec::new();
             let mut result = tokio::select! {
-                result = run_pi_turn(&mut rpc, turn.context, turn.prompt, &sink, &mut controls, &mut requests, &mut queue) => result,
+                result = run_pi_turn(&mut rpc, turn.context, turn.prompt, &sink, &mut controls, &mut requests, &mut queue, adopt) => result,
                 _ = shutdown.changed() => Err(AppError::TurnCancelled),
             };
             // Text and tool progress streamed right before a cancel or failure
@@ -1135,13 +1310,21 @@ async fn pi_session_worker(
                 if let Err(error) = pause_pi_queue(&sink, &mut queue).await {
                     tracing::error!(error = %error, "failed to persist Pi queue closure");
                 }
+            } else if result.is_ok() {
+                // Before `turn.completed`: clients keep waiting on the
+                // background runs the turn leaves behind.
+                if let Err(error) = emit_pi_background_pending(&mut rpc, &sink).await {
+                    tracing::warn!(error = %error, "failed to persist Pi background tasks");
+                }
             }
             rpc.end_turn();
+            own_run = false;
             let _ = turn.result.send(PiTurnReply::Finished(result));
             if closing {
                 break;
             }
             idle_deadline = tokio::time::Instant::now() + idle_timeout;
+            hold_cap = tokio::time::Instant::now() + background_hold;
         }
     } else {
         reason = "persistence_error".to_owned();
@@ -1156,6 +1339,13 @@ async fn pi_session_worker(
     if let Err(error) = rpc.flush_pending_ui(true).await {
         tracing::warn!(error = %error, "failed to persist final Pi UI state");
     }
+    // Background runs, and reports nobody took over, go with the process.
+    let mut lost = rpc.subagents.lost_task_ids(REPORT_GRACE);
+    if let Some(run) = awaiting.take() {
+        lost.extend(run.tasks);
+        lost.sort();
+        lost.dedup();
+    }
     rpc.process.terminate().await;
     // A prewarmed runtime that stops before its first turn never journalled
     // `ready`, so it has no closure to journal either.
@@ -1168,6 +1358,18 @@ async fn pi_session_worker(
             .await
         {
             tracing::warn!(error = %error, "failed to persist Pi runtime closure");
+        }
+    }
+    if let Some((handle, _)) = provider_work.filter(|_| !lost.is_empty()) {
+        let lost = handle.lost(LostWork {
+            task_ids: lost,
+            reason: pi_lost_reason(&reason),
+        });
+        if tokio::time::timeout(REPORT_LOST_TIMEOUT, lost)
+            .await
+            .is_err()
+        {
+            tracing::warn!("journalling Pi's lost background work timed out");
         }
     }
     turns.close();
@@ -1191,6 +1393,97 @@ async fn pi_session_worker(
             turn: Box::new((turn.context, turn.prompt)),
             retry,
         });
+    }
+}
+
+/// Offers a run Pi just started on its own (`start`, its `agent_start`) to
+/// the supervisor as a provider-initiated turn; `None` when no turn can be
+/// opened for it.
+fn offer_pi_run(
+    rpc: &mut PiRpc<'_>,
+    provider_work: Option<&PiProviderWork>,
+    start: &Value,
+) -> Option<AwaitedRun> {
+    let (handle, settings) = provider_work?;
+    let adoption = uuid::Uuid::new_v4().simple().to_string();
+    let trigger = rpc.subagents.take_trigger();
+    let tasks = trigger
+        .get("taskIds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let work = ProviderWork {
+        adoption: adoption.clone(),
+        settings: settings.clone(),
+        trigger,
+    };
+    let handle = handle.clone();
+    tokio::spawn(async move {
+        if let Err(error) = handle.start(work).await {
+            tracing::warn!(%error, "could not open a turn for Pi's own run");
+        }
+    });
+    Some(AwaitedRun {
+        adoption,
+        deadline: tokio::time::Instant::now() + ADOPT_TIMEOUT,
+        start: start.clone(),
+        tasks,
+    })
+}
+
+/// Tells clients which background runs Pi still owes a report on.
+async fn emit_pi_background_pending(
+    rpc: &mut PiRpc<'_>,
+    sink: &DriverEventSink,
+) -> Result<(), AppError> {
+    let tasks = rpc.subagents.background_tasks();
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let task_ids: Vec<Value> = tasks
+        .iter()
+        .filter_map(|task| task.get("taskId"))
+        .cloned()
+        .collect();
+    sink.emit(
+        "provider.event",
+        json!({
+            "provider": "pi",
+            "providerMethod": "background_tasks_pending",
+            "metadata": { "taskIds": task_ids, "tasks": tasks },
+        }),
+    )
+    .await
+    .map(drop)
+}
+
+/// The [`LostWork`] reason for a worker that stopped for `reason`.
+fn pi_lost_reason(reason: &str) -> &'static str {
+    match reason {
+        "idle_timeout" => "expired",
+        "mcp_changed" => "settings_changed",
+        "process_exited" | "protocol_error" | "persistence_error" => "process_ended",
+        _ => "stopped",
+    }
+}
+
+fn pi_native_session(context: &DriverContext) -> String {
+    context
+        .provider_state
+        .native_session_id
+        .clone()
+        .unwrap_or_else(|| context.manifest.id.clone())
+}
+
+/// The result of a provider-initiated turn whose run was already gone.
+fn nothing_to_adopt(session_id: String) -> DriverTurnResult {
+    DriverTurnResult {
+        native_session_id: Some(session_id),
+        stop_reason: "no_work".to_owned(),
+        cancelled: false,
     }
 }
 
@@ -1313,6 +1606,10 @@ fn pi_supported_thinking_levels(item: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Runs one turn: sends `prompt`, or with `adopt` takes over the run Pi
+/// already started on its own (its frames wait in the buffer) without
+/// sending anything.
+#[allow(clippy::too_many_arguments)]
 async fn run_pi_turn(
     rpc: &mut PiRpc<'_>,
     context: DriverContext,
@@ -1321,23 +1618,37 @@ async fn run_pi_turn(
     controls: &mut mpsc::Receiver<PendingProviderControl>,
     requests: &mut mpsc::Receiver<PiSessionRequest>,
     queue: &mut Vec<PiQueueItem>,
+    adopt: bool,
 ) -> Result<DriverTurnResult, AppError> {
     let native_session_id = context
         .provider_state
         .native_session_id
         .clone()
         .unwrap_or_else(|| context.manifest.id.clone());
+    if adopt {
+        // Everything the adopted run says from here on is this turn's.
+        rpc.activate_turn();
+    }
     rpc.process
         .send(&json!({ "id": "state", "type": "get_state" }))
         .await?;
     let mut state = rpc.wait_response("state").await?;
     verify_pi_session(&state, context.provider_state.native_session_id.as_deref())?;
     rpc.reusable = true;
-    if !pi_is_idle(&state) {
+    // Pi is running on its own (an extension started the run, e.g. to
+    // report finished background subagents): the prompt follows that run.
+    let follows_run = !adopt
+        && state.pointer("/data/isStreaming").and_then(Value::as_bool) == Some(true)
+        && state.pointer("/data/isCompacting").and_then(Value::as_bool) != Some(true);
+    if !adopt && !follows_run && !pi_is_idle(&state) {
         return Err(AppError::Conflict("A Pi extension is still working in this runtime; wait for it to finish before starting another turn".to_owned()));
     }
-    let requested_model = prompt.model.as_deref();
-    let requested_thinking = prompt.reasoning_effort.as_deref();
+    // The running model and level stay: they cannot change mid-run.
+    let requested_model = prompt.model.as_deref().filter(|_| !adopt && !follows_run);
+    let requested_thinking = prompt
+        .reasoning_effort
+        .as_deref()
+        .filter(|_| !adopt && !follows_run);
     validate_pi_config(requested_model, requested_thinking)?;
     // Only values the runtime does not report are sent. Even a fresh
     // process is checked: `--session` may restore the saved session's model
@@ -1367,6 +1678,21 @@ async fn run_pi_turn(
     provider_state.last_error = None;
     sink.save_provider_state(provider_state.clone()).await?;
 
+    if adopt {
+        rpc.reusable = false;
+        return read_pi_turn(
+            rpc,
+            &prompt,
+            sink,
+            controls,
+            requests,
+            queue,
+            provider_state,
+            None,
+        )
+        .await;
+    }
+
     let mut request = json!({
         "id": prompt.turn_id,
         "type": "prompt",
@@ -1388,6 +1714,9 @@ async fn run_pi_turn(
         .collect::<Vec<_>>();
     if !images.is_empty() {
         request["images"] = Value::Array(images);
+    }
+    if follows_run {
+        request["streamingBehavior"] = json!("followUp");
     }
     // State/configuration responses can be interleaved with background output.
     // These frames predate this prompt and must keep their session scope even
@@ -1418,6 +1747,32 @@ async fn run_pi_turn(
                 Some("agent_start" | "agent_end")
             )
         });
+    read_pi_turn(
+        rpc,
+        &prompt,
+        sink,
+        controls,
+        requests,
+        queue,
+        provider_state,
+        handled_without_run.then_some(accepted_state),
+    )
+    .await
+}
+
+/// Reads the turn's run until Pi settles. `handled` is the state after a
+/// prompt an extension or input handler consumed without starting a run.
+#[allow(clippy::too_many_arguments)]
+async fn read_pi_turn(
+    rpc: &mut PiRpc<'_>,
+    prompt: &DriverPrompt,
+    sink: &DriverEventSink,
+    controls: &mut mpsc::Receiver<PendingProviderControl>,
+    requests: &mut mpsc::Receiver<PiSessionRequest>,
+    queue: &mut Vec<PiQueueItem>,
+    mut provider_state: crate::conversation::ProviderState,
+    handled: Option<Value>,
+) -> Result<DriverTurnResult, AppError> {
     let mut stop_reason = "completed".to_owned();
     let mut terminal_error = None;
     let mut extension_error = None;
@@ -1425,9 +1780,9 @@ async fn run_pi_turn(
     let mut message_open = false;
     let mut active_message_id = format!("{}-message-1", prompt.turn_id);
     loop {
-        if handled_without_run && rpc.events.is_empty() {
+        if let Some(accepted_state) = handled.as_ref().filter(|_| rpc.events.is_empty()) {
             rpc.close_dialogs().await;
-            save_pi_state(sink, &mut provider_state, &accepted_state, &prompt).await?;
+            save_pi_state(sink, &mut provider_state, accepted_state, prompt).await?;
             rpc.reusable = true;
             return pi_turn_result(
                 provider_state.native_session_id.clone(),
@@ -1449,7 +1804,7 @@ async fn run_pi_turn(
                     if control.expected_turn_id != prompt.turn_id || control.respond_to.is_closed() || rpc.events.iter().any(|event| event.get("type").and_then(Value::as_str) == Some("agent_settled")) {
                         let _ = control.respond_to.send(Err(AppError::Conflict("Pi live control targets a stale turn".to_owned())));
                     } else {
-                        let result = pi_control(rpc, &prompt, sink, queue, &control.request_id, control.control).await;
+                        let result = pi_control(rpc, prompt, sink, queue, &control.request_id, control.control).await;
                         let uncertain = matches!(&result, Err(AppError::ProviderUnavailable(_) | AppError::Io(_) | AppError::StreamClosed | AppError::Anyhow(_)));
                         let _ = control.respond_to.send(result);
                         if uncertain { return Err(AppError::ProviderUnavailable("Pi live control outcome is unknown; the resident process was closed".to_owned())); }
@@ -1473,7 +1828,7 @@ async fn run_pi_turn(
                     .send(&json!({"id":"settled-state","type":"get_state"}))
                     .await?;
                 let state = rpc.wait_response("settled-state").await?;
-                save_pi_state(sink, &mut provider_state, &state, &prompt).await?;
+                save_pi_state(sink, &mut provider_state, &state, prompt).await?;
                 rpc.reusable = pi_is_idle(&state);
                 return pi_turn_result(
                     provider_state.native_session_id.clone(),
@@ -2394,6 +2749,12 @@ impl<'a> PiRpc<'a> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned();
+            if method == "setStatus"
+                && message.get("statusKey").and_then(Value::as_str) == Some(subagents::STATUS_KEY)
+            {
+                self.subagents
+                    .set_status(message.get("statusText").and_then(Value::as_str));
+            }
             if matches!(method.as_str(), "select" | "confirm" | "input" | "editor") {
                 if self.dialogs.len() + self.session_dialogs.len() >= 32 {
                     return Err(AppError::ProviderUnavailable(
@@ -2521,6 +2882,14 @@ impl<'a> PiRpc<'a> {
             self.events.push_back(message);
             self.event_sizes.push_back(size);
         }
+    }
+
+    /// Puts `event` back to be read next.
+    fn push_front_buffered(&mut self, event: Value) {
+        let size = serialized_len(&event);
+        self.buffered_bytes = self.buffered_bytes.saturating_add(size);
+        self.events.push_front(event);
+        self.event_sizes.push_front(size);
     }
 
     /// The oldest buffered event, releasing its share of the buffer budget.
@@ -3252,6 +3621,7 @@ mod tests {
                     sessions: Arc::new(Mutex::new(HashMap::new())),
                     starting: std::sync::Mutex::new(HashMap::new()),
                     idle_timeout: SESSION_IDLE_TIMEOUT,
+                    background_hold: MAX_BACKGROUND_HOLD,
                     spawn_gate: None,
                     models: CatalogCache::new(None),
                     commands: CatalogCache::new(None),
@@ -3385,6 +3755,32 @@ mod tests {
                 .unwrap()
                 .lines()
                 .count()
+        }
+
+        /// Runs `scenario` with `handles` (provider work, adoption).
+        async fn run_with(
+            &self,
+            scenario: &str,
+            turn: &str,
+            handles: super::super::types::TurnHandles,
+        ) -> Result<DriverTurnResult, AppError> {
+            use crate::conversation::ConversationEventHub;
+            let (mut context, prompt) = self.turn_parts(scenario, turn).await;
+            context.handles = handles;
+            let sink = DriverEventSink::new(
+                self.store.clone(),
+                ConversationEventHub::default(),
+                self.permissions.clone(),
+                &self.manifest.id,
+            )
+            .with_turn_id(turn);
+            let (_cancel, receiver) = watch::channel(false);
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.driver.run_turn(context, prompt, sink, receiver),
+            )
+            .await
+            .expect("Pi turn hung")
         }
 
         async fn run(&self, scenario: &str, turn: &str) -> Result<DriverTurnResult, AppError> {
@@ -4434,6 +4830,238 @@ mod tests {
         fixture.finish().await;
     }
 
+    /// What the worker offers the supervisor, recorded instead of opening a
+    /// turn, and the background work it reports lost.
+    fn recorded_work() -> (
+        super::super::types::TurnHandles,
+        mpsc::UnboundedReceiver<ProviderWork>,
+        mpsc::UnboundedReceiver<LostWork>,
+    ) {
+        let (offers, offered) = mpsc::unbounded_channel();
+        let (losses, lost) = mpsc::unbounded_channel();
+        let handle = ProviderWorkHandle::new(move |work| {
+            let _ = offers.send(work);
+            Box::pin(async { Ok(()) })
+        })
+        .with_lost(move |work| {
+            let _ = losses.send(work);
+            Box::pin(async {})
+        });
+        let handles = super::super::types::TurnHandles {
+            provider_work: Some(handle),
+            ..Default::default()
+        };
+        (handles, offered, lost)
+    }
+
+    fn adopting(token: &str) -> super::super::types::TurnHandles {
+        super::super::types::TurnHandles {
+            adopt: Some(token.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    async fn pi_runtime_stopped(
+        fixture: &Fixture,
+    ) -> Option<crate::conversation::ConversationEvent> {
+        fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                event.event_type == "provider.runtime" && event.payload["status"] == "stopped"
+            })
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn background_subagents_keep_the_runtime_past_its_keepalive_until_reported() {
+        let mut fixture = Fixture::new().await;
+        Arc::get_mut(&mut fixture.driver).unwrap().idle_timeout = Duration::from_millis(200);
+        fixture.run("bg-subagent", "launch").await.unwrap();
+        // The turn ends waiting on the run it launched.
+        let pending = fixture
+            .wait_event(|event| {
+                event.event_type == "provider.event"
+                    && event.payload["providerMethod"] == "background_tasks_pending"
+            })
+            .await;
+        assert_eq!(pending.payload["turnId"], "launch");
+        let task = &pending.payload["metadata"]["tasks"][0];
+        assert_eq!(task["taskId"], "bg-1");
+        assert_eq!(task["toolUseId"], "bg-call");
+        assert_eq!(task["description"], "Scan tests");
+        assert_eq!(task["taskType"], "subagent");
+        // It settles at 0.8 s, long past the 200 ms keepalive; Pi's own
+        // report, with no turn to take it over, is journalled between turns.
+        let report = fixture
+            .wait_event(|event| {
+                event.event_type == "message.completed"
+                    && event.payload.to_string().contains("report")
+            })
+            .await;
+        assert!(report.payload.get("turnId").is_none());
+        let stopped = pi_runtime_stopped(&fixture).await;
+        assert!(
+            stopped.is_none_or(|stopped| stopped.sequence > report.sequence),
+            "the runtime stopped before the subagent reported"
+        );
+        let stopped = fixture
+            .wait_event(|event| {
+                event.event_type == "provider.runtime" && event.payload["status"] == "stopped"
+            })
+            .await;
+        assert_eq!(stopped.payload["reason"], "idle_timeout");
+        assert_eq!(fixture.launches().await, 1);
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pis_own_report_is_offered_and_adopted_as_a_provider_turn() {
+        let mut fixture = Fixture::new().await;
+        Arc::get_mut(&mut fixture.driver).unwrap().idle_timeout = Duration::from_millis(200);
+        let (handles, mut offered, mut lost) = recorded_work();
+        fixture
+            .run_with("bg-subagent", "launch", handles)
+            .await
+            .unwrap();
+        let work = tokio::time::timeout(Duration::from_secs(5), offered.recv())
+            .await
+            .expect("no provider turn offered")
+            .unwrap();
+        assert_eq!(
+            work.trigger,
+            json!({ "kind": "background_task", "taskIds": ["bg-1"], "taskType": "subagent",
+                "summary": "Scan tests" })
+        );
+        let adopted = fixture
+            .run_with("unused", "report-turn", adopting(&work.adoption))
+            .await
+            .unwrap();
+        assert!(!adopted.cancelled);
+        assert_ne!(adopted.stop_reason, "no_work");
+        let events = fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap();
+        // The notification and the report belong to the adopted turn.
+        assert!(events.iter().any(|event| {
+            event.event_type == "message.completed"
+                && event.payload["turnId"] == "report-turn"
+                && event.payload.to_string().contains("report")
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "extension.message" && event.payload["turnId"] == "report-turn"
+        }));
+        // Nothing was sent for it.
+        assert_eq!(fixture.commands("prompt").await, 1);
+        // A stale token finds nothing to take over.
+        let stale = fixture
+            .run_with("unused", "stale-turn", adopting(&work.adoption))
+            .await
+            .unwrap();
+        assert_eq!(stale.stop_reason, "no_work");
+        fixture
+            .wait_event(|event| {
+                event.event_type == "provider.runtime" && event.payload["status"] == "stopped"
+            })
+            .await;
+        // Everything was reported: nothing lost with the process.
+        assert!(lost.try_recv().is_err());
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_prompt_during_pis_own_run_follows_it_instead_of_failing() {
+        let fixture = Fixture::new().await;
+        tokio::fs::write(fixture.root.join("pi-own-run-wait"), b"")
+            .await
+            .unwrap();
+        tokio::fs::write(fixture.root.join("pi-bg-delay"), b"0.1")
+            .await
+            .unwrap();
+        fixture.run("bg-subagent", "launch").await.unwrap();
+        fixture
+            .wait_event(|event| {
+                event.event_type == "extension.message"
+                    && event.payload.pointer("/message/customType")
+                        == Some(&json!("subagent-notification"))
+            })
+            .await;
+        let result = fixture.run("later", "later-turn").await.unwrap();
+        assert!(!result.cancelled);
+        let commands = tokio::fs::read_to_string(fixture.root.join("pi-commands"))
+            .await
+            .unwrap();
+        assert!(commands
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|command| command["type"] == "prompt"
+                && command["message"] == "later"
+                && command["streamingBehavior"] == "followUp"));
+        fixture
+            .wait_event(|event| {
+                event.event_type == "message.completed"
+                    && event.payload["turnId"] == "later-turn"
+                    && event.payload.to_string().contains("after later")
+            })
+            .await;
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn background_work_past_its_hold_or_stopped_is_reported_lost() {
+        let mut fixture = Fixture::new().await;
+        {
+            let driver = Arc::get_mut(&mut fixture.driver).unwrap();
+            driver.idle_timeout = Duration::from_millis(200);
+            driver.background_hold = Duration::from_millis(1500);
+        }
+        let (handles, _offered, mut lost) = recorded_work();
+        fixture
+            .run_with("bg-forever", "launch", handles)
+            .await
+            .unwrap();
+        // Restarting would lose the run: maintenance is refused meanwhile.
+        let (context, _) = fixture.turn_parts("unused", "unused").await;
+        let (_cancel, receiver) = watch::channel(false);
+        assert!(matches!(
+            fixture.driver.compact_session(context, receiver).await,
+            Err(AppError::Conflict(_))
+        ));
+        let lost_work = tokio::time::timeout(Duration::from_secs(5), lost.recv())
+            .await
+            .expect("lost work not reported")
+            .unwrap();
+        assert_eq!(lost_work.task_ids, ["bg-1"]);
+        assert_eq!(lost_work.reason, "expired");
+        let stopped = pi_runtime_stopped(&fixture).await.unwrap();
+        assert_eq!(stopped.payload["reason"], "idle_timeout");
+
+        // Stopped by the user while the run goes on.
+        let (handles, _offered, mut lost) = recorded_work();
+        fixture
+            .run_with("bg-forever", "again", handles)
+            .await
+            .unwrap();
+        fixture
+            .driver
+            .shutdown_session_with_reason(&fixture.manifest.id, "user_closed")
+            .await;
+        let lost_work = tokio::time::timeout(Duration::from_secs(5), lost.recv())
+            .await
+            .expect("lost work not reported")
+            .unwrap();
+        assert_eq!(lost_work.reason, "stopped");
+        fixture.finish().await;
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn rpc_plugin_subagents_surface_as_subagent_runs_across_turn_boundaries() {
@@ -4654,6 +5282,7 @@ mod tests {
                     requests,
                     shutdown,
                     stopping: Arc::default(),
+                    background: Arc::default(),
                     runtime_id: format!("occupied-{index}"),
                     agent_mcp: None,
                 },

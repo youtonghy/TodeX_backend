@@ -137,6 +137,51 @@ def subagent_runs():
         out({'type': 'message_end', 'message': message})
     threading.Thread(target=settle, daemon=True).start()
 
+def background_subagent(settles):
+    # pi-subagents' default: the Agent call returns at once, the run goes on in
+    # the Pi process writing nothing but its status line, then settles through
+    # a session record and a notification that makes Pi start a run of its own.
+    out({'type': 'agent_start'})
+    ui('setStatus', id='status-bg', statusKey='subagents', statusText='1 running agent')
+    args = {'prompt': 'Scan the tests', 'description': 'Scan tests', 'subagent_type': 'general-purpose'}
+    out({'type': 'tool_execution_start', 'toolCallId': 'bg-call', 'toolName': 'Agent', 'args': args})
+    out({'type': 'tool_execution_end', 'toolCallId': 'bg-call', 'toolName': 'Agent', 'isError': False,
+         'result': {'content': [{'type': 'text', 'text': 'Agent started in background.\nAgent ID: bg-1\nOutput file: /tmp/bg-1.output'}],
+                    'details': {'description': 'Scan tests', 'subagentType': 'general-purpose', 'status': 'background', 'agentId': 'bg-1'}}})
+    finish(text='launched')
+    if not settles:
+        return
+    def settle():
+        global streaming
+        time.sleep(float(open('pi-bg-delay').read()) if os.path.exists('pi-bg-delay') else 0.8)
+        ui('setStatus', id='status-bg-done', statusKey='subagents')
+        out({'type': 'entry_appended', 'entry': {'type': 'custom', 'id': 'r1', 'customType': 'subagents:record',
+             'data': {'id': 'bg-1', 'type': 'general-purpose', 'description': 'Scan tests', 'status': 'completed', 'result': 'Tests scanned.'}}})
+        streaming = True
+        out({'type': 'agent_start'})
+        message = {'role': 'custom', 'customType': 'subagent-notification', 'display': True,
+                   'content': '<task-notification>...</task-notification>',
+                   'details': {'id': 'bg-1', 'description': 'Scan tests', 'status': 'completed', 'resultPreview': 'Tests scanned.'}}
+        out({'type': 'message_start', 'message': message})
+        out({'type': 'message_end', 'message': message})
+        if os.path.exists('pi-own-run-wait'):
+            # Holds the run until a prompt queued behind it arrives.
+            for _ in range(300):
+                if queue:
+                    break
+                time.sleep(0.01)
+        out({'type': 'message_start', 'message': {'role': 'assistant'}})
+        out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop', 'content': [{'type': 'text', 'text': 'report'}], 'usage': {'input': 1, 'output': 1}}})
+        while queue:
+            text = queue.pop(0)
+            out({'type': 'message_start', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': text}]}})
+            out({'type': 'message_start', 'message': {'role': 'assistant'}})
+            out({'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop', 'content': [{'type': 'text', 'text': 'after ' + text}], 'usage': {'input': 1, 'output': 1}}})
+        streaming = False
+        out({'type': 'agent_end'})
+        out({'type': 'agent_settled'})
+    threading.Thread(target=settle, daemon=True).start()
+
 def update_queue():
     out({'type': 'queue_update', 'steering': steering[:], 'followUp': queue[:]})
 
@@ -186,6 +231,9 @@ for line in sys.stdin:
     elif kind == 'set_thinking_level':
         level = 'high' if cmd['level'] == 'max' else cmd['level']
         ack(cmd)
+    elif kind == 'prompt' and cmd.get('streamingBehavior') == 'followUp':
+        queue.append(cmd['message'])
+        ack(cmd, {'disposition': 'queued'})
     elif kind == 'prompt':
         scenario = cmd['message']
         streaming = scenario not in ['pure', 'preack', 'preack-dialog', 'extension-error', 'ui', 'schedule-idle', 'stall-catalog', 'buffer-idle', 'rejected']
@@ -220,6 +268,9 @@ for line in sys.stdin:
             threading.Thread(target=idle_events, daemon=True).start()
         elif scenario == 'rejected':
             out({'type': 'response', 'id': cmd.get('id'), 'command': kind, 'success': False, 'error': 'fixture command rejected'})
+        elif scenario in ['bg-subagent', 'bg-forever']:
+            ack(cmd)
+            background_subagent(scenario == 'bg-subagent')
         elif scenario == 'malformed':
             ack(cmd)
             print('not-json', flush=True)
