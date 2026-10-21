@@ -441,7 +441,7 @@ impl AgentMcp {
 
     async fn enabled_servers(&self, child: bool) -> Vec<(&'static str, &'static str, u64)> {
         let mut enabled = Vec::new();
-        if self.inner.ssh.has_agent_hosts().await {
+        if self.inner.ssh.agent_local().await.enabled || self.inner.ssh.has_agent_hosts().await {
             enabled.push((SSH_SERVER, SSH_ROUTE, SSH_TOOL_TIMEOUT_SECONDS));
         }
         if self.inner.desktop.enabled().await {
@@ -630,6 +630,22 @@ pub(crate) mod tests {
         .unwrap();
         mcp.set_listen_addr("0.0.0.0:7345".parse().unwrap());
         mcp
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_local_host_alone_injects_the_ssh_server() {
+        let fixture = crate::ssh::tests::fixture("").await;
+        let mcp = registry(fixture.service.clone(), &fixture.root).await;
+        assert!(mcp.launch("conv_a").await.is_none());
+        fixture
+            .service
+            .set_agent_local(crate::ssh::AgentLocal { enabled: true })
+            .await
+            .unwrap();
+        let launch = mcp.launch("conv_a").await.unwrap();
+        assert_eq!(launch.servers.len(), 1);
+        assert_eq!(launch.servers[0].name, SSH_SERVER);
     }
 
     #[cfg(unix)]

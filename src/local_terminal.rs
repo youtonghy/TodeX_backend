@@ -728,7 +728,7 @@ fn is_pty_eof(error: &std::io::Error) -> bool {
     false
 }
 
-fn default_shell() -> String {
+pub(crate) fn default_shell() -> String {
     if cfg!(windows) {
         std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
     } else {

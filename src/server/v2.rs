@@ -5165,6 +5165,8 @@ mod tests {
             ("GET", "/v2/ssh/settings"),
             ("PUT", "/v2/ssh/settings"),
             ("GET", "/v2/ssh/agent-output-filter"),
+            ("GET", "/v2/ssh/agent-local"),
+            ("PUT", "/v2/ssh/agent-local"),
             ("PUT", "/v2/ssh/agent-output-filter"),
             ("POST", "/v2/ftp/sites"),
         ] {
@@ -5272,6 +5274,34 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(rejected.status(), StatusCode::BAD_REQUEST, "{invalid}");
+        }
+
+        for (method, body, status, expected) in [
+            ("GET", "", StatusCode::OK, json!({ "enabled": false })),
+            (
+                "PUT",
+                r#"{"enabled":true}"#,
+                StatusCode::OK,
+                json!({ "enabled": true }),
+            ),
+            ("GET", "", StatusCode::OK, json!({ "enabled": true })),
+            (
+                "PUT",
+                r#"{"enabled":true,"x":1}"#,
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(signed_request(&device, method, "/v2/ssh/agent-local", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{method} {body}");
+            if status == StatusCode::OK {
+                let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+                assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
+            }
         }
 
         let providers = app

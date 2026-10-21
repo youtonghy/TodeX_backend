@@ -46,13 +46,13 @@ use crate::{
         self, bounded_text, prepare_captured, CommandLimits, ExternalCommandError, OutputChunk,
         OutputStream,
     },
-    local_terminal::decode_terminal_output,
+    local_terminal::{decode_terminal_output, default_shell},
     privacy_filter::{self, Categories},
     provider::ConversationSupervisor,
     ssh::{
-        classify_failure,
+        classify_failure, is_agent_local_alias,
         login::{LoginAsk, LoginOutcome, LoginResolution, LOGIN_TIMEOUT},
-        SshFailureKind, SshMode,
+        SshFailureKind, SshMode, AGENT_LOCAL_HOST,
     },
 };
 
@@ -308,7 +308,9 @@ fn registry_of_tools() -> ToolRegistry<SshTools, SshCall> {
                  in Plan mode; in ask mode the user approves each call and command and stdin are each limited \
                  to 4096 bytes (upload a longer script to the host as a file first, then run it). \
                  The user's privacy filter may replace keys, passwords, tokens, card and ID numbers in the \
-                 output with [REDACTED:<kind>] placeholders (redacted=true).",
+                 output with [REDACTED:<kind>] placeholders (redacted=true). The host `Local`, when \
+                 ssh_list_hosts lists it, is the machine running TodeX: the command runs in the user's \
+                 login shell, and cwd defaults to the conversation workspace.",
                 schema(json!({
                     "type": "object",
                     "properties": {
@@ -356,8 +358,8 @@ impl ServerHandler for SshTools {
     fn get_info(&self) -> InitializeResult {
         registry::server_info(
             SERVER_NAME,
-            "Runs commands on the user's SSH hosts. Call ssh_list_hosts first; \
-             only hosts listed there can be used.",
+            "Runs commands on the user's SSH hosts (and, when listed as `Local`, on the machine \
+             running TodeX). Call ssh_list_hosts first; only hosts listed there can be used.",
         )
     }
 
@@ -413,9 +415,16 @@ impl ServerHandler for SshTools {
 
 impl SshTools {
     async fn list_hosts(&self) -> CallToolResult {
+        let local = self.mcp.ssh().agent_local().await.enabled.then(|| {
+            json!({
+                "alias": AGENT_LOCAL_HOST,
+                "local": true,
+                "description": "The machine running TodeX; commands run in the user's login shell, by default in the conversation workspace.",
+            })
+        });
         match self.mcp.ssh().agent_hosts().await {
             Ok(hosts) => CallToolResult::structured(json!({
-                "hosts": hosts.into_iter().map(|host| {
+                "hosts": local.into_iter().chain(hosts.into_iter().map(|host| {
                     let resolved = host.resolved.unwrap_or_default();
                     json!({
                         "alias": host.alias,
@@ -423,26 +432,46 @@ impl SshTools {
                         "user": resolved.user,
                         "port": resolved.port,
                     })
-                }).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
             })),
             Err(error) => tool_error(format!("cannot list SSH hosts: {error}")),
         }
     }
 
-    async fn exec(&self, invocation: &Invocation<'_>, request: ExecRequest) -> CallToolResult {
+    async fn exec(&self, invocation: &Invocation<'_>, mut request: ExecRequest) -> CallToolResult {
         let caller = &invocation.caller;
         let context = invocation.context;
-        match self.mcp.ssh().is_agent_host(&request.host).await {
-            Ok(true) => {}
-            Ok(false) => {
+        // The local host runs in the conversation's workspace.
+        let local_workspace = if is_agent_local_alias(&request.host) {
+            if !self.mcp.ssh().agent_local().await.enabled {
                 return tool_error(format!(
-                    "SSH host {} is not available to agents. Use a host from ssh_list_hosts; \
-                     the user can grant access per host in TodeX SSH settings.",
-                    request.host
-                ))
+                    "{AGENT_LOCAL_HOST} is not available to agents. The user can allow agents to \
+                     run commands on the TodeX machine in TodeX SSH settings."
+                ));
             }
-            Err(error) => return tool_error(format!("cannot list SSH hosts: {error}")),
-        }
+            request.host = AGENT_LOCAL_HOST.to_owned();
+            match self.conversations.get(&caller.conversation_id).await {
+                Ok(manifest) => Some(manifest.workspace),
+                Err(error) => return tool_error(format!("cannot read the conversation: {error}")),
+            }
+        } else {
+            match self.mcp.ssh().is_agent_host(&request.host).await {
+                Ok(true) => None,
+                Ok(false) => {
+                    return tool_error(format!(
+                        "SSH host {} is not available to agents. Use a host from ssh_list_hosts; \
+                         the user can grant access per host in TodeX SSH settings.",
+                        request.host
+                    ))
+                }
+                Err(error) => return tool_error(format!("cannot list SSH hosts: {error}")),
+            }
+        };
+        let local_directory = local_workspace.map(|workspace| match &request.cwd {
+            // An absolute `cwd` replaces the workspace.
+            Some(cwd) => workspace.join(cwd),
+            None => workspace,
+        });
         let slots = self
             .host_slots
             .entry(request.host.clone())
@@ -462,7 +491,9 @@ impl SshTools {
             "host": request.host,
             "command": bounded_text(request.command.as_bytes(), EVENT_COMMAND_LIMIT),
         });
-        if let Some(cwd) = &request.cwd {
+        if let Some(directory) = &local_directory {
+            started["cwd"] = json!(directory.display().to_string());
+        } else if let Some(cwd) = &request.cwd {
             started["cwd"] = json!(cwd);
         }
         if let Some(device) = &invocation.approved_by {
@@ -483,8 +514,17 @@ impl SshTools {
         let begun = Instant::now();
         let (tap, chunks) = mpsc::unbounded_channel();
         let run = async {
+            let running = async {
+                match &local_directory {
+                    Some(directory) => run_local(directory, &request, tap).await,
+                    None => {
+                        self.run_logged_in(&caller.conversation_id, &exec_id, &request, tap)
+                            .await
+                    }
+                }
+            };
             tokio::select! {
-                outcome = self.run_logged_in(&caller.conversation_id, &exec_id, &request, tap) => outcome,
+                outcome = running => outcome,
                 // Dropping the run kills ssh and its process group; it also
                 // drops the tap, which ends the recorder below.
                 () = context.ct.cancelled() => ExecOutcome::Cancelled,
@@ -497,8 +537,12 @@ impl SshTools {
         };
         let (outcome, output_truncated) = tokio::join!(run, recorder.record(chunks));
         let duration_ms = u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let (result, mut completed) =
-            outcome.into_result(&request.host, duration_ms, filter.active());
+        let (result, mut completed) = outcome.into_result(
+            &request.host,
+            duration_ms,
+            filter.active(),
+            local_directory.is_some(),
+        );
         completed["execId"] = json!(exec_id);
         completed["outputTruncated"] = json!(output_truncated);
         if let Err(error) = self
@@ -612,26 +656,59 @@ impl SshTools {
             .arg("--")
             .arg(&request.host)
             .arg(remote_command(&request.command, request.cwd.as_deref()));
-        prepare_captured(&mut command, request.stdin.is_some());
-        let limits = CommandLimits {
-            timeout: request.timeout,
-            output_limit: OUTPUT_LIMIT,
-        };
-        match external_command::run_streaming(
-            command,
-            request.stdin.clone().map(String::into_bytes),
-            limits,
-            tap,
-        )
-        .await
-        {
-            Ok(output) => ExecOutcome::Finished(output),
-            Err(ExternalCommandError::TimedOut) => ExecOutcome::TimedOut(request.timeout),
-            Err(ExternalCommandError::NotFound) => {
-                ExecOutcome::NotStarted("ssh executable not found on the TodeX host".to_owned())
-            }
-            Err(error) => ExecOutcome::NotStarted(error.to_string()),
-        }
+        stream(command, request, tap, "ssh").await
+    }
+}
+
+/// Runs `request` on the [`AGENT_LOCAL_HOST`]: the user's login shell (so
+/// their profile sets PATH and the like) in `directory`, with the daemon's
+/// basic environment only, as the TodeX terminal does.
+async fn run_local(
+    directory: &std::path::Path,
+    request: &ExecRequest,
+    tap: mpsc::UnboundedSender<OutputChunk>,
+) -> ExecOutcome {
+    let mut command = external_command::secure_command(default_shell());
+    #[cfg(windows)]
+    {
+        // `cmd /S /C "<line>"` runs the line as typed.
+        command
+            .args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{}\"", request.command));
+    }
+    #[cfg(not(windows))]
+    command.arg("-l").arg("-c").arg(&request.command);
+    command.current_dir(directory);
+    stream(command, request, tap, "the local shell").await
+}
+
+/// Runs a prepared command for `ssh_exec` with its limits; `program` names
+/// what could not start.
+async fn stream(
+    mut command: tokio::process::Command,
+    request: &ExecRequest,
+    tap: mpsc::UnboundedSender<OutputChunk>,
+    program: &str,
+) -> ExecOutcome {
+    prepare_captured(&mut command, request.stdin.is_some());
+    let limits = CommandLimits {
+        timeout: request.timeout,
+        output_limit: OUTPUT_LIMIT,
+    };
+    match external_command::run_streaming(
+        command,
+        request.stdin.clone().map(String::into_bytes),
+        limits,
+        tap,
+    )
+    .await
+    {
+        Ok(output) => ExecOutcome::Finished(output),
+        Err(ExternalCommandError::TimedOut) => ExecOutcome::TimedOut(request.timeout),
+        Err(ExternalCommandError::NotFound) => ExecOutcome::NotStarted(format!(
+            "{program} could not run: not found on the TodeX host"
+        )),
+        Err(error) => ExecOutcome::NotStarted(format!("{program} could not run: {error}")),
     }
 }
 
@@ -867,23 +944,33 @@ const SSH_ERROR_STATUS: i32 = 255;
 impl ExecOutcome {
     /// The tool result and the `ssh.exec.completed` payload.
     /// `filter`: the categories redacted from output the agent receives.
+    /// `local`: ran on the [`AGENT_LOCAL_HOST`], where every exit status is
+    /// the command's own.
     fn into_result(
         self,
         host: &str,
         duration_ms: u64,
         filter: Option<&Categories>,
+        local: bool,
     ) -> (CallToolResult, Value) {
         let mut completed = json!({ "host": host, "durationMs": duration_ms, "truncated": false });
         let result = match self {
-            Self::Finished(output) => {
-                finished_result(output, None, host, duration_ms, filter, &mut completed)
-            }
+            Self::Finished(output) => finished_result(
+                output,
+                None,
+                host,
+                duration_ms,
+                filter,
+                local,
+                &mut completed,
+            ),
             Self::LoginFailed(output, hint) => finished_result(
                 output,
                 Some(hint),
                 host,
                 duration_ms,
                 filter,
+                local,
                 &mut completed,
             ),
             Self::TimedOut(timeout) => {
@@ -898,7 +985,7 @@ impl ExecOutcome {
                 completed["failure"] = json!(SshFailureKind::Other);
                 CallToolResult::structured_error(json!({
                     "failure": SshFailureKind::Other,
-                    "message": format!("ssh could not run: {detail}"),
+                    "message": detail,
                     "durationMs": duration_ms,
                 }))
             }
@@ -920,6 +1007,7 @@ fn finished_result(
     host: &str,
     duration_ms: u64,
     filter: Option<&Categories>,
+    local: bool,
     completed: &mut Value,
 ) -> CallToolResult {
     let raw_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -940,7 +1028,7 @@ fn finished_result(
     let stdout = filtered(String::from_utf8_lossy(&output.stdout).into_owned());
     let stderr = filtered(raw_stderr.clone());
     let (mut body, failed) = match exit_code {
-        Some(code) if code != SSH_ERROR_STATUS => (
+        Some(code) if local || code != SSH_ERROR_STATUS => (
             json!({
                 "stdout": stdout,
                 "stderr": stderr,
@@ -952,7 +1040,7 @@ fn finished_result(
         ),
         _ => {
             // Classified from what ssh printed, before redaction.
-            let failure = if exit_code.is_some() {
+            let failure = if exit_code.is_some() && !local {
                 classify_failure(&raw_stderr)
             } else {
                 SshFailureKind::Other
@@ -960,6 +1048,7 @@ fn finished_result(
             completed["failure"] = json!(failure);
             let message = match exit_code {
                 Some(_) => format!("ssh to {host} failed"),
+                None if local => format!("the command on {host} was terminated by a signal"),
                 None => format!("ssh to {host} was terminated by a signal"),
             };
             let mut error = json!({
@@ -1593,6 +1682,89 @@ exit 3
             .map(|event| event.payload["data"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(live, format!("ran:cat\n{stdin}"));
+
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn local_host_runs_in_the_workspace_when_enabled() {
+        let harness = harness().await;
+        let client = bridged_client(&harness).await;
+        let workspace = std::fs::canonicalize(harness.root.join("workspaces/project")).unwrap();
+        std::fs::create_dir(workspace.join("sub")).unwrap();
+
+        // Off by default: not listed, and calls are refused.
+        let hosts = call(&client, "ssh_list_hosts", json!({})).await;
+        assert!(!structured(&hosts)["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|host| host["alias"] == "Local"));
+        let refused = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "Local", "command": "pwd" }),
+        )
+        .await;
+        assert_eq!(refused.is_error, Some(true));
+
+        harness
+            .state
+            .ssh
+            .set_agent_local(crate::ssh::AgentLocal { enabled: true })
+            .await
+            .unwrap();
+        let hosts = call(&client, "ssh_list_hosts", json!({})).await;
+        assert_eq!(structured(&hosts)["hosts"][0]["alias"], "Local");
+        assert_eq!(structured(&hosts)["hosts"][0]["local"], true);
+
+        // The workspace is the default directory; 255 is the command's own
+        // status; stdin reaches the command; output is filtered.
+        let result = call(
+            &client,
+            "ssh_exec",
+            json!({
+                "host": "local",
+                "command": "pwd; cat; exit 255",
+                "stdin": "password=Zq8x7Lk9w\n",
+            }),
+        )
+        .await;
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let output = structured(&result);
+        assert_eq!(output["exitCode"], 255);
+        assert_eq!(
+            output["stdout"],
+            format!("{}\npassword=[REDACTED:credential]\n", workspace.display())
+        );
+        assert_eq!(output["redacted"], true);
+
+        let sub = call(
+            &client,
+            "ssh_exec",
+            json!({ "host": "Local", "command": "pwd", "cwd": "sub" }),
+        )
+        .await;
+        assert_eq!(
+            structured(&sub)["stdout"],
+            format!("{}\n", workspace.join("sub").display())
+        );
+
+        let history = harness
+            .state
+            .conversations
+            .history_for_tests(&harness.conversation_id)
+            .await;
+        let started: Vec<_> = history
+            .iter()
+            .filter(|event| event.event_type == "ssh.exec.started")
+            .map(|event| event.payload.clone())
+            .collect();
+        assert_eq!(started[0]["host"], "Local");
+        assert_eq!(started[0]["cwd"], json!(workspace.display().to_string()));
+        // Nothing went through ssh.
+        let log = std::fs::read_to_string(harness.root.join("ssh.log")).unwrap_or_default();
+        assert!(!log.contains("pwd"));
 
         client.cancel().await.unwrap();
     }

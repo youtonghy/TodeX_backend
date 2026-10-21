@@ -129,6 +129,35 @@ struct SshStore {
     ip_pool: StoredIpPool,
     /// Redaction of `ssh_exec` output before agents read it.
     agent_output_filter: AgentOutputFilter,
+    /// The [`AGENT_LOCAL_HOST`] pseudo-host for agents; off by default.
+    agent_local: AgentLocal,
+}
+
+/// The alias agents use to run commands on the daemon's own machine; real
+/// hosts with this name (in any case) are kept from agents while it is on.
+pub(crate) const AGENT_LOCAL_HOST: &str = "Local";
+
+pub(crate) fn is_agent_local_alias(alias: &str) -> bool {
+    alias.eq_ignore_ascii_case(AGENT_LOCAL_HOST)
+}
+
+/// `/v2/ssh/agent-local`: whether agents get the [`AGENT_LOCAL_HOST`].
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentLocal {
+    pub enabled: bool,
+}
+
+impl AgentLocal {
+    /// Anything unreadable in the store keeps it off.
+    fn from_stored(value: serde_json::Value) -> Self {
+        Self {
+            enabled: value
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
 }
 
 /// `store.json`. Older daemons ignore unknown top-level fields but reject
@@ -156,6 +185,8 @@ struct PersistedStore {
     ip_pool: Option<serde_json::Value>,
     #[serde(default)]
     agent_output_filter: Option<serde_json::Value>,
+    #[serde(default)]
+    agent_local: Option<serde_json::Value>,
 }
 
 /// The written form of [`SshStore`], read back as [`PersistedStore`].
@@ -173,6 +204,7 @@ struct PersistedStoreRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     ip_pool: Option<&'a StoredIpPool>,
     agent_output_filter: &'a AgentOutputFilter,
+    agent_local: &'a AgentLocal,
 }
 
 impl SshStore {
@@ -226,6 +258,10 @@ impl SshStore {
                 .agent_output_filter
                 .map(AgentOutputFilter::from_stored)
                 .unwrap_or_default(),
+            agent_local: persisted
+                .agent_local
+                .map(AgentLocal::from_stored)
+                .unwrap_or_default(),
         })
     }
 
@@ -250,6 +286,7 @@ impl SshStore {
             forwards: &self.forwards,
             ip_pool: (!self.ip_pool.is_default()).then_some(&self.ip_pool),
             agent_output_filter: &self.agent_output_filter,
+            agent_local: &self.agent_local,
         };
         Ok(serde_json::to_vec_pretty(&persisted)?)
     }
@@ -1179,25 +1216,51 @@ impl SshService {
         Ok(store.agent_output_filter)
     }
 
+    pub async fn agent_local(&self) -> AgentLocal {
+        self.inner.store.read().await.agent_local
+    }
+
+    /// Turning it off applies to the next call; turning it on, to
+    /// conversations started afterwards (the MCP server is injected then).
+    pub async fn set_agent_local(&self, settings: AgentLocal) -> Result<AgentLocal, AppError> {
+        let mut store = self.inner.store.write().await;
+        if store.agent_local != settings {
+            let next = SshStore {
+                agent_local: settings,
+                ..store.clone()
+            };
+            self.save(&mut store, next).await?;
+        }
+        Ok(store.agent_local)
+    }
+
+    /// Whether a granted host is usable by agents: one named like
+    /// [`AGENT_LOCAL_HOST`] is not while the local host is on.
+    async fn agent_visible(&self, view: &SshHostView) -> bool {
+        view.agent_access
+            && !(is_agent_local_alias(&view.alias) && self.agent_local().await.enabled)
+    }
+
     /// Agent-enabled hosts that still exist, with resolved parameters.
     pub async fn agent_hosts(&self) -> Result<Vec<SshHostView>, AppError> {
-        let mut views: Vec<SshHostView> = self
-            .host_views()
-            .await?
-            .into_iter()
-            .filter(|view| view.agent_access)
-            .collect();
+        let mut views = Vec::new();
+        for view in self.host_views().await? {
+            if self.agent_visible(&view).await {
+                views.push(view);
+            }
+        }
         self.resolve_views(&mut views).await;
         Ok(views)
     }
 
     /// Whether agents may use `alias` right now (granted and still defined).
     pub async fn is_agent_host(&self, alias: &str) -> Result<bool, AppError> {
-        Ok(self
-            .host_views()
-            .await?
-            .iter()
-            .any(|view| view.alias == alias && view.agent_access))
+        for view in self.host_views().await? {
+            if view.alias == alias && self.agent_visible(&view).await {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether any existing host is granted to agents; decides MCP injection.
@@ -1206,7 +1269,14 @@ impl SshService {
             return false;
         }
         match self.host_views().await {
-            Ok(views) => views.iter().any(|view| view.agent_access),
+            Ok(views) => {
+                for view in &views {
+                    if self.agent_visible(view).await {
+                        return true;
+                    }
+                }
+                false
+            }
             Err(error) => {
                 tracing::warn!(%error, "cannot read ssh hosts; agent ssh tools disabled");
                 false
@@ -1983,6 +2053,45 @@ exit 0
                 .unwrap_err(),
             AppError::InvalidRequest(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn the_local_host_is_opt_in_persists_and_reserves_its_name() {
+        let fixture = fixture("").await;
+        assert_eq!(
+            fixture.service.agent_local().await,
+            AgentLocal { enabled: false }
+        );
+        fixture.service.create_host(managed("local")).await.unwrap();
+        fixture
+            .service
+            .set_agent_access("local", true)
+            .await
+            .unwrap();
+        assert!(fixture.service.is_agent_host("local").await.unwrap());
+
+        fixture
+            .service
+            .set_agent_local(AgentLocal { enabled: true })
+            .await
+            .unwrap();
+        // A real host by that name is kept from agents while Local is on.
+        assert!(!fixture.service.is_agent_host("local").await.unwrap());
+        assert!(fixture.service.agent_hosts().await.unwrap().is_empty());
+        assert!(!fixture.service.has_agent_hosts().await);
+
+        let reloaded = SshService::with_home(
+            &fixture.root.join("data"),
+            "ssh".into(),
+            Some(fixture.root.join("home")),
+        )
+        .await
+        .unwrap();
+        assert!(reloaded.agent_local().await.enabled);
+        assert_eq!(
+            AgentLocal::from_stored(serde_json::json!("garbage")),
+            AgentLocal { enabled: false }
+        );
     }
 
     #[tokio::test]

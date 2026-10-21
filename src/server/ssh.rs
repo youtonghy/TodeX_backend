@@ -19,7 +19,7 @@ use crate::ssh::forward::ForwardInput;
 use crate::ssh::ip_pool::{AssignmentInput, AssignmentUpdate, PoolConfigInput};
 use crate::ssh::keys::{KeyGenerateRequest, KeyImportRequest};
 use crate::ssh::login::LoginAnswer;
-use crate::ssh::{ConnectionSettings, FtpSiteInput, ManagedHost};
+use crate::ssh::{AgentLocal, ConnectionSettings, FtpSiteInput, ManagedHost};
 
 use super::v2::require_auth;
 
@@ -84,6 +84,10 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/v2/ssh/agent-output-filter",
             get(get_agent_output_filter).put(set_agent_output_filter),
+        )
+        .route(
+            "/v2/ssh/agent-local",
+            get(get_agent_local).put(set_agent_local),
         )
         .route("/v2/ssh/keys", get(list_keys))
         .route(
@@ -478,6 +482,28 @@ async fn set_agent_output_filter(
         )
     })?;
     Ok(Json(state.ssh.set_agent_output_filter(filter).await?))
+}
+
+async fn get_agent_local(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AgentLocal>, AppError> {
+    require_auth(&state, &headers)?;
+    Ok(Json(state.ssh.agent_local().await))
+}
+
+async fn set_agent_local(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<AgentLocal>, AppError> {
+    require_auth(&state, &headers)?;
+    let settings: AgentLocal = serde_json::from_slice(&body).map_err(|_| {
+        AppError::InvalidRequest(
+            "invalid agent local terminal: expected { enabled: boolean }".to_owned(),
+        )
+    })?;
+    Ok(Json(state.ssh.set_agent_local(settings).await?))
 }
 
 async fn list_keys(
