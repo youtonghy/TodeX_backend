@@ -672,18 +672,8 @@
       "scheduledConversations": true,
       "runtimeStop": true,
       "sessionCommands": true,
-      "extensionMessages": true,
-      "extensionUi": [
-        "select",
-        "confirm",
-        "input",
-        "editor",
-        "notify",
-        "setStatus",
-        "setWidget",
-        "setTitle",
-        "set_editor_text"
-      ]
+      "extensionMessages": false,
+      "extensionUi": []
     },
     "models": []
   },
@@ -736,18 +726,8 @@
       "scheduledConversations": true,
       "runtimeStop": true,
       "sessionCommands": true,
-      "extensionMessages": true,
-      "extensionUi": [
-        "select",
-        "confirm",
-        "input",
-        "editor",
-        "notify",
-        "setStatus",
-        "setWidget",
-        "setTitle",
-        "set_editor_text"
-      ]
+      "extensionMessages": false,
+      "extensionUi": []
     },
     "models": []
   },
@@ -847,18 +827,8 @@
       "scheduledConversations": true,
       "runtimeStop": true,
       "sessionCommands": true,
-      "extensionMessages": true,
-      "extensionUi": [
-        "select",
-        "confirm",
-        "input",
-        "editor",
-        "notify",
-        "setStatus",
-        "setWidget",
-        "setTitle",
-        "set_editor_text"
-      ]
+      "extensionMessages": false,
+      "extensionUi": []
     },
     "models": []
   }

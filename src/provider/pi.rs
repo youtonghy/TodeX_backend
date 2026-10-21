@@ -459,6 +459,10 @@ impl ProviderDriver for PiDriver {
         true
     }
 
+    fn supports_extension_ui(&self) -> bool {
+        true
+    }
+
     async fn stop_runtime(&self, conversation_id: &str) -> Result<Value, AppError> {
         let runtime_id = self.close_session(conversation_id, "user_closed").await;
         Ok(

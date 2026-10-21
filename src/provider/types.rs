@@ -256,8 +256,12 @@ impl ProviderSnapshot {
                     ResidentRuntimeCapabilities {
                         runtime_stop: true,
                         session_commands: true,
-                        extension_messages: true,
-                        extension_ui: EXTENSION_UI,
+                        extension_messages: driver.supports_extension_ui(),
+                        extension_ui: if driver.supports_extension_ui() {
+                            EXTENSION_UI
+                        } else {
+                            &[]
+                        },
                     },
                 ),
             },
@@ -1344,6 +1348,12 @@ pub trait ProviderDriver: Send + Sync {
     }
 
     fn supports_runtime_stop(&self) -> bool {
+        false
+    }
+
+    /// Whether the resident runtime exchanges extension messages and UI
+    /// requests (Pi's extension protocol).
+    fn supports_extension_ui(&self) -> bool {
         false
     }
 
