@@ -1738,7 +1738,14 @@ async fn run_pi_turn(
     rpc.reusable = false;
     rpc.activate_turn();
     rpc.process.send(&request).await?;
-    let accepted = rpc.wait_response(&prompt.turn_id).await?;
+    let accepted = rpc
+        .wait_prompt_acceptance(
+            sink,
+            &prompt.turn_id,
+            super::process::control_timeout()?,
+            super::process::compact_timeout()?,
+        )
+        .await?;
     if accepted.get("success").and_then(Value::as_bool) != Some(true) {
         return Err(pi_response_error(&accepted, "prompt"));
     }
@@ -1888,20 +1895,7 @@ async fn read_pi_turn(
                 .await?;
             }
             Some("compaction_start" | "compaction_end") => {
-                let event_type = if message["type"] == "compaction_start" {
-                    "compaction.started"
-                } else if message["aborted"] == true {
-                    "compaction.cancelled"
-                } else if message
-                    .get("errorMessage")
-                    .and_then(Value::as_str)
-                    .is_some()
-                {
-                    "compaction.failed"
-                } else {
-                    "compaction.completed"
-                };
-                sink.emit(event_type, json!({ "provider": "pi", "turnId": prompt.turn_id, "source": "provider", "reason": message.get("reason"), "result": message.get("result"), "error": message.get("errorMessage") })).await?;
+                emit_pi_compaction(sink, Some(&prompt.turn_id), &message).await?;
             }
             Some("message_end") => {
                 if !message_open {
@@ -2195,6 +2189,33 @@ fn validate_pi_config<'a>(
         ));
     }
     Ok(model)
+}
+
+/// Maps Pi `compaction_start`/`compaction_end` onto `compaction.*`; `turn_id`
+/// is absent for compactions Pi runs while idle.
+async fn emit_pi_compaction(
+    sink: &DriverEventSink,
+    turn_id: Option<&str>,
+    message: &Value,
+) -> Result<(), AppError> {
+    let kind = if message["type"] == "compaction_start" {
+        "compaction.started"
+    } else if message["aborted"] == true {
+        "compaction.cancelled"
+    } else if message
+        .get("errorMessage")
+        .is_some_and(|error| error.is_string())
+    {
+        "compaction.failed"
+    } else {
+        "compaction.completed"
+    };
+    let mut payload = json!({"provider":"pi","source":"provider","reason":message.get("reason"),"result":message.get("result"),"error":message.get("errorMessage")});
+    if let Some(turn_id) = turn_id {
+        payload["turnId"] = json!(turn_id);
+    }
+    sink.emit(kind, payload).await?;
+    Ok(())
 }
 
 async fn pi_control(
@@ -2863,6 +2884,56 @@ impl<'a> PiRpc<'a> {
             .await
     }
 
+    /// Waits for the acknowledgement of prompt `id`. Pi compacts before it
+    /// starts the run and only then acknowledges, which on a slow model takes
+    /// minutes: from `compaction_start` to `compaction_end` the wait is bounded
+    /// by `compact` instead of `control`, and those events reach the client
+    /// as they happen rather than after the acknowledgement.
+    async fn wait_prompt_acceptance(
+        &mut self,
+        sink: &DriverEventSink,
+        id: &str,
+        control: Duration,
+        compact: Duration,
+    ) -> Result<Value, AppError> {
+        let mut deadline = tokio::time::Instant::now() + control;
+        let mut compacting = false;
+        loop {
+            let dialog_wait = self.dialog_wait;
+            let message = match self.read_frame(Some(deadline)).await {
+                Err(AppError::ProviderUnavailable(error))
+                    if compacting && error == "provider control response timed out" =>
+                {
+                    return Err(AppError::ProviderUnavailable(
+                        "Pi auto-compaction exceeded the compact timeout".to_owned(),
+                    ))
+                }
+                result => result?,
+            };
+            deadline += self.dialog_wait - dialog_wait;
+            match message.get("type").and_then(Value::as_str) {
+                Some("compaction_start" | "compaction_end") => {
+                    compacting = message["type"] == "compaction_start";
+                    deadline =
+                        tokio::time::Instant::now() + if compacting { compact } else { control };
+                    emit_pi_compaction(sink, Some(id), &message).await?;
+                    continue;
+                }
+                Some("response") if message.get("id").and_then(Value::as_str) == Some(id) => {
+                    return match message.get("success").and_then(Value::as_bool) {
+                        Some(true) => Ok(message),
+                        Some(false) => Err(pi_response_error(&message, id)),
+                        None => Err(AppError::ProviderUnavailable(
+                            "Pi sent a control response without an outcome".to_owned(),
+                        )),
+                    };
+                }
+                _ => {}
+            }
+            self.buffer_before_response(message)?;
+        }
+    }
+
     async fn wait_response_for(&mut self, id: &str, timeout: Duration) -> Result<Value, AppError> {
         let mut deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -2882,17 +2953,23 @@ impl<'a> PiRpc<'a> {
                     }
                 }
             }
-            // Bound unexpected notifications while a provider withholds its response.
-            let size = serialized_len(&message);
-            self.buffered_bytes = self.buffered_bytes.saturating_add(size);
-            if self.events.len() >= 1024 || self.buffered_bytes > 16 * 1024 * 1024 {
-                return Err(AppError::ProviderUnavailable(
-                    "Pi exceeded the event buffer limit before its control response".to_owned(),
-                ));
-            }
-            self.events.push_back(message);
-            self.event_sizes.push_back(size);
+            self.buffer_before_response(message)?;
         }
+    }
+
+    /// Holds `message` for later, bounding unexpected notifications while a
+    /// provider withholds its response.
+    fn buffer_before_response(&mut self, message: Value) -> Result<(), AppError> {
+        let size = serialized_len(&message);
+        self.buffered_bytes = self.buffered_bytes.saturating_add(size);
+        if self.events.len() >= 1024 || self.buffered_bytes > 16 * 1024 * 1024 {
+            return Err(AppError::ProviderUnavailable(
+                "Pi exceeded the event buffer limit before its control response".to_owned(),
+            ));
+        }
+        self.events.push_back(message);
+        self.event_sizes.push_back(size);
+        Ok(())
     }
 
     /// Puts `event` back to be read next.
@@ -3231,19 +3308,7 @@ async fn emit_pi_idle_frame(rpc: &mut PiRpc<'_>, message: Value) -> Result<(), A
             }
         }
         Some("compaction_start" | "compaction_end") => {
-            let kind = if message["type"] == "compaction_start" {
-                "compaction.started"
-            } else if message["aborted"] == true {
-                "compaction.cancelled"
-            } else if message
-                .get("errorMessage")
-                .is_some_and(|error| error.is_string())
-            {
-                "compaction.failed"
-            } else {
-                "compaction.completed"
-            };
-            sink.emit(kind, json!({"provider":"pi","source":"provider","reason":message.get("reason"),"result":message.get("result"),"error":message.get("errorMessage")})).await?;
+            emit_pi_compaction(&sink, None, &message).await?;
         }
         Some("response") | None => {}
         Some("entry_appended") if rpc.emit_subagent_record(&sink, &message).await? => {}
@@ -3579,6 +3644,93 @@ mod tests {
         );
         assert!(orphan["arguments"].is_null());
     }
+    /// Waits for the `turn-1` prompt acknowledgement from a shell `script`
+    /// with a 300 ms control and 1.5 s compact timeout; returns the outcome
+    /// and the event types recorded meanwhile.
+    #[cfg(unix)]
+    async fn prompt_acceptance(script: &str) -> (Result<Value, AppError>, Vec<String>) {
+        use crate::conversation::{ConversationEventHub, ConversationManifest, ConversationStore};
+        let root = std::env::temp_dir().join(format!(
+            "todex-pi-compaction-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = ConversationStore::new(root.join("data")).await.unwrap();
+        let manifest = store
+            .create(ConversationManifest::new(
+                ProviderKind::Pi,
+                root.clone(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let sink = DriverEventSink::new(
+            store.clone(),
+            ConversationEventHub::default(),
+            super::super::types::PermissionBroker::default(),
+            &manifest.id,
+        )
+        .with_turn_id("turn-1");
+        let mut spec = CommandSpec::new("/bin/sh", &root);
+        spec.args = vec!["-c".to_owned(), script.to_owned()];
+        let mut process = JsonLineProcess::spawn(&spec).await.unwrap();
+        let (_cancel, receiver) = watch::channel(false);
+        let outcome = PiRpc::new(&mut process, None, receiver)
+            .wait_prompt_acceptance(
+                &sink,
+                "turn-1",
+                Duration::from_millis(300),
+                Duration::from_millis(1500),
+            )
+            .await;
+        let events = store
+            .complete_history(&manifest.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type.starts_with("compaction."))
+            .inspect(|event| assert_eq!(event.payload["turnId"], "turn-1"))
+            .map(|event| event.event_type)
+            .collect();
+        std::fs::remove_dir_all(root).unwrap();
+        (outcome, events)
+    }
+
+    const COMPACTION_START: &str = r#"echo '{"type":"compaction_start","reason":"threshold"}'"#;
+    const COMPACTION_END: &str =
+        r#"echo '{"type":"compaction_end","reason":"threshold","result":{},"aborted":false}'"#;
+    const PROMPT_ACCEPTED: &str = r#"echo '{"type":"response","id":"turn-1","success":true}'"#;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn prompt_acceptance_waits_out_an_auto_compaction_past_the_control_timeout() {
+        let (outcome, events) = prompt_acceptance(&format!(
+            "{COMPACTION_START}; sleep 0.8; {COMPACTION_END}; {PROMPT_ACCEPTED}; sleep 5"
+        ))
+        .await;
+        outcome.unwrap();
+        assert_eq!(events, ["compaction.started", "compaction.completed"]);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn prompt_acceptance_bounds_an_auto_compaction_by_the_compact_timeout() {
+        let (outcome, events) = prompt_acceptance(&format!("{COMPACTION_START}; sleep 5")).await;
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.contains("auto-compaction exceeded"), "{error}");
+        assert_eq!(events, ["compaction.started"]);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn prompt_acceptance_returns_to_the_control_timeout_after_compaction() {
+        let (outcome, _) =
+            prompt_acceptance(&format!("{COMPACTION_START}; {COMPACTION_END}; sleep 5")).await;
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.contains("control response timed out"), "{error}");
+    }
+
     #[cfg(unix)]
     struct Fixture {
         root: std::path::PathBuf,
