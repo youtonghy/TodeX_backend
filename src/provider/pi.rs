@@ -4832,6 +4832,7 @@ mod tests {
 
     /// What the worker offers the supervisor, recorded instead of opening a
     /// turn, and the background work it reports lost.
+    #[cfg(unix)]
     fn recorded_work() -> (
         super::super::types::TurnHandles,
         mpsc::UnboundedReceiver<ProviderWork>,
@@ -4854,6 +4855,7 @@ mod tests {
         (handles, offered, lost)
     }
 
+    #[cfg(unix)]
     fn adopting(token: &str) -> super::super::types::TurnHandles {
         super::super::types::TurnHandles {
             adopt: Some(token.to_owned()),
@@ -4861,6 +4863,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn pi_runtime_stopped(
         fixture: &Fixture,
     ) -> Option<crate::conversation::ConversationEvent> {
