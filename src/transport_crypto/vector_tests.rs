@@ -4,8 +4,6 @@
 //! the vector carries the ciphertext with its expected shared secret.
 use std::sync::Arc;
 
-use pqcrypto_mlkem::mlkem768;
-use pqcrypto_traits::kem::SecretKey as MlKemSecretKey;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
@@ -18,7 +16,7 @@ use super::handshake::{
     derive_keys, derive_rest_keys, KeyScheduleInput, RestKeys, TransportKeys,
     RESPONSE_NONCE_LENGTH, REST_LABEL, WS_LABEL,
 };
-use super::{encode_b64, EncryptionProtocol, PairingKeys};
+use super::{encode_b64, ml_kem_secret_from_expanded, EncryptionProtocol, PairingKeys};
 
 pub(crate) fn fixture() -> Value {
     serde_json::from_str(include_str!("../../tests/fixtures/transport-v2.json")).unwrap()
@@ -50,7 +48,7 @@ fn server_keys(protocol: EncryptionProtocol, server: &Value) -> PairingKeys {
         }
         EncryptionProtocol::MlKem768 => {
             keys.ml_kem_secret =
-                Arc::new(mlkem768::SecretKey::from_bytes(&hex(&server["secretKey"])).unwrap());
+                Arc::new(ml_kem_secret_from_expanded(&hex(&server["secretKey"])).unwrap());
             keys.ml_kem_public = hex(&server["publicKey"]);
         }
     }

@@ -14,8 +14,7 @@
 //! 32-byte `response_nonce` into every response key instead and sends it in
 //! front of the response records.
 use hkdf::Hkdf;
-use pqcrypto_mlkem::mlkem768;
-use pqcrypto_traits::kem::{Ciphertext as MlKemCiphertext, SharedSecret as MlKemSharedSecret};
+use ml_kem::Decapsulate;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use x25519_dalek::PublicKey as X25519PublicKey;
@@ -32,22 +31,6 @@ pub(crate) const NONCE_LENGTH: usize = 32;
 pub(crate) const RESPONSE_NONCE_LENGTH: usize = 32;
 const KEY_LENGTH: usize = 32;
 const ML_KEM_768_CIPHERTEXT_LENGTH: usize = 1088;
-
-/// pqcrypto-mlkem 0.1's `SharedSecret` is a plain `Copy` byte array: it does
-/// not zeroize on drop and offers no mutable access. Overwrite the copy we
-/// own in place with a volatile write of an all-zero secret. Copies the
-/// crate makes internally (the FFI output inside `decapsulate`, on its own
-/// stack frame) are out of reach; the stack is reused by later calls.
-fn wipe_ml_kem_shared_secret(shared: &mut mlkem768::SharedSecret) {
-    let Ok(zero) = mlkem768::SharedSecret::from_bytes(&[0_u8; 32]) else {
-        // Unreachable for ML-KEM-768 (32-byte secrets); nothing to wipe with.
-        return;
-    };
-    // SAFETY: `shared` is a valid, aligned, exclusive reference and `zero`
-    // is a valid value of the same type, which has no `Drop` to skip.
-    unsafe { std::ptr::write_volatile(shared, zero) };
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-}
 
 /// Inputs to the key schedule, shared by WebSocket and REST.
 pub(crate) struct KeyScheduleInput<'a> {
@@ -209,18 +192,17 @@ impl PairingKeys {
                 if client_material.len() != ML_KEM_768_CIPHERTEXT_LENGTH {
                     return Err(TransportCryptoError::new("ml-kem-768 ciphertext length"));
                 }
-                let ciphertext = mlkem768::Ciphertext::from_bytes(client_material)
+                // A forged ciphertext yields FIPS 203's implicit-rejection
+                // secret, so it fails at the first sealed record, not here.
+                let mut shared = self
+                    .ml_kem_secret
+                    .decapsulate_slice(client_material)
                     .map_err(|_| TransportCryptoError::new("ml-kem-768 ciphertext"))?;
-                let mut shared = mlkem768::decapsulate(&ciphertext, &self.ml_kem_secret);
                 let mut out = Zeroizing::new([0_u8; 32]);
-                let copied = if shared.as_bytes().len() == out.len() {
-                    out.copy_from_slice(shared.as_bytes());
-                    Ok(out)
-                } else {
-                    Err(TransportCryptoError::new("ml-kem-768 shared secret length"))
-                };
-                wipe_ml_kem_shared_secret(&mut shared);
-                copied
+                out.copy_from_slice(shared.as_slice());
+                // `SharedKey` is a plain array; wipe our copy of it.
+                zeroize::Zeroize::zeroize(shared.as_mut_slice());
+                Ok(out)
             }
         }
     }

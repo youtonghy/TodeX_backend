@@ -12,8 +12,7 @@ use axum::response::Response;
 use axum::routing::{any, get};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use pqcrypto_mlkem::mlkem768;
-use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SharedSecret as _};
+use ml_kem::{Encapsulate, EncapsulationKey, MlKem768, TryKeyInit};
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
@@ -97,9 +96,10 @@ pub(crate) fn client_handshake(
             )
         }
         EncryptionProtocol::MlKem768 => {
-            let public = mlkem768::PublicKey::from_bytes(keys.static_public(protocol)).unwrap();
-            let (shared, ciphertext) = mlkem768::encapsulate(&public);
-            (ciphertext.as_bytes().to_vec(), shared.as_bytes().to_vec())
+            let public =
+                EncapsulationKey::<MlKem768>::new_from_slice(keys.static_public(protocol)).unwrap();
+            let (ciphertext, shared) = public.encapsulate();
+            (ciphertext.to_vec(), shared.to_vec())
         }
     }
 }

@@ -354,10 +354,13 @@ name, a tampered name, and valid and invalid device names).
   `prk` and derived keys are `Zeroizing`. The tunnel derives `k_down` as soon
   as it has drawn the response nonce, at the start of the request, and wipes
   `prk` right away (hkdf 0.12 keeps an HMAC state for the expansion that it
-  does not zeroize; it lives only for that call). pqcrypto-mlkem's `SharedSecret` is a plain
-  `Copy` array without zeroize support, so the backend overwrites its own
-  copy with a volatile write after copying it out; the temporary that
-  `decapsulate` fills inside the crate cannot be reached.
+  does not zeroize; it lives only for that call). ML-KEM-768 is RustCrypto
+  `ml-kem`: its decapsulation key wipes itself on drop, and the backend
+  wipes the returned shared key after copying it out. `pairing_keys.json`
+  stores the FIPS 203 expanded decapsulation key (2400 bytes, the format
+  earlier pqcrypto-mlkem builds wrote), so existing keys load unchanged; the
+  loader rejects a key whose embedded public key hash or stored public key
+  does not match.
 - WebSocket: protocol problems answer before the upgrade (`tv` other than
   `2` is `426 PROTOCOL_UPGRADE_REQUIRED`; a protocol other than the server's
   `pairing_encryption` is `403`). Malformed handshake material (bad base64,

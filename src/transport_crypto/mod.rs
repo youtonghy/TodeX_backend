@@ -22,8 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use pqcrypto_mlkem::mlkem768;
-use pqcrypto_traits::kem::{PublicKey as MlKemPublicKey, SecretKey as MlKemSecretKey};
+use ml_kem::{DecapsulationKey, Kem, KeyExport, MlKem768};
 use qrcodegen::{QrCode, QrCodeEcc};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -40,11 +39,37 @@ const PAIRING_VERSION: u8 = 1;
 const PAIRING_LINK_VERSION: u8 = 2;
 const PAIRING_KEYS_FILE: &str = "pairing_keys.json";
 
+pub(crate) type MlKemSecret = DecapsulationKey<MlKem768>;
+
+/// The FIPS 203 expanded decapsulation key (2400 bytes), the form
+/// `pairing_keys.json` has always stored (pqcrypto-mlkem wrote it), so older
+/// files load unchanged and older builds still read new ones. It holds no
+/// seed, which is why existing keys cannot move to ml-kem's 64-byte seeds.
+#[allow(deprecated)]
+fn ml_kem_secret_to_expanded(secret: &MlKemSecret) -> zeroize::Zeroizing<Vec<u8>> {
+    use ml_kem::ExpandedKeyEncoding;
+    let mut expanded = secret.to_expanded_bytes();
+    let bytes = zeroize::Zeroizing::new(expanded.to_vec());
+    zeroize::Zeroize::zeroize(expanded.as_mut_slice());
+    bytes
+}
+
+/// Parses an expanded key; `None` for a wrong length, or when its embedded
+/// public key does not match the public key hash stored with it.
+#[allow(deprecated)]
+pub(crate) fn ml_kem_secret_from_expanded(bytes: &[u8]) -> Option<MlKemSecret> {
+    use ml_kem::ExpandedKeyEncoding;
+    let mut expanded = bytes.try_into().ok()?;
+    let secret = MlKemSecret::from_expanded_bytes(&expanded).ok();
+    zeroize::Zeroize::zeroize(expanded.as_mut_slice());
+    secret
+}
+
 #[derive(Clone)]
 pub struct PairingKeys {
     x25519_secret: Arc<X25519Secret>,
     x25519_public: [u8; 32],
-    ml_kem_secret: Arc<mlkem768::SecretKey>,
+    ml_kem_secret: Arc<MlKemSecret>,
     ml_kem_public: Vec<u8>,
 }
 
@@ -52,13 +77,13 @@ impl PairingKeys {
     pub fn generate() -> Self {
         let x25519_secret = X25519Secret::random_from_rng(OsRng);
         let x25519_public = X25519PublicKey::from(&x25519_secret).to_bytes();
-        let (ml_kem_public, ml_kem_secret) = mlkem768::keypair();
+        let (ml_kem_secret, ml_kem_public) = MlKem768::generate_keypair();
 
         Self {
             x25519_secret: Arc::new(x25519_secret),
             x25519_public,
             ml_kem_secret: Arc::new(ml_kem_secret),
-            ml_kem_public: ml_kem_public.as_bytes().to_vec(),
+            ml_kem_public: ml_kem_public.to_bytes().to_vec(),
         }
     }
 
@@ -101,7 +126,7 @@ impl PairingKeys {
             version: PAIRING_VERSION,
             x25519_secret: encode_b64(self.x25519_secret.to_bytes().as_slice()),
             ml_kem_public: encode_b64(&self.ml_kem_public),
-            ml_kem_secret: encode_b64(self.ml_kem_secret.as_bytes()),
+            ml_kem_secret: encode_b64(&ml_kem_secret_to_expanded(&self.ml_kem_secret)),
         };
         let json = zeroize::Zeroizing::new(serde_json::to_vec_pretty(&persisted)?);
         secure_fs::write_owner_only_atomic_async(path, json, secure_fs::ParentDir::Create).await?;
@@ -122,16 +147,20 @@ impl PairingKeys {
             "x25519 pairing secret",
         )?);
         let x25519_public = X25519PublicKey::from(&x25519_secret).to_bytes();
-        let ml_kem_secret_bytes =
-            decode_b64(&persisted.ml_kem_secret, "ml-kem-768 pairing secret")?;
-        let ml_kem_secret =
-            mlkem768::SecretKey::from_bytes(&ml_kem_secret_bytes).map_err(|_| {
-                AppError::InvalidRequest("ml-kem-768 pairing secret is invalid".to_owned())
-            })?;
-        let ml_kem_public = decode_b64(&persisted.ml_kem_public, "ml-kem-768 pairing public key")?;
-        mlkem768::PublicKey::from_bytes(&ml_kem_public).map_err(|_| {
-            AppError::InvalidRequest("ml-kem-768 pairing public key is invalid".to_owned())
+        let ml_kem_secret_bytes = zeroize::Zeroizing::new(decode_b64(
+            &persisted.ml_kem_secret,
+            "ml-kem-768 pairing secret",
+        )?);
+        let ml_kem_secret = ml_kem_secret_from_expanded(&ml_kem_secret_bytes).ok_or_else(|| {
+            AppError::InvalidRequest("ml-kem-768 pairing secret is invalid".to_owned())
         })?;
+        let ml_kem_public = decode_b64(&persisted.ml_kem_public, "ml-kem-768 pairing public key")?;
+        // Clients pin the stored public key; it must be the secret's own.
+        if ml_kem_secret.encapsulation_key().to_bytes().as_slice() != ml_kem_public.as_slice() {
+            return Err(AppError::InvalidRequest(
+                "ml-kem-768 pairing public key is invalid".to_owned(),
+            ));
+        }
 
         Ok(Self {
             x25519_secret: Arc::new(x25519_secret),
@@ -642,7 +671,82 @@ mod tests {
         let client_shared = client.diffie_hellman(&X25519PublicKey::from(server_public));
         assert_eq!(server_shared.as_slice(), client_shared.as_bytes());
 
+        use ml_kem::{Encapsulate, EncapsulationKey, TryKeyInit};
+        let server_public = EncapsulationKey::<MlKem768>::new_from_slice(
+            first.transport_public_key(PairingEncryption::MlKem768),
+        )
+        .unwrap();
+        let (ciphertext, client_shared) = server_public.encapsulate();
+        let server_shared = second
+            .agree(EncryptionProtocol::MlKem768, &ciphertext)
+            .unwrap();
+        assert_eq!(server_shared.as_slice(), client_shared.as_slice());
+
         tokio::fs::remove_dir_all(&data_dir).await.unwrap();
+    }
+
+    /// `pairing_keys.json` from pqcrypto-mlkem (PQClean) builds loads as is,
+    /// decapsulates what PQClean encapsulated, and is written back unchanged.
+    #[tokio::test]
+    async fn pqclean_pairing_keys_load_and_round_trip_unchanged() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/pairing-keys-pqclean.json"
+        ))
+        .unwrap();
+        let raw = fixture["file"].to_string();
+        let keys = PairingKeys::from_persisted_json(&raw, "fixture").unwrap();
+        let ciphertext = vector_tests::hex(&fixture["ciphertext"]);
+        let shared = keys
+            .agree(EncryptionProtocol::MlKem768, &ciphertext)
+            .unwrap();
+        assert_eq!(shared.as_slice(), vector_tests::hex(&fixture["shared"]));
+
+        let data_dir = unique_tmp_dir("todex-pairing-keys-pqclean");
+        let path = data_dir.join(PAIRING_KEYS_FILE);
+        keys.persist(&path).await.unwrap();
+        let written: PersistedPairingKeys =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let original: PersistedPairingKeys = serde_json::from_str(&raw).unwrap();
+        assert_eq!(written.ml_kem_secret, original.ml_kem_secret);
+        assert_eq!(written.ml_kem_public, original.ml_kem_public);
+        tokio::fs::remove_dir_all(&data_dir).await.unwrap();
+    }
+
+    #[test]
+    fn pairing_keys_reject_a_mismatched_or_tampered_ml_kem_key() {
+        let keys = PairingKeys::generate();
+        let other = PairingKeys::generate();
+        let persisted = |public: &[u8], secret: &[u8]| {
+            serde_json::to_string(&PersistedPairingKeys {
+                version: PAIRING_VERSION,
+                x25519_secret: encode_b64(keys.x25519_secret.to_bytes().as_slice()),
+                ml_kem_public: encode_b64(public),
+                ml_kem_secret: encode_b64(secret),
+            })
+            .unwrap()
+        };
+        let secret = ml_kem_secret_to_expanded(&keys.ml_kem_secret);
+        assert!(
+            PairingKeys::from_persisted_json(&persisted(&keys.ml_kem_public, &secret), "keys")
+                .is_ok()
+        );
+
+        // Another key's public half.
+        let error =
+            PairingKeys::from_persisted_json(&persisted(&other.ml_kem_public, &secret), "keys");
+        assert!(error.is_err());
+        // A flipped bit in the public key embedded in the secret (its hash no
+        // longer matches), and a truncated secret.
+        let mut tampered = secret.to_vec();
+        tampered[1152 + 5] ^= 1;
+        let error =
+            PairingKeys::from_persisted_json(&persisted(&keys.ml_kem_public, &tampered), "keys");
+        assert!(error.is_err());
+        let error = PairingKeys::from_persisted_json(
+            &persisted(&keys.ml_kem_public, &secret[..2399]),
+            "keys",
+        );
+        assert!(error.is_err());
     }
 
     #[tokio::test]

@@ -25,11 +25,9 @@ hmac = "0.12"
 if-addrs = "0.15"
 json5 = "0.4"
 libc = "0.2"
-# SIMD backends are enabled per target below. The NEON backend runs SHA-3
-# instructions without a CPU check (and MSVC cannot compile it), so ARM64
-# outside macOS, where every CPU has them, uses the portable implementation.
-pqcrypto-mlkem = { version = "0.1", default-features = false, features = ["std"] }
-pqcrypto-traits = "0.3"
+# Transport v2 ML-KEM-768 pairing key. `pairing_keys.json` keeps the FIPS 203
+# expanded key, an encoding 0.3 deprecates; a later ml-kem may drop it.
+ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
 portable-pty = "0.9"
 qrcodegen = "1"
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -74,9 +72,6 @@ jpeg-encoder = "0.7"
 # Agent browser: the DevTools socket on Windows, and unpacking Chromium.
 tokio-tungstenite = "0.29"
 zip = { version = "9", default-features = false, features = ["deflate"] }
-
-[target.'cfg(any(not(target_arch = "aarch64"), target_os = "macos"))'.dependencies]
-pqcrypto-mlkem = { version = "0.1", features = ["avx2", "neon"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 xa11y-macos = "=0.15.2"
