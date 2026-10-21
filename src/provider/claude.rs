@@ -1588,7 +1588,10 @@ mod tests {
         }));
         tasks.apply(&json!({ "subtype": "background_tasks_changed", "tasks": [] }));
         assert!(tasks.ids().is_empty());
-        assert!(tasks.pending(), "owes follow-up because main-session foreground was backgrounded");
+        assert!(
+            tasks.pending(),
+            "owes follow-up because main-session foreground was backgrounded"
+        );
     }
 
     #[test]
@@ -3223,11 +3226,17 @@ impl BackgroundTasks {
                 let Some(id) = message.get("task_id").and_then(Value::as_str) else {
                     return;
                 };
-                let is_subagent = message.get("owned_by_subagent").and_then(Value::as_bool) == Some(true)
-                    || message.get("parent_task_id").and_then(Value::as_str).is_some();
-                let info =
-                    BackgroundTaskInfo::from_frame(message, Some(Utc::now().to_rfc3339()));
-                self.known.entry(id.to_owned()).or_default().merge(info.clone());
+                let is_subagent = message.get("owned_by_subagent").and_then(Value::as_bool)
+                    == Some(true)
+                    || message
+                        .get("parent_task_id")
+                        .and_then(Value::as_str)
+                        .is_some();
+                let info = BackgroundTaskInfo::from_frame(message, Some(Utc::now().to_rfc3339()));
+                self.known
+                    .entry(id.to_owned())
+                    .or_default()
+                    .merge(info.clone());
                 if !is_subagent {
                     self.main.insert(id.to_owned());
                     if message.get("is_backgrounded").and_then(Value::as_bool) != Some(false) {
@@ -3239,7 +3248,10 @@ impl BackgroundTasks {
                 let Some(id) = message.get("task_id").and_then(Value::as_str) else {
                     return;
                 };
-                if let Some(bg) = message.pointer("/patch/is_backgrounded").and_then(Value::as_bool) {
+                if let Some(bg) = message
+                    .pointer("/patch/is_backgrounded")
+                    .and_then(Value::as_bool)
+                {
                     if bg && self.main.contains(id) {
                         let mut info = self.known.get(id).cloned().unwrap_or_default();
                         info.merge(BackgroundTaskInfo::from_frame(message, None));
@@ -3276,7 +3288,8 @@ impl BackgroundTasks {
                         let Some(id) = task.get("task_id").and_then(Value::as_str) else {
                             continue;
                         };
-                        let is_subagent = task.get("owned_by_subagent").and_then(Value::as_bool) == Some(true)
+                        let is_subagent = task.get("owned_by_subagent").and_then(Value::as_bool)
+                            == Some(true)
                             || task.get("parent_task_id").and_then(Value::as_str).is_some()
                             || !self.main.contains(id) && self.known.contains_key(id);
                         if is_subagent {

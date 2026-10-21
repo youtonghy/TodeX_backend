@@ -15,7 +15,7 @@ use rmcp::transport::{
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
 use tokio::io::{AsyncRead, BufReader, ReadBuf};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::time::timeout;
 
 use crate::catalog::{McpRuntimeTarget, McpToolDescriptor, McpTransport};
@@ -222,10 +222,9 @@ fn stdio_transport(target: &McpRuntimeTarget) -> Result<StdioServer, AppError> {
             target.descriptor.name
         )));
     };
-    let mut command = Command::new(program);
+    let mut command = crate::external_command::secure_command(program);
     command.args(&target.command[1..]);
-    command.current_dir(&target.workspace).env_clear();
-    inherit_base_env(&mut command);
+    command.current_dir(&target.workspace);
     for (key, value) in &target.env {
         if key.starts_with("TODEX_AGENTD_") {
             return Err(AppError::InvalidRequest(
@@ -311,16 +310,6 @@ async fn forward_stderr(stderr: impl AsyncRead + Unpin, mut emit: impl FnMut(Str
             emit(text);
         } else if lines == STDERR_MAX_LINES {
             emit("[further stderr output omitted]".to_owned());
-        }
-    }
-}
-
-fn inherit_base_env(command: &mut Command) {
-    for key in [
-        "PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP",
-    ] {
-        if let Ok(value) = std::env::var(key) {
-            command.env(key, value);
         }
     }
 }
@@ -678,12 +667,33 @@ while True:
         path
     }
 
+    fn python_program() -> &'static str {
+        #[cfg(windows)]
+        let candidates = ["python", "python3"];
+        #[cfg(not(windows))]
+        let candidates = ["python3", "python"];
+        candidates
+            .into_iter()
+            .find(|name| {
+                std::process::Command::new(name)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            })
+            .expect("python3 or python is required for the MCP stdio fixture")
+    }
+
     #[tokio::test]
     async fn stdio_lists_and_calls_tools() {
         let fixture = write_stdio_fixture();
         let target = McpRuntimeTarget::stdio_fixture(
             "echo",
-            vec!["python3".to_owned(), fixture.to_string_lossy().into_owned()],
+            vec![
+                python_program().to_owned(),
+                "-u".to_owned(),
+                "-S".to_owned(),
+                fixture.to_string_lossy().into_owned(),
+            ],
             fixture.parent().unwrap().to_path_buf(),
         );
         let tools = list_tools(&target).await.expect("list tools");

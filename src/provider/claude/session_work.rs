@@ -60,18 +60,32 @@ impl SessionWork {
         match message.get("subtype").and_then(Value::as_str) {
             Some("task_started") => {
                 let Some(id) = task_id else { return };
-                let is_subagent = message.get("owned_by_subagent").and_then(Value::as_bool) == Some(true)
-                    || message.get("parent_task_id").and_then(Value::as_str).is_some();
-                let task_type = message.get("task_type").and_then(Value::as_str).map(str::to_owned);
-                self.known.insert(id.to_owned(), (task_type.clone(), is_subagent));
-                if !is_subagent && message.get("is_backgrounded").and_then(Value::as_bool) != Some(false) {
+                let is_subagent = message.get("owned_by_subagent").and_then(Value::as_bool)
+                    == Some(true)
+                    || message
+                        .get("parent_task_id")
+                        .and_then(Value::as_str)
+                        .is_some();
+                let task_type = message
+                    .get("task_type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.known
+                    .insert(id.to_owned(), (task_type.clone(), is_subagent));
+                if !is_subagent
+                    && message.get("is_backgrounded").and_then(Value::as_bool) != Some(false)
+                {
                     self.live.insert(id.to_owned(), task_type);
                 }
             }
             Some("task_updated") => {
                 let Some(id) = task_id else { return };
-                if let Some(bg) = message.pointer("/patch/is_backgrounded").and_then(Value::as_bool) {
-                    let (task_type, is_subagent) = self.known.get(id).cloned().unwrap_or((None, false));
+                if let Some(bg) = message
+                    .pointer("/patch/is_backgrounded")
+                    .and_then(Value::as_bool)
+                {
+                    let (task_type, is_subagent) =
+                        self.known.get(id).cloned().unwrap_or((None, false));
                     if !is_subagent {
                         if bg {
                             self.live.insert(id.to_owned(), task_type);
@@ -113,7 +127,8 @@ impl SessionWork {
                         let Some(id) = task.get("task_id").and_then(Value::as_str) else {
                             continue;
                         };
-                        let is_subagent = task.get("owned_by_subagent").and_then(Value::as_bool) == Some(true)
+                        let is_subagent = task.get("owned_by_subagent").and_then(Value::as_bool)
+                            == Some(true)
                             || task.get("parent_task_id").and_then(Value::as_str).is_some()
                             || self.known.get(id).is_some_and(|(_, sub)| *sub);
                         if !is_subagent {
@@ -131,7 +146,8 @@ impl SessionWork {
                 self.live.retain(|id, task_type| {
                     let keep = current_main.contains(id);
                     if !keep {
-                        self.recently_left.insert(id.clone(), (task_type.clone(), now));
+                        self.recently_left
+                            .insert(id.clone(), (task_type.clone(), now));
                     }
                     keep
                 });
