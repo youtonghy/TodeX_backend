@@ -1304,6 +1304,13 @@ async fn pi_session_worker(
                         | AppError::StreamClosed
                         | AppError::Anyhow(_))
                 );
+            // A foreground subagent whose call never returned (stopped, or
+            // the process went) does not run on without its turn.
+            for (kind, payload) in rpc.subagents.close_foreground() {
+                if let Err(error) = sink.emit(kind, payload).await {
+                    tracing::warn!(error = %error, "failed to persist Pi subagent closure");
+                }
+            }
             rpc.close_dialogs().await;
             if closing {
                 reason = requested_shutdown.unwrap_or_else(|| "protocol_error".to_owned());
@@ -5145,6 +5152,72 @@ mod tests {
             })
             .count();
         assert_eq!(agent_cards, 2);
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn rpc_spawn_runs_surface_as_subagents_and_close_with_a_stopped_turn() {
+        let fixture = Fixture::new().await;
+        let (running, cancel) = fixture.start_cancellable("spawn-hold", "spawn-turn").await;
+        fixture
+            .wait_event(|event| {
+                event.event_type == "subagent.updated"
+                    && event.payload["subagentId"] == "spawn-open"
+            })
+            .await;
+        cancel.send_replace(true);
+        let result = tokio::time::timeout(Duration::from_secs(3), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.cancelled);
+        let events = fixture
+            .store
+            .complete_history(&fixture.manifest.id)
+            .await
+            .unwrap();
+        let runs: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type.starts_with("subagent."))
+            .map(|event| {
+                (
+                    event.event_type.as_str(),
+                    event.payload["subagentId"].as_str().unwrap_or(""),
+                    event.payload["status"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                ("subagent.started", "spawn-done", "running"),
+                ("subagent.updated", "spawn-done", "running"),
+                ("subagent.completed", "spawn-done", "completed"),
+                ("subagent.started", "spawn-open", "running"),
+                ("subagent.updated", "spawn-open", "running"),
+                ("subagent.cancelled", "spawn-open", "cancelled"),
+            ]
+        );
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "subagent.completed")
+            .unwrap();
+        assert_eq!(completed.payload["result"], "child answer");
+        assert_eq!(completed.payload["usage"]["total_tokens"], 15);
+        let started = events
+            .iter()
+            .find(|event| event.event_type == "subagent.started")
+            .unwrap();
+        assert_eq!(started.payload["title"], "Child task spawn-done");
+        assert_eq!(started.payload["turnId"], "spawn-turn");
+        // The closure is journalled within the stopped turn.
+        let cancelled = events
+            .iter()
+            .find(|event| event.event_type == "subagent.cancelled")
+            .unwrap();
+        assert_eq!(cancelled.payload["turnId"], "spawn-turn");
         fixture.finish().await;
     }
 

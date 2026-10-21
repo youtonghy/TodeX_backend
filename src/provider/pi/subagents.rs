@@ -11,6 +11,11 @@
 //! outlive the turn that launched them and die with the Pi process, while
 //! writing nothing to stdout until they settle. They are tracked here so the
 //! resident process is kept until they settle and Pi has reported on them.
+//!
+//! `pi-agenticoding`'s `spawn` tool runs a child session in the foreground:
+//! one `running` update, then the result with `details.outcome` and the
+//! child's `stats`. Its child session writes nothing to stdout, so there is
+//! no progress in between.
 
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -18,6 +23,9 @@ use tokio::time::Instant;
 
 const AGENT_TOOL: &str = "Agent";
 const WORKFLOW_TOOL: &str = "SubagentWorkflow";
+const SPAWN_TOOL: &str = "spawn";
+/// A `spawn` run is titled by its prompt's first line, cut to this many chars.
+const SPAWN_TITLE_CHARS: usize = 60;
 const RECORD_ENTRY: &str = "subagents:record";
 const NOTIFICATION_MESSAGE: &str = "subagent-notification";
 /// The plugin's status line key; its text counts running and queued agents
@@ -46,6 +54,9 @@ pub(super) struct PiSubagents {
     /// The plugin's status line reports running agents, including ones no
     /// `Agent` result introduced.
     status_busy: bool,
+    /// Runs started by a call in the foreground. One the turn ends without
+    /// settling (stopped, process gone) is cancelled then.
+    foreground: HashSet<String>,
 }
 
 /// A background run as clients see it while the agent waits on it.
@@ -64,6 +75,9 @@ impl PiSubagents {
             self.workflow_launched(kind, payload);
             return None;
         }
+        if payload.get("toolName").and_then(Value::as_str) == Some(SPAWN_TOOL) {
+            return self.spawn_event(kind, payload);
+        }
         if payload.get("toolName").and_then(Value::as_str) != Some(AGENT_TOOL) {
             return None;
         }
@@ -80,6 +94,7 @@ impl PiSubagents {
                 if !self.known.insert(id.clone()) {
                     return None;
                 }
+                self.foreground.insert(id.clone());
                 let mut fields = Map::new();
                 fields.insert("agentKind".into(), agent_kind.clone());
                 insert_string(
@@ -105,6 +120,101 @@ impl PiSubagents {
             "tool.completed" => self.tool_completed(&id, payload),
             _ => None,
         }
+    }
+
+    /// `subagent.*` for a `pi-agenticoding` `spawn` call, keyed by its
+    /// toolCallId. Frames without the plugin's shape stay plain tool cards.
+    fn spawn_event(&mut self, kind: &str, payload: &Value) -> Option<SubagentEvent> {
+        let id = payload
+            .get("toolCallId")
+            .and_then(Value::as_str)?
+            .to_owned();
+        match kind {
+            "tool.started" => {
+                let prompt = payload
+                    .pointer("/arguments/prompt")
+                    .and_then(Value::as_str)
+                    .filter(|prompt| !prompt.trim().is_empty())?;
+                if !self.known.insert(id.clone()) {
+                    return None;
+                }
+                self.foreground.insert(id.clone());
+                let mut fields = Map::new();
+                fields.insert("agentKind".into(), json!(SPAWN_TOOL));
+                fields.insert("title".into(), json!(spawn_title(prompt)));
+                fields.insert("task".into(), json!(prompt));
+                fields.insert("status".into(), json!("running"));
+                Some(("subagent.started", event(&id, Some(payload), fields)))
+            }
+            "tool.updated" => {
+                let details = spawn_details(payload.get("partialResult"))?;
+                if !self.known.contains(&id) || self.finished.contains(&id) {
+                    return None;
+                }
+                let mut fields = spawn_fields(details);
+                fields.insert("status".into(), json!("running"));
+                Some(("subagent.updated", event(&id, Some(payload), fields)))
+            }
+            "tool.completed" => {
+                let details = spawn_details(payload.get("result"));
+                if (details.is_none() && !self.known.contains(&id))
+                    || !self.finished.insert(id.clone())
+                {
+                    return None;
+                }
+                self.known.insert(id.clone());
+                let mut fields = details.map(spawn_fields).unwrap_or_default();
+                let text = result_text(payload.get("result"));
+                let outcome = details
+                    .and_then(|details| details.get("outcome"))
+                    .and_then(Value::as_str);
+                let (kind, status) = if payload.get("isError").and_then(Value::as_bool)
+                    == Some(true)
+                    || outcome == Some("error")
+                {
+                    ("subagent.failed", "failed")
+                } else if outcome == Some("aborted") {
+                    ("subagent.cancelled", "cancelled")
+                } else {
+                    ("subagent.completed", "completed")
+                };
+                fields.insert("status".into(), json!(status));
+                if let Some(text) = text {
+                    let key = if status == "failed" {
+                        "error"
+                    } else {
+                        "result"
+                    };
+                    fields.insert(key.into(), json!(text));
+                }
+                Some((kind, event(&id, Some(payload), fields)))
+            }
+            _ => None,
+        }
+    }
+
+    /// `subagent.cancelled` for foreground runs the turn ended without
+    /// settling: their call never returned (stopped, or the process went).
+    pub(super) fn close_foreground(&mut self) -> Vec<SubagentEvent> {
+        let launched: HashSet<&str> = self
+            .background
+            .values()
+            .map(|run| run.tool_call_id.as_str())
+            .collect();
+        let mut open: Vec<String> = self
+            .foreground
+            .drain()
+            .filter(|id| !self.finished.contains(id) && !launched.contains(id.as_str()))
+            .collect();
+        open.sort();
+        open.into_iter()
+            .map(|id| {
+                self.finished.insert(id.clone());
+                let mut fields = Map::new();
+                fields.insert("status".into(), json!("cancelled"));
+                ("subagent.cancelled", event(&id, None, fields))
+            })
+            .collect()
     }
 
     fn tool_completed(&mut self, id: &str, payload: &Value) -> Option<SubagentEvent> {
@@ -417,6 +527,72 @@ fn plugin_details(result: Option<&Value>) -> Option<&Value> {
     result
         .and_then(|result| result.get("details"))
         .filter(|details| details.get("subagentType").is_some_and(Value::is_string))
+}
+
+/// `spawn`'s `SpawnResultDetails`; `outcome` and `model` set it apart from
+/// another extension's `spawn` tool.
+fn spawn_details(result: Option<&Value>) -> Option<&Value> {
+    result
+        .and_then(|result| result.get("details"))
+        .filter(|details| {
+            details.get("outcome").is_some_and(Value::is_string)
+                && details.get("model").is_some_and(Value::is_string)
+        })
+}
+
+/// Model, routing and usage of a `spawn` run.
+fn spawn_fields(details: &Value) -> Map<String, Value> {
+    let mut fields = Map::new();
+    let mut metadata = Map::new();
+    for (from, to) in [("model", "modelName"), ("thinking", "thinking")] {
+        if let Some(value) = details.get(from).filter(|value| value.is_string()) {
+            metadata.insert(to.into(), value.clone());
+        }
+    }
+    if let Some(group) = details
+        .pointer("/route/group")
+        .or_else(|| details.pointer("/route/requestedGroup"))
+        .filter(|group| group.as_str().is_some_and(|group| !group.is_empty()))
+    {
+        metadata.insert("group".into(), group.clone());
+    }
+    if let Some(stats) = details.get("stats") {
+        for key in ["cost", "turns"] {
+            if let Some(value) = stats.get(key).filter(|value| value.is_number()) {
+                metadata.insert(key.into(), value.clone());
+            }
+        }
+        let usage = usage(
+            stats,
+            &[
+                ("inputTokens", "input_tokens"),
+                ("outputTokens", "output_tokens"),
+                ("totalTokens", "total_tokens"),
+            ],
+        );
+        if !usage.is_empty() {
+            fields.insert("usage".into(), Value::Object(usage));
+        }
+    }
+    if !metadata.is_empty() {
+        fields.insert("metadata".into(), Value::Object(metadata));
+    }
+    fields
+}
+
+/// The first non-empty line of a `spawn` prompt, cut to [`SPAWN_TITLE_CHARS`].
+fn spawn_title(prompt: &str) -> String {
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    if line.chars().count() <= SPAWN_TITLE_CHARS {
+        return line.to_owned();
+    }
+    let mut title: String = line.chars().take(SPAWN_TITLE_CHARS).collect();
+    title.push('…');
+    title
 }
 
 /// Plugin statuses that end a run, as a TodeX event kind and status.
@@ -763,5 +939,165 @@ mod tests {
         assert!(runs.tool_event("tool.completed", &plain_end).is_none());
         let entry = json!({ "type": "entry_appended", "entry": { "type": "custom", "customType": "other", "data": {} } });
         assert!(runs.record_entry(&entry).is_none());
+    }
+
+    fn spawn_tool(phase: &str, id: &str, extra: Value) -> Value {
+        let mut payload = tool(phase, id, extra);
+        payload["toolName"] = json!("spawn");
+        payload["arguments"] =
+            json!({ "prompt": "\n  Check the router's packages\nRemove the unused ones." });
+        payload
+    }
+
+    fn spawn_details(outcome: &str, extra: Value) -> Value {
+        let mut details = json!({
+            "model": "glm-5.3", "thinking": "high", "truncated": false, "outcome": outcome,
+            "route": { "status": "routed", "group": "fast", "provider": "zai", "modelId": "glm-5.3" },
+        });
+        details
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        details
+    }
+
+    #[test]
+    fn spawn_runs_surface_as_foreground_subagents() {
+        let mut runs = PiSubagents::default();
+        let (kind, started) = runs
+            .tool_event("tool.started", &spawn_tool("started", "spawn-1", json!({})))
+            .unwrap();
+        assert_eq!(kind, "subagent.started");
+        assert_eq!(started["subagentId"], "spawn-1");
+        assert_eq!(started["agentKind"], "spawn");
+        assert_eq!(started["title"], "Check the router's packages");
+        assert_eq!(
+            started["task"],
+            "\n  Check the router's packages\nRemove the unused ones."
+        );
+        assert_eq!(started["turnId"], "turn-1");
+
+        let running = spawn_tool(
+            "delta",
+            "spawn-1",
+            json!({ "partialResult": { "content": [], "details": spawn_details("running", json!({})) } }),
+        );
+        let (kind, updated) = runs.tool_event("tool.updated", &running).unwrap();
+        assert_eq!(kind, "subagent.updated");
+        assert_eq!(updated["status"], "running");
+        assert_eq!(updated["metadata"]["modelName"], "glm-5.3");
+        assert_eq!(updated["metadata"]["group"], "fast");
+
+        let stats = json!({ "stats": { "inputTokens": 1200, "outputTokens": 300, "cacheReadTokens": 50,
+            "totalTokens": 1550, "cost": 0.01, "turns": 4 } });
+        let done = spawn_tool(
+            "completed",
+            "spawn-1",
+            json!({ "result": { "content": text("Removed 3 packages."), "details": spawn_details("success", stats) } }),
+        );
+        let (kind, completed) = runs.tool_event("tool.completed", &done).unwrap();
+        assert_eq!(kind, "subagent.completed");
+        assert_eq!(completed["result"], "Removed 3 packages.");
+        assert_eq!(
+            completed["usage"],
+            json!({ "input_tokens": 1200, "output_tokens": 300, "total_tokens": 1550 })
+        );
+        assert_eq!(completed["metadata"]["turns"], 4);
+        // Settled runs stay settled and are not cancelled with the turn.
+        assert!(runs.tool_event("tool.completed", &done).is_none());
+        assert!(runs.tool_event("tool.updated", &running).is_none());
+        assert!(runs.close_foreground().is_empty());
+    }
+
+    #[test]
+    fn spawn_outcomes_and_errors_map_to_terminal_states() {
+        let mut runs = PiSubagents::default();
+        for id in ["aborted", "errored", "thrown"] {
+            runs.tool_event("tool.started", &spawn_tool("started", id, json!({})));
+        }
+        let aborted = spawn_tool(
+            "completed",
+            "aborted",
+            json!({ "result": { "content": [], "details": spawn_details("aborted", json!({})) } }),
+        );
+        let (kind, cancelled) = runs.tool_event("tool.completed", &aborted).unwrap();
+        assert_eq!(
+            (kind, &cancelled["status"]),
+            ("subagent.cancelled", &json!("cancelled"))
+        );
+
+        let errored = spawn_tool(
+            "completed",
+            "errored",
+            json!({ "result": { "content": text("rate limited"), "details": spawn_details("error", json!({})) } }),
+        );
+        let (kind, failed) = runs.tool_event("tool.completed", &errored).unwrap();
+        assert_eq!(kind, "subagent.failed");
+        assert_eq!(failed["error"], "rate limited");
+        assert!(failed.get("result").is_none());
+
+        // A thrown spawn returns a plain error result without details.
+        let thrown = spawn_tool(
+            "completed",
+            "thrown",
+            json!({ "result": { "content": text("Child agent produced no output.") }, "isError": true }),
+        );
+        let (kind, failed) = runs.tool_event("tool.completed", &thrown).unwrap();
+        assert_eq!(kind, "subagent.failed");
+        assert_eq!(failed["error"], "Child agent produced no output.");
+    }
+
+    #[test]
+    fn other_spawn_tools_stay_plain_tool_cards() {
+        let mut runs = PiSubagents::default();
+        let mut started = spawn_tool("started", "other", json!({}));
+        started["arguments"] = json!({ "command": "ls" });
+        assert!(runs.tool_event("tool.started", &started).is_none());
+        let done = spawn_tool(
+            "completed",
+            "other",
+            json!({ "result": { "content": text("pid 42"), "details": { "pid": 42 } } }),
+        );
+        assert!(runs.tool_event("tool.completed", &done).is_none());
+        assert!(runs.close_foreground().is_empty());
+    }
+
+    #[test]
+    fn foreground_runs_left_open_are_cancelled_but_background_ones_are_not() {
+        let mut runs = PiSubagents::default();
+        runs.tool_event("tool.started", &spawn_tool("started", "spawn-1", json!({})));
+        runs.tool_event("tool.started", &tool("started", "agent-fg", json!({})));
+        runs.tool_event("tool.started", &tool("started", "agent-bg", json!({})));
+        let launched = tool(
+            "completed",
+            "agent-bg",
+            json!({ "result": {
+                "content": text("Agent started in background.\nAgent ID: bg-1\n"),
+                "details": details("background", json!({ "agentId": "bg-1" })),
+            } }),
+        );
+        runs.tool_event("tool.completed", &launched).unwrap();
+
+        let closed = runs.close_foreground();
+        let ids: Vec<_> = closed
+            .iter()
+            .map(|(kind, payload)| (*kind, payload["subagentId"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("subagent.cancelled", "agent-fg"),
+                ("subagent.cancelled", "spawn-1")
+            ]
+        );
+        assert!(runs.running(), "the background run still holds the process");
+        assert!(runs.close_foreground().is_empty());
+        // A late result for a closed run adds nothing.
+        let late = spawn_tool(
+            "completed",
+            "spawn-1",
+            json!({ "result": { "content": text("done"), "details": spawn_details("success", json!({})) } }),
+        );
+        assert!(runs.tool_event("tool.completed", &late).is_none());
     }
 }

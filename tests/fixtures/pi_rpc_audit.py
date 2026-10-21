@@ -137,6 +137,24 @@ def subagent_runs():
         out({'type': 'message_end', 'message': message})
     threading.Thread(target=settle, daemon=True).start()
 
+def spawn_runs():
+    # pi-agenticoding: `spawn` runs a child session in the foreground with
+    # one running update; the second call is still running when the turn is
+    # stopped and never returns.
+    def details(outcome, **extra):
+        return {'model': 'text', 'thinking': 'high', 'truncated': False, 'outcome': outcome,
+                'route': {'status': 'inherited'}, **extra}
+    for call in ['spawn-done', 'spawn-open']:
+        args = {'prompt': 'Child task ' + call + '\nwith details'}
+        out({'type': 'tool_execution_start', 'toolCallId': call, 'toolName': 'spawn', 'args': args})
+        out({'type': 'tool_execution_update', 'toolCallId': call, 'toolName': 'spawn', 'args': args,
+             'partialResult': {'content': [], 'details': details('running')}})
+        if call == 'spawn-done':
+            stats = {'inputTokens': 10, 'outputTokens': 5, 'cacheReadTokens': 0, 'cacheWriteTokens': 0,
+                     'totalTokens': 15, 'cost': 0, 'turns': 1}
+            out({'type': 'tool_execution_end', 'toolCallId': call, 'toolName': 'spawn', 'isError': False,
+                 'result': {'content': [{'type': 'text', 'text': 'child answer'}], 'details': details('success', stats=stats)}})
+
 def background_subagent(settles):
     # pi-subagents' default: the Agent call returns at once, the run goes on in
     # the Pi process writing nothing but its status line, then settles through
@@ -280,6 +298,8 @@ for line in sys.stdin:
                 out({'type': 'agent_start'})
             if scenario == 'hold':
                 out({'type': 'tool_execution_start', 'toolCallId': 'holding', 'toolName': 'fixture'})
+            if scenario == 'spawn-hold':
+                spawn_runs()
             if scenario == 'extension-warning':
                 out({'type': 'extension_error', 'error': 'nonfatal hook failed'})
                 finish()
