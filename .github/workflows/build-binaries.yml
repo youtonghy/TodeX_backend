@@ -71,7 +71,7 @@ jobs:
       sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -99,7 +99,7 @@ jobs:
       TODEX_RELEASE_BUILD: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.source.outputs.sha }}
 
@@ -153,7 +153,7 @@ jobs:
             archive: zip
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.source.outputs.sha }}
 
@@ -403,7 +403,7 @@ jobs:
           echo "artifact_path=dist/${archive_name}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload binary archive
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.package.outputs.artifact_name }}
           path: |
@@ -434,7 +434,7 @@ jobs:
       contents: write
     steps:
       - name: Download binary archives
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
