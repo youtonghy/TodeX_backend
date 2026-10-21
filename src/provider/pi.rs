@@ -3697,9 +3697,12 @@ mod tests {
         (outcome, events)
     }
 
+    #[cfg(unix)]
     const COMPACTION_START: &str = r#"echo '{"type":"compaction_start","reason":"threshold"}'"#;
+    #[cfg(unix)]
     const COMPACTION_END: &str =
         r#"echo '{"type":"compaction_end","reason":"threshold","result":{},"aborted":false}'"#;
+    #[cfg(unix)]
     const PROMPT_ACCEPTED: &str = r#"echo '{"type":"response","id":"turn-1","success":true}'"#;
 
     #[tokio::test]
