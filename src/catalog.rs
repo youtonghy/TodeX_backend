@@ -1318,10 +1318,15 @@ fn mcp_sources(home: Option<&Path>, workspace: &Path, provider: ProviderKind) ->
     if let Some(home) = home {
         let config_home = catalog.config_home.resolve(home);
         for file in catalog.mcp_user_files {
-            let path = match file {
-                UserConfigFile::Home(relative) => home.join(relative),
-                UserConfigFile::ConfigHome(relative) => config_home.join(relative),
+            // Join the `/`-separated relative path segment by segment so the
+            // listed path uses native separators on Windows.
+            let (base, relative) = match file {
+                UserConfigFile::Home(relative) => (home, relative),
+                UserConfigFile::ConfigHome(relative) => (config_home.as_path(), relative),
             };
+            let path = relative
+                .split('/')
+                .fold(base.to_path_buf(), |path, segment| path.join(segment));
             sources.push(SourceRoot {
                 path,
                 scope: CatalogScope::User,
