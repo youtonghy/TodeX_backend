@@ -461,7 +461,14 @@
         "priority": 20
       }
     ],
-    "mcpSources": [],
+    "mcpSources": [
+      {
+        "path": "~/.dsh/profiles/acp/cordis.patch.yml",
+        "scope": "user",
+        "source": "dsh-user",
+        "priority": 20
+      }
+    ],
     "skills": 0,
     "mcp": [],
     "mcpTarget": {

@@ -265,6 +265,9 @@ pub enum McpConfigFormat {
     /// Reported by the provider's own inspection (Grok Build), not a file
     /// TodeX parses.
     Native,
+    /// `dsh-mcp-client` rows of a DeepSeek Harness patch layer, shown and
+    /// edited as entry JSON (see [`crate::dsh_mcp`]).
+    DshPatch,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1232,13 +1235,10 @@ fn scan_mcp(
                 continue;
             }
         };
-        let format = if source.path.extension().and_then(|value| value.to_str()) == Some("toml") {
-            McpConfigFormat::Toml
-        } else {
-            McpConfigFormat::Json
-        };
+        let format = file_format(&source.path);
         let parsed = match format {
             McpConfigFormat::Toml => parse_toml_mcp(&raw),
+            McpConfigFormat::DshPatch => parse_dsh_mcp(&raw),
             _ => parse_json_mcp(&raw),
         };
         let entries = match parsed {
@@ -1586,6 +1586,37 @@ fn parsed_mcp_from_toml(name: String, table: &toml::Table) -> ParsedMcpServer {
 }
 
 /// An empty or whitespace-only file declares no servers.
+/// How the MCP config file at `path` is written, by its extension.
+fn file_format(path: &Path) -> McpConfigFormat {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("toml") => McpConfigFormat::Toml,
+        Some("yml" | "yaml") => McpConfigFormat::DshPatch,
+        _ => McpConfigFormat::Json,
+    }
+}
+
+fn parse_dsh_mcp(raw: &str) -> Result<Vec<ParsedMcpServer>, AppError> {
+    Ok(crate::dsh_mcp::parse(raw)?
+        .into_iter()
+        .map(|server| ParsedMcpServer {
+            name: server.name,
+            key: server.row_id,
+            map_pointer: String::new(),
+            raw: server.entry,
+            transport: if server.http {
+                McpTransport::Http
+            } else {
+                McpTransport::Stdio
+            },
+            enabled: server.enabled,
+            command: server.command,
+            env: server.env,
+            url: server.url,
+            headers: server.headers,
+        })
+        .collect())
+}
+
 fn parse_json_mcp(raw: &str) -> Result<Vec<ParsedMcpServer>, AppError> {
     if raw.trim().is_empty() {
         return Ok(Vec::new());
@@ -1710,6 +1741,9 @@ fn find_mcp_server_maps<'a>(
 /// the old one, keeping its permissions. Fails with `NotFound` when the file
 /// changed and the entry is no longer there.
 fn remove_mcp_entry(origin: &McpOrigin) -> Result<(), AppError> {
+    if origin.format == McpConfigFormat::DshPatch {
+        return crate::dsh_mcp::remove(&origin.path, &origin.key);
+    }
     let path = &origin.path;
     let raw = std::fs::read_to_string(path)?;
     let missing = || AppError::NotFound(format!("mcp server {} in {}", origin.key, path.display()));
@@ -1741,7 +1775,7 @@ fn remove_mcp_entry(origin: &McpOrigin) -> Result<(), AppError> {
             }
             text
         }
-        McpConfigFormat::Native => {
+        McpConfigFormat::Native | McpConfigFormat::DshPatch => {
             return Err(AppError::Unsupported(
                 "natively managed MCP servers cannot be removed here".to_owned(),
             ))
@@ -1793,6 +1827,9 @@ fn write_through_temp(
 /// Adds `name` to the config file at `path` (top-level `mcpServers` for
 /// JSON, `[mcp_servers]` for TOML), creating the file when missing.
 fn insert_mcp_entry(path: &Path, name: &str, config: Value) -> Result<(), AppError> {
+    if file_format(path) == McpConfigFormat::DshPatch {
+        return crate::dsh_mcp::insert(path, name, &config);
+    }
     let existing = match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(AppError::InvalidRequest(format!(
@@ -1869,6 +1906,9 @@ fn insert_mcp_entry(path: &Path, name: &str, config: Value) -> Result<(), AppErr
 
 /// Replaces the entry `origin` points at with `config` under `name`.
 fn replace_mcp_entry(origin: &McpOrigin, name: &str, config: Value) -> Result<(), AppError> {
+    if origin.format == McpConfigFormat::DshPatch {
+        return crate::dsh_mcp::replace(&origin.path, &origin.key, name, &config);
+    }
     let path = &origin.path;
     let raw = std::fs::read_to_string(path)?;
     let missing = || AppError::NotFound(format!("mcp server {} in {}", origin.key, path.display()));
@@ -1920,7 +1960,7 @@ fn replace_mcp_entry(origin: &McpOrigin, name: &str, config: Value) -> Result<()
             servers.insert(name.to_owned(), config);
             pretty_json(&value, raw.ends_with('\n'))?
         }
-        McpConfigFormat::Native => {
+        McpConfigFormat::Native | McpConfigFormat::DshPatch => {
             return Err(AppError::Unsupported(
                 "natively managed MCP servers cannot be edited here".to_owned(),
             ))
@@ -2288,6 +2328,76 @@ mod tests {
         assert!(toml.starts_with("# keep me\nmodel = \"x\"\n"));
         assert!(!toml.contains("gone"));
         assert!(toml.contains("[mcp_servers.stay]"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dsh_mcp_servers_are_rows_of_the_acp_profile_patch() {
+        let root = temp_dir("todex-catalog-dsh");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let config = Arc::new(test_config(root.join("data"), workspace_root));
+        let service = CatalogService::with_home(config, Some(home.clone()));
+        let provider = ProviderKind::DeepseekHarness;
+
+        let catalog = service.mcp(provider, workspace.clone()).await.unwrap();
+        assert!(catalog.editable);
+        assert_eq!(catalog.creatable_scopes, vec![CatalogScope::User]);
+        let created = service
+            .create_mcp(
+                provider,
+                workspace.clone(),
+                CatalogScope::User,
+                "docs".to_owned(),
+                json!({ "command": "/usr/bin/docs-mcp", "args": ["--stdio"] }),
+            )
+            .await
+            .unwrap();
+        let patch = home.join(".dsh/profiles/acp/cordis.patch.yml");
+        assert_eq!(created.path, patch.to_string_lossy());
+        assert_eq!(created.format, McpConfigFormat::DshPatch);
+        assert_eq!(
+            created.config,
+            json!({ "type": "stdio", "command": "/usr/bin/docs-mcp", "args": ["--stdio"] })
+        );
+        assert!(fs::read_to_string(&patch)
+            .unwrap()
+            .contains("name: '@deepseek-ai/dsh-mcp-client'"));
+        let updated = service
+            .update_mcp(
+                provider,
+                workspace.clone(),
+                &created.descriptor.resource_id,
+                "docs".to_owned(),
+                json!({ "type": "http", "url": "https://docs.test/mcp", "enabled": false }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.descriptor.transport, McpTransport::Http);
+        assert!(!updated.descriptor.enabled);
+        assert!(service
+            .create_mcp(
+                provider,
+                workspace.clone(),
+                CatalogScope::User,
+                "todex_ssh".to_owned(),
+                json!({ "command": "/bin/x" }),
+            )
+            .await
+            .is_err());
+        service
+            .delete_mcp(provider, workspace.clone(), &updated.descriptor.resource_id)
+            .await
+            .unwrap();
+        assert!(service
+            .mcp(provider, workspace)
+            .await
+            .unwrap()
+            .servers
+            .is_empty());
+        assert_eq!(fs::read_to_string(&patch).unwrap(), "[]\n");
         let _ = fs::remove_dir_all(root);
     }
 

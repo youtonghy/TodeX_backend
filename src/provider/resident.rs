@@ -116,6 +116,9 @@ pub(super) struct ResidentSessions {
     label: &'static str,
     idle_timeout: Duration,
     max_sessions: usize,
+    /// Restart an idle process before a turn once TodeX has rewritten the
+    /// provider's config, for agents that read it only at startup.
+    restart_on_config_change: bool,
     sessions: Mutex<HashMap<String, SessionHandle>>,
 }
 
@@ -133,6 +136,7 @@ impl ResidentSessions {
                 .process_model
                 .max_sessions()
                 .expect("resident providers declare a session limit"),
+            restart_on_config_change: false,
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -140,6 +144,15 @@ impl ResidentSessions {
     /// Replaces the profile's idle timeout (the configured keepalive).
     pub(super) fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Starts a new process for the next turn when the managed config
+    /// revision moved since the running one started (see
+    /// [`crate::agent_providers::config_revision`]). The agent resumes its
+    /// session, so the conversation continues with the new config.
+    pub(super) fn with_config_restart(mut self) -> Self {
+        self.restart_on_config_change = true;
         self
     }
 
@@ -328,6 +341,9 @@ impl ResidentSessions {
                 spec,
                 runtime,
                 warm_pending: warm_pending.clone(),
+                config_revision: self
+                    .restart_on_config_change
+                    .then(crate::agent_providers::config_revision),
             }
             .run(turn_rx, control_rx, shutdown_rx, stopped_tx),
         );
@@ -436,6 +452,9 @@ struct SessionActor {
     spec: CommandSpec,
     runtime: AcpRuntimeOptions,
     warm_pending: Arc<AtomicBool>,
+    /// The managed config revision the running process started with, when
+    /// config changes restart it.
+    config_revision: Option<u64>,
 }
 
 impl SessionActor {
@@ -546,6 +565,18 @@ impl SessionActor {
                     last_sink = None;
                     self.spec = relaunch.spec;
                     self.runtime = relaunch.runtime;
+                }
+            }
+            if let Some(started_with) = self.config_revision {
+                let current = crate::agent_providers::config_revision();
+                if current != started_with {
+                    // Turns run one at a time, so the process is idle here.
+                    if let Some(mut stale) = process.take() {
+                        stale.terminate().await;
+                    }
+                    connection = AcpConnectionState::default();
+                    last_sink = None;
+                    self.config_revision = Some(current);
                 }
             }
             if process.is_none() {

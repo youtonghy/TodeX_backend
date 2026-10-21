@@ -38,14 +38,24 @@ fn endpoint_credentials(agent: ProviderKind, settings: &Value) -> (Option<String
         .unwrap_or((None, None))
 }
 
-fn models_url(agent: ProviderKind, base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
+/// Whether the endpoint speaks Anthropic's API: Claude Code, and DeepSeek
+/// Harness routes on the Anthropic Messages protocol.
+fn anthropic_style(agent: ProviderKind, settings: &Value) -> bool {
     match agent {
-        // Anthropic-style endpoints mount the catalog at /v1/models; third-party
-        // gateways usually already include the /v1 segment.
-        ProviderKind::ClaudeCode if base.ends_with("/v1") => format!("{base}/models"),
-        ProviderKind::ClaudeCode => format!("{base}/v1/models"),
-        _ => format!("{base}/models"),
+        ProviderKind::ClaudeCode => true,
+        ProviderKind::DeepseekHarness => super::dsh::anthropic_style(settings),
+        _ => false,
+    }
+}
+
+fn models_url(anthropic: bool, base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    // Anthropic-style endpoints mount the catalog at /v1/models; third-party
+    // gateways usually already include the /v1 segment.
+    if anthropic && !base.ends_with("/v1") {
+        format!("{base}/v1/models")
+    } else {
+        format!("{base}/models")
     }
 }
 
@@ -62,7 +72,8 @@ pub async fn fetch_models(agent: ProviderKind, settings: &Value) -> Result<Value
                 agent.as_str()
             ))
         })?;
-    let url = models_url(agent, &base_url);
+    let anthropic = anthropic_style(agent, settings);
+    let url = models_url(anthropic, &base_url);
 
     let mut request = http_client()?.get(&url);
     if let Some(key) = api_key.filter(|key| !key.is_empty()) {
@@ -70,7 +81,7 @@ pub async fn fetch_models(agent: ProviderKind, settings: &Value) -> Result<Value
             .header("authorization", format!("Bearer {key}"))
             .header("x-api-key", &key);
     }
-    if agent == ProviderKind::ClaudeCode {
+    if anthropic {
         request = request.header("anthropic-version", "2023-06-01");
     }
     let response = request
@@ -116,22 +127,38 @@ pub async fn fetch_models(agent: ProviderKind, settings: &Value) -> Result<Value
 
 #[cfg(test)]
 mod tests {
-    use super::models_url;
+    use super::{anthropic_style, models_url};
     use crate::conversation::ProviderKind;
+    use serde_json::json;
 
     #[test]
     fn claude_models_url_avoids_doubling_v1() {
         assert_eq!(
-            models_url(ProviderKind::ClaudeCode, "https://api.anthropic.com"),
+            models_url(true, "https://api.anthropic.com"),
             "https://api.anthropic.com/v1/models"
         );
         assert_eq!(
-            models_url(ProviderKind::ClaudeCode, "https://gw.example.com/v1/"),
+            models_url(true, "https://gw.example.com/v1/"),
             "https://gw.example.com/v1/models"
         );
         assert_eq!(
-            models_url(ProviderKind::Codex, "https://gw.example.com/v1"),
+            models_url(false, "https://gw.example.com/v1"),
             "https://gw.example.com/v1/models"
         );
+    }
+
+    #[test]
+    fn dsh_routes_follow_their_wire_protocol() {
+        let route = |api: &str| json!({"api": api});
+        assert!(anthropic_style(
+            ProviderKind::DeepseekHarness,
+            &route("anthropic-messages")
+        ));
+        assert!(!anthropic_style(
+            ProviderKind::DeepseekHarness,
+            &route("openai-completions")
+        ));
+        assert!(anthropic_style(ProviderKind::ClaudeCode, &json!({})));
+        assert!(!anthropic_style(ProviderKind::Codex, &json!({})));
     }
 }

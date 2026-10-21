@@ -1,6 +1,7 @@
 //! Global instruction files of the CLIs, edited from the CLI manager:
-//! Claude Code's `<claude_dir>/CLAUDE.md`, Codex's `<codex_home>/AGENTS.md`
-//! and Pi's `<pi_dir>/AGENTS.md`, plus a library of instruction presets kept
+//! Claude Code's `<claude_dir>/CLAUDE.md`, Codex's `<codex_home>/AGENTS.md`,
+//! Pi's `<pi_dir>/AGENTS.md` and DeepSeek Harness's `$DSH_HOME/AGENTS.md`,
+//! plus a library of instruction presets kept
 //! in `<data_dir>/agent-instructions.json`.
 //!
 //! A CLI either keeps its own text or is bound to a preset. A bound file is
@@ -42,10 +43,16 @@ pub(crate) enum InstructionsTarget {
     ClaudeCode,
     Codex,
     Pi,
+    DeepseekHarness,
 }
 
 impl InstructionsTarget {
-    const ALL: [Self; 3] = [Self::ClaudeCode, Self::Codex, Self::Pi];
+    const ALL: [Self; 4] = [
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::Pi,
+        Self::DeepseekHarness,
+    ];
 
     pub(crate) fn from_provider(provider: &str) -> Option<Self> {
         Self::ALL
@@ -58,6 +65,7 @@ impl InstructionsTarget {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
             Self::Pi => "pi",
+            Self::DeepseekHarness => "deepseek-harness",
         }
     }
 
@@ -78,6 +86,12 @@ impl InstructionsTarget {
             Self::Pi => InstructionsFile {
                 target: self,
                 path: dirs.pi_dir().join("AGENTS.md"),
+                override_path: None,
+            },
+            // Read before `$DSH_AGENTS_HOME/AGENTS.md` and the project's files.
+            Self::DeepseekHarness => InstructionsFile {
+                target: self,
+                path: crate::dsh_config::DshPaths::of(&dirs).instructions(),
                 override_path: None,
             },
         }

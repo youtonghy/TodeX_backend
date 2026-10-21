@@ -270,17 +270,13 @@
     "tomlHeaderTables": null
   },
   "deepseek-harness": {
-    "managed": false,
-    "additive": false,
+    "managed": true,
+    "additive": true,
     "readLive": {
       "error": "unsupported capability: deepseek-harness is not an exclusive-mode agent"
     },
-    "additiveNodes": {
-      "error": "unsupported capability: deepseek-harness is not an additive-mode agent"
-    },
-    "additiveSelection": {
-      "error": "unsupported capability: deepseek-harness is not an additive-mode agent"
-    },
+    "additiveNodes": {},
+    "additiveSelection": null,
     "firstModel": null,
     "liveMatchesItself": false,
     "masked": {

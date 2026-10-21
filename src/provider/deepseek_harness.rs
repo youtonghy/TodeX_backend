@@ -22,8 +22,8 @@ use super::acp::{AcpQuirks, AcpRuntimeOptions, PLAIN_ACP};
 use super::discovery::{DiscoveryCache, DiscoveryKey, DiscoverySnapshot};
 use super::process::{executable_available, CommandSpec, JsonLineProcess};
 use super::profile::{
-    CatalogProfile, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel, ProviderProfile,
-    SkillInjection,
+    CatalogProfile, CatalogSource, ConfigHome, FileAttachmentStyle, McpInjection, ProcessModel,
+    ProviderProfile, SkillInjection, UserConfigFile,
 };
 use super::resident::{allowlisted_environment, initialize_acp, ResidentLaunch, ResidentSessions};
 use super::rpc::{FailureWording, RpcClient, RpcPeer};
@@ -50,11 +50,20 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// an effort level, so it never appears in the catalog.
 const PROVIDER_DEFAULT_EFFORT: &str = "";
 /// The overlay TodeX passes with `--patch`. dsh-base mounts
-/// `session-log-deepseek`, which uploads the session log with every official
-/// DeepSeek API request; TodeX does not opt users into that.
+/// `session-log-deepseek` and `plugin-package-inventory-deepseek`, which
+/// attach the session log and the active plugin list to every official
+/// DeepSeek API request; TodeX does not opt users into either.
 const PATCH_FILE: &str = "todex.patch.yml";
 const PATCH: &str = "# Managed by TodeX; rewritten on every launch.\n\
-- id: session-log-deepseek\n  disabled: true\n";
+- id: session-log-deepseek\n  disabled: true\n\
+- id: plugin-package-inventory-deepseek\n  disabled: true\n";
+/// Rows TodeX's overlay keeps off; clients cannot turn them on.
+pub(crate) const LOCKED_ROWS: [&str; 2] =
+    ["session-log-deepseek", "plugin-package-inventory-deepseek"];
+/// Composing the profile imports no plugin code and answers in well under a
+/// second; the bound covers a cold Node start on a slow disk.
+const DUMP_TIMEOUT: Duration = Duration::from_secs(30);
+const DUMP_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Where dsh deviates from plain ACP.
 pub(super) const ACP_QUIRKS: AcpQuirks = AcpQuirks {
@@ -102,13 +111,20 @@ pub(super) const PROFILE: ProviderProfile = ProviderProfile {
         max_sessions: 32,
     },
     discovery_cache_ttl: Some(Duration::from_secs(300)),
-    catalog: CatalogProfile::skills_only(
-        ConfigHome {
+    // dsh's own MCP servers are `dsh-mcp-client` rows the acp profile
+    // patch inserts (see `crate::dsh_mcp`); dsh has no project MCP file.
+    catalog: CatalogProfile {
+        source: CatalogSource::Filesystem,
+        config_home: ConfigHome {
             env: Some("DSH_HOME"),
             home_relative: ".dsh",
         },
-        ".agents/skills",
-    ),
+        project_skills: ".agents/skills",
+        mcp_user_files: &[UserConfigFile::ConfigHome("profiles/acp/cordis.patch.yml")],
+        mcp_project_files: &[],
+        mcp_user_source: "dsh-user",
+        mcp_project_source: "",
+    },
 };
 
 pub struct DeepseekHarnessDriver {
@@ -137,12 +153,10 @@ impl DeepseekHarnessDriver {
         Self {
             binary: config.dsh_bin.clone(),
             env_allowlist: config.dsh_env_allowlist.clone(),
-            patch_path: data_dir
-                .join("providers")
-                .join(ProviderKind::DeepseekHarness.as_str())
-                .join(PATCH_FILE),
+            patch_path: patch_path(data_dir),
             sessions: ResidentSessions::new(&PROFILE, "DeepSeek Harness")
-                .with_idle_timeout(config.provider_keepalive()),
+                .with_idle_timeout(config.provider_keepalive())
+                .with_config_restart(),
             discovery: DiscoveryCache::new(),
         }
     }
@@ -213,6 +227,49 @@ impl DeepseekHarnessDriver {
             })
             .await
     }
+}
+
+fn patch_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("providers")
+        .join(ProviderKind::DeepseekHarness.as_str())
+        .join(PATCH_FILE)
+}
+
+/// The `acp` profile as dsh composes it for TodeX's launches (`dsh --profile
+/// acp --patch <overlay> --dump-config`), row by row with the layer each came
+/// from. It runs outside any workspace, so no project `.env` is read.
+pub(crate) async fn composed_profile(
+    config: &AgentConfig,
+    data_dir: &Path,
+) -> Result<Vec<crate::dsh_config::ComposedRow>, AppError> {
+    let patch = patch_path(data_dir);
+    write_patch(&patch)?;
+    let cwd = patch.parent().expect("patch path has a parent").to_owned();
+    let mut spec = CommandSpec::new(&config.dsh_bin, &cwd);
+    spec.args = vec![
+        "--profile".to_owned(),
+        crate::dsh_config::PROFILE.to_owned(),
+        "--patch".to_owned(),
+        patch.to_string_lossy().into_owned(),
+        "--dump-config".to_owned(),
+    ];
+    spec.env = dsh_environment(&config.dsh_env_allowlist);
+    let output =
+        super::process::run_bounded_command(&spec, DUMP_OUTPUT_BYTES, DUMP_TIMEOUT).await?;
+    if !output.success {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("dsh exited with an error");
+        return Err(AppError::ProviderUnavailable(format!(
+            "dsh could not compose the acp profile: {reason}"
+        )));
+    }
+    crate::dsh_config::parse_dump(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn write_patch(path: &Path) -> Result<(), AppError> {
@@ -495,7 +552,7 @@ async fn control_request(
         .await
 }
 
-fn dsh_environment(allowlist: &[String]) -> BTreeMap<String, String> {
+pub(crate) fn dsh_environment(allowlist: &[String]) -> BTreeMap<String, String> {
     allowlisted_environment(&[("NO_COLOR", "1")], allowlist)
 }
 
@@ -573,6 +630,9 @@ mod tests {
         // An edited overlay is restored before launch.
         assert_eq!(std::fs::read_to_string(&patch).unwrap(), PATCH);
         assert!(PATCH.contains("- id: session-log-deepseek\n  disabled: true\n"));
+        for row in LOCKED_ROWS {
+            assert!(PATCH.contains(&format!("- id: {row}\n  disabled: true\n")));
+        }
         assert_eq!(spec.env.get("NO_COLOR").map(String::as_str), Some("1"));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -785,6 +845,26 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "usage.updated"));
+        fixture.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_config_changes_restart_the_idle_process_and_resume() {
+        let fixture = Fixture::new().await;
+        fixture.run("turn-1", "hello", None, None, None).await;
+        fixture.run("turn-2", "again", None, None, None).await;
+        assert_eq!(fixture.count("initialize"), 1);
+        // TodeX rewrote dsh's config (an account, plugin or MCP edit): dsh
+        // reads it only at startup, so the next turn runs on a new process
+        // that resumes the same session.
+        crate::agent_providers::bump_config_revision();
+        fixture.run("turn-3", "after edit", None, None, None).await;
+        assert_eq!(fixture.count("initialize"), 2);
+        assert_eq!(fixture.count("session/new"), 1);
+        assert_eq!(fixture.count("session/resume"), 1);
+        fixture.run("turn-4", "settled", None, None, None).await;
+        assert_eq!(fixture.count("initialize"), 2);
         fixture.finish().await;
     }
 

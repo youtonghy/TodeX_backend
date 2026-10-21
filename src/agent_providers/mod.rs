@@ -2,7 +2,7 @@
 //!
 //! The store at `$DATA_DIR/agent-providers.json` is the source of truth; each
 //! agent's native config file is a projection written on save (additive
-//! agents: Pi, OpenCode) or on activate (exclusive agents: Claude, Codex,
+//! agents: Pi, OpenCode, DeepSeek Harness) or on activate (exclusive agents: Claude, Codex,
 //! Grok Build).
 //! Writes use atomic owner-only files plus a content-revision check so edits
 //! made outside TodeX surface as conflicts rather than being overwritten.
@@ -10,6 +10,7 @@
 mod auth_config;
 mod claude;
 mod codex;
+mod dsh;
 pub(crate) mod files;
 mod grok;
 mod model_fetch;
@@ -48,12 +49,13 @@ pub const MAX_PROVIDER_TRANSFER_BYTES: usize =
     MAX_PROVIDERS_PER_AGENT * (MAX_PROVIDER_SETTINGS_BYTES + 16 * 1024);
 
 /// Agents that support managed providers in this first pass.
-pub const SUPPORTED_AGENTS: [ProviderKind; 5] = [
+pub const SUPPORTED_AGENTS: [ProviderKind; 6] = [
     ProviderKind::Codex,
     ProviderKind::ClaudeCode,
     ProviderKind::GrokBuild,
     ProviderKind::Pi,
     ProviderKind::Opencode,
+    ProviderKind::DeepseekHarness,
 ];
 
 /// Sentinel written into responses in place of secret values. A write that
@@ -139,6 +141,7 @@ pub(crate) struct AgentDirs {
     grok_auth_path: PathBuf,
     pi_dir: PathBuf,
     opencode_dir: PathBuf,
+    dsh_home: PathBuf,
 }
 
 impl AgentDirs {
@@ -161,6 +164,7 @@ impl AgentDirs {
             grok_home,
             pi_dir: env_dir("PI_CODING_AGENT_DIR", home.join(".pi").join("agent")),
             opencode_dir: env_dir("XDG_CONFIG_HOME", home.join(".config")).join("opencode"),
+            dsh_home: env_dir("DSH_HOME", home.join(".dsh")),
         }
     }
 
@@ -174,8 +178,22 @@ impl AgentDirs {
             grok_home: root.join("grok"),
             grok_auth_path: root.join("grok").join("auth.json"),
             opencode_dir: root.join("opencode"),
+            dsh_home: root.join("dsh"),
             pi_dir,
         }
+    }
+
+    /// Every directory under `dsh_home`'s parent, for tests of dsh files.
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_dsh_home(dsh_home: PathBuf) -> Self {
+        let mut dirs = Self::for_tests_with_pi_dir(dsh_home.join("other-agents").join("pi"));
+        dirs.dsh_home = dsh_home;
+        dirs
+    }
+
+    /// DeepSeek Harness's home (`$DSH_HOME` or `~/.dsh`).
+    pub(crate) fn dsh_home(&self) -> &std::path::Path {
+        &self.dsh_home
     }
 
     /// Pi's agent directory (`$PI_CODING_AGENT_DIR` or `~/.pi/agent`).
@@ -569,6 +587,7 @@ impl AgentProviderService {
             let model = model_id
                 .filter(|value| !value.trim().is_empty())
                 .or_else(|| additive_first_model(agent, &profile.settings_config))
+                .or_else(|| additive(agent).ok()?.model_optional(id).then(String::new))
                 .ok_or_else(|| {
                     AppError::InvalidRequest(format!(
                         "provider {id} declares no models; pass modelId"
@@ -889,6 +908,11 @@ trait AdditiveProjection: Sync {
     fn default_selection(&self, dirs: &AgentDirs) -> Result<Value, AppError>;
     /// First declared model id inside a provider node.
     fn first_model_id(&self, node: &Value) -> Option<String>;
+    /// Whether provider `id` can become the default without a model (the
+    /// agent then picks the provider's own default model).
+    fn model_optional(&self, _id: &str) -> bool {
+        false
+    }
     fn endpoint_credentials(&self, node: &Value) -> (Option<String>, Option<String>);
 }
 
@@ -900,10 +924,8 @@ fn projection(agent: ProviderKind) -> Option<ConfigProjection> {
         ProviderKind::GrokBuild => Some(ConfigProjection::Exclusive(&grok::Projection)),
         ProviderKind::Opencode => Some(ConfigProjection::Additive(&opencode::Projection)),
         ProviderKind::Pi => Some(ConfigProjection::Additive(&pi::Projection)),
-        ProviderKind::Acp
-        | ProviderKind::Devin
-        | ProviderKind::Antigravity
-        | ProviderKind::DeepseekHarness => None,
+        ProviderKind::DeepseekHarness => Some(ConfigProjection::Additive(&dsh::Projection)),
+        ProviderKind::Acp | ProviderKind::Devin | ProviderKind::Antigravity => None,
     }
 }
 
@@ -1251,6 +1273,7 @@ mod tests {
             grok_auth_path: root.join("grok").join("auth.json"),
             pi_dir: root.join("pi"),
             opencode_dir: root.join("opencode"),
+            dsh_home: root.join("dsh"),
         }
     }
 

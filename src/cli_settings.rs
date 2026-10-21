@@ -1,6 +1,7 @@
 //! User settings of the CLIs edited from the CLI manager: Claude Code's
-//! `<claude_dir>/settings.json`, Codex's `<codex_home>/config.toml` and Pi's
-//! `<pi_dir>/settings.json`. Every write names the revision it was based on,
+//! `<claude_dir>/settings.json`, Codex's `<codex_home>/config.toml`, Pi's
+//! `<pi_dir>/settings.json` and DeepSeek Harness's `acp` profile patch
+//! (`$DSH_HOME/profiles/acp/cordis.patch.yml`, edited as text only). Every write names the revision it was based on,
 //! so an edit made meanwhile by the CLI itself, a provider switch or a text
 //! editor surfaces as `CONFLICT` instead of being overwritten. The settings
 //! form sends an RFC 7386 merge patch (only the keys it changed); the raw
@@ -30,6 +31,7 @@ pub(crate) enum CliSettingsTarget {
     ClaudeCode,
     Codex,
     Pi,
+    DeepseekHarness,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -37,6 +39,9 @@ pub(crate) enum CliSettingsTarget {
 pub(crate) enum SettingsFormat {
     Json,
     Toml,
+    /// A dsh patch layer: a YAML list of entries, replaced as a whole text
+    /// under dsh's profile lock (see [`crate::dsh_config`]).
+    Yaml,
 }
 
 impl CliSettingsTarget {
@@ -45,6 +50,7 @@ impl CliSettingsTarget {
             "claude-code" => Some(Self::ClaudeCode),
             "codex" => Some(Self::Codex),
             "pi" => Some(Self::Pi),
+            "deepseek-harness" => Some(Self::DeepseekHarness),
             _ => None,
         }
     }
@@ -64,6 +70,11 @@ impl CliSettingsTarget {
             Self::Pi => SettingsFile {
                 pi_lock: true,
                 ..SettingsFile::json(crate::agent_providers::pi::settings_path(dirs))
+            },
+            Self::DeepseekHarness => SettingsFile {
+                path: crate::dsh_config::DshPaths::of(dirs).profile_patch(),
+                format: SettingsFormat::Yaml,
+                pi_lock: false,
             },
         }
     }
@@ -99,7 +110,8 @@ pub(crate) struct SettingsDocument {
     /// The file as stored; empty when it does not exist.
     pub text: String,
     /// The parsed object (TOML as its JSON equivalent, datetimes as
-    /// strings); `None` when the text does not parse.
+    /// strings); `None` when the text does not parse. Always empty for YAML,
+    /// whose entries are a list.
     pub settings: Option<Map<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parse_error: Option<String>,
@@ -154,6 +166,11 @@ pub(crate) fn apply_patch(
     expected_revision: &str,
     patch: &Map<String, Value>,
 ) -> Result<SettingsDocument, AppError> {
+    if file.format == SettingsFormat::Yaml {
+        return Err(AppError::Unsupported(
+            "dsh patch files are edited as text".to_owned(),
+        ));
+    }
     let _guard = WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -184,6 +201,7 @@ pub(crate) fn apply_patch(
             parse_object(&text, format).map_err(AppError::InvalidRequest)?;
             text.into_bytes()
         }
+        SettingsFormat::Yaml => unreachable!("YAML is rejected above"),
     };
     write(file, &bytes)
 }
@@ -233,6 +251,18 @@ pub(crate) fn replace_text(
     let _guard = WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if file.format == SettingsFormat::Yaml {
+        // dsh's own writers lock the profile through its manifest, beside
+        // the patch; dsh reads the patch at startup, so running processes
+        // restart before their next turn.
+        let manifest = file.path.with_file_name("package.json");
+        return crate::dsh_config::with_lock(&manifest, || {
+            checked(file, expected_revision)?;
+            let document = write(file, text.as_bytes())?;
+            crate::agent_providers::bump_config_revision();
+            Ok(document)
+        });
+    }
     let _file_lock = PiLock::acquire(file)?;
     checked(file, expected_revision)?;
     write(file, text.as_bytes())
@@ -320,6 +350,11 @@ fn parse_object(text: &str, format: SettingsFormat) -> Result<Map<String, Value>
         SettingsFormat::Toml => match text.parse::<toml::Table>() {
             Ok(table) => Ok(toml_table_to_json(table)),
             Err(error) => Err(format!("config.toml is not valid TOML: {error}")),
+        },
+        SettingsFormat::Yaml => match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text) {
+            Ok(serde_yaml_ng::Value::Sequence(_) | serde_yaml_ng::Value::Null) => Ok(Map::new()),
+            Ok(_) => Err("the dsh patch must be a YAML list of entries".to_owned()),
+            Err(error) => Err(format!("the dsh patch is not valid YAML: {error}")),
         },
     }
 }
@@ -475,6 +510,36 @@ mod tests {
             panic!("not an object")
         };
         map
+    }
+
+    #[test]
+    fn dsh_patch_is_replaced_as_text_and_only_as_a_list() {
+        let dir = temp_dir();
+        let dirs = crate::agent_providers::AgentDirs::for_tests_with_dsh_home(dir.join("dsh"));
+        let file = CliSettingsTarget::DeepseekHarness.file_in(&dirs);
+        assert_eq!(file.format, SettingsFormat::Yaml);
+        assert!(file.path.ends_with("dsh/profiles/acp/cordis.patch.yml"));
+        let missing = read(&file).unwrap();
+        assert!(!missing.exists);
+        let text = "# mine\n- id: web\n  config:\n    root: !!js process.cwd()\n";
+        let written = replace_text(&file, &missing.revision, text).unwrap();
+        // Kept byte for byte, tags included.
+        assert_eq!(written.text, text);
+        assert_eq!(written.settings, Some(Map::new()));
+        assert!(!file.path.with_file_name("package.json.lock").exists());
+        assert!(matches!(
+            replace_text(&file, &written.revision, "id: web\n"),
+            Err(AppError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            replace_text(&file, &missing.revision, "[]\n"),
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            apply_patch(&file, &written.revision, &Map::new()),
+            Err(AppError::Unsupported(_))
+        ));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

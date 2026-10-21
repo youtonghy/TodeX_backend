@@ -7,6 +7,7 @@ mod browser_proxy;
 mod cli_instructions;
 mod cli_settings;
 mod device_pairing;
+mod dsh_plugins;
 mod enforcement;
 mod git;
 mod history_cleanup;
