@@ -543,6 +543,9 @@ POST /v2/catalog/skills?provider=claude-code&workspace=/home/user/projects/demo
 GET /v2/catalog/skills/{resourceId}?provider=claude-code&workspace=/home/user/projects/demo
 PUT /v2/catalog/skills/{resourceId}?provider=claude-code&workspace=/home/user/projects/demo
 DELETE /v2/catalog/skills/{resourceId}?provider=claude-code&workspace=/home/user/projects/demo
+GET /v2/catalog/skills/{resourceId}/bundle?provider=claude-code&workspace=/home/user/projects/demo
+PUT /v2/catalog/skills/{resourceId}/bundle?provider=claude-code&workspace=/home/user/projects/demo
+POST /v2/catalog/skills/bundle?provider=claude-code&workspace=/home/user/projects/demo
 GET /v2/catalog/mcp?provider=claude-code&workspace=/home/user/projects/demo
 POST /v2/catalog/mcp?provider=claude-code&workspace=/home/user/projects/demo
 GET /v2/catalog/mcp/{resourceId}?provider=claude-code&workspace=/home/user/projects/demo
@@ -552,10 +555,16 @@ DELETE /v2/catalog/mcp/{resourceId}?provider=claude-code&workspace=/home/user/pr
 
 Skill 与 MCP 列表另带 `editable`（列出的条目能否在此编辑、删除）以及 `creatableSources`（Skill，可新建到的来源，取值同条目的 `source`：`shared-user`、`provider-user`、`shared-project`、`provider-project`，与 Provider 目录重合的来源只保留优先级高的一个）或 `creatableScopes`（MCP，`user` / `project`）。Grok Build 由 Provider 自行管理，`editable: false` 且不可新建；没有 MCP 配置文件的 Provider（OpenCode、ACP）MCP 列表 `editable: false`、`creatableScopes: []`；旧 daemon 不返回这些字段，客户端应视为只读。
 
+Skill 条目位于 Skill 根目录下的隐藏目录中（如 Codex 自带的 `skills/.system/*`）时带 `builtIn: true`，表示该 Skill 由 CLI 自行安装和管理；其他条目不返回该字段。配置同步等批量复制会跳过这类 Skill。
+
 - `POST /v2/catalog/skills` 请求体 `{ source, name, content }`：在该来源的 Skill 根目录下新建 `<name>/SKILL.md`。`name` 为 1–100 个字母、数字、`.`、`_`、`-`，不能以 `.` 开头；目录已存在返回 `409`。`content` 必须带可解析的 YAML front matter，且不超过 256 KiB。返回新 Skill 的 descriptor。
 - `PUT /v2/catalog/skills/{resourceId}` 请求体 `{ content }`：校验同上后原子覆盖该 `SKILL.md`（沿用原权限），`resourceId` 不变；格式无效的 Skill 也可借此修复。返回更新后的 descriptor。
 - `DELETE /v2/catalog/skills/{resourceId}`：删除该 Skill 所在目录（含其中脚本等附属文件）；`SKILL.md` 直接位于 Skill 根目录时只删除该文件。返回 `{ resourceId, name, path }`，`path` 为被删除的目录或文件。
-- 以上三个 Skill 写操作都会先解析符号链接：项目级来源的目标必须仍在工作区内，用户级来源的目标必须仍在该 Skill 根目录内（根目录本身可以是符号链接），否则返回 `400 INVALID_REQUEST`，不写入也不删除。例如仓库自带指向工作区外的 `.claude` 符号链接时，`provider-project` 来源的新建、编辑与删除都会被拒绝。
+- `GET /v2/catalog/skills/{resourceId}/bundle`：读取该 Skill 所在目录的全部文件（Skill bundle，用于在两个 TodeX 后端之间复制 Skill 及其脚本、资源），返回 `{ resourceId, name, source, files: [{ path, contentBase64, executable }], skipped: [path] }`。`path` 为相对 Skill 目录、以 `/` 分隔的路径，`files` 按 `path` 升序；只读取普通文件，`contentBase64` 为标准 base64（带 padding），`executable` 表示文件有任一执行位（仅 Unix，其他平台恒为 `false`）。符号链接（指向文件或目录）、特殊文件与非 UTF-8 文件名不跟随也不读取，其相对路径按升序列在 `skipped` 中（被跳过的目录不再列出其内容）。`SKILL.md` 直接位于 Skill 根目录时 bundle 只含该文件。上限：最多 200 个文件、解码后合计 4 MiB、每个文件路径最多 8 段，超出返回 `413 PAYLOAD_TOO_LARGE`；未知 `resourceId` 返回 `404`，格式无效的 Skill 返回 `400`（与 `GET /v2/catalog/skills/{resourceId}` 相同）。
+- `PUT /v2/catalog/skills/{resourceId}/bundle` 请求体 `{ files: [{ path, contentBase64, executable? }] }`：用且仅用 `files` 替换该 Skill 的目录：先写入同级的临时目录，再把旧目录改名移开、新目录改名就位、删除旧目录（就位失败时恢复旧目录），旧目录中的任何内容（含符号链接与权限）都不保留，`resourceId` 不变。`files` 必须在根部包含 `SKILL.md`，按与 `PUT /v2/catalog/skills/{resourceId}` 相同的规则校验（UTF-8、可解析的 YAML front matter、不超过 256 KiB）。`SKILL.md` 直接位于 Skill 根目录的 Skill 没有可替换的目录，返回 `400`（改用 `PUT /v2/catalog/skills/{resourceId}`）。返回更新后的 descriptor（与 `PUT /v2/catalog/skills/{resourceId}` 相同）。
+- `POST /v2/catalog/skills/bundle` 请求体 `{ source, name, files }`：在该来源的 Skill 根目录下新建 `<name>/`，内容为 `files`（同样经临时目录改名就位）。`source`、`name` 的校验与 `POST /v2/catalog/skills` 相同，目录已存在返回 `409`。返回新 Skill 的 descriptor（HTTP 200，与 `POST /v2/catalog/skills` 相同）。
+- 两个 bundle 写操作对 `files` 的校验：`path` 非空、相对路径、以 `/` 分隔，不含 `\` 或 NUL，没有空段、`.` 或 `..` 段，不以 `/` 或盘符（如 `C:`）开头，最多 8 段、1024 字节，且互不重复（区分大小写），同一路径不能既是文件又是另一文件的目录；`contentBase64` 必须是标准 base64（带 padding）。这些问题返回 `400 INVALID_REQUEST`；超过 200 个文件或解码后合计超过 4 MiB 返回 `413 PAYLOAD_TOO_LARGE`。在 Unix 上文件写为 `0644`，`executable: true` 时为 `0755`（不受 umask 影响）。这两个路由的请求体上限放宽到约 7.3 MiB（4 MiB 的 base64 加路径与 JSON 开销），其他路由不变。Grok Build 这类由 Provider 自行管理 Skill 的写入返回 `UNSUPPORTED`，与其他 Skill 写操作相同。
+- 以上 Skill 写操作（含 bundle 写入）都会先解析符号链接：项目级来源的目标必须仍在工作区内，用户级来源的目标必须仍在该 Skill 根目录内（根目录本身可以是符号链接），否则返回 `400 INVALID_REQUEST`，不写入也不删除。例如仓库自带指向工作区外的 `.claude` 符号链接时，`provider-project` 来源的新建、编辑与删除都会被拒绝。
 - `POST /v2/catalog/mcp` 请求体 `{ scope, name, config }`：把条目写入该 scope 的第一个 MCP 配置文件（如 Claude Code 的 `~/.claude.json` 顶层 `mcpServers` 或项目 `.mcp.json`，Codex 的 `config.toml` `[mcp_servers]`），文件不存在时创建（权限 0600）。`name` 去除首尾空白后为 1–200 个可打印字符，`config` 必须是 JSON 对象；同一文件中已有同名条目返回 `409`。返回与 `GET /v2/catalog/mcp/{resourceId}` 相同的结构。
 - `PUT /v2/catalog/mcp/{resourceId}` 请求体 `{ name, config }`：在声明它的文件中原位替换该条目，`name` 与原名不同则重命名（新名已存在返回 `409`）。`resourceId` 由名称与文件计算，重命名后会改变，以响应中的 descriptor 为准。
 
@@ -1753,6 +1762,7 @@ TUI 配对二维码只携带后端地址（`{"kind":"todex-pairing-link","versio
 | `REQUEST_TIMEOUT` | `/v2/sealed` 外层 body 在内层 head 解出后停顿超过 30 秒（加密的内层 HTTP 408）。 |
 | `UNAUTHORIZED` | tenant 与认证上下文不匹配；或 `enable_auth = false` 时请求的 `Host`/`Origin` 不是本地来源。 |
 | `UNSUPPORTED` | 请求能力不在当前后端支持范围。 |
+| `PAYLOAD_TOO_LARGE` | 请求或其读取的资源超过固定的大小上限（HTTP 413），如 Skill bundle 超过 200 个文件或 4 MiB。 |
 | `REMOTE_AUTH_FAILED` | SFTP/FTP 登录失败（HTTP 403）：提供密码，或先在终端登录以复用共享连接。 |
 | `REMOTE_HOST_KEY_UNVERIFIED` | 远程主机密钥未确认或已变化（HTTP 403）：先在 TodeX 终端中连接一次。 |
 | `REMOTE_UNREACHABLE` | 远程主机不可达或连接中断（HTTP 502），会话随之关闭。 |

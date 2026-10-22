@@ -433,6 +433,20 @@ fn authenticated_routes() -> Router<AppState> {
             "/v2/catalog/skills/{resource_id}",
             get(skill_resource).put(update_skill).delete(delete_skill),
         )
+        .route(
+            "/v2/catalog/skills/bundle",
+            post(create_skill_bundle).layer(DefaultBodyLimit::max(
+                crate::catalog::MAX_SKILL_BUNDLE_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/v2/catalog/skills/{resource_id}/bundle",
+            get(skill_bundle)
+                .put(replace_skill_bundle)
+                .layer(DefaultBodyLimit::max(
+                    crate::catalog::MAX_SKILL_BUNDLE_REQUEST_BYTES,
+                )),
+        )
         .route("/v2/catalog/mcp", get(mcp).post(create_mcp))
         .route(
             "/v2/catalog/mcp/{resource_id}",
@@ -1883,6 +1897,61 @@ async fn delete_skill(
         state
             .catalog
             .delete_skill(query.provider, workspace, &resource_id)
+            .await?,
+    ))
+}
+
+async fn skill_bundle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(resource_id): AxumPath<String>,
+    Query(query): Query<CatalogQuery>,
+) -> Result<Json<crate::catalog::SkillBundle>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_catalog_workspace(&state, &query.workspace)?;
+    Ok(Json(
+        state
+            .catalog
+            .skill_bundle(query.provider, workspace, &resource_id)
+            .await?,
+    ))
+}
+
+async fn replace_skill_bundle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(resource_id): AxumPath<String>,
+    Query(query): Query<CatalogQuery>,
+    Json(request): Json<ReplaceSkillBundleRequest>,
+) -> Result<Json<crate::catalog::SkillDescriptor>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_catalog_workspace(&state, &query.workspace)?;
+    Ok(Json(
+        state
+            .catalog
+            .replace_skill_bundle(query.provider, workspace, &resource_id, request.files)
+            .await?,
+    ))
+}
+
+async fn create_skill_bundle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CatalogQuery>,
+    Json(request): Json<CreateSkillBundleRequest>,
+) -> Result<Json<crate::catalog::SkillDescriptor>, AppError> {
+    require_auth(&state, &headers)?;
+    let workspace = validate_catalog_workspace(&state, &query.workspace)?;
+    Ok(Json(
+        state
+            .catalog
+            .create_skill_bundle(
+                query.provider,
+                workspace,
+                &request.source,
+                &request.name,
+                request.files,
+            )
             .await?,
     ))
 }
@@ -4557,6 +4626,20 @@ struct CreateSkillRequest {
 #[serde(rename_all = "camelCase")]
 struct UpdateSkillRequest {
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplaceSkillBundleRequest {
+    files: Vec<crate::catalog::SkillBundleFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSkillBundleRequest {
+    source: String,
+    name: String,
+    files: Vec<crate::catalog::SkillBundleFile>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -12525,6 +12608,141 @@ mod tests {
             let response = app.clone().oneshot(request("PUT", uri)).await.unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn skill_bundle_routes_copy_whole_directories() {
+        let root = std::env::temp_dir().join(format!("todex-v2-skill-bundle-{}", Uuid::new_v4()));
+        let workspace = root.join("workspaces").join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let mut config = Config {
+            data_dir: root.join("data"),
+            workspace_roots: vec![fs::canonicalize(root.join("workspaces")).unwrap()],
+            ..Config::default()
+        };
+        config.security.enable_auth = true;
+        let state = AppState::new_for_tests(config).await.unwrap();
+        let device = enroll(&root.join("data"));
+        let app = crate::server::loopback_test_router(state);
+        let query = format!(
+            "provider=claude-code&workspace={}",
+            workspace.to_string_lossy()
+        );
+        let send = |method: &'static str, uri: String, body: String| {
+            let app = app.clone();
+            let request = signed_request(&device, method, &uri, &body);
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body: Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), 16 << 20).await.unwrap(),
+                )
+                .unwrap_or(Value::Null);
+                (status, body)
+            }
+        };
+        // 3 MiB of assets: the request is over the default 2 MiB body limit.
+        let asset = vec![7u8; 3 * 1024 * 1024];
+        let files = json!([
+            {
+                "path": "SKILL.md",
+                "contentBase64": BASE64_STANDARD.encode("---\nname: synced\ndescription: Synced\n---\n"),
+            },
+            {
+                "path": "assets/blob.bin",
+                "contentBase64": BASE64_STANDARD.encode(&asset),
+            },
+            {
+                "path": "run.sh",
+                "contentBase64": BASE64_STANDARD.encode("#!/bin/sh\n"),
+                "executable": true,
+            },
+        ]);
+        let (status, created) = send(
+            "POST",
+            format!("/v2/catalog/skills/bundle?{query}"),
+            json!({ "source": "shared-project", "name": "synced", "files": files }).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["name"], "synced");
+        assert_eq!(created["source"], "shared-project");
+        let resource_id = created["resourceId"].as_str().unwrap().to_owned();
+        assert_eq!(
+            fs::read(workspace.join(".agents/skills/synced/assets/blob.bin")).unwrap(),
+            asset
+        );
+
+        let (status, bundle) = send(
+            "GET",
+            format!("/v2/catalog/skills/{resource_id}/bundle?{query}"),
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{bundle}");
+        assert_eq!(bundle["resourceId"], resource_id.as_str());
+        assert_eq!(bundle["name"], "synced");
+        let paths = bundle["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["SKILL.md", "assets/blob.bin", "run.sh"]);
+        assert_eq!(bundle["files"][2]["executable"], cfg!(unix));
+        assert_eq!(bundle["skipped"], json!([]));
+
+        let (status, replaced) = send(
+            "PUT",
+            format!("/v2/catalog/skills/{resource_id}/bundle?{query}"),
+            json!({ "files": [bundle["files"][0].clone()] }).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replaced}");
+        assert_eq!(replaced["resourceId"], resource_id.as_str());
+        assert!(!workspace.join(".agents/skills/synced/assets").exists());
+
+        let (status, conflict) = send(
+            "POST",
+            format!("/v2/catalog/skills/bundle?{query}"),
+            json!({ "source": "shared-project", "name": "synced", "files": [bundle["files"][0].clone()] })
+                .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+
+        let oversized = vec![0u8; 4 * 1024 * 1024];
+        let (status, too_large) = send(
+            "PUT",
+            format!("/v2/catalog/skills/{resource_id}/bundle?{query}"),
+            json!({ "files": [
+                bundle["files"][0].clone(),
+                { "path": "big", "contentBase64": BASE64_STANDARD.encode(&oversized) },
+            ] })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{too_large}");
+        assert_eq!(too_large["code"], "PAYLOAD_TOO_LARGE");
+
+        let (status, invalid) = send(
+            "PUT",
+            format!("/v2/catalog/skills/{resource_id}/bundle?{query}"),
+            json!({ "files": [{ "path": "notes.txt", "contentBase64": "" }] }).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+        assert_eq!(invalid["code"], "INVALID_REQUEST");
+
+        let (status, _) = send(
+            "GET",
+            format!("/v2/catalog/skills/res_unknown/bundle?{query}"),
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let _ = fs::remove_dir_all(&root);
     }
 }

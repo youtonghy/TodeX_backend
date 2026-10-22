@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,6 +15,18 @@ use crate::error::AppError;
 use crate::provider::profile::{CatalogProfile, CatalogSource, UserConfigFile};
 
 const MAX_SKILL_BYTES: u64 = 256 * 1024;
+/// Most files a skill bundle may hold.
+const MAX_SKILL_BUNDLE_FILES: usize = 200;
+/// Most bytes (decoded) across every file of a skill bundle.
+const MAX_SKILL_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
+/// Most path components of a bundle file (`a/b/c` has three).
+const MAX_SKILL_BUNDLE_DEPTH: usize = 8;
+/// Longest bundle file path accepted on write.
+const MAX_SKILL_BUNDLE_PATH_BYTES: usize = 1024;
+/// Request body limit of the bundle write routes: the base64 of the largest
+/// bundle plus room for 200 JSON-escaped paths and the framing.
+pub const MAX_SKILL_BUNDLE_REQUEST_BYTES: usize =
+    MAX_SKILL_BUNDLE_BYTES.div_ceil(3) * 4 + 2 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SCAN_ENTRIES: usize = 2000;
 const MAX_SCAN_VISITED_ENTRIES: usize = 20_000;
@@ -176,6 +188,10 @@ pub struct SkillDescriptor {
     pub valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Shipped and managed by the CLI itself (inside a hidden folder of a
+    /// skill root, such as Codex's `skills/.system`); absent when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub built_in: bool,
     #[serde(skip)]
     pub(crate) path: PathBuf,
     #[serde(skip)]
@@ -293,6 +309,34 @@ pub struct SkillDeletion {
     pub resource_id: String,
     pub name: String,
     pub path: String,
+}
+
+/// Every regular file of one skill's directory, for copying the skill to
+/// another backend.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillBundle {
+    pub resource_id: String,
+    pub name: String,
+    pub source: String,
+    /// Sorted by `path`.
+    pub files: Vec<SkillBundleFile>,
+    /// Relative paths of symlinks, special files and non-UTF-8 names that
+    /// were not read (a skipped directory's contents are not listed).
+    pub skipped: Vec<String>,
+}
+
+/// One file of a [`SkillBundle`]; also the shape bundle writes accept.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillBundleFile {
+    /// Relative to the skill directory, `/`-separated.
+    pub path: String,
+    /// Standard base64 with padding.
+    pub content_base64: String,
+    /// Any execute bit set (Unix); written as 0755 instead of 0644.
+    #[serde(default)]
+    pub executable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -761,6 +805,142 @@ impl CatalogService {
         })
     }
 
+    /// Every regular file in one skill's directory (just `SKILL.md` when it
+    /// sits directly in a skill root). Symlinks and special files are listed
+    /// in `skipped`, never followed.
+    pub async fn skill_bundle(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_id: &str,
+    ) -> Result<SkillBundle, AppError> {
+        let descriptor = self
+            .skill_descriptor(provider, workspace.clone(), resource_id)
+            .await?;
+        if !descriptor.valid {
+            return Err(AppError::InvalidRequest(
+                descriptor
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "skill resource is not readable".to_owned()),
+            ));
+        }
+        let root_level = self.is_root_level_skill(provider, &workspace, &descriptor);
+        let path = descriptor.path.clone();
+        let (files, skipped) =
+            tokio::task::spawn_blocking(move || read_skill_bundle(&path, root_level))
+                .await
+                .map_err(|error| AppError::Anyhow(error.into()))??;
+        Ok(SkillBundle {
+            resource_id: descriptor.resource_id,
+            name: descriptor.name,
+            source: descriptor.source,
+            files,
+            skipped,
+        })
+    }
+
+    /// Replaces one skill's directory with exactly `files`: they are written
+    /// to a sibling staging directory that is then swapped in, so the skill
+    /// is never seen half-written and nothing of the old directory remains.
+    pub async fn replace_skill_bundle(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        resource_id: &str,
+        files: Vec<SkillBundleFile>,
+    ) -> Result<SkillDescriptor, AppError> {
+        let descriptor = self
+            .writable_skill(provider, workspace.clone(), resource_id)
+            .await?;
+        let entries = decode_skill_bundle(files)?;
+        if self.is_root_level_skill(provider, &workspace, &descriptor) {
+            return Err(AppError::InvalidRequest(
+                "this SKILL.md sits directly in a skill root, which has no skill directory to replace; edit it with PUT /v2/catalog/skills/{resourceId}".to_owned(),
+            ));
+        }
+        let base = self.skill_write_base(provider, &workspace, &descriptor)?;
+        let directory = descriptor
+            .path
+            .parent()
+            .expect("skill file has a parent")
+            .to_path_buf();
+        let replaced = tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            let metadata = std::fs::symlink_metadata(&directory)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(AppError::InvalidRequest(format!(
+                    "{} is not a regular directory",
+                    directory.display()
+                )));
+            }
+            ensure_confined(&directory, &base)?;
+            replace_skill_directory(&directory, &entries)
+        })
+        .await;
+        self.cache.invalidate();
+        replaced.map_err(|error| AppError::Anyhow(error.into()))??;
+        self.skill_descriptor(provider, workspace, resource_id)
+            .await
+    }
+
+    /// Creates `<root>/<name>/` under the skill root of `source` holding
+    /// exactly `files`, which must include a valid `SKILL.md`.
+    pub async fn create_skill_bundle(
+        &self,
+        provider: ProviderKind,
+        workspace: PathBuf,
+        source: &str,
+        name: &str,
+        files: Vec<SkillBundleFile>,
+    ) -> Result<SkillDescriptor, AppError> {
+        if catalog_profile(provider).source == CatalogSource::NativeInspect {
+            return Err(AppError::Unsupported(format!(
+                "{} skills are managed by the provider itself",
+                crate::provider::profile::profile(provider).display_name
+            )));
+        }
+        validate_skill_directory_name(name)?;
+        let entries = decode_skill_bundle(files)?;
+        let root = skill_roots(self.home.as_deref(), &workspace, provider)
+            .into_iter()
+            .find(|root| root.source == source)
+            .ok_or_else(|| AppError::InvalidRequest(format!("unknown skill source {source}")))?;
+        let directory = root.path.join(name);
+        let path = directory.join("SKILL.md");
+        let base = skill_write_base(&root, &workspace);
+        let created = tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            if std::fs::symlink_metadata(&directory).is_ok() {
+                return Err(AppError::Conflict(format!(
+                    "{} already exists",
+                    directory.display()
+                )));
+            }
+            ensure_confined(&directory, &base)?;
+            create_skill_directory(&directory, &entries)
+        })
+        .await;
+        self.cache.invalidate();
+        created.map_err(|error| AppError::Anyhow(error.into()))??;
+        self.skill_descriptor(provider, workspace, &resource_id("skill", &path))
+            .await
+    }
+
+    /// Whether `descriptor`'s `SKILL.md` sits directly in one of the skill
+    /// roots, so its parent directory holds other skills too.
+    fn is_root_level_skill(
+        &self,
+        provider: ProviderKind,
+        workspace: &Path,
+        descriptor: &SkillDescriptor,
+    ) -> bool {
+        let Some(directory) = descriptor.path.parent() else {
+            return true;
+        };
+        skill_roots(self.home.as_deref(), workspace, provider)
+            .iter()
+            .any(|root| root.path == directory)
+    }
+
     /// The directory a write to `descriptor`'s skill must stay inside once
     /// symlinks are resolved; see [`skill_write_base`].
     fn skill_write_base(
@@ -1007,6 +1187,22 @@ fn deduplicate_roots(roots: Vec<SourceRoot>) -> Vec<SourceRoot> {
     selected.into_values().collect()
 }
 
+/// A `SKILL.md` inside a hidden folder of its root (Codex's `skills/.system`)
+/// belongs to the CLI, which reinstalls it on its own.
+fn is_built_in_skill(root: &Path, skill_file: &Path) -> bool {
+    skill_file
+        .parent()
+        .and_then(|directory| directory.strip_prefix(root).ok())
+        .is_some_and(|relative| {
+            relative.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with('.'))
+            })
+        })
+}
+
 /// Lists the skills under `roots`, recording in `validator` every directory
 /// it listed and every `SKILL.md` it read (stamped before reading).
 fn scan_skills(
@@ -1039,6 +1235,7 @@ fn scan_skills(
                 .unwrap_or("unnamed-skill")
                 .to_owned();
             let resource_id = resource_id("skill", &path);
+            let built_in = is_built_in_skill(&root.path, &path);
             match read_limited_text(&path, MAX_SKILL_BYTES)
                 .and_then(|content| parse_skill_front_matter(&content))
             {
@@ -1058,6 +1255,7 @@ fn scan_skills(
                     shadowed_by: None,
                     valid: true,
                     error: None,
+                    built_in,
                     path,
                     priority: root.priority,
                 }),
@@ -1071,6 +1269,7 @@ fn scan_skills(
                     shadowed_by: None,
                     valid: false,
                     error: Some(error.to_string().chars().take(500).collect()),
+                    built_in,
                     path,
                     priority: root.priority,
                 }),
@@ -1390,6 +1589,7 @@ fn parse_grok_skills(inspect: &Value, workspace: &Path) -> Vec<SkillDescriptor> 
                 error: (!valid).then(|| {
                     "Grok reported a skill path that is not a readable regular file".to_owned()
                 }),
+                built_in: false,
                 path,
                 priority: 100,
             })
@@ -2074,6 +2274,384 @@ fn validate_skill_content(content: &str) -> Result<(), AppError> {
         )));
     }
     parse_skill_front_matter(content).map(|_| ())
+}
+
+fn bundle_too_large(detail: String) -> AppError {
+    AppError::PayloadTooLarge(format!(
+        "{detail}; a skill bundle holds at most {MAX_SKILL_BUNDLE_FILES} files, {MAX_SKILL_BUNDLE_BYTES} bytes in total and {MAX_SKILL_BUNDLE_DEPTH} path components per file"
+    ))
+}
+
+/// Reads a skill's bundle: the whole directory holding `skill_file`, or
+/// only `skill_file` when it sits directly in a skill root. Returns the
+/// files and the skipped paths, both sorted.
+fn read_skill_bundle(
+    skill_file: &Path,
+    root_level: bool,
+) -> Result<(Vec<SkillBundleFile>, Vec<String>), AppError> {
+    let mut reader = BundleReader::default();
+    if root_level {
+        let metadata = std::fs::symlink_metadata(skill_file)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(AppError::InvalidRequest(
+                "catalog resource must be a regular file".to_owned(),
+            ));
+        }
+        reader.read_file(skill_file, "SKILL.md".to_owned())?;
+    } else {
+        let directory = skill_file.parent().expect("skill file has a parent");
+        let metadata = std::fs::symlink_metadata(directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(AppError::InvalidRequest(format!(
+                "{} is not a regular directory",
+                directory.display()
+            )));
+        }
+        reader.walk(directory, "", 0)?;
+    }
+    reader
+        .files
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    reader.skipped.sort();
+    Ok((reader.files, reader.skipped))
+}
+
+#[derive(Default)]
+struct BundleReader {
+    files: Vec<SkillBundleFile>,
+    skipped: Vec<String>,
+    total_bytes: usize,
+}
+
+impl BundleReader {
+    /// Reads `directory`, whose relative path is `prefix` (`""` for the
+    /// skill directory) made of `depth` components.
+    fn walk(&mut self, directory: &Path, prefix: &str, depth: usize) -> Result<(), AppError> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let join = |name: &str| {
+                if prefix.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{prefix}/{name}")
+                }
+            };
+            let Some(name) = file_name.to_str() else {
+                self.skipped.push(join(&file_name.to_string_lossy()));
+                continue;
+            };
+            let relative = join(name);
+            // `DirEntry::file_type` does not follow symlinks.
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() || !(file_type.is_file() || file_type.is_dir()) {
+                self.skipped.push(relative);
+                continue;
+            }
+            if depth + 1 > MAX_SKILL_BUNDLE_DEPTH {
+                return Err(bundle_too_large(format!(
+                    "{relative} is nested more than {MAX_SKILL_BUNDLE_DEPTH} levels deep"
+                )));
+            }
+            if file_type.is_dir() {
+                self.walk(&entry.path(), &relative, depth + 1)?;
+            } else {
+                self.read_file(&entry.path(), relative)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_file(&mut self, path: &Path, relative: String) -> Result<(), AppError> {
+        use std::io::Read as _;
+
+        if self.files.len() >= MAX_SKILL_BUNDLE_FILES {
+            return Err(bundle_too_large(format!(
+                "the skill has more than {MAX_SKILL_BUNDLE_FILES} files"
+            )));
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The entry was a regular file when listed; do not follow a
+            // symlink swapped in since.
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            self.skipped.push(relative);
+            return Ok(());
+        }
+        let remaining = MAX_SKILL_BUNDLE_BYTES - self.total_bytes;
+        let mut contents = Vec::new();
+        file.take(remaining as u64 + 1).read_to_end(&mut contents)?;
+        if contents.len() > remaining {
+            return Err(bundle_too_large(format!(
+                "the skill's files exceed {MAX_SKILL_BUNDLE_BYTES} bytes"
+            )));
+        }
+        self.total_bytes += contents.len();
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = false;
+        self.files.push(SkillBundleFile {
+            path: relative,
+            content_base64: STANDARD.encode(&contents),
+            executable,
+        });
+        Ok(())
+    }
+}
+
+/// A validated, decoded bundle file ready to be written.
+struct BundleEntry {
+    path: String,
+    contents: Vec<u8>,
+    executable: bool,
+}
+
+/// Validates a bundle write: file count and size limits, safe unique
+/// paths, base64 contents, and a root `SKILL.md` that passes the same
+/// checks as a single `SKILL.md` write.
+fn decode_skill_bundle(files: Vec<SkillBundleFile>) -> Result<Vec<BundleEntry>, AppError> {
+    if files.len() > MAX_SKILL_BUNDLE_FILES {
+        return Err(bundle_too_large(format!(
+            "the bundle has {} files",
+            files.len()
+        )));
+    }
+    let mut paths = HashSet::new();
+    let mut entries = Vec::with_capacity(files.len());
+    let mut total_bytes = 0usize;
+    for file in files {
+        validate_bundle_path(&file.path)?;
+        if !paths.insert(file.path.clone()) {
+            return Err(AppError::InvalidRequest(format!(
+                "bundle path {:?} appears more than once",
+                file.path
+            )));
+        }
+        // Base64 decodes to at most 3/4 of its length.
+        if file.content_base64.len() / 4 * 3 > MAX_SKILL_BUNDLE_BYTES + 2 {
+            return Err(bundle_too_large(format!(
+                "{} exceeds {MAX_SKILL_BUNDLE_BYTES} bytes",
+                file.path
+            )));
+        }
+        let contents = STANDARD.decode(&file.content_base64).map_err(|error| {
+            AppError::InvalidRequest(format!(
+                "contentBase64 of {:?} is not valid base64: {error}",
+                file.path
+            ))
+        })?;
+        total_bytes += contents.len();
+        if total_bytes > MAX_SKILL_BUNDLE_BYTES {
+            return Err(bundle_too_large(format!(
+                "the bundle's files exceed {MAX_SKILL_BUNDLE_BYTES} bytes"
+            )));
+        }
+        entries.push(BundleEntry {
+            path: file.path,
+            contents,
+            executable: file.executable,
+        });
+    }
+    for path in &paths {
+        for (index, _) in path.match_indices('/') {
+            if paths.contains(&path[..index]) {
+                return Err(AppError::InvalidRequest(format!(
+                    "bundle path {:?} is both a file and a directory",
+                    &path[..index]
+                )));
+            }
+        }
+    }
+    let skill = entries
+        .iter()
+        .find(|entry| entry.path == "SKILL.md")
+        .ok_or_else(|| {
+            AppError::InvalidRequest("a skill bundle must contain SKILL.md at its root".to_owned())
+        })?;
+    let content = std::str::from_utf8(&skill.contents)
+        .map_err(|_| AppError::InvalidRequest("SKILL.md is not valid UTF-8".to_owned()))?;
+    validate_skill_content(content)?;
+    Ok(entries)
+}
+
+/// Bundle paths are relative, `/`-separated and made only of plain
+/// components, so a write can never leave the skill directory.
+fn validate_bundle_path(path: &str) -> Result<(), AppError> {
+    let invalid =
+        |reason: &str| AppError::InvalidRequest(format!("invalid bundle path {path:?}: {reason}"));
+    if path.is_empty() {
+        return Err(invalid("it is empty"));
+    }
+    if path.len() > MAX_SKILL_BUNDLE_PATH_BYTES {
+        return Err(invalid(&format!(
+            "it is longer than {MAX_SKILL_BUNDLE_PATH_BYTES} bytes"
+        )));
+    }
+    if path.contains('\\') || path.contains('\0') {
+        return Err(invalid("it contains '\\' or NUL"));
+    }
+    if path.starts_with('/') {
+        return Err(invalid("it must be relative"));
+    }
+    let components = path.split('/').collect::<Vec<_>>();
+    if components.len() > MAX_SKILL_BUNDLE_DEPTH {
+        return Err(invalid(&format!(
+            "it has more than {MAX_SKILL_BUNDLE_DEPTH} components"
+        )));
+    }
+    if components
+        .iter()
+        .any(|component| component.is_empty() || *component == "." || *component == "..")
+    {
+        return Err(invalid("it has an empty, '.' or '..' component"));
+    }
+    let first = components[0].as_bytes();
+    if first.len() >= 2 && first[0].is_ascii_alphabetic() && first[1] == b':' {
+        return Err(invalid("it starts with a drive prefix"));
+    }
+    // Whatever else this platform treats as special (e.g. Windows prefixes).
+    let parsed = Path::new(path).components().collect::<Vec<_>>();
+    if parsed.len() != components.len()
+        || !parsed
+            .iter()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(invalid("it is not a plain relative path"));
+    }
+    Ok(())
+}
+
+/// Writes `entries` into the empty directory `directory`: 0644 files, 0755
+/// when executable (Unix; set explicitly so the umask does not apply).
+fn write_bundle_entries(directory: &Path, entries: &[BundleEntry]) -> Result<(), AppError> {
+    use std::io::Write as _;
+
+    for entry in entries {
+        let target = directory.join(&entry.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        let mode = if entry.executable { 0o755 } else { 0o644 };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        let mut file = options.open(&target).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                AppError::InvalidRequest(format!(
+                    "bundle path {:?} collides with another bundle file on this filesystem",
+                    entry.path
+                ))
+            } else {
+                error.into()
+            }
+        })?;
+        file.write_all(&entry.contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+    }
+    Ok(())
+}
+
+/// A fresh staging directory next to `directory`, holding `entries`.
+fn stage_skill_directory(directory: &Path, entries: &[BundleEntry]) -> Result<PathBuf, AppError> {
+    let (Some(parent), Some(name)) = (directory.parent(), directory.file_name()) else {
+        return Err(AppError::InvalidRequest(format!(
+            "{} has no parent directory",
+            directory.display()
+        )));
+    };
+    let staging = parent.join(format!(
+        ".{}.todex-{}",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir(&staging)?;
+    if let Err(error) = write_bundle_entries(&staging, entries) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    Ok(staging)
+}
+
+/// Swaps the existing `directory` for one holding exactly `entries`: the
+/// old directory is renamed aside, the staged one renamed in, and the old
+/// one removed; the old one is put back when the swap fails.
+fn replace_skill_directory(directory: &Path, entries: &[BundleEntry]) -> Result<(), AppError> {
+    let staging = stage_skill_directory(directory, entries)?;
+    let name = directory
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let retired = directory.with_file_name(format!(
+        ".{name}.todex-old-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(error) = std::fs::rename(directory, &retired) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error.into());
+    }
+    if let Err(error) = std::fs::rename(&staging, directory) {
+        if let Err(restore) = std::fs::rename(&retired, directory) {
+            tracing::error!(
+                path = %directory.display(),
+                retired = %retired.display(),
+                error = %restore,
+                "could not restore a skill directory after a failed bundle write"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error.into());
+    }
+    if let Err(error) = std::fs::remove_dir_all(&retired) {
+        tracing::warn!(
+            path = %retired.display(),
+            error = %error,
+            "could not remove a replaced skill directory"
+        );
+    }
+    Ok(())
+}
+
+/// Creates `directory` (which must not exist) holding exactly `entries`,
+/// creating missing parents such as the skill root itself.
+fn create_skill_directory(directory: &Path, entries: &[BundleEntry]) -> Result<(), AppError> {
+    if let Some(parent) = directory.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let staging = stage_skill_directory(directory, entries)?;
+    let conflict = || AppError::Conflict(format!("{} already exists", directory.display()));
+    if std::fs::symlink_metadata(directory).is_ok() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(conflict());
+    }
+    if let Err(error) = std::fs::rename(&staging, directory) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(if std::fs::symlink_metadata(directory).is_ok() {
+            conflict()
+        } else {
+            error.into()
+        });
+    }
+    Ok(())
 }
 
 fn apply_mcp_precedence(servers: &mut [McpServerDescriptor]) {
@@ -3089,6 +3667,399 @@ mod tests {
             "deletion invalidated the cache"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn bundle_file(path: &str, contents: &[u8], executable: bool) -> SkillBundleFile {
+        SkillBundleFile {
+            path: path.to_owned(),
+            content_base64: STANDARD.encode(contents),
+            executable,
+        }
+    }
+
+    fn bundle_paths(files: &[SkillBundleFile]) -> Vec<&str> {
+        files.iter().map(|file| file.path.as_str()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skills_in_hidden_folders_of_a_root_are_built_in() {
+        let root = Path::new("/home/u/.codex/skills");
+        assert!(is_built_in_skill(
+            root,
+            &root.join(".system/imagegen/SKILL.md")
+        ));
+        assert!(!is_built_in_skill(root, &root.join("mine/SKILL.md")));
+        assert!(!is_built_in_skill(root, &root.join("SKILL.md")));
+        // Hidden folders above the root (`.codex`) do not count.
+        assert!(!is_built_in_skill(
+            root,
+            Path::new("/home/u/.codex/skills/a/b/SKILL.md")
+        ));
+    }
+    #[tokio::test]
+    async fn skill_bundles_round_trip_and_replace_the_whole_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("todex-catalog-bundle");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let skill = home.join(".agents/skills/tool");
+        fs::create_dir_all(skill.join("scripts")).unwrap();
+        fs::create_dir_all(skill.join("assets/deep")).unwrap();
+        let skill_md = "---\nname: tool\ndescription: Tool skill\n---\nRun scripts/run.sh\n";
+        fs::write(skill.join("SKILL.md"), skill_md).unwrap();
+        fs::write(skill.join("scripts/run.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        fs::set_permissions(
+            skill.join("scripts/run.sh"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        let binary = (0..=255u8).collect::<Vec<_>>();
+        fs::write(skill.join("assets/deep/data.bin"), &binary).unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), skill.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside, skill.join("assets/linked-dir")).unwrap();
+        let config = Arc::new(test_config(root.join("data"), workspace_root));
+        let service = CatalogService::with_home(config, Some(home.clone()));
+        let provider = ProviderKind::ClaudeCode;
+
+        let listed = service
+            .skills(provider, workspace.clone())
+            .await
+            .unwrap()
+            .skills
+            .into_iter()
+            .find(|skill| skill.name == "tool")
+            .unwrap();
+        let bundle = service
+            .skill_bundle(provider, workspace.clone(), &listed.resource_id)
+            .await
+            .unwrap();
+        assert_eq!(bundle.resource_id, listed.resource_id);
+        assert_eq!(bundle.source, "shared-user");
+        assert_eq!(
+            bundle_paths(&bundle.files),
+            ["SKILL.md", "assets/deep/data.bin", "scripts/run.sh"]
+        );
+        assert_eq!(bundle.skipped, ["assets/linked-dir", "link.txt"]);
+        assert!(!bundle.files[0].executable);
+        assert!(bundle.files[2].executable);
+        assert_eq!(
+            STANDARD.decode(&bundle.files[1].content_base64).unwrap(),
+            binary
+        );
+        let json = serde_json::to_value(&bundle).unwrap();
+        assert!(json["files"][0]["contentBase64"].is_string());
+        assert!(json["resourceId"].is_string());
+
+        // GET -> POST elsewhere preserves contents and the execute bit.
+        let copied = service
+            .create_skill_bundle(
+                provider,
+                workspace.clone(),
+                "provider-user",
+                "tool-copy",
+                bundle.files.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(copied.source, "provider-user");
+        let copy = home.join(".claude/skills/tool-copy");
+        assert_eq!(fs::read_to_string(copy.join("SKILL.md")).unwrap(), skill_md);
+        assert_eq!(fs::read(copy.join("assets/deep/data.bin")).unwrap(), binary);
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&copy.join("scripts/run.sh")), 0o755);
+        assert_eq!(mode(&copy.join("SKILL.md")), 0o644);
+        let reread = service
+            .skill_bundle(provider, workspace.clone(), &copied.resource_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&reread.files).unwrap(),
+            serde_json::to_value(&bundle.files).unwrap()
+        );
+        assert!(reread.skipped.is_empty());
+
+        // An existing directory is a conflict and stays untouched.
+        assert!(matches!(
+            service
+                .create_skill_bundle(
+                    provider,
+                    workspace.clone(),
+                    "provider-user",
+                    "tool-copy",
+                    vec![bundle_file("SKILL.md", skill_md.as_bytes(), false)],
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(copy.join("scripts/run.sh").exists());
+
+        // PUT replaces the directory with exactly the given files.
+        let updated_md = "---\nname: tool\ndescription: Updated\n---\n";
+        let updated = service
+            .replace_skill_bundle(
+                provider,
+                workspace.clone(),
+                &listed.resource_id,
+                vec![
+                    bundle_file("SKILL.md", updated_md.as_bytes(), false),
+                    bundle_file("bin/tool", b"#!/bin/sh\n", true),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.resource_id, listed.resource_id);
+        assert_eq!(updated.description, "Updated");
+        let mut remaining = fs::read_dir(&skill)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(remaining, ["SKILL.md", "bin"]);
+        assert_eq!(mode(&skill.join("bin/tool")), 0o755);
+        assert_eq!(
+            fs::read_to_string(outside.join("secret.txt")).unwrap(),
+            "secret"
+        );
+        // No staging or retired directory is left next to the skill.
+        let mut siblings = fs::read_dir(home.join(".agents/skills"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        siblings.sort();
+        assert_eq!(siblings, ["tool"]);
+
+        // An invalid bundle leaves the skill as it was.
+        assert!(matches!(
+            service
+                .replace_skill_bundle(
+                    provider,
+                    workspace.clone(),
+                    &listed.resource_id,
+                    vec![
+                        bundle_file("SKILL.md", updated_md.as_bytes(), false),
+                        bundle_file("../escape.txt", b"x", false),
+                    ],
+                )
+                .await,
+            Err(AppError::InvalidRequest(_))
+        ));
+        assert!(!home.join(".agents/skills/escape.txt").exists());
+        assert!(skill.join("bin/tool").exists());
+
+        // Grok Build manages its skills itself: bundle writes are refused.
+        assert!(matches!(
+            service
+                .create_skill_bundle(
+                    ProviderKind::GrokBuild,
+                    workspace.clone(),
+                    "shared-user",
+                    "grok-copy",
+                    vec![bundle_file("SKILL.md", skill_md.as_bytes(), false)],
+                )
+                .await,
+            Err(AppError::Unsupported(_))
+        ));
+        assert!(matches!(
+            service
+                .replace_skill_bundle(
+                    ProviderKind::GrokBuild,
+                    workspace.clone(),
+                    &listed.resource_id,
+                    vec![bundle_file("SKILL.md", skill_md.as_bytes(), false)],
+                )
+                .await,
+            Err(AppError::Unsupported(_))
+        ));
+        assert!(matches!(
+            service
+                .skill_bundle(provider, workspace.clone(), "res_missing")
+                .await,
+            Err(AppError::NotFound(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn skill_bundle_limits_and_root_level_skills() {
+        let root = temp_dir("todex-catalog-bundle-limits");
+        let home = root.join("home");
+        let workspace_root = root.join("workspaces");
+        let workspace = workspace_root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let skills_root = home.join(".agents/skills");
+        let content = "---\nname: many\ndescription: x\n---\n";
+        let many = skills_root.join("many");
+        fs::create_dir_all(&many).unwrap();
+        fs::write(many.join("SKILL.md"), content).unwrap();
+        for index in 0..MAX_SKILL_BUNDLE_FILES {
+            fs::write(many.join(format!("f{index}.txt")), "x").unwrap();
+        }
+        let deep = skills_root.join("deep");
+        let mut nested = deep.clone();
+        for level in 0..MAX_SKILL_BUNDLE_DEPTH {
+            nested = nested.join(format!("d{level}"));
+        }
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            deep.join("SKILL.md"),
+            "---\nname: deep\ndescription: x\n---\n",
+        )
+        .unwrap();
+        fs::write(nested.join("too-deep.txt"), "x").unwrap();
+        let big = skills_root.join("big");
+        fs::create_dir_all(&big).unwrap();
+        fs::write(
+            big.join("SKILL.md"),
+            "---\nname: big\ndescription: x\n---\n",
+        )
+        .unwrap();
+        fs::write(big.join("blob"), vec![0u8; MAX_SKILL_BUNDLE_BYTES]).unwrap();
+        let root_level_md = "---\nname: loose\ndescription: x\n---\n";
+        let project_root = workspace.join(".agents/skills");
+        fs::create_dir_all(project_root.join("other")).unwrap();
+        fs::write(project_root.join("SKILL.md"), root_level_md).unwrap();
+        fs::write(project_root.join("other/notes.txt"), "x").unwrap();
+
+        let config = Arc::new(test_config(root.join("data"), workspace_root));
+        let service = CatalogService::with_home(config, Some(home));
+        let provider = ProviderKind::ClaudeCode;
+        let skills = service
+            .skills(provider, workspace.clone())
+            .await
+            .unwrap()
+            .skills;
+        let id = |name: &str| {
+            skills
+                .iter()
+                .find(|skill| skill.name == name)
+                .unwrap()
+                .resource_id
+                .clone()
+        };
+        for name in ["many", "deep", "big"] {
+            let result = service
+                .skill_bundle(provider, workspace.clone(), &id(name))
+                .await;
+            assert!(
+                matches!(result, Err(AppError::PayloadTooLarge(_))),
+                "{name}: {result:?}"
+            );
+        }
+
+        // A SKILL.md directly in a skill root bundles alone and cannot be
+        // replaced as a directory.
+        let loose = service
+            .skill_bundle(provider, workspace.clone(), &id("loose"))
+            .await
+            .unwrap();
+        assert_eq!(bundle_paths(&loose.files), ["SKILL.md"]);
+        assert!(matches!(
+            service
+                .replace_skill_bundle(
+                    provider,
+                    workspace.clone(),
+                    &id("loose"),
+                    loose.files.clone(),
+                )
+                .await,
+            Err(AppError::InvalidRequest(_))
+        ));
+        assert!(project_root.join("other/notes.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_bundle_writes_are_validated() {
+        let skill_md = b"---\nname: x\ndescription: y\n---\n";
+        let with_skill = |extra: Vec<SkillBundleFile>| {
+            let mut files = vec![bundle_file("SKILL.md", skill_md, false)];
+            files.extend(extra);
+            decode_skill_bundle(files)
+        };
+        assert!(with_skill(vec![bundle_file("a/b/c.txt", b"x", true)]).is_ok());
+        for path in [
+            "",
+            "/etc/passwd",
+            "../escape",
+            "a/../../escape",
+            "a/./b",
+            "a//b",
+            "a/",
+            ".",
+            "a\\b",
+            "a\0b",
+            "C:/windows",
+            "c:file",
+            "1/2/3/4/5/6/7/8/9",
+        ] {
+            assert!(
+                matches!(
+                    with_skill(vec![bundle_file(path, b"x", false)]),
+                    Err(AppError::InvalidRequest(_))
+                ),
+                "{path:?}"
+            );
+        }
+        let invalid = |result: Result<Vec<BundleEntry>, AppError>| {
+            matches!(result, Err(AppError::InvalidRequest(_)))
+        };
+        // Duplicate paths, a path that is both file and directory, bad
+        // base64 (URL-safe alphabet and missing padding included).
+        assert!(invalid(with_skill(vec![
+            bundle_file("a", b"x", false),
+            bundle_file("a", b"y", false),
+        ])));
+        assert!(invalid(with_skill(vec![
+            bundle_file("a", b"x", false),
+            bundle_file("a/b", b"y", false),
+        ])));
+        for encoded in ["not base64!", "-_8=", "YQ"] {
+            assert!(invalid(with_skill(vec![SkillBundleFile {
+                path: "a".to_owned(),
+                content_base64: encoded.to_owned(),
+                executable: false,
+            }])));
+        }
+        // SKILL.md must be present at the root and valid.
+        assert!(invalid(decode_skill_bundle(vec![bundle_file(
+            "sub/SKILL.md",
+            skill_md,
+            false
+        )])));
+        assert!(invalid(decode_skill_bundle(vec![bundle_file(
+            "SKILL.md",
+            b"no front matter",
+            false
+        )])));
+        assert!(invalid(decode_skill_bundle(vec![bundle_file(
+            "SKILL.md",
+            &[0xff, 0xfe],
+            false
+        )])));
+        // Limits: file count and total size.
+        let too_many = (0..MAX_SKILL_BUNDLE_FILES)
+            .map(|index| bundle_file(&format!("f{index}"), b"x", false))
+            .collect();
+        assert!(matches!(
+            with_skill(too_many),
+            Err(AppError::PayloadTooLarge(_))
+        ));
+        let half = vec![0u8; MAX_SKILL_BUNDLE_BYTES / 2];
+        assert!(matches!(
+            with_skill(vec![
+                bundle_file("a", &half, false),
+                bundle_file("b", &half, false),
+            ]),
+            Err(AppError::PayloadTooLarge(_))
+        ));
+        assert!(with_skill(vec![bundle_file("a", &half, false)]).is_ok());
     }
 
     fn test_config(data_dir: PathBuf, workspace_root: PathBuf) -> Config {

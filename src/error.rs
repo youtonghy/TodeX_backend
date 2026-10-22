@@ -56,6 +56,9 @@ pub enum AppError {
     TurnCancelled,
     #[error("resource capacity exhausted: {0}")]
     ResourceExhausted(String),
+    /// A request or the resource it reads is over a fixed size limit.
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
     /// Too many requests from one caller; `Retry-After` says when to retry.
     #[error("rate limited: {message}")]
     RateLimited {
@@ -165,6 +168,7 @@ impl AppError {
             Self::Conflict(_) => "CONFLICT",
             Self::TurnCancelled => "TURN_CANCELLED",
             Self::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
+            Self::PayloadTooLarge(_) => "PAYLOAD_TOO_LARGE",
             Self::RateLimited { .. } => "RATE_LIMITED",
             Self::PairingBusy(_) => "PAIRING_BUSY",
             Self::TransportBusy => "TRANSPORT_BUSY",
@@ -208,7 +212,7 @@ impl IntoResponse for AppError {
             Self::GitCommandTimedOut(_) => StatusCode::GATEWAY_TIMEOUT,
             Self::GitOutputLimitExceeded(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::GitProcess(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::GitScanLimitExceeded => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::GitScanLimitExceeded | Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
