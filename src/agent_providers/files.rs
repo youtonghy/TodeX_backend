@@ -13,9 +13,12 @@ use sha2::{Digest, Sha256};
 use crate::error::AppError;
 
 pub const MAX_LIVE_FILE_BYTES: u64 = 1024 * 1024;
-const MISSING_REVISION: &str = "missing";
+/// The revision of a file that does not exist (as in `cli_settings`).
+pub const MISSING_REVISION: &str = "missing";
 
-fn revision(bytes: &[u8]) -> String {
+/// A content revision: SHA-256 of the file bytes, the same revision
+/// `cli_settings` reports for the file.
+pub fn revision(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -150,7 +153,8 @@ fn read_with_revision(path: &Path, label: &str) -> Result<(Value, String), AppEr
     }
 }
 
-fn ensure_revision(path: &Path, label: &str, expected: &str) -> Result<(), AppError> {
+/// Fails with Conflict unless the file still has revision `expected`.
+pub fn ensure_revision(path: &Path, label: &str, expected: &str) -> Result<(), AppError> {
     let actual = match fs::File::open(path) {
         Ok(_) => revision(&read_limited(path, label)?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => MISSING_REVISION.to_owned(),

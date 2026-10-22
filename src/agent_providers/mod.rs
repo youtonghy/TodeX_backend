@@ -9,6 +9,8 @@
 
 mod auth_config;
 mod claude;
+#[cfg(test)]
+mod claude_merge_tests;
 mod codex;
 mod dsh;
 pub(crate) mod files;
@@ -39,6 +41,8 @@ pub(crate) const MAX_PROVIDER_SETTINGS_BYTES: usize = 256 * 1024;
 const MAX_PROVIDERS_PER_AGENT: usize = 100;
 const MAX_PROVIDER_NAME_CHARS: usize = 120;
 const MAX_PROVIDER_ID_CHARS: usize = 64;
+/// Name of a profile imported automatically on a first activation.
+const IMPORTED_NAME: &str = "Imported";
 /// `format` tag of an exported provider file; bumps to `version` mark
 /// incompatible layouts.
 pub const PROVIDER_TRANSFER_FORMAT: &str = "todex.agent-providers";
@@ -519,7 +523,18 @@ impl AgentProviderService {
                     &stored.settings_config,
                 )?;
             }
-            write_live(&dirs, agent, &profile.settings_config, false)?;
+            let bucket = snapshot
+                .agents
+                .get(agent.as_str())
+                .cloned()
+                .unwrap_or_default();
+            project_live(
+                &dirs,
+                agent,
+                &profile.settings_config,
+                false,
+                &known_settings(&bucket),
+            )?;
         }
         self.store.upsert(agent, profile).await?;
         self.agent_block(&dirs, agent, &self.bucket(agent).await)
@@ -557,9 +572,17 @@ impl AgentProviderService {
         }
         if is_additive(agent) {
             additive_remove(&dirs, agent, id)?;
+        } else {
+            // Deleting the current profile clears the pointer; agents that
+            // merge into the live file also take the profile's keys out of
+            // it (Claude), the others keep live as-is, like cc-switch.
+            let bucket = self.bucket(agent).await;
+            if bucket.current_provider_id.as_deref() == Some(id)
+                && exclusive(agent)?.release_live(&dirs, &known_settings(&bucket))?
+            {
+                bump_config_revision();
+            }
         }
-        // Exclusive agents keep the live file as-is; deleting the current
-        // profile only clears the pointer, like cc-switch.
         self.store.remove(agent, id).await.map(|_| ())
     }
 
@@ -596,6 +619,7 @@ impl AgentProviderService {
             additive_set_default(&dirs, agent, id, &model)?;
             self.store.set_current(agent, Some(id.to_owned())).await?;
         } else {
+            let projection = exclusive(agent)?;
             let current = bucket.current_provider_id.as_deref();
             if current != Some(id) {
                 // Backfill: capture the live config into the outgoing profile so
@@ -603,21 +627,40 @@ impl AgentProviderService {
                 // recoverable before we overwrite the live files.
                 let live = read_live(&dirs, agent)?;
                 let mut backfilled = false;
-                if let (Some(old_id), Some(live)) = (current, live) {
-                    if old_id != id {
-                        backfilled = self.store.backfill_settings(agent, old_id, live).await?;
+                let mut adopted = None;
+                match (current, live) {
+                    (Some(old_id), Some(live)) => {
+                        let value = match bucket.providers.get(old_id) {
+                            Some(stored) => {
+                                projection.backfilled(&live, &stored.settings_config)?
+                            }
+                            None => live,
+                        };
+                        backfilled = self.store.backfill_settings(agent, old_id, value).await?;
                     }
+                    (None, Some(_)) => {
+                        adopted = projection.adopt_unknown_live(&dirs, &known_settings(&bucket))?;
+                        if let Some(owned) = adopted.clone() {
+                            self.import_adopted(agent, &bucket, owned).await?;
+                        }
+                    }
+                    _ => {}
                 }
-                let remove_auth = exclusive(agent)?.has_auth_file()
+                let remove_auth = projection.has_auth_file()
                     && !auth_config::has_auth(&profile.settings_config)
                     && backfilled;
-                write_live(&dirs, agent, &profile.settings_config, remove_auth)?;
+                let bucket = self.bucket(agent).await;
+                // An adopted live config was already backed up, imported or
+                // not, so it counts as known.
+                let mut known = known_settings(&bucket);
+                known.extend(adopted.as_ref());
+                project_live(&dirs, agent, &profile.settings_config, remove_auth, &known)?;
                 self.store.set_current(agent, Some(id.to_owned())).await?;
             } else {
                 // Re-activating the current provider self-heals the live file.
                 let mut settings = profile.settings_config.clone();
                 carry_live_auth(&dirs, agent, &mut settings, &profile.settings_config)?;
-                write_live(&dirs, agent, &settings, false)?;
+                project_live(&dirs, agent, &settings, false, &known_settings(&bucket))?;
             }
         }
         self.agent_block(&dirs, agent, &self.bucket(agent).await)
@@ -657,7 +700,7 @@ impl AgentProviderService {
             let live = read_live(&dirs, agent)?.ok_or_else(|| {
                 AppError::NotFound(format!("no live {} config to import", agent.as_str()))
             })?;
-            (live, true)
+            (exclusive(agent)?.owned_part(&live), true)
         };
 
         let name = input
@@ -672,8 +715,23 @@ impl AgentProviderService {
                 "provider name must be 1-{MAX_PROVIDER_NAME_CHARS} characters"
             )));
         }
-        let now = now_millis();
         self.enforce_limit(agent, id).await?;
+        self.store_imported(agent, id, name, settings_config)
+            .await?;
+        if is_live {
+            self.store.set_current(agent, Some(id.to_owned())).await?;
+        }
+        self.agent_block(&dirs, agent, &self.bucket(agent).await)
+    }
+
+    async fn store_imported(
+        &self,
+        agent: ProviderKind,
+        id: &str,
+        name: String,
+        settings_config: Value,
+    ) -> Result<(), AppError> {
+        let now = now_millis();
         self.store
             .upsert(
                 agent,
@@ -691,11 +749,32 @@ impl AgentProviderService {
                     updated_at: now,
                 },
             )
-            .await?;
-        if is_live {
-            self.store.set_current(agent, Some(id.to_owned())).await?;
+            .await
+    }
+
+    /// Import a live config adopted on first activation as a new profile,
+    /// like `import-live` with the client's default id and name (`imported`,
+    /// "Imported"; numbered when taken). Over the profile limit nothing is
+    /// imported: the caller has already backed the live config up.
+    async fn import_adopted(
+        &self,
+        agent: ProviderKind,
+        bucket: &AgentProviderBucket,
+        settings_config: Value,
+    ) -> Result<(), AppError> {
+        let (id, name) = (1..)
+            .map(|index: usize| match index {
+                1 => ("imported".to_owned(), IMPORTED_NAME.to_owned()),
+                n => (format!("imported-{n}"), format!("{IMPORTED_NAME} {n}")),
+            })
+            .find(|(id, _)| !bucket.providers.contains_key(id))
+            .expect("unbounded ids");
+        match self.enforce_limit(agent, &id).await {
+            Ok(()) => {}
+            Err(AppError::ResourceExhausted(_)) => return Ok(()),
+            Err(error) => return Err(error),
         }
-        self.agent_block(&dirs, agent, &self.bucket(agent).await)
+        self.store_imported(agent, &id, name, settings_config).await
     }
 
     /// Every stored profile of one agent, unmasked, in display order.
@@ -872,6 +951,43 @@ trait ExclusiveProjection: Sync {
     ) -> Result<(), AppError>;
     /// Whether the live config still matches `settings`.
     fn live_matches(&self, live: &Value, settings: &Value) -> bool;
+    /// Merge hook: project a profile into the live config. `known` holds
+    /// every stored profile's settings, for agents that back up live values
+    /// no profile holds. The default replaces the whole live config.
+    fn project(
+        &self,
+        dirs: &AgentDirs,
+        settings: &Value,
+        remove_auth: bool,
+        _known: &[&Value],
+    ) -> Result<(), AppError> {
+        self.write_live(dirs, settings, remove_auth)
+    }
+    /// Merge hook: take a deleted current profile out of the live config;
+    /// returns whether it changed. The default keeps the live config as-is.
+    fn release_live(&self, _dirs: &AgentDirs, _known: &[&Value]) -> Result<bool, AppError> {
+        Ok(false)
+    }
+    /// Merge hook for a first activation (no current profile): when the live
+    /// config holds values no `known` profile has, back it up and return the
+    /// part to import as a profile. The default overwrites live as-is.
+    fn adopt_unknown_live(
+        &self,
+        _dirs: &AgentDirs,
+        _known: &[&Value],
+    ) -> Result<Option<Value>, AppError> {
+        Ok(None)
+    }
+    /// Merge hook: the part of a live config a profile owns, which
+    /// `import-live` captures. The default is the whole config.
+    fn owned_part(&self, live: &Value) -> Value {
+        live.clone()
+    }
+    /// Merge hook: the outgoing profile's settings after a switch captures
+    /// `live` into it. The default replaces them with the whole live config.
+    fn backfilled(&self, live: &Value, _stored: &Value) -> Result<Value, AppError> {
+        Ok(live.clone())
+    }
     /// Whether credentials live in a separate auth file that switching to a
     /// profile without credentials may remove.
     fn has_auth_file(&self) -> bool {
@@ -953,15 +1069,25 @@ fn read_live(dirs: &AgentDirs, agent: ProviderKind) -> Result<Option<Value>, App
     exclusive(agent)?.read_live(dirs)
 }
 
-fn write_live(
+fn project_live(
     dirs: &AgentDirs,
     agent: ProviderKind,
     settings: &Value,
     remove_auth: bool,
+    known: &[&Value],
 ) -> Result<(), AppError> {
-    exclusive(agent)?.write_live(dirs, settings, remove_auth)?;
+    exclusive(agent)?.project(dirs, settings, remove_auth, known)?;
     bump_config_revision();
     Ok(())
+}
+
+/// Every stored profile's settings, for [`ExclusiveProjection::project`].
+fn known_settings(bucket: &AgentProviderBucket) -> Vec<&Value> {
+    bucket
+        .providers
+        .values()
+        .map(|profile| &profile.settings_config)
+        .collect()
 }
 
 fn additive_nodes(dirs: &AgentDirs, agent: ProviderKind) -> Result<Map<String, Value>, AppError> {
@@ -1313,6 +1439,7 @@ mod tests {
                     "additiveSelection": outcome(additive_selection(&dirs, agent)),
                     "firstModel": additive_first_model(agent, &sample),
                     "liveMatchesItself": live_matches(agent, &sample, &sample),
+                    "ownedPart": exclusive(agent).ok().map(|projection| projection.owned_part(&sample)),
                     "masked": mask_agent_settings(agent, &sample),
                     "tomlHeaderTables": toml_header_tables(agent),
                 }),

@@ -13,6 +13,7 @@
     },
     "firstModel": null,
     "liveMatchesItself": false,
+    "ownedPart": null,
     "masked": {
       "auth": {
         "OPENAI_API_KEY": "__TODEX_MASKED__"
@@ -46,6 +47,25 @@
     },
     "firstModel": null,
     "liveMatchesItself": true,
+    "ownedPart": {
+      "auth": {
+        "OPENAI_API_KEY": "sk-sample"
+      },
+      "config": "model = \"gpt\"\n[model_providers.x.http_headers]\nAuthorization = \"Bearer t\"\n",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "token",
+        "ANTHROPIC_MODEL": "m"
+      },
+      "options": {
+        "apiKey": "key",
+        "baseURL": "https://example.test"
+      },
+      "models": {
+        "model-a": {
+          "name": "A"
+        }
+      }
+    },
     "masked": {
       "auth": {
         "OPENAI_API_KEY": "__TODEX_MASKED__"
@@ -79,6 +99,7 @@
     "additiveSelection": null,
     "firstModel": null,
     "liveMatchesItself": false,
+    "ownedPart": null,
     "masked": {
       "auth": {
         "OPENAI_API_KEY": "__TODEX_MASKED__"
@@ -112,6 +133,12 @@
     },
     "firstModel": null,
     "liveMatchesItself": true,
+    "ownedPart": {
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "token",
+        "ANTHROPIC_MODEL": "m"
+      }
+    },
     "masked": {
       "auth": {
         "OPENAI_API_KEY": "__TODEX_MASKED__"
@@ -145,6 +172,25 @@
     },
     "firstModel": null,
     "liveMatchesItself": true,
+    "ownedPart": {
+      "auth": {
+        "OPENAI_API_KEY": "sk-sample"
+      },
+      "config": "model = \"gpt\"\n[model_providers.x.http_headers]\nAuthorization = \"Bearer t\"\n",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "token",
+        "ANTHROPIC_MODEL": "m"
+      },
+      "options": {
+        "apiKey": "key",
+        "baseURL": "https://example.test"
+      },
+      "models": {
+        "model-a": {
+          "name": "A"
+        }
+      }
+    },
     "masked": {
       "auth": {
         "OPENAI_API_KEY": "__TODEX_MASKED__"
@@ -182,6 +228,7 @@
     },
     "firstModel": null,
     "liveMatchesItself": false,
+    "ownedPart": null,
     "masked": {
       "auth": {
         "OPENAI_API_KEY": "__TODEX_MASKED__"
@@ -213,6 +260,7 @@
     "additiveSelection": null,
     "firstModel": "model-a",
     "liveMatchesItself": false,
+    "ownedPart": null,
     "masked": {
       "auth": {
         "OPENAI_API_KEY": "__TODEX_MASKED__"
@@ -248,6 +296,7 @@
     },
     "firstModel": null,
     "liveMatchesItself": false,
+    "ownedPart": null,
     "masked": {
       "auth": {
         "OPENAI_API_KEY": "__TODEX_MASKED__"
@@ -279,6 +328,7 @@
     "additiveSelection": null,
     "firstModel": null,
     "liveMatchesItself": false,
+    "ownedPart": null,
     "masked": {
       "auth": {
         "OPENAI_API_KEY": "__TODEX_MASKED__"

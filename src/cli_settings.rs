@@ -22,8 +22,16 @@ pub(crate) const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 /// The revision of a file that does not exist yet.
 const MISSING_REVISION: &str = "missing";
 
-/// Serializes this module's read-check-write cycles within the daemon.
-static WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes this module's read-check-write cycles within the daemon. The
+/// Claude provider projection (`agent_providers::claude`) also takes it
+/// around its own read-check-write of `settings.json`, so a provider switch
+/// and a settings-page save never interleave.
+///
+/// Lock order: a caller that also holds an `AgentProviderService` per-agent
+/// lock (`lock_for(agent)`) takes that one first and this one second. Code
+/// in this module never takes a per-agent lock, so the order cannot invert.
+/// Never hold this guard across an `.await`.
+pub(crate) static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// A CLI whose user settings file the CLI manager edits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
