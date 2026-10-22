@@ -1284,6 +1284,8 @@ pub struct CodexLocalAdapterSupervisor {
     events: EventBus,
     idle_shutdown_after: Duration,
     cli_execution_gate: Arc<RwLock<()>>,
+    /// Codex's lock: an adapter start waits while Codex is upgraded.
+    cli_locks: crate::provider::CliLocks,
 }
 
 impl CodexLocalAdapterSupervisor {
@@ -1333,14 +1335,26 @@ impl CodexLocalAdapterSupervisor {
             events,
             idle_shutdown_after,
             cli_execution_gate,
+            cli_locks: crate::provider::CliLocks::default(),
         }
+    }
+
+    pub fn with_cli_locks(mut self, cli_locks: crate::provider::CliLocks) -> Self {
+        self.cli_locks = cli_locks;
+        self
     }
 
     pub async fn start(
         &self,
         options: CodexLocalAdapterStartOptions,
     ) -> CodexLocalAdapterProcessResult<Arc<LocalCodexAdapter>> {
-        let cli_start_permit = self.cli_execution_gate.read().await;
+        // Codex's lock before the shared gate, as for conversation turns.
+        let cli_start_permit = (
+            self.cli_locks
+                .read(&[crate::provider::ManagedCli::Codex])
+                .await,
+            self.cli_execution_gate.read().await,
+        );
         if let Some(adapter) = self
             .adapters
             .get(&options.codex_session_id)

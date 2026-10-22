@@ -114,11 +114,13 @@ impl AppState {
         let events = EventBus::new(4096);
         let codex_gateway = CodexGatewayStore::new(config.data_dir.clone());
         let cli_execution_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let cli_manager = CliManager::default();
         let codex_local_adapters = CodexLocalAdapterSupervisor::new_with_execution_gate(
             codex_gateway.clone(),
             events.clone(),
             cli_execution_gate.clone(),
-        );
+        )
+        .with_cli_locks(cli_manager.locks());
         let workspaces =
             WorkspaceStore::new(config.data_dir.clone(), config.workspace_roots.clone()).await?;
         let kanban_tasks = KanbanTaskStore::new(config.data_dir.clone()).await?;
@@ -161,6 +163,7 @@ impl AppState {
             conversation_hub.clone(),
             cli_execution_gate.clone(),
         )
+        .with_cli_locks(cli_manager.locks())
         .with_quota(quota.clone())
         .with_agent_mcp(agent_mcp.clone());
         conversations.set_permission_policy(std::sync::Arc::new(
@@ -175,7 +178,6 @@ impl AppState {
         conversations.recover_all().await?;
         agent_calls.start().await;
         let local_terminals = LocalTerminalManager::new(events.clone());
-        let cli_manager = CliManager::default();
         let pairing_keys = PairingKeyStore::load(&config.data_dir).await?;
         let device_auth = DeviceAuthenticator::new(devices.clone());
         // Pairing reads the same key store and configured protocol as the

@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -19,10 +19,14 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(12);
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
-const VERSION_CACHE_TTL: Duration = Duration::from_secs(30);
+/// A CLI's whole row, including the version its binary reports.
+const ROW_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Its latest release, read from the network; a refresh skips it.
+const LATEST_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+const LATEST_FAILURE_TTL: Duration = Duration::from_secs(2 * 60);
 const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum ManagedCli {
     Codex,
@@ -36,6 +40,18 @@ pub enum ManagedCli {
 }
 
 impl ManagedCli {
+    /// In declaration order: `cli as usize` indexes it.
+    pub const ALL: [ManagedCli; 8] = [
+        Self::Codex,
+        Self::Pi,
+        Self::ClaudeCode,
+        Self::GrokBuild,
+        Self::Devin,
+        Self::Opencode,
+        Self::Antigravity,
+        Self::DeepseekHarness,
+    ];
+
     pub fn id(self) -> &'static str {
         match self {
             Self::Codex => "codex",
@@ -207,9 +223,13 @@ pub struct CliVersionInfo {
 #[serde(rename_all = "camelCase")]
 pub struct CliVersionsResponse {
     pub clis: Vec<CliVersionInfo>,
+    /// When the oldest latest-release check among `clis` ran.
     pub checked_at: String,
+    /// The earliest-started running operation, for clients that track one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_operation: Option<CliUpgradeOperation>,
+    /// Every running operation, at most one per CLI.
+    pub active_operations: Vec<CliUpgradeOperation>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -230,49 +250,141 @@ pub struct CliUpgradeOperation {
     pub error: Option<String>,
 }
 
-#[derive(Default)]
-struct UpgradeState {
-    active_id: Option<String>,
-    operations: HashMap<String, CliUpgradeOperation>,
-}
+/// One lock per managed CLI. An install or upgrade holds its CLI's lock
+/// exclusively for its whole run; anything that starts that CLI's binary
+/// (a turn, discovery, a version probe) holds it shared while it starts, so
+/// CLIs upgrade independently of each other and of every other Agent.
+#[derive(Clone, Default)]
+pub struct CliLocks([Arc<RwLock<()>>; ManagedCli::ALL.len()]);
 
-#[derive(Clone)]
-pub struct CliManager {
-    upgrades: Arc<Mutex<UpgradeState>>,
-    version_check: Arc<Mutex<()>>,
-    version_cache: Arc<RwLock<Option<(Instant, CliVersionsResponse)>>>,
-}
+/// Shared permits on one or more CLIs; dropping it releases them.
+#[must_use]
+pub struct CliPermits(#[allow(dead_code)] Vec<OwnedRwLockReadGuard<()>>);
 
-impl Default for CliManager {
-    fn default() -> Self {
-        Self {
-            upgrades: Arc::new(Mutex::new(UpgradeState::default())),
-            version_check: Arc::new(Mutex::new(())),
-            version_cache: Arc::new(RwLock::new(None)),
+impl CliLocks {
+    fn lock(&self, cli: ManagedCli) -> Arc<RwLock<()>> {
+        self.0[cli as usize].clone()
+    }
+
+    /// In the fixed `ManagedCli::ALL` order, so two callers taking several
+    /// locks never wait on each other in a cycle.
+    fn ordered(clis: &[ManagedCli]) -> impl Iterator<Item = ManagedCli> + '_ {
+        ManagedCli::ALL
+            .into_iter()
+            .filter(move |cli| clis.contains(cli))
+    }
+
+    /// Waits while any of `clis` is being installed or upgraded.
+    pub async fn read(&self, clis: &[ManagedCli]) -> CliPermits {
+        let mut guards = Vec::new();
+        for cli in Self::ordered(clis) {
+            guards.push(self.lock(cli).read_owned().await);
         }
+        CliPermits(guards)
+    }
+
+    /// `None` while any of `clis` is being installed or upgraded.
+    pub fn try_read(&self, clis: &[ManagedCli]) -> Option<CliPermits> {
+        let mut guards = Vec::new();
+        for cli in Self::ordered(clis) {
+            guards.push(self.lock(cli).try_read_owned().ok()?);
+        }
+        Some(CliPermits(guards))
+    }
+
+    pub fn try_write(&self, cli: ManagedCli) -> Option<OwnedRwLockWriteGuard<()>> {
+        self.lock(cli).try_write_owned().ok()
+    }
+
+    /// Waits up to `wait` for starts and probes of `cli` already holding it
+    /// shared to finish, so an upgrade does not fail just because the
+    /// version list was being read.
+    pub async fn write_within(
+        &self,
+        cli: ManagedCli,
+        wait: Duration,
+    ) -> Option<OwnedRwLockWriteGuard<()>> {
+        tokio::time::timeout(wait, self.lock(cli).write_owned())
+            .await
+            .ok()
+    }
+
+    /// No CLI is held, shared or exclusively.
+    pub fn is_idle(&self) -> bool {
+        self.0.iter().all(|lock| lock.try_write().is_ok())
     }
 }
 
+#[derive(Default)]
+struct UpgradeState {
+    /// The running operation of each CLI; at most one per CLI.
+    running: HashMap<ManagedCli, String>,
+    operations: HashMap<String, CliUpgradeOperation>,
+}
+
+struct LatestRelease {
+    at: Instant,
+    checked_at: DateTime<Utc>,
+    /// A user-facing error when the release source could not be read.
+    version: Result<Option<String>, String>,
+}
+
+impl LatestRelease {
+    fn fresh(&self) -> bool {
+        let ttl = if self.version.is_ok() {
+            LATEST_CACHE_TTL
+        } else {
+            LATEST_FAILURE_TTL
+        };
+        self.at.elapsed() < ttl
+    }
+}
+
+/// Probe results by CLI: a whole row for a short while, and the latest
+/// release (a network request) for longer.
+#[derive(Default)]
+struct VersionCache {
+    rows: HashMap<ManagedCli, (Instant, CliVersionInfo)>,
+    latest: HashMap<ManagedCli, LatestRelease>,
+}
+
+#[derive(Clone, Default)]
+pub struct CliManager {
+    upgrades: Arc<Mutex<UpgradeState>>,
+    locks: CliLocks,
+    /// One probe of each CLI at a time; concurrent version requests share it.
+    probes: Arc<[Mutex<()>; ManagedCli::ALL.len()]>,
+    cache: Arc<std::sync::Mutex<VersionCache>>,
+}
+
 impl CliManager {
-    pub async fn versions(&self, config: &Config) -> CliVersionsResponse {
-        if let Some(cached) = self.cached_versions().await {
-            return self.with_active_operation(cached).await;
-        }
-        let _check = self.version_check.lock().await;
-        if let Some(cached) = self.cached_versions().await {
-            return self.with_active_operation(cached).await;
-        }
-        let (codex, pi, claude, grok, devin, opencode, antigravity, dsh) = tokio::join!(
-            inspect_cli(config, ManagedCli::Codex),
-            inspect_cli(config, ManagedCli::Pi),
-            inspect_cli(config, ManagedCli::ClaudeCode),
-            inspect_cli(config, ManagedCli::GrokBuild),
-            inspect_cli(config, ManagedCli::Devin),
-            inspect_cli(config, ManagedCli::Opencode),
-            inspect_cli(config, ManagedCli::Antigravity),
-            inspect_cli(config, ManagedCli::DeepseekHarness),
-        );
-        let mut clis = vec![codex, pi, claude, grok, devin, opencode, antigravity, dsh];
+    pub fn locks(&self) -> CliLocks {
+        self.locks.clone()
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, VersionCache> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `refresh` re-reads every CLI's latest release instead of the cache.
+    pub async fn versions(&self, config: &Config, refresh: bool) -> CliVersionsResponse {
+        let rows = futures_util::future::join_all(
+            ManagedCli::ALL
+                .into_iter()
+                .map(|cli| self.version_row(config, cli, refresh)),
+        )
+        .await;
+        let checked_at = {
+            let cache = self.cache();
+            ManagedCli::ALL
+                .iter()
+                .filter_map(|cli| cache.latest.get(cli).map(|latest| latest.checked_at))
+                .min()
+                .unwrap_or_else(Utc::now)
+        };
+        let mut clis = rows;
         clis.extend(config.agent.acp_profiles.keys().map(|name| CliVersionInfo {
             id: format!("acp:{name}"),
             name: name.clone(),
@@ -285,47 +397,131 @@ impl CliManager {
             install_supported: false,
             error: None,
         }));
-        let response = CliVersionsResponse {
+        let (active_operation, active_operations) = self.running_operations().await;
+        CliVersionsResponse {
             clis,
-            checked_at: Utc::now().to_rfc3339(),
-            active_operation: None,
-        };
-        *self.version_cache.write().await = Some((Instant::now(), response.clone()));
-        self.with_active_operation(response).await
+            checked_at: checked_at.to_rfc3339(),
+            active_operation,
+            active_operations,
+        }
     }
 
-    async fn cached_versions(&self) -> Option<CliVersionsResponse> {
-        self.version_cache
-            .read()
-            .await
-            .as_ref()
-            .filter(|(checked, _)| checked.elapsed() < VERSION_CACHE_TTL)
-            .map(|(_, response)| response.clone())
+    async fn version_row(&self, config: &Config, cli: ManagedCli, refresh: bool) -> CliVersionInfo {
+        self.cached_row(cli, refresh, || {
+            inspect_cli(config, cli, self.latest_version(config, cli, refresh))
+        })
+        .await
     }
 
-    pub async fn cached_versions_while_busy(&self) -> Option<CliVersionsResponse> {
-        let cached = self
-            .version_cache
-            .read()
-            .await
-            .as_ref()
-            .map(|(_, response)| response.clone())?;
-        Some(self.with_active_operation(cached).await)
-    }
-
-    async fn with_active_operation(
+    /// `probe` runs only when no usable row is cached and `cli` is not
+    /// being installed or upgraded.
+    async fn cached_row<F>(
         &self,
-        mut response: CliVersionsResponse,
-    ) -> CliVersionsResponse {
-        let state = self.upgrades.lock().await;
-        response.active_operation = state
-            .active_id
-            .as_ref()
-            .and_then(|id| state.operations.get(id))
-            .cloned();
-        response
+        cli: ManagedCli,
+        refresh: bool,
+        probe: impl FnOnce() -> F,
+    ) -> CliVersionInfo
+    where
+        F: std::future::Future<Output = CliVersionInfo>,
+    {
+        let requested = Instant::now();
+        let _probe = self.probes[cli as usize].lock().await;
+        if let Some((at, row)) = self.cache().rows.get(&cli) {
+            // A probe that finished while this request waited is as new as
+            // a refresh could make it.
+            if *at >= requested || (!refresh && at.elapsed() < ROW_CACHE_TTL) {
+                return row.clone();
+            }
+        }
+        // Mid-install or upgrade: report the last result without running it.
+        let Some(_permit) = self.locks.try_read(&[cli]) else {
+            if let Some((_, row)) = self.cache().rows.get(&cli) {
+                return row.clone();
+            }
+            return self.busy_row(cli).await;
+        };
+        let row = probe().await;
+        self.cache().rows.insert(cli, (Instant::now(), row.clone()));
+        row
     }
 
+    async fn latest_version(
+        &self,
+        config: &Config,
+        cli: ManagedCli,
+        refresh: bool,
+    ) -> Result<Option<String>, String> {
+        if !refresh {
+            if let Some(latest) = self
+                .cache()
+                .latest
+                .get(&cli)
+                .filter(|latest| latest.fresh())
+            {
+                return latest.version.clone();
+            }
+        }
+        let version = latest_version(config, cli)
+            .await
+            .map_err(|error| user_facing_error(&error));
+        self.cache().latest.insert(
+            cli,
+            LatestRelease {
+                at: Instant::now(),
+                checked_at: Utc::now(),
+                version: version.clone(),
+            },
+        );
+        version
+    }
+
+    /// A row for a CLI first seen mid-operation, from what the operation knows.
+    async fn busy_row(&self, cli: ManagedCli) -> CliVersionInfo {
+        let operation = {
+            let state = self.upgrades.lock().await;
+            state
+                .running
+                .get(&cli)
+                .and_then(|id| state.operations.get(id))
+                .cloned()
+        };
+        let upgrading = operation
+            .as_ref()
+            .is_some_and(|operation| operation.action == CliOperationAction::Upgrade);
+        let latest_version = self
+            .cache()
+            .latest
+            .get(&cli)
+            .and_then(|latest| latest.version.clone().ok().flatten());
+        CliVersionInfo {
+            id: cli.id().to_owned(),
+            name: cli.name().to_owned(),
+            kind: "managed".to_owned(),
+            installed: upgrading,
+            current_version: operation.and_then(|operation| operation.previous_version),
+            latest_version,
+            status: if upgrading { "unknown" } else { "notInstalled" }.to_owned(),
+            upgrade_supported: false,
+            install_supported: false,
+            error: None,
+        }
+    }
+
+    /// The earliest-started running operation, and all of them in start order.
+    async fn running_operations(&self) -> (Option<CliUpgradeOperation>, Vec<CliUpgradeOperation>) {
+        let state = self.upgrades.lock().await;
+        let mut running = state
+            .running
+            .values()
+            .filter_map(|id| state.operations.get(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        running.sort_by(|left, right| left.started_at.cmp(&right.started_at));
+        (running.first().cloned(), running)
+    }
+
+    /// Each CLI runs one install or upgrade at a time; different CLIs run
+    /// theirs concurrently.
     pub async fn begin_operation(
         &self,
         provider: ManagedCli,
@@ -333,18 +529,18 @@ impl CliManager {
         previous_version: Option<String>,
     ) -> Result<CliUpgradeOperation, AppError> {
         let mut state = self.upgrades.lock().await;
-        if let Some(id) = &state.active_id {
+        if let Some(id) = state.running.get(&provider) {
             let active = state
                 .operations
                 .get(id)
-                .expect("active CLI operation must exist");
+                .expect("running CLI operation must exist");
             let verb = match active.action {
                 CliOperationAction::Install => "install",
                 CliOperationAction::Upgrade => "upgrade",
             };
             return Err(AppError::Conflict(format!(
                 "CLI {verb} of {} is already running",
-                active.provider.id()
+                provider.id()
             )));
         }
         let operation = CliUpgradeOperation {
@@ -358,20 +554,20 @@ impl CliManager {
             current_version: None,
             error: None,
         };
-        state.active_id = Some(operation.id.clone());
+        state.running.insert(provider, operation.id.clone());
         state
             .operations
             .insert(operation.id.clone(), operation.clone());
         if state.operations.len() > 50 {
-            let active_id = state.active_id.clone();
             let mut completed = state
                 .operations
                 .values()
-                .filter(|item| Some(&item.id) != active_id.as_ref())
+                .filter(|item| item.status != "running")
                 .map(|item| (item.started_at.clone(), item.id.clone()))
                 .collect::<Vec<_>>();
             completed.sort_unstable();
-            for (_, id) in completed.into_iter().take(state.operations.len() - 50) {
+            let excess = state.operations.len() - 50;
+            for (_, id) in completed.into_iter().take(excess) {
                 state.operations.remove(&id);
             }
         }
@@ -396,12 +592,17 @@ impl CliManager {
                 operation.error = Some(user_facing_error(&error));
             }
         }
-        if state.active_id.as_deref() == Some(operation_id) {
-            state.active_id = None;
+        let provider = operation.provider;
+        if state.running.get(&provider).map(String::as_str) == Some(operation_id) {
+            state.running.remove(&provider);
         }
         let completed = state.operations.get(operation_id).cloned();
         drop(state);
-        *self.version_cache.write().await = None;
+        // Only this CLI changed; the next list probes it again, and its
+        // release too, since a self-update may have gone past the cached one.
+        let mut cache = self.cache();
+        cache.rows.remove(&provider);
+        cache.latest.remove(&provider);
         completed
     }
 
@@ -579,10 +780,14 @@ pub async fn read_current_version(
     current_version(config, provider).await
 }
 
-async fn inspect_cli(config: &Config, provider: ManagedCli) -> CliVersionInfo {
+async fn inspect_cli(
+    config: &Config,
+    provider: ManagedCli,
+    latest: impl std::future::Future<Output = Result<Option<String>, String>>,
+) -> CliVersionInfo {
     // A missing binary is a normal state with an Install action, not an error.
     if !executable_available(provider.binary(config)) {
-        let latest_version = latest_version(config, provider).await.ok().flatten();
+        let latest_version = latest.await.ok().flatten();
         return CliVersionInfo {
             id: provider.id().to_owned(),
             name: provider.name().to_owned(),
@@ -596,8 +801,7 @@ async fn inspect_cli(config: &Config, provider: ManagedCli) -> CliVersionInfo {
             error: None,
         };
     }
-    let current = current_version(config, provider).await;
-    let latest = latest_version(config, provider).await;
+    let (current, latest) = tokio::join!(current_version(config, provider), latest);
     let installed = current.is_ok();
     let current_version = current.as_ref().ok().cloned().flatten();
     let latest_version = latest.as_ref().ok().cloned().flatten();
@@ -612,8 +816,8 @@ async fn inspect_cli(config: &Config, provider: ManagedCli) -> CliVersionInfo {
     };
     let error = current
         .err()
-        .or_else(|| latest.err())
-        .map(|error| user_facing_error(&error));
+        .map(|error| user_facing_error(&error))
+        .or_else(|| latest.err());
     CliVersionInfo {
         id: provider.id().to_owned(),
         name: provider.name().to_owned(),
@@ -828,27 +1032,63 @@ fn find_version_value(value: &Value) -> Option<String> {
     value.as_str().and_then(extract_version)
 }
 
+/// Numeric release parts first; on a tie a pre-release (`1.2.0-beta.1`)
+/// precedes its release, and `+build` metadata is ignored, as in semver.
 fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
-    let parts = |value: &str| {
-        value
-            .split(['.', '-', '+'])
+    use std::cmp::Ordering;
+    let split = |value: &str| {
+        let value = value.split('+').next().unwrap_or(value);
+        match value.split_once('-') {
+            Some((core, pre)) => (core.to_owned(), Some(pre.to_owned())),
+            None => (value.to_owned(), None),
+        }
+    };
+    let numbers = |core: &str| {
+        core.split('.')
             .map(|part| part.parse::<u64>().unwrap_or(0))
             .collect::<Vec<_>>()
     };
-    let left = parts(left);
-    let right = parts(right);
-    for index in 0..left.len().max(right.len()) {
-        match left
+    let ((left_core, left_pre), (right_core, right_pre)) = (split(left), split(right));
+    let (left_core, right_core) = (numbers(&left_core), numbers(&right_core));
+    for index in 0..left_core.len().max(right_core.len()) {
+        match left_core
             .get(index)
             .copied()
             .unwrap_or(0)
-            .cmp(&right.get(index).copied().unwrap_or(0))
+            .cmp(&right_core.get(index).copied().unwrap_or(0))
         {
-            std::cmp::Ordering::Equal => {}
+            Ordering::Equal => {}
             ordering => return ordering,
         }
     }
-    std::cmp::Ordering::Equal
+    match (left_pre, right_pre) {
+        (None, None) => Ordering::Equal,
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(left), Some(right)) => {
+            let mut left = left.split('.');
+            let mut right = right.split('.');
+            loop {
+                match (left.next(), right.next()) {
+                    (None, None) => return Ordering::Equal,
+                    (None, Some(_)) => return Ordering::Less,
+                    (Some(_), None) => return Ordering::Greater,
+                    (Some(left), Some(right)) => {
+                        let ordering = match (left.parse::<u64>(), right.parse::<u64>()) {
+                            (Ok(left), Ok(right)) => left.cmp(&right),
+                            // Numeric identifiers sort before alphanumeric ones.
+                            (Ok(_), Err(_)) => Ordering::Less,
+                            (Err(_), Ok(_)) => Ordering::Greater,
+                            (Err(_), Err(_)) => left.cmp(right),
+                        };
+                        if ordering != Ordering::Equal {
+                            return ordering;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn user_facing_error(error: &AppError) -> String {
@@ -860,9 +1100,13 @@ fn user_facing_error(error: &AppError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use chrono::Utc;
+
     use super::{
-        compare_versions, extract_version, npm_install_args, strip_ansi, CliManager,
-        CliOperationAction, ManagedCli, ProviderKind,
+        compare_versions, extract_version, npm_install_args, strip_ansi, CliLocks, CliManager,
+        CliOperationAction, LatestRelease, ManagedCli, ProviderKind, ROW_CACHE_TTL,
     };
 
     #[test]
@@ -903,10 +1147,20 @@ mod tests {
         assert!(compare_versions("1.2.0", "1.1.9").is_gt());
     }
 
+    #[test]
+    fn pre_releases_precede_their_release() {
+        assert!(compare_versions("1.2.0-beta.1", "1.2.0").is_lt());
+        assert!(compare_versions("1.2.0", "1.2.0-rc.2").is_gt());
+        assert!(compare_versions("1.2.0-beta.2", "1.2.0-beta.10").is_lt());
+        assert!(compare_versions("1.2.0-1", "1.2.0-alpha").is_lt());
+        assert!(compare_versions("1.2.0+build.5", "1.2.0").is_eq());
+        assert!(compare_versions("1.2.1-beta.1", "1.2.0").is_gt());
+    }
+
     #[tokio::test]
-    async fn upgrades_are_single_flight() {
+    async fn operations_are_single_flight_per_cli() {
         let manager = CliManager::default();
-        let first = manager
+        let codex = manager
             .begin_operation(
                 ManagedCli::Codex,
                 CliOperationAction::Upgrade,
@@ -914,17 +1168,115 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(manager
+        // Another CLI runs alongside; the same CLI does not.
+        let pi = manager
             .begin_operation(ManagedCli::Pi, CliOperationAction::Install, None)
+            .await
+            .unwrap();
+        assert!(manager
+            .begin_operation(ManagedCli::Codex, CliOperationAction::Upgrade, None)
             .await
             .is_err());
+        let (first, running) = manager.running_operations().await;
+        assert_eq!(first.unwrap().id, codex.id);
+        assert_eq!(
+            running
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            [codex.id.as_str(), pi.id.as_str()]
+        );
+
         manager
-            .complete_operation(&first.id, Ok(Some("1.1.0".to_owned())))
+            .complete_operation(&codex.id, Ok(Some("1.1.0".to_owned())))
             .await;
+        assert_eq!(manager.running_operations().await.1.len(), 1);
         assert!(manager
-            .begin_operation(ManagedCli::Pi, CliOperationAction::Install, None)
+            .begin_operation(ManagedCli::Codex, CliOperationAction::Upgrade, None)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn completing_an_operation_forgets_only_that_cli() {
+        let manager = CliManager::default();
+        for cli in [ManagedCli::Codex, ManagedCli::Pi] {
+            let row = manager.busy_row(cli).await;
+            let mut cache = manager.cache();
+            cache.rows.insert(cli, (Instant::now(), row));
+            cache.latest.insert(
+                cli,
+                LatestRelease {
+                    at: Instant::now(),
+                    checked_at: Utc::now(),
+                    version: Ok(Some("2.0.0".to_owned())),
+                },
+            );
+        }
+        let operation = manager
+            .begin_operation(ManagedCli::Codex, CliOperationAction::Upgrade, None)
+            .await
+            .unwrap();
+        manager.complete_operation(&operation.id, Ok(None)).await;
+        let cache = manager.cache();
+        assert!(!cache.rows.contains_key(&ManagedCli::Codex));
+        assert!(!cache.latest.contains_key(&ManagedCli::Codex));
+        assert!(cache.rows.contains_key(&ManagedCli::Pi));
+        assert!(cache.latest.contains_key(&ManagedCli::Pi));
+    }
+
+    #[tokio::test]
+    async fn a_cli_mid_upgrade_reports_its_last_row() {
+        let manager = CliManager::default();
+        let mut cached = manager.busy_row(ManagedCli::ClaudeCode).await;
+        cached.current_version = Some("2.1.0".to_owned());
+        cached.status = "updateAvailable".to_owned();
+        manager.cache().rows.insert(
+            ManagedCli::ClaudeCode,
+            (Instant::now() - ROW_CACHE_TTL, cached),
+        );
+        let _upgrade = manager.locks().try_write(ManagedCli::ClaudeCode).unwrap();
+        // Stale, and a refresh, yet the binary being replaced is not run.
+        let row = manager
+            .cached_row(ManagedCli::ClaudeCode, true, || async {
+                unreachable!("a CLI mid-upgrade is not probed")
+            })
+            .await;
+        assert_eq!(row.current_version.as_deref(), Some("2.1.0"));
+        assert_eq!(row.status, "updateAvailable");
+    }
+
+    #[tokio::test]
+    async fn cli_locks_scope_to_one_cli() {
+        let locks = CliLocks::default();
+        let upgrade = locks.try_write(ManagedCli::Codex).unwrap();
+        assert!(!locks.is_idle());
+        assert!(locks.try_read(&[ManagedCli::Codex]).is_none());
+        assert!(locks
+            .try_read(&[ManagedCli::ClaudeCode, ManagedCli::Codex])
+            .is_none());
+        let other = locks.try_read(&[ManagedCli::ClaudeCode]).unwrap();
+        assert!(locks.try_write(ManagedCli::Pi).is_some());
+        // A start of Codex waits for its upgrade, then proceeds.
+        let waiting = tokio::spawn({
+            let locks = locks.clone();
+            async move { locks.read(&[ManagedCli::Codex]).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(upgrade);
+        drop(waiting.await.unwrap());
+        // An upgrade waits a bounded time for starts holding the lock shared.
+        assert!(locks
+            .write_within(ManagedCli::ClaudeCode, Duration::from_millis(20))
+            .await
+            .is_none());
+        drop(other);
+        assert!(locks
+            .write_within(ManagedCli::ClaudeCode, Duration::from_millis(20))
+            .await
+            .is_some());
+        assert!(locks.is_idle());
     }
 
     #[test]

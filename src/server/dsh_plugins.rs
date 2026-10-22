@@ -174,7 +174,11 @@ async fn composed(state: &AppState) -> Result<(Vec<ComposedRow>, Option<String>)
             return Ok((cached.rows.clone(), cached.runtime_version.clone()));
         }
     }
-    let Ok(_gate) = state.cli_execution_gate.clone().try_read_owned() else {
+    let Some(_gate) = state
+        .cli_manager
+        .locks()
+        .try_read(&[ManagedCli::DeepseekHarness])
+    else {
         return Err(AppError::Conflict(
             "a CLI upgrade or plugin operation is running; try again".to_owned(),
         ));
@@ -410,10 +414,15 @@ async fn start_operation(
             Some(reason),
         )
     };
-    let Ok(execution_guard) = state.cli_execution_gate.clone().try_write_owned() else {
+    // DeepSeek Harness's lock alone: other Agents keep running.
+    let Some(execution_guard) = state
+        .cli_manager
+        .locks()
+        .try_write(ManagedCli::DeepseekHarness)
+    else {
         deny("CLI_EXECUTION_BUSY").await?;
         return Err(AppError::Conflict(
-            "an Agent or CLI upgrade is starting".to_owned(),
+            "a DeepSeek Harness start or upgrade is in progress; try again".to_owned(),
         ));
     };
     if state

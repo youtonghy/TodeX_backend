@@ -22,7 +22,7 @@ mod supervisor;
 pub(crate) mod types;
 
 pub(crate) use cli_manager::{
-    read_current_version, run_install, run_upgrade, CliManager, CliOperationAction,
+    read_current_version, run_install, run_upgrade, CliLocks, CliManager, CliOperationAction,
     CliUpgradeOperation, CliVersionsResponse, ManagedCli,
 };
 pub(crate) use devin::devin_cli_environment;

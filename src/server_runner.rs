@@ -254,9 +254,10 @@ impl ManagedServer {
 
     /// No Agent turn or local Codex adapter is running, no follow-up queue is
     /// about to start its next item, and nothing holds the CLI execution gate
-    /// (an Agent start in progress or a CLI install/upgrade).
+    /// or a CLI's lock (an Agent start in progress or a CLI install/upgrade).
     pub fn is_agent_idle(&self) -> bool {
         self.state.cli_execution_gate.try_write().is_ok()
+            && self.state.cli_manager.locks().is_idle()
             && !self.state.conversations.has_active_turns()
             && !self.state.conversations.has_pending_follow_ups()
             && !self.state.codex_local_adapters.has_active_adapters()
@@ -543,6 +544,15 @@ mod tests {
         let starting = server.state.cli_execution_gate.clone().read_owned().await;
         assert!(!server.is_agent_idle());
         drop(starting);
+        assert!(server.is_agent_idle());
+        let upgrading = server
+            .state
+            .cli_manager
+            .locks()
+            .try_write(crate::provider::ManagedCli::Pi)
+            .unwrap();
+        assert!(!server.is_agent_idle());
+        drop(upgrading);
         assert!(server.is_agent_idle());
         server.stop().await.expect("stop server");
 

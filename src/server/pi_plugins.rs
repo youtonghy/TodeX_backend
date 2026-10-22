@@ -200,10 +200,11 @@ async fn start_operation(
             Some(reason),
         )
     };
-    let Ok(execution_guard) = state.cli_execution_gate.clone().try_write_owned() else {
+    // Pi's lock alone: other Agents keep running.
+    let Some(execution_guard) = state.cli_manager.locks().try_write(ManagedCli::Pi) else {
         deny("CLI_EXECUTION_BUSY").await?;
         return Err(AppError::Conflict(
-            "an Agent or CLI upgrade is starting".to_owned(),
+            "a Pi start or upgrade is in progress; try again".to_owned(),
         ));
     };
     if state.conversations.has_active_turns_for_cli(ManagedCli::Pi) {

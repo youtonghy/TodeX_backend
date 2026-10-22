@@ -1900,22 +1900,31 @@ async fn providers(
     Ok(Json(json!({ "providers": providers })))
 }
 
+#[derive(Deserialize)]
+struct ProviderVersionsQuery {
+    /// Re-read each CLI's latest release instead of the cached one.
+    #[serde(default)]
+    refresh: bool,
+}
+
+/// A CLI being installed or upgraded keeps its last row; the others are
+/// probed as usual.
+/// How long an install or upgrade waits for starts and probes of its CLI
+/// (bounded by the 12 s version probe) before reporting it busy.
+const CLI_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 async fn provider_versions(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ProviderVersionsQuery>,
 ) -> Result<Json<CliVersionsResponse>, AppError> {
     require_auth(&state, &headers)?;
-    match state.cli_execution_gate.clone().try_read_owned() {
-        Ok(_permit) => Ok(Json(state.cli_manager.versions(&state.config).await)),
-        Err(_) => state
+    Ok(Json(
+        state
             .cli_manager
-            .cached_versions_while_busy()
-            .await
-            .map(Json)
-            .ok_or_else(|| {
-                AppError::Conflict("CLI versions are unavailable during an upgrade".to_owned())
-            }),
-    }
+            .versions(&state.config, query.refresh)
+            .await,
+    ))
 }
 
 async fn upgrade_provider_cli(
@@ -1959,8 +1968,9 @@ async fn remove_antigravity_integration(
     Ok(Json(json!({ "removed": removed })))
 }
 
-/// Install and upgrade share the single-flight operation, the execution gate
-/// and the audit trail; they differ in the precondition and the command.
+/// Install and upgrade share the per-CLI operation, the CLI's lock and the
+/// audit trail; they differ in the precondition and the command. Different
+/// CLIs install and upgrade concurrently.
 async fn start_cli_operation(
     state: AppState,
     headers: HeaderMap,
@@ -1973,9 +1983,15 @@ async fn start_cli_operation(
             "CLI installs and upgrades require device authentication".to_owned(),
         ));
     }
-    let execution_guard = match state.cli_execution_gate.clone().try_write_owned() {
-        Ok(guard) => guard,
-        Err(_) => {
+    // Held for the whole run: starts of this CLI wait, other Agents do not.
+    let execution_guard = match state
+        .cli_manager
+        .locks()
+        .write_within(provider, CLI_LOCK_WAIT)
+        .await
+    {
+        Some(guard) => guard,
+        None => {
             append_cli_audit(
                 &state,
                 &auth,
@@ -1986,9 +2002,10 @@ async fn start_cli_operation(
                 Some("CLI_EXECUTION_BUSY"),
             )
             .await?;
-            return Err(AppError::Conflict(
-                "an Agent or CLI upgrade is starting".to_owned(),
-            ));
+            return Err(AppError::Conflict(format!(
+                "{} is busy starting; try again",
+                provider.name()
+            )));
         }
     };
     if state.conversations.has_active_turns_for_cli(provider)

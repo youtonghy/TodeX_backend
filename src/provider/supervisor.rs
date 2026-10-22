@@ -30,7 +30,7 @@ use crate::workspace_store::stable_workspace_id;
 
 use super::acp::AcpDriver;
 use super::claude::ClaudeDriver;
-use super::cli_manager::ManagedCli;
+use super::cli_manager::{CliLocks, CliPermits, ManagedCli};
 use super::codex::CodexDriver;
 use super::grok::GrokBuildDriver;
 use super::pi::PiDriver;
@@ -385,6 +385,10 @@ pub struct ConversationSupervisor {
     active: Arc<DashMap<String, ActiveTurn>>,
     request_gates: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     cli_execution_gate: Arc<RwLock<()>>,
+    /// Per-CLI locks an install or upgrade holds; starts of a CLI take its
+    /// lock shared before `cli_execution_gate`, so a start waiting on an
+    /// upgrade holds nothing every other Agent needs.
+    cli_locks: CliLocks,
     /// `[agent].provider_idle_timeout_minutes`; `None` disables the watchdog.
     provider_idle_timeout: Option<Duration>,
     /// SSH tools injected into provider sessions; `None` in bare test setups.
@@ -527,6 +531,7 @@ impl ConversationSupervisor {
             active: Arc::new(DashMap::new()),
             request_gates: Arc::new(DashMap::new()),
             cli_execution_gate,
+            cli_locks: CliLocks::default(),
             agent_mcp: None,
             quota: crate::quota_store::QuotaStore::default(),
             control_results: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
@@ -569,6 +574,54 @@ impl ConversationSupervisor {
     /// Standing answers for permission requests (API key approval policies).
     pub fn set_permission_policy(&self, policy: Arc<dyn super::types::PermissionPolicy>) {
         self.permissions.set_policy(policy);
+    }
+
+    pub fn with_cli_locks(mut self, cli_locks: CliLocks) -> Self {
+        self.cli_locks = cli_locks;
+        self
+    }
+
+    /// The managed CLIs a `provider` (with ACP `profile`) runs.
+    fn clis_for(&self, provider: ProviderKind, profile: Option<&str>) -> Vec<ManagedCli> {
+        ManagedCli::ALL
+            .into_iter()
+            .filter(|cli| {
+                turn_runs_cli(
+                    &self.config.agent,
+                    provider,
+                    profile,
+                    cli.provider_kind(),
+                    cli.binary(&self.config),
+                )
+            })
+            .collect()
+    }
+
+    /// Discovery runs the CLI; it is refused, not queued, while an install
+    /// or upgrade replaces it.
+    fn try_discovery_permits(
+        &self,
+        provider: ProviderKind,
+        profile: Option<&str>,
+    ) -> Result<(CliPermits, tokio::sync::RwLockReadGuard<'_, ()>), AppError> {
+        let busy =
+            || AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned());
+        let clis = self
+            .cli_locks
+            .try_read(&self.clis_for(provider, profile))
+            .ok_or_else(busy)?;
+        let gate = self.cli_execution_gate.try_read().map_err(|_| busy())?;
+        Ok((clis, gate))
+    }
+
+    /// Waits while the CLI is installed or upgraded, then for the shared gate.
+    async fn start_permits(
+        &self,
+        provider: ProviderKind,
+        profile: Option<&str>,
+    ) -> (CliPermits, tokio::sync::RwLockReadGuard<'_, ()>) {
+        let clis = self.cli_locks.read(&self.clis_for(provider, profile)).await;
+        (clis, self.cli_execution_gate.read().await)
     }
 
     pub fn with_quota(mut self, quota: crate::quota_store::QuotaStore) -> Self {
@@ -1040,9 +1093,7 @@ impl ConversationSupervisor {
         provider: ProviderKind,
         workspace: &Path,
     ) -> Result<Vec<ProviderModelDescriptor>, AppError> {
-        let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
-            AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
-        })?;
+        let _cli_permit = self.try_discovery_permits(provider, None)?;
         self.validate_workspace(workspace)?;
         let driver = self.registry.driver(provider)?;
         tokio::time::timeout(
@@ -1089,9 +1140,7 @@ impl ConversationSupervisor {
                 }
             }
             ImageInputMode::Profile => {
-                let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
-                    AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
-                })?;
+                let _cli_permit = self.try_discovery_permits(provider, profile)?;
                 self.validate_workspace(workspace)?;
                 let driver = self.registry.driver(provider)?;
                 let image_input = tokio::time::timeout(
@@ -1129,9 +1178,7 @@ impl ConversationSupervisor {
         provider: ProviderKind,
         workspace: &Path,
     ) -> Result<Vec<ProviderCommandDescriptor>, AppError> {
-        let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
-            AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
-        })?;
+        let _cli_permit = self.try_discovery_permits(provider, None)?;
         self.validate_workspace(workspace)?;
         let driver = self.registry.driver(provider)?;
         tokio::time::timeout(
@@ -1156,9 +1203,8 @@ impl ConversationSupervisor {
         conversation_id: &str,
     ) -> Result<Value, AppError> {
         let manifest = self.get_owned(owner_id, conversation_id).await?;
-        let _cli_permit = self.cli_execution_gate.try_read().map_err(|_| {
-            AppError::Conflict("CLI discovery is unavailable during an upgrade".to_owned())
-        })?;
+        let _cli_permit =
+            self.try_discovery_permits(manifest.provider, manifest.provider_profile.as_deref())?;
         self.validate_workspace(&manifest.workspace)?;
         let driver = self.registry.driver(manifest.provider)?;
         let catalog = tokio::time::timeout(driver.discovery_timeout(), async {
@@ -1641,7 +1687,9 @@ impl ConversationSupervisor {
                 "Native conversation fork is not supported by this provider.".to_owned(),
             ));
         }
-        let _cli_permit = self.cli_execution_gate.read().await;
+        let _cli_permit = self
+            .start_permits(source.provider, source.provider_profile.as_deref())
+            .await;
         let (cancel, _) = watch::channel(false);
         match self.active.entry(conversation_id.to_owned()) {
             Entry::Occupied(_) => {
@@ -1732,7 +1780,9 @@ impl ConversationSupervisor {
                 "Native compaction is not supported by this provider.".to_owned(),
             ));
         }
-        let _cli_permit = self.cli_execution_gate.read().await;
+        let _cli_permit = self
+            .start_permits(manifest.provider, manifest.provider_profile.as_deref())
+            .await;
         let (cancel, cancel_rx) = watch::channel(false);
         let operation_id = format!("compact_{}", Uuid::new_v4().simple());
         match self.active.entry(conversation_id.to_owned()) {
@@ -1866,13 +1916,16 @@ impl ConversationSupervisor {
         let Ok(_slot) = self.prewarms.clone().try_acquire_owned() else {
             return Ok(Some("busy"));
         };
-        // A CLI upgrade holds the gate exclusively; never wait for it.
-        // An admission check only: the guard is dropped before the provider
+        // An install or upgrade of the CLI, or a cleanup, holds a lock
+        // exclusively; never wait for it. An admission check only: the guard is dropped before the provider
         // is awaited. Tokio's RwLock is write-preferring, so a queued writer
         // (`cleanup_expired`, a CLI upgrade) would otherwise block every
         // prompt's read behind a slow warm for up to PREWARM_TIMEOUT. The
         // re-check after the warm covers a conversation removed meanwhile.
-        if self.cli_execution_gate.try_read().is_err() {
+        if self
+            .try_discovery_permits(manifest.provider, manifest.provider_profile.as_deref())
+            .is_err()
+        {
             return Ok(Some("busy"));
         }
         if let Err(error) = self.validate_workspace(&manifest.workspace) {
@@ -2481,7 +2534,9 @@ impl ConversationSupervisor {
         conversation_id: &str,
         manifest: &ConversationManifest,
     ) -> Result<(String, watch::Receiver<bool>), AppError> {
-        let cli_start_permit = self.cli_execution_gate.read().await;
+        let cli_start_permit = self
+            .start_permits(manifest.provider, manifest.provider_profile.as_deref())
+            .await;
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let (cancel, cancel_rx) = watch::channel(false);
         match self.active.entry(conversation_id.to_owned()) {
@@ -4712,8 +4767,53 @@ mod tests {
         let store = ConversationStore::new(config.data_dir.clone())
             .await
             .unwrap();
+        let locks = CliLocks::default();
         let supervisor =
-            ConversationSupervisor::new(config, store, ConversationEventHub::default());
+            ConversationSupervisor::new(config, store, ConversationEventHub::default())
+                .with_cli_locks(locks.clone());
+        assert_eq!(
+            supervisor.clis_for(ProviderKind::Codex, None),
+            [ManagedCli::Codex]
+        );
+        assert_eq!(
+            supervisor.clis_for(ProviderKind::Acp, Some("managed")),
+            [ManagedCli::Codex]
+        );
+        assert!(supervisor
+            .clis_for(ProviderKind::Acp, Some("external"))
+            .is_empty());
+        // While Codex upgrades, other Agents start; Codex and the ACP profile
+        // running its binary wait.
+        let upgrade = locks.try_write(ManagedCli::Codex).unwrap();
+        drop(
+            supervisor
+                .start_permits(ProviderKind::ClaudeCode, None)
+                .await,
+        );
+        drop(
+            supervisor
+                .start_permits(ProviderKind::Acp, Some("external"))
+                .await,
+        );
+        for (provider, profile) in [
+            (ProviderKind::Codex, None),
+            (ProviderKind::Acp, Some("managed")),
+        ] {
+            assert!(tokio::time::timeout(
+                Duration::from_millis(50),
+                supervisor.start_permits(provider, profile)
+            )
+            .await
+            .is_err());
+        }
+        assert!(supervisor
+            .try_discovery_permits(ProviderKind::Codex, None)
+            .is_err());
+        assert!(supervisor
+            .try_discovery_permits(ProviderKind::Pi, None)
+            .is_ok());
+        drop(upgrade);
+        drop(supervisor.start_permits(ProviderKind::Codex, None).await);
         for (id, provider, profile) in [
             ("conv-codex", ProviderKind::Codex, None),
             (
